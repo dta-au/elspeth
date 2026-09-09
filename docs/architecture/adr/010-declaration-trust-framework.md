@@ -339,3 +339,80 @@ contracts fire produces `exception_type =
 `violations` list. Queries filtering on a specific contract's exception
 type must be updated to also match inside the aggregate's `violations`
 list when they want all occurrences.
+
+## §Terminology — the runtime declaration cross-check, colloquially "val" (Amendment A4)
+
+> **Amendment A4 — 2026-09-10.**
+> The term appears 83 times — in ADR-008, in this ADR, in
+> `contracts/runtime_val_manifest.py`, on the orchestrator's resume path, in the
+> Landscape schema, and throughout the invariant suite — and is defined in none
+> of them. This section is the definition of record. It documents vocabulary
+> already in use: no behaviour changes, no symbol is renamed, nothing is
+> superseded.
+
+### The term
+
+The mechanism is the **runtime declaration cross-check**. Everywhere it is
+actually spoken about it is a **val** — capitalised `VAL` in compounds
+(`runtime-VAL manifest`, `declaration-VAL gate`), lowercase in prose.
+
+It is not an initialism, and it is not short for "validation". The name is an
+accident of origin: a value named `val`, in the problem discussion that grew
+into this framework, lent its name to the idea that discussion produced, and the
+shorthand outlived the variable. Nothing is gained by back-forming an expansion
+for it, and something is lost — "validation" suggests ordinary input checking,
+which is precisely what a val is not.
+
+### What a val is
+
+A val is the runtime check that holds a plugin to its own word.
+
+A plugin *declares* something about its behaviour — `passes_through_input`,
+`sink_required_fields`. Static analysis of the DAG *trusts* that declaration and
+plans around it. The val is what stands behind the trust: at runtime it measures
+observed behaviour against the declaration and fails closed when the two
+disagree. In code it is a `DeclarationContract`'s `runtime_check`; there is no
+`static_check` in the 2A protocol (§Decision 3, Amendment A1), so for now the
+val carries the whole of the enforcement.
+
+The failure is deliberately loud. Each registered contract's `violation_class`
+carries `@tier_1_error`, so a contradicted declaration aborts the run rather
+than letting it finish and produce evidence nobody can trust. Measured
+2026-09-10: `passes_through_input` → `PassThroughContractViolation` and
+`sink_required_fields` → `SinkRequiredFieldsViolation` are both in
+`TIER_1_ERRORS`, as is `AggregateDeclarationContractViolation`. The generic base
+`DeclarationContractViolation` is not, and should not be — registration belongs
+on the concrete subclasses.
+
+A val is a countable noun: each declaration contract has exactly one. It can
+also be present without being alive. A contract whose `runtime_check` does not
+raise on its own `negative_example` has a **dormant** val — the declaration is
+still trusted, but nothing is holding it to account. That is the failure
+`tests/invariants/test_contract_negative_examples_fire.py` exists to catch, and
+the reason the orchestrator asserts per-site registry equality at bootstrap
+(§Decision 3) rather than merely asserting the registry is non-empty.
+
+### Established compounds
+
+These are the forms in use. None of them changes.
+
+| Form | Meaning |
+| ---- | ------- |
+| runtime val, runtime-VAL | The check itself — 73 of the 83 occurrences. |
+| runtime-VAL manifest | The record, written into the Landscape run header, of which vals and which dispatch sites were in force for a given run. Its drift check is a resume precondition (`orchestrator/resume.py`). |
+| declaration val | A val on a transform (Phase 2B). |
+| boundary val | A val sited at a trust boundary rather than on a transform (Phase 2C). |
+
+### Provenance
+
+ADR-008 built the pattern for a single declaration and named its parts:
+"annotation + static trust + runtime VAL + TIER_1 escalation + invariant
+framework". This ADR generalised those parts into the `DeclarationContract`
+protocol; the name came along unchanged.
+
+### Writing rule
+
+In reader-facing prose — README, runbooks, composer copy — keep the bare term
+and gloss it once, at first use: *"runtime VAL manifests (a val being the
+runtime check that backs a static plugin declaration)"*. Do not expand it, and
+do not write "(VAL)" after an invented phrase.
