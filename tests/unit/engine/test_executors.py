@@ -5786,6 +5786,17 @@ class TestReRaiseGuardPattern:
                             f"instead of re-raising — the Tier-1 failure is swallowed"
                         )
 
+                # ``return`` is not the only way out. When the ``try`` sits in a
+                # loop, a ``break``/``continue`` bound to THAT loop leaves the
+                # handler while its last statement is still a ``raise``, so the
+                # check below cannot see it.
+                for stmt in _handler_escaping_jumps(node):
+                    violations.append(
+                        f"{where}: except TIER_1_ERRORS handler leaves via "
+                        f"{type(stmt).__name__.lower()} at line {stmt.lineno} instead of "
+                        f"re-raising — the Tier-1 failure is swallowed by the enclosing loop"
+                    )
+
                 # A handler whose last statement is not a raise has a path that
                 # falls out of it, which swallows the failure just as quietly.
                 last = node.body[-1]
@@ -5807,25 +5818,18 @@ class TestReRaiseGuardPattern:
                     )
 
                 # ``raise <caught name>`` is a re-raise only while that name still
-                # binds the caught exception. Rebinding it — by assignment, or by
-                # an inner handler that catches ``as`` the same name — lets any
-                # exception leave through the spelling the check above trusts, so
-                # the rebinding is refused outright rather than tracked.
-                if node.name is not None:
-                    for stmt in owned:
-                        if isinstance(stmt, ast.Name):
-                            rebinds = isinstance(stmt.ctx, ast.Store) and stmt.id == node.name
-                        elif isinstance(stmt, ast.ExceptHandler):
-                            rebinds = stmt.name == node.name
-                        else:
-                            continue
-                        if not rebinds:
-                            continue
-                        violations.append(
-                            f"{where}: except TIER_1_ERRORS handler rebinds its caught name "
-                            f"'{node.name}' at line {stmt.lineno} — a later `raise {node.name}` "
-                            f"would no longer re-raise the Tier-1 failure"
-                        )
+                # binds the caught exception, so any rebinding of it is refused
+                # outright rather than tracked. The check asks the OVER-
+                # approximating question — is this name bound anywhere under the
+                # handler, by any binding form? — because enumerating the
+                # spellings a reviewer thinks of is how the previous version let
+                # ``match ... as exc`` and ``import x as exc`` through.
+                if node.name is not None and node.name in _names_bound_anywhere_in(node):
+                    violations.append(
+                        f"{where}: except TIER_1_ERRORS handler rebinds its caught name "
+                        f"'{node.name}' — a later `raise {node.name}` would no longer "
+                        f"re-raise the Tier-1 failure (rename the inner binding)"
+                    )
 
         assert not violations, f"Re-raise guard violations found ({len(violations)}):\n" + "\n".join(f"  - {v}" for v in violations)
 
@@ -6288,6 +6292,81 @@ def _handler_owned_nodes(handler: object) -> list[object]:
                 continue
             stack.append(child)
     return owned
+
+
+def _handler_escaping_jumps(handler: object) -> list[object]:
+    """``break``/``continue`` statements that leave the handler without raising.
+
+    A jump bound to a loop the handler ITSELF opens is ordinary control flow.
+    One with no such loop around it binds to a loop outside the ``try``, so it
+    carries the Tier-1 failure out of the handler silently — and because the
+    handler can still END on a ``raise``, the last-statement check alone reads
+    green. ``return`` is covered separately; these are the other two ways out.
+    """
+    import ast
+
+    if not isinstance(handler, ast.ExceptHandler):
+        return []
+
+    nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    loops = (ast.For, ast.AsyncFor, ast.While)
+    escaping: list[object] = []
+    # Each entry is (node, is a handler-internal loop already around it?).
+    stack: list[tuple[ast.AST, bool]] = [(stmt, False) for stmt in handler.body if not isinstance(stmt, nested)]
+    while stack:
+        node, enclosed = stack.pop()
+        if not enclosed and isinstance(node, (ast.Break, ast.Continue)):
+            escaping.append(node)
+        # Only a loop's BODY is covered by it. A jump in its ``else`` binds to
+        # an outer loop just as one written before the loop does, so ``orelse``
+        # (and the iterable/test) inherit the enclosing state unchanged.
+        covered = {id(child) for child in node.body} if isinstance(node, loops) else frozenset()
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, nested):
+                continue
+            stack.append((child, enclosed or id(child) in covered))
+    return escaping
+
+
+def _names_bound_anywhere_in(handler: object) -> set[str]:
+    """Every name bound by any binding form anywhere under the handler.
+
+    Deliberately OVER-approximating: it descends into nested callables and
+    comprehensions whose own scope could not really touch the caught name, and
+    it enumerates binding FORMS rather than the two spellings that come to mind.
+    A gate that trusts ``raise <name>`` is only as sound as this set is
+    complete, and the cost of the two errors is not symmetric — an extra name
+    here is a loud failure the author fixes by renaming, while a missing form
+    is a silent escape (``match ... as exc`` and ``import x as exc`` both were).
+    """
+    import ast
+
+    if not isinstance(handler, ast.ExceptHandler):
+        return set()
+
+    bound: set[str] = set()
+    for node in ast.walk(handler):
+        if node is handler:
+            continue  # the ``except ... as exc`` clause is the binding we trust
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                bound.add(node.id)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                bound.add(node.rest)
+        elif isinstance(node, ast.alias):
+            # ``import a.b`` binds ``a``; ``import a.b as c`` binds ``c``.
+            bound.add(node.asname or node.name.split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+    return bound
 
 
 # =============================================================================
