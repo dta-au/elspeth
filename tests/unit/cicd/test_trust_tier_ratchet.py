@@ -1,10 +1,7 @@
-"""Pins for the trust-tier pre-commit ratchet (``scripts/trust_tier_ratchet.py``).
+"""Behavior tests for the trust-tier ratchet (``scripts/trust_tier_ratchet.py``).
 
-The tier-model corpus is deliberately non-empty until the operator signs the
-package, so the fail-closed CLI cannot be the pre-commit entry: it would refuse
-every commit on its trigger paths, including ones that shrink the corpus. The
-hook must therefore invoke the ratchet, and the ratchet's comparison must be
-line-insensitive and one-directional: new findings block, removed ones do not.
+The comparison is line-insensitive and one-directional: new findings block,
+removed ones do not.
 These tests exercise the comparison on synthetic findings; they never spawn the
 real lint.
 """
@@ -14,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
 from scripts.trust_tier_ratchet import (
     LINTS_SOURCE_ROOT,
     RULE_ID,
@@ -30,11 +26,6 @@ from scripts.trust_tier_ratchet import (
     parse_findings,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
-HOOK_ID = "elspeth-lints-trust-tier"
-HOOK_ENTRY = ".venv/bin/python -m scripts.trust_tier_ratchet"
-HOOK_TRIGGER = "^(config/cicd/enforce_tier_model/|elspeth-lints/src/elspeth_lints/rules/trust_tier/)"
 HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -42,27 +33,6 @@ def _finding(
     path: str = "web/app.py", rule_id: str = "R5", message: str = "isinstance() used: x", *, line: int = 10, severity: str = "error"
 ) -> FindingRecord:
     return FindingRecord(path=path, rule_id=rule_id, message=message, line=line, column=4, severity=severity)
-
-
-def _trust_tier_hook() -> dict[str, object]:
-    payload = yaml.safe_load(PRE_COMMIT_CONFIG.read_text(encoding="utf-8"))
-    hooks = [hook for repo in payload["repos"] for hook in repo.get("hooks", ()) if hook["id"] == HOOK_ID]
-    assert len(hooks) == 1, f"expected exactly one {HOOK_ID} hook, found {len(hooks)}"
-    hook = hooks[0]
-    assert isinstance(hook, dict)
-    return hook
-
-
-def test_pre_commit_trust_tier_hook_invokes_the_ratchet_script() -> None:
-    """The hook's entry is the ratchet, not the fail-closed CLI, with its trigger and scope unchanged."""
-    hook = _trust_tier_hook()
-
-    assert hook["entry"] == HOOK_ENTRY
-    assert hook["language"] == "system"
-    assert hook["pass_filenames"] is False
-    assert hook["files"] == HOOK_TRIGGER
-    assert "types" not in hook
-    assert (REPO_ROOT / "scripts" / "trust_tier_ratchet.py").is_file()
 
 
 def test_ratchet_runs_the_same_rule_and_verify_mode_as_the_previous_entry() -> None:

@@ -708,13 +708,11 @@ jobs:
 
       - name: Install system dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        # nodejs: tests/unit/test_dir_bug_sweep_workflow_contract.py runs the
-        # workflow script under `node -e` (30 ids); ripgrep:
-        # tests/unit/architecture/test_sink_publication_callers.py's alias
+        # ripgrep: tests/unit/architecture/test_sink_publication_callers.py's alias
         # sweep; sqlite3: examples/multi_worker_showcase/outcome_stats.sh
-        # under tests/e2e/examples. All three were absent from the
-        # python:*-bookworm image and 32 ids failed on every push
-        # (elspeth-bc97e06221 B1). Docker is NOT available inside a container
+        # under tests/e2e/examples. These dependencies were absent from the
+        # python:*-bookworm image (elspeth-bc97e06221 B1).
+        # Docker is NOT available inside a container
         # job; the docker-CLI tests run in the host-runner-unit job below.
         run: |
           apt-get update -q

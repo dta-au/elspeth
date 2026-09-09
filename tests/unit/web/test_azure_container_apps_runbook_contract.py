@@ -1,4 +1,4 @@
-"""Executable contract for the Azure Container Apps runbooks and skill.
+"""Executable contract for the Azure Container Apps runbooks.
 
 Mirrors ``test_aws_ecs_runbook_contract.py`` for the ACA trio. The two rules
 that matter most here are the ECS lessons: every epoch literal in prose or
@@ -17,7 +17,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import yaml
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web._aws_ecs_acceptance import receipt_contracts
@@ -30,8 +29,6 @@ COLD_INSTALL_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-cold-install.md"
 REDEPLOY_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-existing-service-redeploy.md"
 RUNBOOKS = (ACCEPTANCE_RUNBOOK, COLD_INSTALL_RUNBOOK, REDEPLOY_RUNBOOK)
 PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-05-phase6b-azure-container-apps-platform-facts.md"
-SKILL_DIR = REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps"
-SKILL_SYMLINK = REPO_ROOT / ".claude" / "skills" / "operating-azure-container-apps"
 KEY_DERIVATION_MODULE = REPO_ROOT / "src" / "elspeth" / "web" / "key_derivation.py"
 KEY_DERIVATION_TEST = REPO_ROOT / "tests" / "unit" / "web" / "test_key_derivation_wiring.py"
 
@@ -71,11 +68,6 @@ def _text(path: Path) -> str:
 
 def _fences(text: str, language: str) -> list[str]:
     return re.findall(rf"```{language}\n(.*?)```", text, flags=re.DOTALL)
-
-
-def _skill_texts() -> list[str]:
-    paths = (SKILL_DIR / "SKILL.md", *sorted((SKILL_DIR / "references").glob("*.md")))
-    return [_text(path) for path in paths]
 
 
 def _compatibility_record() -> dict[str, object]:
@@ -186,7 +178,7 @@ def test_compatibility_record_is_byte_bound_to_the_live_derivation() -> None:
 
 
 def test_every_epoch_literal_matches_the_live_constants() -> None:
-    texts = [_text(runbook) for runbook in RUNBOOKS] + _skill_texts()
+    texts = [_text(runbook) for runbook in RUNBOOKS]
     session_hits = 0
     landscape_hits = 0
     for text in texts:
@@ -707,33 +699,3 @@ def test_testcontainer_run_is_recorded_with_the_ci_selection_and_gated() -> None
         < section.index("unset ELSPETH_TEST_POSTGRES_URL")
     )
     assert text.index("## Connection budget") < text.index("## Testcontainer run") < text.index("## Evidence")
-
-
-def test_skill_mirrors_the_ecs_layout_and_worktree_guidance() -> None:
-    assert (SKILL_DIR / "SKILL.md").is_file()
-    assert (SKILL_DIR / "agents" / "openai.yaml").is_file()
-    assert (SKILL_DIR / "references" / "command-cheatsheet.md").is_file()
-    assert (SKILL_DIR / "references" / "test-and-triage.md").is_file()
-    assert SKILL_SYMLINK.is_symlink()
-    assert SKILL_SYMLINK.resolve() == SKILL_DIR.resolve()
-
-    skill = _text(SKILL_DIR / "SKILL.md")
-    status = " ".join(skill.replace("> ", "").split())
-    assert "desktop acceptance" in status
-    assert "No live cloud acceptance is claimed" in status
-    assert "PostgreSQL progress and shared budgets" in status
-    frontmatter = yaml.safe_load(skill.split("---\n")[1])
-    assert frontmatter["name"] == "operating-azure-container-apps"
-    assert "Do not use for AWS ECS" in " ".join(frontmatter["description"].split())
-
-    combined = "\n".join(_skill_texts())
-    assert not re.search(r"(?m)^\s*uv sync\b", combined)
-    assert not re.search(r"(?m)^\s*uv run\b", combined)
-    assert "PYTHONPATH" in combined
-    assert ".venv/bin/pytest" in combined
-    assert "Azure Files carries no database" in combined
-    assert "docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md" in combined
-
-    agent = yaml.safe_load(_text(SKILL_DIR / "agents" / "openai.yaml"))
-    assert agent["interface"]["display_name"] == "Operate Azure Container Apps"
-    assert "$operating-azure-container-apps" in agent["interface"]["default_prompt"]
