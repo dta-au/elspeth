@@ -197,8 +197,8 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.8.0 is a pre-1.0 database cutover. The session store moves
-from epoch 35 to 53; guided schema moves to 11, and Landscape moves from epoch
-29 to 38. The individual session epochs are:
+from epoch 35 to 54; guided schema moves to 11, and Landscape moves from epoch
+29 to 39. The individual session epochs are:
 
 | Session epoch | What changed |
 | ------------- | ------------ |
@@ -604,8 +604,12 @@ Current 0.8.0 behaviour:
   Single/sticky routing with PostgreSQL membership and session fencing;
   durable run-event replay, renewable Composer inflight accounting and shared
   budgets work across replicas. Interrupted provider requests are not
-  automatically resumed, and dead-owner recovery does not imply transparent
-  run handoff. Other maintained targets retain one replica and
+  automatically resumed. Durable run admission, PREPARED restart and eligible
+  checkpoint handoff are implemented with fresh web and Landscape authority;
+  integrated verification is recorded in the
+  [ACA plan](docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification). See the
+  [handoff limits](docs/reference/deployment-platforms.md#durable-run-handoff).
+  Other maintained targets retain one replica and
   stop-before-start replacement. Production deployments use external PostgreSQL
   where the deployment contract requires it.
 - Each web process serves all blocking work from one shared 16-thread worker

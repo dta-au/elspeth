@@ -53,6 +53,8 @@ from pathlib import Path
 
 import pytest
 from tests.helpers.tree_gate import iter_gate_files
+from tests.unit.architecture.test_session_db_mutation_authority import _attach_parents as _attach_session_inventory_parents
+from tests.unit.architecture.test_session_db_mutation_authority import _ProductionWriterCollector
 from tests.unit.core.landscape.test_database_clock_authority import (
     _clock_captured_alias_is_mutated,
     _clock_lexical_scopes,
@@ -168,6 +170,7 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
         "run-lifecycle",
         (
             "begin_run",
+            "materialize_cancelled_permit",
             "complete_run",
             "record_source_field_resolution",
             "record_run_source",
@@ -181,6 +184,12 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
             "set_export_pending_unless_completed",
             "finalize_run",
         ),
+    ),
+    *_apis(
+        "src/elspeth/core/landscape/run_start_admission.py",
+        "RunStartAdmissionRepository",
+        "run-start-admission",
+        ("reset_prepared_initialization", "mark_executing"),
     ),
     *_apis(
         _DATA_FLOW_PATH,
@@ -295,7 +304,8 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
 )
 
 _EXPECTED_API_CATEGORY_COUNTS = {
-    "run-lifecycle": 13,
+    "run-lifecycle": 14,
+    "run-start-admission": 2,
     "data-flow": 17,
     "execution": 19,
     "scheduler": 23,
@@ -312,6 +322,7 @@ _FRESH_EPOCH_ONE_EXCEPTION = AuthorityEstablishmentException(
     callee_symbol="RunCoordinationRepository.register_run_leader_on",
     write_counts=(
         ("run_attributions", "insert", 1),
+        ("run_start_admissions", "insert", 1),
         ("run_coordination", "insert", 1),
         ("run_coordination", "update", 1),
         ("run_coordination_events", "insert", 2),
@@ -361,7 +372,22 @@ _EXPORT_SEAT_ESTABLISHMENT = AuthorityEstablishmentException(
     caller_path="src/elspeth/core/landscape/run_coordination_repository.py",
     caller_symbol="RunCoordinationRepository.acquire_export_leadership",
     callee_path="src/elspeth/core/landscape/run_coordination_repository.py",
-    callee_symbol="RunCoordinationRepository._acquire_export_leadership_on",
+    callee_symbol="RunCoordinationRepository._acquire_terminal_leadership_on",
+    write_counts=(
+        ("run_coordination", "update", 2),
+        ("run_coordination_events", "insert", 3),
+        ("run_workers", "insert", 1),
+        ("run_workers", "update", 2),
+    ),
+    temporary=False,
+    sunset=None,
+)
+_RECONCILIATION_SEAT_ESTABLISHMENT = AuthorityEstablishmentException(
+    classification="reconciliation-seat-claim",
+    caller_path="src/elspeth/core/landscape/run_coordination_repository.py",
+    caller_symbol="RunCoordinationRepository.acquire_reconciliation_leadership",
+    callee_path="src/elspeth/core/landscape/run_coordination_repository.py",
+    callee_symbol="RunCoordinationRepository._acquire_terminal_leadership_on",
     write_counts=(
         ("run_coordination", "update", 2),
         ("run_coordination_events", "insert", 3),
@@ -376,6 +402,7 @@ _AUTHORITY_ESTABLISHMENTS = (
     _EXISTING_RUN_LEADERSHIP_ESTABLISHMENT,
     _FOLLOWER_MEMBERSHIP_ESTABLISHMENT,
     _EXPORT_SEAT_ESTABLISHMENT,
+    _RECONCILIATION_SEAT_ESTABLISHMENT,
 )
 _AUTHORITY_ESTABLISHMENT_EXCEPTIONS = tuple(item for item in _AUTHORITY_ESTABLISHMENTS if item.temporary)
 _EXACT_BEGIN_RUN_PRODUCTION_CALLERS = frozenset(
@@ -435,6 +462,7 @@ _COORDINATION_MUTATION_METHOD_NAMES = frozenset(
         "register_run_leader",
         "register_run_leader_on",
         "acquire_run_leadership",
+        "acquire_reconciliation_leadership",
         "release_seat",
         "record_fence_refusal",
         "record_heartbeat_degraded",
@@ -586,7 +614,7 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # already took an UPDATE through depart_worker and evict_worker, so this is a
 # new construction of an existing write shape, not a new shape. Re-derived from
 # this file's own printed output on the rebased tree, applied and run.
-_EXPECTED_DML_COUNT = 150
+_EXPECTED_DML_COUNT = 158
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -659,7 +687,7 @@ _EXPECTED_DML_COUNT = 150
 # Fresh-time renewal and explicit registration finalizers add four DML sites;
 # the approved helper extraction adds seven edges. Table/operation shapes and
 # public caller inventories remain unchanged (measured from the live AST).
-_EXPECTED_DML_INVENTORY_SHA256 = "c3b43f8fe38e43d916e79dc0dddc5c5a5e90bdb6a21df411be77039efe60c0f0"
+_EXPECTED_DML_INVENTORY_SHA256 = "8b0ae236f5005e11d5a4626bfcb3fe3bb5ea47c6a665eca794e4fe7f77325302"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -680,16 +708,19 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("coalesce_effect_members", "update"),
         ("coalesce_effects", "insert"),
         ("coalesce_effects", "update"),
+        ("edges", "delete"),
         ("edges", "insert"),
         ("group_losses", "insert"),
         ("group_losses", "update"),
         ("group_records", "insert"),
         ("node_states", "insert"),
         ("node_states", "update"),
+        ("nodes", "delete"),
         ("nodes", "insert"),
         ("nodes", "update"),
         ("operations", "insert"),
         ("operations", "update"),
+        ("preflight_results", "delete"),
         ("preflight_results", "insert"),
         ("routing_events", "insert"),
         ("rows", "insert"),
@@ -697,14 +728,18 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("run_coordination", "insert"),
         ("run_coordination", "update"),
         ("run_coordination_events", "insert"),
+        ("run_sources", "delete"),
         ("run_sources", "insert"),
         ("run_sources", "update"),
+        ("run_start_admissions", "insert"),
+        ("run_start_admissions", "update"),
         ("run_web_plugin_policy", "insert"),
         ("run_workers", "insert"),
         ("run_workers", "update"),
         ("runs", "insert"),
         ("runs", "update"),
         ("scheduler_events", "insert"),
+        ("secret_resolutions", "delete"),
         ("secret_resolutions", "insert"),
         ("sidecar_journal_outbox", "insert"),
         ("sink_effect_attempts", "insert"),
@@ -739,14 +774,14 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_lifecycle.complete_run#1
 #   + engine/orchestrator/abandon.py _acquire_leaderless_run_seat -> factory.run_coordination.acquire_run_leadership#1
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_coordination.release_seat#1
-_EXPECTED_CALL_COUNT = 275
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "d0824a8cd25f6e8d537549a6a9b77465dd4e8b4153a7f5b2cedb8273f9ba7017"
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 136
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "0561dddd71e704031510290def021516e75e0d0668316c25a6e659ad2702c6fe"
-_EXPECTED_COORDINATION_CALL_COUNT = 25
-_EXPECTED_COORDINATION_CALL_SHA256 = "1c58e572672e06b38094c8c3c0b31e1c3201ce193e600272fa1514146acbf98c"
-_EXPECTED_INTERNAL_EDGE_COUNT = 88
-_EXPECTED_INTERNAL_EDGE_SHA256 = "fc1f6fe8a8d29cc56d7bdd8000d34d00c3136b4cb83d677c9b049d22f7ed89a8"
+_EXPECTED_CALL_COUNT = 279
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "edb7b7d4799c2aa0921b502897d1185de6a323d44ab9bcab72ff48ed8a109322"
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 138
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "84327c0bcbbf9e2e7f46f206d6fccc70ae79a5a0b93fb6d54d1d50319eb00f94"
+_EXPECTED_COORDINATION_CALL_COUNT = 39
+_EXPECTED_COORDINATION_CALL_SHA256 = "ff8a26cb2828009160ea7c434c37378945eb50fbf7ca0bff661490e89fd4f906"
+_EXPECTED_INTERNAL_EDGE_COUNT = 92
+_EXPECTED_INTERNAL_EDGE_SHA256 = "d1af3e662208f61e4514edd9cc62e5e30fb573f047d2916b108c5a7c0c392c39"
 
 
 def _repo_root() -> Path:
@@ -1581,6 +1616,7 @@ def _receiver_attribute_string_candidates(
     *,
     use: ast.AST,
     seen: frozenset[int],
+    imported_candidates: frozenset[str] | None = None,
 ) -> frozenset[str] | None:
     """Every string ``self.<attr>`` can hold, when EVERY binding of it in the enclosing class is finite and static.
 
@@ -1598,10 +1634,24 @@ def _receiver_attribute_string_candidates(
     if located is None or node.value.id != located[1]:
         return None
     owner_class = located[0]
+    if imported_candidates is not None:
+        # The shared dictionary proof must not hide a consumer-side retarget
+        # performed outside the class whose literal binding it inspected.
+        for member in ast.walk(resolver.unit.tree):
+            if _is_descendant(member, owner_class):
+                continue
+            if isinstance(member, ast.Attribute) and (
+                (member.attr == node.attr and isinstance(member.ctx, (ast.Store, ast.Del))) or member.attr == "__dict__"
+            ):
+                return None
+            if isinstance(member, ast.Call) and _call_name(member) in {"setattr", "__setattr__", "delattr", "__delattr__", "vars"}:
+                return None
     candidates: set[str] = set()
     bindings = 0
     for member in ast.walk(owner_class):
-        if isinstance(member, ast.Call) and _call_name(member) == "setattr":
+        if isinstance(member, ast.Call) and _call_name(member) in {"setattr", "__setattr__", "delattr", "__delattr__", "vars"}:
+            return None
+        if isinstance(member, ast.Attribute) and member.attr == "__dict__":
             return None
         if isinstance(member, (ast.AugAssign, ast.AnnAssign)):
             targets: list[ast.expr] = [member.target]
@@ -1629,7 +1679,11 @@ def _receiver_attribute_string_candidates(
                 return None
             values = _constant_string_candidates(member.value, resolver, use=member.value, seen=seen)
             if values is None:
-                return None
+                # Supplied only by the shared literal-dictionary resolver.
+                # The enclosing class mutation checks above remain mandatory.
+                values = imported_candidates
+                if values is None:
+                    return None
             candidates.update(values)
             bindings += 1
     return frozenset(candidates) if bindings else None
@@ -1776,6 +1830,8 @@ def _required_authority(path: str, symbol: str) -> str:
         return "RunCoordinationMutationAuthority"
     if path == _RUN_LIFECYCLE_PATH:
         return "RunLifecycleMutationAuthority"
+    if path == "src/elspeth/core/landscape/run_start_admission.py":
+        return "RunStartAdmissionMutationAuthority"
     if "/data_flow/" in path or path == _DATA_FLOW_PATH:
         return "DataFlowMutationAuthority"
     if "/scheduler/" in path or path == _SCHEDULER_PATH:
@@ -1804,6 +1860,15 @@ def scan_dml_identities(units: Iterable[SourceUnit]) -> tuple[DmlIdentity, ...]:
                 continue
             shape = _dml_shape(node, resolver) or _raw_dml_shape(node, resolver)
             if shape is None:
+                # A loop-controlled table is not one statically identified
+                # write. Keep the inventory fail-closed until the owner names
+                # each target explicitly; do not certify a partial write set.
+                if _dml_construction(node, resolver) is not None:
+                    ancestor = next(_ancestors(node), None)
+                    while ancestor is not None and not isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if isinstance(ancestor, (ast.For, ast.AsyncFor)):
+                            raise InventoryScanError(f"{unit.path}:{node.lineno} {_symbol(node)} unresolved loop DML table")
+                        ancestor = next(_ancestors(ancestor), None)
                 continue
             table, operation = shape
             raw.append(
@@ -1883,6 +1948,7 @@ _TRUSTED_CAPABILITY_QUALIFIED = frozenset(
 
 _CATEGORY_RECEIVER_MARKERS: dict[str, frozenset[str]] = {
     "run-lifecycle": frozenset({"lifecycle", "run_lifecycle"}),
+    "run-start-admission": frozenset({"admission", "admissions", "run_start_admission"}),
     "data-flow": frozenset({"data_flow", "token_manager"}),
     "execution": frozenset({"audit", "execution", "landscape", "recorder"}),
     "scheduler": frozenset({"processor", "scheduler"}),
@@ -2542,7 +2608,7 @@ def _authority_binding_origin(name: str, owner: ast.FunctionDef | ast.AsyncFunct
     """One unchanged binding on every path reaching this use.
 
     Uses may sit inside later nested statements. An assignment inside a try
-    may reach a later statement only if every handler raises; conditional,
+    may reach a later statement only if every handler exits the owner; conditional,
     iterative, and potentially suppressing context-manager assignments cannot
     certify a value outside their own body.
     """
@@ -2578,7 +2644,7 @@ def _authority_binding_origin(name: str, owner: ast.FunctionDef | ast.AsyncFunct
         parent = getattr(candidate, "_landscape_parent", None)
         if not isinstance(parent, ast.Try) or block is not parent.body:
             return None
-        if any(not _authority_block_raises(handler.body) for handler in parent.handlers):
+        if any(not _authority_relay_block_terminates(handler.body) for handler in parent.handlers):
             return None
         if any(isinstance(part, (ast.Return, ast.Break, ast.Continue)) for statement in parent.finalbody for part in ast.walk(statement)):
             return None
@@ -2643,11 +2709,30 @@ def _fresh_epoch_one_creation_authority(
         return False
     if not isinstance(worker, ast.Name):
         return False
-    creation = _admission_unique_binding(run_id.value.id, owner, node)
+    creation = _authority_binding_origin(run_id.value.id, owner, node)
     if not isinstance(creation, ast.Call) or not isinstance(creation.func, ast.Attribute) or creation.func.attr != "begin_run":
         return False
     if any(kw.arg is None for kw in creation.keywords):
         return False
+    permits = [kw.value for kw in creation.keywords if kw.arg == "run_start_permit"]
+    if len(permits) > 1:
+        return False
+    if permits and not (isinstance(permits[0], ast.Constant) and permits[0].value is None):
+        permit = permits[0]
+        assignment = next(_ancestors(node), None)
+        branch = next(_ancestors(assignment), None)
+        if (
+            not isinstance(permit, ast.Name)
+            or resolver.parameter(permit.id, creation) is None
+            or _subject_rebound(owner, permit.id)
+            or not isinstance(assignment, ast.Assign)
+            or not isinstance(branch, ast.If)
+            or branch.body != [assignment]
+        ):
+            return False
+        expected_guard = ast.parse(f"{permit.id} is None", mode="eval").body
+        if stable_ast_dump(branch.test) != stable_ast_dump(expected_guard):
+            return False
     registered_workers = [kw.value for kw in creation.keywords if kw.arg == "leader_worker_id"]
     if len(registered_workers) != 1 or not isinstance(registered_workers[0], ast.Name) or registered_workers[0].id != worker.id:
         return False
@@ -2657,7 +2742,7 @@ def _fresh_epoch_one_creation_authority(
     if parameter is not None:
         if _parameter_rebound(owner, worker.id):
             return False
-    elif _admission_unique_binding(worker.id, owner, creation) is None:
+    elif _authority_binding_origin(worker.id, owner, creation) is None:
         return False
     # Owned Run is frozen. Explicit escape hatches and attribute writes are
     # not compatible with proving its returned identity.
@@ -2697,11 +2782,12 @@ def _authority_return_body_is_visible(function: ast.FunctionDef | ast.AsyncFunct
 def _authority_factory_return_contract(
     proof: _AuthorityProof, function: ast.FunctionDef | ast.AsyncFunctionDef, resolver: _Resolver, scope: str
 ) -> bool:
-    """Check actual returned subjects of the three established factory APIs."""
+    """Check actual returned subjects of the reviewed factory APIs."""
     key = (resolver.unit.path, _symbol(function))
     expected_scope = {
         "RunCoordinationRepository.acquire_run_leadership": _LEADER_SCOPE,
         "RunCoordinationRepository.acquire_export_leadership": _LEADER_SCOPE,
+        "RunCoordinationRepository.acquire_reconciliation_leadership": _LEADER_SCOPE,
         "RunCoordinationRepository.admit_follower": _MEMBER_SCOPE,
     }.get(key[1])
     if expected_scope == scope and key in _proven_coordination_deadline_writers(proof.units):
@@ -2783,6 +2869,57 @@ def _receiver_owned_class(proof, qualified):
         return None
     found = proof.class_for(qualified)
     return found if found is not None and _receiver_class_body_is_visible(proof, *found) else None
+
+
+def _immediate_receiver_argument_origin(name, owner, use):
+    """Capture a receiver argument before later local assignments execute.
+
+    This is deliberately separate from token binding: only an immediate call
+    in a non-repeating function body may capture an earlier local receiver.
+    Every other store must be provably later in the same execution sequence.
+    """
+    if not isinstance(use, ast.Call) or _owner_function(use) is not owner or _has_repeating_ancestor(use, stop=owner):
+        return None
+    if any(isinstance(part, (ast.Nonlocal, ast.Global)) and name in part.names for part in ast.walk(owner)):
+        return None
+    if _authority_value_mutated(name, owner):
+        return None
+    stores = [
+        part for part in ast.walk(owner) if isinstance(part, ast.Name) and part.id == name and isinstance(part.ctx, (ast.Store, ast.Del))
+    ]
+    if any(_owner_function(part) is not owner or _has_repeating_ancestor(part, stop=owner) for part in stores):
+        return None
+    assignments = [next(_ancestors(part), None) for part in stores]
+    if any(
+        not isinstance(statement, (ast.Assign, ast.AnnAssign))
+        or statement.value is None
+        or (statement.targets if isinstance(statement, ast.Assign) else [statement.target]) != [store]
+        for store, statement in zip(stores, assignments, strict=True)
+    ):
+        return None
+    dominating = [statement for statement in assignments if _receiver_binding_dominates(statement.value, use)]
+    if len(dominating) != 1:
+        return None
+    origin = dominating[0]
+
+    def follows_call(statement):
+        use_ancestors = []
+        current = _admission_statement(use)
+        while current is not None and current is not owner:
+            use_ancestors.append(current)
+            current = _admission_statement(next(_ancestors(current), None))
+        current = statement
+        while current is not None and current is not owner:
+            block = _admission_block(current)
+            for before in use_ancestors:
+                if block is not None and _admission_block(before) is block and block.index(before) < block.index(current):
+                    return True
+            current = _admission_statement(next(_ancestors(current), None))
+        return False
+
+    if any(statement is not origin and not follows_call(statement) for statement in assignments):
+        return None
+    return origin.value
 
 
 def _receiver_binding_dominates(value, use):
@@ -3399,6 +3536,158 @@ class _AuthorityProof:
                         return ()
         return tuple(suppliers)
 
+    def _prepared_initialization_authority(self, node, owner, resolver, use, scope, seen):
+        """Prove the three exclusive origins of a prepared initialization token."""
+        if scope != _LEADER_SCOPE or not isinstance(node, ast.Name) or id(node) in seen:
+            return False
+        if _authority_value_mutated(node.id, owner) or any(
+            isinstance(part, (ast.Nonlocal, ast.Global)) and node.id in part.names for part in ast.walk(owner)
+        ):
+            return False
+        stores = [
+            part
+            for part in _walk_same_scope(owner)
+            if isinstance(part, ast.Name) and part.id == node.id and isinstance(part.ctx, (ast.Store, ast.Del))
+        ]
+        if len(stores) != 3:
+            return False
+        bindings = _lexical_binding_sites(owner)
+        if bindings.get("*") or bindings.get(node.id) != stores:
+            return False
+
+        def sole_assignment(name, value):
+            sites = bindings.get(name, [])
+            if len(sites) != 1 or not isinstance(sites[0], ast.Name) or not isinstance(sites[0].ctx, ast.Store):
+                return False
+            assignment = next(_ancestors(sites[0]), None)
+            return isinstance(assignment, ast.Assign) and assignment.targets == sites and assignment.value is value
+
+        assignments = [next(_ancestors(store), None) for store in stores]
+        if any(
+            not isinstance(item, ast.Assign) or item.targets != [store] or not isinstance(item.value, ast.Call)
+            for item, store in zip(assignments, stores, strict=True)
+        ):
+            return False
+        fresh = [item for item in assignments if _fresh_epoch_one_creation_authority(item.value, owner, resolver, scope)]
+        if len(fresh) != 1:
+            return False
+        fresh = fresh[0]
+        outer = next(_ancestors(fresh), None)
+        if not isinstance(outer, ast.If) or outer.body != [fresh]:
+            return False
+        # The idempotent begin_run arm may reuse an existing seat; only the
+        # no-permit branch can assume epoch one.
+        if not (
+            isinstance(outer.test, ast.Compare)
+            and isinstance(outer.test.left, ast.Name)
+            and len(outer.test.ops) == 1
+            and isinstance(outer.test.ops[0], ast.Is)
+            and len(outer.test.comparators) == 1
+            and isinstance(outer.test.comparators[0], ast.Constant)
+            and outer.test.comparators[0].value is None
+        ):
+            return False
+        permit_name = outer.test.left.id
+        if resolver.parameter(permit_name, outer) is None or _subject_rebound(owner, permit_name):
+            return False
+        fresh_args = _exact_keyword_arguments(fresh.value)
+        if fresh_args is None:
+            return False
+        run_value, worker_value = fresh_args["run_id"], fresh_args["worker_id"]
+        creation = _authority_binding_origin(run_value.value.id, owner, fresh.value)
+        creation_args = _exact_keyword_arguments(creation)
+        minted_worker = _authority_binding_origin(worker_value.id, owner, creation)
+        if (
+            creation_args is None
+            or "run_id" not in creation_args
+            or minted_worker is None
+            or resolver.parameter(worker_value.id, creation) is not None
+            or not _establishment_owned_unary_call(
+                minted_worker, "elspeth.contracts.coordination.mint_worker_id", creation_args["run_id"], resolver
+            )
+        ):
+            return False
+        permits = [kw.value for kw in creation.keywords if kw.arg == "run_start_permit"]
+        if len(permits) != 1 or not isinstance(permits[0], ast.Name) or permits[0].id != permit_name:
+            return False
+        others = [item for item in assignments if item is not fresh]
+        inner = next(_ancestors(others[0]), None)
+        if not isinstance(inner, ast.If) or inner not in outer.orelse or set(map(id, inner.body + inner.orelse)) != set(map(id, others)):
+            return False
+        if len(inner.body) != 1 or len(inner.orelse) != 1:
+            return False
+        observed, acquired = inner.body[0].value, inner.orelse[0].value
+        observed_args = _exact_keyword_arguments(observed)
+        if observed_args is None or set(observed_args) != {"run_id", "worker_id", "leader_epoch"}:
+            return False
+        if resolver.qualified_name(observed.func, use=observed) != "elspeth.contracts.coordination.CoordinationToken":
+            return False
+        if any(stable_ast_dump(observed_args[key]) != stable_ast_dump(fresh_args[key]) for key in ("run_id", "worker_id")):
+            return False
+        epoch = observed_args["leader_epoch"]
+        if not isinstance(epoch, ast.Attribute) or epoch.attr != "leader_epoch" or not isinstance(epoch.value, ast.Name):
+            return False
+        leader_name = epoch.value.id
+        expected_test = ast.parse(f"{leader_name} is not None and {leader_name}.leader_worker_id == {worker_value.id}", mode="eval").body
+        if stable_ast_dump(inner.test) != stable_ast_dump(expected_test) or _subject_rebound(owner, leader_name):
+            return False
+        observation = _authority_binding_origin(leader_name, owner, inner)
+        if (
+            not isinstance(observation, ast.Call)
+            or not isinstance(observation.func, ast.Attribute)
+            or observation.func.attr != "live_leader"
+        ):
+            return False
+        observation_args = _exact_keyword_arguments(observation)
+        if (
+            observation_args is None
+            or set(observation_args) != {"run_id"}
+            or stable_ast_dump(observation_args["run_id"]) != stable_ast_dump(run_value)
+        ):
+            return False
+        observed_reader = self.called_function(observation, resolver, observation)
+        if (
+            observed_reader is None
+            or (observed_reader[1].unit.path, _symbol(observed_reader[0]))
+            != ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader")
+            or not self._callback_function_unmodified(observed_reader[0])
+        ):
+            return False
+        if (
+            not isinstance(observation.func.value, ast.Attribute)
+            or observation.func.value.attr != "run_coordination"
+            or not isinstance(observation.func.value.value, ast.Name)
+            or not isinstance(creation.func.value, ast.Attribute)
+            or stable_ast_dump(observation.func.value.value) != stable_ast_dump(creation.func.value.value)
+            or _authority_value_mutated(observation.func.value.value.id, owner)
+        ):
+            return False
+        factory_name = observation.func.value.value.id
+        factory_origin = _authority_binding_origin(factory_name, owner, creation)
+        if (
+            not sole_assignment(worker_value.id, minted_worker)
+            or not sole_assignment(run_value.value.id, creation)
+            or not sole_assignment(leader_name, observation)
+            or factory_origin is None
+            or not sole_assignment(factory_name, factory_origin)
+            or bindings.get(permit_name) != [resolver.parameter(permit_name, outer)]
+        ):
+            return False
+        acquired_args = _exact_keyword_arguments(acquired)
+        if (
+            not isinstance(acquired.func, ast.Attribute)
+            or acquired.func.attr != "acquire_run_leadership"
+            or acquired_args is None
+            or not {"run_id", "worker_id"} <= acquired_args.keys()
+            or any(stable_ast_dump(acquired_args[key]) != stable_ast_dump(fresh_args[key]) for key in ("run_id", "worker_id"))
+        ):
+            return False
+        if not self.returned_authority(acquired, resolver, acquired, scope, seen | {id(node)}):
+            return False
+        return _callback_statement_dominates(outer, use, owner) or (
+            _is_descendant(use, outer) and _callback_statement_dominates(inner, use, owner)
+        )
+
     def _tuple_payload(self, function, resolver, index, arity, scope, seen):
         if id(function) in seen or function.decorator_list or not _authority_relay_block_terminates(function.body):
             return False
@@ -3418,6 +3707,8 @@ class _AuthorityProof:
                     return False
             elif isinstance(value, ast.Tuple) and len(value.elts) == arity:
                 payload = value.elts[index]
+                if self._prepared_initialization_authority(payload, function, resolver, statement, scope, seen):
+                    continue
                 payload_use = statement
                 aliases = set()
                 while isinstance(payload, ast.Name):
@@ -3448,6 +3739,41 @@ class _AuthorityProof:
             for part in _walk_same_scope(owner)
             if isinstance(part, ast.Name) and part.id == node.id and isinstance(part.ctx, (ast.Store, ast.Del))
         ]
+        if not stores:
+            # A nested function captures the outer tuple value. Follow only
+            # the nearest lexical binding, and prove it before declaration.
+            # Capturing a token is not permission to synthesize or rebind it.
+            local_bindings = _lexical_binding_sites(owner)
+            if local_bindings.get(node.id) or local_bindings.get("*"):
+                return False
+            parameters = (
+                *owner.args.posonlyargs,
+                *owner.args.args,
+                *owner.args.kwonlyargs,
+                *([owner.args.vararg] if owner.args.vararg is not None else []),
+                *([owner.args.kwarg] if owner.args.kwarg is not None else []),
+            )
+            if any(parameter.arg == node.id for parameter in parameters):
+                return False
+            declaration = owner
+            outer = _owner_function(next(_ancestors(declaration), declaration))
+            if outer is None:
+                return False
+            writes = [
+                part
+                for part in ast.walk(outer)
+                if isinstance(part, ast.Name) and part.id == node.id and isinstance(part.ctx, (ast.Store, ast.Del))
+            ]
+            if len(writes) != 1 or _owner_function(writes[0]) is not outer:
+                return False
+            outer_bindings = _lexical_binding_sites(outer)
+            if outer_bindings.get(node.id) != writes or outer_bindings.get("*"):
+                return False
+            if _authority_value_mutated(node.id, outer) or any(
+                isinstance(part, (ast.Nonlocal, ast.Global)) and node.id in part.names for part in ast.walk(outer)
+            ):
+                return False
+            return self._unpacked_callback_authority(node, outer, resolver, declaration, scope, seen)
         if len(stores) != 1:
             return False
         target = getattr(stores[0], "_landscape_parent", None)
@@ -3512,12 +3838,36 @@ class _AuthorityProof:
                         binding = actual_resolver.binding(actual.id, actual_use)
                         if binding is None:
                             break
-                        if (
-                            actual_owner is None
-                            or id(binding) in visited_aliases
-                            or _authority_binding_origin(actual.id, actual_owner, actual_use) is not binding
-                        ):
+                        if actual_owner is None or id(binding) in visited_aliases:
                             return False
+                        if _authority_binding_origin(actual.id, actual_owner, actual_use) is not binding:
+                            # A frozen receiver argument is captured now even
+                            # if its local variable is refreshed afterwards.
+                            # Never grant this relaxation to token arguments.
+                            annotation = producer_resolver.qualified_name(parameter.annotation, use=function)
+                            carrier = self.class_for(annotation)
+                            if (
+                                carrier is None
+                                or any(
+                                    self.annotation(parameter.annotation, producer_resolver, function, candidate)[0]
+                                    for candidate in (_LEADER_SCOPE, _MEMBER_SCOPE, _ITEM_SCOPE, _WORK_ITEM_SCOPE)
+                                )
+                                or carrier[0].bases
+                                or len(carrier[0].decorator_list) != 1
+                            ):
+                                return False
+                            decorator = carrier[0].decorator_list[0]
+                            if (
+                                not isinstance(decorator, ast.Call)
+                                or carrier[1].qualified_name(decorator.func, use=carrier[0]) != "dataclasses.dataclass"
+                                or not any(
+                                    kw.arg == "frozen" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                                    for kw in decorator.keywords
+                                )
+                            ):
+                                return False
+                            if _immediate_receiver_argument_origin(actual.id, actual_owner, actual_use) is not binding:
+                                return False
                         visited_aliases.add(id(binding))
                         actual, actual_use = binding, binding
                         continue
@@ -4031,6 +4381,8 @@ class _AuthorityProof:
     ) -> bool:
         if isinstance(node, ast.Name) and _authority_value_mutated(node.id, owner):
             return False
+        if self._prepared_initialization_authority(node, owner, resolver, use, scope, seen):
+            return True
         if id(node) not in seen and self._unpacked_callback_authority(node, owner, resolver, use, scope, seen):
             return True
         if id(node) in seen:
@@ -4240,6 +4592,8 @@ def _caller_authority_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]
             identity = (unit.path, _symbol(call))
             if call.func.attr == "begin_run" and identity in _EXACT_BEGIN_RUN_PRODUCTION_CALLERS:
                 continue
+            if call.func.attr == "materialize_cancelled_permit" and _cancelled_permit_caller_is_proven(unit, call, proof):
+                continue
             if _resolved_non_landscape_receiver_owner(call.func.value, call.func.attr, resolver, use=call) is not None:
                 continue
             if _proven_mutation_forwarder(call.func.value, call.func.attr, resolver, call, proof):
@@ -4310,11 +4664,21 @@ _EXACT_TAKEOVER_HELPERS = {
     ("src/elspeth/web/app.py", "_acquire_orphaned_run_leadership"): "orphan-finalize",
     ("src/elspeth/engine/orchestrator/abandon.py", "_acquire_leaderless_run_seat"): "abandon",
 }
+_EXACT_PERMIT_TAKEOVER_CALLERS = {
+    ("src/elspeth/engine/orchestrator/run_lifecycle.py", "RunLifecycleCoordinator.initialize_database_phase"): "prepared-restart",
+    ("src/elspeth/web/execution/service.py", "ExecutionServiceImpl._materialize_durable_cancellation.materialize"): "web-durable-cancel",
+}
 _EXACT_ESTABLISHMENT_CALLERS = {
+    "acquire_reconciliation_leadership": frozenset(
+        {
+            ("src/elspeth/web/execution/recovery.py", "RunRecoveryCoordinator._reconcile_resumable_terminal"),
+        }
+    ),
     "acquire_run_leadership": frozenset(
         {
             ("src/elspeth/engine/orchestrator/resume.py", "ResumeCoordinator._acquire_resume_leadership"),
             *_EXACT_TAKEOVER_HELPERS,
+            *_EXACT_PERMIT_TAKEOVER_CALLERS,
         }
     ),
     "admit_follower": frozenset(
@@ -4429,6 +4793,7 @@ def _establishment_call_shape_violation(method: str, call: ast.Call) -> str | No
     arguments = _exact_keyword_arguments(call)
     required = {
         "acquire_run_leadership": {"run_id", "worker_id", "window_seconds", "entry_point"},
+        "acquire_reconciliation_leadership": {"run_id", "worker_id", "window_seconds", "expected_status"},
         "admit_follower": {"run_id", "worker_id", "config_hash", "window_seconds"},
     }[method]
     if arguments is None or not required <= arguments.keys() or set(arguments) - required - {"now"}:
@@ -4442,6 +4807,47 @@ def _establishment_call_shape_violation(method: str, call: ast.Call) -> str | No
     parameters = {argument.arg for argument in (*owner.args.posonlyargs, *owner.args.args, *owner.args.kwonlyargs)}
     if not _establishment_window_is_proven(arguments["window_seconds"], owner=owner, resolver=resolver, call=call):
         return "authority-establishment window is not a required parameter or exact owned default/fallback"
+    identity = (resolver.unit.path, _symbol(owner))
+    if method == "acquire_reconciliation_leadership" or identity in _EXACT_PERMIT_TAKEOVER_CALLERS:
+        if method == "acquire_reconciliation_leadership":
+            status = arguments["expected_status"]
+            parameter = next((argument for argument in owner.args.args if argument.arg == "expected_status"), None)
+            if (
+                not isinstance(status, ast.Name)
+                or status.id != "expected_status"
+                or parameter is None
+                or _subject_rebound(owner, "expected_status")
+                or resolver.qualified_name(parameter.annotation, use=owner) != "elspeth.contracts.enums.RunStatus"
+            ):
+                return "reconciliation does not bind the exact observed terminal status"
+        elif not (
+            isinstance(arguments["entry_point"], ast.Constant)
+            and arguments["entry_point"].value == _EXACT_PERMIT_TAKEOVER_CALLERS[identity]
+        ):
+            return "permit takeover does not bind its exact entry point"
+        if identity == ("src/elspeth/engine/orchestrator/run_lifecycle.py", "RunLifecycleCoordinator.initialize_database_phase"):
+            if _dotted_name(arguments["run_id"]) != "run.run_id" or _dotted_name(arguments["worker_id"]) != "worker_id":
+                return "prepared takeover does not bind its exact returned run and newly minted worker"
+            worker = _authority_binding_origin("worker_id", owner, call)
+            if worker is None or not _establishment_owned_unary_call(
+                worker, "elspeth.contracts.coordination.mint_worker_id", ast.Name(id="run_id", ctx=ast.Load()), resolver
+            ):
+                return "prepared takeover worker is not minted from the exact run UUID"
+        else:
+            run_id = arguments["run_id"]
+            if not (
+                isinstance(run_id, ast.Call)
+                and _deadline_lock_builtin(run_id.func, "str", resolver, run_id)
+                and len(run_id.args) == 1
+                and not run_id.keywords
+                and _dotted_name(run_id.args[0]) == "run.id"
+                and not _subject_rebound(owner, "run")
+                and _establishment_owned_unary_call(
+                    arguments["worker_id"], "elspeth.contracts.coordination.mint_worker_id", run_id, resolver
+                )
+            ):
+                return "web takeover does not bind one run UUID and its freshly minted worker"
+        return None
     if (
         method == "acquire_run_leadership"
         and isinstance(arguments["entry_point"], ast.Constant)
@@ -4544,6 +4950,57 @@ def _coordination_subject_violation(
     return None
 
 
+def _closed_release_callback_context(call, resolver, proof):
+    """Prove an immediate callback against the owned, non-escaping dispatcher."""
+    callback = next(_ancestors(call), None)
+    if not isinstance(callback, ast.Lambda) or callback.body is not call:
+        return None
+    args = callback.args
+    if args.posonlyargs or args.args or args.vararg or args.kwonlyargs or args.kwarg or args.defaults or args.kw_defaults:
+        return None
+    dispatch = next(_ancestors(callback), None)
+    if (
+        not isinstance(dispatch, ast.Call)
+        or dispatch.args != [callback]
+        or dispatch.keywords
+        or not isinstance(dispatch.func, ast.Attribute)
+        or dispatch.func.attr != "release_on_loss"
+        or not isinstance(dispatch.func.value, ast.Name)
+        or call.func.attr != "release_seat"
+    ):
+        return None
+    owner = _owner_function(dispatch)
+    if owner is None:
+        return None
+    guard = _authority_binding_origin(dispatch.func.value.id, owner, dispatch)
+    qualified = "elspeth.engine.orchestrator.authority_guard.CallerAuthorityGuard"
+    if (
+        not isinstance(guard, ast.Call)
+        or resolver.qualified_name(guard.func, use=guard) != qualified
+        or _trusted_qualified_name_is_mutated(qualified, resolver=resolver, use=dispatch)
+        or _authority_value_mutated(dispatch.func.value.id, owner)
+    ):
+        return None
+    producer = proof.called_function(dispatch, resolver, dispatch)
+    if producer is None or not proof._callback_function_unmodified(producer[0]):
+        return None
+    method = producer[0]
+    expected = ast.parse(
+        "def release_on_loss(self, release):\n    if self._failure is not None:\n        release()\n        raise self._failure\n"
+    ).body[0]
+    body = method.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+        body = body[1:]
+    if method.decorator_list or [a.arg for a in method.args.args] != ["self", "release"]:
+        return None
+    args = method.args
+    if args.posonlyargs or args.kwonlyargs or args.defaults or args.kw_defaults or args.vararg or args.kwarg:
+        return None
+    if [stable_ast_dump(s) for s in body] != [stable_ast_dump(s) for s in expected.body]:
+        return None
+    return owner, dispatch
+
+
 def _coordination_caller_authority_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
     unit_list = tuple(units)
     proof = _AuthorityProof(unit_list)
@@ -4598,6 +5055,9 @@ def _coordination_caller_authority_violations(units: Iterable[SourceUnit]) -> tu
                     violations.append(f"{unit.path}:{call.lineno} {_symbol(call)} authority-establishment call is statically unreachable")
                 continue
             owner = _owner_function(call)
+            authority_use = call
+            if owner is None and (context := _closed_release_callback_context(call, resolver, proof)) is not None:
+                owner, authority_use = context
             if owner is None:
                 violations.append(f"{unit.path}:{call.lineno} {_symbol(call)} coordination call has no owner")
                 continue
@@ -4616,7 +5076,7 @@ def _coordination_caller_authority_violations(units: Iterable[SourceUnit]) -> tu
                     violations.append(f"{unit.path}:{call.lineno} {_symbol(call)} {subject_violation}")
                 continue
             token_keywords = [keyword for keyword in call.keywords if keyword.arg in _AUTHORITY_PARAMETER_NAMES]
-            if len(token_keywords) != 1 or not proof.expression(token_keywords[0].value, owner, resolver, call, scope):
+            if len(token_keywords) != 1 or not proof.expression(token_keywords[0].value, owner, resolver, authority_use, scope):
                 violations.append(f"{unit.path}:{call.lineno} {_symbol(call)} .{call.func.attr} lacks one exact current authority")
                 continue
             subject_violation = _coordination_subject_violation(call, token_keywords[0].value, coordination_definitions)
@@ -4650,6 +5110,8 @@ def _internal_coordination_authority_violations(units: Iterable[SourceUnit]) -> 
             if call.func.attr not in _COORDINATION_MUTATION_METHOD_NAMES:
                 continue
             identity = (unit.path, _symbol(call), call.func.attr)
+            if _cancelled_permit_internal_coordination_call_is_proven(unit, call, unit_list):
+                continue
             if identity == (
                 _FRESH_EPOCH_ONE_EXCEPTION.caller_path,
                 _FRESH_EPOCH_ONE_EXCEPTION.caller_symbol,
@@ -4815,6 +5277,11 @@ def _api_authority_violations(
             violations.append(f"{api.path}:{api.symbol} definitions={len(nodes)} expected=1")
             continue
         if api.symbol == _FRESH_EPOCH_ONE_EXCEPTION.caller_symbol:
+            continue
+        if (api.path, api.symbol) == (
+            _RUN_LIFECYCLE_PATH,
+            "RunLifecycleRepository.materialize_cancelled_permit",
+        ) and _cancelled_permit_facade_is_proven(unit_list):
             continue
         node = nodes[0]
         parameter = _authority_parameter(node)
@@ -4998,6 +5465,13 @@ def _mutation_callable_escapes(units: Iterable[SourceUnit]) -> tuple[str, ...]:
                 continue
             proven_receiver = _looks_like_landscape_receiver(node.value, node.attr, resolver=resolver, use=node)
             if not proven_receiver:
+                call = next(_ancestors(node), None)
+                if (
+                    isinstance(call, ast.Call)
+                    and call.func is node
+                    and _cancelled_permit_internal_coordination_call_is_proven(unit, call, proof.units)
+                ):
+                    continue
                 if node.attr == "finalize" and _dotted_name(node.value) in {
                     "factory",
                     "context",
@@ -5547,7 +6021,30 @@ def _dml_table_metadata_module(statement: ast.expr | None, resolver: _Resolver) 
     return None if identity is None or not identity[0] else identity[0]
 
 
+@cache
+def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) -> _ProductionWriterCollector:
+    """Reuse the hardened Sessions literal resolver with the inspected sources.
+
+    Provided imported modules take precedence over disk so a source mutation
+    cannot be hidden by a stale on-disk dictionary. The shared helper resolves
+    exactly one owned import; absent peers use its normal anchored lookup.
+    """
+    imported_paths = {
+        f"src/{node.module.replace('.', '/')}.py"
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None and node.module.startswith("elspeth.") and not node.level
+    }
+    peers = {}
+    for source in (unit, *(source for source in units if source.path in imported_paths and source.path != unit.path)):
+        _attach_session_inventory_parents(source.tree)
+        peers[source.path] = _ProductionWriterCollector(source.path, source.tree, anchor=_repo_root())
+    for collector in peers.values():
+        collector.peers = peers
+    return peers[unit.path]
+
+
 def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
+    units = tuple(units)
     violations: list[str] = []
     implementation_prefixes = (
         "src/elspeth/core/landscape/",
@@ -5604,6 +6101,12 @@ def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...
                 # or the method's own instance attribute is admitted only when
                 # EVERY candidate resolves and every one is a proven read.
                 exact = _raw_sql_exact_texts(node.args[0], resolver, use=node)
+                if exact is None and isinstance(node.args[0], ast.Attribute):
+                    texts = _raw_attribute_collector(unit, units)._self_attribute_module_constant_texts(node.args[0], use=node)
+                    if texts is not None:
+                        exact = _receiver_attribute_string_candidates(
+                            node.args[0], resolver, use=node, seen=frozenset(), imported_candidates=frozenset(texts)
+                        )
                 if any(_raw_sql_is_write(text) for text in (exact or ())):
                     violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} outside raw SQL write/DDL")
                 elif exact is None or not all(_raw_sql_is_proven_read(text) for text in exact):
@@ -6311,7 +6814,12 @@ def _dml_named_run_subjects(node: ast.FunctionDef | ast.AsyncFunctionDef) -> fro
     )
 
 
-def _dml_run_subject_violation(node: ast.FunctionDef | ast.AsyncFunctionDef, token_parameter: ast.arg) -> str | None:
+def _dml_run_subject_violation(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    token_parameter: ast.arg,
+    *,
+    bound_run_subjects: frozenset[str] = frozenset(),
+) -> str | None:
     argument_names = {argument.arg for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)}
     resolver = _resolver_for_node(node)
 
@@ -6328,7 +6836,7 @@ def _dml_run_subject_violation(node: ast.FunctionDef | ast.AsyncFunctionDef, tok
             if not isinstance(assignment, ast.Assign) or assignment not in node.body or assignment.lineno >= subject.lineno:
                 return False
         resolved = resolver.resolve_value(subject, use=subject)
-        return _exact_token_run_id_expression(resolved, token_parameter)
+        return _exact_token_run_id_expression(resolved, token_parameter) or _dotted_name(resolved) in bound_run_subjects
 
     for construction, root in _dml_subject_roots(node):
         for subject in _run_column_subjects(root):
@@ -6346,7 +6854,7 @@ def _dml_run_subject_violation(node: ast.FunctionDef | ast.AsyncFunctionDef, tok
                 return f"DML construction line {construction.lineno} uses non-token run subject {child.id}"
             if not isinstance(child, ast.Attribute) or child.attr != "run_id":
                 continue
-            if _exact_token_run_id_expression(child, token_parameter):
+            if token_subject(child):
                 continue
             if isinstance(child.value, ast.Attribute) and child.value.attr == "c":
                 continue
@@ -6354,7 +6862,11 @@ def _dml_run_subject_violation(node: ast.FunctionDef | ast.AsyncFunctionDef, tok
     return None
 
 
-def _function_fence_violation(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+def _function_fence_violation(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    bound_run_subjects: frozenset[str] = frozenset(),
+) -> str | None:
     parameter = _authority_parameter(node)
     if parameter is None:
         return "missing explicit current token"
@@ -6390,7 +6902,7 @@ def _function_fence_violation(node: ast.FunctionDef | ast.AsyncFunctionDef) -> s
             return "item fence does not receive the exact claimed work_item parameter"
     if not _run_id_is_bound_to_token(node, parameter, context):
         return "run_id is not structurally bound to token.run_id"
-    subject_violation = _dml_run_subject_violation(node, parameter)
+    subject_violation = _dml_run_subject_violation(node, parameter, bound_run_subjects=bound_run_subjects)
     if subject_violation is not None:
         return subject_violation
     binding_violation = _dml_execution_binding_violation(node, context.connection)
@@ -8269,6 +8781,7 @@ _DEADLINE_FINALIZATION_DEPENDENCIES = frozenset(
         "elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository",
         "elspeth.core.landscape.run_lifecycle_repository.RunLifecycleRepository",
         "elspeth.core.landscape.run_coordination_repository.record_coordination_event",
+        "elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository",
     }
 )
 
@@ -8434,7 +8947,7 @@ def _acquire_run_leadership_on(self, conn: Connection, *, run_id: str, worker_id
 def acquire_export_leadership(self, *, run_id: str, worker_id: str, window_seconds: float) -> CoordinationToken:
     try:
         with begin_write(self._engine) as conn:
-            token = self._acquire_export_leadership_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds)
+            token = self._acquire_terminal_leadership_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds, purpose='export')
             self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
         return token
     except OperationalError as exc:
@@ -8442,13 +8955,16 @@ def acquire_export_leadership(self, *, run_id: str, worker_id: str, window_secon
             raise
         raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
 """,
-    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"): """
-def _acquire_export_leadership_on(self, conn: Connection, *, run_id: str, worker_id: str, window_seconds: float) -> CoordinationToken:
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_terminal_leadership_on"): """
+def _acquire_terminal_leadership_on(self, conn: Connection, *, run_id: str, worker_id: str, window_seconds: float, purpose: Literal['export', 'reconciliation'], expected_status: RunStatus | None=None) -> CoordinationToken:
     seat = conn.execute(select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch, run_coordination_table.c.leader_heartbeat_expires_at).where(run_coordination_table.c.run_id == run_id).with_for_update()).one_or_none()
     if seat is None:
         raise AuditIntegrityError(f'Run {run_id!r} has no run_coordination seat row; at schema epoch 21 begin_run creates it atomically with the run. The audit DB is corrupt or was written by incompatible code.')
     database_now = read_landscape_decision_time(conn)
     run_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one_or_none()
+    if expected_status is not None and run_status != expected_status.value:
+        from elspeth.core.checkpoint.recovery import NonResumableRunError
+        raise NonResumableRunError(run_id, 'terminal status changed before reconciliation acquired authority')
     if run_status == RunStatus.RUNNING.value:
         from elspeth.core.checkpoint.recovery import NonResumableRunError
         raise NonResumableRunError(run_id, 'run is not terminal; its running leader owns finalization')
@@ -8468,10 +8984,10 @@ def _acquire_export_leadership_on(self, conn: Connection, *, run_id: str, worker
     if prior_worker is not None and prior_worker != worker_id:
         evicted = conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == prior_worker, run_workers_table.c.status == 'active').values(status='evicted', evicted_at=database_now, evicted_by_worker_id=worker_id))
         if evicted.rowcount == 1:
-            record_coordination_event(conn, run_id=run_id, event_type='worker_evict', worker_id=prior_worker, leader_epoch=new_epoch, recorded_at=database_now, context={'evicted_by_worker_id': worker_id, 'reason': 'deposed_leader_export_takeover'})
-    self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role='leader', window_seconds=window_seconds, entry_point='export', database_now=database_now)
-    record_coordination_event(conn, run_id=run_id, event_type='worker_register', worker_id=worker_id, leader_epoch=new_epoch, recorded_at=database_now, context={'role': 'leader', 'entry_point': 'export'})
-    record_coordination_event(conn, run_id=run_id, event_type='leader_acquire', worker_id=worker_id, leader_epoch=new_epoch, recorded_at=database_now, context={'entry_point': 'export', 'deposed_leader_worker_id': prior_worker})
+            record_coordination_event(conn, run_id=run_id, event_type='worker_evict', worker_id=prior_worker, leader_epoch=new_epoch, recorded_at=database_now, context={'evicted_by_worker_id': worker_id, 'reason': f'deposed_leader_{purpose}_takeover'})
+    self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role='leader', window_seconds=window_seconds, entry_point=purpose, database_now=database_now)
+    record_coordination_event(conn, run_id=run_id, event_type='worker_register', worker_id=worker_id, leader_epoch=new_epoch, recorded_at=database_now, context={'role': 'leader', 'entry_point': purpose})
+    record_coordination_event(conn, run_id=run_id, event_type='leader_acquire', worker_id=worker_id, leader_epoch=new_epoch, recorded_at=database_now, context={'entry_point': purpose, 'deposed_leader_worker_id': prior_worker})
     return token
 """,
     ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"): """
@@ -8503,7 +9019,7 @@ def _coordination_repo(self) -> RunCoordinationRepository:
     return self._run_coordination
 """,
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): """
-def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None) -> Run:
+def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_start_permit: RunStartPermitBinding | None=None) -> Run:
     if status == RunStatus.COMPLETED:
         raise AuditIntegrityError('begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail.')
     validate_run_attribution(initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type)
@@ -8511,6 +9027,8 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
     if web_plugin_policy_evidence is not None and (not isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence)):
         raise AuditIntegrityError('web_plugin_policy_evidence must be a WebPluginPolicyEvidence value')
     run_id = run_id or generate_id()
+    if run_start_permit is not None and (type(run_start_permit) is not RunStartPermitBinding or run_start_permit.run_id != run_id):
+        raise AuditIntegrityError('Run start permit must bind the exact run UUID')
     settings_json = canonical_json(config)
     config_hash = stable_hash(config)
     timestamp = now()
@@ -8520,7 +9038,13 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
     coordination = self._coordination_repo
     try:
         with self._db.write_connection() as conn:
+            if run_start_permit is not None:
+                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+                if existing is not None:
+                    return existing
             conn.execute(runs_table.insert().values(run_id=run.run_id, started_at=run.started_at, config_hash=run.config_hash, settings_json=run.settings_json, canonical_version=run.canonical_version, status=run.status.value, reproducibility_grade=run.reproducibility_grade, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, llm_call_count=None, seeded_from_cache=False, cache_key=None, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source))
+            if run_start_permit is not None:
+                conn.execute(run_start_admissions_table.insert().values(run_id=run_id, permit_id=run_start_permit.permit_id, permit_epoch=run_start_permit.permit_epoch, subject_hash=run_start_permit.subject_hash, state='prepared'))
             if initiated_by_user_id is not None and auth_provider_type is not None:
                 conn.execute(run_attributions_table.insert().values(run_id=run.run_id, recorded_at=timestamp, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type))
             if web_plugin_policy_evidence is not None:
@@ -8528,6 +9052,11 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
             leader_token = coordination.register_run_leader_on(conn, run_id=run.run_id, worker_id=worker_id, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, entry_point='run')
             coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
     except SQLAlchemyError as exc:
+        if run_start_permit is not None:
+            with self._db.engine.connect() as conn:
+                existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+                if existing is not None:
+                    return existing
         raise LandscapeRecordError(f'begin_run — database rejected audit write: {type(exc).__name__}: {exc}') from exc
     return run
 """,
@@ -8585,7 +9114,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
         "WriteLockHeldError": "elspeth.contracts.errors.WriteLockHeldError",
         "_is_database_locked": "elspeth.core.landscape.run_coordination_repository._is_database_locked",
     },
-    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"): {
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_terminal_leadership_on"): {
         "CoordinationToken": "elspeth.contracts.coordination.CoordinationToken",
         "Connection": "sqlalchemy.engine.Connection",
         "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
@@ -8650,11 +9179,281 @@ def __init__(self, db: LandscapeDB, ops: DatabaseOps, run_loader: RunLoader) -> 
 """
 _COORDINATION_FINALIZATION_DEPENDENCIES[("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.__init__")] = {}
 
+
+_COORDINATION_FINALIZATION_RECIPES[
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_reconciliation_leadership")
+] = """
+def acquire_reconciliation_leadership(self, *, run_id: str, worker_id: str, window_seconds: float, expected_status: RunStatus) -> CoordinationToken:
+    if type(expected_status) is not RunStatus or expected_status.value not in _EXPORT_SEAT_RUN_STATUSES:
+        raise ValueError('Reconciliation requires an exact terminal RunStatus')
+    try:
+        with begin_write(self._engine) as conn:
+            token = self._acquire_terminal_leadership_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds, purpose='reconciliation', expected_status=expected_status)
+            self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
+        return token
+    except OperationalError as exc:
+        if not _is_database_locked(exc):
+            raise
+        raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
+"""
+_COORDINATION_FINALIZATION_RECIPES[
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository._observe_permitted_run_on")
+] = """
+def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBinding, *, config_hash: str, canonical_version: str, openrouter_catalog_sha256: str, openrouter_catalog_source: str, initiated_by_user_id: str | None, auth_provider_type: str | None, source_schema_json: str | None, runtime_val_manifest_json: str | None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None) -> Run | None:
+    row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
+    if row is None:
+        return None
+    if RunStartAdmissionRepository.observe_on(conn, binding) is None:
+        raise AuditIntegrityError('Existing legacy run has no permit-bound baseline')
+    if (row.config_hash, row.canonical_version, row.openrouter_catalog_sha256, row.openrouter_catalog_source) != (config_hash, canonical_version, openrouter_catalog_sha256, openrouter_catalog_source):
+        raise AuditIntegrityError('Permit retry changed immutable run configuration or catalog')
+    attribution = conn.execute(select(run_attributions_table).where(run_attributions_table.c.run_id == binding.run_id)).one_or_none()
+    actual_attribution = (None, None) if attribution is None else (attribution.initiated_by_user_id, attribution.auth_provider_type)
+    if actual_attribution != (initiated_by_user_id, auth_provider_type):
+        raise AuditIntegrityError('Permit retry changed run attribution')
+    if row.source_schema_json != source_schema_json or row.runtime_val_manifest_json != runtime_val_manifest_json:
+        raise AuditIntegrityError('Permit retry changed source schema or runtime VAL manifest')
+    policy = conn.execute(select(run_web_plugin_policy_table).where(run_web_plugin_policy_table.c.run_id == binding.run_id)).one_or_none()
+    if web_plugin_policy_evidence is None:
+        if policy is not None:
+            raise AuditIntegrityError('Permit retry removed web plugin policy evidence')
+    elif policy is None:
+        raise AuditIntegrityError('Permit retry added web plugin policy evidence')
+    else:
+        evidence = web_plugin_policy_evidence
+        if (policy.schema_version, policy.policy_hash, policy.snapshot_hash, policy.authorized_plugin_ids_json, policy.available_plugin_ids_json, policy.control_modes_json, policy.selected_implementations_json, policy.selected_profile_aliases_json, policy.plugin_code_identities_json, policy.binding_generation_fingerprint, policy.decision_codes_json) != (evidence.schema_version, evidence.policy_hash, evidence.snapshot_hash, canonical_json(evidence.authorized_plugin_ids), canonical_json(evidence.available_plugin_ids), canonical_json(evidence.control_modes), canonical_json(evidence.selected_implementations), canonical_json(evidence.selected_profile_aliases), canonical_json(evidence.plugin_code_identities), evidence.binding_generation_fingerprint, canonical_json(evidence.decision_codes)):
+            raise AuditIntegrityError('Permit retry changed web plugin policy evidence')
+    return self._run_loader.load(row)
+"""
+_COORDINATION_FINALIZATION_RECIPES[("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.observe_on")] = """
+@staticmethod
+def observe_on(conn: Connection, binding: RunStartPermitBinding) -> RunStartAdmission | None:
+    if type(binding) is not RunStartPermitBinding:
+        raise TypeError('run admission requires an exact RunStartPermitBinding')
+    row = conn.execute(select(run_start_admissions_table).where(run_start_admissions_table.c.run_id == binding.run_id)).one_or_none()
+    if row is None:
+        return None
+    actual = RunStartPermitBinding(row.run_id, row.permit_id, row.permit_epoch, row.subject_hash)
+    if actual != binding:
+        raise AuditIntegrityError('Run UUID is bound to a different start permit')
+    return RunStartAdmission(binding=actual, state=RunStartAdmissionState(row.state))
+"""
+
+_COORDINATION_FINALIZATION_DEPENDENCIES[
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_reconciliation_leadership")
+] = {
+    "CoordinationToken": "elspeth.contracts.coordination.CoordinationToken",
+    "RunStatus": "elspeth.contracts.enums.RunStatus",
+    "OperationalError": "sqlalchemy.exc.OperationalError",
+    "begin_write": "elspeth.core.landscape.database.begin_write",
+    "WriteLockHeldError": "elspeth.contracts.errors.WriteLockHeldError",
+    "_is_database_locked": "elspeth.core.landscape.run_coordination_repository._is_database_locked",
+}
+_COORDINATION_FINALIZATION_DEPENDENCIES[
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run")
+].update(
+    {
+        "RunStartPermitBinding": "elspeth.contracts.run_start.RunStartPermitBinding",
+        "run_start_admissions_table": "elspeth.core.landscape.schema.run_start_admissions_table",
+    }
+)
+_COORDINATION_FINALIZATION_DEPENDENCIES[
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository._observe_permitted_run_on")
+] = {
+    "Connection": "sqlalchemy.engine.Connection",
+    "Run": "elspeth.contracts.Run",
+    "RunStartPermitBinding": "elspeth.contracts.run_start.RunStartPermitBinding",
+    "RunStartAdmissionRepository": "elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository",
+    "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+    "WebPluginPolicyEvidence": "elspeth.contracts.plugin_policy_audit.WebPluginPolicyEvidence",
+    "select": "sqlalchemy.select",
+    "runs_table": "elspeth.core.landscape.schema.runs_table",
+    "run_attributions_table": "elspeth.core.landscape.schema.run_attributions_table",
+    "run_web_plugin_policy_table": "elspeth.core.landscape.schema.run_web_plugin_policy_table",
+    "canonical_json": "elspeth.core.canonical.canonical_json",
+}
+_COORDINATION_FINALIZATION_DEPENDENCIES[("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.observe_on")] = {
+    "Connection": "sqlalchemy.Connection",
+    "RunStartPermitBinding": "elspeth.contracts.run_start.RunStartPermitBinding",
+    "RunStartAdmission": "elspeth.core.landscape.run_start_admission.RunStartAdmission",
+    "RunStartAdmissionState": "elspeth.core.landscape.run_start_admission.RunStartAdmissionState",
+    "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+    "select": "sqlalchemy.select",
+    "run_start_admissions_table": "elspeth.core.landscape.schema.run_start_admissions_table",
+}
+
+
+# This facade establishes its own Landscape token; it never accepts a caller's
+# nominal annotation as authority. Its exact recipe delegates only to the
+# reviewed creation/seat-claim/fenced-completion graph.
+_COORDINATION_FINALIZATION_RECIPES[
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.materialize_cancelled_permit")
+] = """
+def materialize_cancelled_permit(self, binding: RunStartPermitBinding, config: Mapping[str, Any], canonical_version: str, *, openrouter_catalog_sha256: str, openrouter_catalog_source: str, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, pre_effect_guard: Callable[[], None] | None=None) -> Run:
+    if pre_effect_guard is not None:
+        pre_effect_guard()
+    worker_id = mint_worker_id(binding.run_id)
+    with self._db.engine.connect() as conn:
+        header = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
+        run = None if header is None else self._observe_permitted_run_on(conn, binding, config_hash=stable_hash(config), canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=header.source_schema_json, runtime_val_manifest_json=header.runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
+    if run is None:
+        run = self.begin_run(config, canonical_version, run_id=binding.run_id, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, web_plugin_policy_evidence=web_plugin_policy_evidence, leader_worker_id=worker_id, run_start_permit=binding)
+    if run.status in _TERMINAL_RUN_STATUSES:
+        return run
+    admission = RunStartAdmissionRepository(self._db).observe(binding)
+    if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+        raise AuditIntegrityError('Cancellation materialization requires a prepared admission')
+    leader = self._coordination_repo.live_leader(run_id=binding.run_id)
+    if leader is not None and leader.leader_worker_id == worker_id:
+        token = CoordinationToken(binding.run_id, worker_id, leader.leader_epoch)
+    else:
+        token = self._coordination_repo.acquire_run_leadership(run_id=binding.run_id, worker_id=worker_id, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, entry_point='cancel-prepared')
+    try:
+        if pre_effect_guard is not None:
+            pre_effect_guard()
+        admission = RunStartAdmissionRepository(self._db).observe(binding)
+        if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+            raise AuditIntegrityError('Prepared cancellation lost its pre-effect baseline')
+        self.complete_run(RunStatus.INTERRUPTED, coordination_token=token)
+    finally:
+        self._coordination_repo.release_seat(token=token)
+    result = self.get_run(binding.run_id)
+    if result is None:
+        raise AuditIntegrityError('Cancelled admission lost its run record')
+    return result
+"""
+_COORDINATION_FINALIZATION_DEPENDENCIES[
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.materialize_cancelled_permit")
+] = {
+    "Run": "elspeth.contracts.Run",
+    "RunStatus": "elspeth.contracts.RunStatus",
+    "RunStartPermitBinding": "elspeth.contracts.run_start.RunStartPermitBinding",
+    "RunStartAdmissionRepository": "elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository",
+    "RunStartAdmissionState": "elspeth.core.landscape.run_start_admission.RunStartAdmissionState",
+    "CoordinationToken": "elspeth.contracts.coordination.CoordinationToken",
+    "DEFAULT_RUN_LIVENESS_WINDOW_SECONDS": "elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS",
+    "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+    "WebPluginPolicyEvidence": "elspeth.contracts.plugin_policy_audit.WebPluginPolicyEvidence",
+    "mint_worker_id": "elspeth.contracts.coordination.mint_worker_id",
+    "select": "sqlalchemy.select",
+    "runs_table": "elspeth.core.landscape.schema.runs_table",
+    "stable_hash": "elspeth.core.canonical.stable_hash",
+}
+_CANCELLED_PERMIT_CALLER_RECIPE = """
+async def _materialize_durable_cancellation(self, run: RunRecord, lease: SessionOperationLease) -> None:
+    from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+    from elspeth.contracts.hashing import CANONICAL_VERSION
+    from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
+    from elspeth.web.coordination.contracts import StartPermitState
+    from elspeth.web.execution.envelope import EnvelopeRecoveryReason
+    execution_input = await self._session_service.get_run_execution_input(run.id)
+    if execution_input is None:
+        raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
+    cancellation = read_cancelled_execution_envelope(execution_input)
+    permit = await self._session_service.issue_run_start_permit(run.id, session_operation_context=lease.context)
+    if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
+        return
+    assert permit.permit_id is not None and permit.permit_epoch is not None and (permit.subject_hash is not None)
+    binding = RunStartPermitBinding(str(run.id), permit.permit_id, permit.permit_epoch, permit.subject_hash)
+
+    def materialize() -> None:
+        with open_landscape_db(self._settings) as db:
+            repositories = RecorderFactory(db)
+            admission = RunStartAdmissionRepository(db).observe(binding)
+            if admission is not None and admission.state is RunStartAdmissionState.EXECUTING:
+                token = repositories.run_coordination.acquire_run_leadership(run_id=str(run.id), worker_id=mint_worker_id(str(run.id)), window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, entry_point='web-durable-cancel')
+                try:
+                    lease.guard_external_effect()
+                    repositories.run_lifecycle.complete_run(RunStatus.INTERRUPTED, coordination_token=token)
+                finally:
+                    repositories.run_coordination.release_seat(token=token)
+                return
+            existing = repositories.run_lifecycle.get_run(str(run.id))
+            config = json.loads(existing.settings_json) if existing is not None else deep_thaw(cancellation.audit_safe_config)
+            repositories.run_lifecycle.materialize_cancelled_permit(binding, config, CANONICAL_VERSION, openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256, openrouter_catalog_source=cancellation.openrouter_catalog_source, initiated_by_user_id=cancellation.user_id, auth_provider_type=cancellation.auth_provider_type, web_plugin_policy_evidence=cancellation.web_plugin_policy_evidence, pre_effect_guard=lease.guard_external_effect)
+    await run_sync_in_worker(materialize)
+"""
+
+
+def _cancelled_permit_facade_is_proven(units: tuple[SourceUnit, ...]) -> bool:
+    key = ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.materialize_cancelled_permit")
+    return key in _function_index(units) and (
+        _RUN_LIFECYCLE_PATH,
+        "RunLifecycleRepository.begin_run",
+    ) in _proven_coordination_deadline_writers(units)
+
+
+def _cancelled_permit_internal_coordination_call_is_proven(unit: SourceUnit, call: ast.Call, units: tuple[SourceUnit, ...]) -> bool:
+    """The two exact seat edges in the fully proved cancellation facade."""
+    return (
+        (unit.path, _symbol(call)) == (_RUN_LIFECYCLE_PATH, "RunLifecycleRepository.materialize_cancelled_permit")
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"acquire_run_leadership", "release_seat"}
+        and _dotted_name(call.func.value) == "self._coordination_repo"
+        and _cancelled_permit_facade_is_proven(units)
+    )
+
+
+def _cancelled_permit_caller_is_proven(unit: SourceUnit, call: ast.Call, proof: _AuthorityProof) -> bool:
+    if (unit.path, _symbol(call)) != (
+        "src/elspeth/web/execution/service.py",
+        "ExecutionServiceImpl._materialize_durable_cancellation.materialize",
+    ):
+        return False
+    outer = next(
+        (
+            node
+            for node in ast.walk(unit.tree)
+            if isinstance(node, ast.AsyncFunctionDef) and _symbol(node) == "ExecutionServiceImpl._materialize_durable_cancellation"
+        ),
+        None,
+    )
+    if outer is None or _finalization_recipe_dump(outer) != _finalization_recipe_dump(ast.parse(_CANCELLED_PERMIT_CALLER_RECIPE).body[0]):
+        return False
+    target = proof.called_function(call, _resolver_for_unit(unit), call)
+    if target is None or (target[1].unit.path, _symbol(target[0])) != (
+        "src/elspeth/core/landscape/run_lifecycle_repository.py",
+        "RunLifecycleRepository.materialize_cancelled_permit",
+    ):
+        return False
+    if not _cancelled_permit_facade_is_proven(proof.units):
+        return False
+    # This method is intentionally supplied as a closed callback. Reject code
+    # replacement without treating that reviewed callback use as an escape.
+    guard = _function_index(proof.units).get(("src/elspeth/web/coordination/lifecycle.py", "SessionOperationLease.guard_external_effect"))
+    return guard is not None and proof._callback_function_unmodified(outer) and proof._callback_function_unmodified(guard)
+
+
+# The prepared retry may read back only the epoch of the worker just minted
+# by that invocation. Pin this authoritative reader before admitting that
+# constructor branch; changing its body withdraws the whole proof.
+_COORDINATION_FINALIZATION_RECIPES[
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader")
+] = """
+def live_leader(self, *, run_id: str) -> LeaderInfo | None:
+    with self._engine.connect() as conn:
+        database_now = read_landscape_decision_time(conn)
+        seat = conn.execute(select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch, run_coordination_table.c.leader_heartbeat_expires_at, (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label('seat_live')).where(run_coordination_table.c.run_id == run_id)).one_or_none()
+    if seat is None or seat.leader_worker_id is None:
+        return None
+    return LeaderInfo(run_id=run_id, leader_worker_id=seat.leader_worker_id, leader_epoch=int(seat.leader_epoch), leader_heartbeat_expires_at=_utc(seat.leader_heartbeat_expires_at), seat_live=bool(seat.seat_live))
+"""
+_COORDINATION_FINALIZATION_DEPENDENCIES[
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader")
+] = {
+    "LeaderInfo": "elspeth.contracts.coordination.LeaderInfo",
+    "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+    "select": "sqlalchemy.select",
+    "run_coordination_table": "elspeth.core.landscape.schema.run_coordination_table",
+    "_utc": "elspeth.core.landscape.run_coordination_repository._utc",
+}
+
 _COORDINATION_FINALIZATION_CALLERS = {
     "_finalize_leader_registration_on": {
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_reconciliation_leadership"),
     },
     "_finalize_follower_admission_on": {
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"),
@@ -8665,8 +9464,9 @@ _COORDINATION_FINALIZATION_CALLERS = {
     "_acquire_run_leadership_on": {
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
     },
-    "_acquire_export_leadership_on": {
+    "_acquire_terminal_leadership_on": {
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_reconciliation_leadership"),
     },
 }
 
@@ -8857,7 +9657,7 @@ def _deadline_finalization_caller_violations_for_units(units: tuple[SourceUnit, 
                 for part in references
             ):
                 problems.append(f"deadline-finalization dependency changed: {key}:{name}")
-        for name in {"int", "bool", "dict", "str", "property"}:
+        for name in {"int", "bool", "dict", "str", "property", "type", "isinstance", "staticmethod"}:
             references = [
                 part for part in ast.walk(function) if isinstance(part, ast.Name) and part.id == name and isinstance(part.ctx, ast.Load)
             ]
@@ -8961,9 +9761,10 @@ def _proven_coordination_deadline_writers(units: tuple[SourceUnit, ...]) -> froz
     symbols = {
         "RunCoordinationRepository.register_run_leader_on",
         "RunCoordinationRepository._acquire_run_leadership_on",
-        "RunCoordinationRepository._acquire_export_leadership_on",
+        "RunCoordinationRepository._acquire_terminal_leadership_on",
         "RunCoordinationRepository.acquire_run_leadership",
         "RunCoordinationRepository.acquire_export_leadership",
+        "RunCoordinationRepository.acquire_reconciliation_leadership",
         "RunCoordinationRepository.admit_follower",
         "RunCoordinationRepository._insert_worker_row",
         "RunCoordinationRepository._finalize_leader_registration_on",
@@ -9110,9 +9911,10 @@ def test_finalization_current_writer_delegation_and_factory_returns(finalization
     expected = {
         "RunCoordinationRepository.register_run_leader_on",
         "RunCoordinationRepository._acquire_run_leadership_on",
-        "RunCoordinationRepository._acquire_export_leadership_on",
+        "RunCoordinationRepository._acquire_terminal_leadership_on",
         "RunCoordinationRepository.acquire_run_leadership",
         "RunCoordinationRepository.acquire_export_leadership",
+        "RunCoordinationRepository.acquire_reconciliation_leadership",
         "RunCoordinationRepository.admit_follower",
         "RunCoordinationRepository._insert_worker_row",
         "RunCoordinationRepository._finalize_leader_registration_on",
@@ -9130,10 +9932,163 @@ def test_finalization_current_writer_delegation_and_factory_returns(finalization
             if isinstance(function, ast.FunctionDef) and function.name in {
                 "acquire_run_leadership",
                 "acquire_export_leadership",
+                "acquire_reconciliation_leadership",
                 "admit_follower",
             }:
                 scope = _MEMBER_SCOPE if function.name == "admit_follower" else _LEADER_SCOPE
                 assert _authority_factory_return_contract(proof, function, _resolver_for_unit(unit), scope)
+
+
+@pytest.mark.parametrize(
+    ("path", "symbol", "old", "new"),
+    [
+        (
+            "src/elspeth/core/landscape/run_coordination_repository.py",
+            "RunCoordinationRepository.live_leader",
+            "leader_epoch=int(seat.leader_epoch)",
+            "leader_epoch=1",
+        ),
+        (
+            "src/elspeth/core/landscape/run_coordination_repository.py",
+            "RunCoordinationRepository._acquire_terminal_leadership_on",
+            ".with_for_update()",
+            ".with_for_update(read=True)",
+        ),
+        (
+            "src/elspeth/core/landscape/run_coordination_repository.py",
+            "RunCoordinationRepository._acquire_terminal_leadership_on",
+            "if expected_status is not None and run_status != expected_status.value:",
+            "if False:",
+        ),
+        (
+            "src/elspeth/core/landscape/run_coordination_repository.py",
+            "RunCoordinationRepository.acquire_reconciliation_leadership",
+            "token=token, window_seconds=window_seconds)",
+            "token=foreign_token, window_seconds=window_seconds)",
+        ),
+        (
+            "src/elspeth/core/landscape/run_lifecycle_repository.py",
+            "RunLifecycleRepository._observe_permitted_run_on",
+            "row = conn.execute(",
+            "conn.commit()\n        row = conn.execute(",
+        ),
+        (
+            "src/elspeth/core/landscape/run_start_admission.py",
+            "RunStartAdmissionRepository.observe_on",
+            "row = conn.execute(",
+            "conn.rollback()\n        row = conn.execute(",
+        ),
+    ],
+)
+def test_finalization_reconciliation_and_permit_readers_refuse_authority_mutations(finalization_source_units, path, symbol, old, new):
+    unit = next(unit for unit in finalization_source_units if unit.path == path)
+    method = next(node for node in ast.walk(unit.tree) if isinstance(node, ast.FunctionDef) and _symbol(node) == symbol)
+    original = ast.get_source_segment(unit.source, method)
+    assert original is not None and old in original
+    units = _finalization_mutate(finalization_source_units, path, original, original.replace(old, new, 1))
+    assert _deadline_finalization_caller_violations(units)
+    assert not _proven_coordination_deadline_writers(units)
+
+
+@pytest.mark.parametrize(
+    ("path", "symbol", "old", "new"),
+    [
+        (
+            "src/elspeth/engine/orchestrator/run_lifecycle.py",
+            "RunLifecycleCoordinator.initialize_database_phase",
+            'entry_point="prepared-restart"',
+            'entry_point="resume"',
+        ),
+        (
+            "src/elspeth/web/execution/service.py",
+            "ExecutionServiceImpl._materialize_durable_cancellation.materialize",
+            "worker_id=mint_worker_id(str(run.id))",
+            "worker_id=mint_worker_id(str(other_run.id))",
+        ),
+        (
+            "src/elspeth/web/execution/recovery.py",
+            "RunRecoveryCoordinator._reconcile_resumable_terminal",
+            "expected_status=expected_status",
+            "expected_status=RunStatus.COMPLETED",
+        ),
+    ],
+)
+def test_permit_and_reconciliation_establishment_refuses_changed_subject(path, symbol, old, new):
+    unit = next(unit for unit in _production_units() if unit.path == path)
+    owner = next(
+        node for node in ast.walk(unit.tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _symbol(node) == symbol
+    )
+    original = ast.get_source_segment(unit.source, owner)
+    assert original is not None and old in original
+    mutated = _parse_source(path, unit.source.replace(original, original.replace(old, new, 1), 1))
+    owner = next(
+        node for node in ast.walk(mutated.tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _symbol(node) == symbol
+    )
+    call = next(
+        node
+        for node in ast.walk(owner)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"acquire_run_leadership", "acquire_reconciliation_leadership"}
+    )
+    assert _establishment_call_shape_violation(call.func.attr, call) is not None
+
+
+def test_cancelled_permit_facade_refuses_removed_external_authority_guard():
+    units = _production_units()
+    path = "src/elspeth/web/execution/service.py"
+    unit = next(unit for unit in units if unit.path == path)
+    mutated = _parse_source(path, unit.source.replace("pre_effect_guard=lease.guard_external_effect", "pre_effect_guard=None", 1))
+    proof = _AuthorityProof(tuple(mutated if original.path == path else original for original in units))
+    call = next(
+        node
+        for node in ast.walk(mutated.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "materialize_cancelled_permit"
+    )
+    assert not _cancelled_permit_caller_is_proven(mutated, call, proof)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("leader.leader_worker_id == worker_id", "leader.leader_worker_id != worker_id"),
+        ("CoordinationToken(binding.run_id, worker_id, leader.leader_epoch)", "CoordinationToken(binding.run_id, worker_id, 1)"),
+        ("self._coordination_repo.acquire_run_leadership", "foreign.acquire_run_leadership"),
+        ("release_seat(token=token)", "release_seat(token=foreign)"),
+        ("pre_effect_guard()", "pass"),
+    ],
+)
+def test_cancelled_permit_internal_seat_edges_require_complete_fresh_authority(finalization_source_units, before, after):
+    path = _RUN_LIFECYCLE_PATH
+    original = next(unit for unit in finalization_source_units if unit.path == path)
+    owner = next(
+        node
+        for node in ast.walk(original.tree)
+        if isinstance(node, ast.FunctionDef) and _symbol(node) == "RunLifecycleRepository.materialize_cancelled_permit"
+    )
+    recipe = ast.get_source_segment(original.source, owner)
+    assert recipe is not None and before in recipe
+    calls = [
+        call
+        for call in ast.walk(owner)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"acquire_run_leadership", "release_seat"}
+    ]
+    assert len(calls) == 2
+    assert all(_cancelled_permit_internal_coordination_call_is_proven(original, call, finalization_source_units) for call in calls)
+    units = _finalization_mutate(finalization_source_units, path, recipe, recipe.replace(before, after, 1))
+    changed = next(unit for unit in units if unit.path == path)
+    calls = [
+        call
+        for call in ast.walk(changed.tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and _symbol(call) == "RunLifecycleRepository.materialize_cancelled_permit"
+        and call.func.attr in {"acquire_run_leadership", "release_seat"}
+    ]
+    assert len(calls) == 2
+    assert not any(_cancelled_permit_internal_coordination_call_is_proven(changed, call, units) for call in calls)
 
 
 def test_finalization_registry_mutation_removes_every_writer_grant(finalization_source_units):
@@ -9162,7 +10117,7 @@ def test_finalization_complete_production_graph_and_writer_grants():
     units = _production_units()
     findings = _deadline_finalization_caller_violations(units)
     assert not findings, findings
-    assert len(_proven_coordination_deadline_writers(units)) == 12
+    assert len(_proven_coordination_deadline_writers(units)) == 13
 
 
 @pytest.mark.parametrize(
@@ -10051,6 +11006,204 @@ def _deadline_issuance_violations(units: tuple[SourceUnit, ...]) -> tuple[str, .
     return tuple(violations)
 
 
+# These two modules jointly prove the permit subject: the owned frozen binding,
+# exact nominal validation, equality refusal before the fence, and the complete
+# reset/admission statements. This grants only binding.run_id equivalence; all
+# ordinary fence, first-effect and exact-connection checks still run.
+_RUN_START_SUBJECT_RECIPES = {
+    "src/elspeth/contracts/run_start.py": '''
+"""Immutable cross-store admission identity; never execution authority."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class RunStartPermitBinding:
+    """Bind a Landscape run to the exact Sessions-issued permit subject."""
+
+    run_id: str
+    permit_id: str
+    permit_epoch: int
+    subject_hash: str
+
+    def __post_init__(self) -> None:
+        for value in (self.run_id, self.permit_id):
+            if type(value) is not str or not value.strip():
+                raise ValueError("run and permit identities must be nonblank strings")
+        if type(self.permit_epoch) is not int or self.permit_epoch < 1:
+            raise ValueError("permit_epoch must be a positive exact integer")
+        if (
+            type(self.subject_hash) is not str
+            or len(self.subject_hash) != 64
+            or any(c not in "0123456789abcdef" for c in self.subject_hash)
+        ):
+            raise ValueError("permit subject must be a lowercase SHA256 digest")
+''',
+    "src/elspeth/core/landscape/run_start_admission.py": '''
+"""Landscape-owned immutable permit binding and pre-effect admission state.
+
+Observation never returns a coordination token. A successor must obtain its
+own Landscape leadership before advancing a prepared admission.
+"""
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+from sqlalchemy import Connection, delete, select, update
+
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.run_start import RunStartPermitBinding
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.schema import (
+    checkpoints_table,
+    edges_table,
+    node_states_table,
+    nodes_table,
+    operations_table,
+    preflight_results_table,
+    rows_table,
+    run_sources_table,
+    run_start_admissions_table,
+    secret_resolutions_table,
+    sink_effects_table,
+)
+
+
+class RunStartAdmissionState(StrEnum):
+    PREPARED = "prepared"
+    EXECUTING = "executing"
+
+
+@dataclass(frozen=True, slots=True)
+class RunStartAdmission:
+    binding: RunStartPermitBinding
+    state: RunStartAdmissionState
+
+
+class RunStartAdmissionRepository:
+    """Write admission only with the Landscape leader's authority."""
+
+    def __init__(self, db: LandscapeDB) -> None:
+        self._db = db
+
+    @staticmethod
+    def observe_on(conn: Connection, binding: RunStartPermitBinding) -> RunStartAdmission | None:
+        if type(binding) is not RunStartPermitBinding:
+            raise TypeError("run admission requires an exact RunStartPermitBinding")
+        row = conn.execute(select(run_start_admissions_table).where(run_start_admissions_table.c.run_id == binding.run_id)).one_or_none()
+        if row is None:
+            return None
+        actual = RunStartPermitBinding(row.run_id, row.permit_id, row.permit_epoch, row.subject_hash)
+        if actual != binding:
+            raise AuditIntegrityError("Run UUID is bound to a different start permit")
+        return RunStartAdmission(binding=actual, state=RunStartAdmissionState(row.state))
+
+    def observe(self, binding: RunStartPermitBinding) -> RunStartAdmission | None:
+        with self._db.engine.connect() as conn:
+            return self.observe_on(conn, binding)
+
+    def reset_prepared_initialization(self, binding: RunStartPermitBinding, *, coordination_token: CoordinationToken) -> None:
+        """Rebuild setup metadata only after independently proving no effects."""
+        if coordination_token.run_id != binding.run_id:
+            raise AuditIntegrityError("Admission and Landscape authority belong to different runs")
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="run-start-reset-prepared",
+        ) as conn:
+            admission = self.observe_on(conn, binding)
+            if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+                raise AuditIntegrityError("Only a prepared admission can restart initialization")
+            for table in (rows_table, node_states_table, operations_table, sink_effects_table):
+                if conn.execute(select(table.c.run_id).where(table.c.run_id == binding.run_id).limit(1)).first() is not None:
+                    raise AuditIntegrityError("Prepared initialization contains execution evidence")
+            if (
+                conn.execute(
+                    select(checkpoints_table.c.run_id)
+                    .where(
+                        checkpoints_table.c.run_id == binding.run_id,
+                        (checkpoints_table.c.sequence_number != 0) | checkpoints_table.c.barrier_scalars_json.is_not(None),
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            ):
+                raise AuditIntegrityError("Prepared initialization contains an execution checkpoint")
+            if (
+                conn.execute(
+                    select(run_sources_table.c.run_id)
+                    .where(
+                        run_sources_table.c.run_id == binding.run_id,
+                        run_sources_table.c.lifecycle_state != "ready",
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            ):
+                raise AuditIntegrityError("Prepared initialization contains an activated source")
+            conn.execute(delete(checkpoints_table).where(checkpoints_table.c.run_id == binding.run_id))
+            conn.execute(delete(edges_table).where(edges_table.c.run_id == binding.run_id))
+            conn.execute(delete(run_sources_table).where(run_sources_table.c.run_id == binding.run_id))
+            conn.execute(delete(nodes_table).where(nodes_table.c.run_id == binding.run_id))
+            conn.execute(delete(preflight_results_table).where(preflight_results_table.c.run_id == binding.run_id))
+            conn.execute(delete(secret_resolutions_table).where(secret_resolutions_table.c.run_id == binding.run_id))
+
+    def mark_executing(self, binding: RunStartPermitBinding, *, coordination_token: CoordinationToken) -> None:
+        if coordination_token.run_id != binding.run_id:
+            raise AuditIntegrityError("Admission and Landscape authority belong to different runs")
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="run-start-effects",
+        ) as conn:
+            admission = self.observe_on(conn, binding)
+            if admission is None:
+                raise AuditIntegrityError("Run has no durable start admission")
+            if admission.state is RunStartAdmissionState.PREPARED:
+                conn.execute(
+                    update(run_start_admissions_table)
+                    .where(run_start_admissions_table.c.run_id == binding.run_id)
+                    .values(state="executing")
+                )
+''',
+}
+
+
+@cache
+def _run_start_subject_sources_are_proven(units: tuple[SourceUnit, ...]) -> bool:
+    for path, recipe in _RUN_START_SUBJECT_RECIPES.items():
+        found = [unit for unit in units if unit.path == path]
+        if len(found) != 1 or stable_ast_dump(found[0].tree) != stable_ast_dump(ast.parse(recipe)):
+            return False
+    return not _deadline_dependency_mutation_violations(
+        units,
+        frozenset(
+            {
+                "elspeth.contracts.run_start.RunStartPermitBinding",
+                "elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository",
+            }
+        ),
+    )
+
+
+def _run_start_bound_subjects(node: ast.FunctionDef | ast.AsyncFunctionDef, units: tuple[SourceUnit, ...]) -> frozenset[str]:
+    if (
+        _resolver_for_node(node).unit.path == "src/elspeth/core/landscape/run_start_admission.py"
+        and _symbol(node)
+        in {
+            "RunStartAdmissionRepository.mark_executing",
+            "RunStartAdmissionRepository.reset_prepared_initialization",
+        }
+        and _run_start_subject_sources_are_proven(units)
+    ):
+        return frozenset({"binding.run_id"})
+    return frozenset()
+
+
 def _pre_admission_helper_effect_violations(units: tuple[SourceUnit, ...]) -> tuple[str, ...]:
     """Do not hide clock reads before admission.
 
@@ -10061,6 +11214,7 @@ def _pre_admission_helper_effect_violations(units: tuple[SourceUnit, ...]) -> tu
     """
     proof = _AuthorityProof(units)
     memo: dict[int, bool] = {}
+    established = _proven_coordination_deadline_writers(units)
 
     def executes_database(call, resolver, seen):
         if resolver.qualified_name(call.func, use=call) in {
@@ -10072,6 +11226,14 @@ def _pre_admission_helper_effect_violations(units: tuple[SourceUnit, ...]) -> tu
         if called is None:
             return False
         function, helper_resolver = called
+        if (
+            function.name in {"acquire_run_leadership", "acquire_export_leadership", "acquire_reconciliation_leadership", "admit_follower"}
+            and (helper_resolver.unit.path, _symbol(function)) in established
+        ):
+            # Exact establishment recipes prove these APIs own their separate
+            # begin_write transaction. Connection-taking clock helpers receive
+            # no such delegation and remain effects of their caller.
+            return False
         if _fenced_contexts(function) and _function_fence_violation(function) is None:
             # The ordinary owner check proves this callee's own transaction.
             # Its pre-admission helper calls are checked when this sweep visits
@@ -10333,7 +11495,7 @@ def _transaction_order_violations(
 
     def fenced_owner_edge_violation(helper_key: tuple[str, str], caller_key: tuple[str, str]) -> str | None:
         caller = index[caller_key]
-        caller_violation = _function_fence_violation(caller)
+        caller_violation = _function_fence_violation(caller, bound_run_subjects=_run_start_bound_subjects(caller, unit_list))
         if caller_violation is not None:
             return f"is not fenced: {caller_violation}"
         fenced_context = _fenced_contexts(caller)[0]
@@ -10484,7 +11646,7 @@ def _transaction_order_violations(
             if reason is not None:
                 violations.append(f"{path}:{symbol} {reason}")
             continue
-        violation = _function_fence_violation(node)
+        violation = _function_fence_violation(node, bound_run_subjects=_run_start_bound_subjects(node, unit_list))
         if violation is not None:
             violations.append(f"{path}:{symbol} {violation}")
     return tuple(violations)
@@ -10574,7 +11736,7 @@ _ESTABLISHMENT_HELPER_SYMBOLS: dict[str, frozenset[tuple[str, str]]] = {
             ),
             (
                 "src/elspeth/core/landscape/run_coordination_repository.py",
-                "RunCoordinationRepository._acquire_export_leadership_on",
+                "RunCoordinationRepository._acquire_terminal_leadership_on",
             ),
             (
                 "src/elspeth/core/landscape/run_coordination_repository.py",
@@ -10611,6 +11773,15 @@ _ESTABLISHMENT_HELPER_SYMBOLS: dict[str, frozenset[tuple[str, str]]] = {
         }
     ),
 }
+
+
+_ESTABLISHMENT_HELPER_SYMBOLS["reconciliation-seat-claim"] = frozenset(
+    (
+        _ESTABLISHMENT_HELPER_SYMBOLS["export-seat-claim"]
+        - {("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership")}
+    )
+    | {("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_reconciliation_leadership")}
+)
 
 
 def _establishment_live_write_counts(
@@ -15384,6 +16555,7 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
         "existing-run-leadership-claim",
         "follower-membership-admission",
         "export-seat-claim",
+        "reconciliation-seat-claim",
     )
     assert sum(item.temporary for item in _AUTHORITY_ESTABLISHMENTS) == 1
     exception = _FRESH_EPOCH_ONE_EXCEPTION
@@ -15398,6 +16570,7 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
     )
     assert exception.write_counts == (
         ("run_attributions", "insert", 1),
+        ("run_start_admissions", "insert", 1),
         ("run_coordination", "insert", 1),
         ("run_coordination", "update", 1),
         ("run_coordination_events", "insert", 2),
@@ -15417,7 +16590,7 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
 
 def test_landscape_mutation_api_inventory_is_literal_complete_and_cardinality_one() -> None:
     units = _production_units()
-    assert len(_MUTATION_APIS) == 88
+    assert len(_MUTATION_APIS) == 91
     assert Counter(api.category for api in _MUTATION_APIS) == Counter(_EXPECTED_API_CATEGORY_COUNTS)
     assert len({(api.path, api.symbol) for api in _MUTATION_APIS}) == len(_MUTATION_APIS)
 
@@ -16897,24 +18070,30 @@ def other_member(c: RunLifecycleCoordinator):
     assert _callback_fixture_admitted(_callback_fixture_units(extra_source=source))
 
 
-def test_actual_six_release_calls_still_have_proven_authority():
-    units = tuple(
-        _parse_source(
-            f"src/elspeth/engine/orchestrator/{name}.py", (_repo_root() / f"src/elspeth/engine/orchestrator/{name}.py").read_text()
-        )
-        for name in ("core", "run_lifecycle")
-    )
-    unit = units[1]
+def test_actual_lifecycle_release_calls_have_proven_authority():
+    units = _production_units()
+    unit = next(unit for unit in units if unit.path == "src/elspeth/engine/orchestrator/run_lifecycle.py")
     calls = [
         part
         for part in ast.walk(unit.tree)
         if isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute) and part.func.attr == "release_seat"
     ]
-    assert len(calls) == 6
+    assert Counter(_symbol(call) for call in calls) == {
+        "RunLifecycleCoordinator.initialize_database_phase": 1,
+        "RunLifecycleCoordinator.run": 10,
+    }
     proof = _AuthorityProof(units)
+    resolver = _resolver_for_unit(unit)
     for call in calls:
-        token = next(keyword.value for keyword in call.keywords if keyword.arg == "token")
-        assert proof.expression(token, _owner_function(call), _resolver_for_unit(unit), call, _LEADER_SCOPE)
+        arguments = _exact_keyword_arguments(call)
+        assert arguments is not None and set(arguments) == {"token"}, f"line {call.lineno}: release must bind only its exact token"
+        owner = _owner_function(call)
+        use = call
+        if owner is None:
+            context = _closed_release_callback_context(call, resolver, proof)
+            assert context is not None, f"line {call.lineno}: release callback must be immediate and source-proven"
+            owner, use = context
+        assert proof.expression(arguments["token"], owner, resolver, use, _LEADER_SCOPE), f"line {call.lineno}: release token is unproven"
 
 
 def test_returned_carrier_and_twohop_authority_extended_controls():
@@ -17334,3 +18513,599 @@ def test_finalization_graph_actual_missing_finalizer_calls_are_rejected(method):
     violations = _deadline_finalization_caller_violations(tuple(changed))
     assert any("caller set incomplete: " + method in finding for finding in violations)
     assert not _proven_coordination_deadline_writers(tuple(changed))
+
+
+@pytest.mark.parametrize(
+    "loop",
+    [
+        "for table in (nodes_table, edges_table):\n        conn.execute(delete(table))",
+        "tables = (nodes_table, edges_table)\n    for table in tables:\n        conn.execute(delete(table))",
+        "for table in (nodes_table, edges_table):\n        table = other_table\n        conn.execute(delete(table))",
+        "for table in (nodes_table, edges_table):\n        alias = table\n        conn.execute(delete(alias))",
+    ],
+)
+def test_dml_inventory_refuses_unresolved_loop_table_targets(loop: str) -> None:
+    unit = _parse_source(
+        "src/elspeth/core/landscape/loop_probe.py",
+        "from sqlalchemy import delete\n"
+        "from elspeth.core.landscape.schema import nodes_table, edges_table\n"
+        "def clear(conn, other_table):\n    " + loop + "\n",
+    )
+    with pytest.raises(InventoryScanError, match="unresolved loop DML table"):
+        scan_dml_identities([unit])
+
+
+def test_dml_inventory_keeps_explicit_loop_target_classified() -> None:
+    unit = _parse_source(
+        "src/elspeth/core/landscape/loop_probe.py",
+        "from sqlalchemy import delete\n"
+        "from elspeth.core.landscape.schema import nodes_table\n"
+        "def clear(conn, run_ids):\n"
+        "    for run_id in run_ids:\n"
+        "        conn.execute(delete(nodes_table).where(nodes_table.c.run_id == run_id))\n",
+    )
+    identities = scan_dml_identities([unit])
+    assert [(site.table, site.operation) for site in identities] == [("nodes", "delete")]
+
+
+def _prepared_callback_fixture_units(before=None, after=None):
+    prepared = """            if run_start_permit is None:
+                token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=1)
+            else:
+                leader = factory.run_coordination.live_leader(run_id=run.run_id)
+                if leader is not None and leader.leader_worker_id == worker_id:
+                    token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=leader.leader_epoch)
+                else:
+                    token = factory.run_coordination.acquire_run_leadership(run_id=run.run_id, worker_id=worker_id, window_seconds=80, entry_point="prepared-restart")
+"""
+
+    def edit(source):
+        source = source.replace(
+            "def initialize_database_phase(self, db, run_id):", "def initialize_database_phase(self, db, run_id, run_start_permit=None):"
+        )
+        source = source.replace("leader_worker_id=worker_id)", "leader_worker_id=worker_id, run_start_permit=run_start_permit)")
+        source = source.replace("            token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=1)\n", prepared)
+        if before is not None:
+            assert before in source
+            source = source.replace(before, after)
+        return source
+
+    repository = """from elspeth.contracts.coordination import CoordinationToken
+class RunCoordinationRepository:
+    def live_leader(self, *, run_id):
+        return None
+    def acquire_run_leadership(self, *, run_id, worker_id, window_seconds, entry_point):
+        return self._acquire_run_leadership_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds, entry_point=entry_point)
+    def _acquire_run_leadership_on(self, conn, *, run_id, worker_id, window_seconds, entry_point):
+        epoch = int(seat.leader_epoch) + 1
+        return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=epoch)
+"""
+    factory = """from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+class RecorderFactory:
+    def __init__(self, db):
+        self.run_coordination = RunCoordinationRepository()
+"""
+    return (
+        *_callback_fixture_units(producer_edit=edit),
+        _parse_source("src/elspeth/core/landscape/run_coordination_repository.py", repository),
+        _parse_source("src/elspeth/core/landscape/factory.py", factory),
+    )
+
+
+def test_prepared_callback_proves_all_three_token_origins():
+    assert _callback_fixture_admitted(_prepared_callback_fixture_units())
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("leader.leader_worker_id == worker_id", "leader.leader_worker_id != worker_id"),
+        ("leader_epoch=leader.leader_epoch", "leader_epoch=1"),
+        ("leader_epoch=leader.leader_epoch", "leader_epoch=foreign.leader_epoch"),
+        ("live_leader(run_id=run.run_id)", "live_leader(run_id=foreign)"),
+        ("run_start_permit is None", "run_start_permit is not None"),
+        ("run_start_permit=run_start_permit", "run_start_permit=foreign"),
+        ("acquire_run_leadership(run_id=run.run_id", "acquire_run_leadership(run_id=foreign"),
+        ("token = factory.run_coordination.acquire_run_leadership", "token = unknown.acquire_run_leadership"),
+        ("return factory, run, token", "token = forged\n        return factory, run, token"),
+        ("return factory, run, token", "object.__setattr__(token, 'leader_epoch', 99)\n        return factory, run, token"),
+    ],
+)
+def test_prepared_callback_refuses_broken_subject_or_origin(before, after):
+    assert not _callback_fixture_admitted(_prepared_callback_fixture_units(before, after))
+
+
+def _release_callback_fixture(*, consumer_edit=None, dispatcher_edit=None):
+    consumer = """from elspeth.contracts.coordination import CoordinationToken
+from elspeth.engine.orchestrator.authority_guard import CallerAuthorityGuard
+def consume(token: CoordinationToken):
+    guard = CallerAuthorityGuard(None)
+    guard.release_on_loss(lambda: factory.run_coordination.release_seat(token=token))
+"""
+    dispatcher = """class CallerAuthorityGuard:
+    def __init__(self, callback):
+        self._callback = callback
+        self._failure = None
+    def release_on_loss(self, release):
+        if self._failure is not None:
+            release()
+            raise self._failure
+"""
+    if consumer_edit is not None:
+        before, after = consumer_edit
+        assert before in consumer
+        consumer = consumer.replace(before, after)
+    if dispatcher_edit is not None:
+        before, after = dispatcher_edit
+        assert before in dispatcher
+        dispatcher = dispatcher.replace(before, after)
+    unit = _parse_source("src/elspeth/example.py", consumer)
+    units = (unit, _parse_source("src/elspeth/engine/orchestrator/authority_guard.py", dispatcher))
+    proof = _AuthorityProof(units)
+    call = next(
+        part
+        for part in ast.walk(unit.tree)
+        if isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute) and part.func.attr == "release_seat"
+    )
+    resolver = _resolver_for_unit(unit)
+    context = _closed_release_callback_context(call, resolver, proof)
+    return context is not None and proof.expression(call.keywords[0].value, context[0], resolver, context[1], _LEADER_SCOPE)
+
+
+def test_release_callback_proves_immediate_owned_dispatch():
+    assert _release_callback_fixture()
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        ("lambda:", "lambda ignored=None:"),
+        ("token=token", "token=forged"),
+        ("guard.release_on_loss", "unknown.release_on_loss"),
+        ("    guard.release_on_loss", "    guard = unknown\n    guard.release_on_loss"),
+        ("    guard.release_on_loss", "    guard.release_on_loss = unknown\n    guard.release_on_loss"),
+        (
+            "    guard.release_on_loss(lambda: factory.run_coordination.release_seat(token=token))",
+            "    callback = lambda: factory.run_coordination.release_seat(token=token)\n    guard.release_on_loss(callback)",
+        ),
+    ],
+)
+def test_release_callback_refuses_escaping_or_rebound_consumer(edit):
+    assert not _release_callback_fixture(consumer_edit=edit)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        ("            release()", "            save(release)"),
+        ("            release()", "            release()\n            release()"),
+        ("    def release_on_loss", "    @decorate\n    def release_on_loss"),
+        ("            release()", "            release = unknown\n            release()"),
+    ],
+)
+def test_release_callback_refuses_changed_dispatcher(edit):
+    assert not _release_callback_fixture(dispatcher_edit=edit)
+
+
+def _temporal_receiver_fixture(before=None, after=None):
+    source = """from dataclasses import dataclass
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+@dataclass(frozen=True)
+class Snapshot:
+    repo: RunCoordinationRepository
+def acquire(snapshot: Snapshot):
+    return snapshot.repo.acquire_run_leadership(run_id=run_id, worker_id=worker_id, window_seconds=80, entry_point="resume")
+def caller():
+    snapshot = Snapshot(repo=RunCoordinationRepository())
+    token = acquire(snapshot)
+    try:
+        snapshot = unknown()
+    except Exception:
+        raise
+    repository.release_seat(token=token)
+"""
+    if before is not None:
+        assert before in source
+        source = source.replace(before, after)
+    unit = _parse_source("src/elspeth/temporal_receiver.py", source)
+    repository = _prepared_callback_fixture_units()[2]
+    proof = _AuthorityProof((unit, repository))
+    call = next(
+        part
+        for part in ast.walk(unit.tree)
+        if isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute) and part.func.attr == "release_seat"
+    )
+    return proof.expression(call.keywords[0].value, _owner_function(call), _resolver_for_unit(unit), call, _LEADER_SCOPE)
+
+
+def test_immediate_receiver_argument_captures_prior_frozen_value():
+    assert _temporal_receiver_fixture()
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("    token = acquire(snapshot)", "    snapshot = unknown()\n    token = acquire(snapshot)"),
+        ("    token = acquire(snapshot)", "    if condition:\n        snapshot = unknown()\n    token = acquire(snapshot)"),
+        ("    token = acquire(snapshot)", "    for item in items:\n        token = acquire(snapshot)"),
+        ("    token = acquire(snapshot)", "    def deferred():\n        return acquire(snapshot)\n    token = deferred()"),
+        (
+            "    token = acquire(snapshot)",
+            "    def mutate():\n        nonlocal snapshot\n        snapshot = unknown()\n    token = acquire(snapshot)",
+        ),
+        ("    repository.release_seat(token=token)", "    token = unknown()\n    repository.release_seat(token=token)"),
+        ("@dataclass(frozen=True)", "@dataclass(frozen=False)"),
+        ("    try:\n        snapshot = unknown()", "    try:\n        for item in items:\n            snapshot = unknown()"),
+    ],
+)
+def test_temporal_receiver_argument_refuses_prior_or_deferred_mutation(before, after):
+    assert not _temporal_receiver_fixture(before, after)
+
+
+@pytest.mark.parametrize(
+    "handler,admitted",
+    [
+        ("return", True),
+        ("raise", True),
+        ("if stop:\n            return\n        else:\n            raise", True),
+        ("pass", False),
+        ("if stop:\n            return", False),
+    ],
+)
+def test_authority_origin_handler_must_leave_owner_before_use(handler, admitted):
+    source = "def owner():\n    try:\n        token = acquire()\n    except Refused:\n        " + handler + "\n    release(token)\n"
+    unit = _parse_source("src/elspeth/handler_control.py", source)
+    owner = unit.tree.body[0]
+    call = owner.body[-1].value
+    origin = _authority_binding_origin("token", owner, call)
+    assert (origin is not None) is admitted
+
+
+def test_fresh_epoch_one_refuses_unguarded_idempotent_begin_run():
+    def edit(source):
+        source = source.replace(
+            "def initialize_database_phase(self, db, run_id):", "def initialize_database_phase(self, db, run_id, run_start_permit=None):"
+        )
+        return source.replace("leader_worker_id=worker_id)", "leader_worker_id=worker_id, run_start_permit=run_start_permit)")
+
+    assert not _callback_fixture_admitted(_callback_fixture_units(producer_edit=edit))
+
+
+def test_fresh_epoch_one_accepts_explicit_no_permit_creation():
+    def edit(source):
+        return source.replace("leader_worker_id=worker_id)", "leader_worker_id=worker_id, run_start_permit=None)")
+
+    assert _callback_fixture_admitted(_callback_fixture_units(producer_edit=edit))
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("worker_id = mint_worker_id(run_id)", "worker_id = 'old-worker'"),
+        ("mint_worker_id(run_id)", "mint_worker_id(foreign_run_id)"),
+        (
+            "from elspeth.contracts.coordination import CoordinationToken, mint_worker_id",
+            "from elspeth.contracts.coordination import CoordinationToken\nfrom foreign import mint_worker_id",
+        ),
+        (
+            "def initialize_database_phase(self, db, run_id, run_start_permit=None):",
+            "def initialize_database_phase(self, db, run_id, worker_id, run_start_permit=None):",
+        ),
+    ],
+)
+def test_prepared_callback_requires_new_owned_worker_mint(before, after):
+    assert not _callback_fixture_admitted(_prepared_callback_fixture_units(before, after))
+
+
+def test_prepared_callback_refuses_replaced_observation_reader():
+    units = _prepared_callback_fixture_units()
+    replacement = _parse_source(
+        "src/elspeth/replace_reader.py",
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\nRunCoordinationRepository.live_leader = unknown\n",
+    )
+    assert not _callback_fixture_admitted((*units, replacement))
+
+
+def test_prepared_callback_refuses_foreign_observation_receiver():
+    units = _prepared_callback_fixture_units()
+    factory = units[-1]
+    changed = _parse_source(
+        factory.path, factory.source.replace("from elspeth.core.landscape.run_coordination_repository import", "from foreign import")
+    )
+    assert not _callback_fixture_admitted((*units[:-1], changed))
+
+
+def _captured_tuple_fixture(before=None, after=None):
+    def edit(source):
+        source = source.replace(
+            "        factory.run_coordination.release_seat(token=coordination_token)",
+            "        def effect():\n            factory.run_coordination.release_seat(token=coordination_token)\n        effect()",
+        )
+        if before is not None:
+            assert before in source
+            source = source.replace(before, after)
+        return source
+
+    return _callback_fixture_units(consumer_edit=edit)
+
+
+def test_nested_effect_captures_proven_callback_tuple_token():
+    assert _callback_fixture_admitted(_captured_tuple_fixture())
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("def effect():", "def effect(coordination_token):"),
+        ("def effect():", "def effect(*coordination_token):"),
+        ("def effect():", "def effect(**coordination_token):"),
+        ("        effect()", "        coordination_token = unknown\n        effect()"),
+        ("        def effect():", "        object.__setattr__(coordination_token, 'leader_epoch', 99)\n        def effect():"),
+        ("        def effect():", "        def effect():\n            nonlocal coordination_token"),
+        ("        def effect():", "        def effect():\n            global coordination_token"),
+        (
+            "        effect()",
+            "        def mutate():\n            nonlocal coordination_token\n            coordination_token = unknown\n        effect()",
+        ),
+        ("        factory, run, coordination_token = initialize_database_phase(db, run_id)\n", ""),
+    ],
+)
+def test_nested_effect_rejects_shadowed_missing_or_mutated_tuple_token(before, after):
+    assert not _callback_fixture_admitted(_captured_tuple_fixture(before, after))
+
+
+def test_nested_effect_declaration_must_follow_tuple_binding():
+    units = _captured_tuple_fixture()
+    unit = units[0]
+    assignment = "        factory, run, coordination_token = initialize_database_phase(db, run_id)\n"
+    changed = unit.source.replace(assignment, "").replace("        effect()", assignment + "        effect()")
+    assert not _callback_fixture_admitted((_parse_source(unit.path, changed), *units[1:]))
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "            match unknown():\n                case coordination_token:\n                    factory.run_coordination.release_seat(token=coordination_token)",
+        "            try:\n                unknown()\n            except Exception as coordination_token:\n                factory.run_coordination.release_seat(token=coordination_token)",
+        "            def coordination_token():\n                pass\n            factory.run_coordination.release_seat(token=coordination_token)",
+        "            import foreign as coordination_token\n            factory.run_coordination.release_seat(token=coordination_token)",
+    ],
+)
+def test_nested_effect_rejects_non_name_local_binding(replacement):
+    original = "            factory.run_coordination.release_seat(token=coordination_token)"
+    assert not _callback_fixture_admitted(_captured_tuple_fixture(original, replacement))
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "        match unknown():\n            case coordination_token:\n                effect()",
+        "        try:\n            unknown()\n        except Exception as coordination_token:\n            effect()",
+        "        def coordination_token():\n            pass\n        effect()",
+        "        import foreign as coordination_token\n        effect()",
+    ],
+)
+def test_nested_effect_rejects_non_name_outer_binding(replacement):
+    assert not _callback_fixture_admitted(_captured_tuple_fixture("        effect()", replacement))
+
+
+@pytest.mark.parametrize("statement", ["exec(code)", "eval(code)", "from foreign import *", "locals()[name] = forged"])
+@pytest.mark.parametrize("scope", ["local", "outer"])
+def test_nested_effect_rejects_unknown_namespace_bindings(statement, scope):
+    if scope == "local":
+        before = "        def effect():"
+        after = before + "\n            " + statement
+    else:
+        before = "        effect()"
+        after = "        " + statement + "\n" + before
+    assert not _callback_fixture_admitted(_captured_tuple_fixture(before, after))
+
+
+@pytest.mark.parametrize("kind", ["definition", "import", "match", "except"])
+@pytest.mark.parametrize("subject", ["worker_id", "run", "factory", "leader", "run_start_permit", "token"])
+def test_prepared_authority_rejects_hidden_subject_rebinding(subject, kind):
+    if subject == "worker_id":
+        before = "            worker_id = mint_worker_id(run_id)\n"
+        indentation = "            "
+        prefix = before
+        suffix = ""
+    elif subject == "leader":
+        before = "                if leader is not None and leader.leader_worker_id == worker_id:"
+        indentation = "                "
+        prefix = ""
+        suffix = before
+    elif subject == "token":
+        before = "        return factory, run, token"
+        indentation = "        "
+        prefix = ""
+        suffix = before
+    else:
+        before = "            if run_start_permit is None:"
+        indentation = "            "
+        prefix = ""
+        suffix = before
+    if kind == "definition":
+        injected = f"{indentation}def {subject}():\n{indentation}    pass\n"
+    elif kind == "import":
+        injected = f"{indentation}import foreign as {subject}\n"
+    elif kind == "match":
+        injected = f"{indentation}match unknown():\n{indentation}    case {subject}:\n{indentation}        pass\n"
+    else:
+        injected = f"{indentation}try:\n{indentation}    unknown()\n{indentation}except Exception as {subject}:\n{indentation}    pass\n"
+    units = _prepared_callback_fixture_units(before, prefix + injected + suffix)
+    assert not _callback_fixture_admitted(units)
+
+
+@pytest.mark.parametrize("statement", ["exec(code)", "eval(code)", "locals()[name] = forged"])
+def test_prepared_authority_rejects_unknown_namespace_mutation(statement):
+    before = "            worker_id = mint_worker_id(run_id)\n"
+    units = _prepared_callback_fixture_units(before, before + "            " + statement + "\n")
+    assert not _callback_fixture_admitted(units)
+
+
+@pytest.mark.parametrize(
+    ("path", "before", "after"),
+    [
+        ("src/elspeth/contracts/run_start.py", "frozen=True", "frozen=False"),
+        (
+            "src/elspeth/core/landscape/run_start_admission.py",
+            "if coordination_token.run_id != binding.run_id:",
+            "if coordination_token.run_id == binding.run_id:",
+        ),
+        (
+            "src/elspeth/core/landscape/run_start_admission.py",
+            'raise AuditIntegrityError("Admission and Landscape authority belong to different runs")',
+            "pass",
+        ),
+        (
+            "src/elspeth/core/landscape/run_start_admission.py",
+            "token=coordination_token,",
+            "token=foreign_token,",
+        ),
+        (
+            "src/elspeth/core/landscape/run_start_admission.py",
+            "row.run_id, row.permit_id, row.permit_epoch, row.subject_hash",
+            "row.run_id, binding.permit_id, row.permit_epoch, row.subject_hash",
+        ),
+        (
+            "src/elspeth/core/landscape/run_start_admission.py",
+            "        with fenced_leader_transaction(",
+            "        self._db.engine.execute(delete(nodes_table))\n        with fenced_leader_transaction(",
+        ),
+    ],
+)
+def test_run_start_subject_proof_refuses_guard_fence_binding_and_immutability_drift(path, before, after):
+    units = tuple(_parse_source(relative, (_repo_root() / relative).read_text()) for relative in _RUN_START_SUBJECT_RECIPES)
+    assert _run_start_subject_sources_are_proven(units)
+    changed = tuple(_parse_source(unit.path, unit.source.replace(before, after)) if unit.path == path else unit for unit in units)
+    assert any(left.source != right.source for left, right in zip(units, changed, strict=True))
+    assert not _run_start_subject_sources_are_proven(changed)
+    for name in ("mark_executing", "reset_prepared_initialization"):
+        key = ("src/elspeth/core/landscape/run_start_admission.py", f"RunStartAdmissionRepository.{name}")
+        original = _function_index(units)[key]
+        assert _function_fence_violation(original, bound_run_subjects=_run_start_bound_subjects(original, units)) is None
+        mutated = _function_index(changed)[key]
+        assert not _run_start_bound_subjects(mutated, changed)
+        assert _function_fence_violation(mutated) is not None
+
+
+def test_run_start_subject_proof_refuses_external_binding_class_mutation():
+    units = tuple(_parse_source(relative, (_repo_root() / relative).read_text()) for relative in _RUN_START_SUBJECT_RECIPES)
+    mutation = _parse_source(
+        "src/elspeth/foreign_binding_mutation.py",
+        "from elspeth.contracts.run_start import RunStartPermitBinding as Binding\nBinding.run_id = 'foreign'\n",
+    )
+    assert _run_start_subject_sources_are_proven(units)
+    assert not _run_start_subject_sources_are_proven((*units, mutation))
+
+
+@pytest.mark.parametrize("fault", [None, "early_clock", "renamed_unproven_factory"])
+def test_reconciliation_establishment_owns_its_pre_admission_transaction(fault):
+    recovery_path = "src/elspeth/web/execution/recovery.py"
+    coordination_path = "src/elspeth/core/landscape/run_coordination_repository.py"
+    units = tuple(unit for unit in _production_units() if unit.path.startswith("src/elspeth/core/landscape/") or unit.path == recovery_path)
+    if fault == "early_clock":
+        altered = []
+        for unit in units:
+            if unit.path == coordination_path:
+                tree = ast.parse(unit.source)
+                owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RunCoordinationRepository")
+                function = next(
+                    node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "acquire_reconciliation_leadership"
+                )
+                function.body.insert(1, ast.parse("read_landscape_decision_time(foreign_conn)").body[0])
+                unit = _parse_source(unit.path, ast.unparse(ast.fix_missing_locations(tree)))
+            altered.append(unit)
+        units = tuple(altered)
+    elif fault == "renamed_unproven_factory":
+        units = tuple(
+            _parse_source(unit.path, unit.source.replace("acquire_reconciliation_leadership", "unreviewed_reconciliation_leadership"))
+            if unit.path in {coordination_path, recovery_path}
+            else unit
+            for unit in units
+        )
+    findings = _pre_admission_helper_effect_violations(units)
+    recovery_findings = tuple(finding for finding in findings if recovery_path in finding)
+    assert bool(recovery_findings) is (fault is not None), findings
+
+
+def _imported_raw_clock_units(*, definition=None, consumer_change="", extra_method=""):
+    definition = definition or "CLOCK = {'sqlite': 'SELECT 1', 'postgresql': 'SELECT clock_timestamp()'}\n"
+    consumer = (
+        "from elspeth.clock_values import CLOCK\n" + consumer_change + "\n"
+        "class Authority:\n"
+        "    def __init__(self, dialect):\n"
+        "        self._clock_sql = CLOCK[dialect]\n"
+        "    def read(self, conn):\n"
+        "        conn.exec_driver_sql(self._clock_sql)\n" + extra_method
+    )
+    return (
+        _parse_source("src/elspeth/clock_consumer.py", consumer),
+        _parse_source("src/elspeth/clock_values.py", definition),
+    )
+
+
+def test_imported_clock_raw_sql_uses_shared_source_dictionary_proof():
+    assert _raw_write_surface_violations(_imported_raw_clock_units()) == ()
+
+
+def test_imported_clock_write_literal_remains_a_raw_write():
+    units = _imported_raw_clock_units(definition="CLOCK = {'sqlite': 'SELECT 1', 'postgresql': 'DELETE FROM runs'}\n")
+    assert any("outside raw SQL write/DDL" in item for item in _raw_write_surface_violations(units))
+
+
+@pytest.mark.parametrize(
+    "definition,consumer_change",
+    [
+        ("CLOCK = {'sqlite': 'SELECT 1'}\nalias = CLOCK\nalias['sqlite'] = 'DELETE FROM runs'", ""),
+        ("CLOCK = {'sqlite': 'SELECT 1'}", "alias = CLOCK\nalias['sqlite'] = 'DELETE FROM runs'"),
+        ("CLOCK = {'sqlite': 'SELECT 1'}", "CLOCK['sqlite'] = 'DELETE FROM runs'"),
+        ("CLOCK = {'sqlite': 'SELECT 1'}", "from elspeth.clock_values import CLOCK as alias\nalias['sqlite'] = 'DELETE FROM runs'"),
+    ],
+)
+def test_imported_clock_dictionary_alias_or_mutation_stays_opaque(definition, consumer_change):
+    units = _imported_raw_clock_units(definition=definition, consumer_change=consumer_change)
+    assert any("outside unknown raw SQL effect" in item for item in _raw_write_surface_violations(units))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "self._clock_sql = runtime_sql",
+        "setattr(self, '_clock_sql', runtime_sql)",
+        "object.__setattr__(self, '_clock_sql', runtime_sql)",
+        "self.__dict__['_clock_sql'] = runtime_sql",
+        "vars(self)['_clock_sql'] = runtime_sql",
+    ],
+)
+def test_imported_clock_runtime_attribute_mutation_stays_opaque(mutation):
+    units = _imported_raw_clock_units(extra_method="    def retarget(self, runtime_sql):\n        " + mutation + "\n")
+    assert any("outside unknown raw SQL effect" in item for item in _raw_write_surface_violations(units))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "authority._clock_sql = runtime_sql",
+        "setattr(authority, '_clock_sql', runtime_sql)",
+        "object.__setattr__(authority, '_clock_sql', runtime_sql)",
+        "authority.__dict__['_clock_sql'] = runtime_sql",
+    ],
+)
+def test_imported_clock_external_consumer_mutation_stays_opaque(mutation):
+    units = _imported_raw_clock_units()
+    consumer = units[0]
+    changed = _parse_source(consumer.path, consumer.source + "\ndef retarget(authority, runtime_sql):\n    " + mutation + "\n")
+    assert any("outside unknown raw SQL effect" in item for item in _raw_write_surface_violations((changed, *units[1:])))
+
+
+def test_actual_ticket_runtime_clock_override_withdraws_read_proof():
+    paths = ("src/elspeth/web/coordination/websocket_ticket_authority.py", "src/elspeth/web/coordination/membership_authority.py")
+    units = tuple(_read_source(_repo_root() / path, anchor=_repo_root()) for path in paths)
+    consumer = units[0]
+    binding = "        self._clock_sql = _DATABASE_CLOCK_SQL[engine.dialect.name]"
+    assert binding in consumer.source
+    changed = _parse_source(consumer.path, consumer.source.replace(binding, binding + '\n        self._clock_sql = "DELETE FROM runs"'))
+    violations = _raw_write_surface_violations((changed, *units[1:]))
+    assert sum("RepositorySessionWebsocketTicketAuthority.issue" in item and "raw SQL" in item for item in violations) == 1
+    assert sum("RepositorySessionWebsocketTicketAuthority.consume" in item and "raw SQL" in item for item in violations) == 1

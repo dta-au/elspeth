@@ -44,7 +44,8 @@ def test_epoch_is_thirty_eight() -> None:
     # Database time ties inside a SQLite second and inside a PostgreSQL
     # transaction, so (recorded_at, event_id) replayed in hash order and two
     # identical same-second transitions collided on the old primary key.
-    assert SQLITE_SCHEMA_EPOCH == 38
+    # Epoch 39 binds recoverable web starts to immutable permit subjects.
+    assert SQLITE_SCHEMA_EPOCH == 39
 
 
 def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:

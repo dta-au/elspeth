@@ -21,8 +21,14 @@ affinity and 2–4 replicas with one web process per replica. External PostgreSQ
 provides single-use tickets and durable run-event replay on authorized peer
 reconnect, renewable Composer request leases with saved progress and current
 inflight accounting, and shared budgets for auth, writes and Composer/execution
-work. An interrupted provider request is not automatically resumed. Dead-owner
-recovery does not imply transparent run handoff. Verification is limited to
+work. An interrupted provider request is not automatically resumed. Automatic
+run handoff covers durable admission, permit-bound PREPARED initialization and
+eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
+effects, incomplete sources and identity/compatibility failures remain
+`recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
+Integrated verification is recorded in the
+[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+Evidence remains limited to
 local PostgreSQL mechanism and integration evidence, with no cloud receipt or
 no-affinity deployment qualification. The legacy v2 P4b receipt remains
 conservative `cannot_pass`; it does not measure the new runtime capabilities.
@@ -68,7 +74,7 @@ A successful install has:
   `/api/health` and `/api/ready`;
 - both databases (`elspeth_sessions`, `elspeth_landscape`) on one Flexible
   Server behind a private endpoint, one schema-owner role and one runtime role,
-  session epoch 54 and Landscape epoch 38 initialized;
+  session epoch 54 and Landscape epoch 39 initialized;
 - one NFS 4.1 Azure Files share mounted at `/mnt/elspeth` on the app and every
   Job with `data`, `data/blobs` and `payloads` owned `1654:1654`. SMB Azure
   Files is not supported for this target; **Azure Files carries no database**

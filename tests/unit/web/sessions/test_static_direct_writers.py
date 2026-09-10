@@ -2084,6 +2084,30 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 # ``_REVIEWED_ALLOWLIST`` above.
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
+    ReviewedWriter(
+        path="tests/testcontainer/web/test_cross_process_run_control_postgres.py",
+        enclosing_symbol="_prepare",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="PostgreSQL admission race fixture: one version-1 session_seed parent row before spawned run contenders start.",
+        count=1,
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_durable_run_admission.py",
+        enclosing_symbol="_admission",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Durable admission fixture: one version-1 session_seed parent row before authority-owned pending run creation.",
+        count=1,
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/execution/test_durable_websocket_ticket.py",
+        enclosing_symbol="seed_ticket_run",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Ticket authority fixture: one version-1 session_seed FK parent for the real run whose authorization is exercised.",
+        count=1,
+    ),
     # ------ FK-parent setup rows: a run needs a composition_state ------
     # ``runs.composition_state_id`` is a FK to ``composition_states``, so a
     # test that needs a live/completed run to exercise a blob guard has to

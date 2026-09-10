@@ -15,6 +15,7 @@ schedule coroutines on the main event loop from the background thread.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 import traceback
@@ -24,7 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
-from pathlib import PurePath
+from pathlib import Path, PurePath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from uuid import UUID
@@ -41,11 +42,12 @@ from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
 from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.enums import NodeStateStatus, RunStatus, is_llm_authored_creation_modality
-from elspeth.contracts.errors import GracefulShutdownError
+from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
+from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -58,8 +60,10 @@ from elspeth.core.blobs_inline import (
     _resolve_blob_content_results,
     _substitute_blob_content_refs,
 )
+from elspeth.core.checkpoint.recovery import NonResumableRunError, RecoveryManager, check_source_lifecycle_resumable
 from elspeth.core.config import load_bounded_pipeline_yaml
 from elspeth.core.events import EventBus
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_lifecycle_repository import is_valid_sha256_hex
 from elspeth.core.landscape.schema import node_states_table
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -90,7 +94,7 @@ from elspeth.web.blobs.protocol import (
 from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
-from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
 from elspeth.web.execution.accounting import load_run_accounting_from_db
@@ -100,6 +104,19 @@ from elspeth.web.execution.completion_gates import (
     parse_completion_gates,
 )
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
+from elspeth.web.execution.envelope import (
+    ExecutionEnvelope,
+    ExecutionEnvelopeRefused,
+    RestoredExecutionEnvelope,
+    RetainedBlobInput,
+    build_run_execution_input,
+    capture_execution_envelope,
+    discover_execution_blob_inputs,
+    read_cancelled_execution_envelope,
+    restore_execution_envelope,
+    runtime_implementation_fingerprint,
+    validate_run_execution_input,
+)
 from elspeth.web.execution.errors import (
     BlobRowsSourceAdmissionError,
     BlobSourcePathMismatchError,
@@ -127,6 +144,7 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.progress import BroadcastResult, ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService, FrozenRunSettings, StateAccessError, YamlGenerator
+from elspeth.web.execution.retained_inputs import read_retained_input, retain_execution_inputs, retain_source_bytes
 from elspeth.web.execution.schemas import (
     CHECK_PROOF_DIAGNOSTICS,
     VALIDATION_CHECK_NAMES,
@@ -557,7 +575,7 @@ def _structural_frame_path(filename: str) -> str:
     """
     parts = PurePath(filename).parts
     if _FRAME_PACKAGE_ROOT in parts:
-        # Last occurrence: for ``/home/x/elspeth/src/elspeth/web/...`` it is
+        # Last occurrence: for ``/opt/project/elspeth/src/elspeth/web/...`` it is
         # the package directory, not the checkout, that names the module.
         start = len(parts) - 1 - parts[::-1].index(_FRAME_PACKAGE_ROOT)
         parts = parts[start:]
@@ -874,6 +892,7 @@ class ExecutionServiceImpl:
         operator_profile_registry: OperatorProfileRegistry | None,
         web_plugin_policy: WebPluginPolicy | None,
         catalog: CatalogService,
+        principal_is_active: Callable[[str], bool] | None = None,
         _composition_root: object | None = None,
     ) -> None:
         trained_operator_mode = _composition_root is _TRAINED_OPERATOR_COMPOSITION_ROOT
@@ -899,6 +918,7 @@ class ExecutionServiceImpl:
         self._web_plugin_policy = web_plugin_policy
         self._catalog = catalog
         self._trained_operator_mode = trained_operator_mode
+        self._principal_is_active = principal_is_active
         # AC #17: No run_repository — all Run CRUD delegates to SessionService
         # via create_run(), update_run_status(), get_active_run(), get_run().
         # R6 expanded params: landscape_run_id, pipeline_yaml, rows_processed,
@@ -920,7 +940,7 @@ class ExecutionServiceImpl:
         # crashes loudly at ``_run_pipeline`` rather than silently
         # dropping the audit field.
         self._openrouter_catalog_sha256: str | None = None
-        self._openrouter_catalog_source: str | None = None
+        self._openrouter_catalog_source: Literal["live", "bundled"] | None = None
 
     @classmethod
     def for_trained_operator(cls, **kwargs: Any) -> ExecutionServiceImpl:
@@ -1181,7 +1201,7 @@ class ExecutionServiceImpl:
         if source not in ("live", "bundled"):
             raise RuntimeError(f"openrouter_catalog_source must be 'live' or 'bundled', got {source!r}")
         self._openrouter_catalog_sha256 = sha256
-        self._openrouter_catalog_source = source
+        self._openrouter_catalog_source = cast(Literal["live", "bundled"], source)
 
     def _call_async(self, coro: Coroutine[Any, Any, T]) -> T:
         """Bridge an async call from the background thread to the main event loop.
@@ -1319,6 +1339,7 @@ class ExecutionServiceImpl:
                 self._signal_shutdown_on_operation_loss(
                     session_operation_lease,
                     prepared.shutdown_event,
+                    run_id=prepared.run_id,
                 ),
                 name=f"execution-operation-loss-{prepared.run_id}",
             )
@@ -1332,6 +1353,7 @@ class ExecutionServiceImpl:
                     prepared.user_id,
                     prepared.auth_provider_type,
                     session_operation_lease=session_operation_lease,
+                    durable_admission=True,
                 )
             except BaseException as exc:
                 loss_watcher.cancel()
@@ -1794,6 +1816,51 @@ class ExecutionServiceImpl:
             profiled_s3_audit_identities=policy_result.profiled_s3_audit_identities,
             profiled_textract_audit_identities=policy_result.profiled_textract_audit_identities,
         )
+        frozen_run_settings, retained_inputs = await run_sync_in_worker(
+            retain_execution_inputs,
+            frozen_run_settings,
+            root=Path(self._settings.data_dir) / "retained-run-inputs",
+        )
+        retained_blobs: list[RetainedBlobInput] = []
+        for reference in discover_execution_blob_inputs(frozen_run_settings):
+            if self._blob_service is None:
+                raise RuntimeError("Durable blob input admission requires the blob service")
+            blob = await self._blob_service.get_blob(reference.blob_id, session_operation_context=session_operation_context)
+            if blob.session_id != session_id:
+                raise BlobNotFoundError(str(reference.blob_id))
+            if blob.status != "ready" or blob.content_hash != reference.content_hash:
+                raise BlobRowsSourceAdmissionError("Durable blob input metadata changed before admission")
+            content = await self._blob_service.read_blob_content(reference.blob_id, session_operation_context=session_operation_context)
+            retained = await run_sync_in_worker(
+                retain_source_bytes,
+                content,
+                original_path=blob.storage_path,
+                root=Path(self._settings.data_dir) / "retained-run-inputs",
+            )
+            retained_blobs.append(
+                RetainedBlobInput(
+                    reference=reference, retained=retained, size_bytes=blob.size_bytes, filename=blob.filename, mime_type=blob.mime_type
+                )
+            )
+            if reference.blob_id not in parsed_blob_ids:
+                parsed_blob_ids.append(reference.blob_id)
+        implementation = await run_sync_in_worker(runtime_implementation_fingerprint, plugin_snapshot)
+        envelope = await run_sync_in_worker(
+            capture_execution_envelope,
+            frozen_run_settings,
+            user_id=user_id,
+            auth_provider_type=auth_provider_type,
+            resolver=self._secret_service,
+            env_ref_names=secret_guard_env_ref_names,
+            implementation_fingerprint=implementation,
+            deployment_generation=implementation,
+            retained_inputs=retained_inputs,
+            blob_inputs=tuple(retained_blobs),
+            openrouter_catalog_sha256=self._openrouter_catalog_sha256,
+            openrouter_catalog_source=self._openrouter_catalog_source,
+            web_plugin_policy_evidence=_build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
+        )
+        execution_input = build_run_execution_input(envelope, frozen_run_settings, implementation, implementation, retained_inputs)
 
         # B9 fix: create_run() generates its own UUID internally and returns
         # a RunRecord. Read the run_id back from the returned record so our
@@ -1804,6 +1871,7 @@ class ExecutionServiceImpl:
             state_id=state_record.id,  # From the record, not the domain object
             pipeline_yaml=pipeline_yaml,
             session_operation_context=session_operation_context,
+            execution_input=execution_input,
         )
         run_id = run_record.id  # Use the DB-generated UUID as canonical
 
@@ -1843,6 +1911,195 @@ class ExecutionServiceImpl:
             auth_provider_type=auth_provider_type,
         )
 
+    async def recover_run(
+        self,
+        run: RunRecord,
+        session_operation_lease: SessionOperationLease,
+        *,
+        resume_existing: bool,
+    ) -> bool:
+        """Rehydrate one admitted run and transfer its renewable web lease."""
+        from elspeth.web.coordination.contracts import RecoveryRequiredReason
+
+        if run.cancel_requested_at is not None:
+            try:
+                await self._materialize_durable_cancellation(run, session_operation_lease)
+            except NonResumableRunError:
+                # A still-live Landscape seat is retryable; do not project it.
+                return False
+            return False
+        session = await self._session_service.get_session(run.session_id)
+        active = self._principal_is_active
+        if session.archived_at is not None or (
+            not self._trained_operator_mode and (active is None or not await run_sync_in_worker(active, session.user_id))
+        ):
+            await run_sync_in_worker(
+                self._session_service.session_operation_authority.mutate,
+                session_operation_lease.context,
+                lambda tx: tx.runs.mark_recovery_required(run_id=run.id, reason=RecoveryRequiredReason.COMPATIBILITY_MISMATCH),
+            )
+            return False
+        try:
+            restored = await self._restore_admitted_run(
+                run,
+                user_id=session.user_id,
+                auth_provider_type=session.auth_provider_type,
+                session_operation_context=session_operation_lease.context,
+            )
+        except ExecutionEnvelopeRefused as exc:
+            await self._record_recovery_refusal(run.id, session_operation_lease, exc)
+            return False
+        shutdown_event = threading.Event()
+        with self._shutdown_events_lock:
+            self._shutdown_events[str(run.id)] = shutdown_event
+        watcher = asyncio.create_task(
+            self._signal_shutdown_on_operation_loss(session_operation_lease, shutdown_event, run_id=run.id),
+            name=f"recovered-execution-control-{run.id}",
+        )
+        assert run.pipeline_yaml is not None
+        try:
+            future = self._executor.submit(
+                self._run_pipeline,
+                str(run.id),
+                run.pipeline_yaml,
+                shutdown_event,
+                restored.settings,
+                session.user_id,
+                session.auth_provider_type,
+                session_operation_lease=session_operation_lease,
+                durable_admission=True,
+                resume_existing=resume_existing,
+                restored_envelope=restored,
+            )
+        except BaseException:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            with self._shutdown_events_lock:
+                del self._shutdown_events[str(run.id)]
+            raise
+        future.add_done_callback(partial(self._on_pipeline_done, session_operation_lease=session_operation_lease, loss_watcher=watcher))
+        return True
+
+    async def _materialize_durable_cancellation(self, run: RunRecord, lease: SessionOperationLease) -> None:
+        from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+        from elspeth.contracts.hashing import CANONICAL_VERSION
+        from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
+        from elspeth.web.coordination.contracts import StartPermitState
+        from elspeth.web.execution.envelope import EnvelopeRecoveryReason
+
+        execution_input = await self._session_service.get_run_execution_input(run.id)
+        if execution_input is None:
+            raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
+        cancellation = read_cancelled_execution_envelope(execution_input)
+        permit = await self._session_service.issue_run_start_permit(run.id, session_operation_context=lease.context)
+        if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
+            return
+        assert permit.permit_id is not None and permit.permit_epoch is not None and permit.subject_hash is not None
+        binding = RunStartPermitBinding(str(run.id), permit.permit_id, permit.permit_epoch, permit.subject_hash)
+
+        def materialize() -> None:
+            with open_landscape_db(self._settings) as db:
+                repositories = RecorderFactory(db)
+                admission = RunStartAdmissionRepository(db).observe(binding)
+                if admission is not None and admission.state is RunStartAdmissionState.EXECUTING:
+                    token = repositories.run_coordination.acquire_run_leadership(
+                        run_id=str(run.id),
+                        worker_id=mint_worker_id(str(run.id)),
+                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                        entry_point="web-durable-cancel",
+                    )
+                    try:
+                        lease.guard_external_effect()
+                        repositories.run_lifecycle.complete_run(RunStatus.INTERRUPTED, coordination_token=token)
+                    finally:
+                        repositories.run_coordination.release_seat(token=token)
+                    return
+                existing = repositories.run_lifecycle.get_run(str(run.id))
+                config = json.loads(existing.settings_json) if existing is not None else deep_thaw(cancellation.audit_safe_config)
+                repositories.run_lifecycle.materialize_cancelled_permit(
+                    binding,
+                    config,
+                    CANONICAL_VERSION,
+                    openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256,
+                    openrouter_catalog_source=cancellation.openrouter_catalog_source,
+                    initiated_by_user_id=cancellation.user_id,
+                    auth_provider_type=cancellation.auth_provider_type,
+                    web_plugin_policy_evidence=cancellation.web_plugin_policy_evidence,
+                    pre_effect_guard=lease.guard_external_effect,
+                )
+
+        await run_sync_in_worker(materialize)
+
+    async def _restore_admitted_run(
+        self,
+        run: RunRecord,
+        *,
+        user_id: str | None,
+        auth_provider_type: str | None,
+        session_operation_context: SessionOperationContext,
+    ) -> RestoredExecutionEnvelope:
+        from elspeth.web.execution.envelope import EnvelopeRecoveryReason
+
+        execution_input = await self._session_service.get_run_execution_input(run.id)
+        if execution_input is None or ExecutionEnvelope(execution_input.envelope_json).digest != execution_input.canonical_input_digest:
+            raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
+        await run_sync_in_worker(validate_run_execution_input, execution_input)
+        snapshot = self._plugin_snapshot_for_user(user_id, operation="run recovery")
+        implementation = await run_sync_in_worker(runtime_implementation_fingerprint, snapshot)
+
+        def verify_blob(item: RetainedBlobInput) -> None:
+            if self._blob_service is None:
+                raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE)
+            try:
+                blob = self._call_async(
+                    self._blob_service.get_blob(item.reference.blob_id, session_operation_context=session_operation_context)
+                )
+            except BlobNotFoundError:
+                raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE) from None
+            if (
+                blob.session_id != run.session_id
+                or blob.status != "ready"
+                or blob.content_hash != item.reference.content_hash
+                or blob.size_bytes != item.size_bytes
+                or blob.filename != item.filename
+                or blob.mime_type != item.mime_type
+            ):
+                raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE)
+
+        return await run_sync_in_worker(
+            restore_execution_envelope,
+            execution_input.envelope_json,
+            current_snapshot=snapshot,
+            user_id=user_id,
+            auth_provider_type=auth_provider_type,
+            resolver=self._secret_service,
+            implementation_fingerprint=implementation,
+            deployment_generation=implementation,
+            blob_verifier=verify_blob,
+        )
+
+    async def _record_recovery_refusal(
+        self, run_id: UUID, session_operation_lease: SessionOperationLease, error: ExecutionEnvelopeRefused
+    ) -> None:
+        from elspeth.web.coordination.contracts import RecoveryRequiredReason
+        from elspeth.web.execution.envelope import EnvelopeRecoveryReason
+
+        if error.reason is EnvelopeRecoveryReason.IMPLEMENTATION_CHANGED:
+            reason = RecoveryRequiredReason.IMPLEMENTATION_DRIFT
+        elif error.reason is EnvelopeRecoveryReason.DEPLOYMENT_CHANGED:
+            reason = RecoveryRequiredReason.GENERATION_DRIFT
+        elif error.reason in (EnvelopeRecoveryReason.SECRET_VERSION_CHANGED, EnvelopeRecoveryReason.SECRET_VERSION_UNAVAILABLE):
+            reason = RecoveryRequiredReason.SECRET_VERSION_UNAVAILABLE
+        elif error.reason is EnvelopeRecoveryReason.SOURCE_UNAVAILABLE:
+            reason = RecoveryRequiredReason.INCOMPLETE_SOURCE
+        else:
+            reason = RecoveryRequiredReason.COMPATIBILITY_MISMATCH
+        await run_sync_in_worker(
+            self._session_service.session_operation_authority.mutate,
+            session_operation_lease.context,
+            lambda tx: tx.runs.mark_recovery_required(run_id=run_id, reason=reason),
+        )
+
     async def _handle_pipeline_submission_failure(
         self,
         run_id: UUID,
@@ -1872,14 +2129,23 @@ class ExecutionServiceImpl:
                 cleanup_exc_class=type(cleanup_err).__name__,
             )
 
-    @staticmethod
     async def _signal_shutdown_on_operation_loss(
+        self,
         session_operation_lease: SessionOperationLease,
         shutdown_event: threading.Event,
+        *,
+        run_id: UUID,
     ) -> None:
-        """Stop the worker as soon as renewal proves EXECUTE authority lost."""
-        await session_operation_lease.wait_until_lost()
-        shutdown_event.set()
+        """Bridge durable cancellation and loss of the exact web owner."""
+        while True:
+            try:
+                await asyncio.wait_for(session_operation_lease.wait_until_lost(), timeout=0.25)
+            except TimeoutError:
+                run = await self._session_service.get_run(run_id)
+                if run.cancel_requested_at is None:
+                    continue
+            shutdown_event.set()
+            return
 
     async def get_status(
         self,
@@ -1895,10 +2161,7 @@ class ExecutionServiceImpl:
             run = run_record
         else:
             run = await self._session_service.get_run(run_id)
-        event_key = str(run_id)
-        with self._shutdown_events_lock:
-            event = self._shutdown_events[event_key] if event_key in self._shutdown_events else None
-        cancel_requested = event is not None and event.is_set() and run.status not in SESSION_TERMINAL_RUN_STATUS_VALUES
+        cancel_requested = run.cancel_requested_at is not None and run.status not in SESSION_TERMINAL_RUN_STATUS_VALUES
         return RunStatusResponse(
             run_id=str(run.id),
             status=run.status,
@@ -2033,28 +2296,19 @@ class ExecutionServiceImpl:
             session.archived_at is None and session.user_id == user.user_id and session.auth_provider_type == self._settings.auth_provider
         )
 
-    async def cancel(self, run_id: UUID) -> None:
-        """Cancel a run via the shutdown Event.
-
-        Active runs: sets the Event, Orchestrator detects during row processing.
-        Pending runs (no Event registered yet): marks the run as cancelled
-        directly via SessionService so _run_pipeline terminates immediately.
-        Terminal runs: no-op (idempotent).
-
-        Async because the pending-run path awaits SessionService (we're in
-        the event loop thread, not the background thread).
-        """
+    async def cancel(self, run_id: UUID, *, user: UserIdentity) -> None:
+        """Persist authenticated intent so any replica can stop the owner."""
+        run = await self._session_service.get_run(run_id)
+        await self._session_service.request_run_cancellation(
+            run_id,
+            session_id=run.session_id,
+            user_id=user.user_id,
+            auth_provider_type=self._settings.auth_provider,
+        )
         with self._shutdown_events_lock:
             event = self._shutdown_events.get(str(run_id))
         if event is not None:
             event.set()
-        else:
-            # A missing local event means this process does not own the EXECUTE
-            # authority required to mutate the run. Terminal reads stay
-            # idempotent; non-terminal cancellation fails closed.
-            run = await self._session_service.get_run(run_id)
-            if run.status not in SESSION_TERMINAL_RUN_STATUS_VALUES:
-                raise RuntimeError("Cannot cancel a non-terminal run without local EXECUTE authority")
 
     # ── Background Thread ──────────────────────────────────────────────
 
@@ -2068,6 +2322,9 @@ class ExecutionServiceImpl:
         auth_provider_type: str | None = None,
         *,
         session_operation_lease: SessionOperationLease,
+        durable_admission: bool = False,
+        resume_existing: bool = False,
+        restored_envelope: RestoredExecutionEnvelope | None = None,
     ) -> _RunPipelineOutcome:
         """Execute a pipeline in the background thread.
 
@@ -2089,11 +2346,48 @@ class ExecutionServiceImpl:
         run_uuid = UUID(run_id)
         session_operation_context = session_operation_lease.context
         sink_effect_gate_passed = False
+        run_start_permit: RunStartPermitBinding | None = None
         try:
             session_operation_lease.guard_external_effect()
+            if durable_admission and restored_envelope is None:
+                admitted_run = self._call_async(self._session_service.get_run(run_uuid))
+                if admitted_run.cancel_requested_at is not None:
+                    self._call_async(self._materialize_durable_cancellation(admitted_run, session_operation_lease))
+                    return None
+                restored_envelope = self._call_async(
+                    self._restore_admitted_run(
+                        admitted_run,
+                        user_id=user_id,
+                        auth_provider_type=auth_provider_type,
+                        session_operation_context=session_operation_context,
+                    )
+                )
+                frozen_run_settings = restored_envelope.settings
+            if durable_admission:
+                from elspeth.web.coordination.contracts import StartPermitState
+
+                permit = self._call_async(
+                    self._session_service.issue_run_start_permit(run_uuid, session_operation_context=session_operation_context)
+                )
+                if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
+                    return None
+                assert permit.permit_id is not None and permit.permit_epoch is not None and permit.subject_hash is not None
+                run_start_permit = RunStartPermitBinding(run_id, permit.permit_id, permit.permit_epoch, permit.subject_hash)
+                from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
+
+                landscape_db = open_landscape_db(self._settings)
+                admission = RunStartAdmissionRepository(landscape_db).observe(run_start_permit)
+                if admission is not None and admission.state is RunStartAdmissionState.PREPARED:
+                    resume_existing = False
+                latest_run = self._call_async(self._session_service.get_run(run_uuid))
+                if latest_run.cancel_requested_at is not None:
+                    shutdown_event.set()
+                if shutdown_event.is_set() and not resume_existing:
+                    self._call_async(self._materialize_durable_cancellation(latest_run, session_operation_lease))
+                    return None
             # Early shutdown check: if cancel()/shutdown() fired before we
             # start setup, skip the expensive LandscapeDB/plugin/graph work.
-            if shutdown_event.is_set():
+            if shutdown_event.is_set() and not resume_existing:
                 self._finalize_output_blobs(
                     run_id,
                     success=False,
@@ -2151,7 +2445,7 @@ class ExecutionServiceImpl:
                 raise TypeError("Pipeline YAML must produce a mapping before sink effect eligibility")
             validate_sink_effect_eligibility_from_raw_config(
                 raw_eligibility_config,
-                purpose=SinkEffectExecutionPurpose.FRESH,
+                purpose=SinkEffectExecutionPurpose.RESUME if resume_existing else SinkEffectExecutionPurpose.FRESH,
             )
             export_settings = validate_landscape_export_settings_from_raw_config(raw_eligibility_config)
             if export_settings.enabled:
@@ -2195,13 +2489,18 @@ class ExecutionServiceImpl:
                         )
                     resolved_dict = cast(dict[str, Any], config_dict)
 
-                if self._secret_service is not None and user_id is not None:
+                runtime_secret_resolver = self._secret_service if restored_envelope is None else restored_envelope.secret_resolver
+                if runtime_secret_resolver is not None and user_id is not None:
                     from elspeth.core.secrets import resolve_secret_refs
 
-                    env_ref_names = {item.name for item in self._secret_service.list_refs(user_id)}
+                    env_ref_names = (
+                        {item.name for item in runtime_secret_resolver.list_refs(user_id)}
+                        if restored_envelope is None
+                        else set(restored_envelope.env_ref_names)
+                    )
                     resolved_dict, resolutions = resolve_secret_refs(
                         resolved_dict,
-                        self._secret_service,
+                        runtime_secret_resolver,
                         user_id,
                         env_ref_names=env_ref_names,
                     )
@@ -2307,6 +2606,9 @@ class ExecutionServiceImpl:
                         async def _read_inline_blob_contents() -> dict[Any, bytes]:
                             async def _read_one(blob_id: UUID) -> bytes:
                                 await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                                if restored_envelope is not None:
+                                    item = next(item for item in restored_envelope.blob_inputs if item.reference.blob_id == blob_id)
+                                    return await run_sync_in_worker(read_retained_input, item.retained)
                                 return await blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
 
                             results = await asyncio.gather(
@@ -2508,14 +2810,19 @@ class ExecutionServiceImpl:
 
             try:
                 session_operation_lease.guard_external_effect()
-                self._call_async(
-                    self._session_service.update_run_status(
-                        run_uuid,
-                        status="running",
-                        landscape_run_id=run_id,
-                        session_operation_context=session_operation_context,
+                current_run = self._call_async(self._session_service.get_run(run_uuid)) if durable_admission else None
+                if current_run is not None and current_run.status == "running":
+                    if current_run.landscape_run_id != run_id:
+                        raise RuntimeError("Recovered run linkage disagrees with its immutable run identity")
+                else:
+                    self._call_async(
+                        self._session_service.update_run_status(
+                            run_uuid,
+                            status="running",
+                            landscape_run_id=run_id,
+                            session_operation_context=session_operation_context,
+                        )
                     )
-                )
             except IllegalRunTransitionError:
                 session_operation_lease.guard_external_effect()
                 current = self._call_async(self._session_service.get_run(run_uuid))
@@ -2548,7 +2855,8 @@ class ExecutionServiceImpl:
             # These are the first durable runtime resources. The exact sink
             # instances have already earned admission above.
             session_operation_lease.guard_external_effect()
-            landscape_db = open_landscape_db(self._settings)
+            if landscape_db is None:
+                landscape_db = open_landscape_db(self._settings)
             session_operation_lease.guard_external_effect()
             payload_store = FilesystemPayloadStore(base_path=self._settings.get_payload_store_path())
 
@@ -2567,9 +2875,13 @@ class ExecutionServiceImpl:
                 if staging_blob_service is None:
                     raise RuntimeError("blob_rows sources require BlobServiceProtocol wiring")
                 for staged_blob_id, expected_ref in admitted_blob_rows:
-                    staged_content = self._call_async(
-                        staging_blob_service.read_blob_content(staged_blob_id, session_operation_context=session_operation_context)
-                    )
+                    if restored_envelope is not None:
+                        item = next(item for item in restored_envelope.blob_inputs if item.reference.blob_id == staged_blob_id)
+                        staged_content = read_retained_input(item.retained)
+                    else:
+                        staged_content = self._call_async(
+                            staging_blob_service.read_blob_content(staged_blob_id, session_operation_context=session_operation_context)
+                        )
                     stored_ref = payload_store.store(staged_content)
                     if stored_ref != expected_ref:
                         raise BlobIntegrityError(str(staged_blob_id), expected=expected_ref, actual=stored_ref)
@@ -2646,7 +2958,7 @@ class ExecutionServiceImpl:
                 )
             else:
                 telemetry_manager = create_telemetry_manager(telemetry_config)
-            checkpoint_manager = CheckpointManager(landscape_db) if checkpoint_config.enabled else None
+            checkpoint_manager = CheckpointManager(landscape_db) if checkpoint_config.enabled or resume_existing else None
 
             orchestrator = Orchestrator(
                 db=landscape_db,
@@ -2666,8 +2978,8 @@ class ExecutionServiceImpl:
             # ``set_openrouter_catalog_snapshot()`` these are ``None`` and
             # the assertions below crash loudly, surfacing the wiring bug
             # rather than silently writing a NULL audit field.
-            catalog_sha = self._openrouter_catalog_sha256
-            catalog_source = self._openrouter_catalog_source
+            catalog_sha = self._openrouter_catalog_sha256 if restored_envelope is None else restored_envelope.openrouter_catalog_sha256
+            catalog_source = self._openrouter_catalog_source if restored_envelope is None else restored_envelope.openrouter_catalog_source
             if catalog_sha is None or catalog_source is None:
                 raise RuntimeError(
                     "ExecutionServiceImpl has no OpenRouter catalog snapshot. "
@@ -2685,30 +2997,54 @@ class ExecutionServiceImpl:
                 )
 
             session_operation_lease.guard_external_effect()
-            result = orchestrator.run(
-                pipeline_config,
-                graph=graph,
-                settings=settings,
-                payload_store=payload_store,
-                audit_export_content_store=audit_export_content_store,
-                audit_export_content_store_resolver=audit_export_content_store_resolver,
-                secret_resolutions=secret_resolution_inputs or None,
-                shutdown_event=shutdown_event,  # B2: NEVER omit this
-                sink_factory=make_policy_bound_sink_factory(
-                    settings,
-                    plugin_snapshot=plugin_snapshot,
-                ),
-                run_id=run_id,
-                initiated_by_user_id=user_id,
-                auth_provider_type=auth_provider_type,
-                openrouter_catalog_sha256=catalog_sha,
-                openrouter_catalog_source=catalog_source,
-                web_plugin_policy_evidence=_build_web_plugin_policy_evidence(
-                    snapshot=plugin_snapshot,
-                    policy=self._web_plugin_policy,
-                ),
-                check_coordination_latch=session_operation_lease.guard_external_effect,
-            )
+            if resume_existing:
+                assert checkpoint_manager is not None
+                if checkpoint_manager.get_latest_checkpoint(run_id) is None:
+                    raise _RunRecoveryRequired(RecoveryRequiredReason.MISSING_BASELINE)
+                lifecycle = check_source_lifecycle_resumable(landscape_db, run_id)
+                if not lifecycle.check.can_resume:
+                    raise _RunRecoveryRequired(RecoveryRequiredReason.INCOMPLETE_SOURCE)
+                recovery = RecoveryManager(landscape_db, checkpoint_manager)
+                resume_point = recovery.get_resume_point(run_id, graph)
+                if resume_point is None:
+                    raise _RunRecoveryRequired(RecoveryRequiredReason.COMPATIBILITY_MISMATCH)
+                result = orchestrator.resume(
+                    resume_point,
+                    pipeline_config,
+                    graph,
+                    payload_store=payload_store,
+                    settings=settings,
+                    shutdown_event=shutdown_event,
+                    pre_effect_guard=session_operation_lease.guard_external_effect,
+                    check_coordination_latch=session_operation_lease.guard_external_effect,
+                )
+            else:
+                result = orchestrator.run(
+                    pipeline_config,
+                    graph=graph,
+                    settings=settings,
+                    payload_store=payload_store,
+                    audit_export_content_store=audit_export_content_store,
+                    audit_export_content_store_resolver=audit_export_content_store_resolver,
+                    secret_resolutions=secret_resolution_inputs or None,
+                    shutdown_event=shutdown_event,  # B2: NEVER omit this
+                    sink_factory=make_policy_bound_sink_factory(
+                        settings,
+                        plugin_snapshot=plugin_snapshot,
+                    ),
+                    run_id=run_id,
+                    initiated_by_user_id=user_id,
+                    auth_provider_type=auth_provider_type,
+                    openrouter_catalog_sha256=catalog_sha,
+                    openrouter_catalog_source=catalog_source,
+                    web_plugin_policy_evidence=_build_web_plugin_policy_evidence(
+                        snapshot=plugin_snapshot,
+                        policy=self._web_plugin_policy,
+                    ),
+                    check_coordination_latch=session_operation_lease.guard_external_effect,
+                    pre_effect_guard=session_operation_lease.guard_external_effect,
+                    run_start_permit=run_start_permit,
+                )
 
             # Orchestrator.run() returns normally ONLY on completion.
             # If shutdown was requested, it raises GracefulShutdownError
@@ -2940,6 +3276,28 @@ class ExecutionServiceImpl:
             # The finally block still retires worker-local resources.
             raise
 
+        except ExecutionEnvelopeRefused as exc:
+            self._call_async(self._record_recovery_refusal(run_uuid, session_operation_lease, exc))
+            return None
+
+        except (NonResumableRunError, _RunRecoveryRequired) as exc:
+            refusal_reason = exc.reason if isinstance(exc, _RunRecoveryRequired) else RecoveryRequiredReason.COMPATIBILITY_MISMATCH
+            if landscape_db is not None:
+                repositories = RecorderFactory(landscape_db)
+                if repositories.run_coordination.live_leader(run_id=run_id) is not None:
+                    return None
+            self._call_async(
+                run_sync_in_worker(
+                    self._session_service.session_operation_authority.mutate,
+                    session_operation_context,
+                    lambda tx: tx.runs.mark_recovery_required(
+                        run_id=run_uuid,
+                        reason=refusal_reason,
+                    ),
+                )
+            )
+            return None
+
         except GracefulShutdownError as gse:
             # Orchestrator detected shutdown during processing and raised
             # after flushing in-progress work. Finalize → status → broadcast.
@@ -2982,6 +3340,20 @@ class ExecutionServiceImpl:
             return _RUN_PIPELINE_GRACEFUL_SHUTDOWN_HANDLED
 
         except BaseException as exc:
+            if durable_admission and isinstance(exc, (SinkEffectCapabilityError, IncompleteSourceResumeError)):
+                reason = (
+                    RecoveryRequiredReason.UNSAFE_EFFECT
+                    if isinstance(exc, SinkEffectCapabilityError)
+                    else RecoveryRequiredReason.INCOMPLETE_SOURCE
+                )
+                self._call_async(
+                    run_sync_in_worker(
+                        self._session_service.session_operation_authority.mutate,
+                        session_operation_context,
+                        lambda tx: tx.runs.mark_recovery_required(run_id=run_uuid, reason=reason),
+                    )
+                )
+                return None
             if not sink_effect_gate_passed and isinstance(exc, SinkEffectCapabilityError):
                 raise
 
@@ -3677,6 +4049,12 @@ class _RunStateProbeOutcome:
 
 type _RunPipelineOutcome = Literal["graceful_shutdown_handled"] | None
 _RUN_PIPELINE_GRACEFUL_SHUTDOWN_HANDLED: Literal["graceful_shutdown_handled"] = "graceful_shutdown_handled"
+
+
+class _RunRecoveryRequired(Exception):
+    def __init__(self, reason: RecoveryRequiredReason) -> None:
+        self.reason = reason
+        super().__init__(reason.value)
 
 
 # Protocol conformance enforcement — mypy verifies ExecutionServiceImpl

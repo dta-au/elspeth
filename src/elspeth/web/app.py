@@ -105,6 +105,7 @@ from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.deployment_profiles import deployment_startup_profile, read_platform_identity, resolve_instance_id
 from elspeth.web.execution.progress import ProgressBroadcaster
+from elspeth.web.execution.recovery import RunRecoveryCoordinator
 from elspeth.web.execution.routes import create_execution_router
 from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
 from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
@@ -114,6 +115,7 @@ from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.external_state_startup import _CONNECT_TIMEOUT_SECONDS
 from elspeth.web.key_derivation import (
     derive_binding_generation_key,
+    derive_rate_limit_key,
     derive_session_token_key,
     derive_user_secret_master_key,
 )
@@ -330,18 +332,13 @@ async def _periodic_orphan_cleanup(
     max_age_seconds: int,
     landscape_url: str | None = None,
     create_tables: bool = True,
+    recovery_coordinator: RunRecoveryCoordinator | None = None,
 ) -> None:
-    """Background task that periodically cancels orphaned runs.
+    """Periodically recover runs whose durable owners have expired.
 
-    Runs orphaned by SIGKILL, OOM, or other unclean termination leave
-    sessions permanently blocked (partial unique index on active runs).
-    Startup cleanup handles the bulk case, but if the server runs for
-    days/weeks without restart, this catches runs orphaned mid-uptime.
-
-    Consults execution_service.get_live_run_ids() to distinguish runs
-    with active executor threads from genuinely orphaned ones. A run
-    is only orphaned if it has no registered shutdown event — age alone
-    is not proof of orphanhood.
+    Production supplies the coordinator, which classifies Landscape truth
+    before any terminal projection. Local worker exclusion avoids reclaiming
+    a thread during its final unwind; durable fences decide replica ownership.
     """
     import structlog
 
@@ -353,7 +350,9 @@ async def _periodic_orphan_cleanup(
         live_run_ids: frozenset[str] = frozenset()
         try:
             live_run_ids = execution_service.get_live_run_ids()
-            if landscape_url is None:
+            if recovery_coordinator is not None:
+                await recovery_coordinator.recover()
+            elif landscape_url is None:
                 cancelled = await session_service.cancel_all_orphaned_runs(
                     max_age_seconds=max_age_seconds,
                     exclude_run_ids=live_run_ids,
@@ -515,9 +514,8 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     slog = structlog.get_logger()
 
-    # Cancel runs orphaned by a previous server crash (D5).
-    # Single-process server: every non-terminal run is orphaned after restart.
-    # No age filter — cancel ALL pending/running runs immediately.
+    # Recovery waits until the executor and current identity policy are wired.
+    # Candidate ownership is decided by durable fences and membership.
     settings: WebSettings = app.state.settings
     state_mode: str = app.state.deployment_state_mode
     create_landscape_tables = state_mode == "sqlite-single"
@@ -531,27 +529,6 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     # best-effort orphan bookkeeping. Do not serve until every stage has a
     # row-authoritative outcome.
     await app.state.blob_service.reconcile_inline_custody_publications()
-    # The startup orphan sweep fails startup on any SQL/IO fault, same as
-    # the inline-custody reconciliation above: a server that cannot settle
-    # orphaned runs would serve sessions still blocked by the active-run
-    # index and Landscape rows pending reconciliation, with no record that
-    # the sweep never ran. The process supervisor retries boot; a fault
-    # transient enough to boot through is transient enough to restart
-    # through.
-    cancelled_runs = await session_service.cancel_all_orphaned_run_records(
-        reason=f"Orphaned by server restart — no active process {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
-    )
-    await _reconcile_pending_landscape_runs(
-        session_service,
-        landscape_url,
-        create_tables=create_landscape_tables,
-    )
-    cancelled = len(cancelled_runs)
-    if cancelled:
-        app.state.sessions_telemetry.orphaned_runs_cancelled_total.add(
-            cancelled,
-            attributes={"source": "startup", "excluded_live_runs": 0},
-        )
 
     # An SSO deployment resolves its IdP endpoints (break-glass override or
     # discovery) and binds the runtime the three /api/auth/sso routes read.
@@ -595,6 +572,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         operator_profile_registry=app.state.operator_profile_registry,
         web_plugin_policy=app.state.web_plugin_policy,
         catalog=app.state.catalog_service,
+        principal_is_active=app.state.principal_is_active,
     )
     app.state.execution_service = execution_service
 
@@ -750,10 +728,18 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         source=catalog_source,
     )
 
-    # Periodic orphan cleanup — catches runs orphaned by SIGKILL/OOM
-    # between restarts. Startup cleanup (above) handles the bulk case;
-    # this catches runs orphaned while the server is still running.
-    # Liveness-aware: excludes runs with active executor threads.
+    recovery_coordinator = RunRecoveryCoordinator(
+        session_service,
+        execution_service,
+        app.state.blob_service,
+        landscape_url=landscape_url,
+        create_tables=create_landscape_tables,
+        landscape_passphrase=settings.landscape_passphrase,
+    )
+    await recovery_coordinator.recover()
+
+    # Recover expired owners throughout process uptime, with the same
+    # coordinator used at startup.
     orphan_task = asyncio.create_task(
         _periodic_orphan_cleanup(
             session_service,
@@ -763,6 +749,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             max_age_seconds=settings.orphan_run_max_age_seconds,
             landscape_url=landscape_url,
             create_tables=create_landscape_tables,
+            recovery_coordinator=recovery_coordinator,
         )
     )
 
@@ -1483,6 +1470,12 @@ def _create_app(
     identity_authority = RepositoryIdentityAuthority(session_engine)
     app.state.identity_authority = identity_authority
 
+    def recovery_principal_is_active(identity_id: str) -> bool:
+        record = identity_authority.read_identity(identity_id=identity_id)
+        return record is not None and record.is_active
+
+    app.state.principal_is_active = recovery_principal_is_active
+
     # --- Auth provider setup ---
     #
     # ORDER: this block now sits AFTER the session engine, because a local
@@ -1670,7 +1663,7 @@ def _create_app(
         app.state.run_progress_reader = RepositoryRunProgressReader(session_engine)
         rate_limit_authority = RepositoryRateLimitAuthority(
             session_engine,
-            signing_key=settings.shareable_link_signing_key.get_secret_value(),
+            signing_key=derive_rate_limit_key(settings.secret_key),
         )
         app.state.rate_limiter = SharedRateLimiter(
             settings.composer_rate_limit_per_minute, authority=rate_limit_authority, scope="composer"

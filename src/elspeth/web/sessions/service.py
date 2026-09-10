@@ -88,7 +88,10 @@ from elspeth.web.composer.telemetry_phase8 import record_interpretation_opt_out
 from elspeth.web.composer.tools import is_blob_store_only_mutation_tool
 from elspeth.web.coordination.contracts import (
     ArchiveManifestRelation,
+    CancellationSource,
     FenceLossReason,
+    RecoveryRequiredReason,
+    RunSagaState,
     SessionOperationContext,
     SessionOperationFenceLost,
     SessionOperationKind,
@@ -102,6 +105,7 @@ from elspeth.web.coordination.repository import (
     _RepositoryMutationState,
     _RepositorySessionMutations,
 )
+from elspeth.web.coordination.run_cancellation_authority import RepositoryRunCancellationAuthority
 from elspeth.web.coordination.run_diagnostics_authority import RepositoryRunDiagnosticsAuditAuthority
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -153,6 +157,7 @@ from elspeth.web.sessions.models import (
     proposal_blob_effect_receipts_table,
     proposal_events_table,
     run_events_table,
+    run_execution_inputs_table,
     runs_table,
     session_operation_fences_table,
     sessions_table,
@@ -266,6 +271,7 @@ from elspeth.web.sessions.protocol import (
     RunDiagnosticsAuditMutationAuthority,
     RunEventRecord,
     RunRecord,
+    RunStartPermitRecord,
     SessionArchiveDisposition,
     SessionCompositionStateCreation,
     SessionForkAuthority,
@@ -305,6 +311,7 @@ if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
     from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedProposalRef, GuidedSession
     from elspeth.web.composer.state import CompositionState, ValidationSummary
+    from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
@@ -9987,6 +9994,7 @@ class SessionServiceImpl:
         pipeline_yaml: str | None = None,
         *,
         session_operation_context: SessionOperationContext,
+        execution_input: RunExecutionInput | None = None,
     ) -> RunRecord:
         """Create a new pending run, enforcing one active run per session (B6).
 
@@ -10016,9 +10024,73 @@ class SessionServiceImpl:
                     state_id=state_id,
                     pipeline_yaml=pipeline_yaml,
                     started_at=now,
+                    execution_input=execution_input,
                 ),
             ),
         )
+
+    async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+        return cast(
+            "RunStartPermitRecord",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.runs.issue_start_permit(run_id=run_id),
+            ),
+        )
+
+    async def request_run_cancellation(
+        self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType
+    ) -> RunRecord:
+        return cast(
+            "RunRecord",
+            await self._run_sync(
+                RepositoryRunCancellationAuthority(self._engine).request,
+                run_id,
+                session_id=session_id,
+                user_id=user_id,
+                auth_provider_type=auth_provider_type,
+            ),
+        )
+
+    async def list_recoverable_run_records(self) -> tuple[RunRecord, ...]:
+        return cast(
+            "tuple[RunRecord, ...]",
+            await self._run_sync(
+                RepositoryGlobalRunRecoveryAuthority(self._engine).list_recoverable_run_records,
+            ),
+        )
+
+    async def get_run_execution_input(self, run_id: UUID) -> RunExecutionInput | None:
+        from elspeth.web.execution.envelope import RunExecutionInput
+
+        def _sync() -> RunExecutionInput | None:
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(run_execution_inputs_table).where(run_execution_inputs_table.c.run_id == str(run_id))
+                ).one_or_none()
+                if row is None:
+                    return None
+                return RunExecutionInput(
+                    schema_version=row.schema_version,
+                    envelope_json=json.dumps(row.envelope, sort_keys=True, separators=(",", ":")),
+                    canonical_input_digest=row.canonical_input_digest,
+                    topology_digest=row.topology_digest,
+                    source_manifest_digest=row.source_manifest_digest,
+                    application_fingerprint=row.application_fingerprint,
+                    plugin_registry_fingerprint=row.plugin_registry_fingerprint,
+                    configuration_fingerprint=row.configuration_fingerprint,
+                    graph_fingerprint=row.graph_fingerprint,
+                    runtime_fingerprint=row.runtime_fingerprint,
+                    implementation_fingerprint=row.implementation_fingerprint,
+                    deployment_generation=row.deployment_generation,
+                    session_epoch=row.session_epoch,
+                    landscape_epoch=row.landscape_epoch,
+                    coordination_protocol=row.coordination_protocol,
+                    automatic_recovery_eligible=row.automatic_recovery_eligible,
+                )
+
+        return cast("RunExecutionInput | None", await self._run_sync(_sync))
 
     async def get_run(self, run_id: UUID) -> RunRecord:
         """Fetch a run by ID. Raises ValueError if not found."""
@@ -13935,6 +14007,12 @@ class SessionServiceImpl:
             error=row.error,
             landscape_run_id=row.landscape_run_id,
             pipeline_yaml=row.pipeline_yaml,
+            cancel_requested_at=self._ensure_utc(row.cancel_requested_at) if row.cancel_requested_at is not None else None,
+            cancellation_source=CancellationSource(row.cancellation_source) if row.cancellation_source is not None else None,
+            saga_state=RunSagaState(row.saga_state),
+            recovery_required_reason=RecoveryRequiredReason(row.recovery_required_reason)
+            if row.recovery_required_reason is not None
+            else None,
         )
 
     def _row_to_run_event_record(self, row: Any) -> RunEventRecord:

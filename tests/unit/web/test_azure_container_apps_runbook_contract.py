@@ -229,7 +229,7 @@ def test_replica_probes_name_their_mechanism_and_run_in_order() -> None:
         "ALTER ROLE elspeth_runtime_a LOGIN;",
         "terminationGracePeriodSeconds: 0",
         "downgrades to `graceful_stop`",
-        "asserts that no `run_start_permits` row exists",
+        "does not measure durable permit admission or handoff",
         "P4b (recorded, cannot pass)",
         "`kill -9 1`",
         "recorded, not used",

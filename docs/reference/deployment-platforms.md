@@ -115,7 +115,10 @@ The supported ACA operating configuration uses `Single` revision mode,
 `sticky` session affinity, 2 to 4 replicas, and one web process per replica.
 PostgreSQL holds both databases; shared NFS holds files, never SQLite.
 Membership and session fences protect concurrent operations and dead-owner
-recovery. This is not a claim of transparent run handoff after owner loss.
+recovery. Automatic handoff is implemented for the bounded transitions below;
+integrated verification is recorded in the
+[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification). This is not
+an unrestricted transparent run handoff claim.
 
 External PostgreSQL now stores single-use WebSocket tickets and durable ordered
 run events, allowing an authorized peer to consume a ticket and replay progress
@@ -130,6 +133,49 @@ it is not a cloud receipt or a no-affinity deployment qualification. Keep the
 Single/sticky configuration. The legacy v2 P4b acceptance receipt remains
 conservative: its `owner_affine` mechanism is `cannot_pass` and does not measure
 these new runtime capabilities. Receipt evolution is explicitly deferred.
+
+### Durable run handoff
+
+Durable admission binds a run UUID and permit to an immutable execution
+envelope. It retains file, `blob_rows` and inline-content input bytes, pinned
+secret versions, and admitted policy evidence so later session edits or source
+file changes cannot silently change the run. Recovery rechecks runtime,
+schema, protocol, source and distribution compatibility before execution.
+
+Central plugin version, source and determinism checks apply to both CLI and
+web resume. The full engine/runtime source and distribution fingerprint is
+bound to the web handoff envelope. Direct CLI resume across engine or
+interpreter drift without a version change remains open in
+`elspeth-f321e3ff21` (closure review, comment 10110); this handoff contract does
+not establish universal CLI resume identity protection.
+
+The implemented automatic transitions cover admission before dispatch,
+permit-bound `PREPARED` initialization with proof that no effects occurred, and
+eligible executing runs with a durable checkpoint. A successor retains the
+same run UUID, obtains fresh web and Landscape authority, and selects the
+latest checkpoint after acquiring leadership. At most one active Landscape
+scheduler leader may own a run; a still-live Landscape seat defers takeover.
+The header becomes `EXECUTING` before plugin initialization or effects, so
+pure-initialization replay applies only to a still-`PREPARED` header.
+Continuous web-ownership checks fence execution after custody loss.
+
+Authenticated peer cancellation is durable. Terminal recovery reconciles
+status, counters, one terminal progress event and output artifacts across
+process crashes. FAILED/INTERRUPTED reconciliation preserves the Landscape
+status through fresh Landscape authority and holds its row lock through web
+and output finalization to exclude concurrent CLI takeover.
+
+Unsafe or ambiguous external effects, incomplete source ingestion, and failed
+identity or compatibility checks require explicit `recovery_required`
+disposition; they do not silently replay work or invent a terminal result.
+Cancellation before a baseline verifies the envelope's digest and identity but
+does not invoke plugins or require current secret, runtime or policy state.
+Retained input objects are content-addressed and fsynced; they currently
+have no automatic pruning policy. These mechanisms have local PostgreSQL
+process-crash evidence and completed default/serial PostgreSQL verification.
+They neither
+resume an interrupted Composer provider request nor promote the frozen v3
+state-engine catalog or legacy acceptance receipts.
 
 ## Kubernetes
 

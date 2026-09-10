@@ -31,12 +31,10 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
-from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, create_autospec, patch
-from uuid import UUID, uuid4
+from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -46,12 +44,12 @@ from elspeth.web.composer import yaml_generator as real_yaml_generator
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.execution.fanout_guard import ExecutionFanoutGuardRequired
+from elspeth.web.execution.fanout_guard import LLM_FANOUT_HIGH_CALL_THRESHOLD, ExecutionFanoutGuardRequired
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
-from elspeth.web.sessions.protocol import CompositionStateRecord, SessionServiceProtocol
+from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.composer.parity.conftest import PARITY_FIXTURES
 
@@ -89,13 +87,10 @@ def _resolve_prompt_template_review(node: dict[str, Any]) -> dict[str, Any]:
     return {**node, "options": options}
 
 
-def _record_from_committed(state: CompositionState, session_id: UUID) -> CompositionStateRecord:
+def _data_from_committed(state: CompositionState) -> CompositionStateData:
     committed = state.to_dict()
     nodes = [_resolve_prompt_template_review(node) if node.get("plugin") == "llm" else node for node in committed["nodes"]]
-    return CompositionStateRecord(
-        id=uuid4(),
-        session_id=session_id,
-        version=1,
+    return CompositionStateData(
         source=None,
         sources=committed["sources"],
         nodes=nodes,
@@ -104,8 +99,6 @@ def _record_from_committed(state: CompositionState, session_id: UUID) -> Composi
         metadata_=committed["metadata"],
         is_valid=True,
         validation_errors=None,
-        created_at=datetime.now(UTC),
-        derived_from_state_id=None,
         composer_meta=None,
     )
 
@@ -138,7 +131,14 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
     committed_data = committed.to_dict()
     for source in committed_data["sources"].values():
         path = Path(source["options"]["path"])
-        source["options"]["path"] = str(parity_env.data_dir / "blobs" / str(session_id) / path.name)
+        admitted_path = parity_env.data_dir / "blobs" / str(session_id) / path.name
+        admitted_path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the separate fanout acknowledgement real with known cardinality.
+        admitted_path.write_text(
+            "color_name,hex\n" + "blue,#0000ff\n" * (LLM_FANOUT_HIGH_CALL_THRESHOLD + 1),
+            encoding="utf-8",
+        )
+        source["options"]["path"] = str(admitted_path)
     committed = CompositionState.from_dict(committed_data)
 
     # The real set_pipeline path persists the profiled multi-query node in
@@ -153,12 +153,21 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
     assert "max_capacity_retry_seconds" not in assess["options"]
 
     app_state = parity_env.app.state
-    record = _record_from_committed(committed, session_id)
-
-    session_service = create_autospec(SessionServiceProtocol, instance=True)
-    session_service.get_active_run.return_value = None
-    session_service.get_current_state.return_value = record
-    session_service.create_run.return_value = SimpleNamespace(id=uuid4())
+    session_service = parity_env.sessions
+    compose_lease = await SessionOperationLease.acquire(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=session_service.session_operation_lease_seconds,
+    )
+    async with compose_lease:
+        record = await session_service.save_composition_state(
+            session_id,
+            _data_from_committed(committed),
+            provenance="session_seed",
+            session_operation_context=compose_lease.context,
+        )
 
     loop = asyncio.get_running_loop()
     service = ExecutionServiceImpl(
@@ -234,4 +243,6 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
         await service.shutdown()
 
     assert isinstance(run_id, UUID)
-    session_service.create_run.assert_awaited_once()
+    admitted_run = await session_service.get_run(run_id)
+    assert admitted_run.state_id == record.id
+    assert await session_service.get_run_execution_input(run_id) is not None

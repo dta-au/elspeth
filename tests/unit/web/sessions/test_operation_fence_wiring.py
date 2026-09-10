@@ -37,6 +37,7 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.execution.envelope import RunExecutionInput
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
@@ -306,9 +307,26 @@ def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
 
 def _resolved_signature(member: Any) -> tuple[tuple[tuple[str, inspect._ParameterKind, Any], ...], Any]:
     signature = inspect.signature(member)
-    hints = typing.get_type_hints(member, include_extras=True)
+    hints = typing.get_type_hints(
+        member,
+        localns={"RunExecutionInput": RunExecutionInput}
+        if member
+        in {
+            sessions_protocol.SessionOperationRunMutations.create_pending_run,
+            coordination_repository._RepositoryRunMutations.create_pending_run,
+        }
+        else None,
+        include_extras=True,
+    )
     parameters = tuple(parameter for parameter in signature.parameters.values() if parameter.name != "self")
-    assert all(parameter.default is inspect.Parameter.empty for parameter in parameters)
+    for parameter in parameters:
+        if parameter.name == "execution_input" and member in {
+            sessions_protocol.SessionOperationRunMutations.create_pending_run,
+            coordination_repository._RepositoryRunMutations.create_pending_run,
+        }:
+            assert parameter.default is None
+        else:
+            assert parameter.default is inspect.Parameter.empty
     return (
         tuple((parameter.name, parameter.kind, hints[parameter.name]) for parameter in parameters),
         hints["return"],
@@ -323,7 +341,17 @@ def _top_level_types(annotation: Any) -> tuple[Any, ...]:
 
 
 def _assert_no_authority_escape(*, owner: type[Any], member_name: str, member: Any) -> None:
-    hints = typing.get_type_hints(member, include_extras=True)
+    hints = typing.get_type_hints(
+        member,
+        localns={"RunExecutionInput": RunExecutionInput}
+        if member
+        in {
+            sessions_protocol.SessionOperationRunMutations.create_pending_run,
+            coordination_repository._RepositoryRunMutations.create_pending_run,
+        }
+        else None,
+        include_extras=True,
+    )
     forbidden_names = {"conn", "connection", "cursor", "engine", "query", "sql", "statement", "transaction", "tx"}
     assert not forbidden_names.intersection(member_name.lower().split("_"))
     for name, annotation in hints.items():
@@ -429,12 +457,41 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         (
             (run_protocol, implementation_types[2]),
             {
+                "issue_start_permit": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    sessions_protocol.RunStartPermitRecord,
+                ),
+                "rebind_run_ownership": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    sessions_protocol.RunSagaState,
+                ),
+                "mark_recovery_outputs_finalized": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    type(None),
+                ),
+                "mark_recovery_required": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("reason", inspect.Parameter.KEYWORD_ONLY, sessions_protocol.RecoveryRequiredReason),
+                    ),
+                    type(None),
+                ),
+                "append_terminal_run_event_once": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("timestamp", inspect.Parameter.KEYWORD_ONLY, datetime),
+                        ("event_type", inspect.Parameter.KEYWORD_ONLY, sessions_protocol.SessionRunEventType),
+                        ("data", inspect.Parameter.KEYWORD_ONLY, Mapping[str, Any]),
+                    ),
+                    RunEventRecord,
+                ),
                 "create_pending_run": (
                     (
                         ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
                         ("state_id", inspect.Parameter.KEYWORD_ONLY, UUID),
                         ("pipeline_yaml", inspect.Parameter.KEYWORD_ONLY, str | None),
                         ("started_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                        ("execution_input", inspect.Parameter.KEYWORD_ONLY, RunExecutionInput | None),
                     ),
                     sessions_protocol.RunRecord,
                 ),

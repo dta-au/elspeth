@@ -2405,7 +2405,10 @@ def test_guided_full_settled_cancellation_replay_failure_does_not_publish_a_fabr
                     json={"operation_id": operation_id, "intent": "Settle before cancellation is observed."},
                 )
             )
-            await asyncio.wait_for(settlement_committed.wait(), timeout=3)
+            # Synchronize on the actual durable settlement. Full-suite worker
+            # contention needs scheduling allowance before injecting cancellation;
+            # the fixture's provider budget is 85 seconds.
+            await asyncio.wait_for(settlement_committed.wait(), timeout=30)
             request_task.cancel()
             await asyncio.sleep(0)
             release_settlement.set()

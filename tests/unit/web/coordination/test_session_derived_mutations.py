@@ -764,3 +764,69 @@ def test_output_reads_fail_closed_on_cross_session_link(engine: Engine) -> None:
     assert inserted is True
     assert duplicate is False
     assert [(link.blob_id, link.run_id, link.direction) for link in links] == [(owned_blob, owned_run, "output")]
+
+
+def test_inline_resolution_exact_retry_preserves_original_receipt(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="inline retry")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    context = _acquire(authority, session_id=session.id)
+    resolutions = (
+        ResolvedBlobContent(
+            field_path="source.options.text",
+            blob_id=blob_id,
+            content_hash="a" * 64,
+            byte_length=3,
+            mime_type="text/plain",
+            encoding="utf-8",
+        ),
+    )
+    first_time = datetime(2026, 1, 1, tzinfo=UTC)
+    authority.mutate(
+        context,
+        lambda tx: tx.blobs.insert_blob_inline_resolutions(run_id=run_id, attempt=1, resolutions=resolutions, resolved_at=first_time),
+    )
+    with engine.connect() as conn:
+        before = conn.execute(select(blob_inline_resolutions_table)).all()
+    authority.release(context)
+    context = _acquire(authority, session_id=session.id)
+    authority.mutate(
+        context,
+        lambda tx: tx.blobs.insert_blob_inline_resolutions(
+            run_id=run_id, attempt=1, resolutions=resolutions, resolved_at=datetime.now(UTC)
+        ),
+    )
+    with engine.connect() as conn:
+        assert conn.execute(select(blob_inline_resolutions_table)).all() == before
+
+
+@pytest.mark.parametrize("changed", ["encoding", "additional_field", "missing_field"])
+def test_inline_resolution_retry_refuses_changed_manifest_without_mutation(engine: Engine, changed: str) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="inline mismatch")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    context = _acquire(authority, session_id=session.id)
+    resolution = ResolvedBlobContent(
+        field_path="source.options.text", blob_id=blob_id, content_hash="a" * 64, byte_length=3, mime_type="text/plain", encoding="utf-8"
+    )
+    authority.mutate(
+        context,
+        lambda tx: tx.blobs.insert_blob_inline_resolutions(
+            run_id=run_id, attempt=1, resolutions=(resolution,), resolved_at=datetime.now(UTC)
+        ),
+    )
+    with engine.connect() as conn:
+        before = conn.execute(select(blob_inline_resolutions_table)).all()
+    if changed == "encoding":
+        retry = (replace(resolution, encoding="latin-1"),)
+    elif changed == "additional_field":
+        retry = (resolution, replace(resolution, field_path="source.options.other"))
+    else:
+        retry = ()
+    with pytest.raises(AuditIntegrityError, match="inline resolution"):
+        authority.mutate(
+            context,
+            lambda tx: tx.blobs.insert_blob_inline_resolutions(run_id=run_id, attempt=1, resolutions=retry, resolved_at=datetime.now(UTC)),
+        )
+    with engine.connect() as conn:
+        assert conn.execute(select(blob_inline_resolutions_table)).all() == before

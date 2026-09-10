@@ -23,7 +23,12 @@ PostgreSQL provides single-use tickets, durable run-event replay on authorized
 peer reconnect, renewable Composer request leases with saved progress and
 current inflight accounting, and shared budgets for auth, writes and
 Composer/execution work. An interrupted provider request is not automatically
-resumed. Dead-owner recovery does not provide transparent run handoff.
+resumed. Automatic run handoff is implemented for durable admission,
+permit-bound PREPARED initialization and eligible checkpoint resume, with
+fresh web and Landscape authority and explicit `recovery_required` exclusions.
+Integrated verification is recorded in the
+[ACA plan](../../docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification); see the
+[handoff contract](../../docs/reference/deployment-platforms.md#durable-run-handoff).
 
 Verification is limited to local PostgreSQL mechanism and integration evidence;
 no cloud receipt or no-affinity deployment qualification is claimed. The legacy

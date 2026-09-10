@@ -594,16 +594,8 @@ class TestResumeCheckpointCurrencyGuard:
         assert exc_info.value.run_id == "run-stored-topo-drift"
         assert checkpoints.rebase_calls == []
 
-    def test_current_checkpoint_and_matching_topology_admitted(self, db: LandscapeDB) -> None:
-        """Positive control: a current, topology-matching point passes the guard.
-
-        Admission is proven by ``rebase_sequence`` being reached (the first
-        mutation after the guard); the resume then fails downstream inside
-        ``reconstruct_resume_state`` on this fixture's bare runs row, which is
-        expected — the guard must refuse stale points without over-blocking
-        current ones.
-        """
-        from elspeth.contracts.errors import AuditIntegrityError
+    def test_current_checkpoint_without_implementation_baseline_refused(self, db: LandscapeDB) -> None:
+        """A matching topology cannot replace the registered implementation baseline."""
         from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
         from elspeth.engine.orchestrator import PipelineConfig
         from tests.fixtures.base_classes import as_sink, as_source
@@ -624,7 +616,7 @@ class TestResumeCheckpointCurrencyGuard:
             latest=_latest_checkpoint("run-current-cp", topology_hash=current_hash),
         )
 
-        with pytest.raises(AuditIntegrityError, match=r"no runtime VAL manifest stored"):
+        with pytest.raises(NonResumableRunError, match="implementation baseline"):
             coordinator.resume(
                 _full_resume_point("run-current-cp", topology_hash=current_hash),
                 cast(Any, config),
@@ -632,4 +624,4 @@ class TestResumeCheckpointCurrencyGuard:
                 payload_store=MockPayloadStore(),
             )
 
-        assert checkpoints.rebase_calls == [7], "a current resume point must be admitted past the guard"
+        assert checkpoints.rebase_calls == []

@@ -22,8 +22,14 @@ affinity and 2–4 replicas with one web process per replica. External PostgreSQ
 provides single-use tickets and durable run-event replay on authorized peer
 reconnect, renewable Composer request leases with saved progress and current
 inflight accounting, and shared budgets for auth, writes and Composer/execution
-work. An interrupted provider request is not automatically resumed. Dead-owner
-recovery does not imply transparent run handoff. Verification is limited to
+work. An interrupted provider request is not automatically resumed. Automatic
+run handoff covers durable admission, permit-bound PREPARED initialization and
+eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
+effects, incomplete sources and identity/compatibility failures remain
+`recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
+Integrated verification is recorded in the
+[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+Evidence remains limited to
 local PostgreSQL mechanism and integration evidence, with no cloud receipt or
 no-affinity deployment qualification.
 
@@ -100,7 +106,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The epoch-54 image (session epoch 54, Landscape epoch 38) in the registry.
+- The epoch-54 image (session epoch 54, Landscape epoch 39) in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -398,7 +404,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
   with the schema-owner URLs and initializes both schemas at session epoch 54
-  and Landscape epoch 38.
+  and Landscape epoch 39.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
   `session_tls`, `landscape_tls`, `payload_store_writable` and
@@ -482,7 +488,7 @@ parity test feeds one corpus through both).
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 54, "landscape_epoch": 38, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 54, "landscape_epoch": 39, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
@@ -579,9 +585,13 @@ tree proves, and overclaiming is a schema violation rather than a convention.
 | probe | action | passing evidence | `mechanism` |
 |---|---|---|---|
 | **P1** concurrent guided ops from two replicas | 20 trials; the same `POST /api/sessions/{id}/guided/respond` fired at `LABEL_A_URL` and `LABEL_B_URL` within 5 ms | per trial exactly one 2xx and one 409 `"Session operation is already active"`; the fence's `operation_epoch` advances by exactly one; exactly one `guided_operations` row; two distinct `owner_instance_id` values across the run | `session_operation_fence` |
-| **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. The receipt asserts that no `run_start_permits` row exists: the table has no writer, and the driver has no code path that could claim one | `session_operation_fence_execute` |
+| **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. This legacy receipt does not measure durable permit admission or handoff; its field set records run-start contention only | `session_operation_fence_execute` |
 | **P4** cross-replica progress | session and run created via `LABEL_A_URL`; status, outputs, messages and a blob written by `rA` read via `LABEL_B_URL` | **P4a (must pass):** all DB-backed state visible from `rB` within one poll interval; blob bytes identical through NFS; terminal status observed on `rB`. **P4b (recorded, cannot pass):** the legacy v2 receipt conservatively retains its owner-affine result and records production sticky sessions; it does not measure the new durable ticket/event replay mechanisms | `postgresql_and_nfs` (P4a); `owner_affine` (P4b) |
 | **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); observe the survivor before and after the session-operation and membership lease deadlines; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `role_revocation_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
+
+P3 retains the legacy receipt's cancellation-shaped oracle; it does not measure
+the new automatic dispatch or checkpoint-resume transitions. A run that takes
+one of those transitions must not be relabelled as satisfying that oracle.
 
 The legacy v2 P4b result remains `cannot_pass` and does not measure the new
 runtime capabilities. Receipt evolution is explicitly deferred; keep its

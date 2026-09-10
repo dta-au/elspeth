@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
     from elspeth.web.composer.pipeline_proposal import PipelineProposal, ProposalBase
+    from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 ChatMessageRole = Literal["user", "assistant", "system", "tool", "audit"]
@@ -2917,6 +2918,10 @@ class RunRecord:
     error: str | None
     landscape_run_id: str | None
     pipeline_yaml: str | None
+    cancel_requested_at: datetime | None = None
+    cancellation_source: CancellationSource | None = None
+    saga_state: RunSagaState = RunSagaState.DRAFT
+    recovery_required_reason: RecoveryRequiredReason | None = None
 
     def __post_init__(self) -> None:
         self._validate_counters()
@@ -3314,6 +3319,23 @@ class SessionOperationInterpretationMutations(Protocol):
 class SessionOperationRunMutations(Protocol):
     """Run mutations available inside one exact EXECUTE operation fence."""
 
+    def issue_start_permit(self, *, run_id: UUID) -> RunStartPermitRecord: ...
+
+    def rebind_run_ownership(self, *, run_id: UUID) -> RunSagaState: ...
+
+    def mark_recovery_outputs_finalized(self, *, run_id: UUID) -> None: ...
+
+    def mark_recovery_required(self, *, run_id: UUID, reason: RecoveryRequiredReason) -> None: ...
+
+    def append_terminal_run_event_once(
+        self,
+        *,
+        run_id: UUID,
+        timestamp: datetime,
+        event_type: SessionRunEventType,
+        data: Mapping[str, Any],
+    ) -> RunEventRecord: ...
+
     def create_pending_run(
         self,
         *,
@@ -3321,6 +3343,7 @@ class SessionOperationRunMutations(Protocol):
         state_id: UUID,
         pipeline_yaml: str | None,
         started_at: datetime,
+        execution_input: RunExecutionInput | None = None,
     ) -> RunRecord: ...
 
     def transition_run_status(
@@ -4571,7 +4594,18 @@ class SessionServiceProtocol(Protocol):
         pipeline_yaml: str | None = None,
         *,
         session_operation_context: SessionOperationContext,
+        execution_input: RunExecutionInput | None = None,
     ) -> RunRecord: ...
+
+    async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord: ...
+
+    async def request_run_cancellation(
+        self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType
+    ) -> RunRecord: ...
+
+    async def get_run_execution_input(self, run_id: UUID) -> RunExecutionInput | None: ...
+
+    async def list_recoverable_run_records(self) -> tuple[RunRecord, ...]: ...
 
     async def get_run(self, run_id: UUID) -> RunRecord: ...
 

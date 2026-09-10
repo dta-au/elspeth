@@ -83,7 +83,14 @@ provides single-use tickets and durable run-event replay on authorized peer
 reconnect, renewable Composer request leases with saved progress and current
 inflight accounting, and shared auth/write/Composer budgets. An interrupted
 provider request is not automatically resumed. P4a covers shared database state
-and files; neither P3 nor desktop acceptance claims transparent run handoff.
+and files. Automatic run handoff is implemented for durable admission,
+permit-bound PREPARED initialization and eligible checkpoint resume, with
+fresh web and Landscape authority. Unsafe effects, incomplete sources and
+identity/compatibility failures remain `recovery_required`. Integrated
+verification is recorded in the
+[ACA plan](../../../../docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification);
+neither P2/P3 nor desktop acceptance measures those
+new transitions or promotes them into the legacy receipt contract.
 Verification of the new mechanisms is limited to local PostgreSQL mechanism
 and integration evidence. There is no cloud receipt or no-affinity deployment
 qualification. Receipt evolution remains deferred: runtime capabilities do

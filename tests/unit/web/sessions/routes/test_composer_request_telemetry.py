@@ -46,7 +46,7 @@ async def _settle_dependency(
     failure: BaseException | None = None,
 ) -> tuple[list[tuple[Any, ...]], _Registry]:
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock())
+    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
     lifecycle: list[tuple[Any, ...]] = []
     token = object()
 
@@ -158,7 +158,7 @@ async def test_metrics_token_pairing_failure_does_not_replace_request_failure(
     from elspeth.web.composer import provider_telemetry
 
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock())
+    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
 
     monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
 
@@ -208,7 +208,7 @@ def test_existing_terminal_counter_also_marks_request_aggregate(monkeypatch: pyt
 @pytest.mark.asyncio
 async def test_request_renews_while_provider_waits_and_stops_after_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock())
+    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
     monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
     monkeypatch.setattr(_helpers, "_COMPOSER_HEARTBEAT_SECONDS", 0.001)
     dependency = cast(
@@ -228,7 +228,9 @@ async def test_request_renews_while_provider_waits_and_stops_after_teardown(monk
 @pytest.mark.asyncio
 async def test_unauthorized_request_never_enters_cluster_inflight(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(side_effect=HTTPException(404)))
+    monkeypatch.setattr(
+        _helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership, side_effect=HTTPException(404))
+    )
     monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
     dependency = _helpers._track_compose_inflight(
         uuid4(), _request("/api/sessions/1/messages"), UserIdentity(user_id="user", username="user")
@@ -245,9 +247,9 @@ async def test_failed_durable_admission_never_opens_metrics_scope(
     failure: BaseException,
 ) -> None:
     registry = _Registry()
-    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock())
+    monkeypatch.setattr(_helpers, "_verify_session_ownership", AsyncMock(spec=_helpers._verify_session_ownership))
     monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
-    monkeypatch.setattr(registry, "start_request", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(registry, "start_request", AsyncMock(spec=_Registry.start_request, side_effect=failure))
     begun: list[str] = []
     monkeypatch.setattr(_helpers, "begin_composer_request_metrics", lambda *, surface: begun.append(surface))
     dependency = _helpers._track_compose_inflight(

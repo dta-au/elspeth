@@ -733,7 +733,7 @@ async def cancel_tutorial_run(
         return TutorialCancelResponse(cancelled=False)
 
     execution_service: ExecutionService = request.app.state.execution_service
-    await execution_service.cancel(active_run.id)
+    await execution_service.cancel(active_run.id, user=user)
     return TutorialCancelResponse(cancelled=True)
 
 

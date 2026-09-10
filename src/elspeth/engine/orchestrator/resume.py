@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts import PipelineRow, ResumedRow, RunStatus
+from elspeth.contracts import PipelineRow, ResumedRow, ResumePoint, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
@@ -74,10 +74,12 @@ from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
 from elspeth.engine.orchestrator.aggregation import check_aggregation_timeouts
+from elspeth.engine.orchestrator.authority_guard import CallerAuthorityGuard
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
 from elspeth.engine.orchestrator.graph_wiring import build_source_id_map, load_edge_map
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
+from elspeth.engine.orchestrator.implementation_compatibility import check_implementation_compatibility
 from elspeth.engine.orchestrator.leader_drain import run_end_of_input_barrier_flush
 from elspeth.engine.orchestrator.outcomes import (
     accumulate_row_outcomes,
@@ -107,7 +109,7 @@ from elspeth.engine.orchestrator.validation import (
 from elspeth.engine.retry import RetryManager
 
 if TYPE_CHECKING:
-    from elspeth.contracts import ResumePoint, SchemaContract
+    from elspeth.contracts import SchemaContract
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.checkpoint import CheckpointManager
     from elspeth.core.checkpoint.recovery import IncompleteTokenSpec, RecoveryManager
@@ -588,6 +590,8 @@ class ResumeCoordinator:
         payload_store: PayloadStore,
         *,
         worker_id: str | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        on_resume_point_refreshed: Callable[[ResumePoint], None] | None = None,
     ) -> ResumeState:
         """Reconstruct state needed to process resumed rows.
 
@@ -635,7 +639,38 @@ class ResumeCoordinator:
         reconstruction_start_time = time.perf_counter()
         coordination_token = self._acquire_resume_leadership(snapshot)
 
+        if pre_effect_guard is not None:
+            try:
+                pre_effect_guard()
+            except BaseException:
+                snapshot.factory.run_coordination.release_seat(token=coordination_token)
+                raise
+
         try:
+            # The previous leader may have advanced its checkpoint between
+            # our advisory read and the CAS. Refresh all source state under
+            # the winning authority, and restore scalars from that same point.
+            if self._checkpoint_manager is None:
+                raise OrchestrationInvariantError("CheckpointManager is required for resume")
+            latest = self._checkpoint_manager.get_latest_checkpoint(snapshot.run_id)
+            if latest is None:
+                raise NonResumableRunError(snapshot.run_id, "checkpoint disappeared before leadership acquisition")
+            if latest.checkpoint_id != resume_point.checkpoint.checkpoint_id:
+                format_check = CheckpointCompatibilityValidator().validate_format_version(latest)
+                if not format_check.can_resume:
+                    assert format_check.reason is not None
+                    raise NonResumableRunError(snapshot.run_id, format_check.reason)
+                if latest.full_topology_hash != resume_point.checkpoint.full_topology_hash:
+                    raise NonResumableRunError(snapshot.run_id, "checkpoint topology changed before leadership acquisition")
+                resume_point = ResumePoint(
+                    checkpoint=latest,
+                    sequence_number=latest.sequence_number,
+                    barrier_scalars=snapshot.recovery._restore_barrier_scalars(latest),
+                )
+            snapshot = self._load_resume_audit_snapshot(resume_point, payload_store, worker_id=snapshot.worker_id)
+            if on_resume_point_refreshed is not None:
+                on_resume_point_refreshed(resume_point)
+
             # Stage 2.5 — compute the work set under acquired leadership.
             # Row outcomes and incomplete tokens can change between a pre-CAS
             # read and acquisition; replaying that stale set duplicates completed
@@ -887,6 +922,8 @@ class ResumeCoordinator:
         payload_store: PayloadStore,
         settings: ElspethSettings | None = None,
         shutdown_event: threading.Event | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
         """Resume a failed run from a checkpoint.
 
@@ -987,6 +1024,13 @@ class ResumeCoordinator:
                 topology_check.reason or "checkpoint topology is incompatible with the current execution graph",
             )
 
+        implementation_check = check_implementation_compatibility(
+            RecorderFactory(self._db, payload_store=payload_store), guarded_run_id, config, graph
+        )
+        if not implementation_check.can_resume:
+            assert implementation_check.reason is not None
+            raise NonResumableRunError(guarded_run_id, implementation_check.reason)
+
         # ---- resume() entry guard, part 3: group satisfiability (spec §8) ----
         # SAME shared implementation as the advisory can_resume() — the
         # check_source_lifecycle_resumable two-surface precedent
@@ -1011,7 +1055,19 @@ class ResumeCoordinator:
         # CAS inside reconstruct_resume_state registers it as the new leader
         # and returns the fencing token on ResumeState.
         resume_worker_id = mint_worker_id(resume_point.checkpoint.run_id)
-        state = self.reconstruct_resume_state(resume_point, payload_store, worker_id=resume_worker_id)
+
+        def accept_current_resume_point(current: ResumePoint) -> None:
+            nonlocal resume_point
+            resume_point = current
+            self._checkpoints.rebase_sequence(current.sequence_number)
+
+        state = self.reconstruct_resume_state(
+            resume_point,
+            payload_store,
+            worker_id=resume_worker_id,
+            pre_effect_guard=pre_effect_guard,
+            on_resume_point_refreshed=accept_current_resume_point,
+        )
         run_id = state.run_id
         factory = state.factory
         coordination_token = state.coordination_token
@@ -1029,6 +1085,7 @@ class ResumeCoordinator:
         _heartbeat: RunHeartbeatThread | None = None
         resume_failure_counter_baseline: ExecutionCounters | None = None
         trace_stack = ExitStack()
+        caller_authority = CallerAuthorityGuard(check_coordination_latch)
 
         try:
             # Startup belongs to the cleanup boundary too: construction or
@@ -1036,6 +1093,12 @@ class ResumeCoordinator:
             _heartbeat = RunHeartbeatThread(factory.run_coordination, member_token=coordination_token.membership)
             _heartbeat.start()
 
+            def check_combined_coordination_latch() -> None:
+                assert _heartbeat is not None
+                _heartbeat.check_and_raise()
+                caller_authority.check()
+
+            check_combined_coordination_latch()
             # The token reaches each fenced collaborator by value (ADR-048 §3).
             schema_contracts_by_source = state.schema_contracts_by_source
             unprocessed_rows = state.unprocessed_rows
@@ -1081,6 +1144,7 @@ class ResumeCoordinator:
             if has_active_scheduler_work:
                 resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
             if not unprocessed_rows and not state.has_restored_barrier_work and not has_active_scheduler_work:
+                check_combined_coordination_latch()
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
 
                 # All rows were processed - complete the run.
@@ -1100,6 +1164,7 @@ class ResumeCoordinator:
                 )
 
             with shutdown_ctx as active_event:
+                check_combined_coordination_latch()
                 # F1: bundle the journal-restore inputs (checkpoint scalars +
                 # batch remap) for the processor's construction-time restore
                 # sweep (BarrierRecoveryCoordinator.restore_from_journal).
@@ -1126,9 +1191,10 @@ class ResumeCoordinator:
                     schema_contracts_by_source=schema_contracts_by_source,
                     shutdown_event=active_event,
                     coordination_token=coordination_token,
-                    check_coordination_latch=_heartbeat.check_and_raise,
+                    check_coordination_latch=check_combined_coordination_latch,
                 )
 
+            check_combined_coordination_latch()
             # 6. Complete the run with reproducibility grade
             # SUCCESS PATH: Must be inside try block so RunFinished is emitted
             # BEFORE the finally block flushes telemetry to exporters.
@@ -1181,6 +1247,7 @@ class ResumeCoordinator:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             if _heartbeat is not None:
                 _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
             with best_effort("Interrupted ceremony on resume graceful shutdown", run_id=run_id):
                 self._ceremony.emit_interrupted_ceremony(
                     run_id, factory, shutdown_exc, resume_start_time, coordination_token=coordination_token
@@ -1195,6 +1262,7 @@ class ResumeCoordinator:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             if _heartbeat is not None:
                 _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
             failed_result = _resume_failure_result_from_baseline(
                 run_id,
                 baseline=resume_failure_counter_baseline,
@@ -1219,6 +1287,7 @@ class ResumeCoordinator:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             if _heartbeat is not None:
                 _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
             with best_effort("Generic failure ceremony on resume", run_id=run_id):
                 self._ceremony.emit_failed_ceremony(run_id, factory, resume_start_time, coordination_token=coordination_token)
                 # Seat hygiene: after the FAILED finalize succeeded.

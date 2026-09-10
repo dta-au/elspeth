@@ -174,6 +174,7 @@ def _insert_run_source(
         )
 
 
+@contextmanager
 def _admit_resume_point(orch: Orchestrator, resume_point: ResumePoint) -> Any:
     """Satisfy the resume() entry guard's read-only checkpoint checks.
 
@@ -190,10 +191,17 @@ def _admit_resume_point(orch: Orchestrator, resume_point: ResumePoint) -> Any:
     manager.get_latest_checkpoint.return_value = resume_point.checkpoint
     orch._checkpoint_manager = manager
     orch._resume_coordinator._checkpoint_manager = manager
-    return patch(
-        "elspeth.engine.orchestrator.resume.CheckpointCompatibilityValidator.validate",
-        return_value=ResumeCheck(can_resume=True),
-    )
+    with (
+        patch(
+            "elspeth.engine.orchestrator.resume.CheckpointCompatibilityValidator.validate",
+            return_value=ResumeCheck(can_resume=True),
+        ),
+        patch(
+            "elspeth.engine.orchestrator.resume.check_implementation_compatibility",
+            return_value=ResumeCheck(can_resume=True),
+        ),
+    ):
+        yield
 
 
 @pytest.mark.parametrize(
@@ -336,6 +344,9 @@ def test_real_payload_restore_failure_releases_reconstruction_seat(damage: str, 
     )
     orch = _make_orchestrator(db)
     recovery = RecoveryManager(db, MagicMock(spec=CheckpointManager))
+    manager = MagicMock(spec=CheckpointManager)
+    manager.get_latest_checkpoint.return_value = checkpoint
+    orch._resume_coordinator._checkpoint_manager = manager
     source_id = NodeID(setup.source_node_id)
     snapshot = _ResumeAuditSnapshot(
         factory=factory,
@@ -1889,6 +1900,7 @@ class TestResumeFinalizesAsFailed:
             checkpoint=checkpoint,
             sequence_number=checkpoint.sequence_number,
         )
+        orch._checkpoint_manager.get_latest_checkpoint.return_value = checkpoint
         orders_contract = MagicMock(spec=SchemaContract, name="orders-contract")
         refunds_contract = MagicMock(spec=SchemaContract, name="refunds-contract")
         mock_factory = MagicMock(spec=RecorderFactory)
@@ -1936,7 +1948,10 @@ class TestResumeFinalizesAsFailed:
         with (
             patch("elspeth.engine.orchestrator.resume.RecorderFactory", return_value=mock_factory),
             patch("elspeth.core.checkpoint.RecoveryManager", return_value=mock_recovery),
-            patch("elspeth.engine.orchestrator.resume.reconstruct_schema_from_json", side_effect=[orders_schema, refunds_schema]),
+            patch(
+                "elspeth.engine.orchestrator.resume.reconstruct_schema_from_json",
+                side_effect=[orders_schema, refunds_schema, orders_schema, refunds_schema],
+            ),
         ):
             state = orch._resume_coordinator.reconstruct_resume_state(resume_point, MockPayloadStore())
 
@@ -1989,6 +2004,7 @@ class TestResumeFinalizesAsFailed:
             checkpoint=checkpoint,
             sequence_number=checkpoint.sequence_number,
         )
+        orch._checkpoint_manager.get_latest_checkpoint.return_value = checkpoint
         source_contract = MagicMock(spec=SchemaContract, name="source-contract")
         mock_factory = MagicMock(spec=RecorderFactory)
         prepare_for_run()

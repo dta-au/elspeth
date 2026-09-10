@@ -61,6 +61,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from typing import Literal
 
 from sqlalchemy import insert, select, update
 from sqlalchemy.engine import Connection
@@ -945,11 +946,12 @@ class RunCoordinationRepository:
         """
         try:
             with begin_write(self._engine) as conn:
-                token = self._acquire_export_leadership_on(
+                token = self._acquire_terminal_leadership_on(
                     conn,
                     run_id=run_id,
                     worker_id=worker_id,
                     window_seconds=window_seconds,
+                    purpose="export",
                 )
                 self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
             return token
@@ -958,13 +960,49 @@ class RunCoordinationRepository:
                 raise
             raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
 
-    def _acquire_export_leadership_on(
+    def acquire_reconciliation_leadership(
+        self,
+        *,
+        run_id: str,
+        worker_id: str,
+        window_seconds: float,
+        expected_status: RunStatus,
+    ) -> CoordinationToken:
+        """Own a terminal projection without changing the engine's status.
+
+        The expected observation is rechecked after locking the leadership
+        seat, before any durable write. Hold a leader-fenced transaction while
+        projecting into another store if an arbitrary pause must not allow a
+        competing resumer to pass an expired lease.
+        """
+        if type(expected_status) is not RunStatus or expected_status.value not in _EXPORT_SEAT_RUN_STATUSES:
+            raise ValueError("Reconciliation requires an exact terminal RunStatus")
+        try:
+            with begin_write(self._engine) as conn:
+                token = self._acquire_terminal_leadership_on(
+                    conn,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    window_seconds=window_seconds,
+                    purpose="reconciliation",
+                    expected_status=expected_status,
+                )
+                self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
+            return token
+        except OperationalError as exc:
+            if not _is_database_locked(exc):
+                raise
+            raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
+
+    def _acquire_terminal_leadership_on(
         self,
         conn: Connection,
         *,
         run_id: str,
         worker_id: str,
         window_seconds: float,
+        purpose: Literal["export", "reconciliation"],
+        expected_status: RunStatus | None = None,
     ) -> CoordinationToken:
         seat = conn.execute(
             select(
@@ -983,6 +1021,10 @@ class RunCoordinationRepository:
             )
         database_now = read_landscape_decision_time(conn)
         run_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one_or_none()
+        if expected_status is not None and run_status != expected_status.value:
+            from elspeth.core.checkpoint.recovery import NonResumableRunError
+
+            raise NonResumableRunError(run_id, "terminal status changed before reconciliation acquired authority")
         if run_status == RunStatus.RUNNING.value:
             from elspeth.core.checkpoint.recovery import NonResumableRunError
 
@@ -1037,7 +1079,7 @@ class RunCoordinationRepository:
                     worker_id=prior_worker,
                     leader_epoch=new_epoch,
                     recorded_at=database_now,
-                    context={"evicted_by_worker_id": worker_id, "reason": "deposed_leader_export_takeover"},
+                    context={"evicted_by_worker_id": worker_id, "reason": f"deposed_leader_{purpose}_takeover"},
                 )
         self._insert_worker_row(
             conn,
@@ -1045,7 +1087,7 @@ class RunCoordinationRepository:
             worker_id=worker_id,
             role="leader",
             window_seconds=window_seconds,
-            entry_point="export",
+            entry_point=purpose,
             database_now=database_now,
         )
         record_coordination_event(
@@ -1055,7 +1097,7 @@ class RunCoordinationRepository:
             worker_id=worker_id,
             leader_epoch=new_epoch,
             recorded_at=database_now,
-            context={"role": "leader", "entry_point": "export"},
+            context={"role": "leader", "entry_point": purpose},
         )
         record_coordination_event(
             conn,
@@ -1064,7 +1106,7 @@ class RunCoordinationRepository:
             worker_id=worker_id,
             leader_epoch=new_epoch,
             recorded_at=database_now,
-            context={"entry_point": "export", "deposed_leader_worker_id": prior_worker},
+            context={"entry_point": purpose, "deposed_leader_worker_id": prior_worker},
         )
         return token
 

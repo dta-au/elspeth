@@ -7,6 +7,7 @@ import time
 from collections.abc import Iterator
 from datetime import timedelta
 from multiprocessing.connection import Connection
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import Engine, select, text, update
@@ -24,10 +25,25 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture
 def ticket_postgres(external_deployment_postgres_url: str) -> Iterator[Engine]:
-    engine = create_session_engine(external_deployment_postgres_url)
-    initialize_session_schema(engine)
-    yield engine
-    engine.dispose()
+    # Ticket-only seeds omit execution fences. Keep those rows out of the
+    # shared database scanned by the global recovery and membership proofs.
+    database = f"ticket_{uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    try:
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+        engine = create_session_engine(
+            make_url(external_deployment_postgres_url).set(database=database).render_as_string(hide_password=False)
+        )
+        try:
+            initialize_session_schema(engine)
+            yield engine
+        finally:
+            engine.dispose()
+            with control.connect() as conn:
+                conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+    finally:
+        control.dispose()
 
 
 def _issue_process(url: str, run_id: str, user: UserIdentity, pipe: Connection) -> None:

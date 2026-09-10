@@ -35,7 +35,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.types import AggregationName
 from elspeth.core.checkpoint.recovery import NonResumableRunError
-from elspeth.core.config import ElspethSettings, SourceSettings, resolve_config
+from elspeth.core.config import ElspethSettings, resolve_config
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
 from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
@@ -43,7 +43,7 @@ from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
-    from elspeth.contracts import SinkProtocol, SourceProtocol
+    from elspeth.contracts import SinkProtocol
     from elspeth.contracts.coordination import WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_context import PluginContext
@@ -2536,7 +2536,7 @@ def _execute_resume_with_instances(
     Args:
         config: Validated ElspethSettings
         graph: Validated ExecutionGraph
-        plugins: Pre-instantiated plugins (with NullSource)
+        plugins: Pre-instantiated original plugins for compatibility validation
         resume_point: Resume point information
         payload_store: Payload store for retrieving row data
         db: LandscapeDB connection (caller owns close lifecycle)
@@ -2577,9 +2577,8 @@ def _build_resume_graphs(
     Returns:
         Tuple of (validation_graph, execution_graph):
         - validation_graph: Uses original source for topology hash matching
-        - execution_graph: Uses the same original topology/source IDs; runtime
-          plugin instances are swapped to NullSource later because resume data
-          comes from stored payloads
+        - execution_graph: Uses the same original topology/source IDs and
+          plugin identities; resume reads row data from stored payloads
     """
     gate_settings = list(settings_config.gates)
     coalesce_settings = list(settings_config.coalesce) if settings_config.coalesce else None
@@ -2588,8 +2587,8 @@ def _build_resume_graphs(
 
     # Both resume graphs use the ORIGINAL source topology to match the topology
     # hash and source node IDs computed during the original run. The runtime
-    # PluginBundle is swapped to NullSource separately before execution; graph
-    # identity must not change just because resume does not reopen sources.
+    # Source instances also remain original for implementation compatibility;
+    # the resume lifecycle does not reopen or invoke those sources.
     execution_sinks = _execution_sinks_for_graph(settings_config, plugins.sinks)
     validation_graph = ExecutionGraph.from_plugin_instances(
         sources=plugins.sources,
@@ -3094,8 +3093,6 @@ def resume(
         # _configure_execution_sinks_for_resume BEFORE admission was issued,
         # so the admission receipt binds the live post-resume mode
         # (elspeth-fc9906e398).
-        from elspeth.plugins.sources.null_source import NullSource
-
         resume_sinks = {}
 
         for sink_name, sink in execution_sinks.items():
@@ -3148,28 +3145,18 @@ def resume(
 
             resume_sinks[sink_name] = sink
 
-        # Override sources with NullSource for resume (data comes from payloads).
-        # Per ADR-025 §2 each named source becomes its own NullSource so the
-        # execution graph mirrors the original source-name set.
+        # Keep original source implementations for the enforcing resume
+        # compatibility check. Resume skips source start/load/cleanup and
+        # obtains rows from persisted payloads, so substitution is unnecessary
+        # and would compare the original audit evidence against another plugin.
         from dataclasses import replace
 
-        from elspeth.core.config import SourceSettings as _SourceSettings
-
-        null_resume_sources: dict[str, SourceProtocol] = {}
-        null_resume_settings: dict[str, SourceSettings] = {}
-        for source_name, original_source in plugins.sources.items():
-            null_source = NullSource({})
-            null_source.on_success = original_source.on_success
-            null_resume_sources[source_name] = null_source
-            null_resume_settings[source_name] = _SourceSettings(plugin="null", on_success=original_source.on_success)
         resume_plugins = replace(
             plugins,
-            sources=null_resume_sources,
-            source_settings_map=null_resume_settings,
             sinks=resume_sinks,  # Use append-mode sinks
         )
 
-        # Execute resume with execution graph (NullSource)
+        # Execute resume from persisted rows with the original plugin evidence.
         from elspeth.contracts.errors import RunWorkerEvictedError
 
         try:
