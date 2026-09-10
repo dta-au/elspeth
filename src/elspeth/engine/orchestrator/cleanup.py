@@ -144,6 +144,7 @@ def cleanup_plugins(
         public_error, error_digest, error_length = _safe_cleanup_error_text(error)
         logger.warning(
             "Plugin cleanup hook failed",
+            run_id=ctx.run_id,
             hook=hook,
             plugin=plugin_name,
             error=public_error,
@@ -238,6 +239,7 @@ def cleanup_plugins(
             # the aggregate and let the original exception continue.
             logger.error(
                 "Plugin cleanup failed during exception propagation; original error preserved",
+                run_id=ctx.run_id,
                 cleanup_errors=tuple(cleanup_errors),
                 pending_error_type=type(pending_exc).__name__,
             )

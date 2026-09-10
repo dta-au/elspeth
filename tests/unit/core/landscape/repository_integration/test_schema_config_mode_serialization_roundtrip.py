@@ -256,6 +256,7 @@ class TestSchemaConfigModeRoundTrip:
             "observed_mode": "observed",
             "declared_locked": True,
             "observed_locked": True,
+            "emitted_index": 0,
         }
 
     def test_batch_flush_aggregate_round_trip_with_pass_through(self) -> None:

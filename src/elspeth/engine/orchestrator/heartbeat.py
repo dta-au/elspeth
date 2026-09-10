@@ -209,10 +209,6 @@ class RunHeartbeatThread:
         self._wait_fn: Callable[[float], bool] = wait_fn if wait_fn is not None else self._stop_event.wait
 
         self._coordination_lost_event = threading.Event()
-        # Stores the eviction reason for the error message raised at the
-        # boundary; written by the heartbeat thread, read by check_and_raise.
-        self._coordination_lost_reason: str = "worker registry row left 'active' (evicted or departed)"
-
         # Fatal-integrity latch (elspeth-d0ce4e12af): a Tier-1 error from
         # worker_heartbeat is corruption, not contention — the beat thread
         # stores it here and check_and_raise() re-raises it at the drain
@@ -386,9 +382,6 @@ class RunHeartbeatThread:
                     self._token.worker_id,
                     self._token.run_id,
                 )
-                self._coordination_lost_reason = (
-                    f"worker {self._token.worker_id!r} registry row left 'active' (evicted or departed at finalize)"
-                )
                 self._coordination_lost_event.set()
                 return
 
@@ -406,7 +399,6 @@ class RunHeartbeatThread:
                     self._token.worker_id,
                     self._token.run_id,
                 )
-                self._coordination_lost_reason = f"seat taken by {snapshot.leader_worker_id!r} (our worker_id={self._token.worker_id!r})"
                 self._coordination_lost_event.set()
                 return
 

@@ -327,6 +327,16 @@ class TestSanitizeFilename:
         result = sanitize_filename(long_name)
         assert len(result.encode("utf-8")) <= 200
 
+    def test_oversized_suffix_stays_within_byte_cap(self) -> None:
+        result = sanitize_filename("report." + "x" * 250)
+        assert result
+        assert len(result.encode("utf-8")) <= 200
+
+    def test_oversized_unicode_suffix_stays_within_byte_cap(self) -> None:
+        result = sanitize_filename("report." + "é" * 200)
+        assert result
+        assert len(result.encode("utf-8")) <= 200
+
 
 # ---------------------------------------------------------------------------
 # content_hash — audit integrity

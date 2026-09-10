@@ -1522,6 +1522,7 @@ class SchemaConfigFieldMetadataMismatch(TypedDict):
 class SchemaConfigModePayload(TypedDict):
     """Audit payload for ADR-014 schema-mode/runtime-semantic mismatches."""
 
+    emitted_index: Required[int]
     declared_mode: Required[str]
     observed_mode: Required[str]
     declared_locked: Required[bool]

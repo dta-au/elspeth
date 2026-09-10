@@ -327,8 +327,8 @@ def sanitize_filename(filename: str) -> str:
         # Preserve the extension
         stem = Path(sanitized).stem
         suffix = Path(sanitized).suffix
-        max_stem = 200 - len(suffix.encode("utf-8"))
-        sanitized = stem.encode("utf-8")[:max_stem].decode("utf-8", errors="ignore") + suffix
+        suffix = suffix.encode("utf-8")[:200].decode(errors="ignore") if len(suffix.encode("utf-8")) >= 200 else suffix
+        sanitized = stem.encode("utf-8")[: 200 - len(suffix.encode("utf-8"))].decode(errors="ignore") + suffix
     return sanitized
 
 

@@ -1186,7 +1186,7 @@ class TestResumeFinalizesAsFailed:
         )
         run_ctx = SimpleNamespace(
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_id=processor.run_id),
             agg_transform_lookup={},
             coalesce_executor=None,
             coalesce_node_map={},
@@ -1245,7 +1245,7 @@ class TestResumeFinalizesAsFailed:
         )
         run_ctx = SimpleNamespace(
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_id=processor.run_id),
             agg_transform_lookup={},
             coalesce_executor=None,
             coalesce_node_map={},
