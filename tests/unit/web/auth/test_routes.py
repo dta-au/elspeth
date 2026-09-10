@@ -24,7 +24,7 @@ from elspeth.web.auth.routes import LoginRequest, RegisterRequest, create_auth_r
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 
-from .conftest import build_local_auth_provider
+from .conftest import build_local_auth_provider, saturated_worker_pool
 
 # What every IdP profile requires of a deployment, whichever one is selected.
 # ``WebSettings`` refuses a non-local provider that is missing any of them, so
@@ -600,6 +600,48 @@ class TestRegisterEndpoint:
             retry_response = await client.post("/api/auth/verify-email", json={"token": token})
 
         assert retry_response.status_code == 200
+
+    async def test_a_saturated_worker_pool_at_register_is_a_503_not_an_outbox_failure(self, tmp_path) -> None:
+        """The refusal must name the pool, not the disk.
+
+        ``AsyncWorkerAdmissionTimeoutError`` subclasses ``TimeoutError`` and
+        therefore ``OSError``, so before its own arm existed it was caught by
+        the ``except OSError`` that reports a failed outbox write -- sending
+        the operator to diagnose a disk that is fine, during exactly the
+        incident (pool saturation) that the SSO offloads make reachable.
+
+        This asserts BOTH halves: the status is 503, and the detail is not the
+        outbox message. Asserting only the status would still pass if the arm
+        were deleted and the outbox handler's message were changed to 503.
+        """
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        app = _create_test_app(provider, registration_mode="email_verified", data_dir=tmp_path)
+
+        async with _client_for(app) as client, saturated_worker_pool():
+            response = await client.post(
+                "/api/auth/register",
+                json={"username": "bob", "password": "pw123", "display_name": "Bob", "email": "bob@example.com"},
+            )
+
+        assert response.status_code == 503
+        assert "outbox" not in response.json()["detail"]
+        # Nothing was written: the work never reached the provider.
+        assert not (tmp_path / "email-verifications.jsonl").exists()
+
+    async def test_a_saturated_worker_pool_at_open_register_is_a_503(self, tmp_path) -> None:
+        """The open branch has no ``except OSError`` to mislabel it, but a bare
+        500 is still the wrong answer for work that never started and is safe
+        to retry once the pool drains."""
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        app = _create_test_app(provider, registration_mode="open")
+
+        async with _client_for(app) as client, saturated_worker_pool():
+            response = await client.post(
+                "/api/auth/register",
+                json={"username": "bob", "password": "pw123", "display_name": "Bob"},
+            )
+
+        assert response.status_code == 503
 
     async def test_register_email_verified_mode_requires_email(self, tmp_path) -> None:
         provider = build_local_auth_provider(tmp_path / "auth.db")

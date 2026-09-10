@@ -287,7 +287,7 @@ def test_compatibility_record_validate_binds_the_record_and_the_gate_delegates_t
         "candidate_image_digest": f"sha256:{SHA}",
         "candidate_revision_sha256": "1" * 64,
         "candidate_doctor_job_sha256": "2" * 64,
-        "candidate_package_version": "0.8.0",
+        "candidate_package_version": "0.8.1",
         "previous_source_sha": "",
         "previous_image_digest": "",
         "previous_revision_sha256": "",

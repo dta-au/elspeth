@@ -6,6 +6,7 @@ import multiprocessing
 import time
 from collections.abc import Iterator
 from datetime import timedelta
+from hashlib import sha256
 from multiprocessing.connection import Connection
 from uuid import uuid4
 
@@ -188,6 +189,48 @@ def test_expiry_uses_database_time_after_ticket_lock(ticket_postgres: Engine) ->
         assert parent.recv() is None
         process.join(30)
         assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(30)
+        parent.close()
+
+
+def test_issuance_cleanup_skips_locked_expired_ticket_and_retries_later(ticket_postgres: Engine) -> None:
+    _, old_run_id, old_user = seed_ticket_run(ticket_postgres)
+    _, run_id, user = seed_ticket_run(ticket_postgres)
+    authority = RepositorySessionWebsocketTicketAuthority(ticket_postgres)
+    locked_ticket = authority.issue(run_id=old_run_id, user=old_user)
+    removable_ticket = authority.issue(run_id=old_run_id, user=old_user)
+    locked_digest = sha256(locked_ticket.ticket.encode()).hexdigest()
+    removable_digest = sha256(removable_ticket.ticket.encode()).hexdigest()
+    with ticket_postgres.begin() as conn:
+        expired = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one() - timedelta(seconds=1)
+        conn.execute(update(websocket_tickets_table).values(expires_at=expired))
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = ctx.Process(target=_issue_process, args=(ticket_postgres.url.render_as_string(hide_password=False), run_id, user, child))
+    try:
+        with ticket_postgres.begin() as conn:
+            conn.execute(
+                select(websocket_tickets_table).where(websocket_tickets_table.c.ticket_digest == locked_digest).with_for_update()
+            ).one()
+            process.start()
+            child.close()
+            # Issuance must finish while the expired credential remains locked.
+            assert parent.poll(30)
+            issued = parent.recv()
+            process.join(30)
+            assert process.exitcode == 0
+            remaining = set(conn.execute(select(websocket_tickets_table.c.ticket_digest)).scalars())
+            assert locked_digest in remaining
+            assert removable_digest not in remaining
+        authority.issue(run_id=run_id, user=user)
+        with ticket_postgres.connect() as conn:
+            assert locked_digest not in set(conn.execute(select(websocket_tickets_table.c.ticket_digest)).scalars())
+        assert authority.consume(ticket=locked_ticket.ticket, run_id=old_run_id) is None
+        assert authority.consume(ticket=issued, run_id=run_id) == UserIdentity(user.user_id, "current-name")
+        assert authority.consume(ticket=issued, run_id=run_id) is None
     finally:
         if process.is_alive():
             process.terminate()

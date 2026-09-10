@@ -307,14 +307,17 @@ class SingleRevisionProgressDetails(ReplicaProgressDetails):
 
 
 class ResourceGraphCleanupDetails(TypedDict):
-    """``resource-graph-cleanup``: the group is gone from Resource Graph; the vault was purged or tombstoned."""
+    """The group is gone from Resource Graph; both vaults were purged or tombstoned."""
 
     mechanism: str
     resource_group_sha256: str
     remaining_resources: int
-    key_vault_purged: bool
-    key_vault_tombstoned: bool
-    scheduled_purge_date: str | None
+    runtime_key_vault_purged: bool
+    runtime_key_vault_tombstoned: bool
+    runtime_scheduled_purge_date: str | None
+    schema_owner_key_vault_purged: bool
+    schema_owner_key_vault_tombstoned: bool
+    schema_owner_scheduled_purge_date: str | None
 
 
 CheckDetails = (
@@ -574,7 +577,7 @@ def _purge_date(*, purged: object, tombstoned: object, scheduled: object) -> Non
         "every scalar has the exact type the kind demands (a bool never stands in for a number), and the kind's own "
         "facts hold: a succeeded Job, the doctor checks, the three NFS directories as 1654/0700, 2/2 blob cases, the "
         "four KQL queries under the ingestion ceiling with no canary, one revision at 100 %, a passed gate, zero "
-        "remaining resources with one vault fate, and a probe record the owned ProbeResult re-admits - where P4b "
+        "remaining resources with a fate for each vault, and a probe record the owned ProbeResult re-admits - where P4b "
         "cannot pass and a graceful_stop P3 cannot record a pass"
     ),
     test_ref="tests/unit/web/azure_container_apps_acceptance/test_receipt_contracts.py::test_every_kind_rejects_open_field_sets",
@@ -703,7 +706,14 @@ def validate_check_details(kind: str, details: Mapping[str, object]) -> None:
         _sha256_text(details["resource_group_sha256"])
         _exact(details["remaining_resources"], 0)
         _purge_date(
-            purged=details["key_vault_purged"], tombstoned=details["key_vault_tombstoned"], scheduled=details["scheduled_purge_date"]
+            purged=details["runtime_key_vault_purged"],
+            tombstoned=details["runtime_key_vault_tombstoned"],
+            scheduled=details["runtime_scheduled_purge_date"],
+        )
+        _purge_date(
+            purged=details["schema_owner_key_vault_purged"],
+            tombstoned=details["schema_owner_key_vault_tombstoned"],
+            scheduled=details["schema_owner_scheduled_purge_date"],
         )
 
 

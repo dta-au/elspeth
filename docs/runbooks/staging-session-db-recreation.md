@@ -2,9 +2,19 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.0 blob cleanup, guided decline, aggregation recovery, the identity substrate, and read admissions (session epoch 54 and Landscape epoch 39)
+## Current Cutover: 0.8.1 durable Composer progress and run admission (session epoch 54 and Landscape epoch 39)
 
-0.8.0 advances `SESSION_SCHEMA_EPOCH` from 35 to 54. Epoch 36 ensures a committed
+0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 54 and Landscape
+`SQLITE_SCHEMA_EPOCH` from 38 to 39. Session epoch 54 adds durable Composer
+progress snapshots and exact request lifecycle leases. Landscape epoch 39
+adds immutable web run-start permit binding and recoverable pre-effect
+admission state. Stop the service, archive/export required evidence, recreate
+both stale stores, and install 0.8.1 using the procedure below.
+
+The preceding 0.8.0 release advanced `SESSION_SCHEMA_EPOCH` from 35 to 53
+and Landscape `SQLITE_SCHEMA_EPOCH` from 29 to 38. Its historical changes
+and credential re-admission guidance remain relevant when recreating these
+stores. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
 after restart. Epoch 37 adds the completed `guided_plan` `declined`
 result kind and its state-only result locator. Epoch 38 additionally retains the
@@ -59,9 +69,6 @@ the session is archived or deleted. Landscape advances to epoch 38:
 authoritative replay order, and `event_id` becomes a non-unique content digest
 of the transition, because database-stamped events tie on `recorded_at`
 inside one SQLite second or one PostgreSQL transaction.
-Session epoch 54 adds durable Composer progress snapshots and exact request
-lifecycle leases. Landscape epoch 39 adds immutable web run-start permit
-binding and recoverable pre-effect admission state.
 An epoch-35 through epoch-53 database cannot represent
 the complete current contract and must be recreated. Only `sessions.db` is
 recreated — `data/auth.db` and the content-addressed payload store are never

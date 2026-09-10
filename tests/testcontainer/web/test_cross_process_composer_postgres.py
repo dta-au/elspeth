@@ -132,8 +132,10 @@ def composer_session(external_deployment_postgres_url: str) -> Iterator[tuple[En
             activate=True,
             quota_tokens_per_day=None,
             quota_storage_bytes=None,
+            identity_dormancy_days=90,
             record_admission=lambda *_args: None,
             record_rebound=lambda *_args: None,
+            record_dormant=lambda *_args: None,
         )
         .record
     )

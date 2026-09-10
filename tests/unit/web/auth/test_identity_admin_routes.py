@@ -11,12 +11,14 @@ authority's contract, pinned where it lives.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import Engine, update
 
 from elspeth.web.auth.identity_admin_routes import create_identity_admin_router
 from elspeth.web.auth.models import IdentityClaims
@@ -25,6 +27,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 from .conftest import build_local_auth_provider
@@ -102,6 +105,9 @@ class _Harness:
     authority: RepositoryIdentityAuthority
     audit: _RecordingAuditWriter
     root_identity_id: str
+    # The substrate itself, for the one thing no route can do: move a stored
+    # ``last_login_at`` into the past so R9 has something to measure.
+    engine: Engine
 
 
 def _local_claims(username: str) -> IdentityClaims:
@@ -148,7 +154,7 @@ def _build(tmp_path: Path) -> _Harness:
     app.state.auth_rate_limiter = ComposerRateLimiter(limit=100)
     app.include_router(create_auth_router())
     app.include_router(create_identity_admin_router())
-    return _Harness(app=app, authority=authority, audit=audit, root_identity_id=bootstrapped.record.identity_id)
+    return _Harness(app=app, authority=authority, audit=audit, root_identity_id=bootstrapped.record.identity_id, engine=engine)
 
 
 def _client(app: FastAPI) -> AsyncClient:
@@ -168,8 +174,10 @@ def _pending(harness: _Harness, username: str) -> str:
         activate=False,
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
+        identity_dormancy_days=90,
         record_admission=lambda *_args: None,
         record_rebound=lambda *_args: None,
+        record_dormant=lambda *_args: None,
     )
     assert outcome.record.access_state == "pending"
     return outcome.record.identity_id
@@ -181,8 +189,10 @@ def _active(harness: _Harness, username: str) -> str:
         activate=True,
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
+        identity_dormancy_days=90,
         record_admission=lambda *_args: None,
         record_rebound=lambda *_args: None,
+        record_dormant=lambda *_args: None,
     )
     assert outcome.record.access_state == "active"
     return outcome.record.identity_id
@@ -261,6 +271,100 @@ async def test_the_queue_lists_pending_rows_as_subject_and_organisation_only(har
     assert row["username"] is None and row["display_name"] is None and row["email"] is None
     assert row["last_login_at"] is None
     assert "raw_claims_json" not in row
+
+
+def _re_pend_for_dormancy(harness: _Harness, identity_id: str, username: str) -> None:
+    """Drive a REAL R9 re-pend: backdate the stored login, then log in again.
+
+    The window is passed as one day and the login moved two days back rather
+    than the clock being mocked: dormancy is measured against the database
+    clock inside the authority's own transaction, and a mocked clock would
+    prove the mock.
+    """
+    with harness.engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == identity_id)
+            .values(
+                last_login_at=datetime.now(UTC) - timedelta(days=2),
+                activated_at=datetime.now(UTC) - timedelta(days=2),
+            )
+        )
+    outcome = harness.authority.ensure_identity(
+        claims=_local_claims(username),
+        activate=False,
+        quota_tokens_per_day=None,
+        quota_storage_bytes=None,
+        identity_dormancy_days=1,
+        record_admission=lambda *_args: None,
+        record_rebound=lambda *_args: None,
+        record_dormant=lambda *_args: None,
+    )
+    assert outcome.record.access_state == "pending"
+
+
+async def test_a_dormancy_re_pended_row_keeps_the_profile_the_admin_must_act_on(harness: _Harness) -> None:
+    """The rev2.2 blanking is about NEVER-ADMITTED rows, and R9 broke that premise.
+
+    "The list exposes its subject and organisation and nothing else" exists so
+    the queue does not become a directory of everyone who ever TRIED to log
+    in. An R9 re-pend puts a person the container already admitted -- whose
+    profile it therefore already holds, and whose ``activated_at`` is stamped
+    -- back into that queue. Blanking them leaves the administrator deciding
+    whether to re-admit a bare provider ``sub``, and positively asserts
+    ``last_login_at`` is NULL, which everywhere else in this system (R9's own
+    exemption included) means "has never logged in" -- the one fact that
+    would explain why the row is pending.
+
+    Same predicate, same reason, as the ``activated_at IS NULL`` term the
+    lazy purge takes.
+    """
+    alice_id = _active(harness, "alice")
+    _re_pend_for_dormancy(harness, alice_id, "alice")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        listed = await client.get("/api/auth/admin/identities", headers=root)
+        assert listed.status_code == 200, listed.text
+        (row,) = [entry for entry in listed.json()["identities"] if entry["subject"] == "alice"]
+        # A never-admitted row in the same queue, to prove the rule narrowed
+        # rather than lapsed: rev2.2's blanking still holds where its premise
+        # does.
+        _pending(harness, "bob")
+        both = await client.get("/api/auth/admin/identities", headers=root)
+    assert row["access_state"] == "pending"
+    assert row["disable_reason"] == "dormant"
+    assert row["username"] == "alice"
+    assert row["last_login_at"] is not None
+    assert row["activated_at"] is not None
+    (never,) = [entry for entry in both.json()["identities"] if entry["subject"] == "bob"]
+    assert never["username"] is None and never["last_login_at"] is None and never["activated_at"] is None
+
+
+async def test_re_admitting_a_dormant_identity_records_the_access_it_did_not_grant(harness: _Harness) -> None:
+    """``role="none"`` grants nothing and still returns the person to their role.
+
+    The activation route is R9's stated remedy. It must neither collide with
+    the grant the identity kept nor let the trail read as an admission with
+    no authority, so the audit call carries what was retained.
+    """
+    alice_id = _active(harness, "alice")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        granted = await client.post("/api/auth/admin/roles", headers=root, json={"identity_id": alice_id, "role": "user"})
+        assert granted.status_code == 201, granted.text
+        _re_pend_for_dormancy(harness, alice_id, "alice")
+        response = await client.post(
+            f"/api/auth/admin/identities/{alice_id}/activate",
+            headers=root,
+            json={"role": "none", "note": "back from long service leave"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["identity"]["access_state"] == "active"
+    call = harness.audit.only("record_identity_activated")
+    assert call.kwargs["role"] is None and call.kwargs["role_id"] is None
+    # Role AND scope: ``None`` is the deployment-wide grant, which is the one
+    # that would make a re-admitted identity an administrator again.
+    assert call.kwargs["retained_roles"] == (("user", None),)
 
 
 async def test_activation_admits_with_a_role_and_a_quota_and_records_it_before_answering(harness: _Harness) -> None:

@@ -23,7 +23,7 @@
 #     --min-samples (default 10). Converts the override-rate metric from
 #     informational to enforcing.
 #
-#   VAL (check-judge-quality): on trusted pushes only, run the labelled
+#   check-judge-quality: on trusted pushes only, run the labelled
 #     judge-quality corpus through the live OpenRouter-backed judge and
 #     require exact verdict/decorator accuracy >= 0.90. This is a prompt/model
 #     REGRESSION TRIPWIRE, not a quality guarantee: the corpus is small (10-30
@@ -53,9 +53,9 @@
 # GitHub Actions —
 # requiring the individual gate jobs is fragile (a renamed job silently drops
 # the requirement) and GitHub keys protection on one named check. The
-# aggregate fails if C3 is not ``success``; VAL may be ``skipped`` (it is
-# intentionally skipped on every PR so PR-controlled code can never read the
-# OpenRouter secret).
+# aggregate fails if C3 is not ``success``; check-judge-quality may be
+# ``skipped`` (it is intentionally skipped on every PR so PR-controlled code
+# can never read the OpenRouter secret).
 #
 # Spec: notes/cicd-judge-cli-prototype-plan.md + the convergent-findings
 # remediation diff that introduced this workflow.
@@ -95,7 +95,7 @@ defaults:
 # compilation, no tests); a small hosted runner is sufficient for PR checks.
 jobs:
   check-judge-quality:
-    name: Judge-quality validation corpus (VAL)
+    name: Judge-quality validation corpus
     if: github.event_name != 'pull_request'
     runs-on: ${{ fromJSON('["self-hosted","Linux","X64","nyx-ci","trusted"]') }}
     # This job makes real OpenRouter calls; keep the corpus bounded and fail
@@ -215,7 +215,8 @@ jobs:
   # aggregate, a red gate only blocks merge if that specific job name is listed
   # as required — fragile against renames, and it leaves "are the gates even
   # gating?" depending on unverifiable repo settings. This job makes the answer
-  # mechanical: it fails unless C3 succeeded and VAL succeeded-or-skipped.
+  # mechanical: it fails unless C3 succeeded and check-judge-quality
+  # succeeded or was skipped.
   judge-gates-success:
     name: Judge gates success
     runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
@@ -235,13 +236,13 @@ jobs:
             echo "C3 override-rate drift gate did not pass (result: ${{ needs.check-override-rate.result }})"
             exit 1
           fi
-          # VAL (judge-quality) is intentionally skipped on every PR: it needs the
+          # check-judge-quality is intentionally skipped on every PR: it needs the
           # OpenRouter secret, which must not be reachable from PR-controlled code.
           # 'skipped' is therefore acceptable here; any other non-success result
           # (failure / cancelled / timed_out) blocks the merge.
-          val_result="${{ needs.check-judge-quality.result }}"
-          if [[ "$val_result" != "success" && "$val_result" != "skipped" ]]; then
-            echo "VAL judge-quality gate did not pass (result: $val_result)"
+          judge_quality_result="${{ needs.check-judge-quality.result }}"
+          if [[ "$judge_quality_result" != "success" && "$judge_quality_result" != "skipped" ]]; then
+            echo "judge-quality gate did not pass (result: $judge_quality_result)"
             exit 1
           fi
-          echo "All judge gates passed (VAL result: $val_result)."
+          echo "All judge gates passed (judge-quality result: $judge_quality_result)."

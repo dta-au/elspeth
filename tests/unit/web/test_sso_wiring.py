@@ -11,6 +11,7 @@ from the profile rather than from a per-provider branch.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -372,3 +373,101 @@ def test_a_rebound_login_is_refused_at_the_wiring_and_writes_the_system_disable(
     # No request columns: the disable is the authority's act, not the
     # request's. The refused login writes its own row with those.
     assert disabled[0].request_id is None
+
+
+def _backdate_login(engine, identity_id: str, *, days: int) -> None:
+    """Move ``last_login_at`` into the past; the database clock cannot be moved from here."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+
+    from elspeth.web.sessions.models import identities_table
+
+    with engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == identity_id)
+            .values(
+                last_login_at=datetime.now(UTC) - timedelta(days=days),
+                activated_at=datetime.now(UTC) - timedelta(days=days),
+            )
+        )
+
+
+def test_a_dormant_login_is_re_pended_at_the_wiring_and_writes_the_system_disable(tmp_path: Path, substrate) -> None:
+    """R9's seam: the container's window reaches the authority, and the re-pend is audited.
+
+    ``identity_dormancy_days`` was a validated-only setting until this landed;
+    the assertion that matters is that the wiring PASSES it, because an
+    authority that never receives it cannot enforce R9 no matter what it does
+    with the value.
+    """
+    from sqlalchemy import update
+
+    from elspeth.web.sessions.models import identities_table
+
+    engine, authority = substrate
+    idp = FakeIdP()
+    settings = _oidc_wired(tmp_path, idp, identity_dormancy_days=30)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    wiring = build_sso_wiring(settings, session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single")
+    assert wiring is not None
+
+    admitted = wiring.upsert_identity(_identity_claims("ada", "ada@example.com"))
+    # R9 acts on ACTIVE rows; an SSO first login lands pending (D12), so this
+    # stands in for the administrator's activation.
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == admitted.identity_id).values(access_state="active"))
+    _backdate_login(engine, admitted.identity_id, days=31)
+
+    bound = wiring.upsert_identity(_identity_claims("ada", "ada@example.com"))
+
+    # The state gate refuses the login from here: the row is pending, so
+    # ``admit`` raises SsoAccessPending. R9 needs no refusal of its own.
+    assert bound.access_state == "pending"
+    disabled = [row for row in _auth_event_rows(settings) if row.event_type == "identity_disabled"]
+    assert len(disabled) == 1
+    assert disabled[0].outcome == "success"
+    assert disabled[0].identity_id == admitted.identity_id
+    metadata = json.loads(disabled[0].metadata_json)
+    assert (metadata["cause"], metadata["state"], metadata["dormancy_days"]) == ("dormant", "pending", 30)
+
+
+def test_the_last_admins_dormancy_is_exempted_and_the_exemption_is_the_only_evidence(tmp_path: Path, substrate, monkeypatch) -> None:
+    """D34's audit must succeed before the login erases its dormancy evidence."""
+    from elspeth.web.auth.audit import AuthAuditRecorder
+
+    engine, authority = substrate
+    idp = FakeIdP()
+    settings = _oidc_wired(tmp_path, idp, identity_dormancy_days=30, sso_admin_subjects=["root"])
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    wiring = build_sso_wiring(settings, session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single")
+    assert wiring is not None
+
+    seeded = wiring.upsert_identity(_identity_claims("root", "root@example.com"))
+    assert seeded.access_state == "active"
+    assert authority.count_active_human_admins() == 1
+    _backdate_login(engine, seeded.identity_id, days=400)
+    previous_login = authority.read_identity_summary(identity_id=seeded.identity_id).last_login_at
+
+    def refuse_audit(*args, **kwargs):
+        raise RuntimeError("exemption audit unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AuthAuditRecorder, "record_identity_dormancy_exempted", refuse_audit)
+        with pytest.raises(RuntimeError, match="exemption audit unavailable"):
+            wiring.upsert_identity(_identity_claims("root", "root@example.com"))
+    assert authority.read_identity_summary(identity_id=seeded.identity_id).last_login_at == previous_login
+
+    bound = wiring.upsert_identity(_identity_claims("root", "root@example.com"))
+
+    # NOT re-pended: the login proceeds and the container keeps its admin.
+    assert bound.access_state == "active"
+    assert authority.count_active_human_admins() == 1
+    exempted = [row for row in _auth_event_rows(settings) if row.failure_category == "dormancy_last_admin_exempt"]
+    assert len(exempted) == 1
+    assert (exempted[0].event_type, exempted[0].outcome) == ("identity_disabled", "failure")
+    assert exempted[0].identity_id == seeded.identity_id
+    # No re-pend row: a success-outcome dormancy row would assert a state
+    # change that did not happen.
+    assert [row.outcome for row in _auth_event_rows(settings) if row.event_type == "identity_disabled"] == ["failure"]

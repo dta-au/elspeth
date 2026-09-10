@@ -31,6 +31,47 @@ _EXECUTOR_LOCK = threading.Lock()
 # from worker threads, and process-wide because the pool is process-wide.
 _OUTSTANDING_ADMISSIONS = 0
 
+AUTH_AUDIT_MAX_WORKERS: Final[int] = 2
+AUTH_AUDIT_ADMISSION_CAPACITY: Final[int] = 4
+
+
+class _AuthAuditWorkers:
+    """Reserved capacity for must-fire refusals when ordinary workers are full."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.executor: ThreadPoolExecutor | None = None
+        self.outstanding = 0
+
+    def get_executor(self) -> ThreadPoolExecutor:
+        with self.lock:
+            if self.executor is None:
+                self.executor = ThreadPoolExecutor(max_workers=AUTH_AUDIT_MAX_WORKERS, thread_name_prefix="auth-audit")
+            return self.executor
+
+    def try_admit(self) -> bool:
+        with self.lock:
+            if self.outstanding >= AUTH_AUDIT_ADMISSION_CAPACITY:
+                return False
+            self.outstanding += 1
+            return True
+
+    def release(self) -> None:
+        with self.lock:
+            self.outstanding -= 1
+
+    def release_when_finished(self, _finished: ConcurrentFuture[Any]) -> None:
+        self.release()
+
+    def detach_executor(self) -> ThreadPoolExecutor | None:
+        with self.lock:
+            executor = self.executor
+            self.executor = None
+            return executor
+
+
+_AUTH_AUDIT_WORKERS = _AuthAuditWorkers()
+
 
 class AsyncWorkerAdmissionTimeoutError(TimeoutError):
     """The shared worker pool could not admit new work within the bounded wait.
@@ -64,13 +105,17 @@ def _get_shared_executor() -> ThreadPoolExecutor:
 
 
 async def shutdown_async_workers() -> None:
-    """Shut down the shared worker pool (called at app lifespan shutdown)."""
+    """Drain both worker pools (called at app lifespan shutdown)."""
     global _SHARED_EXECUTOR
+    loop = asyncio.get_running_loop()
+    executors = []
     if _SHARED_EXECUTOR is not None:
-        loop = asyncio.get_running_loop()
-        executor = _SHARED_EXECUTOR
+        executors.append(_SHARED_EXECUTOR)
         _SHARED_EXECUTOR = None
-        await loop.run_in_executor(None, executor.shutdown, True)
+    audit_executor = _AUTH_AUDIT_WORKERS.detach_executor()
+    if audit_executor is not None:
+        executors.append(audit_executor)
+    await asyncio.gather(*(loop.run_in_executor(None, executor.shutdown, True) for executor in executors))
 
 
 def outstanding_admissions() -> int:
@@ -113,17 +158,21 @@ async def _acquire_admission() -> None:
     released from worker threads), and this helper must stay usable from any
     running loop.
     """
-    if _try_admit():
+    await _wait_for_admission(_try_admit, ADMISSION_CAPACITY, "async worker")
+
+
+async def _wait_for_admission(try_admit: Callable[[], bool], capacity: int, pool_name: str) -> None:
+    if try_admit():
         return
     loop = asyncio.get_running_loop()
     deadline = loop.time() + ADMISSION_WAIT_SECONDS
     while True:
         await asyncio.sleep(_ADMISSION_POLL_SECONDS)
-        if _try_admit():
+        if try_admit():
             return
         if loop.time() >= deadline:
             raise AsyncWorkerAdmissionTimeoutError(
-                f"async worker pool saturated: {ADMISSION_CAPACITY} submissions outstanding for {ADMISSION_WAIT_SECONDS}s"
+                f"{pool_name} pool saturated: {capacity} submissions outstanding for {ADMISSION_WAIT_SECONDS}s"
             )
 
 
@@ -142,7 +191,6 @@ async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwar
     sandboxed runtimes where executor completion can fail to wake the selector
     promptly.
     """
-    loop = asyncio.get_running_loop()
     executor = _get_shared_executor()
     await _acquire_admission()
     try:
@@ -151,6 +199,36 @@ async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwar
         _release_admission()
         raise
     concurrent_future.add_done_callback(_release_admission_when_finished)
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+
+
+async def run_auth_audit_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Record a refusal off-loop using capacity reserved from ordinary work.
+
+    At most two audits run and two wait. Admission failure propagates: an
+    unaudited refusal must not be reported as successfully audited. Once
+    admitted, audit work survives caller cancellation even while queued.
+    Its slot is released by the concurrent future only when work finishes.
+    """
+    executor = _AUTH_AUDIT_WORKERS.get_executor()
+    await _wait_for_admission(_AUTH_AUDIT_WORKERS.try_admit, AUTH_AUDIT_ADMISSION_CAPACITY, "auth audit worker")
+    try:
+        concurrent_future = executor.submit(functools.partial(func, *args, **kwargs))
+    except BaseException:
+        _AUTH_AUDIT_WORKERS.release()
+        raise
+    concurrent_future.add_done_callback(_AUTH_AUDIT_WORKERS.release_when_finished)
+    return await _await_worker_future(concurrent_future, cancel_queued=False)
+
+
+def _retrieve_abandoned_exception(future: asyncio.Future[Any]) -> None:
+    """Consume the outcome after the audit caller has disconnected."""
+    if not future.cancelled():
+        future.exception()
+
+
+async def _await_worker_future[T](concurrent_future: ConcurrentFuture[T], *, cancel_queued: bool) -> T:
+    loop = asyncio.get_running_loop()
     future: asyncio.Future[T] = asyncio.wrap_future(concurrent_future, loop=loop)
     try:
         # ``asyncio.wait`` returns ``(done, pending)`` on each 0.1s tick rather
@@ -168,8 +246,8 @@ async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwar
                 # worker's exception on the awaited (non-cancelled) path.
                 return future.result()
     finally:
-        # The await above was abandoned mid-flight (cancellation, outer
-        # timeout) while the work is still outstanding. Cancel the wrapper:
+        # For ordinary work abandoned mid-flight (cancellation, outer
+        # timeout), cancel the wrapper:
         #
         # * still QUEUED — the concurrent future is cancelled too, so work
         #   nobody will read never occupies a thread, and its admission slot
@@ -186,5 +264,13 @@ async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwar
         # through concurrent requests' own paths, not this echo. The executor
         # is the process-wide shared pool, so it is NOT shut down here —
         # teardown happens once via ``shutdown_async_workers()``.
-        if not future.done():
+        if future.done():
+            # Completion can win the race with cancellation of the waiter.
+            _retrieve_abandoned_exception(future)
+        elif cancel_queued:
             future.cancel()
+        else:
+            # A refused request already owes this audit. Keep queued work
+            # as well as running work; observe any late exception without
+            # publishing a second response to a disconnected caller.
+            future.add_done_callback(_retrieve_abandoned_exception)

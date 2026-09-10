@@ -73,6 +73,12 @@ CANDIDATE_IMAGE="${ACR_LOGIN_SERVER}/elspeth@${ACR_DIGEST}"
 
 ## 4. Doctor Job with the candidate digest
 
+Complete the existing-service runbook's one-time credential isolation migration
+before using this image-only path on an older shared-identity installation.
+The retained parameters must contain `schemaOwnerIdentityResourceId` and
+`identityClientId`, owner URLs must point at the dedicated owner vault, and the
+web container must already select the runtime identity with `AZURE_CLIENT_ID`.
+
 Prepare and review the concrete candidate parameters before any deployment.
 The tracked `.bicepparam` examples contain placeholders and cannot be used here.
 

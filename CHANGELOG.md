@@ -4,6 +4,22 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.1 - Unreleased
+
+**Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
+to 54 for durable Composer progress snapshots and exact request lifecycle
+leases. Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 39 for immutable
+web run-start permit binding and recoverable pre-effect admission state.
+
+ELSPETH does not migrate either predecessor database in place before 1.0.
+Archive or export required evidence, stop the old service, recreate stale
+session and Landscape stores, then install 0.8.1. Session databases below
+epoch 54 and Landscape databases below epoch 39 must be recreated together.
+Preserve `data/auth.db` and follow the account re-admission guidance in the
+[session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
+Do not roll older code back over the recreated databases; keep the service
+drained and repair this release forward.
+
 ## 0.8.0 - 2026-09-07 (Unified lineage and production hardening)
 
 0.8.0 unifies ELSPETH's group-lineage and settlement model while carrying
@@ -15,7 +31,7 @@ security and recovery fixes. The notes below intentionally cover only major
 changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 54. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 53. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -82,9 +98,8 @@ live shareable blob-read admission, written only by the session operation
 authority, so a released or expired read context is refused on its next proof
 instead of keeping read authority until the session is archived or deleted
 (elspeth-f98e0ae8b2); a writer advancing the fence epoch does not invalidate a
-shareable read. Epoch 54 adds durable Composer progress snapshots and exact
-request lifecycle leases.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 39. Epoch 30 adds durable
+shareable read.
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 38. Epoch 30 adds durable
 row-union barrier attribution, epoch 31 closes scheduler status over the public
 six-state vocabulary, epoch 32 atomically records aggregation results and their
 ordered members, and epoch 33 adds the composite `(run_id, token_id)` outcome
@@ -106,13 +121,10 @@ non-unique content digest of the transition. Database-stamped events tie on
 old `(recorded_at, event_id)` key replayed them in hash order and two identical
 transitions of one work item in one second collided on the primary key.
 
-Epoch 39 adds immutable web run-start permit binding and recoverable
-pre-effect admission state.
-
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.0. A Landscape database below
-epoch 39 is not current and must be recreated. Do not roll older code back over
+epoch 38 is not current for 0.8.0 and must be recreated. Do not roll older code back over
 the recreated databases; keep the service drained and repair this release
 forward.
 

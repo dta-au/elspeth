@@ -209,3 +209,119 @@ def test_stale_reconciliation_leader_refuses_before_projection(tmp_path, monkeyp
         assert execution.mock_calls == []
         assert blobs.mock_calls == []
         assert lease.mock_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archive_after_discovery", [False, True])
+async def test_archived_terminal_session_does_not_block_other_recovery(tmp_path, monkeypatch, archive_after_discovery):
+    """Archive before discovery or in its acquisition race; another run progresses."""
+    from unittest.mock import create_autospec
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.coordination.contracts import RecoveryRequiredReason, RunSagaState
+    from elspeth.web.execution.recovery import RunRecoveryCoordinator
+    from elspeth.web.execution.service import ExecutionServiceImpl
+
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+    initialize_session_schema(engine)
+    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+
+    async def seed_run(*, completed):
+        session_id = _insert_session(engine)
+        compose = seed_live_operation_context(engine, session_id, operation_kind=SessionOperationKind.COMPOSE)
+        run_id = UUID(
+            await _seed_active_run(
+                engine,
+                session_id,
+                session_operation_context=compose,
+                status="pending",
+                source={"plugin": "csv", "on_success": "rows", "options": {"path": "input.csv"}, "on_validation_failure": "discard"},
+            )
+        )
+        execute = seed_live_operation_context(engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        await sessions.update_run_status(run_id, "running", session_operation_context=execute)
+        if completed:
+            await sessions.update_run_status(run_id, "completed", landscape_run_id=str(run_id), session_operation_context=execute)
+        sessions.session_operation_authority.release(execute)
+        return await sessions.get_run(run_id)
+
+    archived_run = await seed_run(completed=True)
+    healthy_run = await seed_run(completed=False)
+    discover = sessions.list_recoverable_run_records
+    assert {run.id for run in await discover()} == {archived_run.id, healthy_run.id}
+    if archive_after_discovery:
+
+        async def discover_then_archive():
+            candidates = await discover()
+            await sessions.archive_session(archived_run.session_id)
+            return candidates
+
+        monkeypatch.setattr(sessions, "list_recoverable_run_records", discover_then_archive)
+    else:
+        await sessions.archive_session(archived_run.session_id)
+        assert {run.id for run in await discover()} == {healthy_run.id}
+    landscape_url = f"sqlite:///{tmp_path / 'landscape.db'}"
+    with LandscapeDB.from_url(landscape_url):
+        pass
+    execution = create_autospec(ExecutionServiceImpl, instance=True)
+    execution.get_live_run_ids.return_value = frozenset()
+    coordinator = RunRecoveryCoordinator(
+        sessions, execution, BlobServiceImpl(engine, tmp_path), landscape_url=landscape_url, create_tables=False
+    )
+    try:
+        await coordinator.recover()
+        healthy = await sessions.get_run(healthy_run.id)
+        assert healthy.saga_state is RunSagaState.RECOVERY_REQUIRED
+        assert healthy.recovery_required_reason is RecoveryRequiredReason.MISSING_BASELINE
+        assert (await sessions.get_run(archived_run.id)).status == "completed"
+        execution.recover_run.assert_not_called()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_acquisition_propagates_missing_fence_integrity_failure(tmp_path, monkeypatch):
+    from unittest.mock import create_autospec
+
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+    from elspeth.web.execution.recovery import RunRecoveryCoordinator
+    from elspeth.web.execution.service import ExecutionServiceImpl
+    from elspeth.web.sessions.models import session_operation_fences_table
+
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+    initialize_session_schema(engine)
+    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session_id = _insert_session(engine)
+    compose = seed_live_operation_context(engine, session_id, operation_kind=SessionOperationKind.COMPOSE)
+    await _seed_active_run(
+        engine,
+        session_id,
+        session_operation_context=compose,
+        status="pending",
+        source={"plugin": "csv", "on_success": "rows", "options": {"path": "input.csv"}, "on_validation_failure": "discard"},
+    )
+    sessions.session_operation_authority.release(compose)
+    discover = sessions.list_recoverable_run_records
+
+    async def discover_then_corrupt():
+        candidates = await discover()
+        assert len(candidates) == 1
+        with engine.begin() as connection:
+            connection.execute(delete(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session_id)))
+        return candidates
+
+    monkeypatch.setattr(sessions, "list_recoverable_run_records", discover_then_corrupt)
+    execution = create_autospec(ExecutionServiceImpl, instance=True)
+    execution.get_live_run_ids.return_value = frozenset()
+    coordinator = RunRecoveryCoordinator(
+        sessions, execution, BlobServiceImpl(engine, tmp_path), landscape_url="sqlite://", create_tables=False
+    )
+    try:
+        with pytest.raises(SessionOperationFenceLost) as caught:
+            await coordinator.recover()
+        assert caught.value.reason is FenceLossReason.MISSING
+        execution.recover_run.assert_not_called()
+    finally:
+        engine.dispose()

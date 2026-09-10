@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.0](https://img.shields.io/badge/status-0.8.0-green.svg)
+![Status: 0.8.1](https://img.shields.io/badge/status-0.8.1-green.svg)
 
 > **Pre-release status:** ELSPETH may be suitable for carefully evaluated,
 > use-case-specific applications, but it is not yet ready for general production use.
@@ -33,6 +33,7 @@ inputs into one compiled artifact that the executor runs directly.
 
 - [Why ELSPETH exists](#why-elspeth-exists)
 - [Architecture at a glance](#architecture-at-a-glance)
+- [What changed in 0.8.1](#what-changed-in-081)
 - [What changed in 0.8.0](#what-changed-in-080)
 - [Getting started](#getting-started)
   - [YAML operator path](#yaml-operator-path)
@@ -155,6 +156,23 @@ runtime check that holds a plugin to its own declaration; see
 
 ---
 
+## What changed in 0.8.1
+
+0.8.1 extends the PostgreSQL replica runtime with durable run admission,
+Composer progress, single-use tickets and shared budgets. The bounded runtime
+contract and remaining acceptance limits are documented in
+[Deployment Platforms](docs/reference/deployment-platforms.md); live ACA
+acceptance is not claimed.
+
+**Operational:** 0.8.1 is a pre-1.0 database cutover from session epoch 53
+to 54 and Landscape epoch 38 to 39; guided schema remains at 11. Archive or
+export required evidence, stop the old service, recreate both stale databases
+in the same service-stop window, and install 0.8.1.
+Preserve `data/auth.db` and follow the
+[session DB reset runbook](docs/runbooks/staging-session-db-recreation.md),
+including account re-admission. Do not roll older code back over recreated
+databases.
+
 ## What changed in 0.8.0
 
 0.8.0 hardens the production paths introduced in 0.7.1 across deployment,
@@ -167,8 +185,8 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   `deploy/azure-container-apps/` with receipt validators, replica-count probes
   and runbooks. Its Single/sticky configuration received desktop acceptance
   on 2026-09-10; live cloud acceptance is not claimed. PostgreSQL supplies
-  durable progress, single-use tickets and shared budgets, with the verified
-  scope and limits in [Deployment Platforms](docs/reference/deployment-platforms.md).
+  the coordination substrate; the durable progress, single-use tickets and
+  shared budgets described above are 0.8.1 extensions.
 - **Committed blob deletion is recoverable.** Durable cleanup state remains
   until both the staged unlink and parent-directory fsync succeed, so restart
   recovery does not retain unaccounted files.
@@ -197,8 +215,8 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.8.0 is a pre-1.0 database cutover. The session store moves
-from epoch 35 to 54; guided schema moves to 11, and Landscape moves from epoch
-29 to 39. The individual session epochs are:
+from epoch 35 to 53; guided schema moves to 11, and Landscape moves from epoch
+29 to 38. The individual session epochs are:
 
 | Session epoch | What changed |
 | ------------- | ------------ |
@@ -1157,7 +1175,7 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 **Development setup:**
 
 ```bash
-uv sync --frozen --extra dev --extra azure
+uv sync --frozen --all-extras
 source .venv/bin/activate
 
 # Install the git hook dispatchers (pre-commit + commit-msg policy gates)

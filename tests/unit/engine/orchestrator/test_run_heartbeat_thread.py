@@ -58,6 +58,14 @@ from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 # ---------------------------------------------------------------------------
 
 
+class _Psycopg2Error(Exception):
+    """Model pgcode populated by a server response, not a bare constructor."""
+
+    def __init__(self, pgcode: str) -> None:
+        super().__init__("driver diagnostic")
+        self.pgcode = pgcode
+
+
 class _StubRepo:
     """Minimal stub of RunCoordinationRepository for heartbeat unit tests.
 
@@ -370,6 +378,45 @@ class TestBusyTolerated:
 
         assert not thread._coordination_lost_event.is_set()
         thread.check_and_raise()  # must not raise
+
+    def test_postgresql_lock_timeout_records_degradation(self) -> None:
+        postgres = pytest.importorskip("psycopg")
+        failure = OperationalError(
+            "SELECT run_coordination FOR UPDATE",
+            None,
+            postgres.errors.LockNotAvailable(
+                'canceling statement due to lock timeout\nCONTEXT:  while locking tuple (0,1) in relation "run_coordination"'
+            ),
+        )
+        repo = _StubRepo()
+        repo.side_effect = failure
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 1
+        assert len(repo.record_heartbeat_degraded_calls) == 1
+        assert not thread.coordination_lost
+        thread.check_and_raise()
+
+    @pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+    @pytest.mark.parametrize("reason", ["statement timeout", "user request"])
+    def test_postgresql_non_lock_cancellation_remains_fatal(self, driver: str, reason: str) -> None:
+        postgres = pytest.importorskip(driver)
+        failure = OperationalError(
+            "SELECT run_coordination FOR UPDATE", None, postgres.errors.QueryCanceled(f"canceling statement due to {reason}")
+        )
+        repo = _StubRepo()
+        repo.side_effect = failure
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 0
+        assert repo.record_heartbeat_degraded_calls == []
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
 
     @pytest.mark.parametrize(
         "driver_message",
@@ -991,12 +1038,14 @@ def test_stop_timeout_requires_finite_positive_budget(timeout: float) -> None:
 
 
 @pytest.mark.parametrize("sqlstate", ["55P03", "40P01", "57014"])
-def test_postgresql_sqlstate_distinguishes_contention_from_statement_cancellation(sqlstate: str) -> None:
-    """Real psycopg exception classes carry stable SQLSTATE independent of text."""
+@pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+def test_postgresql_sqlstate_distinguishes_contention_from_statement_cancellation(sqlstate: str, driver: str) -> None:
+    """Both driver fields classify by server SQLSTATE independently of text."""
     from psycopg.errors import lookup
 
     repo = _StubRepo()
-    failure = OperationalError("UPDATE run_workers", None, lookup(sqlstate)("driver diagnostic"))
+    origin = lookup(sqlstate)("driver diagnostic") if driver == "psycopg" else _Psycopg2Error(sqlstate)
+    failure = OperationalError("UPDATE run_workers", None, origin)
     repo.side_effect = failure
     thread = _make_thread(repo, degraded_threshold=1)
     thread._step_beat()

@@ -12,6 +12,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 output=$2
 test ! -e "$output" || { echo 'output already exists; use a new candidate file' >&2; exit 2; }
 vault=$(jq -er '.keyVaultName.value' "$1")
+schema_vault=$(jq -er '.schemaOwnerKeyVaultName.value' "$1")
 parameters=$(mktemp)
 trap 'rm -f -- "$parameters"' EXIT
 # Start with an ARM parameter envelope, not the tracked compilation fixture.
@@ -27,7 +28,9 @@ jq -n '{
 }' >"$parameters"
 # Freeze the version returned now. No secret value is written or printed.
 while read -r parameter secret_name; do
-  secret_id=$(az keyvault secret show --vault-name "$vault" --name "$secret_name" --query id --output tsv --only-show-errors)
+  secret_vault=$vault
+  if [[ "$secret_name" == *-schema-owner ]]; then secret_vault=$schema_vault; fi
+  secret_id=$(az keyvault secret show --vault-name "$secret_vault" --name "$secret_name" --query id --output tsv --only-show-errors)
   document=$(jq --arg key "$parameter" --arg id "$secret_id" '.parameters[$key] = {value: $id}' "$parameters")
   printf '%s\n' "$document" >"$parameters"
 done <<'SECRETS'
@@ -51,6 +54,8 @@ document=$(jq --slurpfile outputs "$1" --arg image "$CANDIDATE_IMAGE" \
   --argjson ceiling "$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" '
   .parameters.environmentResourceId = {value: $outputs[0].environmentResourceId.value} |
   .parameters.identityResourceId = {value: $outputs[0].identityResourceId.value} |
+  .parameters.identityClientId = {value: $outputs[0].identityClientId.value} |
+  .parameters.schemaOwnerIdentityResourceId = {value: $outputs[0].schemaOwnerIdentityResourceId.value} |
   .parameters.nfsStorageName = {value: $outputs[0].nfsStorageName.value} |
   .parameters.image.value = $image |
   .parameters.provisionStorageImage.value = $provisioner |

@@ -15,7 +15,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationFenceLost, SessionOperationKind
+from elspeth.web.coordination.contracts import FenceLossReason, RecoveryRequiredReason, SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.execution.accounting import load_run_accounting_from_db
@@ -168,7 +168,7 @@ class RunRecoveryCoordinator:
         )
         result = await self._blobs.finalize_run_output_blobs(
             run.id,
-            success=observation.status != RunStatus.INTERRUPTED,
+            success=observation.status not in {RunStatus.FAILED, RunStatus.INTERRUPTED},
             session_operation_context=lease.context,
         )
         if not result.errors:
@@ -238,6 +238,12 @@ class RunRecoveryCoordinator:
             )
         except SessionOperationConflictError:
             return
+        except SessionOperationFenceLost as exc:
+            # Candidate discovery is advisory: archive can win before acquire.
+            # Missing/corrupt authority must still surface as an integrity failure.
+            if exc.reason is FenceLossReason.OWNER_INACTIVE:
+                return
+            raise
         transferred = False
         try:
             run = await self._sessions.get_run(candidate.id)

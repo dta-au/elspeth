@@ -105,8 +105,10 @@ class RepositoryGlobalRunRecoveryAuthority:
             raise TypeError("reason must be an exact string or None")
 
     def _session_allows_recovery(self, conn: Connection, *, session_id: str, database_now: datetime) -> bool:
-        session = conn.execute(select(sessions_table.c.id).where(sessions_table.c.id == session_id).with_for_update()).one_or_none()
-        if session is None:
+        session = conn.execute(
+            select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id).with_for_update()
+        ).one_or_none()
+        if session is None or session.archived_at is not None:
             return False
         fence = conn.execute(
             select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == session_id).with_for_update()

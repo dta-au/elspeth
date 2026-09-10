@@ -39,6 +39,9 @@ capture() {
 }
 
 wait_for_keyvault_rbac() {
+  local probe_vault=$1
+  local probe_name=$2
+  local probe_file=$3
   local wait_seconds=${KEY_VAULT_RBAC_WAIT_SECONDS:-600}
   [[ "$wait_seconds" =~ ^[1-9][0-9]*$ ]] && (( wait_seconds <= 600 )) || {
     echo 'invalid Key Vault RBAC wait budget' >&2; return 2;
@@ -49,9 +52,9 @@ wait_for_keyvault_rbac() {
     command_timeout=$((remaining < 30 ? remaining : 30))
     code=0
     (ulimit -f 4096; timeout --signal=TERM --kill-after=5s "$command_timeout" \
-      az keyvault secret set --vault-name "$vault" --name elspeth-secret-key \
-      --file "$secret_dir/elspeth-secret-key" --encoding utf-8 --query id --output tsv --only-show-errors \
-      >"$private_dir/elspeth-secret-key.version" 2>"$private_dir/stderr") || code=$?
+      az keyvault secret set --vault-name "$probe_vault" --name "$probe_name" \
+      --file "$probe_file" --encoding utf-8 --query id --output tsv --only-show-errors \
+      >"$private_dir/$probe_name.version" 2>"$private_dir/stderr") || code=$?
     if (( code == 0 )); then return 0; fi
     # Only this explicit data-plane RBAC refusal is eligible for propagation
     # retry after the just-created assignment. Probe the required WRITE action
@@ -83,11 +86,24 @@ PGHOST=$(jq -er '.postgresFqdn.value' "$inventory")
 PGUSER=$(jq -er '.parameters.postgresAdministratorLogin.value | select(length > 0)' "$MAIN_PARAMETERS")
 PGPASSWORD=$(jq -er '.parameters.postgresAdministratorPassword.value | select(length > 0)' "$MAIN_PARAMETERS")
 vault=$(jq -er '.keyVaultName.value' "$inventory")
-capture "$private_dir/vault-id" az keyvault show --name "$vault" --query id --output tsv --only-show-errors
-vault_id=$(cat "$private_dir/vault-id")
-capture "$private_dir/role.json" az role assignment create --assignee-object-id "$BOOTSTRAP_PRINCIPAL_ID" \
-  --assignee-principal-type "$BOOTSTRAP_PRINCIPAL_TYPE" --role 'Key Vault Secrets Officer' --scope "$vault_id" --only-show-errors
-wait_for_keyvault_rbac
+schema_vault=$(jq -er '.schemaOwnerKeyVaultName.value' "$inventory")
+# Construct the owner URL before the write-authority probe; SQL role creation
+# remains after both vaults have accepted their first real secret.
+jq -nj --rawfile password "$secret_dir/elspeth-schema-owner-password" --arg host "$PGHOST" '
+  "postgresql+psycopg://elspeth_schema_owner:" + ($password | sub("\\n+$"; "") | @uri) + "@" + $host +
+  ":5432/elspeth_sessions?sslmode=verify-full&sslrootcert=system"
+  ' >"$private_dir/elspeth-session-db-url-schema-owner"
+for bootstrap_vault in "$schema_vault" "$vault"; do
+  capture "$private_dir/vault-id" az keyvault show --name "$bootstrap_vault" --query id --output tsv --only-show-errors
+  vault_id=$(cat "$private_dir/vault-id")
+  capture "$private_dir/role.json" az role assignment create --assignee-object-id "$BOOTSTRAP_PRINCIPAL_ID" \
+    --assignee-principal-type "$BOOTSTRAP_PRINCIPAL_TYPE" --role 'Key Vault Secrets Officer' --scope "$vault_id" --only-show-errors
+  if [[ "$bootstrap_vault" == "$schema_vault" ]]; then
+    wait_for_keyvault_rbac "$bootstrap_vault" elspeth-session-db-url-schema-owner "$private_dir/elspeth-session-db-url-schema-owner"
+  else
+    wait_for_keyvault_rbac "$bootstrap_vault" elspeth-secret-key "$secret_dir/elspeth-secret-key"
+  fi
+done
 
 # Do not create non-idempotent SQL roles until Key Vault access has propagated.
 export ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD ELSPETH_RUNTIME_A_PASSWORD ELSPETH_RUNTIME_B_PASSWORD
@@ -122,9 +138,13 @@ for value_file in "$private_dir"/elspeth-*-url-* "$private_dir"/elspeth-secret-k
   "$private_dir"/elspeth-shareable-link-signing-key "$private_dir"/elspeth-fingerprint-key \
   "$private_dir"/elspeth-operator-metrics-bearer-token; do
   name=${value_file##*/}
+  # Version receipts share the private directory but are never secret values.
+  if [[ "$name" == *.version ]]; then continue; fi
   # The permission proof already wrote this exact value and captured its version.
-  if [[ "$name" == elspeth-secret-key ]]; then continue; fi
-  capture "$private_dir/$name.version" az keyvault secret set --vault-name "$vault" --name "$name" \
+  if [[ "$name" == elspeth-secret-key || "$name" == elspeth-session-db-url-schema-owner ]]; then continue; fi
+  secret_vault=$vault
+  if [[ "$name" == *-schema-owner ]]; then secret_vault=$schema_vault; fi
+  capture "$private_dir/$name.version" az keyvault secret set --vault-name "$secret_vault" --name "$name" \
     --file "$value_file" --encoding utf-8 --query id --output tsv --only-show-errors
 done
 if [[ -n ${COMPOSER_ENDPOINT_SECRET_NAME:-} ]]; then
@@ -139,12 +159,18 @@ document=$(jq --slurpfile inventory "$inventory" '
   .parameters.identityClientId.value = $inventory[0].identityClientId.value
   ' "$output_dir/workload.parameters.json")
 printf '%s\n' "$document" >"$output_dir/workload.parameters.json"
+acceptance_urls=$(jq -n \
+  --rawfile session_a "$private_dir/elspeth-session-db-url-runtime-a.version" \
+  --rawfile landscape_a "$private_dir/elspeth-landscape-url-runtime-a.version" \
+  --rawfile session_b "$private_dir/elspeth-session-db-url-runtime-b.version" \
+  --rawfile landscape_b "$private_dir/elspeth-landscape-url-runtime-b.version" '
+  {a: {sessionDbUrl: ($session_a | rtrimstr("\n")), landscapeUrl: ($landscape_a | rtrimstr("\n"))},
+   b: {sessionDbUrl: ($session_b | rtrimstr("\n")), landscapeUrl: ($landscape_b | rtrimstr("\n"))}}')
+document=$(jq --argjson retained "$acceptance_urls" '.parameters.acceptanceRuntimeSecretUrls.value = $retained' \
+  "$output_dir/workload.parameters.json")
+printf '%s\n' "$document" >"$output_dir/workload.parameters.json"
 for role in a b; do
-  session_version=$(cat "$private_dir/elspeth-session-db-url-runtime-${role}.version")
-  landscape_version=$(cat "$private_dir/elspeth-landscape-url-runtime-${role}.version")
-  jq --arg role "$role" --arg session "$session_version" --arg landscape "$landscape_version" '
-    .parameters.sessionDbUrlRuntimeSecretUrl.value = $session |
-    .parameters.landscapeUrlRuntimeSecretUrl.value = $landscape |
+  jq --arg role "$role" '
     .parameters.runtimeRoleLabel.value = $role |
     .parameters.activeRevisionsMode.value = "Multiple" |
     .parameters.stickySessionsAffinity.value = "none" |

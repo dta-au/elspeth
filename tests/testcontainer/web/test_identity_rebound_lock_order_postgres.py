@@ -75,13 +75,19 @@ def _actor(identity_id: str) -> IdentityAdminActor:
 
 
 def _login(authority: RepositoryIdentityAuthority, claims: IdentityClaims, *, record_rebound: Any = _noop) -> Any:
+    # ``identity_dormancy_days`` is passed wide enough that R9 cannot fire on
+    # these fixtures: this file pins R3's lock order, and a dormancy re-pend
+    # sharing the same retry protocol would change which refusal a red here
+    # is reporting.
     return authority.ensure_identity(
         claims=claims,
         activate=False,
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
+        identity_dormancy_days=36_500,
         record_admission=_noop,
         record_rebound=record_rebound,
+        record_dormant=_noop,
     )
 
 
@@ -319,3 +325,65 @@ def test_two_replicas_rebounding_the_last_admin_leave_it_active(external_deploym
     assert row.disable_reason is None
     assert row.rebound_at is not None
     assert setup.count_active_human_admins() == 1
+
+
+def test_concurrent_dormant_admin_logins_preserve_one_active_human_admin(external_deployment_postgres_url: str) -> None:
+    """R9 uses R5's population-before-target order and re-counts after waiting."""
+    from datetime import timedelta
+
+    from sqlalchemy import update
+
+    from elspeth.web.coordination.identity_authority import IdentityDormancyExempted, IdentityDormant
+
+    url = _fresh_database(external_deployment_postgres_url, "dormancy_race")
+    engine = create_session_engine(url)
+    initialize_session_schema(engine)
+    authority = RepositoryIdentityAuthority(engine)
+    root = authority.bootstrap_admin(
+        claims=_claims("root", email="root@example.com"),
+        note="setup",
+        quota_tokens_per_day=None,
+        quota_storage_bytes=None,
+        record=_noop,
+    ).record
+    bob_id = _admin(authority, root.identity_id, "bob", "bob@example.com")
+    old = datetime.now(UTC) - timedelta(days=100)
+    with engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id.in_([root.identity_id, bob_id]))
+            .values(
+                last_login_at=old,
+                activated_at=old,
+            )
+        )
+    barrier = Barrier(2)
+    events: list[IdentityDormant | IdentityDormancyExempted] = []
+
+    def login(subject: str):
+        other_engine = create_session_engine(url, connect_args={"options": "-c lock_timeout=5000 -c statement_timeout=10000"})
+        try:
+            other = RepositoryIdentityAuthority(other_engine)
+            barrier.wait(timeout=10)
+            return other.ensure_identity(
+                claims=_claims(subject, email=f"{subject}@example.com"),
+                activate=False,
+                quota_tokens_per_day=None,
+                quota_storage_bytes=None,
+                record_admission=_noop,
+                record_rebound=_noop,
+                identity_dormancy_days=90,
+                record_dormant=events.append,
+            )
+        finally:
+            other_engine.dispose()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(login, subject) for subject in ("root", "bob")]
+        outcomes = [future.result(timeout=20) for future in futures]
+    assert sorted(outcome.record.access_state for outcome in outcomes) == ["active", "pending"]
+    assert authority.count_active_human_admins() == 1
+    assert sorted(isinstance(event, IdentityDormancyExempted) for event in events) == [False, True]
+    pending = next(outcome.record for outcome in outcomes if outcome.record.access_state == "pending")
+    assert _row(engine, pending.identity_id).disable_reason == "dormant"
+    engine.dispose()

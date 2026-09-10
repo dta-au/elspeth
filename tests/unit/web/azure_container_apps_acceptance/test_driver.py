@@ -151,7 +151,7 @@ elif args[:2] == ["group", "exists"]:
     print(os.environ.get("GROUP_EXISTS", "false"))
 elif args[:3] == ["deployment", "sub", "create"]:
     values = {
-        "keyVaultName": "elspeth-kv-unique", "logAnalyticsCustomerId": "workspace-id",
+        "keyVaultName": "elspeth-kv-unique", "schemaOwnerKeyVaultName": "elspeth-owner-kv-unique", "logAnalyticsCustomerId": "workspace-id",
         "postgresServerResourceId": "postgres-id", "environmentDefaultDomain": "example.test",
         "postgresFqdn": "example.test",
     }
@@ -203,7 +203,7 @@ elif args[:2] == ["graph", "query"]:
 elif args[:2] == ["keyvault", "show-deleted"]:
     emit({"properties": {"scheduledPurgeDate": "2027-01-01T00:00:00Z"}})
 elif args[:2] == ["keyvault", "list-deleted"]:
-    emit([])
+    emit(json.loads(os.environ.get("DELETED_VAULTS", "[]")))
 else:
     emit({})
 """
@@ -369,6 +369,26 @@ def test_complete_driver_orders_jobs_probes_receipts_and_cleanup(driver: DriverR
     assert all(command[command.index("--max-filesize") + 1] == "2097152" for command in requests)
 
 
+@pytest.mark.parametrize("resolved_path", [False, True], ids=["template", "concrete"])
+def test_standalone_probes_resolve_prepared_session_sink_path(driver: DriverRun, resolved_path: bool) -> None:
+    for name in ("P3_SESSION_ID", "P4_SESSION_ID", "P1_TRIAL_REQUESTS", "P2_SESSION_IDS"):
+        del driver.environment[name]
+    for stage in ("environment", "bootstrap", "prepare"):
+        result = driver.run(stage)
+        assert result.returncode == 0, result.stderr
+    sessions = json.loads((driver.evidence / "prepared-sessions.json").read_text())
+    sink_path = driver.environment["P3_SINK_PATH"].replace("{session_id}", sessions["p3"])
+    if resolved_path:
+        driver.environment["P3_SINK_PATH"] = sink_path
+
+    result = driver.run("probes")
+
+    assert result.returncode == 0, result.stderr
+    takeover = next(command for command in driver.commands() if "takeover" in command)
+    assert takeover[takeover.index("--session-id") + 1] == sessions["p3"]
+    assert takeover[takeover.index("--sink-path") + 1] == sink_path
+
+
 @pytest.mark.parametrize("trials", ["0", "1", "19", "-1", "1.5", "x"])
 def test_weak_trials_fail_before_live_probe(driver: DriverRun, trials: str) -> None:
     driver.environment["PROBE_TRIALS"] = trials
@@ -433,8 +453,20 @@ def test_purge_refusal_records_real_scheduled_tombstone(driver: DriverRun) -> No
     result = driver.run("all")
     assert result.returncode == 0, result.stderr
     cleanup = next(command for command in driver.commands() if "resource-graph-cleanup-validate" in command)
-    assert "--scheduled-purge-date" in cleanup
-    assert cleanup[cleanup.index("--scheduled-purge-date") + 1] == "2027-01-01T00:00:00Z"
+    assert "--runtime-scheduled-purge-date" in cleanup
+    assert cleanup[cleanup.index("--runtime-scheduled-purge-date") + 1] == "2027-01-01T00:00:00Z"
+    assert cleanup[cleanup.index("--schema-owner-scheduled-purge-date") + 1] == "2027-01-01T00:00:00Z"
+
+
+def test_cleanup_records_mixed_vault_fates(driver: DriverRun) -> None:
+    driver.environment["FAIL_AT"] = "az keyvault purge --name elspeth-kv-unique"
+    result = driver.run("all")
+    assert result.returncode == 0, result.stderr
+    cleanup = next(command for command in driver.commands() if "resource-graph-cleanup-validate" in command)
+    assert cleanup[cleanup.index("--runtime-scheduled-purge-date") + 1] == "2027-01-01T00:00:00Z"
+    assert "--schema-owner-key-vault-purged" in cleanup
+    assert "--runtime-key-vault-purged" not in cleanup
+    assert "--schema-owner-scheduled-purge-date" not in cleanup
 
 
 def test_existing_group_is_never_deleted(driver: DriverRun) -> None:
@@ -599,3 +631,42 @@ def test_standalone_single_revision_rejects_missing_auth_before_deployment(drive
     assert result.returncode != 0
     assert "set existing acceptance bearer token" in result.stderr
     assert driver.commands() == before
+
+
+def test_cleanup_purges_both_vaults(driver: DriverRun) -> None:
+    result = driver.run("all")
+    assert result.returncode == 0, result.stderr
+    purges = [command for command in driver.commands() if command[:3] == ["az", "keyvault", "purge"]]
+    assert {command[command.index("--name") + 1] for command in purges} == {"elspeth-kv-unique", "elspeth-owner-kv-unique"}
+    cleanup = next(command for command in driver.commands() if "resource-graph-cleanup-validate" in command)
+    assert "--runtime-key-vault-purged" in cleanup
+    assert "--schema-owner-key-vault-purged" in cleanup
+
+
+def test_partial_deployment_cleanup_discovers_all_group_vaults(driver: DriverRun) -> None:
+    driver.environment["FAIL_AT"] = "az deployment sub create"
+    group = "elspeth-acc-" + driver.environment["ACCEPTANCE_RUN_ID"]
+    driver.environment["DELETED_VAULTS"] = json.dumps(
+        [
+            {
+                "name": name,
+                "properties": {"vaultId": f"/subscriptions/sub/resourceGroups/{group}/providers/Microsoft.KeyVault/vaults/{name}"},
+            }
+            for name in ("runtime-vault", "owner-vault")
+        ]
+    )
+    result = driver.run("all")
+    assert result.returncode != 0
+    purges = [command for command in driver.commands() if command[:3] == ["az", "keyvault", "purge"]]
+    assert {command[command.index("--name") + 1] for command in purges} == {"runtime-vault", "owner-vault"}
+    assert not (driver.evidence / "binding.json").exists()
+    assert not (driver.evidence / "resource-graph-cleanup.receipt.json").exists()
+
+
+def test_partial_deployment_before_vault_creation_cleans_up_without_receipt(driver: DriverRun) -> None:
+    driver.environment["FAIL_AT"] = "az deployment sub create"
+    result = driver.run("all")
+    assert result.returncode == 17
+    assert "cleanup_failed" not in result.stderr
+    assert not any(command[:3] == ["az", "keyvault", "purge"] for command in driver.commands())
+    assert not (driver.evidence / "resource-graph-cleanup.receipt.json").exists()

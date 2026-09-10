@@ -373,13 +373,13 @@ def test_cli_takeover_after_resumable_snapshot_defers_all_web_projection(recover
 
 @pytest.mark.parametrize(
     "terminal_status,web_status,blob_status",
-    [("failed", "failed", "ready"), ("interrupted", "cancelled", "error")],
+    [("failed", "failed", "error"), ("interrupted", "cancelled", "error")],
 )
 def test_resumable_terminal_projection_preserves_original_landscape_result(
     recovery_databases, tmp_path, terminal_status, web_status, blob_status
 ):
     session_url, landscape_url = recovery_databases
-    run_id, session_id, owner, blob_id, _ = _process(
+    run_id, session_id, owner, blob_id, storage_path = _process(
         _die_after_engine_result,
         session_url,
         landscape_url,
@@ -387,12 +387,17 @@ def test_resumable_terminal_projection_preserves_original_landscape_result(
         terminal_status,
         expected_exit=73,
     )
+    assert Path(storage_path).read_bytes() == _OUTPUT
     _expire_dead_owner(session_url, session_id, owner)
     with LandscapeDB.from_url(landscape_url, create_tables=False) as db:
         original = RecorderFactory(db).run_lifecycle.get_run(run_id)
     _process(_run_reconciler, session_url, landscape_url, str(tmp_path), False, expected_exit=0)
     run, blob, events = _web_snapshot(session_url, run_id, blob_id)
     assert (run.status, run.saga_state, blob.status, len(events)) == (web_status, "terminal", blob_status, 1)
+    assert events[0].event_type == web_status
+    assert blob.content_hash is None
+    assert blob.size_bytes == 0
+    assert not Path(storage_path).exists()
     with LandscapeDB.from_url(landscape_url, create_tables=False) as db:
         current = RecorderFactory(db).run_lifecycle.get_run(run_id)
     assert current.status == original.status

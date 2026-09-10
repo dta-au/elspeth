@@ -1,7 +1,8 @@
 // ELSPETH on Azure Container Apps — workload (resource-group scope).
 //
 // One container app plus the manual Jobs, all on the same digest, the same
-// NFS mount and the same user-assigned identity. Every secret is a versioned
+// NFS mount. Schema init has a separate identity; the provisioner has none.
+// Every secret is a versioned
 // Key Vault reference; nothing here carries a secret value.
 targetScope = 'resourceGroup'
 
@@ -10,6 +11,14 @@ param environmentResourceId string
 
 @description('Resource id of the user-assigned identity from environment.bicep.')
 param identityResourceId string
+
+@description('Client id of the runtime user-assigned identity; selects it in DefaultAzureCredential.')
+@minLength(36)
+@maxLength(36)
+param identityClientId string
+
+@description('Dedicated schema-init identity; only this identity can read the schema-owner vault.')
+param schemaOwnerIdentityResourceId string
 
 @description('Name of the NFS storage definition on the environment.')
 param nfsStorageName string = 'elspeth'
@@ -21,7 +30,6 @@ param deployWebApp bool = true
 param verifyBlobManagedIdentity bool = false
 param blobAccountUrl string = ''
 param blobContainerName string = ''
-param identityClientId string = ''
 
 @description('Full source commit SHA of the digest-pinned candidate; binds membership and telemetry to the published release.')
 @minLength(40)
@@ -75,8 +83,23 @@ param terminationGracePeriodSeconds int = 60
 param composerTransportIdleCeilingSeconds int
 
 @description('Label distinguishing the runtime role a revision runs as; empty in production, a or b in the acceptance (two revisions, two roles).')
-@maxLength(8)
+@allowed(['', 'a', 'b'])
 param runtimeRoleLabel string = ''
+
+@sealed()
+type databaseSecretUrls = {
+  sessionDbUrl: string
+  landscapeUrl: string
+}
+
+@sealed()
+type acceptanceSecretUrls = {
+  a: databaseSecretUrls
+  b: databaseSecretUrls
+}
+
+@description('Both acceptance roles, retained identically on every app deployment. Required when runtimeRoleLabel is a or b.')
+param acceptanceRuntimeSecretUrls acceptanceSecretUrls?
 
 @description('CPU for the web container (Consumption pairs: 0.5/1Gi, 1.0/2Gi, 2.0/4Gi).')
 param webCpu string = '1.0'
@@ -147,7 +170,7 @@ var applicationSecrets = [
   }
 ]
 
-var runtimeSecrets = concat(applicationSecrets, [
+var productionDatabaseSecrets = [
   {
     name: 'session-db-url'
     keyVaultUrl: sessionDbUrlRuntimeSecretUrl
@@ -158,18 +181,30 @@ var runtimeSecrets = concat(applicationSecrets, [
     keyVaultUrl: landscapeUrlRuntimeSecretUrl
     identity: identityResourceId
   }
-], composerSecret)
+]
 
-var schemaOwnerSecrets = concat(applicationSecrets, [
+var acceptanceDatabaseSecrets = acceptanceRuntimeSecretUrls == null ? [] : [
+  { name: 'session-db-url-a', keyVaultUrl: acceptanceRuntimeSecretUrls!.a.sessionDbUrl, identity: identityResourceId }
+  { name: 'landscape-url-a', keyVaultUrl: acceptanceRuntimeSecretUrls!.a.landscapeUrl, identity: identityResourceId }
+  { name: 'session-db-url-b', keyVaultUrl: acceptanceRuntimeSecretUrls!.b.sessionDbUrl, identity: identityResourceId }
+  { name: 'landscape-url-b', keyVaultUrl: acceptanceRuntimeSecretUrls!.b.landscapeUrl, identity: identityResourceId }
+]
+var runtimeSecrets = concat(applicationSecrets, productionDatabaseSecrets, acceptanceDatabaseSecrets, composerSecret)
+
+var schemaOwnerSecrets = concat(map(applicationSecrets, secret => {
+  name: secret.name
+  keyVaultUrl: secret.keyVaultUrl
+  identity: schemaOwnerIdentityResourceId
+}), [
   {
     name: 'session-db-url'
     keyVaultUrl: sessionDbUrlSchemaOwnerSecretUrl
-    identity: identityResourceId
+    identity: schemaOwnerIdentityResourceId
   }
   {
     name: 'landscape-url'
     keyVaultUrl: landscapeUrlSchemaOwnerSecretUrl
-    identity: identityResourceId
+    identity: schemaOwnerIdentityResourceId
   }
 ])
 
@@ -226,7 +261,7 @@ var contractEnvironment = [
   }
 ]
 
-var secretEnvironment = [
+var databaseSecretEnvironment = [
   {
     name: 'ELSPETH_WEB__SESSION_DB_URL'
     secretRef: 'session-db-url'
@@ -235,6 +270,9 @@ var secretEnvironment = [
     name: 'ELSPETH_WEB__LANDSCAPE_URL'
     secretRef: 'landscape-url'
   }
+]
+
+var applicationSecretEnvironment = [
   {
     name: 'ELSPETH_WEB__SECRET_KEY'
     secretRef: 'secret-key'
@@ -253,8 +291,14 @@ var secretEnvironment = [
   }
 ]
 
-var webEnvironment = concat(contractEnvironment, secretEnvironment, composerEnv, extraEnvironment)
-var doctorEnvironment = concat(contractEnvironment, secretEnvironment)
+var runtimeSecretEnvironment = concat([
+  { name: 'ELSPETH_WEB__SESSION_DB_URL', secretRef: 'session-db-url${jobSuffix}' }
+  { name: 'ELSPETH_WEB__LANDSCAPE_URL', secretRef: 'landscape-url${jobSuffix}' }
+], applicationSecretEnvironment)
+var runtimeIdentityEnvironment = [{ name: 'AZURE_CLIENT_ID', value: identityClientId }]
+var webEnvironment = concat(contractEnvironment, runtimeSecretEnvironment, runtimeIdentityEnvironment, composerEnv, extraEnvironment)
+var doctorEnvironment = concat(contractEnvironment, databaseSecretEnvironment, applicationSecretEnvironment)
+var runtimeDoctorEnvironment = concat(contractEnvironment, runtimeSecretEnvironment, runtimeIdentityEnvironment)
 
 var stateVolumes = [
   {
@@ -380,7 +424,7 @@ module containerApp 'br/public:avm/res/app/container-app:0.23.0' = if (deployWeb
 }
 
 // ---------------------------------------------------------------------------
-// Jobs (Manual, no retry): same mount and identity as the app.
+// Jobs (Manual, no retry): same mount, least-privilege identities.
 // ---------------------------------------------------------------------------
 module provisionStorageJob 'br/public:avm/res/app/job:0.7.2' = {
   name: 'provision-storage-job'
@@ -397,7 +441,6 @@ module provisionStorageJob 'br/public:avm/res/app/job:0.7.2' = {
     }
     replicaRetryLimit: 0
     replicaTimeout: 600
-    managedIdentities: managedIdentities
     volumes: stateVolumes
     containers: [
       {
@@ -433,8 +476,8 @@ module doctorSchemaInitJob 'br/public:avm/res/app/job:0.7.2' = {
     }
     replicaRetryLimit: 0
     replicaTimeout: 1800
-    managedIdentities: managedIdentities
-    registries: registries
+    managedIdentities: { userAssignedResourceIds: [schemaOwnerIdentityResourceId] }
+    registries: [{ server: registryServer, identity: schemaOwnerIdentityResourceId }]
     secrets: schemaOwnerSecrets
     volumes: stateVolumes
     containers: [
@@ -486,7 +529,7 @@ module doctorRuntimeJob 'br/public:avm/res/app/job:0.7.2' = {
           'deployment'
           '--json'
         ]
-        env: doctorEnvironment
+        env: runtimeDoctorEnvironment
         resources: {
           cpu: json('0.5')
           memory: '1Gi'

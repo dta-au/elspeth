@@ -29,10 +29,17 @@ set into status codes. They add no rule of their own.
 
 What a pending row shows
 ------------------------
-A ``pending`` identity has not been admitted; until it is, the list exposes
-its subject and organisation and nothing else (spec rev2.2), so the queue an
-administrator reviews does not become a directory of everyone who ever
-tried to log in. ``raw_claims_json`` is never returned for any state.
+A ``pending`` identity that has NEVER been admitted has no standing here;
+until it is admitted, the list exposes its subject and organisation and
+nothing else (spec rev2.2), so the queue an administrator reviews does not
+become a directory of everyone who ever tried to log in.
+
+A pending row with an ``activated_at`` is a different thing and is shown in
+full: R9's dormancy re-pend returns a person the container already admitted
+to the queue, and their profile is one this deployment has legitimately held
+since their first login. Withholding it would only hide who the
+administrator is being asked to re-admit. ``raw_claims_json`` is never
+returned for any state.
 """
 
 from __future__ import annotations
@@ -154,8 +161,11 @@ class AssertRelationshipRequest(_Provenance):
 class IdentityView(_StrictModel):
     """One identity as an administrator sees it. Never ``raw_claims_json``.
 
-    For a ``pending`` row every field after ``organisation_id`` that would
-    identify the person beyond their subject is ``None`` (spec rev2.2).
+    For a NEVER-ADMITTED ``pending`` row -- ``access_state='pending'`` with
+    no ``activated_at`` -- every field after ``organisation_id`` that would
+    identify the person beyond their subject is ``None`` (spec rev2.2). A row
+    R9 re-pended for dormancy has an ``activated_at`` and is shown in full;
+    see the module docstring.
     """
 
     identity_id: str
@@ -241,7 +251,20 @@ class DisableResponse(_StrictModel):
 
 
 def _identity_view(summary: IdentitySummary) -> IdentityView:
-    pending = summary.access_state == "pending"
+    # NEVER-ADMITTED pending rows are the ones blanked, not every pending row,
+    # and the second term is what R9 made necessary.  The rev2.2 rule exists
+    # so the queue does not become a directory of everyone who ever TRIED to
+    # log in; a dormancy re-pend puts a person the container ALREADY admitted
+    # back into that queue, with an ``activated_at``, a profile it has held
+    # since their first login and a ``last_login_at`` that is the very reason
+    # the row is pending.  Blanking them costs the administrator the identity
+    # of the person they are being asked to re-admit, and positively asserts
+    # ``last_login_at`` is NULL -- which everywhere else in this system,
+    # R9's own NULL exemption included, means "has never logged in".
+    #
+    # The same predicate, for the same reason, as the ``activated_at IS NULL``
+    # term ``_PENDING_ROWS`` takes for the lazy purge.
+    pending = summary.access_state == "pending" and summary.activated_at is None
     return IdentityView(
         identity_id=summary.identity_id,
         provider=summary.provider,
@@ -728,6 +751,11 @@ def _record_activation(
         note=event.note,
         role=None if event.role is None else event.role.role,
         role_id=None if event.role is None else event.role.role_id,
+        # The grants the identity was ALREADY holding. Since R9 an activation
+        # can grant nothing and still return someone to deployment ``admin``:
+        # a re-pended identity keeps its role rows, so ``role=None`` here no
+        # longer means the person came back with no authority.
+        retained_roles=tuple((grant.role, grant.scope) for grant in event.retained_roles),
         tokens_per_day=settings.quota_default_tokens_per_day if event.quota_written else None,
         storage_bytes=settings.quota_default_storage_bytes if event.quota_written else None,
         on_behalf_of=event.on_behalf_of,

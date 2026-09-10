@@ -68,6 +68,10 @@ from elspeth.web.sessions.schema import initialize_session_schema
 
 _TOKENS = 50_000
 _STORAGE = 1_073_741_824
+# R9's window. The container default is 90; these tests pass it explicitly at
+# every login so a test that means "dormant" cannot be made true or false by
+# an edit to ``WebSettings``.
+_DORMANCY_DAYS = 90
 
 
 @pytest.fixture
@@ -139,8 +143,10 @@ def _pending(authority: RepositoryIdentityAuthority, subject: str) -> IdentityRe
         activate=False,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=_noop,
         record_rebound=_noop,
+        record_dormant=_noop,
     ).record
 
 
@@ -562,8 +568,10 @@ def test_a_first_login_binds_to_the_pre_provisioned_row(authority) -> None:
         activate=False,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=_noop,
         record_rebound=_noop,
+        record_dormant=_noop,
     )
     assert outcome.created is False
     assert outcome.record.identity_id == provisioned.record.identity_id
@@ -971,8 +979,10 @@ def test_ensure_identity_lands_pending_and_writes_no_quota(engine, authority) ->
         activate=False,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=_noop,
         record_rebound=_noop,
+        record_dormant=_noop,
     )
     assert outcome.created is True and outcome.record.access_state == "pending"
     assert _quota_rows(engine, outcome.record.identity_id) == []
@@ -989,8 +999,10 @@ def test_ensure_identity_admission_audit_reports_the_written_allowance(authority
         activate=True,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=record_admission,
         record_rebound=_noop,
+        record_dormant=_noop,
     )
     assert seen == [(outcome.record.identity_id, "ada", True)]
     assert outcome.activated_now is True and outcome.quota_written is True
@@ -1006,8 +1018,10 @@ def test_a_failed_admission_audit_rolls_the_activation_back(engine, authority) -
             activate=True,
             quota_tokens_per_day=_TOKENS,
             quota_storage_bytes=_STORAGE,
+            identity_dormancy_days=_DORMANCY_DAYS,
             record_admission=refuse,
             record_rebound=_noop,
+            record_dormant=_noop,
         )
     assert authority.read_identity_by_natural_key(provider="local", subject="ada") is None
 
@@ -1019,8 +1033,10 @@ def test_a_returning_login_never_upgrades_or_downgrades(authority) -> None:
         activate=True,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=_noop,
         record_rebound=_noop,
+        record_dormant=_noop,
     )
     assert again.created is False and again.record.identity_id == pending.identity_id
     assert again.record.access_state == "pending"
@@ -1043,8 +1059,10 @@ def test_the_loser_of_a_first_login_race_binds_to_the_winner(engine, authority, 
         activate=True,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=_noop,
         record_rebound=_noop,
+        record_dormant=_noop,
     )
     assert outcome.created is False and outcome.activated_now is False
     with engine.connect() as conn:
@@ -1127,14 +1145,23 @@ def _sso_claims(subject: str = "ada", *, email: str | None = "ada@example.com", 
     return _claims(subject, provider=provider, email=email)
 
 
-def _login(authority: RepositoryIdentityAuthority, claims: IdentityClaims, *, record_rebound: Any = _noop) -> Any:
+def _login(
+    authority: RepositoryIdentityAuthority,
+    claims: IdentityClaims,
+    *,
+    record_rebound: Any = _noop,
+    record_dormant: Any = _noop,
+    identity_dormancy_days: int = _DORMANCY_DAYS,
+) -> Any:
     return authority.ensure_identity(
         claims=claims,
         activate=False,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=identity_dormancy_days,
         record_admission=_noop,
         record_rebound=record_rebound,
+        record_dormant=record_dormant,
     )
 
 
@@ -1416,3 +1443,878 @@ def test_an_ordinary_re_enable_does_not_adopt_the_current_address_as_the_baselin
 
     row = _identity_row(engine, first.record.identity_id)
     assert row.subject_email_at_first_seen == "ada@old.example"
+
+
+# --------------------------------------------------------------------------
+# R9 / D34: the identity has been dormant longer than the container's window.
+#
+# The recycled-mailbox case R3 cannot see, because the email did not change.
+# ``identity_dormancy_days`` shipped as a validated-only setting; nothing read
+# it until this landed. Every case below asserts the ROW, because R9's whole
+# consequence is what the identity looks like afterwards -- plus the one
+# callback assertion that proves an ``identity_disabled`` event is written
+# for a re-pend and NOT for D34's exemption.
+# --------------------------------------------------------------------------
+
+
+def _as_utc(value: datetime) -> datetime:
+    """SQLite hands back a naive datetime; the database clock value is aware."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _backdate_login(engine, identity_id: str, *, days: int, seconds: int = 0) -> datetime:
+    """Move ``last_login_at`` into the past; returns the value written.
+
+    Dormancy is measured against the DATABASE clock, so the test moves the
+    stored login rather than the clock: there is no way to advance the
+    database's own ``CURRENT_TIMESTAMP`` from here, and mocking it would
+    prove the mock rather than the predicate.
+    """
+    stamped = datetime.now(UTC) - timedelta(days=days, seconds=seconds)
+    with engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == identity_id)
+            .values(last_login_at=stamped, activated_at=stamped)
+        )
+    return stamped
+
+
+def _active_sso_identity(authority: RepositoryIdentityAuthority, actor: IdentityAdminActor, subject: str) -> IdentityRecord:
+    """An ACTIVE IdP identity: R9 only re-pends a row that is currently active."""
+    record = _login(authority, _sso_claims(subject, email=f"{subject}@example.com")).record
+    _activate(authority, actor, record.identity_id)
+    return record
+
+
+def _active_sso_admin(authority: RepositoryIdentityAuthority, actor: IdentityAdminActor, subject: str) -> tuple[IdentityRecord, Any]:
+    """An ACTIVE IdP identity holding a deployment-wide ``admin``, and that grant.
+
+    Admitted with ``role="none"`` and granted ``admin`` afterwards, not
+    admitted with a workload role and promoted: R8 refuses ``admin`` beside
+    ``user`` in either order, so the two-step is the only way to reach an
+    admin holder through the ordinary routes.
+    """
+    record = _login(authority, _sso_claims(subject, email=f"{subject}@example.com")).record
+    _activate(authority, actor, record.identity_id, role="none")
+    return record, _grant(authority, actor, record.identity_id, "admin")
+
+
+def test_first_login_collision_rechecks_the_winners_verified_email(authority, monkeypatch) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    original_once = RepositoryIdentityAuthority._ensure_identity_once
+    first_attempt = True
+
+    def competing_login(self, **kwargs):
+        nonlocal first_attempt
+        if first_attempt:
+            first_attempt = False
+            competing = dict(kwargs)
+            competing["claims"] = _sso_claims("ada", email="previous@example.com")
+            original_once(self, **competing)
+            raise IntegrityError("natural-key collision", {}, RuntimeError("winner inserted"))
+        return original_once(self, **kwargs)
+
+    monkeypatch.setattr(RepositoryIdentityAuthority, "_ensure_identity_once", competing_login)
+    outcome = _login(authority, _sso_claims("ada", email="replacement@example.com"))
+    assert outcome.rebound_refused is True
+    assert outcome.record.access_state == "disabled"
+    assert authority.read_identity_summary(identity_id=outcome.record.identity_id).disable_reason == "rebound"
+
+
+def test_a_delayed_reactivation_starts_a_fresh_dormancy_window(engine, authority) -> None:
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    ada = _active_sso_identity(authority, actor, "ada")
+    _backdate_login(engine, ada.identity_id, days=400)
+    assert _login(authority, _sso_claims("ada")).record.access_state == "pending"
+    # Approval takes longer than the dormancy window after the refused login.
+    _backdate_login(engine, ada.identity_id, days=200)
+    _activate(authority, actor, ada.identity_id, role="none")
+    assert _login(authority, _sso_claims("ada")).record.access_state == "active"
+
+
+@pytest.mark.parametrize("days", [1_000_000_000, 10**100])
+def test_large_valid_dormancy_window_does_not_overflow(engine, authority, days) -> None:
+    root = _sso_bootstrap(authority, "root")
+    ada = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+    _backdate_login(engine, ada.identity_id, days=400)
+    assert _login(authority, _sso_claims("ada"), identity_dormancy_days=days).record.access_state == "active"
+
+
+@pytest.mark.parametrize("sole_admin", [False, True])
+def test_dormancy_event_preserves_actual_login_when_activation_is_newer(engine, authority, sole_admin) -> None:
+    root = _sso_bootstrap(authority, "root")
+    if sole_admin:
+        record = root.record
+        claims = _sso_claims("root", email="root@old.example")
+    else:
+        record = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+        claims = _sso_claims("ada")
+    actual_login = _backdate_login(engine, record.identity_id, days=400)
+    with engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == record.identity_id)
+            .values(activated_at=datetime.now(UTC) - timedelta(days=200))
+        )
+    events = _Recorder()
+    outcome = _login(authority, claims, record_dormant=events)
+    assert outcome.record.access_state == ("active" if sole_admin else "pending")
+    assert len(events.outcomes) == 1
+    assert events.outcomes[0].last_login_at == actual_login
+
+
+def test_failed_exemption_audit_preserves_dormancy_for_the_next_attempt(engine, authority) -> None:
+    root = _sso_bootstrap(authority, "root")
+    stamped = _backdate_login(engine, root.record.identity_id, days=400)
+
+    def refuse(event):
+        raise RuntimeError("audit unavailable")
+
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        _login(authority, _sso_claims("root", email="root@old.example"), record_dormant=refuse)
+    assert _as_utc(_identity_row(engine, root.record.identity_id).last_login_at) == _as_utc(stamped)
+    events = _Recorder()
+    outcome = _login(authority, _sso_claims("root", email="root@old.example"), record_dormant=events)
+    assert outcome.record.access_state == "active"
+    assert [type(event).__name__ for event in events.outcomes] == ["IdentityDormancyExempted"]
+
+
+def test_dormancy_re_pends_the_identity_and_writes_the_disable_event(engine, authority) -> None:
+    """The whole of R9 on an ordinary identity, in one pass."""
+    root = _sso_bootstrap(authority, "root")
+    ada = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+    stamped = _backdate_login(engine, ada.identity_id, days=_DORMANCY_DAYS, seconds=1)
+    recorder = _Recorder()
+
+    outcome = _login(authority, _sso_claims("ada"), record_dormant=recorder)
+
+    assert outcome.record.access_state == "pending"
+    assert outcome.dormancy_exempted_since is None
+    row = _identity_row(engine, ada.identity_id)
+    assert row.access_state == "pending"
+    assert row.disable_reason == "dormant"
+    # Actor ``system``: no administrator decided this, so none is named.
+    assert row.disabled_by_identity_id is None
+    assert row.disabled_at is not None
+    # The login still stamps: the person DID authenticate, and the next
+    # dormancy measurement must run from this moment, not from the one that
+    # tripped it.
+    assert row.last_login_at is not None and _as_utc(row.last_login_at) > _as_utc(stamped)
+    assert [type(event).__name__ for event in recorder.outcomes] == ["IdentityDormant"]
+    assert recorder.outcomes[0].record.access_state == "pending"
+    assert recorder.outcomes[0].dormancy_days == _DORMANCY_DAYS
+    assert _as_utc(recorder.outcomes[0].last_login_at) == _as_utc(stamped)
+
+
+def test_dormancy_reads_the_container_window_rather_than_a_hardcoded_number(engine, authority) -> None:
+    """The mutation-derivation half (spec §Workflow governance): the guard derives from its authority.
+
+    ONE row, TWO windows. A guard that hardcoded 90 -- or that compared
+    against ``first_seen_at`` -- passes the fire test above and fails here.
+    """
+    root = _sso_bootstrap(authority, "root")
+    ada = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+    _backdate_login(engine, ada.identity_id, days=120)
+
+    widened = _login(authority, _sso_claims("ada"), identity_dormancy_days=365)
+
+    assert widened.record.access_state == "active"
+    assert _identity_row(engine, ada.identity_id).access_state == "active"
+
+    _backdate_login(engine, ada.identity_id, days=120)
+    narrowed = _login(authority, _sso_claims("ada"), identity_dormancy_days=30)
+
+    assert narrowed.record.access_state == "pending"
+
+
+def test_the_dormancy_predicate_admits_the_window_itself_and_refuses_one_second_more() -> None:
+    """The boundary, exactly, against a clock the test controls.
+
+    R9 refuses an identity "dormant longer than" the window, so the window
+    itself is still admitted. That tie cannot be pinned through a login: the
+    comparison runs against the DATABASE clock, read inside the transaction,
+    and SQLite truncates ``CURRENT_TIMESTAMP`` to the second -- a test that
+    stored ``now - 90 days`` from Python and asserted the row survived would
+    be measuring sub-second jitter, and would pass whether the predicate
+    said ``<`` or ``<=``. Measured: it did. The predicate takes ``now`` as an
+    argument precisely so the tie is decidable somewhere.
+    """
+    from elspeth.web.coordination.identity_authority import _dormant_since
+
+    now = datetime(2026, 9, 10, 12, 0, 0, tzinfo=UTC)
+    assert _dormant_since(now - timedelta(days=90), now=now, dormancy_days=90) is None
+    assert _dormant_since(now - timedelta(days=90, seconds=1), now=now, dormancy_days=90) == now - timedelta(days=90, seconds=1)
+    # And the window is the argument, not a constant: the same instant reads
+    # both ways under two containers' settings.
+    assert _dormant_since(now - timedelta(days=90), now=now, dormancy_days=30) is not None
+    assert _dormant_since(now - timedelta(days=90), now=now, dormancy_days=365) is None
+    # A naive stored value (SQLite hands back naive datetimes) is read as UTC
+    # rather than raising when compared with the aware clock value. Built by
+    # stripping the tzinfo rather than written as a literal, which is how
+    # SQLite produces it and what the lint rule against naive literals wants.
+    naive = (now - timedelta(days=200)).replace(tzinfo=None)
+    assert _dormant_since(naive, now=now, dormancy_days=90) is not None
+    old_login = now - timedelta(days=200)
+    assert _dormant_since(old_login, now=now, dormancy_days=90, activated_at=now - timedelta(days=90)) is None
+    assert _dormant_since(old_login, now=now, dormancy_days=90, activated_at=now - timedelta(days=91)) == old_login
+
+
+def test_dormancy_is_measured_across_a_real_login_on_both_sides_of_the_window(engine, authority) -> None:
+    """The same boundary through the login path, with a margin the clock cannot cross.
+
+    Five seconds either side of the window, rather than the window itself:
+    the tie belongs to the predicate test above, and this one proves the
+    login path reaches that predicate with the right two values.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    ada = _active_sso_identity(authority, actor, "ada")
+    bob = _active_sso_identity(authority, actor, "bob")
+    _backdate_login(engine, ada.identity_id, days=_DORMANCY_DAYS, seconds=-5)
+    _backdate_login(engine, bob.identity_id, days=_DORMANCY_DAYS, seconds=5)
+
+    # Each login carries the subject's OWN address: ``_sso_claims`` defaults
+    # to ada's, and handing it to bob would trip R3 instead of R9.
+    assert _login(authority, _sso_claims("ada", email="ada@example.com")).record.access_state == "active"
+    assert _login(authority, _sso_claims("bob", email="bob@example.com")).record.access_state == "pending"
+
+
+def test_a_never_used_identity_is_not_infinitely_dormant(engine, authority) -> None:
+    """NULL ``last_login_at`` is a pre-provisioned row, not a dormant one.
+
+    The column is nullable precisely so dormancy is not falsified, and
+    re-pending the pre-provisioned cohort on their FIRST login would rebuild
+    the wall pre-provisioning exists to remove.
+    """
+    root = _sso_bootstrap(authority, "root")
+    provisioned = authority.pre_provision_identity(
+        actor=_actor(root.record.identity_id),
+        provider="vanguard",
+        subject="ada",
+        username=None,
+        organisation_id=None,
+        role="user",
+        note="onboarding cohort",
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record=_noop,
+    )
+    _age_identity(engine, provisioned.record.identity_id, days=400)
+    assert _identity_row(engine, provisioned.record.identity_id).last_login_at is None
+    recorder = _Recorder()
+
+    outcome = _login(authority, _sso_claims("ada"), record_dormant=recorder)
+
+    assert outcome.record.access_state == "active"
+    assert recorder.outcomes == []
+    row = _identity_row(engine, provisioned.record.identity_id)
+    assert row.access_state == "active" and row.disable_reason is None
+    # And it is measurable from the second login onward, which is what makes
+    # the exemption a start rather than a hole.
+    assert row.last_login_at is not None
+
+
+def test_dormancy_leaves_a_pending_or_disabled_row_exactly_as_it_found_it(engine, authority) -> None:
+    """R9 acts on ACTIVE rows only: a login never upgrades or downgrades any other state."""
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    waiting = _login(authority, _sso_claims("ada")).record
+    shut = _active_sso_identity(authority, actor, "bob")
+    authority.disable_identity(actor=actor, identity_id=shut.identity_id, reason="leave of absence", record=_noop)
+    disabled_before = _identity_row(engine, shut.identity_id)
+    _backdate_login(engine, waiting.identity_id, days=400)
+    _backdate_login(engine, shut.identity_id, days=400)
+    recorder = _Recorder()
+
+    _login(authority, _sso_claims("ada", email="ada@example.com"), record_dormant=recorder)
+    _login(authority, _sso_claims("bob", email="bob@example.com"), record_dormant=recorder)
+
+    still_pending = _identity_row(engine, waiting.identity_id)
+    assert still_pending.access_state == "pending"
+    # Not restamped: nothing transitioned, so nothing may claim it did.
+    assert still_pending.disable_reason is None and still_pending.disabled_at is None
+    still_disabled = _identity_row(engine, shut.identity_id)
+    assert still_disabled.access_state == "disabled"
+    assert still_disabled.disable_reason == "leave of absence"
+    assert still_disabled.disabled_at == disabled_before.disabled_at
+    assert still_disabled.disabled_by_identity_id == disabled_before.disabled_by_identity_id
+    assert recorder.outcomes == []
+
+
+def test_dormancy_of_the_last_active_human_admin_leaves_them_active_and_admitted(engine, authority) -> None:
+    """D34. Without it a single-admin container reaches zero active admins at day 91 by doing nothing."""
+    root = _sso_bootstrap(authority, "root")
+    assert authority.count_active_human_admins() == 1
+    stamped = _backdate_login(engine, root.record.identity_id, days=400)
+    recorder = _Recorder()
+
+    outcome = _login(authority, _sso_claims("root", email="root@old.example"), record_dormant=recorder)
+
+    # The login the window was measured from, which the caller needs to write
+    # the exemption row: this transaction has already overwritten the column.
+    assert outcome.dormancy_exempted_since is not None
+    assert _as_utc(outcome.dormancy_exempted_since) == _as_utc(stamped)
+    assert outcome.record.access_state == "active"
+    row = _identity_row(engine, root.record.identity_id)
+    assert row.access_state == "active"
+    assert row.disable_reason is None and row.disabled_at is None
+    # The exemption has a distinct event, recorded before advancing the
+    # timestamp so audit failure cannot erase the condition on retry.
+    assert [type(event).__name__ for event in recorder.outcomes] == ["IdentityDormancyExempted"]
+    assert authority.count_active_human_admins() == 1
+
+
+def test_dormancy_re_pends_an_admin_who_is_not_the_last_one(engine, authority) -> None:
+    """D34's adversarial twin: the exemption is the COUNT, not the role.
+
+    A guard that spared every admin passes the exemption test above and
+    fails here, and the container would then keep a dormant administrator
+    indefinitely.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    second = _login(authority, _sso_claims("bob", email="bob@example.com")).record
+    # ``admin`` is not an ACTIVATION role (D14): admit with none, then grant.
+    _activate(authority, actor, second.identity_id, role="none")
+    _grant(authority, actor, second.identity_id, "admin")
+    assert authority.count_active_human_admins() == 2
+    _backdate_login(engine, second.identity_id, days=400)
+    recorder = _Recorder()
+
+    outcome = _login(authority, _sso_claims("bob", email="bob@example.com"), record_dormant=recorder)
+
+    assert outcome.dormancy_exempted_since is None
+    assert outcome.record.access_state == "pending"
+    assert _identity_row(engine, second.identity_id).access_state == "pending"
+    assert [type(event).__name__ for event in recorder.outcomes] == ["IdentityDormant"]
+    assert authority.count_active_human_admins() == 1
+
+
+def test_a_dormant_admin_takes_the_population_lock_through_the_two_attempt_retry(engine, authority, monkeypatch) -> None:
+    """R9 rides R3's retry protocol rather than counting admins on its own.
+
+    An independent count query would read the admin population AFTER the
+    target row and invert the lock order
+    ``tests/testcontainer/web/test_identity_last_admin_race_postgres.py``
+    pins. The spy records the flag each attempt was given.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    second = _login(authority, _sso_claims("bob", email="bob@example.com")).record
+    _activate(authority, actor, second.identity_id, role="none")
+    _grant(authority, actor, second.identity_id, "admin")
+    _backdate_login(engine, second.identity_id, days=400)
+
+    attempts: list[bool] = []
+    original = RepositoryIdentityAuthority._ensure_identity_once
+
+    def _spy(self: Any, **kwargs: Any) -> Any:
+        attempts.append(kwargs["lock_admin_population"])
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(RepositoryIdentityAuthority, "_ensure_identity_once", _spy)
+
+    _login(authority, _sso_claims("bob", email="bob@example.com"))
+
+    # Attempt 1 without the lock, attempt 2 with it. Exactly two: the retry
+    # is bounded structurally, not by a counter.
+    assert attempts == [False, True]
+
+
+def test_a_dormant_non_admin_never_pays_for_the_population_lock(engine, authority) -> None:
+    """The other half of the lock-order rule: only an admin's dormancy escalates.
+
+    Every dormant login would otherwise take R5's population lock, which is
+    the cost attempt 1 exists to avoid.
+    """
+    root = _sso_bootstrap(authority, "root")
+    ada = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+    _backdate_login(engine, ada.identity_id, days=400)
+
+    attempts: list[bool] = []
+    original = RepositoryIdentityAuthority._ensure_identity_once
+
+    def _spy(self: Any, **kwargs: Any) -> Any:
+        attempts.append(kwargs["lock_admin_population"])
+        return original(self, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(RepositoryIdentityAuthority, "_ensure_identity_once", _spy)
+        outcome = _login(authority, _sso_claims("ada"))
+
+    assert attempts == [False]
+    assert outcome.record.access_state == "pending"
+
+
+def test_a_rebound_outranks_dormancy_when_both_are_true(engine, authority) -> None:
+    """The R3-before-R9 ordering, pinned.
+
+    Both conditions hold on one login. R3 wins: ``disabled`` is the state an
+    administrator must see, ``rebound`` names the evidence that a subject was
+    recycled, and re-pending afterwards would be the upgrade the spec forbids.
+    Exactly one event is written, and it is the rebound's.
+    """
+    root = _sso_bootstrap(authority, "root")
+    ada = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+    _backdate_login(engine, ada.identity_id, days=400)
+    rebounds = _Recorder()
+    dormancies = _Recorder()
+
+    outcome = _login(
+        authority,
+        _sso_claims("ada", email="ada@new.example"),
+        record_rebound=rebounds,
+        record_dormant=dormancies,
+    )
+
+    assert outcome.rebound_refused is True
+    assert outcome.dormancy_exempted_since is None
+    row = _identity_row(engine, ada.identity_id)
+    assert row.access_state == "disabled"
+    assert row.disable_reason == "rebound"
+    assert [type(event).__name__ for event in rebounds.outcomes] == ["IdentityRebound"]
+    assert dormancies.outcomes == []
+
+
+def test_re_activating_a_dormant_identity_clears_the_dormancy_stamp(engine, authority) -> None:
+    """R9 says an admin must re-activate; an active row must not still read ``dormant``.
+
+    ``enable_identity`` clears the disable columns but refuses anything but a
+    ``disabled`` row, so the re-pended identity is cleared by
+    ``activate_identity`` -- the pending route -- or not at all.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    ada = _active_sso_identity(authority, actor, "ada")
+    _backdate_login(engine, ada.identity_id, days=400)
+    _login(authority, _sso_claims("ada"))
+    assert _identity_row(engine, ada.identity_id).disable_reason == "dormant"
+
+    # ``role="none"``: a re-pended identity keeps the role rows it already
+    # holds -- R9 touches ``identities`` only, the same way D32 leaves the
+    # org-tree edges of a rebound disable alone -- so the administrator who
+    # re-admits it need not re-grant a role the person never lost.
+    _activate(authority, actor, ada.identity_id, role="none")
+
+    row = _identity_row(engine, ada.identity_id)
+    assert row.access_state == "active"
+    assert row.disable_reason is None
+    assert row.disabled_at is None
+    assert row.disabled_by_identity_id is None
+
+
+def test_re_admitting_a_dormant_identity_with_the_role_it_already_holds_is_not_a_collision(engine, authority) -> None:
+    """R9's OWN REMEDY, on the role the person is supposed to hold.
+
+    R9 says an administrator must re-activate, and the pending queue offers
+    the ordinary roles. A re-pended identity still holds the deployment-wide
+    grant it had -- that state did not exist before R9 -- so re-granting the
+    same role would insert a second live row and
+    ``uq_identity_roles_active_unscoped`` would refuse it. The route catches
+    only ``IdentityAuthorityRefusal``, so an ``IntegrityError`` here escapes
+    as a 500 and the identity can never be re-admitted at all.
+
+    The activation reports no NEW grant, because it made none, and names the
+    grant it left standing instead.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    ada = _active_sso_identity(authority, actor, "ada")
+    granted_before = _role_rows(engine, ada.identity_id)
+    assert [(row.role, row.revoked_at) for row in granted_before] == [("user", None)]
+    _backdate_login(engine, ada.identity_id, days=400)
+    _login(authority, _sso_claims("ada"))
+    assert _identity_row(engine, ada.identity_id).access_state == "pending"
+
+    outcome = _activate(authority, actor, ada.identity_id, role="user")
+
+    assert _identity_row(engine, ada.identity_id).access_state == "active"
+    # No second row: the grant the identity kept is the grant it has.
+    assert [row.role_id for row in _role_rows(engine, ada.identity_id)] == [granted_before[0].role_id]
+    assert outcome.role is None
+    assert [(grant.role, grant.role_id) for grant in outcome.retained_roles] == [("user", granted_before[0].role_id)]
+
+
+def test_re_admitting_a_dormant_identity_with_no_role_reports_the_grant_it_keeps(engine, authority) -> None:
+    """``role="none"`` does not strip what the identity already holds, and says so.
+
+    An administrator re-admitting a re-pended identity with no role is not
+    revoking anything -- ``revoke_role`` is that decision, and it keeps R5's
+    last-admin protection, which an activation does not. What must not happen
+    is the trail recording "activated, no role granted" while the person
+    comes back holding deployment ``admin``: ``retained_roles`` is what makes
+    the audit row state the access the re-admission actually restored.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    eve, admin_grant = _active_sso_admin(authority, actor, "eve")
+    # Two admins, so D34's exemption does not fire and R9 really re-pends her.
+    assert authority.count_active_human_admins() == 2
+    _backdate_login(engine, eve.identity_id, days=400)
+    # Her OWN address: ``_sso_claims`` defaults to ada's, and any other
+    # address would trip R3 -- which outranks R9 -- and disable her instead.
+    _login(authority, _sso_claims("eve", email="eve@example.com"))
+    assert _identity_row(engine, eve.identity_id).access_state == "pending"
+
+    outcome = _activate(authority, actor, eve.identity_id, role="none")
+
+    assert outcome.role is None
+    assert [(grant.role, grant.role_id) for grant in outcome.retained_roles] == [("admin", admin_grant.role_id)]
+    # And the database agrees with the trail: she is a deployment admin again.
+    assert authority.count_active_human_admins() == 2
+
+
+def test_re_admitting_over_an_expired_grant_replaces_it_instead_of_colliding(engine, authority) -> None:
+    """An EXPIRED grant is inactive to this module and live to the index.
+
+    ``uq_identity_roles_active_unscoped`` is partial on ``revoked_at IS NULL
+    AND scope IS NULL`` -- expiry is NOT in its predicate, because SQLite
+    stores timestamps as text and this module evaluates expiry in Python
+    against database time instead (see ``_ADMIN_HOLDER_ROWS``). So an expired
+    grant still occupies the index slot while ``_active_grants`` drops it,
+    and a guard written over the ACTIVE grants alone would step straight back
+    into the collision it was added to prevent.
+
+    The answer matches the constraint rather than dodging it: the dead row is
+    revoked and a fresh grant is written, which is what ``revoke_role``
+    followed by ``grant_role`` would have done. Revoking it lowers no count
+    -- an expired grant is already uncounted by
+    ``_active_human_admin_count`` -- so R5's population lock is untouched.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    ada = _active_sso_identity(authority, actor, "ada")
+    (before,) = _role_rows(engine, ada.identity_id)
+    _expire_role(engine, before.role_id)
+    assert authority.active_roles(identity_id=ada.identity_id) == ()
+    _backdate_login(engine, ada.identity_id, days=400)
+    _login(authority, _sso_claims("ada"))
+    assert _identity_row(engine, ada.identity_id).access_state == "pending"
+
+    outcome = _activate(authority, actor, ada.identity_id, role="user")
+
+    # A NEW grant, and the expired one closed rather than left to collide.
+    assert outcome.role is not None and outcome.role.role_id != before.role_id
+    assert outcome.retained_roles == ()
+    rows = {row.role_id: row for row in _role_rows(engine, ada.identity_id)}
+    assert set(rows) == {before.role_id, outcome.role.role_id}
+    assert rows[before.role_id].revoked_at is not None
+    assert rows[outcome.role.role_id].revoked_at is None
+    assert [grant.role for grant in authority.active_roles(identity_id=ada.identity_id)] == ["user"]
+
+
+def test_bootstrap_over_an_expired_admin_grant_replaces_it_instead_of_colliding(engine, authority) -> None:
+    """The same predicate mismatch in D20's lockout recovery, where it costs most.
+
+    An administrator whose ``admin`` grant simply EXPIRED is the ordinary way
+    a container reaches zero active human admins, so this is not an exotic
+    path -- it is the path the seed exists to re-arm on.
+    """
+    root = _sso_bootstrap(authority, "root")
+    (before,) = _role_rows(engine, root.record.identity_id)
+    _expire_role(engine, before.role_id)
+    assert authority.count_active_human_admins() == 0
+
+    outcome = authority.bootstrap_admin(
+        claims=_sso_claims("root", email="root@old.example"),
+        note="lockout recovery",
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record=_noop,
+    )
+
+    assert outcome.role is not None and outcome.role.role_id != before.role_id
+    rows = {row.role_id: row for row in _role_rows(engine, root.record.identity_id)}
+    assert rows[before.role_id].revoked_at is not None
+    assert rows[outcome.role.role_id].revoked_at is None
+    assert authority.count_active_human_admins() == 1
+
+
+def test_re_granting_an_expired_role_renews_it_instead_of_colliding(engine, authority) -> None:
+    """The same predicate mismatch in ``grant_role``, which predates R9.
+
+    ``RoleAlreadyHeld`` was read off the ACTIVE grants, so a role whose grant
+    had simply run out fell past the refusal and hit the partial unique --
+    an ``IntegrityError``, not an ``IdentityAuthorityRefusal``, so the route
+    answered 500. Renewing an expired role is the ordinary administrative
+    act, and it is the remedy the dormancy documentation now points at.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    ada = _active_sso_identity(authority, actor, "ada")
+    (before,) = _role_rows(engine, ada.identity_id)
+    # A LIVE grant is still refused as already held: only the expired case moves.
+    with pytest.raises(RoleAlreadyHeld):
+        _grant(authority, actor, ada.identity_id, "user")
+    _expire_role(engine, before.role_id)
+
+    renewed = _grant(authority, actor, ada.identity_id, "user")
+
+    assert renewed.role_id != before.role_id
+    rows = {row.role_id: row for row in _role_rows(engine, ada.identity_id)}
+    assert rows[before.role_id].revoked_at is not None
+    assert rows[renewed.role_id].revoked_at is None
+    assert [grant.role for grant in authority.active_roles(identity_id=ada.identity_id)] == ["user"]
+
+
+def test_stripping_a_re_pended_admin_is_a_revoke_then_a_re_admission(engine, authority) -> None:
+    """The route that removes authority is ``revoke_role``, and it is reachable here.
+
+    An activation restores what the identity kept, so an administrator who
+    wants a dormant admin back WITHOUT their privileges revokes the grant
+    first. That order is not a workaround: revocation is the decision that
+    carries R5's last-admin protection, and an activation that silently
+    stripped roles would route around it. R5 does not fire for this holder --
+    it reads ``access_state == 'active'`` and the re-pended row is pending --
+    which is exactly why the revoke succeeds while the container still has
+    another admin.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    eve, admin_grant = _active_sso_admin(authority, actor, "eve")
+    _backdate_login(engine, eve.identity_id, days=400)
+    _login(authority, _sso_claims("eve", email="eve@example.com"))
+    assert _identity_row(engine, eve.identity_id).access_state == "pending"
+
+    authority.revoke_role(actor=actor, role_id=admin_grant.role_id, note="dormant, re-admitting as a user", record=_noop)
+    outcome = _activate(authority, actor, eve.identity_id, role="user")
+
+    assert outcome.retained_roles == ()
+    assert outcome.role is not None and outcome.role.role == "user"
+    assert [grant.role for grant in authority.active_roles(identity_id=eve.identity_id)] == ["user"]
+    assert authority.count_active_human_admins() == 1
+
+
+def test_an_ordinary_activation_grants_the_role_and_retains_nothing(engine, authority) -> None:
+    """The never-activated pending row, unchanged: there is nothing to retain."""
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    waiting = _login(authority, _sso_claims("ada")).record
+
+    outcome = _activate(authority, actor, waiting.identity_id, role="user")
+
+    assert outcome.role is not None and outcome.role.role == "user"
+    assert outcome.retained_roles == ()
+    assert [row.role for row in _role_rows(engine, waiting.identity_id)] == ["user"]
+
+
+def test_bootstrap_binds_a_re_pended_admin_without_duplicating_its_grant(engine, authority) -> None:
+    """D20's lockout recovery must not be the thing that raises.
+
+    R9 can leave a ``pending`` row holding a live deployment ``admin`` grant
+    -- it re-pends any admin who is not the last one -- and that row is not
+    counted by ``_ADMIN_HOLDER_ROWS``, so a container whose remaining admins
+    lapse reaches zero active human admins with that grant still standing.
+    ``bootstrap_admin`` then binds exactly that row, and a blind insert would
+    collide on the partial unique in the one command an operator runs when
+    they are already locked out.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    eve, admin_grant = _active_sso_admin(authority, actor, "eve")
+    _backdate_login(engine, eve.identity_id, days=400)
+    # Her OWN address: ``_sso_claims`` defaults to ada's, and any other
+    # address would trip R3 -- which outranks R9 -- and disable her instead.
+    _login(authority, _sso_claims("eve", email="eve@example.com"))
+    assert _identity_row(engine, eve.identity_id).access_state == "pending"
+    # The remaining admin's grant EXPIRES, so the container has none and the
+    # seed re-arms. Expiry rather than revocation because R5 refuses to revoke
+    # the last active admin's grant -- an expiry is the way the population
+    # reaches zero without anybody deciding it should.
+    _expire_role(engine, _admin_role_id(root))
+    assert authority.count_active_human_admins() == 0
+
+    outcome = authority.bootstrap_admin(
+        claims=_sso_claims("eve", email="eve@example.com"),
+        note="lockout recovery",
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record=_noop,
+    )
+
+    assert outcome.record.identity_id == eve.identity_id
+    recovered = _identity_row(engine, eve.identity_id)
+    assert recovered.disabled_at is None
+    assert recovered.disabled_by_identity_id is None
+    assert recovered.disable_reason is None
+    assert [row.role_id for row in _role_rows(engine, eve.identity_id)] == [admin_grant.role_id]
+    assert outcome.role is None
+    assert [grant.role_id for grant in outcome.retained_roles] == [admin_grant.role_id]
+    assert authority.count_active_human_admins() == 1
+    # Her allowance is the one her activation wrote, not a second live row:
+    # the same collision, on ``uq_quota_policies_active_per_identity``.
+    assert [row.set_by_actor for row in _quota_rows(engine, eve.identity_id)] == ["identity"]
+    assert outcome.quota_written is False
+
+
+# --------------------------------------------------------------------------
+# The login profile refresh: display_name, email, organisation_id.
+#
+# ``_new_identity_values`` takes all three at first sight, so a row CREATED by
+# a login carries them; a row BOUND by one -- a pre-provisioned row, which an
+# administrator inserts with no profile at all -- kept them NULL forever, and
+# no later login refreshed any of the three on any row. That asymmetry is
+# what these pin, together with the one column that must never join them.
+# --------------------------------------------------------------------------
+
+
+def _pre_provision_sso(
+    authority: RepositoryIdentityAuthority,
+    actor: IdentityAdminActor,
+    subject: str,
+    *,
+    organisation_id: str | None = None,
+) -> IdentityActivated:
+    return authority.pre_provision_identity(
+        actor=actor,
+        provider="vanguard",
+        subject=subject,
+        username=None,
+        organisation_id=organisation_id,
+        role="user",
+        note="onboarding cohort",
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record=_noop,
+    )
+
+
+def test_a_bound_pre_provisioned_row_takes_the_profile_its_first_login_carries(engine, authority) -> None:
+    """The defect: the administrator inserts no profile, so nothing ever filled these in."""
+    root = _sso_bootstrap(authority, "root")
+    provisioned = _pre_provision_sso(authority, _actor(root.record.identity_id), "ada")
+    blank = _identity_row(engine, provisioned.record.identity_id)
+    assert blank.display_name is None and blank.email is None
+
+    _login(authority, _claims("ada", provider="vanguard", display_name="Ada Lovelace", email="ada@example.com"))
+
+    row = _identity_row(engine, provisioned.record.identity_id)
+    assert row.display_name == "Ada Lovelace"
+    assert row.email == "ada@example.com"
+
+
+def test_a_later_login_refreshes_the_profile_like_it_already_refreshed_the_username(engine, authority) -> None:
+    """``identities`` is CURRENT STATE: a renamed person's row says so on their next login."""
+    first = _login(authority, _claims("ada", provider="vanguard", display_name="Ada Byron", email="ada@example.com"))
+
+    _login(
+        authority,
+        _claims("ada", provider="vanguard", username="ada.l", display_name="Ada Lovelace", email="ada@example.com"),
+    )
+
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.username == "ada.l"
+    assert row.display_name == "Ada Lovelace"
+
+
+def test_an_absent_claim_never_nulls_a_stored_profile_value(engine, authority) -> None:
+    """An ABN an administrator typed survives a login whose profile does not carry one.
+
+    An absent claim is no information, not an instruction to erase. Most IdP
+    profiles carry no ``organisation_id`` at all, so a refresh that wrote
+    NULL for a missing claim would delete the column's only real use on the
+    very next login.
+    """
+    root = _sso_bootstrap(authority, "root")
+    provisioned = _pre_provision_sso(authority, _actor(root.record.identity_id), "ada", organisation_id="53004085616")
+
+    _login(authority, _claims("ada", provider="vanguard", display_name="Ada Lovelace", email="ada@example.com"))
+
+    row = _identity_row(engine, provisioned.record.identity_id)
+    assert row.organisation_id == "53004085616"
+    assert row.display_name == "Ada Lovelace"
+
+
+def test_the_profile_refresh_never_rebases_r3s_baseline(engine, authority) -> None:
+    """THE column the refresh must not touch, on the path where it would be silent.
+
+    A re-cased address is not a rebound (``_normalised_email``), so this login
+    takes the ORDINARY branch and refreshes ``email``. If the refresh also
+    wrote ``subject_email_at_first_seen``, every rebound would re-baseline
+    itself against the address that tripped it and R3 would be defeated
+    permanently, with no test in the R3 section going red to say so.
+    """
+    first = _login(authority, _sso_claims(email="ada@example.com"))
+
+    outcome = _login(authority, _sso_claims(email="Ada@Example.COM"))
+
+    assert outcome.rebound_refused is False
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.subject_email_at_first_seen == "ada@example.com"
+    assert row.email == "Ada@Example.COM"
+    # And the proof it is still armed: a genuinely different address trips.
+    assert _login(authority, _sso_claims(email="ada@new.example")).rebound_refused is True
+
+
+def test_a_disabled_row_takes_no_profile_refresh(engine, authority) -> None:
+    """What ``enable_identity``'s rebase rests on: the disable ends profile maintenance.
+
+    ``enable_identity`` adopts ``identities.email`` as the new R3 baseline
+    when it re-enables a ``rebound`` disable. If a later login attempt could
+    still refresh that column, whoever now holds the recycled subject would
+    choose the baseline the administrator later trusts.
+    """
+    first = _login(authority, _sso_claims(email="ada@old.example"))
+    _login(authority, _sso_claims(email="ada@new.example"))
+    assert _identity_row(engine, first.record.identity_id).access_state == "disabled"
+
+    _login(authority, _sso_claims(email="ada@newer.example", provider="vanguard"))
+
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.email == "ada@new.example"
+    assert row.subject_email_at_first_seen == "ada@old.example"
+
+
+def test_the_lazy_purge_never_deletes_an_identity_r9_re_pended(engine, authority) -> None:
+    """R9 puts a row that HAS been active back into the pending queue.
+
+    The purge's whole safety argument is that a pending row was never
+    activated, so it holds no PII and no children. A dormancy re-pend breaks
+    that reading of ``access_state`` alone -- and the re-pended row's
+    ``first_seen_at`` is necessarily older than the window that re-pended it,
+    so it is a purge candidate on the very next admin listing. Deleting it
+    would either fail on the RESTRICT foreign keys or take a real person's
+    identity away for having been on leave.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    ada = _active_sso_identity(authority, actor, "ada")
+    stranger = _login(authority, _sso_claims("zoe", email="zoe@example.com")).record
+    _age_identity(engine, ada.identity_id, days=400)
+    _age_identity(engine, stranger.identity_id, days=400)
+    _backdate_login(engine, ada.identity_id, days=400)
+    _login(authority, _sso_claims("ada", email="ada@example.com"))
+    assert _identity_row(engine, ada.identity_id).access_state == "pending"
+
+    purged = authority.purge_stale_pending_identities(actor=actor, retention_days=90, record=_noop)
+
+    # The never-activated stranger goes; the re-pended identity stays.
+    assert purged.identity_ids == (stranger.identity_id,)
+    assert _identity_row(engine, ada.identity_id) is not None
+    assert _identity_row(engine, stranger.identity_id) is None
+    # And its role grants and quota row are still there for the re-activation.
+    assert [grant.role for grant in authority.active_roles(identity_id=ada.identity_id)] == ["user"]
+    assert len(_quota_rows(engine, ada.identity_id)) == 1
+
+
+def test_a_failed_dormancy_audit_rolls_the_re_pend_back(engine, authority) -> None:
+    """R4's rule, applied to R9: a re-pend the trail cannot hold does not commit.
+
+    The callback fires INSIDE the transaction for exactly this. An identity
+    silently re-pended with no ``identity_disabled`` row would leave an
+    administrator holding a pending queue entry with no explanation anywhere
+    and no way to tell it from a first login.
+    """
+    root = _sso_bootstrap(authority, "root")
+    ada = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+    _backdate_login(engine, ada.identity_id, days=400)
+
+    with pytest.raises(_AuditOutage):
+        _login(authority, _sso_claims("ada", email="ada@example.com"), record_dormant=_refuse_audit)
+
+    row = _identity_row(engine, ada.identity_id)
+    assert row.access_state == "active"
+    assert row.disable_reason is None and row.disabled_at is None

@@ -9,9 +9,11 @@ delivery evidence for this plan. No tests or cloud operations were run for
 the original desktop reconciliation. Tracker states below were retrieved on
 this date; subsequent implementation evidence is distinguished below.
 
-**Implementation update (2026-09-10):** A is implemented; B–E are implemented
-with completed local runtime verification recorded under
-[Final verification](#final-verification). F adopts explicit deferral of receipt v3 and the listed
+**Integration update (2026-09-10):** A–E have feature implementations. The
+merge with `release/0.8.1` and recovery/ticket review repairs require fresh
+verification; that verification is pending. Earlier feature-tree results are
+recorded under [Final verification](#final-verification) as historical evidence
+only. F adopts explicit deferral of receipt v3 and the listed
 provider work. No live ACA acceptance receipt or cloud test is claimed.
 
 **Architecture:** Keep the delivered ACA environment/workload bundle and
@@ -90,11 +92,11 @@ point. The dated implementation statuses below govern the current disposition.
 
 ## A. Reconcile public documentation with desktop acceptance
 
-**Status (2026-09-10): implemented; integrated verification complete.**
+**Status (2026-09-10): implemented; release integration verification pending.**
 See [Final verification](#final-verification).
 Public documentation separates desktop acceptance, bounded runtime capability
 and available evidence. Documentation contracts and current epoch checks
-passed against the integrated implementation.
+must pass again against the release integration.
 
 **Files:** `docs/reference/deployment-platforms.md`,
 `deploy/azure-container-apps/README.md`,
@@ -122,17 +124,18 @@ The subsequent instruction to execute this plan authorizes this follow-up.
 
 ## B. Durable run admission, handoff and cancellation
 
-**Status (2026-09-10): implemented; integrated verification complete.** The
+**Status (2026-09-10): implemented; release integration verification pending.** The
 integrated implementation provides immutable execution envelopes, atomic run/permit
 admission, retained input bytes and version-pinned secrets, authenticated peer
 cancellation, and fresh web/Landscape ownership for automatic dispatch,
 PREPARED restart and eligible checkpoint resume. Landscape advances to epoch
-39; the integrated Sessions schema is epoch 54. Local PostgreSQL process-crash
-proofs cover admission/permit/linkage death, PREPARED and checkpoint recovery,
-stale-owner refusal, terminal/output crash retry and CLI takeover races. These
-mechanisms are covered by the completed default and serial PostgreSQL suites
-recorded under [Final verification](#final-verification). They do not establish
-live ACA acceptance.
+39; the integrated Sessions schema is epoch 54. These are the 0.8.1 boundaries;
+0.8.0 remains Sessions 53 / Landscape 38. Local PostgreSQL process-crash tests
+exercise admission/permit/linkage death, PREPARED and checkpoint recovery,
+stale-owner refusal, terminal/output crash retry and CLI takeover races.
+Earlier suite results under [Final verification](#final-verification) precede
+the release merge and review repairs. They do not establish correctness of
+this integration or live ACA acceptance.
 
 Supported transitions preserve one active Landscape scheduler leader per run
 and the original run UUID. PREPARED replay requires proof of no effects;
@@ -188,13 +191,13 @@ the implementation and integration acceptance checklist.
 
 **Done when:** every documented crash state has a deterministic recovery/refusal
 outcome, non-owner cancellation is durable, and stale owners cannot project or
-finalize. Automatic handoff is implemented for the stated transitions;
-integrated verification covers those transitions and preserves the explicit
-refusal cases above.
+finalize. Integration verification must cover those transitions and the explicit
+refusal cases above, including archived-session recovery races, unavailable
+retained inputs, and failed-run output parity with ordinary execution.
 
 ## C. Durable tickets and reconnectable run progress
 
-**Status (2026-09-10): implemented; integrated verification complete.**
+**Status (2026-09-10): implemented; release integration verification pending.**
 See [Final verification](#final-verification).
 External PostgreSQL stores ticket digests for atomic single-use consumption
 and ordered run events for authorized peer replay. Local process/socket tests
@@ -222,7 +225,7 @@ new mechanism/schema tests; task D is also needed before removing affinity globa
 
 ## D. Durable Composer progress and inflight accounting
 
-**Status (2026-09-10): implemented; integrated verification complete.**
+**Status (2026-09-10): implemented; release integration verification pending.**
 See [Final verification](#final-verification).
 Renewable PostgreSQL request leases, bounded redacted progress snapshots and
 per-request inflight records support peer reads and current cluster activity.
@@ -250,7 +253,7 @@ registry is empty, and snapshots expose no raw tool content or secrets.
 
 ## E. Cluster-wide rate limits — omitted from the short follow-up list
 
-**Status (2026-09-10): implemented; integrated verification complete.**
+**Status (2026-09-10): implemented; release integration verification pending.**
 See [Final verification](#final-verification).
 External PostgreSQL provides shared auth-IP, cheap-write and Composer budgets
 through privacy-preserving keys, fresh post-lock clock decisions and bounded
@@ -282,7 +285,7 @@ and auth, write and Composer routes select the shared adapter consistently.
 
 ## F. Receipt evolution and deferred provider work
 
-**Status (2026-09-10): deferral adopted; existing receipt contracts verified.**
+**Status (2026-09-10): deferral adopted; receipt regression checks pending.**
 See [Final verification](#final-verification). No new provider or receipt v3 is implemented. Existing receipt
 envelopes, closed mechanism vocabulary and validators remain unchanged; old
 and current diagnostic reasons remain admissible without enabling a P4b pass.
@@ -347,23 +350,26 @@ Read the completed `summary.txt` and frozen-tree result. PostgreSQL tests
 require Docker and serial execution; default pytest is not PostgreSQL evidence.
 Compare the key-free lint corpus against the base and report the signing state
 separately. Bicep changes also require the compiled-ARM bundle tests and pinned
-CI compile job. The completed results below distinguish runtime verification
-from the separately reported trust-tier signing state. Historical measurements
-do not substitute for the completed integrated results.
+CI compile job. Historical measurements below do not substitute for fresh
+results from the resolved release integration. The current repair checks and
+full default and serial PostgreSQL gates remain pending.
 
 ## Final verification
 
-The corrected working tree based on `a086371f1`, with the B merge staged
+**Current release integration: verification pending.** Re-run the required
+gates after the release merge and review repairs, and record their completed
+exit codes and frozen-tree result before claiming integration verification.
+
+The earlier feature working tree based on `a086371f1`, with the B merge staged
 (frozen fingerprint `fb5231de4f42f6ea`), completed the default suite (**50,598 passed, 83 skipped, 2 xfailed**, exit 0)
 and serial PostgreSQL suite (**433 passed, 1 skipped**, exit 0), with `frozen=YES`
 in **/tmp/aca-corrected-final-runtime-gates/20260909T233507Z-aca-replica-residuals-2427810/summary.txt**. The separate final static run recorded
 Ruff, mypy and contracts exit 0; the key-free trust-tier lint stage exited 1 with
 1,923 findings (**/tmp/aca-corrected-final-static-gates/20260909T233154Z-aca-replica-residuals-2404264/summary.txt**). This is not an all-gates-green
-or operator-signature claim. The earlier attempt with 74 default-suite and
-6 PostgreSQL failures is corrected history, not the current result; the final
-results above follow those corrections. The subsequent documentation-only
-closeout does not change the tested Python sources. Verification is local and covers the
-bounded A–E implementation and preserved F receipt contracts. It does not
+or operator-signature claim. These results precede the merge with
+`release/0.8.1` and the recovery/ticket review repairs; their frozen fingerprint
+does not certify the current integration. The earlier attempt with 74
+default-suite and 6 PostgreSQL failures is also historical. This evidence does not
 produce a live ACA receipt, qualify routing without affinity, promote a frozen
 state-engine catalog, or close the direct CLI runtime-fingerprint residual
 `elspeth-f321e3ff21`.

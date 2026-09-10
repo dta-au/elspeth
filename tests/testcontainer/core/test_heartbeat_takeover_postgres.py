@@ -26,9 +26,9 @@ from elspeth.core.landscape.schema import run_coordination_events_table, run_coo
 pytestmark = pytest.mark.testcontainer
 
 
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with postgres_test_target(driver="psycopg") as url:
+@pytest.fixture(scope="module", params=["psycopg", "psycopg2"])
+def postgres_url(request: pytest.FixtureRequest) -> Iterator[str]:
+    with postgres_test_target(driver=request.param) as url:
         yield url
 
 
@@ -196,6 +196,7 @@ def test_postgresql_blocked_heartbeat_returns_and_stop_completes(postgres_url: s
             assert errors == []
             heartbeat.check_and_raise()
             assert heartbeat._consecutive_busy == 1
+            heartbeat.check_and_raise()
             with db.engine.connect() as observer:
                 recorded = (
                     observer.execute(
@@ -291,7 +292,8 @@ def test_takeover_wins_before_old_heartbeat_and_refuses_the_evicted_member(postg
 @pytest.mark.timeout(20)
 def test_heartbeat_statement_timeout_without_lock_contention_remains_fatal(postgres_url: str) -> None:
     """The earlier lock budget must not turn arbitrary statement delays into BUSY."""
-    from psycopg.errors import QueryCanceled
+    from psycopg.errors import QueryCanceled as PsycopgQueryCanceled
+    from psycopg2.errors import QueryCanceled as Psycopg2QueryCanceled
 
     from elspeth.engine.orchestrator.heartbeat import _is_lock_contention
 
@@ -305,5 +307,5 @@ def test_heartbeat_statement_timeout_without_lock_contention_remains_fatal(postg
                 is True
             )
             conn.exec_driver_sql("SELECT pg_sleep(10)")
-        assert isinstance(raised.value.orig, QueryCanceled)
+        assert isinstance(raised.value.orig, (PsycopgQueryCanceled, Psycopg2QueryCanceled))
         assert not _is_lock_contention(raised.value)

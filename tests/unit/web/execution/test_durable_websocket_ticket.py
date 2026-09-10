@@ -110,3 +110,44 @@ def test_database_failure_is_not_local_admission(ticket_engine):
         authority.consume(ticket=issued.ticket, run_id=run_id)
     with pytest.raises(OperationalError):
         authority.issue(run_id=run_id, user=user)
+
+
+def test_issue_reclaims_expired_tickets_in_bounded_batches_across_retained_runs(ticket_engine):
+    _, old_run_id, old_user = seed_ticket_run(ticket_engine)
+    _, run_id, user = seed_ticket_run(ticket_engine)
+    authority = RepositorySessionWebsocketTicketAuthority(ticket_engine)
+    consumed = authority.issue(run_id=old_run_id, user=old_user)
+    assert authority.consume(ticket=consumed.ticket, run_id=old_run_id) is not None
+    live = authority.issue(run_id=old_run_id, user=old_user)
+    now = datetime.now(UTC)
+    expired_digests = {sha256(f"expired-{number}".encode()).hexdigest() for number in range(105)}
+    with ticket_engine.begin() as conn:
+        conn.execute(update(runs_table).where(runs_table.c.id == old_run_id).values(status="completed"))
+        conn.execute(
+            insert(websocket_tickets_table),
+            [
+                {
+                    "ticket_digest": digest,
+                    "run_id": old_run_id,
+                    "user_id": old_user.user_id,
+                    "auth_provider_type": "local",
+                    "issued_at": now - timedelta(minutes=2),
+                    "expires_at": now - timedelta(minutes=1),
+                    "consumed_at": now - timedelta(seconds=90) if number % 2 else None,
+                }
+                for number, digest in enumerate(sorted(expired_digests))
+            ],
+        )
+    first = authority.issue(run_id=run_id, user=user)
+    with ticket_engine.connect() as conn:
+        remaining = set(conn.execute(select(websocket_tickets_table.c.ticket_digest)).scalars())
+        assert conn.execute(select(runs_table.c.status).where(runs_table.c.id == old_run_id)).scalar_one() == "completed"
+    assert len(remaining & expired_digests) == 5
+    assert sha256(live.ticket.encode()).hexdigest() in remaining
+    assert sha256(consumed.ticket.encode()).hexdigest() in remaining
+    authority.issue(run_id=run_id, user=user)
+    with ticket_engine.connect() as conn:
+        assert not expired_digests.intersection(conn.execute(select(websocket_tickets_table.c.ticket_digest)).scalars())
+    assert authority.consume(ticket=live.ticket, run_id=old_run_id) is not None
+    assert authority.consume(ticket=consumed.ticket, run_id=old_run_id) is None
+    assert authority.consume(ticket=first.ticket, run_id=run_id) is not None

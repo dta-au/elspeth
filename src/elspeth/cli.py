@@ -2271,6 +2271,12 @@ def composer_users_bootstrap_admin(
             note=event.note,
             role=None if event.role is None else event.role.role,
             role_id=None if event.role is None else event.role.role_id,
+            # The grants the bound row already held. ``bootstrap_admin``
+            # binds an existing identity as well as creating one, and since
+            # R9 that row can be a re-pended administrator whose deployment
+            # ``admin`` never lapsed -- in which case this command grants
+            # nothing and the trail says so here rather than nowhere.
+            retained_roles=tuple((grant.role, grant.scope) for grant in event.retained_roles),
             tokens_per_day=quota_tokens_per_day if event.quota_written else None,
             storage_bytes=quota_storage_bytes if event.quota_written else None,
             on_behalf_of=event.on_behalf_of,

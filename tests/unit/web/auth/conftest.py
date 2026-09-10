@@ -1,13 +1,18 @@
 """Shared fixtures for auth provider tests.
 
-Provides RSA keypair generation, JWKS response building, and JWT
-signing for both OIDC and Entra test modules.
+Provides RSA keypair generation, JWKS response building, JWT signing for
+both OIDC and Entra test modules, and the worker-pool saturation harness
+the offloaded login paths are pinned against.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
+import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import jwt as pyjwt
 import pytest
@@ -15,6 +20,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
 
+from elspeth.web.async_workers import ADMISSION_CAPACITY, outstanding_admissions, run_sync_in_worker
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.session_token import (
@@ -24,6 +30,7 @@ from elspeth.web.auth.session_token import (
     SessionTokenIssuer,
 )
 from elspeth.web.coordination.identity_authority import (
+    IdentityDormant,
     IdentityRebound,
     IdentityRetired,
     RepositoryIdentityAuthority,
@@ -32,6 +39,49 @@ from elspeth.web.coordination.identity_authority import (
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.schema import initialize_session_schema
+
+
+@asynccontextmanager
+async def saturated_worker_pool() -> AsyncIterator[None]:
+    """Hold every admission slot of the process-wide worker pool for the block.
+
+    Offloading synchronous work introduces exactly one new failure mode:
+    ``run_sync_in_worker`` refuses admission with
+    ``AsyncWorkerAdmissionTimeoutError`` once ``ADMISSION_CAPACITY``
+    submissions are outstanding. A test suite never saturates the pool by
+    accident, so that arm is precisely what a green run does NOT show — and on
+    the login paths it would otherwise escape handlers that audit every other
+    outcome. This fills the pool with work blocked on an event, so the next
+    caller goes through the real admission path, waits the real
+    ``ADMISSION_WAIT_SECONDS``, and is refused for real.
+
+    Costs about one second per refused call inside the block, which is the
+    admission wait itself and cannot be shortened without testing something
+    other than the shipped bound.
+
+    The release is unconditional. The pool is process-wide, so a leaked
+    admission would poison every later worker-backed test in this pytest
+    process rather than failing the test that leaked it.
+
+    Not a fixture — a plain helper, like ``make_rsa_token`` above, because the
+    saturation must bracket a specific call rather than a whole test.
+    """
+    released = threading.Event()
+    fillers = [asyncio.create_task(run_sync_in_worker(released.wait)) for _ in range(ADMISSION_CAPACITY)]
+    try:
+        # ``run_sync_in_worker`` takes its admission slot and submits before
+        # its first true suspension, so the fillers are all seated after a few
+        # turns of the loop. Bounded rather than a single sleep(0): the count
+        # is the condition, and asserting it beats assuming the scheduling.
+        for _ in range(100):
+            if outstanding_admissions() >= ADMISSION_CAPACITY:
+                break
+            await asyncio.sleep(0)
+        assert outstanding_admissions() >= ADMISSION_CAPACITY, "the fillers did not take every admission slot"
+        yield
+    finally:
+        released.set()
+        await asyncio.gather(*fillers)
 
 
 @pytest.fixture
@@ -98,6 +148,7 @@ def build_local_auth_provider(
     session_engine=None,
     quota_tokens_per_day: int | None = None,
     quota_storage_bytes: int | None = None,
+    identity_dormancy_days: int = 90,
 ) -> LocalAuthProvider:
     """Build a LocalAuthProvider wired to a real in-memory identity substrate.
 
@@ -150,14 +201,22 @@ def build_local_auth_provider(
         # LOCAL provider, which R3 excludes.
         return None
 
+    def _record_no_dormancy(_outcome: IdentityDormant) -> None:
+        # Same decision as ``_record_nothing``. Unlike the rebound callback
+        # this one IS reachable -- R9 does not exclude local auth -- but no
+        # login in this fixture's tests is 90 days old.
+        return None
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         return authority.ensure_identity(
             claims=claims,
             activate=registration_open,
             quota_tokens_per_day=quota_tokens_per_day,
             quota_storage_bytes=quota_storage_bytes,
+            identity_dormancy_days=identity_dormancy_days,
             record_admission=_record_nothing,
             record_rebound=_record_no_rebound,
+            record_dormant=_record_no_dormancy,
         )
 
     return LocalAuthProvider(

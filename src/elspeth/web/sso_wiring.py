@@ -65,6 +65,8 @@ from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
     IdentityActivated,
     IdentityAlreadyDisabled,
+    IdentityDormancyExempted,
+    IdentityDormant,
     IdentityRebound,
     RepositoryIdentityAuthority,
     RoleForbiddenForIdentity,
@@ -167,6 +169,26 @@ def build_sso_wiring(
             current_email=event.current_email,
         )
 
+    def _record_dormant(event: IdentityDormant | IdentityDormancyExempted) -> None:
+        # Runs INSIDE ensure_identity's transaction, like _record_rebound: a
+        # re-pend this trail cannot hold does not commit. No request -- the
+        # refused login writes its own auth_failure row with the request
+        # context and the sso_access_pending category (the row is pending
+        # now, so `admit` is what refuses it), and the two join on
+        # identity_id.
+        record = (
+            audit_recorder.record_identity_dormancy_exempted
+            if isinstance(event, IdentityDormancyExempted)
+            else audit_recorder.record_identity_dormant
+        )
+        record(
+            provider=provider,
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            last_login_at=event.last_login_at,
+            dormancy_days=event.dormancy_days,
+        )
+
     def _record_bootstrap(event: IdentityActivated) -> None:
         # Runs INSIDE bootstrap_admin's transaction, like _record_admission:
         # a seed the trail cannot hold does not commit. No request: the seed
@@ -181,6 +203,10 @@ def build_sso_wiring(
             note=event.note,
             role=None if event.role is None else event.role.role,
             role_id=None if event.role is None else event.role.role_id,
+            # Normally empty here -- the seed usually creates the row it
+            # seeds -- but it binds an existing one too, and R9 is what put a
+            # live ``admin`` grant on a ``pending`` row this can bind.
+            retained_roles=tuple((grant.role, grant.scope) for grant in event.retained_roles),
             tokens_per_day=settings.quota_default_tokens_per_day if event.quota_written else None,
             storage_bytes=settings.quota_default_storage_bytes if event.quota_written else None,
             on_behalf_of=event.on_behalf_of,
@@ -219,8 +245,10 @@ def build_sso_wiring(
             activate=False,
             quota_tokens_per_day=settings.quota_default_tokens_per_day,
             quota_storage_bytes=settings.quota_default_storage_bytes,
+            identity_dormancy_days=settings.identity_dormancy_days,
             record_admission=_record_admission,
             record_rebound=_record_rebound,
+            record_dormant=_record_dormant,
         )
         if outcome.rebound_refused:
             # R3, and the ONLY place this refusal can be raised: the authority

@@ -12,7 +12,7 @@ fact, the receipt records a sanitized projection of it.
 > **Status.** The implemented ACA slice received desktop acceptance:
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This executable procedure can produce a future receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.0.json`. Steps marked
+> at `docs/operator/evidence/azure-container-apps/0.8.1.json`. Steps marked
 > **LIVE** require measurements from that operator run. Neither a live run nor
 > a receipt is an outstanding closure condition. See
 > [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
@@ -226,10 +226,15 @@ the sample registry identity, administrator login/password, region and IP
 allowlists before what-if. After the environment stage, resolve
 `WORKLOAD_PARAMETERS` with the cold-install resolver and inventory outputs.
 Copy that resolved file to `WORKLOAD_A_PARAMETERS` and
-`WORKLOAD_B_PARAMETERS`, replace the two runtime database secret URLs with
-the versioned URLs for the corresponding role, and set Multiple mode, none
-affinity, min/max replicas 1 and runtimeRoleLabel a/b. Keep schema-owner
-URLs distinct. Never pass a tracked placeholder example to a deployment.
+`WORKLOAD_B_PARAMETERS`; in all three files set the same `acceptanceRuntimeSecretUrls`
+object to `{a: {sessionDbUrl, landscapeUrl}, b: {sessionDbUrl, landscapeUrl}}`,
+using each role's versioned URLs. Set Multiple mode, none affinity, min/max
+replicas 1 and runtimeRoleLabel a/b on the two labelled files. Preserve the
+production runtime URL parameters in all files. Every deployment retains
+production and both acceptance roles' named application secrets through the
+final Single-revision pass; the label selects the references used by that revision.
+Keep schema-owner URLs in the dedicated schema-owner vault. Never pass a
+tracked placeholder example to a deployment.
 
 | Driver input | Required concrete value |
 | --- | --- |
@@ -251,7 +256,7 @@ URLs distinct. Never pass a tracked placeholder example to a deployment.
 | `P1_INTENT`, `P1_BODY` | Initial guided intent and valid action template; `prepare` merges each fresh server turn token and a new operation ID |
 | `ACCEPTANCE_SECRET_DIR` | Private directory of the bootstrap password and application-secret files listed below |
 | `PGSSLROOTCERT` | Operator-host CA bundle for Flexible Server TLS verification |
-| `BOOTSTRAP_PRINCIPAL_ID`, `BOOTSTRAP_PRINCIPAL_TYPE` | Explicit operator object ID and `User` or `ServicePrincipal`, granted Key Vault Secrets Officer on this disposable vault |
+| `BOOTSTRAP_PRINCIPAL_ID`, `BOOTSTRAP_PRINCIPAL_TYPE` | Explicit operator object ID and `User` or `ServicePrincipal`, granted Key Vault Secrets Officer on both disposable vaults |
 
 The `all` path invokes `scripts/bootstrap-acceptance.sh` after environment and
 image publication. `ACCEPTANCE_SECRET_DIR` must contain four distinct password
@@ -268,9 +273,10 @@ observer credentials. That credential file is never receipt evidence. A failed
 bootstrap stops the driver and leaves only a private bounded error log; do not
 rerun the cold-only SQL against partially created roles without investigating.
 The helper first proves the operator's newly assigned secret-write permission
-by writing the real `elspeth-secret-key` value. It retries only an explicit
+by writing the real owner session URL to the schema-owner vault and the real
+`elspeth-secret-key` value to the runtime vault. It retries only an explicit
 `ForbiddenByRbac` response, for at most 600 seconds; firewall, network and other
-failures stop immediately. SQL role creation starts only after this succeeds,
+failures stop immediately. SQL role creation starts only after both succeed,
 so an ordinary RBAC propagation delay does not strand non-idempotent role
 creation. This follows Microsoft's [Key Vault RBAC guidance](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-guide),
 which requires allowing role assignments time to refresh. A shorter bound can
@@ -325,9 +331,12 @@ The resource group is tagged `elspeth.acceptance-run-id`. The environment
 deployment creates the virtual network, the Container Apps environment with
 an NFS storage definition, the Premium FileStorage account with its NFS share
 (`rootSquash: NoRootSquash`, encryption in transit off, private endpoint), the
-Flexible Server with both databases and its administrator login, the Key Vault
-(RBAC, purge protection **off** for the disposable group),
-the Log Analytics workspace and the user-assigned identity. The what-if
+Flexible Server with both databases and its administrator login, separate
+runtime and schema-owner Key Vaults (RBAC, purge protection **off** for the
+disposable group), the Log Analytics workspace and separate runtime and
+schema-owner user-assigned identities. Only the schema-owner identity reads
+the owner vault; both identities can read application keys in the runtime
+vault. Bootstrap grants the operator secret-write access to both vaults. The what-if
 output replaces the ECS plan review; its SHA-256 is bound into the receipt.
 Create the runtime and schema-owner roles and their grants before writing
 their Key Vault URL versions and starting the doctor Jobs; the Bicep database
@@ -360,8 +369,11 @@ no-op that re-asserts the same digest.
 
 ## 3. Run the Jobs in order
 
-Each Job runs the candidate digest with the same NFS mount and identity as
-the app. Start it, poll its execution to a terminal state, and require
+The doctor Jobs run the candidate digest with the same NFS mount as the app.
+Only `doctor-schema-init` attaches the schema-owner identity; runtime and Blob
+checks attach the runtime identity. The root `provision-storage` Job has no
+identity and uses its separately pinned public image. Start each Job, poll
+its execution to a terminal state, and require
 `Succeeded`; retrieve the doctor's `--json` report from Log Analytics by
 execution name.
 
@@ -415,9 +427,11 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   cases inside the environment, the one auth mode whose truth depends on
   where the process runs.
 
-> **LIVE:** the no-schema dry run against the current `release/0.8.0` image
-> (expected: both schema checks red, everything else green) proves the wiring
-> before the epoch-54 image exists; record its execution names.
+> **LIVE:** for 0.8.1 acceptance, run the Jobs with the candidate digest and
+> require both schema checks to pass after initialization at session epoch 54
+> and Landscape epoch 39. Record the execution names. Any no-schema dry run
+> against a `release/0.8.0` image is predecessor-only wiring evidence; it
+> cannot establish the candidate's schema compatibility or acceptance.
 
 ## 4. Deploy the production shape and prove the rollout
 
@@ -481,7 +495,7 @@ parity test feeds one corpus through both).
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_revision_sha256": "64-lowercase-hex",
   "candidate_doctor_job_sha256": "64-lowercase-hex",
-  "candidate_package_version": "0.8.0",
+  "candidate_package_version": "0.8.1",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_revision_sha256": "",
@@ -832,13 +846,20 @@ remaining=$(az_capture graph query \
   -q "Resources | where resourceGroup =~ '${RESOURCE_GROUP}' | count" \
   --query 'data[0].Count' --output tsv)
 test "$remaining" = 0
-az_capture keyvault purge --name "$KEY_VAULT_NAME" --location "$AZURE_LOCATION" \
-  || printf '%s\n' 'key_vault_tombstoned' >>"$EVIDENCE_DIR/cleanup-notes.txt"
+SCHEMA_OWNER_KEY_VAULT_NAME=$(jq -er '.schemaOwnerKeyVaultName.value' "$EVIDENCE_DIR/inventory.json")
+for vault_name in "$KEY_VAULT_NAME" "$SCHEMA_OWNER_KEY_VAULT_NAME"; do
+  az_capture keyvault purge --name "$vault_name" --location "$AZURE_LOCATION" \
+    || printf '%s\n' "key_vault_tombstoned:$vault_name" >>"$EVIDENCE_DIR/cleanup-notes.txt"
+done
 ```
 
 The resource group is a true ownership boundary; Azure Resource Graph is the
 subscription-wide inventory; a Key Vault that cannot be purged is recorded as
-a tombstone with its scheduled purge date. The ECS gate ledger and HMAC
+a tombstone with its scheduled purge date. Record runtime and schema-owner
+vault fates separately in the cleanup receipt: `runtime_key_vault_purged` /
+`runtime_key_vault_tombstoned` / `runtime_scheduled_purge_date` and
+`schema_owner_key_vault_purged` / `schema_owner_key_vault_tombstoned` /
+`schema_owner_scheduled_purge_date`. The ECS gate ledger and HMAC
 approvals are not reproduced for this disposable group (plan D1).
 
 ---
@@ -853,7 +874,7 @@ The facade validates the bundle of receipts (`verify-doctor-job`,
 `resource-graph-cleanup`, `testcontainer-run` — the last
 through the shared gate, which refuses the bundle without exactly one passing
 run) and writes the sanitized
-receipt to `docs/operator/evidence/azure-container-apps/0.8.0.json` only after
+receipt to `docs/operator/evidence/azure-container-apps/0.8.1.json` only after
 the live procedure completes and its evidence passes validation. Never create
 a receipt from desktop analysis or treat skipped or failed probes as passes.
 If a run fails, retain its diagnostics, fix the defect and rerun before claiming

@@ -8,12 +8,14 @@ from hashlib import sha256
 from typing import final
 from uuid import UUID
 
-from sqlalchemy import Engine, insert, select, update
+from sqlalchemy import Engine, delete, insert, select, update
 
 from elspeth.web.auth.models import AuthenticationError, UserIdentity
 from elspeth.web.coordination.membership_authority import _DATABASE_CLOCK_SQL, _database_clock_value, _ensure_utc
 from elspeth.web.execution.websocket_ticket import WebSocketTicket
 from elspeth.web.sessions.models import identities_table, runs_table, sessions_table, websocket_tickets_table
+
+_EXPIRY_CLEANUP_BATCH_SIZE = 100
 
 
 @final
@@ -60,6 +62,22 @@ class RepositorySessionWebsocketTicketAuthority:
             ):
                 raise AuthenticationError("Run WebSocket access refused")
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            # Credentials are transient even when run history is retained. Bound
+            # each issuance's cleanup and skip tickets held by another transaction;
+            # no identity/session lock is acquired after these ticket locks.
+            expired_digests = (
+                conn.execute(
+                    select(websocket_tickets_table.c.ticket_digest)
+                    .where(websocket_tickets_table.c.expires_at <= now)
+                    .order_by(websocket_tickets_table.c.expires_at, websocket_tickets_table.c.ticket_digest)
+                    .limit(_EXPIRY_CLEANUP_BATCH_SIZE)
+                    .with_for_update(skip_locked=True)
+                )
+                .scalars()
+                .all()
+            )
+            if expired_digests:
+                conn.execute(delete(websocket_tickets_table).where(websocket_tickets_table.c.ticket_digest.in_(expired_digests)))
             raw_ticket = secrets.token_urlsafe(32)
             expires_at = now + self._ttl
             conn.execute(

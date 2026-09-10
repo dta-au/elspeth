@@ -36,9 +36,9 @@ changelog and feeds the platform acceptance and release evidence in stages 3 and
 | --- | --- | --- |
 | 1. Set the onboarding path | Decide the pilot model, identity model and default authoring mode. Scope the pilot spend ceiling. Begin evaluation implementation and environment access arrangements. | A defined route to first use, with data-retention expectations and cost limits settled before onboarding. |
 | 2. Prepare and evaluate a pilot | Resolve preview and sharing defects. Deliver the agreed spend ceiling and assess pilot access controls. Establish comparable guided and freeform measurements. | Named participants can use the agreed pilot scope and provide evidence for authoring improvements. The pilot depends on acceptance of a disposal date. |
-| 3. Complete the foundations for durable use | Integrate and verify multi-replica safety before the identity data-store changes. Complete identity, access and administration. Coordinate changes to persisted contracts with the identity cutover. | The planned identity cutover is complete before users rely on retained data. Platform support claims have the required acceptance evidence. |
+| 3. Complete the foundations for durable use | Integrate and verify multi-replica safety before the identity data-store changes. Complete identity, access and administration. Coordinate changes to persisted contracts, including per-user customisation, with the identity cutover. | The planned identity cutover is complete before users rely on retained data. Platform support claims have the required acceptance evidence. |
 | 4. Establish release and assurance evidence | Complete engine evidence, security and data-lifecycle work, release checks and operator signing. Run the assurance programme against the agreed deployment profiles. | Release claims are supported by evidence, with any exclusions stated. A 1.0 claim depends on the agreed completeness criteria. |
-| 5. Extend capability | Schedule the web API seam, compiler seam, worker affinity, additional plugins and branding according to need and dependencies. Design embedded graphs and iteration last. | Users can build their own web layer against a supported backend contract. New capabilities build on the established execution, authoring and assurance contracts. Scope decisions precede estimates. |
+| 5. Extend capability | Schedule the web API seam, compiler seam, worker affinity, additional plugins, Composer skillpacks and branding according to need and dependencies. Design embedded graphs and iteration last. | Users can build their own web layer against a supported backend contract. New capabilities build on the established execution, authoring and assurance contracts. Scope decisions precede estimates. |
 
 The pilot does not require the full identity or multi-replica packages. It does
 require a scoped spend ceiling: if limits must be enforced per person, the
@@ -55,10 +55,11 @@ among extensions does not require it to wait for the earlier stages.
 
 ## Main work packages
 
-Existing package identifiers retain the source inventory's numbering. B.5,
-C.3 and C.4 identify additional roadmap packages: multi-replica pinning, the
-web API seam and Composer wires remediation. Outcomes below describe the
-planned work, not capabilities certified as available.
+Existing package identifiers retain the source inventory's numbering. A.5,
+B.5, C.3, C.4 and E.2 identify additional roadmap packages: user customisation,
+multi-replica pinning, the web API seam, Composer wires remediation and
+Composer skillpacks. Outcomes below describe the planned work, not capabilities
+certified as available.
 
 ### A. Readiness for users
 
@@ -68,6 +69,7 @@ planned work, not capabilities certified as available.
 | **A.2 Guided mode and first-run experience** | Improve entry, stage order, navigation, decision presentation, explanatory text and accessibility. Compare guided and freeform use and conduct participant testing. | Establish D.2 measurement first. Resolve design rulings and order work against collector remediation. The model continues to author pipelines; the tutorial uses the standard backend. |
 | **A.3 Retire bugs** | Correct defects in authoring, execution and output handling, with explicit capacity for reproduction, repair and regression verification. Close issue records when the integrated fix is verified; reconcile already-fixed reports against the current implementation. | Prioritise defects that prevent onboarding or invalidate results. Assign engine and authoring repairs without counting them again in other packages. |
 | **A.4 Customer branding and presentation** | Support controlled customer palettes, contrast variants and colour checks while protecting security markings and product vocabulary. | Decide whether the purpose is branding or distinguishing deployments, whether renaming and shared reviews are included, and how supplied palettes pass accessibility checks. |
+| **A.5 User customisation** | Consolidate per-person customisation of the authoring experience: the level of detail presented, the default authoring mode, and standing personal preferences such as preferred name, language variant and explanation style, carried into Composer sessions so they need not be restated each time. Record which preferences were in force for a composition. | Preferences are presentational and stylistic. They carry no authority over pipeline structure, validation, custody or required controls, and the controls that enforce this remain server-side. Coordinate the persisted-contract change with the identity data-store work in A.1. Decide whether recurring preferences warrant typed fields rather than free text. |
 
 ### B. Platform and deployment
 
@@ -125,6 +127,19 @@ planner authored; it does not author pipeline structure.
 | Package | Main scope and intended outcome | Dependency or decision |
 | --- | --- | --- |
 | **E.1 Plugin work** | Prioritise row-failure routing and plugin contracts, then join typing, document reassembly and provider behaviour. Consider knowledge-management and monitoring capabilities after scope review. Keep plugin documentation aligned with the registry. | Row-failure routing and reassembly share engine dependencies owned by B.1. Reassess search designs against existing retrieval support. Decide which plugins users may author through the web before committing to larger extensions. |
+| **E.2 Composer skillpacks** | Allow a plugin to ship long-form guidance describing the considerations that govern its correct use, and let the Composer planner retrieve that guidance when it judges it relevant. Advanced statistical and industrial plugins carry assumptions, sequencing requirements and failure semantics that a short hint cannot convey. Record which guidance was available and which was used. | Follows E.1's decision on which plugins users may author through the web. Guidance is explanatory only: it carries no pipeline structure, and the planner continues to author every pipeline. Decide the size limits and the first plugin to document before writing further guidance to fit them. |
+
+The [Composer skillpacks design](docs/specs/2026-09-10-plugin-skillpacks-design.md)
+describes guidance that ships with the plugin it documents and reaches the
+planner only when the planner asks for it, so its cost falls on the sessions
+that need it. The [user customisation design](docs/specs/2026-09-10-user-standing-preferences-design.md)
+describes the standing-preferences part of A.5. Both record in the audit trail
+what was in force for a composition, and neither authors pipeline structure.
+Both apply uniformly to the first-run tutorial, which continues to use the
+standard backend; [ADR-049](docs/architecture/adr/049-tutorial-canary-baseline-is-configuration-relative.md)
+records what that means for the tutorial's use as a machinery signal. A.5 can
+proceed earlier than its placement suggests if its persisted-contract change is
+coordinated with A.1.
 
 ### F. Continuity
 

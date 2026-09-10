@@ -29,8 +29,9 @@ from elspeth.plugins.llm.model_catalog import read_openrouter_catalog_snapshot_i
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
-from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.execution.envelope import EnvelopeRecoveryReason, _EnvelopePayload
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.recovery import RunRecoveryCoordinator
 from elspeth.web.execution.service import ExecutionServiceImpl
@@ -209,6 +210,90 @@ def _recover_full_web_dispatch(session_url, landscape_url, data_dir, run_id, con
         connection.send((str(run.id), run.status, run.rows_processed, run.rows_succeeded, run.rows_failed))
 
     asyncio.run(recover())
+
+
+def _recover_unavailable_retained_source(session_url, landscape_url, data_dir, run_id, connection):
+    async def recover():
+        engine = create_session_engine(session_url)
+        sessions = _service(engine, f"fresh-refusal-{uuid4()}")
+        execution, blobs = _execution(sessions, engine, session_url, landscape_url, data_dir)
+        coordinator = RunRecoveryCoordinator(sessions, execution, blobs, landscape_url=landscape_url, create_tables=False)
+        refusals = []
+        record_refusal = execution._record_recovery_refusal
+
+        async def observe_refusal(refused_run_id, lease, error):
+            refusals.append((refused_run_id, error.reason))
+            await record_refusal(refused_run_id, lease, error)
+
+        try:
+            with (
+                patch.object(execution, "_record_recovery_refusal", new=observe_refusal),
+                patch.object(execution._executor, "submit", side_effect=AssertionError("Unavailable source must not dispatch")) as submit,
+            ):
+                await coordinator.recover()
+                assert refusals == [(UUID(run_id), EnvelopeRecoveryReason.SOURCE_UNAVAILABLE)]
+                submit.assert_not_called()
+            run = await sessions.get_run(UUID(run_id))
+            assert run.status == "pending"
+            assert run.saga_state == "recovery_required"
+            assert run.recovery_required_reason is RecoveryRequiredReason.INCOMPLETE_SOURCE
+            assert not execution.get_live_run_ids()
+            connection.send((str(run.id), run.saga_state, run.recovery_required_reason.value))
+        finally:
+            await execution.shutdown()
+            engine.dispose()
+
+    asyncio.run(recover())
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed"])
+def test_fresh_process_refuses_unavailable_retained_source(request, tmp_path, damage):
+    session_url, landscape_url = request.getfixturevalue("recovery_databases")
+    run_id, session_id, owner, source_path, output_path = _process(
+        _die_during_web_dispatch,
+        session_url,
+        landscape_url,
+        str(tmp_path),
+        "admission",
+        expected_exit=75,
+    )
+    engine = create_session_engine(session_url)
+    try:
+        with engine.connect() as conn:
+            envelope = conn.execute(
+                select(run_execution_inputs_table.c.envelope).where(run_execution_inputs_table.c.run_id == run_id)
+            ).scalar_one()
+        retained_inputs = _EnvelopePayload.model_validate(envelope).retained_inputs
+        assert len(retained_inputs) == 1
+        retained_path = Path(retained_inputs[0].retained_path)
+        assert retained_path != Path(source_path)
+        assert retained_path.read_text() == _ADMITTED_CSV
+        if damage == "missing":
+            retained_path.unlink()
+        else:
+            retained_path.write_text(_ADMITTED_CSV.replace("admitted", "modified"))
+        # The original remains readable; recovery must refuse rather than
+        # substitute mutable session storage for the admitted retained bytes.
+        assert Path(source_path).read_text() == _ADMITTED_CSV
+        _expire_dead_owner(session_url, session_id, owner)
+        assert _process(
+            _recover_unavailable_retained_source,
+            session_url,
+            landscape_url,
+            str(tmp_path),
+            run_id,
+            expected_exit=0,
+        ) == (run_id, "recovery_required", RecoveryRequiredReason.INCOMPLETE_SOURCE.value)
+        assert not Path(output_path).exists()
+        with engine.connect() as conn:
+            permit = conn.execute(select(run_start_permits_table).where(run_start_permits_table.c.run_id == run_id)).one()
+            assert permit.start_state == "pending"
+            events = conn.execute(select(run_events_table.c.event_type).where(run_events_table.c.run_id == run_id)).scalars().all()
+            assert not {"failed", "completed", "cancelled"}.intersection(events)
+        with LandscapeDB.from_url(landscape_url, create_tables=False) as landscape, landscape.engine.connect() as conn:
+            assert conn.execute(select(func.count()).select_from(landscape_runs_table)).scalar_one() == 0
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize("seam", ["admission", "permit", "sessions_link"])

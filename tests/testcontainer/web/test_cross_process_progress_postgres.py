@@ -237,8 +237,10 @@ def progress_identity(external_deployment_postgres_url: str) -> Iterator[tuple[s
         activate=True,
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
+        identity_dormancy_days=90,
         record_admission=_noop,
         record_rebound=_noop,
+        record_dormant=_noop,
     )
     try:
         yield outcome.record.identity_id, subject
@@ -304,8 +306,10 @@ def test_existing_reader_rechecks_identity_after_revocation(
                     activate=False,
                     quota_tokens_per_day=None,
                     quota_storage_bytes=None,
+                    identity_dormancy_days=90,
                     record_admission=_noop,
                     record_rebound=_noop,
+                    record_dormant=_noop,
                 )
                 assert outcome.rebound_refused
                 assert outcome.record.access_state == "disabled"
@@ -377,8 +381,10 @@ def test_websocket_route_streams_peer_commit_without_local_broadcast(
                         activate=False,
                         quota_tokens_per_day=None,
                         quota_storage_bytes=None,
+                        identity_dormancy_days=90,
                         record_admission=_noop,
                         record_rebound=_noop,
+                        record_dormant=_noop,
                     )
                     assert outcome.rebound_refused
                 finally:

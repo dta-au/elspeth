@@ -565,8 +565,11 @@ def build_run_execution_input(
     retained_paths = {item.retained_path for item in retained_inputs}
     if not set(_declared_source_paths(payload.executable_config)).issubset(retained_paths):
         raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE)
-    for item in retained_inputs:
-        verify_retained_input(item)
+    try:
+        for item in retained_inputs:
+            verify_retained_input(item)
+    except RetainedInputUnavailable:
+        raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE) from None
     _verify_blob_manifest(discover_execution_blob_inputs(frozen), payload.blob_inputs)
     graph_digest = _digest_json(payload.executable_config)
     document = payload.model_dump(mode="json")

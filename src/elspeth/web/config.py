@@ -546,6 +546,13 @@ class WebSettings(BaseModel):
     # R9 dormancy window, and how long a never-activated pending row is kept
     # before a lazy purge drops it. Both have defaults because both are
     # policy, not deployment facts.
+    #
+    # ``identity_dormancy_days`` IS READ AT EVERY LOGIN: the app factory and
+    # the SSO wiring hand it to ``ensure_identity``, which re-pends an active
+    # identity whose previous login is older than the window (R9), exempting
+    # the last active human administrator (D34). Lower it and the next login
+    # by anyone past the new window re-pends them; raise it and nothing
+    # already re-pended comes back on its own.
     identity_dormancy_days: int = Field(default=90, gt=0)
     identity_pending_retention_days: int = Field(default=90, gt=0)
 
