@@ -593,7 +593,9 @@ class TriggerConfig(BaseModel):
             )
 
         # Reject non-boolean expressions
-        # Per CLAUDE.md: "if bool(result)" coercion is forbidden for our data
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, our data gets no coercion — an `if bool(result)` truth test is
+        # forbidden here.
         if not parser.is_boolean_expression():
             raise ValueError(
                 f"Trigger condition must be a boolean expression that returns True/False. "

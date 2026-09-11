@@ -140,8 +140,8 @@ def test_audit_fail_no_plugin_crash_raises_audit_integrity_error(service):
     assert exc_info.value.__cause__ is not None
     assert isinstance(exc_info.value.__cause__, OperationalError)
 
-    # Counter increments before the raise — telemetry-after-audit per
-    # CLAUDE.md primacy.
+    # Counter increments before the raise — telemetry-after-audit per the
+    # ``logging-telemetry-policy`` skill §Logging Policy.
     assert observed_value(service._telemetry.tool_row_tier1_violation_total) == starting + 1
 
     # The exception must be in TIER_1_ERRORS so ``except Exception:``
@@ -157,8 +157,8 @@ def test_audit_fail_during_plugin_crash_records_unwind_failure(service):
     already has a captured plugin-crash exception to raise; surfacing
     a separate audit exception here would mask the original tool
     failure. The audit failure is recorded via counter + slog
-    (permitted under CLAUDE.md primacy because the audit system
-    itself failed)."""
+    (permitted under the ``logging-telemetry-policy`` skill §Logging Policy
+    because the audit system itself failed)."""
     from elspeth.web.sessions.telemetry import observed_value
 
     _make_session(service, "p2")

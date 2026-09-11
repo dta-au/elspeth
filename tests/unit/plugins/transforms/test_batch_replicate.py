@@ -113,7 +113,8 @@ class TestBatchReplicateHappyPath:
 class TestBatchReplicateTypeEnforcement:
     """Contract enforcement tests - transforms must not coerce types.
 
-    Per CLAUDE.md Tier 2 trust model and docs/contracts/plugin-protocol.md:
+    Per the Tier 2 rules in docs/guides/data-trust-and-error-handling.md
+    §The Three-Tier Trust Model and docs/contracts/plugin-protocol.md:
     Transforms receive pipeline data that should already be type-validated.
     Wrong types indicate upstream bugs and must raise TypeError, not be coerced.
     """

@@ -1,13 +1,15 @@
 """Pydantic request/response models for all session API endpoints.
 
 Response models in this module serialize **system-owned data** (Tier 1 in
-the Data Manifesto).  They inherit from ``_StrictResponse`` so that
+docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
+They inherit from ``_StrictResponse`` so that
 coercion and unknown fields crash rather than silently passing through —
 the Landscape record and the HTTP response must agree exactly.
 
 Request models keep normal ``BaseModel`` coercion semantics: client input
 is Tier 3 and the boundary-layer coercion rules (documented in
-``tier-model-deep-dive``) apply.  They still reject unknown keys
+docs/guides/data-trust-and-error-handling.md §Coercion Rules by Plugin Type)
+apply.  They still reject unknown keys
 mechanically so stale or typoed client payloads fail closed at the HTTP
 boundary instead of being silently reinterpreted by the route layer.
 """
@@ -602,8 +604,9 @@ class GuidedSessionResponse(_StrictResponse):
     # GuidedSessionResponse must explicitly pass the live values.  A default
     # of ``[]`` / ``0`` here would hide drift: a route that forgot to thread
     # ``guided.chat_history`` through would silently return an empty wire
-    # field while the server held real history.  Per CLAUDE.md auditability
-    # standard, that is evidence tampering.
+    # field while the server held real history.  Per the auditability
+    # principle (ARCHITECTURE.md §Design Principles), that is evidence
+    # tampering.
     chat_history: list[ChatTurnResponse]
     chat_turn_seq: int
     # Server-projected reviewed-component ledger. Required for the same

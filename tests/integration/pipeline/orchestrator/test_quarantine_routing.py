@@ -321,8 +321,9 @@ class TestQuarantineHappyPath:
         orchestrator = Orchestrator(db)
         result = orchestrator.run(config, graph=build_production_graph(config), payload_store=payload_store)
 
-        # Quarantine is a clean terminal outcome per CLAUDE.md Tier-3
-        # manifesto. All-quarantined run satisfies the
+        # Quarantine is a clean Tier-3 terminal outcome (see
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model). All-quarantined run satisfies the
         # ``terminal_clean_indicator`` (via rows_quarantined > 0) with no
         # uncaught ``failure_indicator`` => COMPLETED_WITH_FAILURES.
         assert result.status == RunStatus.COMPLETED_WITH_FAILURES
@@ -361,8 +362,9 @@ class TestQuarantineHappyPath:
         orchestrator = Orchestrator(db)
         result = orchestrator.run(config, graph=build_production_graph(config), payload_store=payload_store)
 
-        # Quarantine is a clean terminal outcome per CLAUDE.md Tier-3
-        # manifesto. All-quarantined run satisfies the
+        # Quarantine is a clean Tier-3 terminal outcome (see
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model). All-quarantined run satisfies the
         # ``terminal_clean_indicator`` (via rows_quarantined > 0) with no
         # uncaught ``failure_indicator`` => COMPLETED_WITH_FAILURES.
         assert result.status == RunStatus.COMPLETED_WITH_FAILURES
@@ -408,8 +410,9 @@ class TestQuarantineHappyPath:
         orchestrator = Orchestrator(db)
         result = orchestrator.run(config, graph=build_production_graph(config), payload_store=payload_store)
 
-        # Quarantine is a clean terminal outcome per CLAUDE.md Tier-3
-        # manifesto. All-quarantined run satisfies the
+        # Quarantine is a clean Tier-3 terminal outcome (see
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model). All-quarantined run satisfies the
         # ``terminal_clean_indicator`` (via rows_quarantined > 0) with no
         # uncaught ``failure_indicator`` => COMPLETED_WITH_FAILURES.
         assert result.status == RunStatus.COMPLETED_WITH_FAILURES
@@ -696,8 +699,9 @@ class TestQuarantineNonCanonicalData:
         orchestrator = Orchestrator(db)
         result = orchestrator.run(config, graph=build_production_graph(config), payload_store=payload_store)
 
-        # Quarantine is a clean terminal outcome per CLAUDE.md Tier-3
-        # manifesto. All-quarantined run satisfies the
+        # Quarantine is a clean Tier-3 terminal outcome (see
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model). All-quarantined run satisfies the
         # ``terminal_clean_indicator`` (via rows_quarantined > 0) with no
         # uncaught ``failure_indicator`` => COMPLETED_WITH_FAILURES.
         assert result.status == RunStatus.COMPLETED_WITH_FAILURES

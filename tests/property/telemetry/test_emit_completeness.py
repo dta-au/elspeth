@@ -1,7 +1,8 @@
 # tests/property/telemetry/test_emit_completeness.py
 """Property-based tests for telemetry emit completeness.
 
-Per CLAUDE.md: "Any telemetry emission point MUST either send what it has
+Per the ``logging-telemetry-policy`` skill §Telemetry (Operational Visibility):
+"Any telemetry emission point MUST either send what it has
 OR explicitly acknowledge 'I have nothing' (with failure reason if applicable).
 Never silently swallow events or exceptions."
 

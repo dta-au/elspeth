@@ -143,7 +143,7 @@ describe("ChatInput — controlled-mode prefill listener", () => {
     addSpy.mockRestore();
   });
 
-  it("throws TypeError on non-string event detail (CLAUDE.md trust-tier: internal contract violations crash)", () => {
+  it("throws TypeError on non-string event detail (three-tier trust model: internal contract violations crash)", () => {
     // WHATWG DOM spec: event listener errors do NOT propagate through
     // dispatchEvent — the caller continues; the error is reported via
     // window.onerror / 'error' event.  Capture that report to prove the

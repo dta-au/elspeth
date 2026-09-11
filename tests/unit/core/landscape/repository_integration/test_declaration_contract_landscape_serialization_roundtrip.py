@@ -1,6 +1,7 @@
 """DeclarationContractViolation -> dispatcher -> Landscape -> explain() round-trip.
 
-CLAUDE.md attributability mandate: for any output, explain(recorder, run_id,
+The attributability mandate (``engine-patterns-reference`` skill §The
+Attributability Test): for any output, explain(recorder, run_id,
 token_id) must prove complete lineage. These tests exercise declaration
 violations end-to-end through the dispatcher before they are recorded to the
 Landscape, so contract-name attribution is proven on the same path production

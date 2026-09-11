@@ -248,7 +248,8 @@ class _DispatchOutcome:
     ``plugin_crash`` is set when a tool handler raised an exception
     other than ``ToolArgumentError``. The carrier carries it forward;
     the driver propagates after P4 has had a chance to persist the
-    pre-crash mutations (CLAUDE.md "partial_state" discipline).
+    pre-crash mutations, so state the loop already committed is not
+    silently dropped from the state history.
     """
 
     # State at end of dispatch

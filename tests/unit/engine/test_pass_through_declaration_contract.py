@@ -161,8 +161,9 @@ def test_applies_to_rejects_non_bool_passes_through_input(value: object) -> None
 
 
 def test_applies_to_on_plugin_missing_attribute_crashes() -> None:
-    """CLAUDE.md offensive programming: plugin missing passes_through_input is
-    a framework bug; must crash loudly, not silently return False."""
+    """Offensive programming (``engine-patterns-reference`` skill §Offensive Programming
+    Examples): a plugin missing passes_through_input is a framework bug; it must
+    crash loudly, not silently return False."""
     c = PassThroughDeclarationContract()
 
     class _NoAttr:

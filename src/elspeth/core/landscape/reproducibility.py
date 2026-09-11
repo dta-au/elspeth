@@ -101,7 +101,8 @@ def compute_grade(db: "LandscapeDB", run_id: str) -> ReproducibilityGrade:
 
         # Tier-1 audit data validation: Fetch ALL distinct determinism values
         # and validate each is a valid Determinism enum member.
-        # Per Data Manifesto: "Bad data in the audit trail = crash immediately"
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, bad data in the audit trail crashes immediately.
         query_all = select(nodes_table.c.determinism).where(nodes_table.c.run_id == run_id).distinct()
         result = conn.execute(query_all)
         raw_values = [row[0] for row in result.fetchall()]
@@ -285,7 +286,8 @@ def update_grade_after_purge(
 
         current_grade = row[0]
 
-        # Per Data Manifesto: "Bad data in the audit trail = crash immediately"
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, bad data in the audit trail crashes immediately.
         if current_grade is None:
             raise AuditIntegrityError(f"NULL reproducibility_grade for run {run_id} — audit data corruption")
 

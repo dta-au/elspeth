@@ -5320,7 +5320,8 @@ class TestMessageRoutes:
     def test_send_message_llm_call_persistence_failure_raises_on_success_path(self, tmp_path) -> None:
         """Success-path LLM-call audit-row persist failure MUST raise (Tier-1 audit corruption).
 
-        After CLAUDE.md audit-primacy enforcement, a SQLAlchemyError on the
+        After audit-primacy enforcement (``logging-telemetry-policy`` skill
+        §Logging Policy), a SQLAlchemyError on the
         success-path LLM-call audit-sidecar insert is a Tier-1 audit
         corruption: the assistant row already exists in the audit trail but
         the LLM-call audit row that proves what the model returned is
@@ -5332,9 +5333,9 @@ class TestMessageRoutes:
 
         The "fail-soft on persist failure" behaviour previously asserted
         here was the bug: silently swallowing the audit-row write
-        rationalised silent failure as mercy and violated CLAUDE.md
-        Auditability Standard ("'I don't know what happened' is never an
-        acceptable answer for any output").
+        rationalised silent failure as mercy and violated the auditability
+        principle (ARCHITECTURE.md §Design Principles: complete traceability;
+        "I don't know what happened" is never acceptable).
         """
         app, service = _make_app(tmp_path)
         composer = SimpleNamespace()
@@ -10604,7 +10605,8 @@ sinks:
           dashboards measure the real preflight failure rate, not bugs
           we introduced ourselves.
 
-        Per CLAUDE.md offensive-programming policy: programmer bugs MUST
+        Per the ``engine-patterns-reference`` skill §Offensive Programming
+        Examples: programmer bugs MUST
         crash. Conflating them with user-fixable failures destroys the
         operator's ability to diagnose.
         """
@@ -10632,8 +10634,8 @@ sinks:
         async def programmer_bug(state, *, settings, secret_service, user_id, session_id, **_policy_context):
             # A real bug we'd see if e.g. a refactor accidentally broke
             # an attribute lookup inside validate_pipeline. AttributeError
-            # is in the canonical "programmer bug" set per CLAUDE.md
-            # offensive-programming policy.
+            # is in the canonical "programmer bug" set per the
+            # engine-patterns-reference skill §Offensive Programming Examples.
             raise AttributeError("'NoneType' object has no attribute 'plugin'")
 
         with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=programmer_bug):
@@ -12045,7 +12047,8 @@ class TestComposePluginCrashResponse:
         ``partial_state_save_failed=True``. Pre-fix behaviour caught
         (ValueError, TypeError, KeyError, SQLAlchemyError) and produced
         a soft 500 with the flag set — which is exactly the silent-
-        wrong-result pattern CLAUDE.md forbids for our own data.
+        wrong-result pattern docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model forbids for our own data.
         """
         partial = CompositionState(
             source=None,
@@ -13087,7 +13090,7 @@ def test_compose_plugin_crash_persists_runtime_invalid_partial_state(tmp_path) -
 #
 # The original stubs raised HTTPException(500) directly without persisting,
 # silently dropping accumulated tool-call mutations from the audit trail —
-# an audit-primacy violation per CLAUDE.md.
+# an audit-primacy violation (logging-telemetry-policy skill §Logging Policy).
 
 
 def _make_authoring_valid_partial(name: str, version: int = 5) -> CompositionState:
@@ -13443,9 +13446,9 @@ def test_compose_cached_runtime_preflight_no_partial_state_records_telemetry(tmp
     composer.runtime_preflight.total. Without this, dashboards under-count
     cached-preflight failures by exactly the count of "no LLM mutation
     before cached failure re-raise" events — operators see neither a
-    primary nor a recovery emission, violating CLAUDE.md telemetry primacy
-    ("every telemetry emission point must send or explicitly acknowledge
-    'nothing to send.'").
+    primary nor a recovery emission, violating the ``logging-telemetry-policy``
+    skill §Telemetry (Operational Visibility): "Any telemetry emission point
+    MUST either send what it has OR explicitly acknowledge 'I have nothing'".
 
     Two emissions are required:
       (a) Primary: source="cached_preflight" — attributes the failure to

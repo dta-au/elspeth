@@ -1,6 +1,7 @@
 """Tests for guided-mode audit emit helpers.
 
-Audit-tier (Tier 1) per CLAUDE.md. Coercion forbidden — every field is
+Audit-tier (Tier 1) per docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model. Coercion forbidden — every field is
 either present or the function raises.
 
 Per Errata C4: the guided event types are recorded as ComposerToolInvocation

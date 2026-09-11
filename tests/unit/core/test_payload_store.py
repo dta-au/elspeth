@@ -435,7 +435,9 @@ class TestPayloadStoreSecurityValidation:
     """Security tests for content_hash validation and path containment.
 
     These tests verify that FilesystemPayloadStore rejects malformed hashes
-    and path traversal attempts. Per CLAUDE.md Tier 1 rules, invalid data
+    and path traversal attempts. Per the Tier 1 rules in
+    docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model, invalid data
     from the audit trail must crash immediately - never silently fail.
     """
 

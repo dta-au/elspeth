@@ -1180,9 +1180,10 @@ guided_operation_events_table = Table(
     ),
 )
 
-# Per-event ``payload`` JSON contract (Tier-1 schema; CLAUDE.md
-# §"Three-Tier Trust Model" — values written here are our own data and
-# must satisfy the contract on read or crash):
+# Per-event ``payload`` JSON contract (Tier-1 schema; see
+# docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model —
+# values written here are our own data and must satisfy the contract on read
+# or crash):
 #
 # Payload contract for event_type="trust_mode.changed":
 #   trust_mode: str — the new value the PATCH set
@@ -1195,9 +1196,10 @@ guided_operation_events_table = Table(
 #       counter to satisfy the audit-primacy superset rule).
 #   density_default: str — the new density_default value
 #       (vocabulary per the column's CHECK constraint).
-# Adding a new key here is a Tier-1 schema-cohort change (per
-# CLAUDE.md "DB migration = delete the old DB"); document the
-# key, its vocabulary, and the owning phase at the same time.
+# Adding a new key here is a Tier-1 schema-cohort change: pre-release, a
+# schema change gets no migration shim — the old DB is deleted (per
+# CONTRIBUTING.md §Code Standards). Document the key, its vocabulary, and
+# the owning phase at the same time.
 #
 # Payload contract for event_type="proposal.created":
 #   Generic tool proposals use the closed current

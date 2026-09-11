@@ -1913,7 +1913,8 @@ def __getattr__(name: str) -> tuple[type[Exception], ...]:
 # Schema Contract Violation Types (Tier 3 - External Data)
 # =============================================================================
 # These exceptions represent validation failures on external/user data.
-# They result in row quarantine, NOT crashes. Per CLAUDE.md Three-Tier Trust Model,
+# They result in row quarantine, NOT crashes. Per the three-tier trust model
+# (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
 # Tier 3 data (external) can be "literal trash" and must be handled gracefully.
 #
 # Error messages follow "'original' (normalized)" format for debuggability:

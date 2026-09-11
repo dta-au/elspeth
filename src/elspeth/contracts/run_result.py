@@ -82,9 +82,10 @@ class RunResult:
         predicate counters. Routed counters are guard-only subsets of those.
         ``rows_quarantined`` is a subset of ``rows_failed`` *by bookkeeping*
         (a quarantined row is "not-succeeded") but is a *clean* terminal
-        outcome by audit semantics: per CLAUDE.md Tier-3 data manifesto,
-        quarantine is a deliberate clean classification, not an uncaught
-        failure. The status predicate therefore treats quarantine
+        outcome by audit semantics: under the three-tier trust model
+        (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
+        quarantining Tier-3 data is a deliberate clean classification, not an
+        uncaught failure. The status predicate therefore treats quarantine
         asymmetrically:
 
         * ``terminal_clean_indicator`` — at least one row reached a clean
@@ -233,9 +234,10 @@ def derive_terminal_run_status(
 ) -> RunStatus:
     """Pick a terminal RunStatus from ADR-019 lifecycle counters.
 
-    Quarantine semantics (CLAUDE.md Tier-3 data manifesto): a quarantined
-    row is a *clean* terminal outcome — the pipeline made a deliberate
-    "do not pass this row downstream" determination. It is bookkeeping-
+    Quarantine semantics for Tier-3 data (see
+    docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model):
+    a quarantined row is a *clean* terminal outcome — the pipeline made a
+    deliberate "do not pass this row downstream" determination. It is bookkeeping-
     counted under ``rows_failed`` (subset invariant) but audit-counted as
     a clean classification. The verdict treats it asymmetrically:
 

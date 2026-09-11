@@ -221,7 +221,9 @@ class SchemaContract:
             ValueError: If value is NaN or Infinity
         """
         # Always check for duplicates - prevents broken O(1) lookup invariant
-        # Per CLAUDE.md: Adding duplicate is a bug in caller code
+        # Adding a duplicate is a bug in caller code — reject it at construction
+        # rather than let it reach the audit trail (see the
+        # engine-patterns-reference skill §Offensive Programming Examples)
         if normalized in self._by_normalized:
             raise TypeError(f"Field '{original}' ({normalized}) already exists in contract")
 
@@ -319,7 +321,8 @@ class SchemaContract:
         The hash is truncated to 32 hex characters (128 bits).
 
         IMPORTANT: This hash MUST include ALL fields written by to_checkpoint_format().
-        Per CLAUDE.md Tier 1: integrity checks must detect any mutation of serialized state.
+        Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model), Tier 1 integrity checks must detect any mutation of serialized state.
         Missing fields from the hash would allow tampering without detection.
 
         Includes:
@@ -435,7 +438,8 @@ class SchemaContract:
             raise AuditIntegrityError(f"Corrupt SchemaContract checkpoint: missing key {e}. Top-level keys: {sorted(data.keys())}") from e
 
         # Verify integrity (Tier 1 audit requirement)
-        # Per CLAUDE.md: "Bad data in the audit trail = crash immediately"
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, bad data in the audit trail crashes immediately.
         # to_checkpoint_format() ALWAYS writes version_hash, so missing = corruption
         try:
             expected_hash = data["version_hash"]
@@ -529,7 +533,8 @@ class PipelineRow:
                 f"Non-dict input suggests data corruption on a Tier 1 restore path."
             )
         # Deep-freeze to prevent mutation of nested containers after audit recording.
-        # Per CLAUDE.md Tier 1: audit data must not be modified.
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, Tier 1 audit data must not be modified.
         self._data = deep_freeze(data)
         self._contract = contract
 

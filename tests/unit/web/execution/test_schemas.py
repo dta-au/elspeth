@@ -1720,7 +1720,8 @@ class TestTerminalEventStatusDiscriminator:
 class TestS8FabricationGuard:
     """S-8: ProgressData and CancelledData require all six counters explicitly.
 
-    Per CLAUDE.md fabrication test, defaulting an absent count to ``0`` makes
+    An absent value stays None rather than coerced to zero: defaulting an
+    absent count to ``0`` makes
     "we don't know" indistinguishable from "definitely zero".  The engine's
     ``ProgressEvent`` (contracts/cli.py) already populates every counter on
     every emission; making the wire schema require them too closes the

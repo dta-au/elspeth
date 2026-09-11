@@ -2747,7 +2747,8 @@ class ExecutionServiceImpl:
                 # degradation degrades to the bare structural message (still
                 # satisfying the failed-requires-error invariant) and is
                 # recorded via the slog warning (audit-system failure
-                # exemption per CLAUDE.md logging-telemetry-policy).
+                # exemption per the logging-telemetry-policy skill
+                # §Logging Policy).
                 # Malformed audit JSON (json.JSONDecodeError, a ValueError
                 # subclass raised by load_top_failure_categories) is Tier-1
                 # audit-data corruption and is DELIBERATELY not caught — it
@@ -3095,9 +3096,10 @@ class ExecutionServiceImpl:
                     # record on the audit side.
                     #
                     # We deliberately do NOT add a slog *at this site*.  Per
-                    # ``logging-telemetry-policy`` the logger is not for
-                    # post-audit operational signal — the SRE-discoverable
-                    # surface for this scenario is already three channels:
+                    # the logging-telemetry-policy skill §Logging Policy the
+                    # logger is not for post-audit operational signal — the
+                    # SRE-discoverable surface for this scenario is already
+                    # three channels:
                     #   1. The audit ``runs`` row (queryable by run_id) —
                     #      carries the truthful terminal status the run
                     #      reached before the post-audit exception.
@@ -3207,7 +3209,8 @@ class ExecutionServiceImpl:
             # Broadcast a "failed" SSE event ONLY when the audit row isn't
             # already terminal.  Broadcasting "failed" against a "completed"
             # audit row would tell SSE consumers the opposite of audit truth
-            # and violate the audit-primacy constraint in CLAUDE.md.
+            # and violate audit primacy (the logging-telemetry-policy skill
+            # §The Primacy Test).
             # Re-emitting the *correct* terminal SSE event for consumer
             # continuity is a separate UX improvement.
             #

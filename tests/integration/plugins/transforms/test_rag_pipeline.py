@@ -335,7 +335,8 @@ class TestRAGPipelineWithChromaProvider:
 class TestRAGExecutionGraphAssembly:
     """Exercises ExecutionGraph.from_plugin_instances() with the RAG transform.
 
-    CLAUDE.md mandates integration tests use from_plugin_instances().
+    The ``engine-patterns-reference`` skill §Test Path Integrity mandates that
+    integration tests use from_plugin_instances().
     Uses build_linear_pipeline() from tests/fixtures/pipeline.py — the
     production-path assembly helper that calls from_plugin_instances() internally.
     """

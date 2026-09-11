@@ -191,7 +191,8 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         loaded: true,
       });
     } catch (err) {
-      // No-fabrication shape (CLAUDE.md "fabrication test"). Leave
+      // No-fabrication shape: an absent value stays null rather than
+      // coerced to a default, because absence is evidence. Leave
       // defaultMode and tutorialCompletedAt at null — we genuinely
       // don't know what they were. Setting defaultMode="guided" here
       // would attribute a preference choice to the user that they
@@ -533,7 +534,8 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
 
   dismissDefaultChangedBanner: async () => {
     if (get().writing) {
-      // Offensive guard (CLAUDE.md): the dismiss button is disabled
+      // Offensive guard (the engine-patterns-reference skill §Offensive
+      // Programming Examples): the dismiss button is disabled
       // while `writing` is true, so reaching this branch means a UI
       // guard was bypassed (programmatic call, keyboard race, or
       // future caller that doesn't read the writing flag). Throw a

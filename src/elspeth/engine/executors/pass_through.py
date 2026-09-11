@@ -140,9 +140,9 @@ class PassThroughDeclarationContract(DeclarationContract):
     violation_class: ClassVar[type[PassThroughContractViolation]] = PassThroughContractViolation
 
     def applies_to(self, plugin: Any) -> bool:
-        # Direct attribute access, NOT getattr with default (CLAUDE.md
-        # §Offensive Programming). A plugin missing passes_through_input
-        # is a framework bug — let it crash.
+        # Direct attribute access, NOT getattr with default (see the
+        # engine-patterns-reference skill §Offensive Programming Examples).
+        # A plugin missing passes_through_input is a framework bug — let it crash.
         return _require_bool_flag(
             plugin,
             attr_name="passes_through_input",

@@ -12,7 +12,8 @@
 // Where a path cannot fully execute yet, the body uses
 // `test.skip(!<has-feature>, "<bug-id> gap — see elspeth-XXXXXXXXXX")` so
 // the gap is CI-visible (skip is reported in the run summary) rather than
-// silently suppressed by `test.fixme`. Per CLAUDE.md No-Legacy: no
+// silently suppressed by `test.fixme`. Per CONTRIBUTING.md §Code Standards
+// (no legacy shims): no
 // `// removed for X` placeholder comments — the skip line documents the
 // gap inline. When the bug fixes land, delete the corresponding flag and
 // the `test.skip` call.

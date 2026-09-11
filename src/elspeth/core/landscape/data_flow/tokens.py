@@ -594,8 +594,9 @@ class RowTokenRepository:
             AuditIntegrityError: If parent token does not belong to specified run/row
         """
         # Defense-in-depth: validate even though RoutingAction.fork_to_paths()
-        # already validates. Per CLAUDE.md "no silent drops" - empty forks
-        # would cause tokens to disappear without audit trail.
+        # already validates. Per docs/release/guarantees.md §1.2 No Silent
+        # Drops, every row that enters the system has a recorded outcome —
+        # empty forks would cause tokens to disappear without audit trail.
         if not branches:
             raise ValueError("fork_token requires at least one branch")
 

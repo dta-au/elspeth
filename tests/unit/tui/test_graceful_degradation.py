@@ -2,7 +2,8 @@
 """Property-based tests for TUI widget optional field handling.
 
 These tests verify that TUI widgets handle MISSING optional fields correctly.
-Per CLAUDE.md Three-Tier Trust Model, optional fields may be absent, but when
+Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model,
+optional fields may be absent, but when
 present they MUST conform to their schema (Tier 1 - crash on corruption).
 
 Field categories:

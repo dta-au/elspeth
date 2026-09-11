@@ -73,7 +73,8 @@ def _make_checker(thresholds: ContentSafetyThresholds) -> AzureContentSafety:
     """Create a minimal AzureContentSafety instance for _check_thresholds testing.
 
     Uses object.__new__ to bypass the constructor (which needs HTTP config).
-    This is acceptable per CLAUDE.md for unit tests of isolated algorithms —
+    This is acceptable for unit tests of isolated algorithms per the
+    ``engine-patterns-reference`` skill §Test Path Integrity —
     _check_thresholds only reads self._thresholds.
     """
     obj = object.__new__(AzureContentSafety)

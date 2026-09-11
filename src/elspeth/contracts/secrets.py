@@ -79,9 +79,10 @@ class FingerprintKeyMissingError(SecretsConfigurationError):
     """``ELSPETH_FINGERPRINT_KEY`` is not set.
 
     Without the fingerprint key, audit fingerprints cannot be computed.
-    CLAUDE.md's audit-primacy rule requires the audit record to precede
-    any persistent write, so a secret write that cannot be fingerprinted
-    must fail atomically rather than store an unfingerprinted row.
+    Audit primacy requires the audit record to precede any persistent write
+    (see the ``logging-telemetry-policy`` skill §The Primacy Test), so a
+    secret write that cannot be fingerprinted must fail atomically rather
+    than store an unfingerprinted row.
     """
 
 

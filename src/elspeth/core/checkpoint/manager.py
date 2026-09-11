@@ -23,8 +23,9 @@ _MAX_BARRIER_SCALARS_BYTES = 10_000_000
 class CheckpointCorruptionError(Exception):
     """Raised when checkpoint data integrity verification fails.
 
-    This indicates corruption in the audit trail - a Tier 1 failure
-    that must be treated as unrecoverable per CLAUDE.md data manifesto.
+    This indicates corruption in the audit trail - a Tier 1 failure that must
+    be treated as unrecoverable, per the three-tier trust model
+    (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
     """
 
     pass
@@ -159,7 +160,8 @@ class CheckpointManager:
 
             # Serialize barrier scalars JSON.
             # checkpoint_dumps() handles:
-            # - NaN/Infinity rejection per CLAUDE.md audit integrity requirements
+            # - NaN/Infinity rejection for audit integrity (see the
+            #   engine-patterns-reference skill §Canonical JSON)
             # Note: We don't use canonical_json because it normalizes floats to
             # integers, breaking round-trip for the float trigger-offset latches.
             scalars_json: str | None = None

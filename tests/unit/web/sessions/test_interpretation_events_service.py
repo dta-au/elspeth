@@ -694,7 +694,8 @@ async def test_01_create_pending_interpretation_event_inserts_row(service, opera
 async def test_02_create_pending_rejects_unknown_node_id(service) -> None:
     """Spec test 2: writer-boundary validation on affected_node_id.
 
-    Per CLAUDE.md offensive-programming rules, the writer must detect that
+    Per the ``engine-patterns-reference`` skill §Offensive Programming
+    Examples, the writer must detect that
     affected_node_id is not present in composition_states.nodes BEFORE any
     DB write, raising ValueError. The interpretation_events table must be
     empty after the raise (transaction rolled back).

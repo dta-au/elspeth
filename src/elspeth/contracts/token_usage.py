@@ -183,7 +183,7 @@ class TokenUsage:
         source="LLM API provider response (OpenAI, Anthropic, OpenRouter, etc.)",
         source_param="data",
         suppresses=("R1", "R5"),
-        invariant="Coerces all input to TokenUsage with None sentinels for missing/malformed fields; never raises on external data. Silently converts unknown types, negative values, and absent keys to None per CLAUDE.md fabrication policy.",
+        invariant="Coerces all input to TokenUsage with None sentinels for missing/malformed fields; never raises on external data. Silently converts unknown types, negative values, and absent keys to None rather than zero, because a fabricated zero would be indistinguishable from a measured one.",
         non_raising=True,
     )
     def from_dict(cls, data: Any) -> TokenUsage:
@@ -205,7 +205,8 @@ class TokenUsage:
           ``cache_read_input_tokens`` are sibling fields on the usage object.
         - When neither provider exposes the relevant field, it stays
           ``None`` — a missing cache statistic must NOT be coerced to zero
-          (per CLAUDE.md fabrication policy: absence is evidence, not zero).
+          (absence is evidence: a fabricated zero is indistinguishable from
+          a measured one).
         - Reasoning-capable providers may expose ``reasoning_tokens`` at top
           level or nested under ``completion_tokens_details`` /
           ``output_tokens_details``. The counter remains ``None`` when absent

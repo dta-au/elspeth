@@ -1072,8 +1072,8 @@ def create_execution_router() -> APIRouter:
             # because the path discloses internal storage layout to any
             # caller (including the LLM agent driving the composer in
             # an MCP context).
-            # Per CLAUDE.md logging policy, slog is permitted for
-            # audit-system failures.  Tier 1 corruption of
+            # Per the logging-telemetry-policy skill §Logging Policy, slog is
+            # permitted for audit-system failures.  Tier 1 corruption of
             # composition_states.source.options.path qualifies: the
             # audit row exists but its content is structurally invalid,
             # so neither audit (Landscape — not yet open for this run)
@@ -1594,9 +1594,9 @@ def create_execution_router() -> APIRouter:
             # case — surfacing it as 4004 would launder internal referential
             # corruption into a benign client response. Landscape carries the
             # run audit, not this sessions-DB invariant breach, so slog is the
-            # operator channel (CLAUDE.md logging policy: audit-system
-            # failure). Close 1011 (internal error), mirroring the seed-snapshot
-            # integrity handling below.
+            # operator channel (the logging-telemetry-policy skill §Logging
+            # Policy: audit-system failure). Close 1011 (internal error),
+            # mirroring the seed-snapshot integrity handling below.
             try:
                 slog.error(
                     "websocket_run_ownership_session_integrity_error",
@@ -1633,7 +1633,8 @@ def create_execution_router() -> APIRouter:
                 # the external client, but the operator needs the detail to
                 # diagnose the divergence — Landscape carries the run audit,
                 # not this projection failure, so slog is the only channel
-                # (CLAUDE.md logging policy: audit-system failure).
+                # (the logging-telemetry-policy skill §Logging Policy:
+                # audit-system failure).
                 try:
                     slog.error(
                         "websocket_run_status_integrity_error",

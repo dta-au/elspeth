@@ -74,7 +74,7 @@ def test_checkpoint_loads_restores_new_envelope() -> None:
 
 
 def test_checkpoint_loads_old_datetime_tag_is_not_restored() -> None:
-    """Old shape-based tag is NOT restored (no legacy code per CLAUDE.md)."""
+    """Old shape-based tag is NOT restored (no legacy shims — CONTRIBUTING.md §Code Standards)."""
     payload = '{"ts":{"__datetime__":"2026-02-08T10:15:30+00:00"}}'
     result = checkpoint_loads(payload)
 

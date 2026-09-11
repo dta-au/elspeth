@@ -242,8 +242,10 @@ class TestOptionalAncestorPresentRefusesArraySegment:
     NOT yet support per-array-item ancestor evaluation; silently treating the
     array as "present" would produce wrong validation results.
 
-    Per CLAUDE.md ("Defensive Programming: Forbidden. Offensive Programming:
-    Encouraged"), the walker raises ``NotImplementedError`` with a diagnostic
+    Defensive programming is forbidden and offensive programming encouraged
+    (docs/guides/data-trust-and-error-handling.md §The Defensive Programming
+    Prohibition; ``engine-patterns-reference`` skill §Offensive Programming
+    Examples), so the walker raises ``NotImplementedError`` with a diagnostic
     pointing the next maintainer at the exact extension needed, rather than
     falling through and emitting incorrect missing-required-paths results.
     ``NotImplementedError`` (not ``AssertionError``) communicates that the

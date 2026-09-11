@@ -3220,8 +3220,9 @@ class ComposerServiceImpl:
 
         Boundary contract: this helper NEVER catches plugin exceptions.
         It only repairs *configurations* via composer-tool calls. Plugin
-        bugs (transform.process raising) propagate to the operator per the
-        Plugin Ownership policy in CLAUDE.md.
+        bugs (transform.process raising) propagate to the operator per
+        docs/guides/data-trust-and-error-handling.md §Plugin Ownership:
+        System Code, Not User Code.
 
         The synthesised message is appended verbatim into chat history. It
         contains operator-supplied column names and the diagnostic-message
@@ -3245,10 +3246,11 @@ class ComposerServiceImpl:
         # not a Tier-3 trust boundary — a missing key is a bug in the
         # diagnostic builder, not malformed external data, so direct
         # subscript access is correct and a ``KeyError`` here is the
-        # right failure mode (informative crash) per CLAUDE.md
-        # offensive-programming policy. ``.get()`` fallbacks would bury
-        # contract drift and ship ``[unknown]`` codes / empty messages
-        # into the audit trail and the LLM's repair-message context.
+        # right failure mode (informative crash) per the
+        # engine-patterns-reference skill §Offensive Programming Examples.
+        # ``.get()`` fallbacks would bury contract drift and ship
+        # ``[unknown]`` codes / empty messages into the audit trail and the
+        # LLM's repair-message context.
         blocking = [d for d in diagnostics if d["severity"] == "blocking"]
         if not blocking:
             return _ProofRepairOutcome(action="clear")
@@ -7256,10 +7258,11 @@ class ComposerServiceImpl:
           and they would not.
 
         Both are Tier-3 trust-boundary failures: the LLM is providing
-        external input, and CLAUDE.md's tier model permits ``isinstance``
-        checks (and other defensive validation) at this boundary. Anti-
-        anchor tracking on the caller side ensures repeated identical
-        ARG_ERRORs surface the §7.7 structural hint.
+        external input, and the trust model
+        (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model) permits ``isinstance`` checks (and other defensive validation)
+        at this boundary. Anti-anchor tracking on the caller side ensures
+        repeated identical ARG_ERRORs surface the §7.7 structural hint.
         """
         unknown_keys = sorted(set(arguments) - _ADVISOR_ARGUMENT_KEYS)
         if unknown_keys:

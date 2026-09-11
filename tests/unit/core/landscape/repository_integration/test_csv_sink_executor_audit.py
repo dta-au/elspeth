@@ -8,7 +8,8 @@ asserted call-arg equality on those mocks. That verified only that the
 executor *called* the mocks in a particular shape — NOT that the real
 Landscape would have accepted and persisted a valid artifact record.
 
-Per CLAUDE.md the Landscape audit trail is the legal record; mock-shape
+Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model
+the Landscape audit trail is the legal record; mock-shape
 assertions on the audit chain are inadequate confidence. This integration
 test drives the SinkExecutor through its production path with a real
 RecorderFactory / LandscapeDB and verifies the persisted state by querying

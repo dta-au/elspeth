@@ -6,7 +6,7 @@ that every connection name has exactly one producer and one consumer, that conne
 names don't collide with sink names, and that Levenshtein suggestions are provided
 for near-miss wiring errors.
 
-Per CLAUDE.md Test Path Integrity: all tests go through from_plugin_instances()
+Per the ``engine-patterns-reference`` skill §Test Path Integrity: all tests go through from_plugin_instances()
 and the real plugin instantiation path.
 """
 

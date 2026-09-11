@@ -475,14 +475,15 @@ class RunLifecycleCoordinator:
         # finalize, ceremonies) as a parameter of the call that performs the
         # write — carried by value, never re-read mid-run (ADR-048 §3).
 
-        # ADR-030 §A.3 (slice 4): start the dedicated heartbeat thread AFTER
-        # the seat is minted and the token is bound, BEFORE the run body's
-        # try/except block.  The thread beats both the run_workers row and the
-        # run_coordination seat in ONE BEGIN IMMEDIATE transaction so the two
-        # liveness clocks can never skew.
+        # Option-c design §A.3 (slice 4), see
+        # docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md:
+        # start the dedicated heartbeat thread AFTER the seat is minted and the
+        # token is bound, BEFORE the run body's try/except block.  The thread
+        # beats both the run_workers row and the run_coordination seat in ONE
+        # BEGIN IMMEDIATE transaction so the two liveness clocks can never skew.
         #
-        # Sequencing invariant (design §A.3 "joined before release_seat"): the
-        # thread must NOT beat the seat after release_seat vacates it — a beat
+        # Sequencing invariant (option-c design §A.3): the thread must be joined
+        # before release_seat vacates the seat, and must NOT beat it after — a beat
         # on a vacant seat would re-set leader_heartbeat_expires_at and fool
         # the entry guard's liveness check.  So stop() is called as the FIRST
         # statement of every except arm that calls release_seat and in the

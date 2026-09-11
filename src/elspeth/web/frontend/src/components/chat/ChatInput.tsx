@@ -316,10 +316,11 @@ export function ChatInput({
       const detail = (e as CustomEvent<string>).detail;
       if (typeof detail !== "string") {
         // System-to-system contract violation (the dispatcher always sends a
-        // string).  Per CLAUDE.md trust-tier model: internal contract
-        // violations crash, not log-and-continue.  This surfaces immediately
-        // in dev / tests / DevTools rather than producing a silent no-op
-        // that a future contributor wouldn't notice.
+        // string).  Per the trust model
+        // (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        // Model): internal contract violations crash, not log-and-continue.
+        // This surfaces immediately in dev / tests / DevTools rather than
+        // producing a silent no-op that a future contributor wouldn't notice.
         throw new TypeError(
           `[ChatInput] PREFILL_CHAT_INPUT_EVENT: expected string detail, got ${typeof detail}`,
         );

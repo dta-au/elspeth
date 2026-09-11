@@ -872,7 +872,8 @@ class RecoveryManager:
         through the source's Pydantic schema, which re-coerces strings back to typed values.
 
         Without schema validation, transforms would receive wrong types (str instead of
-        datetime/Decimal), violating the Tier 2 pipeline data trust model from CLAUDE.md.
+        datetime/Decimal), violating the Tier 2 pipeline data trust model
+        (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
 
         Args:
             run_id: The run to get unprocessed rows for
@@ -1403,7 +1404,9 @@ class RecoveryManager:
             CheckpointCorruptionError: If no ``run_sources`` rows exist, if any
                 stored contract is missing, malformed, or has mismatched hash,
                 or if the run itself doesn't exist.
-                Per CLAUDE.md Tier-1 trust model: "Bad data in the audit trail = crash immediately"
+                Per the Tier-1 trust model
+                (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
+                bad data in the audit trail crashes immediately.
         """
         factory = RecorderFactory(self._db)
 

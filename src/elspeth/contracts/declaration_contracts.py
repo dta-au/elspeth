@@ -20,8 +20,9 @@ collect-then-raise audit-complete dispatch (ADR-010 §Semantics).
 - Bundle types — ``PreEmissionInputs``, ``PostEmissionInputs`` /
   ``PostEmissionOutputs``, ``BatchFlushInputs`` / ``BatchFlushOutputs``,
   ``BoundaryInputs`` / ``BoundaryOutputs``. Per dispatch site. Every
-  bundle is a frozen slots dataclass; container fields are deep-frozen
-  in ``__post_init__`` per CLAUDE.md §Frozen Dataclass Immutability.
+  bundle is a frozen slots dataclass; ``frozen=True`` leaves container
+  contents mutable through the attribute reference, so container fields
+  are deep-frozen in ``__post_init__``.
 - ``DeclarationContractViolation`` — per-contract audit-evidence-bearing
   exception. Subclasses declare ``payload_schema`` (H5 Layer 1).
 - ``AggregateDeclarationContractViolation`` — SIBLING class (not subclass)
@@ -153,8 +154,10 @@ def implements_dispatch_site(site_name: DispatchSiteName) -> Callable[[F], F]:
     A typo raises ``ValueError`` at module import rather than silently
     mis-registering.
 
-    CLAUDE.md posture: direct membership check on the frozen set of valid
-    values. No ``getattr`` default, no silent pass-through.
+    Per the defensive-programming prohibition
+    (docs/guides/data-trust-and-error-handling.md §The Defensive Programming
+    Prohibition): direct membership check on the frozen set of valid values.
+    No ``getattr`` default, no silent pass-through.
     """
     if site_name not in _DISPATCH_SITE_VALUES:
         raise ValueError(
@@ -216,8 +219,10 @@ class PreEmissionInputs:
     caller-side derivation prevents the B-antipattern where each contract
     re-implements the derivation and they drift.
 
-    CLAUDE.md §Frozen Dataclass Immutability: ``frozenset`` is intrinsically
-    immutable; no ``__post_init__`` guard required. Scalars need no guard.
+    Deep-freezing exists only because ``frozen=True`` leaves container
+    contents mutable through the attribute reference; ``frozenset`` is
+    intrinsically immutable, so no ``__post_init__`` guard is required here.
+    Scalars need no guard either.
     """
 
     plugin: Any
@@ -255,9 +260,10 @@ class PostEmissionOutputs:
     """Emitted-rows bundle for post-emission dispatch.
 
     ``emitted_rows`` is normalised to a deep-frozen tuple in ``__post_init__``.
-    Non-list/non-tuple inputs crash offensively per CLAUDE.md §Offensive
-    Programming — arbitrary Sequence subtypes (lazy wrappers, generators)
-    cannot silently bypass the freeze guard.
+    Non-list/non-tuple inputs crash offensively (see the
+    ``engine-patterns-reference`` skill §Offensive Programming Examples) —
+    arbitrary Sequence subtypes (lazy wrappers, generators) cannot silently
+    bypass the freeze guard.
     """
 
     emitted_rows: tuple[Any, ...]

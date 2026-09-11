@@ -206,8 +206,8 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     Trust boundary: Row data arriving at this sink is Tier 2 (types validated
     upstream). ChromaDB itself is an external system — SDK errors
     (chromadb.errors.ChromaError) are caught as infrastructure failures;
-    other exceptions crash through as plugin bugs per CLAUDE.md plugin
-    ownership rules.
+    other exceptions crash through as plugin bugs per
+    docs/guides/data-trust-and-error-handling.md §Plugin Ownership.
     """
 
     name = "chroma_sink"

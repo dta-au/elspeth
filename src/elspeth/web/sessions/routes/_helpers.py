@@ -1745,8 +1745,9 @@ async def _persist_tool_invocations(
       was already written and we are about to return success. A
       SQLAlchemyError here means the assistant message exists in the
       audit trail but the tool rows that prove what the LLM saw are
-      missing. That is a Tier-1 audit corruption (CLAUDE.md: "I don't
-      know what happened" is never an acceptable answer). Increment the
+      missing. That is a Tier-1 audit corruption ("I don't know what
+      happened" is never an acceptable answer — ARCHITECTURE.md §Design
+      Principles). Increment the
       Tier-1 counter and raise :class:`AuditIntegrityError` chained
       through the SQLAlchemyError. The request will 500 with the chained
       cause visible to the operator.
@@ -1759,7 +1760,8 @@ async def _persist_tool_invocations(
       AuditIntegrityError here would mask the original failure, which is
       what the operator needs to see. Increment the
       "persist failed during unwind" counter, slog the audit-system
-      failure (the slog is permitted under CLAUDE.md primacy because the
+      failure (the slog is permitted under the logging-telemetry-policy skill
+      §Logging Policy because the
       audit system itself failed — telemetry has nowhere to write the
       structured event), and continue. The unwind disposition is
       observable via the counter increment + slog event; the partial
@@ -2846,7 +2848,8 @@ async def _handle_convergence_error(
         # Persistence guard: DB write failure should not upgrade the
         # response from 422 (convergence error) to 500 (internal).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics.
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model.
         # _state_data_from_composer_state's internal validate() guard catches
         # (ValueError, TypeError, KeyError) from structurally damaged partial
         # state — those are acceptable there. A TypeError/KeyError from
@@ -3006,7 +3009,8 @@ async def _handle_plugin_crash(
         # plugin crash (response stays as the 500 below, the save failure
         # is recorded as a separate audit-system-failure slog event).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics.
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model.
         # _state_data_from_composer_state's validate() guard catches
         # (ValueError, TypeError, KeyError) from structurally damaged partial
         # state — those are acceptable there. TypeError/KeyError from
@@ -3248,7 +3252,8 @@ async def _handle_runtime_preflight_failure(
         # slog event — that slog event is the persistence-fallback
         # exemption, NOT a normal-flow log).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics,
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model,
         # symmetric with the sibling _handle_plugin_crash /
         # _handle_convergence_error helpers. See the comment in
         # _handle_convergence_error for the full rationale on the
@@ -3293,9 +3298,10 @@ async def _handle_runtime_preflight_failure(
         # state is captured (the path-1 cached re-raise with no LLM
         # mutation case), the persist_invalid re-call above is skipped,
         # so its source=runtime_preflight emission inside
-        # _state_data_from_composer_state never fires. CLAUDE.md
-        # telemetry primacy ("every telemetry emission point must send
-        # or explicitly acknowledge 'nothing to send.'") requires the
+        # _state_data_from_composer_state never fires. The no-silent-failures
+        # rule (the logging-telemetry-policy skill §Telemetry (Operational
+        # Visibility)) — every telemetry emission point must send what it has
+        # or explicitly acknowledge "I have nothing" — requires the
         # recovery handler to count its own invocation regardless of
         # whether persistence work occurred — otherwise dashboards
         # filtering composer.runtime_preflight.total{source=

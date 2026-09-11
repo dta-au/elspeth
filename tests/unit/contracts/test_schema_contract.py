@@ -426,7 +426,8 @@ class TestSchemaContractMutation:
     def test_with_field_unlocked_rejects_duplicate(self) -> None:
         """with_field() rejects duplicate field even when unlocked.
 
-        Per CLAUDE.md: Adding duplicate is a bug in caller code.
+        Per docs/guides/data-trust-and-error-handling.md §The Decision Test:
+        adding a duplicate is a bug in caller code, so let it crash.
         Prevents broken O(1) lookup invariant from duplicate fields.
         """
         fc = make_field("amount", int, original_name="'Amount'", required=True, source="declared")
@@ -727,7 +728,8 @@ class TestSchemaContractCheckpoint:
     def test_from_checkpoint_missing_hash_crashes(self, sample_contract: SchemaContract) -> None:
         """from_checkpoint() crashes on missing version_hash (Tier 1 integrity).
 
-        Per CLAUDE.md Tier 1: "Bad data in the audit trail = crash immediately."
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model, Tier 1: "Bad data in the audit trail = crash immediately."
         to_checkpoint_format() ALWAYS writes version_hash, so if it's missing
         that's corruption - not an older format to silently accept.
         """
@@ -799,7 +801,8 @@ class TestSchemaContractCheckpoint:
     def test_from_checkpoint_detects_locked_tampering(self) -> None:
         """from_checkpoint() detects tampering with 'locked' flag.
 
-        Per CLAUDE.md Tier 1: integrity hash must cover ALL serialized state.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model, Tier 1: the integrity hash must cover ALL serialized state.
         Flipping locked=False could allow type inference on resume.
         """
         contract = SchemaContract(
@@ -820,7 +823,8 @@ class TestSchemaContractCheckpoint:
     def test_from_checkpoint_detects_source_tampering(self) -> None:
         """from_checkpoint() detects tampering with field 'source'.
 
-        Per CLAUDE.md Tier 1: integrity hash must cover ALL serialized state.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model, Tier 1: the integrity hash must cover ALL serialized state.
         Changing source could falsify audit trail (declared vs inferred).
         """
         from elspeth.contracts.errors import AuditIntegrityError

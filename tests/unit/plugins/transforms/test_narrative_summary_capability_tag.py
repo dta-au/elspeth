@@ -34,7 +34,8 @@ def test_batch_distribution_profile_class_tags_narrative_summary() -> None:
 def test_narrative_summary_tag_on_real_plugin_instance() -> None:
     """Q5 (quality-reviewer guard): the class attribute survives instantiation.
 
-    CLAUDE.md mandates that integration tests use ``from_plugin_instances()``;
+    The ``engine-patterns-reference`` skill §Test Path Integrity mandates that
+    integration tests use ``from_plugin_instances()``;
     the equivalent unit-level assertion is "instantiate the plugin, then read
     the tag off the instance." Catches the failure mode where the class
     attribute is correct but lost through some metaclass-style wrapping.

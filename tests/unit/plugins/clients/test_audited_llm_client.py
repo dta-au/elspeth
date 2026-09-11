@@ -692,7 +692,7 @@ class TestAuditedLLMClient:
 
     # NOTE: test_response_without_model_dump was removed because we require
     # openai>=2.15 which guarantees model_dump() exists on all responses.
-    # Per CLAUDE.md "No Legacy Code Policy" - no backwards compatibility code.
+    # Per CONTRIBUTING.md §Code Standards - no backwards compatibility code.
 
     def test_null_content_raises_content_policy_error(self) -> None:
         """None content from LLM raises ContentPolicyError — not fabricated to "".
@@ -730,8 +730,8 @@ class TestAuditedLLMClient:
     def test_full_raw_response_recorded_in_audit_trail(self) -> None:
         """Full raw_response from model_dump() is recorded in audit trail.
 
-        This ensures audit completeness per CLAUDE.md:
-        "External calls - Full request AND response recorded"
+        This ensures audit completeness per docs/release/guarantees.md
+        §4.1 Call Recording: request and response are both recorded in full.
         """
         execution = self._create_mock_execution()
 
@@ -936,7 +936,7 @@ class TestAuditedLLMClient:
 
     # NOTE: test_raw_response_none_when_model_dump_unavailable was removed because
     # we require openai>=2.15 which guarantees model_dump() exists on all responses.
-    # Per CLAUDE.md "No Legacy Code Policy" - no backwards compatibility code.
+    # Per CONTRIBUTING.md §Code Standards - no backwards compatibility code.
 
     def test_successful_call_with_missing_usage(self) -> None:
         """LLM call succeeds when provider returns no usage data.

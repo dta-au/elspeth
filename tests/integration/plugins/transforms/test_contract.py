@@ -6,7 +6,7 @@ These tests verify the end-to-end integration of:
 2. Contract preservation when transforms add fields
 3. PipelineRow dual-name access (normalized and original)
 
-Per CLAUDE.md Test Path Integrity: These tests use production code paths
+Per the ``engine-patterns-reference`` skill §Test Path Integrity: these tests use production code paths
 (CSVSource, CSVSink, SchemaContract, PipelineRow) rather than manual construction.
 
 Migrated from tests/integration/test_transform_contract_integration.py

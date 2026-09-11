@@ -364,7 +364,8 @@ class TestNodeDetailPanel:
     def test_malformed_error_json_crashes(self) -> None:
         """Malformed error_json crashes - Tier 1 audit data must be pristine.
 
-        Per CLAUDE.md: Bad data in the audit trail = crash immediately.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model: "Bad data in the audit trail = crash immediately."
         Graceful handling of corrupt audit data is forbidden bug-hiding.
         """
         import json
