@@ -12,7 +12,7 @@ from __future__ import annotations
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
-_CANDIDATE_PACKAGE_VERSION = "0.8.0"
+_CANDIDATE_PACKAGE_VERSION = "0.8.1"
 
 _ROLLBACK_PACKAGE_VERSION = "0.7.1"
 
