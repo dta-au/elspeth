@@ -37,7 +37,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [015](015-creates-tokens-contract.md) | Creates-Tokens Contract | - | **Accepted** |
 | [016](016-source-guaranteed-fields-contract.md) | Source Guaranteed Fields Contract | - | **Accepted** |
 | [017](017-sink-required-fields-contract.md) | Sink Required Fields Contract | - | **Accepted** |
-| [018](018-producer-site-outcome-discrimination.md) | Producer-Site Outcome Discrimination | 2026-05-02 | **Accepted** |
+| [018](018-producer-site-outcome-discrimination.md) | Producer-Site Outcome Discrimination | 2026-05-02 | **Superseded** by [019](019-two-axis-terminal-model.md) |
 | [019](019-two-axis-terminal-model.md) | Two-Axis Terminal Model — Lifecycle, Outcome, and Path | 2026-05-04 | **Accepted** |
 | [020](020-retire-batch-llm-transforms.md) | Retire Batch-LLM Transforms (`azure_batch_llm`, `openrouter_batch_llm`) | 2026-05-06 | **Accepted** |
 | [021](021-sources-and-sinks-uniformly-boundary.md) | Sources and Sinks Are Uniformly Boundary by Architecture | 2026-05-18 | **Accepted** |
@@ -87,4 +87,5 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 
 - [Architecture Overview](../overview.md)
 - [Requirements](../requirements.md)
-- [CLAUDE.md Guidelines](../../../CLAUDE.md)
+- [Contributing Guidelines](../../../CONTRIBUTING.md)
+- [Data Trust and Error Handling](../../guides/data-trust-and-error-handling.md)

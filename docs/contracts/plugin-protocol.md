@@ -444,21 +444,23 @@ institutional-memory message:
 > *Do not fabricate source_row_index or ingest_sequence from row_index.*
 
 **Why.** `source_row_index` and `ingest_sequence` are Tier-1 audit
-evidence (per [CLAUDE.md's three-tier trust model](../../CLAUDE.md)).
-They are the durable identity primitives that resume, replay, and
-cross-source ordering depend on. Substituting an arbitrary value (most
-commonly: `row_index` — the orchestrator's positional count, which is
-*not* the source's own row index during resume) gives the audit trail a
-confident wrong answer. An auditor running `elspeth explain` on a row
-with fabricated identity gets back a value the source never actually
-asserted; the audit story breaks and the wrong answer is
-indistinguishable from a correct one.
+evidence — see
+[Data Trust and Error Handling](../guides/data-trust-and-error-handling.md)
+§The Three-Tier Trust Model. They are the durable identity primitives
+that resume, replay, and cross-source ordering depend on. Substituting
+an arbitrary value (most commonly: `row_index` — the orchestrator's
+positional count, which is *not* the source's own row index during
+resume) gives the audit trail a confident wrong answer. An auditor
+running `elspeth explain` on a row with fabricated identity gets back a
+value the source never actually asserted; the audit story breaks and the
+wrong answer is indistinguishable from a correct one.
 
-This is the fabrication-decision-test from CLAUDE.md applied at the
-source boundary: if the source plugin does not know `source_row_index`
-— because it doesn't natively track per-source row position — then the
-correct value is **not knowable**, and the only honest action is to
-crash. The engine deliberately raises rather than defaulting.
+This is the fabrication decision test (same guide §The Decision Test)
+applied at the source boundary: if the source plugin does not know
+`source_row_index` — because it doesn't natively track per-source row
+position — then the correct value is **not knowable**, and the only
+honest action is to crash. The engine deliberately raises rather than
+defaulting.
 
 **What the audit trail looks like under correct identity.**
 

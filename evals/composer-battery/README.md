@@ -1,6 +1,7 @@
 # Composer path-quality battery
 
-Spec: `docs/specs/2026-08-13-composer-battery-design.md` (rev 4).
+Spec: the 2026-08-13 composer-battery design (rev 4) is retrievable from git
+history; the section and errata references below (§1, §3, §6, §7) are to it.
 Plan: implemented; the 2026-08-17 composer-battery plan is retrievable from git history.
 
 The battery fires a fixed operator-voice corpus (`corpus.md`, 18 stratified

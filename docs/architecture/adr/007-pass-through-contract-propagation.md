@@ -29,6 +29,17 @@
 > 83 (Clause 4). Track 2 will tighten Clause 3 via a new `can_drop_rows`
 > declaration within 90 days of Track 1 merge.
 
+> **Current implementation note (2026-09-11):** the Track 2 commitment in the
+> banner above was met. [ADR-012](012-can-drop-rows-contract.md), dated
+> 2026-04-20 — the day after that banner — is the declaration that tightened
+> Clause 3: it registers `can_drop_rows` under the ADR-010 framework and
+> replaces ADR-009's unconditional empty-emission return with an explicit
+> declaration. The contract is live: `grep -rn can_drop_rows src/elspeth`
+> returned 50 references on 2026-09-11, and
+> `src/elspeth/engine/executors/pass_through.py` reads the flag in
+> `verify_pass_through`'s empty-emission branch. The promise above is left as
+> it was written.
+
 > **Amended by ADR-010 (Declaration-trust framework, 2026-04-19).**
 > Normative in this ADR: Decisions 1–3 for `passes_through_input` specifically.
 > Superseded: §Negative Consequences #2 (resolved earlier by ADR-009 §Clause 1);
@@ -121,7 +132,7 @@ The set of known pass-through plugins is re-derived per call from the live plugi
 
 **Description:** Walk the Python AST of `process()` and infer whether the transform preserves all input fields.
 
-**Rejected because:** Magical and brittle. AST inspection cannot reason about transitive helpers, `**row` spreads through conditionals, or row-content-dependent paths. Invisible to `grep`, which CLAUDE.md requires for load-bearing constraints. Silent false positives would propagate guarantees the transform does not honour at runtime.
+**Rejected because:** Magical and brittle. AST inspection cannot reason about transitive helpers, `**row` spreads through conditionals, or row-content-dependent paths. Invisible to `grep`, and a load-bearing constraint must be greppable. Silent false positives would propagate guarantees the transform does not honour at runtime.
 
 ### Alternative 2: Schema-driven derivation (compare input/output schemas at build time)
 

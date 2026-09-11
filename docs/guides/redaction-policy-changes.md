@@ -146,9 +146,9 @@ is the auditor's job. A complete rationale answers all of the following:
 
    - "The path was annoying in tests" — annoyance is not an audit
      argument.
-   - "I want to log this value for debugging" — see
-     `logging-telemetry-policy`; this needs an audit or telemetry
-     channel, not a removed redaction.
+   - "I want to log this value for debugging" — see the
+     `logging-telemetry-policy` skill §Logging Policy; this needs an
+     audit or telemetry channel, not a removed redaction.
    - "Nothing sensitive ever appears here" — claims about absence of
      sensitive data require evidence, not assertion.
 
@@ -192,7 +192,8 @@ Options for "stricter posture":
   reviewable diff.
 
 The bar to clear is "would this hold up under formal inquiry?" — see
-`CLAUDE.md` § *Auditability Standard*. If the answer is "probably, but
+`ARCHITECTURE.md` § *Design Principles* (auditability: "I don't know
+what happened" is never acceptable). If the answer is "probably, but
 I'd rather not have to defend it," the PR isn't ready.
 
 ---

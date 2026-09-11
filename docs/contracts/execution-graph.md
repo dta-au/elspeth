@@ -430,7 +430,7 @@ def topological_order(self) -> list[str]:
 - Parallel branches (fork paths) may interleave, but each path's internal order is preserved
 - Coalesce appears after all its incoming branches
 
-**Why NetworkX?** The DAG uses `networkx.MultiDiGraph` for graph operations. ELSPETH delegates cycle detection, topological sort, and reachability to NetworkX rather than reimplementing these algorithms — this is part of the acceleration stack philosophy (see CLAUDE.md).
+**Why NetworkX?** The DAG uses `networkx.MultiDiGraph` for graph operations. ELSPETH delegates cycle detection, topological sort, and reachability to NetworkX rather than reimplementing these algorithms — where a proven library already solves a well-defined problem, ELSPETH takes the dependency instead of hand-rolling the algorithm. The choice is recorded in ARCHITECTURE.md §Implicit Architectural Decisions.
 
 ---
 

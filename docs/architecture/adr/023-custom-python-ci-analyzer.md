@@ -166,7 +166,10 @@ remained `in_progress` at the 2026-08-29 checked cutoff.
 * **Rule-taxonomy rationale:** [elspeth-lints rationale](../../elspeth-lints/rationale.md).
 * **Current SARIF publication:** [CI workflow](../../../.github/workflows/ci.yaml).
 * **CodeQL workflow:** [.github/workflows/codeql.yaml](../../../.github/workflows/codeql.yaml)
-* **Existing enforcement scripts:** [scripts/cicd/](../../../scripts/cicd/)
+* **Retired enforcement scripts:** the `enforce_*.py` gates that once lived in
+  [scripts/cicd/](../../../scripts/cicd/) were ported into `elspeth-lints` and
+  deleted; the directory now holds redaction and release checks, parity
+  harnesses, and fixture/baseline generators.
 * **CICD allowlist lifecycle procedure:**
   `.agents/skills/cicd-allowlist-audit/SKILL.md`
 * **Judge-signature and fingerprint workflow:**

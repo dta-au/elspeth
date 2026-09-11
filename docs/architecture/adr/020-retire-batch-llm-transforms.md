@@ -28,7 +28,7 @@ land and would not address the deeper conops critique below.
 
 ### The conops critique
 
-ELSPETH's audit-trail discipline (CLAUDE.md "Auditability Standard") requires per-row attribution within a single run: every output traceable to source data, configuration, and code version, with `explain(recorder, run_id, token_id)` proving complete lineage. Two structural problems make the batch-LLM transforms incompatible:
+ELSPETH's audit-trail discipline (ARCHITECTURE.md §Design Principles — auditability) requires per-row attribution within a single run: every output traceable to source data, configuration, and code version, with `explain(recorder, run_id, token_id)` proving complete lineage. Two structural problems make the batch-LLM transforms incompatible:
 
 1. **`azure_batch_llm` bifurcates row lifetime across runs.** A row enters the pipeline in run A, gets buffered into a batch submission, the run ends with `BatchPendingError`, and (hours later) run B resumes with the same `batch_id`. Audit attribution must span those two runs to be meaningful — a property no other ELSPETH transform requires. The `BatchCheckpointState` / `BatchPendingError` infrastructure exists *solely* to support this lifecycle.
 2. **`openrouter_batch_llm` bypasses the per-row dispatch contract.** ADR-013 (`DeclaredRequiredFieldsContract`) is enforced at the per-row pre-execution dispatch site, which a batch-aware transform never visits. The "batch-pre-execution dispatch site" referenced in the error message has never been built and would require an ADR-010 amendment to design.
