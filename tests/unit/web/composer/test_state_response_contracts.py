@@ -400,6 +400,9 @@ def test_state_response_constructor_detaches_sequence_arguments(case):
     nodes.clear()
     edges.clear()
     outputs.clear()
+    assert type(rebuilt.nodes) is tuple and rebuilt.nodes == admitted.value.nodes
+    assert type(rebuilt.edges) is tuple and rebuilt.edges == admitted.value.edges
+    assert type(rebuilt.outputs) is tuple and rebuilt.outputs == admitted.value.outputs
     assert json.dumps(_contract().admit(rebuilt).to_wire()) == LEGACY_WIRES[case]
 
 
