@@ -28,8 +28,11 @@ from types import MappingProxyType
 from typing import Any, Final, Literal, NotRequired, TypedDict, cast, get_args
 from uuid import UUID
 
+from pydantic import ValidationError
+
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
@@ -554,6 +557,17 @@ _STEP_1_SOURCE_TOOL: dict[str, Any] = {
 }
 
 
+_UPLOADED_SOURCE_OPTIONS_GUIDANCE = (
+    "Source plugin options authored from the user's intent and inspected facts. "
+    "For declared types (including numeric CSV columns), use schema mode fixed or flexible and "
+    'fields as an array of strings, for example {"mode":"flexible","fields":["amount: int"]}. '
+    "Field types are str, int, float, bool, any; a trailing ? marks an optional field. "
+    "Do not use a fields object. Observed mode must omit fields and does not declare numeric CSV coercion. "
+    "Use observed only when inferred runtime types meet the user's intent; guaranteed_fields contains "
+    "plain field names, not typed declarations. Author other requested plugin options explicitly."
+)
+
+
 def _step_1_source_tool(
     *,
     plugin_hint: str | None,
@@ -576,6 +590,7 @@ def _step_1_source_tool(
     if existing_upload is not None:
         tool = copy.deepcopy(dict(_step_1_source_tool(plugin_hint=plugin_hint, available_source_plugins=available_source_plugins)))
         parameters = tool["function"]["parameters"]
+        parameters["properties"]["options"]["description"] = _UPLOADED_SOURCE_OPTIONS_GUIDANCE
         inline_required = parameters.pop("required")
         parameters["properties"]["upload_ref"] = {"type": "string", "enum": [existing_upload.upload_ref]}
         parameters["oneOf"] = [
@@ -1420,6 +1435,7 @@ def _build_step_1_source_dynamic_block(
     field_aliases: Mapping[str, str] | None = None,
     allow_plugin_reselection: bool = False,
     form_directed_revision: bool = False,
+    uploaded_source: bool = False,
 ) -> str:
     """Compose the DYNAMIC Step-1 source block (hint + revise context + tool instructions).
 
@@ -1500,12 +1516,7 @@ def _build_step_1_source_dynamic_block(
             "instead of `resolve_source`; reselection rebuilds the correct wizard form without "
             "discarding a ready upload. "
         )
-    return (
-        "## Step 1 Source/Data Schema Tool\n\n"
-        f"{hint}\n"
-        f"Policy-visible source plugins: {json.dumps(available_source_plugins)}. "
-        "Choose only from this server-supplied list; an absent plugin is not available for this request.\n"
-        f"{revise_block}"
+    resolution_teaching = (
         "If the user's message provides enough information to create inline source data, "
         "call `resolve_source` with the complete file content, the source plugin, "
         "schema options, observed columns, representative sample rows, and a brief "
@@ -1524,6 +1535,22 @@ def _build_step_1_source_dynamic_block(
         "construction, or the name of a quarantine sink for production data whose invalid "
         "rows must be kept for inspection. If the message is only a "
         "question or lacks enough source detail, reply in prose and do not call a tool. "
+    )
+    if uploaded_source:
+        resolution_teaching = (
+            "To bind the offered upload, call resolve_source with its exact upload_ref, plugin, options, "
+            "on_validation_failure and assistant_message. Do not recreate its content. "
+            f"{_UPLOADED_SOURCE_OPTIONS_GUIDANCE} "
+            "Preserve later-stage instructions through retain_deferred_intent instead of inventing transforms. "
+            "For advice or insufficient source detail, reply in prose without binding. "
+        )
+    return (
+        "## Step 1 Source/Data Schema Tool\n\n"
+        f"{hint}\n"
+        f"Policy-visible source plugins: {json.dumps(available_source_plugins)}. "
+        "Choose only from this server-supplied list; an absent plugin is not available for this request.\n"
+        f"{revise_block}"
+        f"{resolution_teaching}"
         f"{reselection_block}"
         "If the user instead gives a concrete instruction for a LATER guided stage, call "
         "`retain_deferred_intent` with only structural constraints and a redacted summary; "
@@ -2841,6 +2868,34 @@ class GuidedToolArgumentShapeError(ValueError):
     """
 
 
+class GuidedUploadedSourceConfigError(GuidedToolArgumentShapeError):
+    """A shape-valid upload resolution failed the existing form authority."""
+
+
+class _UploadedConfigErrorFact(TypedDict):
+    location: list[str | int]
+    type: str
+
+
+def _uploaded_config_feedback(exc: PluginConfigError | ValueError) -> str:
+    """Closed structured cause; never expose validator messages or input values."""
+    errors: list[_UploadedConfigErrorFact] = []
+    cause = exc.__cause__
+    if isinstance(cause, ValidationError):
+        for error in cause.errors(include_input=False, include_context=False, include_url=False)[:8]:
+            location = [
+                part if type(part) is int or part in {"schema", "schema_config", "mode", "fields", "required", "encoding"} else "field"
+                for part in error["loc"][:6]
+            ]
+            category = (
+                error["type"]
+                if error["type"] in {"missing", "value_error", "extra_forbidden", "string_type", "list_type", "dict_type"}
+                else "invalid_value"
+            )
+            errors.append({"location": location, "type": category})
+    return json.dumps({"code": "uploaded_source_configuration_rejected", "errors": errors})
+
+
 def _shape_safe_keys(mapping: Mapping[str, Any]) -> list[str]:
     """Key names only, bounded, for value-free shape diagnostics."""
     return [str(key)[:40] for key in sorted(mapping, key=str)[:12]]
@@ -3096,6 +3151,7 @@ async def maybe_resolve_step_1_source_chat(
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
     existing_upload: Step1ExistingUploadContext | None = None,
+    validate_uploaded_source: Callable[[Step1UploadedSourceChatResolution], None] | None = None,
     allow_plugin_reselection: bool = False,
     # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
     # composer role only; callers always pass the primary endpoint, never
@@ -3129,6 +3185,8 @@ async def maybe_resolve_step_1_source_chat(
         raise InvariantError("maybe_resolve_step_1_source_chat: user_message is empty (route validation gap)")
     if existing_upload is not None and type(existing_upload) is not Step1ExistingUploadContext:
         raise TypeError("existing_upload must be exact Step1ExistingUploadContext")
+    if existing_upload is not None and validate_uploaded_source is None:
+        raise InvariantError("uploaded source solver requires source-form validation authority")
 
     from litellm.exceptions import APIError as LiteLLMAPIError
     from litellm.exceptions import AuthenticationError as LiteLLMAuthError
@@ -3165,6 +3223,7 @@ async def maybe_resolve_step_1_source_chat(
                     field_aliases=field_aliases,
                     allow_plugin_reselection=allow_plugin_reselection,
                     form_directed_revision=form_directed_revision,
+                    uploaded_source=existing_upload is not None,
                 ),
             },
         ]
@@ -3461,6 +3520,13 @@ async def maybe_resolve_step_1_source_chat(
                     )
                 try:
                     result = _parse_step_1_source_tool_arguments(arguments, plugin_hint=plugin_hint, existing_upload=existing_upload)
+                    if type(result) is Step1UploadedSourceChatResolution:
+                        if validate_uploaded_source is None:
+                            raise InvariantError("uploaded source resolution has no form authority")
+                        try:
+                            validate_uploaded_source(result)
+                        except (PluginConfigError, ValueError) as exc:
+                            raise GuidedUploadedSourceConfigError(_uploaded_config_feedback(exc)) from exc
                 except AssistantScaffoldLeakError:
                     # Quality guard, deliberately unrepaired (step-2 parity:
                     # its scaffold-leak arm raises too) — a leaked internal
@@ -3524,8 +3590,16 @@ async def maybe_resolve_step_1_source_chat(
                         for admitted_call in admitted_shape_repair.calls:
                             if admitted_call.is_rejected:
                                 content = (
-                                    f"resolve_source rejected: the arguments were malformed: {exc} "
-                                    "Resend the complete resolve_source call with every required key."
+                                    (
+                                        f"resolve_source configuration rejected: {exc}. "
+                                        "Correct the plugin options and resend the complete call. For explicit numeric types use "
+                                        "fixed/flexible schema with fields as an array of 'name: type' strings; observed must omit fields."
+                                    )
+                                    if isinstance(exc, GuidedUploadedSourceConfigError)
+                                    else (
+                                        f"resolve_source rejected: the arguments were malformed: {exc} "
+                                        "Resend the complete resolve_source call with every required key."
+                                    )
                                 )
                             else:
                                 content = (
@@ -3547,7 +3621,11 @@ async def maybe_resolve_step_1_source_chat(
                         status = ComposerLLMCallStatus.SUCCESS
                         return GuidedChatDeferredIntentWithheldResolutionOutcome(
                             actions=deferred_actions,
-                            resolution_error_class="PairedResolutionShapeRejected",
+                            resolution_error_class=(
+                                "PairedResolutionConfigRejected"
+                                if isinstance(exc, GuidedUploadedSourceConfigError)
+                                else "PairedResolutionShapeRejected"
+                            ),
                         )
                     raise
                 status = ComposerLLMCallStatus.SUCCESS
@@ -3623,6 +3701,13 @@ async def maybe_resolve_step_1_source_chat(
                 raise GuidedSolverResponseShapeError("uploaded-source response called an unoffered tool")
             status = ComposerLLMCallStatus.SUCCESS
             return GuidedChatEmptyOutcome()
+        except (AuditIntegrityError, InvariantError) as exc:
+            # Source-form authority is owned state, not model-output rejection.
+            # Never salvage grouped retains across a failed integrity boundary.
+            status = ComposerLLMCallStatus.API_ERROR
+            error_class = type(exc).__name__
+            error_message = type(exc).__name__
+            raise
         except TimeoutError as exc:
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
