@@ -1,6 +1,7 @@
 # Bug-batch takeover and diagnostic completeness
 
-Target: `release/0.8.1`. This report is in progress, not a release-readiness certificate.
+Target: `release/0.8.1`. The bugfix and bounded structural campaign is integrated
+and verified. This is not an operator-signing or deployment certificate.
 
 ## Integration state
 
@@ -10,7 +11,35 @@ Target: `release/0.8.1`. This report is in progress, not a release-readiness cer
 - DAG version-oracle correction: `e19a1a23cce65bca5a59104fb94f81d8b48cfa7f`.
 - Acceptance version and plugin hash repairs: `5e911e6f8c903d24ab4ec5c80fbd88b33d7616c3`.
 - Initial release integration: `d1b473c8f846f9ed7dc1da1d6c2dd6641abfed8a`, fast-forwarded into both the original bugfix branch and `release/0.8.1`.
-- Structural remediation: `61a67010bfa5e34875b4c5df26b8da2b7df7c3f3`, committed in an isolated task worktree; gate repairs remain in progress and it is not yet integrated.
+- Structural remediation: `61a67010bfa5e34875b4c5df26b8da2b7df7c3f3`.
+- Structural gate and test repairs: `160238d4dfc4f35673f84aa212c47ce7b128d443`, fast-forwarded into `release/0.8.1` after the complete gate passed.
+
+The structural integration preserves the exact gated tree
+`57d7130d14bc8b402971f3306ae9cb42fb4164ea`. The final gate records:
+
+| Check | Terminal result |
+| --- | --- |
+| Ruff, mypy, contracts | Each exit 0. |
+| Default suite, 12 workers | Exit 0; 50,898 passed, 87 skipped, two expected failures. |
+| PostgreSQL, serial | Exit 0; 394 passed, one skipped. |
+| Key-free lint | Exit 1, deliberately nonfatal; 1,855 findings, with the exact controlled delta below. |
+| Frozen-tree accounting | `frozen=yes`, `RESULT=PASS`. |
+| Post-merge selection, all 37 changed test modules | Exit 0; 2,280 passed, one inherited expected failure. |
+
+Final gate run: `20260912T114737Z-diagnostic-completeness-20260912-3982153`,
+using `scripts/full-suite-gate.sh --execute --detach --stages
+ruff,mypy,contracts,lints,pytest,testcontainer --workers 12`. Both import roots
+were verified in the task tree and again on release. The integrated selection
+ran against the same commit and tree; the only subsequent change in this
+report's finalization is this document. No production, test, configuration or
+signature content changes accompany that final accounting.
+
+The independently reviewed repaired-candidate proof is PASS:
+claim `20260912T114808-3a225618`, verdict `20260912T115407043469Z.md`.
+It covers fifteen explicit assertions, including controlled reversions and
+the exact classification gate. The requirements audit found no silently
+dropped in-scope implementation obligation. Temporary proof and gate logs
+remain outside tracked deliverables; their limits are recorded below.
 
 The initial integration preserves the exact fully gated tree
 `6c34800f09d0e6be6c9aef8c78ee8df19d49fc78`. The six-stage gate records
@@ -172,9 +201,9 @@ Those two failed gate runs kept their trees frozen; neither is an overall
 passing result. The subsequent gate on `d1b473c8f` passed and that exact commit
 was integrated, as recorded above.
 
-## Structural remediation under verification
+## Integrated structural remediation
 
-| Site | Disposition in the structural candidate; not yet integrated |
+| Site | Integrated disposition |
 | --- | --- |
 | `WriteLockHeldError.workers` | Local CLI renders registration candidates with worker/role/status/PID/host, including unknown values. Generic exception text stays redacted. Registration is not proof of lock ownership, and no SIGKILL instruction is inferred. |
 | `SessionCheckoutMismatchError.active_session_id` | MCP emits the requested and active identities, with explicit null for no checkout, and persists the same safe refusal in its audit sidecar without changing session state. |
@@ -274,10 +303,12 @@ for the structural changes.
 The eleven original batch tracker closures now include the freshly verified
 release integration and full-gate evidence, while retaining their historical
 branch-only verification. The heartbeat issue is closed on the integrated
-commit. The structural candidate is committed; its two default-suite failures
-are being repaired before release integration.
+commit. The structural candidate and its two default-suite gate repairs are
+also committed and integrated. The lock-diagnostic issue is closed against
+the verified structural release commit; no new follow-up ticket substitutes
+for an in-scope repair.
 
-### Structural verification checkpoint
+### Structural verification history
 
 The first complete six-stage gate at `61a67010b` records ruff, mypy and
 contract checks at exit 0; default pytest at exit 1 (two failed, 50,892 passed,
@@ -285,7 +316,7 @@ contract checks at exit 0; default pytest at exit 1 (two failed, 50,892 passed,
 skipped); and `frozen=yes`. Overall `RESULT=FAIL` is retained, not superseded
 by the successful focused proof.
 
-The failures are the RAG zero-row integration fixture's missing node identity
+The failures were the RAG zero-row integration fixture's missing node identity
 and the exact Sessions connection-classification inventory. The RAG repair
 replaces a duplicate lifecycle fake with the existing real-context factory and
 asserts the typed event and readiness forwarding. Dropping the completion
