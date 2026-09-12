@@ -56,6 +56,9 @@ drained and repair this release forward.
 - **Azure Container Apps deployment.** Schema credentials are isolated from
   the application identity, revision secret bindings are retained across
   revisions, and Key Vault write authority is confirmed before SQL bootstrap.
+  Acceptance is desktop-only; no live cloud acceptance is claimed. See the
+  [platform reference](docs/reference/deployment-platforms.md#azure)
+  for the Single/sticky configuration and operating limitations.
 
 ---
 
