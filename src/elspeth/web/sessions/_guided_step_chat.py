@@ -31,9 +31,11 @@ from elspeth.web.composer.guided.chat_solver import (
     GuidedChatEmptyOutcome,
     GuidedChatProseOutcome,
     GuidedToolArgumentShapeError,
+    Step1ExistingUploadContext,
     Step1SourceChatResolution,
     Step1SourcePluginReselectedOutcome,
     Step1SourceResolvedOutcome,
+    Step1UploadedSourceChatResolution,
     Step2SinkResolvedOutcome,
     StepChatContextInput,
     maybe_manage_deferred_intent_chat,
@@ -197,7 +199,7 @@ class GuidedStepDeferredManagementResult:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Step1SourceResolvedResult:
     chat: StepChatResult
-    resolution: Step1SourceChatResolution
+    resolution: Step1SourceChatResolution | Step1UploadedSourceChatResolution
     # Set when the reply GROUPED resolve_source with retain_deferred_intent
     # calls (elspeth-a96b2f1b0a / R2-F15, generalized by elspeth-3a21f09f09):
     # every half applies in the same settlement.
@@ -206,7 +208,7 @@ class Step1SourceResolvedResult:
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("Step1SourceResolvedResult.chat must be exact")
-        if type(self.resolution) is not Step1SourceChatResolution:
+        if type(self.resolution) not in {Step1SourceChatResolution, Step1UploadedSourceChatResolution}:
             raise TypeError("Step1SourceResolvedResult.resolution must be exact")
         if type(self.deferred_actions) is not tuple or any(type(action) is not DeferredIntentAction for action in self.deferred_actions):
             raise TypeError("Step1SourceResolvedResult.deferred_actions must be a tuple of exact actions")
@@ -488,6 +490,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
     recorder: BufferingRecorder | None = None,
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
+    existing_upload: Step1ExistingUploadContext | None = None,
     allow_plugin_reselection: bool = False,
     api_base: str | None = None,
     api_key: str | None = None,
@@ -515,6 +518,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
             recorder=recorder,
             timeout_seconds=timeout_seconds,
             context_block=context_block,
+            existing_upload=existing_upload,
             allow_plugin_reselection=allow_plugin_reselection,
             api_base=api_base,
             api_key=api_key,

@@ -31,10 +31,10 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.guided.chat_solver import Step1SourceChatResolution
-from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved, SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.source_inspection import SourceInspectionFacts
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.sessions._guided_step_chat import (
     GuidedStepChatOnlyResult,
@@ -62,6 +62,11 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.helpers.guided_leases import abandon_guided_worker_leases
 from tests.helpers.session_fences import acquire_compose_context, create_blob_under_fence, read_blob_content_under_fence
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
+from tests.integration.web.composer.guided.test_step_chat import (
+    _fake_llm_reply,
+    _fake_source_resolution_tool_call,
+    _ReturningLiteLLMCompletion,
+)
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -99,16 +104,14 @@ def _create_session(client: TestClient) -> str:
     return session_id
 
 
-def _source_from_upload_under_compose_fence(client: TestClient, session_id: str, *, plugin_hint: str = "csv"):
+def _source_from_upload_under_compose_fence(client: TestClient, session_id: str):
     """Call the step-1 upload helper the way the chat route does: under a live COMPOSE context.
 
     The context is minted through the production authority
     (``acquire_compose_context``), never synthesised, so the helper receives
     the same exact, database-backed context the route threads from its
-    reserved lease. Today the helper accepts the context but does not yet
-    forward it to the blob read (P4-B9 threads it through); minting a real one
-    here means that forwarding, when it lands, is verified honestly rather
-    than against a synthetic fence.
+    reserved lease. The bounded inspection and blob integrity read therefore
+    exercise the real custody boundary.
     """
 
     async def _call():
@@ -116,7 +119,6 @@ def _source_from_upload_under_compose_fence(client: TestClient, session_id: str,
         async with acquire_compose_context(service, UUID(session_id)) as compose_context:
             return await guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
                 message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
-                plugin_hint=plugin_hint,
                 blob_service=client.app.state.blob_service,
                 session_id=UUID(session_id),
                 session_operation_context=compose_context,
@@ -603,167 +605,121 @@ def test_schema_form_source_resolution_is_advisory_without_blob_mutation_and_rep
     delete.assert_not_awaited()
 
 
-def test_schema_form_uploaded_source_type_mismatch_is_acknowledged_without_provider(
+@pytest.mark.parametrize("selected_plugin", [None, "text"])
+def test_upload_advisory_provider_cannot_answer_a_source_turn(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    selected_plugin: str | None,
 ) -> None:
     session_id = _create_session(composer_test_client)
-    initial_turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
-    schema_turn = _choose_source(composer_test_client, session_id, initial_turn, plugin="text")["next_turn"]
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    if selected_plugin is not None:
+        turn = _choose_source(composer_test_client, session_id, turn, plugin=selected_plugin)["next_turn"]
     uploaded = _upload_blob(composer_test_client, session_id, "MOCK_DATA.json", b'[{"name":"alice","value":1}]\n', "application/json")
+    before = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()
+    record_before = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record_before is not None
+    completion = _ReturningLiteLLMCompletion(_fake_llm_reply("Please choose how to interpret this uploaded JSON."))
+    monkeypatch.setattr("elspeth.web.composer.guided.chat_solver._litellm_acompletion", completion)
+    request_body = _chat_body(turn, message='I\'ve uploaded "MOCK_DATA.json"; please use it as the pipeline input.')
 
-    async def provider_must_not_run(**_kwargs: object) -> GuidedChatProviderOutcome:
-        raise AssertionError("uploaded source mismatch called provider")
-
-    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", provider_must_not_run, raising=False)
-
-    request_body = _chat_body(
-        schema_turn,
-        message='I\'ve uploaded "MOCK_DATA.json"; please use it as the pipeline input.',
-    )
     response = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=request_body)
 
     assert response.status_code == 200, response.json()
     body = response.json()
-    assert body["assistant_message_kind"] == "synthetic_failure"
-    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
-    assert 'I received "MOCK_DATA.json"' in body["assistant_message"]
-    assert "JSON" in body["assistant_message"]
-    assert "Text" in body["assistant_message"]
-    assert "still uploaded" in body["assistant_message"]
-    assert body["next_turn"]["turn_token"] == schema_turn["turn_token"]
-    assert body["next_turn"]["payload"] == schema_turn["payload"]
+    assert completion.calls
+    assert body["assistant_message"] == "Please choose how to interpret this uploaded JSON."
+    assert body["next_turn"] == turn
+    assert body["guided_session"]["history"] == before["guided_session"]["history"]
+    record_after = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record_after is not None
+    assert (
+        record_after.composer_meta["guided_session"]["pending_source_intents"]
+        == record_before.composer_meta["guided_session"]["pending_source_intents"]
+    )
+    assert body["composition_state"]["sources"] == {}
     blobs = asyncio.run(composer_test_client.app.state.blob_service.list_blobs(UUID(session_id)))
     assert [blob.id for blob in blobs] == [uploaded.id]
+    calls_before_replay = len(completion.calls)
     replay = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=request_body)
     assert replay.status_code == 200, replay.json()
     assert replay.json() == body
+    assert len(completion.calls) == calls_before_replay
     assert _chat_operation_count(composer_test_client, session_id) == 1
 
 
-def test_matching_uploaded_source_missing_required_failure_policy_raises(
+def test_uploaded_source_provider_authors_options_before_atomic_replay(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
     uploaded = _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n1,10\n", "text/csv")
+    completion = _ReturningLiteLLMCompletion(
+        _fake_source_resolution_tool_call(
+            {
+                "upload_ref": str(uploaded.id),
+                "plugin": "csv",
+                "options": {"schema": {"mode": "observed", "guaranteed_fields": ["order_id"]}, "encoding": "utf-8-sig"},
+                "on_validation_failure": "discard",
+                "assistant_message": "Review the uploaded orders source with the schema I proposed.",
+            }
+        )
+    )
+    monkeypatch.setattr("elspeth.web.composer.guided.chat_solver._litellm_acompletion", completion)
+    request_body = _chat_body(turn, message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.')
 
-    def missing_policy_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
-        assert inspection_facts is not None
-        return {
-            "path": f"blob:{uploaded.id}",
-            "schema": {"mode": "observed"},
-        }
+    response = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=request_body)
 
-    monkeypatch.setattr(guided_route, "build_step_1_source_prefill", missing_policy_prefill)
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert len(completion.calls) == 1
+    assert body["next_turn"]["type"] == "inspect_and_confirm"
+    assert body["composition_state"]["sources"] == {}
+    record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None
+    pending = next(iter(record.composer_meta["guided_session"]["pending_source_intents"].values()))
+    assert pending["options"]["encoding"] == "utf-8-sig"
+    assert pending["options"]["schema"]["guaranteed_fields"] == ("order_id",)
+    assert pending["options"]["path"] == f"blob:{uploaded.id}"
+    assert [record["turn_type"] for record in body["guided_session"]["history"]] == [
+        "single_select",
+        "schema_form",
+        "inspect_and_confirm",
+    ]
+    replay = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=request_body)
+    assert replay.status_code == 200, replay.json()
+    assert replay.json() == body
+    assert len(completion.calls) == 1
 
-    with pytest.raises(InvariantError, match="source prefill is missing required on_validation_failure"):
-        _source_from_upload_under_compose_fence(composer_test_client, session_id)
+
+def test_uploaded_source_helper_returns_bounded_evidence_without_prefill(
+    composer_test_client: TestClient,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    uploaded = _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n" + b"1,10\n" * 2000, "text/csv")
+
+    facts = _source_from_upload_under_compose_fence(composer_test_client, session_id)
+    assert type(facts) is SourceInspectionFacts
+    assert facts.redacted_identity["blob_id"] == str(uploaded.id)
+    assert facts.observed_headers == ("order_id", "total")
+    assert facts.source_kind == "csv"
+    assert 0 < facts.sample_row_count <= 100
+    assert 0 < facts.byte_range_inspected[1] <= 8192
 
 
-def test_matching_uploaded_source_missing_required_path_raises(
+def test_uploaded_source_helper_propagates_inspection_integrity_failure(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_id = _create_session(composer_test_client)
     _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n1,10\n", "text/csv")
 
-    def missing_path_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
-        assert inspection_facts is not None
-        return {
-            "schema": {"mode": "observed"},
-            "on_validation_failure": "discard",
-        }
+    async def broken_inspection(*_args: object, **_kwargs: object):
+        raise AuditIntegrityError("uploaded content failed integrity verification")
 
-    monkeypatch.setattr(guided_route, "build_step_1_source_prefill", missing_path_prefill)
-
-    with pytest.raises(InvariantError, match="matching source prefill is missing required path"):
-        _source_from_upload_under_compose_fence(composer_test_client, session_id)
-
-
-@pytest.mark.parametrize("malformed_policy", [None, 0, ""])
-def test_matching_uploaded_source_malformed_failure_policy_raises(
-    composer_test_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    malformed_policy: object,
-) -> None:
-    session_id = _create_session(composer_test_client)
-    uploaded = _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n1,10\n", "text/csv")
-
-    def malformed_policy_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
-        assert inspection_facts is not None
-        return {
-            "path": f"blob:{uploaded.id}",
-            "schema": {"mode": "observed"},
-            "on_validation_failure": malformed_policy,
-        }
-
-    monkeypatch.setattr(guided_route, "build_step_1_source_prefill", malformed_policy_prefill)
-
-    with pytest.raises(InvariantError, match="source prefill on_validation_failure must be a non-empty exact str"):
-        _source_from_upload_under_compose_fence(composer_test_client, session_id)
-
-
-@pytest.mark.parametrize(
-    ("prefill", "expected_field"),
-    [
-        (
-            {
-                "path": None,
-                "schema": {"mode": "observed"},
-                "on_validation_failure": "discard",
-            },
-            "path",
-        ),
-        (
-            {
-                "path": 0,
-                "schema": {"mode": "observed"},
-                "on_validation_failure": "discard",
-            },
-            "path",
-        ),
-        (
-            {
-                "path": "",
-                "schema": {"mode": "observed"},
-                "on_validation_failure": "discard",
-            },
-            "path",
-        ),
-        (
-            {
-                "path": "blob:authoritative",
-                "on_validation_failure": "discard",
-            },
-            "schema",
-        ),
-        (
-            {
-                "path": "blob:authoritative",
-                "schema": None,
-                "on_validation_failure": "discard",
-            },
-            "schema",
-        ),
-    ],
-)
-def test_matching_uploaded_source_malformed_prefill_contract_raises(
-    composer_test_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    prefill: dict[str, object],
-    expected_field: str,
-) -> None:
-    session_id = _create_session(composer_test_client)
-    _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n1,10\n", "text/csv")
-
-    def malformed_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
-        assert inspection_facts is not None
-        return dict(prefill)
-
-    monkeypatch.setattr(guided_route, "build_step_1_source_prefill", malformed_prefill)
-
-    with pytest.raises(InvariantError, match=expected_field):
+    monkeypatch.setattr(guided_route, "inspect_selected_ready_session_blob", broken_inspection)
+    with pytest.raises(AuditIntegrityError, match="uploaded content failed integrity verification"):
         _source_from_upload_under_compose_fence(composer_test_client, session_id)
 
 

@@ -125,7 +125,6 @@ from .._helpers import (
     Mapping,
     Request,
     SessionServiceProtocol,
-    SourceResolved,
     TerminalKind,
     TerminalReason,
     TerminalState,
@@ -140,7 +139,6 @@ from .._helpers import (
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _initial_composition_state_with_guided_session,
-    _inspect_latest_ready_session_blob,
     _log_last_resort_diagnostic,
     _named_guided_custody_projection,
     _replace,
@@ -155,7 +153,6 @@ from .._helpers import (
     build_step_1_inspect_and_confirm_turn_from_intent,
     build_step_1_schema_form_turn,
     build_step_1_schema_form_turn_from_resolved,
-    build_step_1_source_prefill,
     build_step_2_multi_select_turn,
     build_step_2_schema_form_turn,
     build_step_2_schema_form_turn_from_resolved,
@@ -541,9 +538,8 @@ def _step_1_uploaded_input_filename(message: str) -> str | None:
     The frontend upload helper APPENDS its bind sentence to whatever the user
     already typed, separated by a newline (``ChatInput``'s upload-completion
     handler), so the sentinel is the message's TRAILING LINE rather than a
-    whole-message prefix. Matching the prefix of the whole message made any
-    typed prose defeat the deterministic upload route and hand an
-    unresolvable request to the provider instead.
+    whole-message prefix. The sentinel discovers uploaded evidence for the
+    planner; it never supplies a source plugin or answers a form.
     """
     lines = message.strip().splitlines()
     if not lines:
@@ -557,27 +553,6 @@ def _step_1_uploaded_input_filename(message: str) -> str | None:
     if not filename or '"' in filename:
         return None
     return filename
-
-
-def _step_1_plugin_for_uploaded_inspection(
-    inspection_facts: SourceInspectionFacts,
-    *,
-    selectable_plugins: tuple[str, ...],
-) -> str | None:
-    """Derive the source plugin an inspected upload binds, or ``None``.
-
-    The upload helper's bind request names no plugin, so a Step-1 plugin
-    SELECTION turn has no server-held plugin to bind against. Invert the
-    prefill compatibility predicate over the turn's own permitted option ids:
-    exactly one match is a deterministic derivation (csv content binds ``csv``,
-    json/jsonl bind ``json``, text binds ``text``), while an unknown source
-    kind or an ambiguous permitted set abstains so the request falls back to
-    the ordinary provider route rather than guessing.
-    """
-    matches = tuple(dict.fromkeys(plugin for plugin in selectable_plugins if _inspection_matches_source_plugin(plugin, inspection_facts)))
-    if len(matches) != 1:
-        return None
-    return matches[0]
 
 
 async def _step_1_unambiguous_compatible_blob_inspection(
@@ -631,100 +606,23 @@ async def _step_1_unambiguous_compatible_blob_inspection(
 async def _source_from_latest_uploaded_blob_for_step_1_chat(
     *,
     message: str,
-    plugin_hint: str | None,
-    selectable_plugins: tuple[str, ...] = (),
     blob_service: BlobServiceProtocol,
     session_id: UUID,
     session_operation_context: SessionOperationContext,
-) -> tuple[SourceResolved | None, SourceInspectionFacts] | None:
-    """Build a source resolution from the newest uploaded blob for upload-hint chat.
-
-    The frontend upload helper currently appends text like "I've uploaded
-    <file>; please use it as the pipeline input." to the chat box. That text
-    carries no blob id, so letting the LLM resolve it invites invented schema.
-    Bind the named ready session blob through the same inspection prefill used
-    by the visible form. The proposal custody boundary later resolves the
-    masked ``blob:<id>`` sentinel authoritatively.
-
-    ``plugin_hint`` is the server-held Step-1 plugin when one exists (a schema
-    form). A plugin SELECTION turn holds none, so the plugin is derived from
-    the inspected content kind restricted to ``selectable_plugins`` — the
-    permitted option ids the same turn advertised. The default empty set means
-    "no derivation is available here", which is the pre-derivation contract:
-    without a plugin hint there is then nothing to bind.
-
-    ``None`` means there is no applicable ready upload. A tuple with a source
-    means the inspected blob matches the selected plugin; a tuple whose source
-    is ``None`` preserves an incompatible ready blob's facts for an explicit
-    type-mismatch response.
-    """
+) -> SourceInspectionFacts | None:
+    """Inspect the named session upload as evidence for the Step-1 planner."""
     uploaded_filename = _step_1_uploaded_input_filename(message)
     if uploaded_filename is None:
         return None
-    inspection_facts = await _inspect_latest_ready_session_blob(
-        blob_service,
-        session_id,
-        session_operation_context=session_operation_context,
-        filename=uploaded_filename,
-    )
-    if inspection_facts is None:
-        return None
-    plugin = (
-        plugin_hint
-        if plugin_hint is not None
-        else _step_1_plugin_for_uploaded_inspection(inspection_facts, selectable_plugins=selectable_plugins)
-    )
-    if plugin is None:
-        return None
-    prefilled = build_step_1_source_prefill(plugin, inspection_facts=inspection_facts)
-    if "path" not in prefilled:
-        if _inspection_matches_source_plugin(plugin, inspection_facts):
-            raise InvariantError("matching source prefill is missing required path")
-        # A ready upload with incompatible inspected content is not the same
-        # thing as no upload. Preserve the facts so the chat boundary can
-        # acknowledge the file and report the type mismatch without asking a
-        # provider to infer whether bytes arrived.
-        return None, inspection_facts
-    path = prefilled["path"]
-    if type(path) is not str or path == "":
-        raise InvariantError("source prefill path must be a non-empty exact str")
-    try:
-        schema = prefilled["schema"]
-    except KeyError as exc:
-        raise InvariantError("source prefill is missing required schema") from exc
-    if type(schema) is not dict:
-        raise InvariantError("source prefill schema must be an exact dict")
-    options: dict[str, Any] = {
-        "path": path,
-        "schema": dict(deep_thaw(schema)),
-    }
-    try:
-        on_validation_failure = prefilled["on_validation_failure"]
-    except KeyError as exc:
-        raise InvariantError("source prefill is missing required on_validation_failure") from exc
-    if type(on_validation_failure) is not str or on_validation_failure == "":
-        raise InvariantError("source prefill on_validation_failure must be a non-empty exact str")
-    observed_headers = inspection_facts.observed_headers
-    if observed_headers is None:
-        observed_columns: tuple[str, ...] = ()
-    else:
-        observed_columns = tuple(observed_headers)
-    identity = inspection_facts.redacted_identity
-    anchor = identity["content_hash_prefix"] if "content_hash_prefix" in identity else None
-    if anchor is not None and (type(anchor) is not str or anchor == ""):
-        raise InvariantError("inspection facts content_hash_prefix must be a non-empty exact str")
-    return (
-        SourceResolved(
-            name="source",
-            plugin=plugin,
-            options=options,
-            observed_columns=observed_columns,
-            sample_rows=(),
-            on_validation_failure=on_validation_failure,
-            content_hash_prefix=anchor,
-        ),
-        inspection_facts,
-    )
+    for record in await blob_service.list_blobs(session_id, limit=None):
+        if record.status == "ready" and record.filename == uploaded_filename:
+            return await inspect_selected_ready_session_blob(
+                blob_service,
+                session_id,
+                selected_blob_id=record.id,
+                session_operation_context=session_operation_context,
+            )
+    return None
 
 
 def _guided_persisted_validity(
