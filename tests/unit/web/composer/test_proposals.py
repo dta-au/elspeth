@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 
 import pytest
 
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.web.composer.proposals import build_tool_proposal_summary
+from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.tools import get_tool_definitions, is_mutation_tool
 from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS, ASYNC_TOOL_EFFECTS, resolve_tool_effects
 from elspeth.web.composer.tools.declarations import EffectDomain, ToolDeclaration, ToolKind
 from elspeth.web.composer.tools.sessions import _SESSION_AWARE_TOOL_HANDLERS
+from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, execute_tool
+
+
+def _pipeline_arguments() -> dict[str, Any]:
+    return {
+        "source": {"plugin": "csv", "on_success": "rows", "options": {"path": "input.csv"}},
+        "nodes": [{"id": "classify_severity", "node_type": "transform", "input": "rows", "plugin": "llm_classifier"}],
+        "edges": [],
+        "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": "output.json"}}],
+    }
 
 
 def test_is_mutation_tool_uses_closed_registries() -> None:
@@ -23,11 +36,7 @@ def test_is_mutation_tool_uses_closed_registries() -> None:
 def test_set_pipeline_summary_is_plain_language() -> None:
     summary = build_tool_proposal_summary(
         tool_name="set_pipeline",
-        arguments={
-            "source": {"plugin": "csv", "options": {}},
-            "nodes": [{"id": "classify_severity", "plugin": "llm_classifier"}],
-            "outputs": [{"name": "out", "plugin": "json"}],
-        },
+        arguments=_pipeline_arguments(),
         redacted_arguments={
             "source": {"plugin": "csv", "options": {}},
             "nodes": [{"id": "classify_severity", "plugin": "llm_classifier"}],
@@ -42,7 +51,8 @@ def test_set_pipeline_summary_is_plain_language() -> None:
 
 @pytest.mark.parametrize("declaration", _REGISTERED_TOOLS, ids=lambda declaration: declaration.name)
 def test_every_declared_tool_has_owned_effects(declaration: ToolDeclaration) -> None:
-    effects = resolve_tool_effects(declaration.name, {})
+    arguments = _pipeline_arguments() if declaration.name == "set_pipeline" else {}
+    effects = resolve_tool_effects(declaration.name, arguments)
     assert all(isinstance(domain, EffectDomain) for domain in effects.domains)
     if declaration.kind in {ToolKind.DISCOVERY, ToolKind.BLOB_DISCOVERY, ToolKind.SECRET_DISCOVERY}:
         expected = ()
@@ -68,10 +78,6 @@ def test_effect_authority_matches_shipped_and_async_tools() -> None:
         ("update_blob", {"content": None}, ("blob_store",)),
         ("delete_blob", {}, ("blob_store",)),
         ("wire_blob_inline_ref", {}, ("graph", "validation", "yaml")),
-        ("set_pipeline", {"source": {"inline_blob": {}}}, ("graph", "validation", "yaml", "blob_store")),
-        ("set_pipeline", {"source": {"inline_blob": None}}, ("graph", "validation", "yaml")),
-        ("set_pipeline", {"source": {"blob_id": "custodied"}}, ("graph", "validation", "yaml")),
-        ("set_pipeline", {"source": "invalid"}, ("graph", "validation", "yaml")),
         ("request_interpretation_review", {}, ("interpretation",)),
         ("request_advisor_hint", {}, ()),
     ],
@@ -81,6 +87,86 @@ def test_summary_uses_prospective_effects(name: str, arguments: dict[str, Any], 
     owned: Mapping[str, Any] = deep_freeze(arguments) if frozen else arguments
     summary = build_tool_proposal_summary(tool_name=name, arguments=owned, redacted_arguments={})
     assert summary.affects == expected
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+@pytest.mark.parametrize("custody", ["inline_blob", "blob_id", "none"])
+def test_set_pipeline_effects_use_admitted_custody(custody: str, frozen: bool) -> None:
+    arguments = _pipeline_arguments()
+    if custody == "inline_blob":
+        arguments["source"]["inline_blob"] = {"filename": "input.csv", "mime_type": "text/csv", "content": "id\n1\n"}
+    elif custody == "blob_id":
+        arguments["source"]["blob_id"] = "custodied"
+    else:
+        arguments["source"]["inline_blob"] = None
+    owned: Mapping[str, Any] = deep_freeze(arguments) if frozen else arguments
+    SetPipelineArgumentsModel.model_validate(owned)
+    expected = ("graph", "validation", "yaml", "blob_store") if custody == "inline_blob" else ("graph", "validation", "yaml")
+    assert tuple(domain.value for domain in resolve_tool_effects("set_pipeline", owned).domains) == expected
+    assert build_tool_proposal_summary(tool_name="set_pipeline", arguments=owned, redacted_arguments={}).affects == expected
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+@pytest.mark.parametrize("invalid", ["source_type", "sources_type", "missing", "both", "source_null", "sources_null", "nodes_type"])
+@pytest.mark.parametrize("surface", ["effects", "summary"])
+def test_set_pipeline_projections_reject_invalid_complete_input(invalid: str, frozen: bool, surface: str) -> None:
+    arguments = _pipeline_arguments()
+    SetPipelineArgumentsModel.model_validate(arguments)
+    assert tuple(domain.value for domain in resolve_tool_effects("set_pipeline", arguments).domains) == ("graph", "validation", "yaml")
+    assert build_tool_proposal_summary(tool_name="set_pipeline", arguments=arguments, redacted_arguments={}).summary == (
+        "Replace the pipeline with 1 input, 1 processing node, and 1 output."
+    )
+    malformed = deepcopy(arguments)
+    if invalid == "source_type":
+        malformed["source"] = "PRIVATE_MALFORMED_SOURCE"
+    elif invalid == "sources_type":
+        del malformed["source"]
+        malformed["sources"] = "PRIVATE_MALFORMED_SOURCE"
+    elif invalid == "missing":
+        del malformed["source"]
+    elif invalid == "both":
+        malformed["sources"] = {"other": deepcopy(arguments["source"])}
+    elif invalid == "source_null":
+        malformed["source"] = None
+    elif invalid == "sources_null":
+        del malformed["source"]
+        malformed["sources"] = None
+    else:
+        malformed["nodes"] = "PRIVATE_MALFORMED_SOURCE"
+    owned: Mapping[str, Any] = deep_freeze(malformed) if frozen else malformed
+    with pytest.raises(ToolArgumentError) as caught:
+        if surface == "effects":
+            resolve_tool_effects("set_pipeline", owned)
+        else:
+            build_tool_proposal_summary(tool_name="set_pipeline", arguments=owned, redacted_arguments={})
+    assert caught.value.argument == "set_pipeline arguments"
+    assert "PRIVATE_MALFORMED_SOURCE" not in str(caught.value)
+    assert "actual JSON objects and arrays" in caught.value.expected
+
+
+@pytest.mark.parametrize("validate_arguments", [False, True])
+def test_set_pipeline_dispatch_retains_safe_model_rejection(validate_arguments: bool) -> None:
+    arguments = _pipeline_arguments()
+    arguments["nodes"] = []
+    arguments["source"]["on_success"] = "out"
+    arguments["source"]["options"]["schema"] = {"mode": "observed"}
+    arguments["outputs"][0]["options"]["schema"] = {"mode": "observed"}
+    SetPipelineArgumentsModel.model_validate(arguments)
+    state = _empty_state()
+    result = execute_tool("set_pipeline", arguments, state, _mock_catalog(), validate_arguments=validate_arguments)
+    assert result.success
+    malformed = {**arguments, "source": "PRIVATE_MALFORMED_SOURCE"}
+    with pytest.raises(ToolArgumentError) as caught:
+        execute_tool(
+            "set_pipeline",
+            malformed,
+            state,
+            _mock_catalog(),
+            validate_arguments=validate_arguments,
+            raise_schema_argument_errors=validate_arguments,
+        )
+    assert "PRIVATE_MALFORMED_SOURCE" not in str(caught.value)
+    assert state == _empty_state()
 
 
 def test_unknown_tool_rejects_summary_and_effect_lookup() -> None:
@@ -106,11 +192,20 @@ def test_effect_resolution_rejects_corrupted_owned_kind() -> None:
 def test_named_inputs_and_mixed_processing_nodes() -> None:
     arguments = deep_freeze(
         {
-            "sources": {"first": {}, "second": {}},
-            "nodes": [{"node_type": "transform"}, {"node_type": "gate"}, {"node_type": "collector"}],
-            "outputs": [{}, {}],
+            "sources": {
+                "first": {"plugin": "csv", "on_success": "first_rows"},
+                "second": {"plugin": "csv", "on_success": "second_rows"},
+            },
+            "nodes": [
+                {"id": "t", "node_type": "transform", "input": "first_rows"},
+                {"id": "g", "node_type": "gate", "input": "second_rows"},
+                {"id": "c", "node_type": "collector", "input": "union"},
+            ],
+            "edges": [],
+            "outputs": [{"sink_name": "out_a", "plugin": "json"}, {"sink_name": "out_b", "plugin": "json"}],
         }
     )
+    SetPipelineArgumentsModel.model_validate(arguments)
     summary = build_tool_proposal_summary(tool_name="set_pipeline", arguments=arguments, redacted_arguments={})
     assert summary.summary == "Replace the pipeline with 2 inputs, 3 processing nodes, and 2 outputs."
 

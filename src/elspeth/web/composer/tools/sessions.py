@@ -1894,8 +1894,8 @@ def _handle_set_pipeline(
 
 def _set_pipeline_effects(arguments: Mapping[str, Any]) -> ToolEffects:
     """Classify prospective inline custody without preparing or writing bytes."""
-    source = arguments["source"] if "source" in arguments else None
-    if isinstance(source, Mapping) and "inline_blob" in source and source["inline_blob"] is not None:
+    validated = _validate_mutation_arguments(SetPipelineArgumentsModel, arguments, "set_pipeline arguments")
+    if validated.source is not None and validated.source.inline_blob is not None:
         return ToolEffects((*GRAPH_EFFECTS.domains, EffectDomain.BLOB_STORE))
     return GRAPH_EFFECTS
 

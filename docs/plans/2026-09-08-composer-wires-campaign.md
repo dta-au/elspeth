@@ -181,6 +181,17 @@ has a separate discriminating regression. LLM and systems reviews found no
 blocker. Advisor rejection remains safe but less field-specific; consider owned
 field-specific diagnostics during the existing guidance milestone.
 
+Key-free lint comparison against the fixed release input exposed two new raw
+mapping fallbacks in pipeline proposal counts and effect classification. Both
+now admit complete input through `SetPipelineArgumentsModel` and consume typed
+fields; malformed selectors raise the safe argument error. The two remaining
+new R5 sites are fail-closed nominal checks on owned effect/model types, retained
+under the trust-domain rule. No signatures or allowlist metadata changed.
+The follow-up broad run reported 9,247 passed and two incomplete test fixtures;
+their storage-purity and exact registry assertions are preserved with valid
+complete fixtures (407 affected tests pass). Final committed-tree verification
+remains the checkpoint gate; global signing and release integration remain open.
+
 Each milestone ends with a frozen, named source state, proportionate tests,
 reconciled baseline/mutant/restored evidence and fresh review. Historical reviewed
 work is retained and regression-tested rather than automatically rewritten.
@@ -226,16 +237,26 @@ are supporting historical evidence; their pending choices are superseded.
 
 Use the [READ handoff](composer-wires/read-wire-handoff.md) and
 [ADMITTED handoff](composer-wires/admitted-scorecard-handoff.md), corrected by the
-accepted closure ruling above.
+accepted closure ruling above. For READ, the later
+[argument-model ruling amendment](composer-wires/argument-model-ruling-amendment.md#practical-read-after-typed-models)
+explicitly supersedes the handoff's semantic-use analyzer: measure original-input
+field extraction, and prove operational consumption separately with behavioral
+tests. This corrects the stronger obsolete requirements copied into the initial
+resumption plan; it does not lower the accepted evidence standard.
 
 - [ ] Reuse the actual callable catalogue and source provenance utilities for
-  READ. Attribute fields to non-diagnostic use with bounded helper inspection;
-  dead locals, logging, presence tests and whole-model serialization do not prove
-  consumption. Preserve proven fields alongside unresolved reasons.
-- [ ] Add the derived READ relation and its controlled probes. Unsupported
-  aliases, copied/transformed roots, invoked closures, cycles and opaque helpers
-  fail honestly until specifically supported. No generic CFG/SSA engine or
-  blanket forwarding fence is needed.
+  READ. Bind instances to complete original-input admission, and collect direct
+  declared field accesses and literal raw reads along supported owned helpers.
+  Preserve extraction sites alongside unresolved provenance. Do not label these
+  static extractions as operational consumption.
+- [ ] Add the derived READ relation and provenance controls: foreign/independent
+  model instances, unused nested functions, ambiguous aliases/copies and whole
+  model dumps cannot manufacture coverage. Unsupported paths remain explicit
+  findings; a bulk dump never implies every field is extracted.
+- [ ] Add meaningful behavior probes showing representative field changes alter
+  intended state, selected results, or the request at a mocked boundary. Cover
+  optional branches and defaults. Dead-read/logging-only positives are not
+  consumption evidence. No general semantic-use graph or shadow field reads.
 - [ ] Extend `test_tool_argument_wire_parity.py` to include closed-empty policies,
   type-driven models and actual accepted/emitted wire names. Check exact universe
   equality before per-field comparisons; do not intersect away missing endpoints.

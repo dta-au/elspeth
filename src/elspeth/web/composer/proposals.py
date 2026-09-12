@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.tools._common import _validate_mutation_arguments
 from elspeth.web.composer.tools._registry import resolve_tool_effects
 
 
@@ -19,14 +21,6 @@ class ToolProposalSummary:
 
     def __post_init__(self) -> None:
         freeze_fields(self, "affects", "arguments_redacted_json")
-
-
-def _count_items(value: object) -> int:
-    if type(value) is list:
-        return len(value)
-    if type(value) is tuple:
-        return len(value)
-    return 0
 
 
 def _plural(count: int, singular: str) -> str:
@@ -50,10 +44,10 @@ def build_tool_proposal_summary(
     affects = tuple(domain.value for domain in resolve_tool_effects(tool_name, arguments).domains)
 
     if tool_name == "set_pipeline":
-        sources = arguments["sources"] if "sources" in arguments else None
-        source_count = len(sources) if isinstance(sources, Mapping) else int("source" in arguments and arguments["source"] is not None)
-        node_count = _count_items(arguments["nodes"] if "nodes" in arguments else ())
-        output_count = _count_items(arguments["outputs"] if "outputs" in arguments else ())
+        validated = _validate_mutation_arguments(SetPipelineArgumentsModel, arguments, "set_pipeline arguments")
+        source_count = len(validated.sources) if validated.sources is not None else 1
+        node_count = len(validated.nodes)
+        output_count = len(validated.outputs)
         return ToolProposalSummary(
             summary=(
                 f"Replace the pipeline with {_plural(source_count, 'input')}, "

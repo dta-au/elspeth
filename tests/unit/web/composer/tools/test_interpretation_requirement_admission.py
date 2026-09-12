@@ -1171,6 +1171,7 @@ def test_public_composition_mutations_reject_preexisting_output_review_metadata(
 
 
 def test_composition_gate_registry_covers_every_public_state_mutation() -> None:
+    from elspeth.web.composer.redaction import SetPipelineArgumentsModel
     from elspeth.web.composer.tools._registry import (
         _MUTATION_TOOL_NAMES,
         _REGISTERED_TOOLS,
@@ -1179,7 +1180,18 @@ def test_composition_gate_registry_covers_every_public_state_mutation() -> None:
     )
     from elspeth.web.composer.tools.declarations import EffectDomain
 
-    covered = frozenset(decl.name for decl in _REGISTERED_TOOLS if EffectDomain.GRAPH in resolve_tool_effects(decl.name, {}).domains)
+    pipeline_arguments = {
+        "source": {"plugin": "csv", "on_success": "rows"},
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    SetPipelineArgumentsModel.model_validate(pipeline_arguments)
+    covered = frozenset(
+        decl.name
+        for decl in _REGISTERED_TOOLS
+        if EffectDomain.GRAPH in resolve_tool_effects(decl.name, pipeline_arguments if decl.name == "set_pipeline" else {}).domains
+    )
 
     assert covered == (
         _MUTATION_TOOL_NAMES

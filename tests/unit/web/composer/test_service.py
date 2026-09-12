@@ -841,6 +841,19 @@ def _blob_content_for_test(engine: Any, blob_id: str) -> str | None:
 
 
 def test_effect_resolution_and_summaries_never_write_seeded_blob_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+
+    pipeline_arguments = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "inline_blob": {"filename": "input.csv", "mime_type": "text/csv", "content": "SECRET_SENTINEL_RAW"},
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    SetPipelineArgumentsModel.model_validate(pipeline_arguments)
     engine, session_id = _session_engine_with_session()
     blob_id = _create_session_blob_for_test(engine=engine, session_id=session_id, data_dir=tmp_path)
     with engine.connect() as conn:
@@ -858,7 +871,7 @@ def test_effect_resolution_and_summaries_never_write_seeded_blob_storage(tmp_pat
         ("create_blob", {"filename": "SECRET_SENTINEL_RAW", "content": "SECRET_SENTINEL_RAW"}),
         ("update_blob", {"blob_id": blob_id, "content": "SECRET_SENTINEL_RAW"}),
         ("delete_blob", {"blob_id": blob_id}),
-        ("set_pipeline", {"source": {"inline_blob": {"content": "SECRET_SENTINEL_RAW"}}}),
+        ("set_pipeline", pipeline_arguments),
     ):
         owned = deep_freeze(arguments)
         assert tool_registry.resolve_tool_effects(name, owned).domains
