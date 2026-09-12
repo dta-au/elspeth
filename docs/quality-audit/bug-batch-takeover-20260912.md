@@ -10,7 +10,7 @@ Target: `release/0.8.1`. This report is in progress, not a release-readiness cer
 - DAG version-oracle correction: `e19a1a23cce65bca5a59104fb94f81d8b48cfa7f`.
 - Acceptance version and plugin hash repairs: `5e911e6f8c903d24ab4ec5c80fbd88b33d7616c3`.
 - Initial release integration: `d1b473c8f846f9ed7dc1da1d6c2dd6641abfed8a`, fast-forwarded into both the original bugfix branch and `release/0.8.1`.
-- Structural remediation: in progress in an isolated task worktree; not yet integrated.
+- Structural remediation: `61a67010bfa5e34875b4c5df26b8da2b7df7c3f3`, committed in an isolated task worktree; gate repairs remain in progress and it is not yet integrated.
 
 The initial integration preserves the exact fully gated tree
 `6c34800f09d0e6be6c9aef8c78ee8df19d49fc78`. The six-stage gate records
@@ -274,7 +274,48 @@ for the structural changes.
 The eleven original batch tracker closures now include the freshly verified
 release integration and full-gate evidence, while retaining their historical
 branch-only verification. The heartbeat issue is closed on the integrated
-commit. Structural work remains uncommitted until its final review and gates.
+commit. The structural candidate is committed; its two default-suite failures
+are being repaired before release integration.
+
+### Structural verification checkpoint
+
+The first complete six-stage gate at `61a67010b` records ruff, mypy and
+contract checks at exit 0; default pytest at exit 1 (two failed, 50,892 passed,
+87 skipped, two expected failures); PostgreSQL at exit 0 (394 passed, one
+skipped); and `frozen=yes`. Overall `RESULT=FAIL` is retained, not superseded
+by the successful focused proof.
+
+The failures are the RAG zero-row integration fixture's missing node identity
+and the exact Sessions connection-classification inventory. The RAG repair
+replaces a duplicate lifecycle fake with the existing real-context factory and
+asserts the typed event and readiness forwarding. Dropping the completion
+callback or replacing its run identity with a constant fails an explicit
+consumer assertion in the isolated repair.
+
+The Sessions classification repair preserves all 390 production writer
+records' domains, authorities, escape flags and multiplicity. Its exact
+66-record classification inventory has 13 changed identities: eleven move
+only by line, and two fingerprints change through added refusal-cause
+keywords. Removing only those keywords recovers both complete enclosing ASTs
+and their former fingerprints; changing a connection acquisition breaks the
+control. No authority policy or scanner resolver is relaxed.
+
+Full-file review also found one fixture-only conditional-provenance test and
+three read-resolution tests that asserted only acquisition presence. All four
+now exercise the scanner and distinguish explicit unknown execution from a
+known-safe control. Process-local detector mutations fail the new assertions
+but survive the old tests. The isolated complete architecture module passes
+221 tests with one inherited expected failure. That expected failure remains
+the separate whole-production authority burn-down, not the hard classification
+inventory repaired here.
+
+The committed candidate's separate focused proof has a deterministic and
+independently reviewed PASS. An earlier attempt is retained as FAIL: reverting
+whole RAG/Chroma producers made real exporters crash before assertions. The
+replacement proof uses explicit typed-callback assertions for those producer
+reversions, with real-console tests as separate positive coverage and actual
+OTLP/Azure projection reversions as exporter assertion proof. Neither a crash
+nor the focused PASS is represented as a successful full release gate.
 
 ## Gate limitations and custody
 
@@ -368,8 +409,10 @@ tests/integration/pipeline/test_audit_export_effect_recovery.py
 tests/integration/pipeline/test_eof_resume_proof.py
 tests/integration/plugins/llm/test_source_pipeline.py
 tests/integration/plugins/test_dataverse_statistics.py
+tests/integration/plugins/transforms/test_rag_pipeline.py
 tests/integration/test_exception_diagnostic_consumers.py
 tests/invariants/test_exception_diagnostic_contracts.py
+tests/unit/architecture/test_session_db_mutation_authority.py
 tests/unit/architecture/test_web_landscape_mutation_fencing.py
 tests/unit/cli/test_abandon_command.py
 tests/unit/cli/test_abandon_refusal_causes.py

@@ -3901,6 +3901,10 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
 
 # Exact acquisition identities proven to belong wholly to another database
 # domain.  This is deliberately separate from writer and read admission.
+# Diagnostic completeness: the source-lifecycle and group-satisfiability
+# fingerprints changed only through their ResumeCheck cause keywords. Eleven
+# other identities below moved by line only. Connection acquisition expressions, database
+# domains, escape flags, authority and multiplicity remain unchanged.
 _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # ADR-047 fresh-time amendment: the PRAGMA verifier installs the reviewed
     # commit guard; three advisory lease readers use the fresh clock helper.
@@ -4149,7 +4153,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         # delete-and-append: _identity_key includes site.line, so a pure line shift
         # leaves a SURVIVING STALE ROW that the row count cannot see, and appending
         # instead of moving is the merge shape that loses rows when two lanes both add.
-        line=207,
+        line=206,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/manager.py",
@@ -4161,7 +4165,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         # CKPT-SNAP (elspeth-43ddb79074): 241 -> 227, POSITION ONLY, same -14 and the
         # same byte-identical fingerprint as the row above.
-        line=229,
+        line=228,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4171,7 +4175,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "288170ec1722ebc2",
         1,
         None,
-        line=126,
+        line=128,
     ),
     # Fingerprint re-pinned by elspeth-5dd23f4df9: the refuse reason this
     # function builds dropped its phantom "source-aware resume path" clause
@@ -4182,10 +4186,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "check_source_lifecycle_resumable",
         "<non-session-write-connection>",
         "write_connection",
-        "1a72af6cb37683c3",
+        "360429a1d3a62990",
         1,
         None,
-        line=233,
+        line=237,
     ),
     # Re-pinned by P4-D6 step 5: the connection is forwarded only to a
     # same-module private callee that executes on it, which the forwarding
@@ -4195,10 +4199,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "check_group_satisfiability_resumable",
         "<non-session-write-connection>",
         "write_connection",
-        "9e291dca4a439605",
+        "56688d7122f39718",
         1,
         None,
-        line=428,
+        line=432,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4215,7 +4219,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "220df19797033d2b",
         1,
         None,
-        line=908,
+        line=915,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4225,7 +4229,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ccdaa74d89308bbb",
         1,
         None,
-        line=969,
+        line=976,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4235,7 +4239,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "63aa60b938d94231",
         1,
         None,
-        line=1036,
+        line=1043,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4245,7 +4249,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "18b91cab2434c597",
         1,
         None,
-        line=1131,
+        line=1138,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4255,7 +4259,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "697320a36b78fae3",
         1,
         None,
-        line=1173,
+        line=1180,
     ),
     # MEMBER-FENCE (elspeth-43ddb79074): the three entries below moved by LINE
     # ONLY -- same symbol, same fingerprint, same domain -- because the
@@ -4271,7 +4275,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e76557a9dc25a086",
         1,
         None,
-        line=1168,
+        line=1173,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4282,7 +4286,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e89517825ad3b8d0",
         1,
         None,
-        line=1651,
+        line=1656,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4293,7 +4297,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1676,
+        line=1681,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
@@ -12770,22 +12774,42 @@ def test_read_only_statement_requires_all_reaching_branches_to_be_selects(tmp_pa
     ]
 
 
-def test_conditional_statement_provenance_merges_every_branch_and_unknown_poisons(tmp_path: Path) -> None:
+@pytest.mark.parametrize("branch_expression", ["dynamic", "sa.update(runs_table)"])
+def test_conditional_statement_provenance_merges_every_branch_and_unknown_poisons(tmp_path: Path, branch_expression: str) -> None:
     source = tmp_path / "conditional_statement_domain.py"
     source.write_text(
         textwrap.dedent(
-            """\
+            f"""\
             import sqlalchemy as sa
+            from elspeth.core.landscape.database import LandscapeDB
             from elspeth.core.landscape.schema import runs_table
 
-            def conditional_writer(conn, flag, dynamic):
-                conn.execute(sa.update(runs_table) if flag else dynamic)
+            def conditional_writer(db: LandscapeDB, flag, dynamic):
+                with db.engine.connect() as conn:
+                    conn.execute(sa.update(runs_table) if flag else {branch_expression})
 
-            def nested_wrapper_writer(conn, outer, inner, dynamic):
-                conn.execute((sa.update(runs_table) if inner else dynamic) if outer else sa.update(runs_table))
+            def nested_wrapper_writer(db: LandscapeDB, outer, inner, dynamic):
+                with db.engine.connect() as conn:
+                    conn.execute((sa.update(runs_table) if inner else {branch_expression}) if outer else sa.update(runs_table))
             """
         )
     )
+
+    sites = scan_production_writers([source], anchor=tmp_path)
+    expected = (
+        [
+            ("conditional_writer", "<unresolved-session-write>", "unknown_execute"),
+            ("nested_wrapper_writer", "<unresolved-session-write>", "unknown_execute"),
+            ("conditional_writer", "<sessions-write-connection>", "write_connection"),
+            ("nested_wrapper_writer", "<sessions-write-connection>", "write_connection"),
+        ]
+        if branch_expression == "dynamic"
+        else [
+            ("conditional_writer", "<non-session-write-connection>", "write_connection"),
+            ("nested_wrapper_writer", "<non-session-write-connection>", "write_connection"),
+        ]
+    )
+    assert [(site.symbol, site.table, site.operation) for site in sites] == expected
 
 
 def test_wrapped_conditional_statement_evidence_preserves_unknown_paths(tmp_path: Path) -> None:
@@ -16566,38 +16590,41 @@ def test_production_scanner_resolves_fully_qualified_imported_dml_and_tables(tmp
     )
 
 
-def test_read_only_resolution_uses_nearest_reassignment(tmp_path: Path) -> None:
+@pytest.mark.parametrize("last_assignment", ["dynamic", "sa.select(models.sessions_table)"])
+def test_read_only_resolution_uses_nearest_reassignment(tmp_path: Path, last_assignment: str) -> None:
     source = tmp_path / "reassigned_statement.py"
     source.write_text(
         textwrap.dedent(
-            """\
+            f"""\
             import sqlalchemy as sa
             from elspeth.web.sessions import models
 
             def reassigned(engine, dynamic):
                 with engine.connect() as conn:
                     statement = sa.select(models.sessions_table)
-                    statement = dynamic
+                    statement = {last_assignment}
                     conn.execute(statement)
             """
         )
     )
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.line) for site in sites if site.operation == "write_connection"] == [
-        ("reassigned", 5),
-    ]
+    expected = [("reassigned", 8, "<unresolved-session-write>", "unknown_opaque")] if last_assignment == "dynamic" else []
+    expected.append(("reassigned", 5, "<sessions-write-connection>", "write_connection"))
+    assert [(site.symbol, site.line, site.table, site.operation) for site in sites] == expected
 
 
-def test_read_only_resolution_excludes_nested_scope_assignments(tmp_path: Path) -> None:
+@pytest.mark.parametrize("outer_assignment", ["dynamic", "sa.select(models.sessions_table)"])
+def test_read_only_resolution_excludes_nested_scope_assignments(tmp_path: Path, outer_assignment: str) -> None:
     source = tmp_path / "nested_statement.py"
     source.write_text(
         textwrap.dedent(
-            """\
+            f"""\
             import sqlalchemy as sa
             from elspeth.web.sessions import models
 
-            def nested_shadow(engine, statement):
+            def nested_shadow(engine, dynamic):
                 with engine.connect() as conn:
+                    statement = {outer_assignment}
                     def nested():
                         statement = sa.select(models.sessions_table)
                         return statement
@@ -16606,21 +16633,23 @@ def test_read_only_resolution_excludes_nested_scope_assignments(tmp_path: Path) 
         )
     )
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.line) for site in sites if site.operation == "write_connection"] == [
-        ("nested_shadow", 5),
-    ]
+    expected = [("nested_shadow", 10, "<unresolved-session-write>", "unknown_opaque")] if outer_assignment == "dynamic" else []
+    expected.append(("nested_shadow", 5, "<sessions-write-connection>", "write_connection"))
+    assert [(site.symbol, site.line, site.table, site.operation) for site in sites] == expected
 
 
-def test_read_only_resolution_fails_closed_on_cyclic_assignment(tmp_path: Path) -> None:
+@pytest.mark.parametrize("assignment", ["statement", "sa.select(models.sessions_table)"])
+def test_read_only_resolution_fails_closed_on_cyclic_assignment(tmp_path: Path, assignment: str) -> None:
     source = tmp_path / "cyclic_statement.py"
     source.write_text(
         textwrap.dedent(
-            """\
+            f"""\
+            import sqlalchemy as sa
             from elspeth.web.sessions import models
 
             def cyclic(engine):
                 with engine.connect() as conn:
-                    statement = statement
+                    statement = {assignment}
                     conn.execute(statement)
             """
         )
@@ -16629,9 +16658,9 @@ def test_read_only_resolution_fails_closed_on_cyclic_assignment(tmp_path: Path) 
         sites = scan_production_writers([source], anchor=tmp_path)
     except RecursionError as error:
         raise AssertionError("cyclic statement resolution must fail closed without recursion") from error
-    assert [(site.symbol, site.line) for site in sites if site.operation == "write_connection"] == [
-        ("cyclic", 4),
-    ]
+    expected = [("cyclic", 7, "<unresolved-session-write>", "unknown_opaque")] if assignment == "statement" else []
+    expected.append(("cyclic", 5, "<sessions-write-connection>", "write_connection"))
+    assert [(site.symbol, site.line, site.table, site.operation) for site in sites] == expected
 
 
 def test_writer_identity_detects_unchanged_block_moved_within_symbol(tmp_path: Path) -> None:

@@ -16,6 +16,8 @@ import httpx
 import pytest
 
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.events import RAGRetrievalStatistics, TelemetryEvent
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -61,9 +63,9 @@ def _make_row(data):
 
 @dataclass
 class _TelemetryRecorder:
-    payloads: list[object] = field(default_factory=list)
+    payloads: list[TelemetryEvent] = field(default_factory=list)
 
-    def __call__(self, payload):
+    def __call__(self, payload: TelemetryEvent) -> None:
         self.payloads.append(payload)
 
 
@@ -82,35 +84,19 @@ class _LandscapeRecorder:
         self.readiness_checks.append(kwargs)
 
 
-@dataclass
-class _LifecycleContext:
-    run_id: str = "run-1"
-    landscape: _LandscapeRecorder = field(default_factory=_LandscapeRecorder)
-    telemetry_emit: _TelemetryRecorder = field(default_factory=_TelemetryRecorder)
-    rate_limit_registry: object | None = None
-    # Carried by value from the executor (ADR-048 §3); the fake models the real forwarder.
-    coordination_token: CoordinationToken | None = field(
-        default_factory=lambda: CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1)
-    )
-
-    def record_readiness_check(self, *, name: str, collection: str, reachable: bool, count: int | None, message: str) -> None:
-        assert self.coordination_token is not None
-        self.landscape.record_readiness_check(
-            name=name,
-            collection=collection,
-            reachable=reachable,
-            count=count,
-            message=message,
-            member_token=self.coordination_token.membership,
-        )
-
-
 def _mock_ctx(state_id="state-1"):
     return make_context(run_id="run-1", state_id=state_id, token=make_token_info(token_id="token-1"))
 
 
-def _mock_lifecycle_ctx():
-    return _LifecycleContext()
+def _mock_lifecycle_ctx(telemetry: _TelemetryRecorder | None = None) -> PluginContext:
+    context = make_context(
+        run_id="run-1",
+        node_id="rag-retrieval",
+        landscape=_LandscapeRecorder(),
+        coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1),
+    )
+    context.telemetry_emit = telemetry if telemetry is not None else _TelemetryRecorder()
+    return context
 
 
 def _create_transform_with_lifecycle(**config_overrides):
@@ -207,7 +193,8 @@ class TestRAGPipelineIntegration:
     def test_on_complete_with_zero_rows(self):
         # Use same lifecycle_ctx for on_start and on_complete: transform stores
         # telemetry_emit from on_start and calls it in on_complete.
-        lifecycle_ctx = _mock_lifecycle_ctx()
+        telemetry = _TelemetryRecorder()
+        lifecycle_ctx = _mock_lifecycle_ctx(telemetry)
         config = {
             "output_prefix": "policy",
             "query_field": "question",
@@ -230,8 +217,32 @@ class TestRAGPipelineIntegration:
             patch.object(AzureSearchProvider, "_readiness_get", return_value=mock_resp),
         ):
             transform.on_start(lifecycle_ctx)
-        transform.on_complete(lifecycle_ctx)
-        assert len(lifecycle_ctx.telemetry_emit.payloads) == 1
+        try:
+            transform.on_complete(lifecycle_ctx)
+            assert len(telemetry.payloads) == 1
+            event = telemetry.payloads[0]
+            assert isinstance(event, RAGRetrievalStatistics)
+            assert event.run_id == "run-1"
+            assert event.node_id == "rag-retrieval"
+            assert event.plugin_name == "rag_retrieval"
+            assert event.provider == "azure_search"
+            assert (event.total_queries, event.total_chunks, event.quarantine_count, event.score_count) == (0, 0, 0, 0)
+            assert event.score_mean is None
+            assert event.score_std is None
+            recorder = lifecycle_ctx.landscape
+            assert isinstance(recorder, _LandscapeRecorder)
+            assert recorder.readiness_checks == [
+                {
+                    "name": "rag_retrieval",
+                    "collection": "test-index",
+                    "reachable": True,
+                    "count": 10,
+                    "message": "Index 'test-index' has 10 documents",
+                    "member_token": lifecycle_ctx.require_member_token(),
+                }
+            ]
+        finally:
+            transform.close()
 
     def test_plugin_discovery(self):
         from elspeth.plugins.infrastructure.discovery import PLUGIN_SCAN_CONFIG
