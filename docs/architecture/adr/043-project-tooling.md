@@ -288,6 +288,21 @@ block, both `warpline-workflow` skill copies, the post-commit block,
 `.weft/warpline/`. Loomweave answers the caller question; git answers the
 rest; the full `pytest tests/` run before merge stays the rule.
 
+### prove-it — retired 2026-09-13
+
+Completion-claim verifier and Claude Stop hook. The Stop hook and the product
+tests that pinned this optional developer tool had already been removed by the
+2026-09-10 tooling amendment, but its skill, command implementation, pytest
+helper, hook implementation, Claude skill symlink, ignored verdict directory,
+and generated `.verify/` state remained in the project. The maintainer directed
+their removal. Lane-manager had imported the pytest helper from the prove-it
+skill; that helper now belongs to lane-manager under its own name and
+environment contract because structural red-run verification is an existing
+lane-manager behavior, independent of completion claims. Removed:
+`.agents/skills/prove-it/`, `.claude/skills/prove-it`, the `.verify/` ignore,
+and the local `.verify/` state. No replacement completion gate or project
+test was introduced.
+
 ## Consequences
 
 - The tool set agents act on is a recorded maintainer decision reviewed through

@@ -65,14 +65,13 @@ docs-archive/
 .claude/worktrees/
 .claude/plans/
 .claude/lanes/
-# lane-manager per-lane state and prove-it claims/verdicts — working state, never public.
+# lane-manager per-lane state — working state, never public.
 .lanes/
 # orchestrator control plane: lane locks, step log, model observations.
 # Tests sit OUTSIDE it so `rm -rf .orchestrator` (a state reset) cannot
 # take them with it; agent tooling is not tested in the tracked tree.
 .orchestrator/
 .orchestrator-tests/
-.verify/
 .claude/handovers/
 .claude/red-team/
 .mcp.json
