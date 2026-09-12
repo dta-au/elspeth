@@ -49,6 +49,7 @@ from elspeth.web.composer.state import (
     ValidationSummary,
 )
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
@@ -702,20 +703,6 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
     def strict_handoff_or_tolerant(*args: Any, **kwargs: Any) -> ValidationResult:
         return tolerant if kwargs.get("allow_pending_interpretation_placeholders") else handoff
 
-    preview_result = ToolResult(
-        success=True,
-        updated_state=state,
-        validation=ValidationSummary(
-            is_valid=True,
-            errors=(),
-            warnings=(),
-            suggestions=(),
-            semantic_contracts=(),
-        ),
-        affected_nodes=(),
-        data={"is_valid": False},
-    )
-
     turn = _make_llm_response(
         tool_calls=[
             {
@@ -739,7 +726,7 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
         patch.object(service, "_runtime_preflight", side_effect=strict_handoff_or_tolerant),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
-            return_value=preview_result,
+            wraps=_strict_execute_tool,
         ) as mock_execute_tool,
         pytest.raises(ComposerConvergenceError),
     ):
@@ -955,49 +942,10 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
 # ``test_compose_loop_records_success_when_canonical_json_fails``).
 #
 # Matrix: 4 discovery tools x {cache miss, cache hit} = 8 invocation
-# scenarios. The cache-hit path (`service.py:980-992`) hand-builds a
-# slim audit dict from raw ``cached_result.data`` — bypassing
-# ``ToolResult.to_dict()`` — so the only normalization site that
-# catches it is ``finish_success`` itself.
+# scenarios. Real handlers now cross selected response admission before
+# audit, while cache hits readmit the owned value and build a slim audit
+# envelope. Both paths must preserve the same catalog data.
 # ---------------------------------------------------------------------------
-
-
-def _discovery_result(
-    tool_name: str,
-    state: CompositionState,
-    catalog: MagicMock,
-) -> ToolResult:
-    """Build a real ToolResult mirroring what _handle_list_*/get_plugin_schema produce.
-
-    This goes through the same construction path as the production
-    handlers (`tools.py:_discovery_result`) so the freeze-on-data
-    discipline (``__post_init__`` calls ``freeze_fields(self, "data")``)
-    runs identically and the test exercises the actual audit-ingress
-    shape rather than a hand-rolled payload.
-    """
-    if tool_name == "list_sources":
-        data: Any = catalog.list_sources()
-    elif tool_name == "list_transforms":
-        data = catalog.list_transforms()
-    elif tool_name == "list_sinks":
-        data = catalog.list_sinks()
-    elif tool_name == "get_plugin_schema":
-        data = catalog.get_schema("source", "csv")
-    else:
-        raise AssertionError(f"unexpected discovery tool: {tool_name}")
-    return ToolResult(
-        success=True,
-        updated_state=state,
-        validation=ValidationSummary(
-            is_valid=True,
-            errors=(),
-            warnings=(),
-            suggestions=(),
-            semantic_contracts=(),
-        ),
-        affected_nodes=(),
-        data=data,
-    )
 
 
 def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
@@ -1022,12 +970,13 @@ def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
 
     data = payload["data"]
     if tool_name == "list_sources":
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["name"] == "csv"
-        assert data[0]["plugin_type"] == "source"
+        assert set(data) == {"available", "prohibited"}
+        assert data["prohibited"] == []
+        assert len(data["available"]) == 1
+        assert data["available"][0]["name"] == "csv"
+        assert data["available"][0]["plugin_type"] == "source"
     elif tool_name in ("list_transforms", "list_sinks"):
-        assert data == []
+        assert data == {"available": [], "prohibited": []}
     elif tool_name == "get_plugin_schema":
         assert isinstance(data, dict)
         assert data["name"] == "csv"
@@ -1060,18 +1009,13 @@ class TestComposerDiscoveryAuditPreservesResult:
     async def test_cache_miss_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
         """A first-time discovery dispatch records the real catalog data.
 
-        Cache miss exercises the regular dispatch path:
-        ``execute_tool`` → real ``ToolResult`` →
-        ``_result_to_audit_payload`` → ``ToolResult.to_dict()`` →
-        ``finish_success`` → ``_normalize_audit_payload`` →
-        ``canonical_json``.
+        Real catalog producers cross selected response admission before
+        the success audit envelope is canonicalized.
         """
         catalog = _mock_catalog()
         settings = _make_settings()
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
         state = _empty_state()
-
-        discovery_result = _discovery_result(tool_name, state, catalog)
 
         turn1 = _make_llm_response(
             tool_calls=[
@@ -1094,7 +1038,7 @@ class TestComposerDiscoveryAuditPreservesResult:
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
-                return_value=discovery_result,
+                wraps=_strict_execute_tool,
             ),
         ):
             mock_llm.side_effect = [turn1, turn2]
@@ -1124,16 +1068,9 @@ class TestComposerDiscoveryAuditPreservesResult:
     async def test_cache_hit_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
         """Cache-hit replay records the cached catalog data, not the sentinel.
 
-        Cache hit exercises the second dispatch path:
-        ``cached_payload = {"success": ..., "data":
-        cached_result.data, "cache_hit": True}`` (hand-built in
-        ``service.py:980-992``, bypasses ``ToolResult.to_dict()``) →
-        ``finish_success`` → ``_normalize_audit_payload`` → ``canonical_json``.
-
-        ``finish_success`` is the single SUCCESS-path audit choke
-        point, so normalizing there catches both cache-miss and
-        cache-hit paths uniformly. This test pins that invariant
-        against any future refactor that might split the two paths.
+        Cache hits readmit the owned response and build a slim audit
+        envelope. Its canonical data must equal the original miss even
+        though the cache avoids a second handler dispatch.
 
         Sequence: two compose loop turns each issuing the same
         cacheable tool call, then a final text turn. The first call
@@ -1143,8 +1080,6 @@ class TestComposerDiscoveryAuditPreservesResult:
         settings = _make_settings()
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
         state = _empty_state()
-
-        discovery_result = _discovery_result(tool_name, state, catalog)
 
         # Same arguments dict on both turns → identical cache key.
         turn1 = _make_llm_response(
@@ -1174,7 +1109,7 @@ class TestComposerDiscoveryAuditPreservesResult:
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
-                return_value=discovery_result,
+                wraps=_strict_execute_tool,
             ) as mock_execute_tool,
         ):
             mock_llm.side_effect = [turn1, turn2, turn3]
@@ -1216,9 +1151,10 @@ class TestComposerDiscoveryAuditPreservesResult:
         assert hit_payload["success"] is True
         assert hit_payload["cache_hit"] is True
         assert "data" in hit_payload
+        assert hit_payload["data"] == miss_payload["data"]
 
         if tool_name == "list_sources":
-            assert hit_payload["data"][0]["name"] == "csv"
+            assert hit_payload["data"]["available"][0]["name"] == "csv"
         elif tool_name == "get_plugin_schema":
             assert hit_payload["data"]["name"] == "csv"
             assert hit_payload["data"]["json_schema"] == {"title": "Config", "properties": {}}

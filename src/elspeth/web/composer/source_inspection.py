@@ -32,6 +32,8 @@ from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
+from pydantic import JsonValue
+
 from elspeth.contracts.blobs import (
     BlobContentMissingError,
     BlobIntegrityError,
@@ -46,6 +48,7 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.plugins.sources.field_normalization import resolve_field_names
 from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.response_contracts import SelectedResponseContract
 
 _MAX_BYTES: Final[int] = 8 * 1024
 _MAX_ROWS: Final[int] = 100
@@ -974,6 +977,73 @@ def facts_to_dict(facts: SourceInspectionFacts) -> dict[str, Any]:
         "url_candidates": list(facts.url_candidates),
         "warnings": list(facts.warnings),
     }
+
+
+def _parse_inspection_response(value: object) -> SourceInspectionFacts:
+    """Recheck the exact inspection wire, including immutable cached facts."""
+    from types import MappingProxyType
+
+    from elspeth.contracts.errors import FrameworkBugError
+    from elspeth.contracts.freeze import deep_thaw
+
+    message = "Source inspection producer returned malformed data"
+    try:
+        if type(value) is SourceInspectionFacts:
+            if (
+                type(value.redacted_identity) is not MappingProxyType
+                or (value.inferred_types is not None and type(value.inferred_types) is not MappingProxyType)
+                or (value.observed_headers is not None and type(value.observed_headers) is not tuple)
+                or type(value.byte_range_inspected) is not tuple
+                or type(value.url_candidates) is not tuple
+                or type(value.warnings) is not tuple
+            ):
+                raise FrameworkBugError(message)
+            value = {
+                "source_kind": value.source_kind,
+                "redacted_identity": value.redacted_identity,
+                "byte_range_inspected": value.byte_range_inspected,
+                "sample_row_count": value.sample_row_count,
+                "observed_headers": value.observed_headers,
+                "inferred_types": value.inferred_types,
+                "url_candidates": value.url_candidates,
+                "warnings": value.warnings,
+            }
+        if type(value) is not dict and type(value) is not MappingProxyType:
+            raise FrameworkBugError(message)
+        if set(value) != {
+            "source_kind",
+            "redacted_identity",
+            "byte_range_inspected",
+            "sample_row_count",
+            "observed_headers",
+            "inferred_types",
+            "url_candidates",
+            "warnings",
+        }:
+            raise FrameworkBugError(message)
+        if type(value["source_kind"]) is not str:
+            raise FrameworkBugError(message)
+        identity = value["redacted_identity"]
+        if type(identity) is not dict and type(identity) is not MappingProxyType:
+            raise FrameworkBugError(message)
+        if not {"filename", "mime_type", "byte_size"} <= set(identity) or not set(identity) <= {
+            "filename",
+            "mime_type",
+            "byte_size",
+            "blob_id",
+            "content_hash_prefix",
+        }:
+            raise FrameworkBugError(message)
+        return facts_from_dict(deep_thaw(value))
+    except (InvariantError, TypeError, ValueError, KeyError):
+        raise FrameworkBugError(message) from None
+
+
+def _encode_inspection_response(value: SourceInspectionFacts) -> JsonValue:
+    return cast(JsonValue, facts_to_dict(value))
+
+
+SOURCE_INSPECTION_RESPONSE_CONTRACT = SelectedResponseContract(_parse_inspection_response, _encode_inspection_response)
 
 
 _SOURCE_KINDS: Final[frozenset[str]] = frozenset({"csv", "jsonl", "json", "text", "unknown"})

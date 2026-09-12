@@ -11,6 +11,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.enums import OutputMode
 from elspeth.core.config import RuntimeNodeName
+from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchNodeOptionsArgumentsModel,
@@ -165,6 +166,7 @@ def _handle_list_transforms(
 
 _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
     name="list_transforms",
+    response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
     handler=_handle_list_transforms,
     kind=ToolKind.DISCOVERY,
     description=(
@@ -199,6 +201,7 @@ def _handle_list_sinks(
 
 _LIST_SINKS_DECLARATION = ToolDeclaration(
     name="list_sinks",
+    response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
     handler=_handle_list_sinks,
     kind=ToolKind.DISCOVERY,
     description=(

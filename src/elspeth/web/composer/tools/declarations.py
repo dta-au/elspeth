@@ -58,6 +58,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.web.composer.response_contracts import ResponseContract
 
 if TYPE_CHECKING:
     from elspeth.web.composer.tools._common import ToolHandler
@@ -182,6 +183,7 @@ class ToolDeclaration:
     blob_store_only: bool = False
     augments_on_failure: bool = False
     argument_effects: Callable[[Mapping[str, Any]], ToolEffects] | None = None
+    response_contract: ResponseContract | None = None
 
     def resolve_effects(self, arguments: Mapping[str, Any]) -> ToolEffects:
         """Resolve effects purely from declaration metadata and argument shape."""
@@ -197,6 +199,12 @@ class ToolDeclaration:
         raise AssertionError("Unsupported tool kind for effect resolution.")
 
     def __post_init__(self) -> None:
+        if self.response_contract is not None and self.kind not in {
+            ToolKind.DISCOVERY,
+            ToolKind.BLOB_DISCOVERY,
+            ToolKind.SECRET_DISCOVERY,
+        }:
+            raise ValueError("Response contracts belong to discovery declarations.")
         if not self.name:
             raise ValueError("ToolDeclaration.name must be non-empty.")
 

@@ -46,7 +46,7 @@ from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerInformationClass,
 )
 from elspeth.contracts.composer_progress import ComposerProgressSink
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -66,7 +66,12 @@ from elspeth.web.composer.capability_skill import (
     PlannerCapabilityManifest,
     build_planner_capability_manifest,
 )
-from elspeth.web.composer.discovery_cache import pydantic_default, serialize_tool_result
+from elspeth.web.composer.discovery_cache import serialize_tool_result
+from elspeth.web.composer.discovery_response import (
+    AdmittedDiscoveryResult,
+    admit_discovery_result,
+    serialize_admitted_discovery_result,
+)
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
 from elspeth.web.composer.guided.planning import GuidedCandidateBindingRejected
 from elspeth.web.composer.llm_response_parsing import (
@@ -89,6 +94,7 @@ from elspeth.web.composer.planner_authoring_aids import (
     build_schema_contract_evidence,
     discovery_digest_detail_tools,
     planner_plugin_contract,
+    planner_plugin_contract_from_snapshot,
 )
 from elspeth.web.composer.progress import (
     emit_progress,
@@ -105,8 +111,23 @@ from elspeth.web.composer.progress import (
 # through protocol's TYPE_CHECKING block.)
 from elspeth.web.composer.prompts import _state_referenced_plugins
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.provider_discovery_response import (
+    ProviderStateContext,
+    admit_provider_current_state,
+    argument_error_response,
+    closed_provider_envelope,
+    projected_plugin_contract_response,
+    provider_node_response,
+    provider_output_response,
+    provider_sources_response,
+    provider_state_response,
+    schema_budget_failure,
+    schema_projection_failure,
+    surface_projection_failure,
+)
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.response_contracts import AdmittedResponse
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import (
     COMPOSER_NODE_TYPES,
@@ -130,6 +151,7 @@ from elspeth.web.composer.tools._dispatch import (
     execute_discovery_tool_with_context,
     get_tool_definitions,
 )
+from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
     EXPLAIN_VALIDATION_ERROR_GUIDANCE,
@@ -138,6 +160,14 @@ from elspeth.web.composer.tools.generation import (
 )
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools.state_responses import (
+    AdmittedPipelineStateResponse,
+    AuthoringStateResponse,
+    FullStateResponse,
+    NodeStateResponse,
+    OutputStateResponse,
+    SourceStateResponse,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.protocol import SessionOperationAuthority
@@ -1384,6 +1414,7 @@ class _AuditedDiscoveryResult:
     """Carry the real result while exposing only a closed audit projection."""
 
     result: ToolResult
+    admitted: AdmittedDiscoveryResult
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2993,20 +3024,6 @@ class _AllowlistedArgumentErrorEntry(TypedDict):
     error_class: str
 
 
-class _AllowlistedArgumentErrorPayload(TypedDict):
-    """``data`` for a discovery result the planner rejected on its arguments.
-
-    ``argument_error`` rather than ``validation``: on that arm the entry rides
-    under the ``data`` of a ``ToolResult`` whose own ``validation`` is the
-    STATE's, so a same-named key would be a homonym carrying different content
-    (systems seat SYS-R3-1), and the envelope's ``success`` already says the
-    call failed. The whole-message projection below keeps the family shape
-    because it has no envelope beside it.
-    """
-
-    argument_error: _AllowlistedArgumentErrorEntry
-
-
 def _allowlisted_argument_error_entry(error: ToolArgumentError) -> _AllowlistedArgumentErrorEntry:
     """Project a semantic argument failure without its message or input."""
     return {
@@ -3024,8 +3041,8 @@ def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any
     around it, so ``success`` and ``validation`` here are the message's own
     top-level fields — the same shape ``_canonical_schema_feedback`` and the
     other terminal-rejection builders use on that surface, not a ``data``
-    payload beside an envelope that already carries both. The ``data`` arm is
-    ``_allowlisted_argument_error_payload``.
+    payload beside an envelope that already carries both. The discovery arm
+    uses the immutable ``argument_error_response`` carrier.
     """
     return {
         "success": False,
@@ -3036,80 +3053,10 @@ def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any
     }
 
 
-def _allowlisted_argument_error_payload(error: ToolArgumentError) -> _AllowlistedArgumentErrorPayload:
-    """``data`` for the ToolResult arm of an argument rejection."""
-    return {"argument_error": _allowlisted_argument_error_entry(error)}
-
-
-class _ClosedProviderValidationEntry(TypedDict):
-    component: str
-    severity: str
-    error_code: str
-
-
-class _ClosedProviderValidationEnvelope(TypedDict):
-    is_valid: bool
-    errors: list[_ClosedProviderValidationEntry]
-    warnings: list[_ClosedProviderValidationEntry]
-    suggestions: list[_ClosedProviderValidationEntry]
-    semantic_contracts: list[object]
-    graph_repair_suggestions: list[object]
-
-
-class _ClosedProviderDiscoveryPayload(TypedDict):
-    success: bool
-    validation: _ClosedProviderValidationEnvelope
-    affected_nodes: list[str]
-    version: int
-    data: NotRequired[object]
-
-
-def _closed_provider_validation_entry(
-    entry: ValidationEntry,
-    *,
-    fallback_code: str,
-) -> _ClosedProviderValidationEntry:
-    """Project one validation entry without state-bearing text or attribution."""
-    return {
-        "component": "pipeline",
-        "severity": entry.severity,
-        "error_code": entry.error_code or fallback_code,
-    }
-
-
-def _closed_provider_discovery_payload(result: ToolResult) -> _ClosedProviderDiscoveryPayload:
-    """Return the closed ToolResult envelope allowed on restricted surfaces.
-
-    Validation messages, semantic contracts, graph repair arguments, runtime
-    preflight details, and optional augmentation fields can all contain
-    authoritative option values. The restricted provider needs only validity,
-    closed codes and severities, stable pipeline attribution, outcome, version,
-    and the separately projected discovery data.
-    """
-    validation = result.validation
-    payload: _ClosedProviderDiscoveryPayload = {
-        "success": result.success,
-        "validation": {
-            "is_valid": validation.is_valid,
-            "errors": [_closed_provider_validation_entry(entry, fallback_code="validation_error") for entry in validation.errors],
-            "warnings": [_closed_provider_validation_entry(entry, fallback_code="validation_warning") for entry in validation.warnings],
-            "suggestions": [
-                _closed_provider_validation_entry(entry, fallback_code="validation_suggestion") for entry in validation.suggestions
-            ],
-            "semantic_contracts": [],
-            "graph_repair_suggestions": [],
-        },
-        "affected_nodes": list(result.affected_nodes),
-        "version": result.updated_state.version,
-    }
-    if result.data is not None:
-        payload["data"] = deep_thaw(result.data)
-    return payload
-
-
-def _serialize_closed_provider_discovery_payload(payload: Mapping[str, Any]) -> str:
-    """Serialize a closed provider payload with canonical ToolResult support."""
-    return json.dumps(payload, default=pydantic_default)
+@dataclass(frozen=True, slots=True)
+class _PlannerArgumentRejection:
+    result: ToolResult
+    response: AdmittedResponse
 
 
 def _project_planner_plugin_contract(data: object) -> tuple[PlannerPluginContract | None, bool]:
@@ -3123,25 +3070,22 @@ def _project_planner_plugin_contract(data: object) -> tuple[PlannerPluginContrac
     return contract, True
 
 
-@observation_boundary(
-    tier=3,
-    source="ToolResult.data from executing a model-requested discovery tool call (unpinned payload shape)",
-    source_param="result",
-    suppresses=("R5",),
-    invariant=(
-        "dispatches on result.data's shape (an authoritative-state component echo) and falls closed "
-        "to the leak-safe surface_projection_unavailable payload for anything unrecognized; raises "
-        "only on an internal invariant failure in the policy-owned provider_current_state projection. "
-        "The output-lookup isinstance site roots at provider_current_state (a separate, policy-owned "
-        "server-computed projection, not this boundary) and is outside this decorator's scope by design"
-    ),
-)
+def _project_discovery_plugin_contract(result: AdmittedDiscoveryResult) -> tuple[PlannerPluginContract | None, bool]:
+    response = result.response
+    if type(response) is not AdmittedPluginSchemaResponse:
+        raise FrameworkBugError("Plugin schema discovery has an invalid admitted response")
+    try:
+        return planner_plugin_contract_from_snapshot(response.snapshot), True
+    except SchemaContractProjectionUnsupported:
+        return None, False
+
+
 def _serialize_provider_discovery_result(
     *,
     call: _ParsedToolCall,
-    result: ToolResult,
+    result: ToolResult | AdmittedDiscoveryResult | _PlannerArgumentRejection,
     surface: PlannerSurface,
-    provider_current_state: Mapping[str, Any],
+    provider_current_state: Mapping[str, Any] | ProviderStateContext,
     schema_contract_budget_remaining: int | None = None,
 ) -> str:
     """Serialize one discovery result through the planner surface disclosure.
@@ -3162,95 +3106,69 @@ def _serialize_provider_discovery_result(
     identifiers that collide with full-state aliases keep dispatch precedence.
     """
     restricted = surface in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE}
+    context = (
+        provider_current_state
+        if isinstance(provider_current_state, ProviderStateContext)
+        else admit_provider_current_state(provider_current_state)
+        if restricted
+        else None
+    )
+    if isinstance(result, _PlannerArgumentRejection):
+        if restricted:
+            return json.dumps(closed_provider_envelope(result.result, data=result.response).to_wire())
+        argument_payload = result.response.to_wire()
+        assert isinstance(argument_payload, dict)
+        return serialize_tool_result(replace(result.result, data=argument_payload))
+    admitted = result if isinstance(result, AdmittedDiscoveryResult) else admit_discovery_result(call.name, result)
+    result = admitted.result
+    data = admitted.response
+    success = result.success
     if call.name == "get_plugin_schema" and result.success:
-        contract, projection_available = _project_planner_plugin_contract(result.data)
+        contract, projection_available = _project_discovery_plugin_contract(admitted)
         if not projection_available:
-            closed = _closed_provider_discovery_payload(result)
-            closed["success"] = False
-            closed["data"] = {
-                "error": "The selected plugin schema cannot be represented in the bounded planner projection. Use get_plugin_assistance.",
-                "error_code": "schema_projection_unavailable",
-                "next_tool": "get_plugin_assistance",
-            }
-            return _serialize_closed_provider_discovery_payload(closed)
+            return json.dumps(closed_provider_envelope(result, success=False, data=schema_projection_failure()).to_wire())
         assert contract is not None
         contract_payload = contract.to_dict()
         if (
             schema_contract_budget_remaining is not None
             and len(canonical_json(contract_payload).encode("utf-8")) > schema_contract_budget_remaining
         ):
-            closed = _closed_provider_discovery_payload(result)
-            closed["success"] = False
-            closed["data"] = {
-                "error": "The selected plugin contracts exceed the aggregate planner schema budget. Use get_plugin_assistance.",
-                "error_code": "schema_contract_budget_exceeded",
-                "next_tool": "get_plugin_assistance",
-            }
-            return _serialize_closed_provider_discovery_payload(closed)
+            return json.dumps(closed_provider_envelope(result, success=False, data=schema_budget_failure()).to_wire())
         if restricted:
-            closed = _closed_provider_discovery_payload(result)
-            closed["data"] = contract_payload
-            return _serialize_closed_provider_discovery_payload(closed)
+            return json.dumps(closed_provider_envelope(result, data=projected_plugin_contract_response(contract)).to_wire())
         return serialize_tool_result(replace(result, data=contract_payload))
     if not restricted:
-        return serialize_tool_result(result)
-    payload = _closed_provider_discovery_payload(result)
-
-    def fail_closed() -> None:
-        payload["success"] = False
-        payload["data"] = {
-            "error": "The requested component is unavailable on this planner disclosure surface.",
-            "error_code": "surface_projection_unavailable",
-        }
-
-    if call.name == "preview_pipeline":
-        if result.success:
-            fail_closed()
-        return _serialize_closed_provider_discovery_payload(payload)
-    if call.name != "get_pipeline_state":
-        return _serialize_closed_provider_discovery_payload(payload)
-    if not result.success:
-        return _serialize_closed_provider_discovery_payload(payload)
-
-    authoritative_data = result.data
-    component = call.arguments["component"] if "component" in call.arguments else None
-    if component == "set_pipeline_arguments":
-        fail_closed()
-    elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"sources"}:
-        projected_sources = provider_current_state["sources"] if "sources" in provider_current_state else []
-        payload["data"] = {"sources": deep_thaw(projected_sources)}
-    elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"node"}:
-        selected = authoritative_data["node"]
-        nodes = provider_current_state["nodes"] if "nodes" in provider_current_state else []
-        selected_id = selected["id"] if isinstance(selected, Mapping) and "id" in selected else None
-        # Node candidates are ELSPETH's own server-computed projection: a
-        # candidate without a subscriptable "id" is an internal invariant
-        # failure that must raise, not fall closed as a surface error.
-        node = next(
-            (candidate for candidate in nodes if candidate["id"] == selected_id),
-            None,
-        )
-        if node is not None:
-            payload["data"] = {"node": deep_thaw(node)}
+        return serialize_admitted_discovery_result(admitted)
+    assert context is not None
+    if call.name == "preview_pipeline" and success:
+        success, data = False, surface_projection_failure()
+    elif call.name == "get_pipeline_state" and success:
+        response = admitted.response
+        if type(response) is not AdmittedPipelineStateResponse:
+            raise FrameworkBugError("Pipeline state discovery has an invalid admitted response")
+        state_response = response.value
+        component = call.arguments["component"] if "component" in call.arguments else None
+        if component == "set_pipeline_arguments" or isinstance(state_response, AuthoringStateResponse):
+            success, data = False, surface_projection_failure()
+        elif isinstance(state_response, SourceStateResponse):
+            data = provider_sources_response(context)
+        elif isinstance(state_response, NodeStateResponse):
+            node = next((item for item in context.nodes if item.id == state_response.node.id), None)
+            if node is None:
+                success, data = False, surface_projection_failure()
+            else:
+                data = provider_node_response(node)
+        elif isinstance(state_response, OutputStateResponse):
+            output = next((item for item in context.outputs if item.name == state_response.output.name), None)
+            if output is None:
+                success, data = False, surface_projection_failure()
+            else:
+                data = provider_output_response(output)
+        elif isinstance(state_response, FullStateResponse):
+            data = provider_state_response(context)
         else:
-            fail_closed()
-    elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"output"}:
-        selected = authoritative_data["output"]
-        outputs = provider_current_state["outputs"] if "outputs" in provider_current_state else []
-        selected_name = selected["sink_name"] if isinstance(selected, Mapping) and "sink_name" in selected else None
-        output = next(
-            (candidate for candidate in outputs if candidate["name"] == selected_name),
-            None,
-        )
-        if output is not None:
-            payload["data"] = {"output": deep_thaw(output)}
-        else:
-            fail_closed()
-    elif isinstance(authoritative_data, Mapping) and "inspection" in authoritative_data:
-        payload["data"] = deep_thaw(provider_current_state)
-    else:
-        fail_closed()
-    return _serialize_closed_provider_discovery_payload(payload)
+            raise FrameworkBugError("Unknown admitted pipeline state variant")
+    return json.dumps(closed_provider_envelope(result, success=success, data=data).to_wire())
 
 
 async def _await_custody_settlement(awaitable: Awaitable[Any]) -> Any:
@@ -3537,7 +3455,12 @@ async def plan_pipeline(
         raise ValueError("conversation_context is available only to the freeform planner surface")
     if policy_catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
-    canonical_json(provider_current_state)
+    admitted_current_state = (
+        admit_provider_current_state(provider_current_state)
+        if surface in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE}
+        else None
+    )
+    canonical_json(admitted_current_state.to_wire() if admitted_current_state is not None else provider_current_state)
     if not callable(candidate_finalizer):
         raise TypeError("candidate_finalizer must be callable")
     if candidate_acceptance is not None and not callable(candidate_acceptance):
@@ -3586,7 +3509,7 @@ async def plan_pipeline(
                 trail=trail,
                 intent=intent,
                 current_state=current_state,
-                provider_current_state=provider_current_state,
+                provider_current_state=admitted_current_state if admitted_current_state is not None else provider_current_state,
                 reviewed_facts=reviewed_facts,
                 reviewed_planner_context=reviewed_planner_context,
                 unproducible_output_fields=unproducible_output_fields,
@@ -3656,7 +3579,7 @@ async def _plan_pipeline_inner(
     trail: _PlannerAttemptTrail,
     intent: str,
     current_state: CompositionState,
-    provider_current_state: Mapping[str, Any],
+    provider_current_state: Mapping[str, Any] | ProviderStateContext,
     reviewed_facts: Mapping[str, Any],
     reviewed_planner_context: Mapping[str, Any],
     unproducible_output_fields: tuple[str, ...],
@@ -3761,7 +3684,9 @@ async def _plan_pipeline_inner(
     tools = planner_tool_definitions(discovery_policy, terminal_contract=terminal_contract)
     provider_request: dict[str, Any] = {
         "intent": intent,
-        "current_state": provider_current_state,
+        "current_state": provider_current_state.to_wire()
+        if isinstance(provider_current_state, ProviderStateContext)
+        else provider_current_state,
         "reviewed_facts": reviewed_planner_context,
         "authoring_aids": authoring_aids,
         "schema_contract_evidence": schema_contract_evidence,
@@ -4971,7 +4896,9 @@ async def _plan_pipeline_inner(
                 raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
             continue
 
-        async def execute_one_discovery(call: _ParsedToolCall) -> tuple[_ParsedToolCall, ToolResult, bool]:
+        async def execute_one_discovery(
+            call: _ParsedToolCall,
+        ) -> tuple[_ParsedToolCall, AdmittedDiscoveryResult | _PlannerArgumentRejection, bool]:
             dispatch = begin_dispatch(
                 call.call_id,
                 call.name,
@@ -4994,7 +4921,8 @@ async def _plan_pipeline_inner(
                 )
                 if result.updated_state != current_state:
                     raise AuditIntegrityError("read-only planner discovery changed composition state")
-                return _AuditedDiscoveryResult(result)
+                admitted = admit_discovery_result(call_to_execute.name, result)
+                return _AuditedDiscoveryResult(result, admitted)
 
             try:
                 audited = await dispatch_with_audit(
@@ -5024,17 +4952,19 @@ async def _plan_pipeline_inner(
                 # (SYS-R3-1). Built inline so there is no local to re-shape.
                 return (
                     call,
-                    ToolResult(
-                        success=False,
-                        updated_state=current_state,
-                        validation=current_state.validate(),
-                        affected_nodes=(),
-                        data=_allowlisted_argument_error_payload(exc),
+                    _PlannerArgumentRejection(
+                        ToolResult(
+                            success=False,
+                            updated_state=current_state,
+                            validation=current_state.validate(),
+                            affected_nodes=(),
+                        ),
+                        argument_error_response(exc),
                     ),
                     False,
                 )
-            result = cast(_AuditedDiscoveryResult, audited.result).result
-            return call, result, True
+            carrier = cast(_AuditedDiscoveryResult, audited.result)
+            return call, carrier.admitted, True
 
         discovery_tasks = [asyncio.create_task(execute_one_discovery(call)) for call in useful_calls]
         try:
@@ -5089,14 +5019,15 @@ async def _plan_pipeline_inner(
                     }
                 )
                 continue
-            result_call, result, information_resolved = next(discovery_results)
+            result_call, discovery_result, information_resolved = next(discovery_results)
+            result = discovery_result.result
             if result_call is not call:
                 raise AuditIntegrityError("planner discovery result order diverged from admitted calls")
             encoded_contracts = len(canonical_json(selected_schema_contracts).encode("utf-8"))
             budget_remaining = _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES - encoded_contracts - (1 if selected_schema_contracts else 0)
             serialized_result = _serialize_provider_discovery_result(
                 call=call,
-                result=result,
+                result=discovery_result,
                 surface=surface,
                 provider_current_state=provider_current_state,
                 schema_contract_budget_remaining=budget_remaining,
@@ -5111,12 +5042,13 @@ async def _plan_pipeline_inner(
             information_available = result.success
             newly_covered_keys = tuple(key for key in information_keys[call.call_id] if not information_manifest.covers(key))
             if call.name == "get_plugin_schema" and result.success:
+                assert isinstance(discovery_result, AdmittedDiscoveryResult)
                 if mark_schema_loaded is not None:
                     # Same per-session tracker and key shape the freeform
                     # batch writes (tool_batch.py); a successful dispatch has
                     # already validated both arguments. Failures never mark.
                     mark_schema_loaded(str(call.arguments["plugin_type"]), str(call.arguments["name"]))
-                contract, projection_available = _project_planner_plugin_contract(result.data)
+                contract, projection_available = _project_discovery_plugin_contract(discovery_result)
                 if not projection_available:
                     information_available = False
                 else:

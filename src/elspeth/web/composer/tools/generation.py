@@ -16,10 +16,10 @@ from typing import Any, Final, Literal, TypedDict, final
 from uuid import UUID
 
 from opentelemetry import metrics
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from sqlalchemy import Engine
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_options, get_raw_schema_config
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -41,6 +41,7 @@ from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.redaction import _JsonInteger, _OmittableString
+from elspeth.web.composer.response_contracts import SelectedResponseContract
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     derive_extra_column_risk,
@@ -78,6 +79,14 @@ from elspeth.web.composer.tools._common import (
     _validate_plugin_name,
     diff_states,
 )
+from elspeth.web.composer.tools._generation_responses import (
+    DIFF_PIPELINE_RESPONSE_CONTRACT,
+    EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT,
+    LIST_MODELS_RESPONSE_CONTRACT,
+    PLUGIN_ASSISTANCE_RESPONSE_CONTRACT,
+    PREVIEW_PIPELINE_RESPONSE_CONTRACT,
+)
+from elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA_RESPONSE_CONTRACT
 from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
     _locked_read_ready_blob,
@@ -300,6 +309,7 @@ def _handle_get_plugin_schema(
 
 
 _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
+    response_contract=PLUGIN_SCHEMA_RESPONSE_CONTRACT,
     name="get_plugin_schema",
     handler=_handle_get_plugin_schema,
     kind=ToolKind.DISCOVERY,
@@ -330,6 +340,30 @@ _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ExpressionGrammarResponse:
+    grammar: str
+
+
+def _admit_expression_grammar(value: object) -> ExpressionGrammarResponse:
+    if type(value) is ExpressionGrammarResponse:
+        grammar = value.grammar
+    elif isinstance(value, Mapping) and value.keys() == {"grammar"}:
+        grammar = value["grammar"]
+    else:
+        raise FrameworkBugError("Malformed expression grammar response")
+    if type(grammar) is not str:
+        raise FrameworkBugError("Malformed expression grammar response")
+    return ExpressionGrammarResponse(grammar)
+
+
+def _encode_expression_grammar(value: ExpressionGrammarResponse) -> JsonValue:
+    return {"grammar": value.grammar}
+
+
+EXPRESSION_GRAMMAR_RESPONSE_CONTRACT = SelectedResponseContract(_admit_expression_grammar, _encode_expression_grammar)
+
+
 def _handle_get_expression_grammar(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -345,6 +379,7 @@ def _handle_get_expression_grammar(
 
 
 _GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
+    response_contract=EXPRESSION_GRAMMAR_RESPONSE_CONTRACT,
     name="get_expression_grammar",
     handler=_handle_get_expression_grammar,
     kind=ToolKind.DISCOVERY,
@@ -2022,6 +2057,7 @@ def _execute_explain_validation_error(
 
 _EXPLAIN_VALIDATION_ERROR_DECLARATION = ToolDeclaration(
     name="explain_validation_error",
+    response_contract=EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT,
     handler=_execute_explain_validation_error,
     kind=ToolKind.DISCOVERY,
     description="Get a human-readable explanation of a validation error "
@@ -2152,6 +2188,7 @@ def _execute_get_plugin_assistance(
 
 _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
     name="get_plugin_assistance",
+    response_contract=PLUGIN_ASSISTANCE_RESPONSE_CONTRACT,
     handler=_execute_get_plugin_assistance,
     kind=ToolKind.DISCOVERY,
     description=(
@@ -2194,6 +2231,44 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
     },
     cacheable=True,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditInfoResponse:
+    enabled: Literal[True]
+    composer_modifiable: Literal[False]
+    summary: str
+    audit_export_summary: str
+
+
+def _admit_audit_info(value: object) -> AuditInfoResponse:
+    if type(value) is AuditInfoResponse:
+        enabled = value.enabled
+        modifiable = value.composer_modifiable
+        summary = value.summary
+        export = value.audit_export_summary
+    elif isinstance(value, Mapping) and value.keys() == {"enabled", "composer_modifiable", "summary", "audit_export_summary"}:
+        enabled = value["enabled"]
+        modifiable = value["composer_modifiable"]
+        summary = value["summary"]
+        export = value["audit_export_summary"]
+    else:
+        raise FrameworkBugError("Malformed audit information response")
+    if enabled is not True or modifiable is not False or type(summary) is not str or type(export) is not str:
+        raise FrameworkBugError("Malformed audit information response")
+    return AuditInfoResponse(enabled, modifiable, summary, export)
+
+
+def _encode_audit_info(value: AuditInfoResponse) -> JsonValue:
+    return {
+        "enabled": value.enabled,
+        "composer_modifiable": value.composer_modifiable,
+        "summary": value.summary,
+        "audit_export_summary": value.audit_export_summary,
+    }
+
+
+AUDIT_INFO_RESPONSE_CONTRACT = SelectedResponseContract(_admit_audit_info, _encode_audit_info)
 
 
 def _execute_get_audit_info(
@@ -2245,6 +2320,7 @@ def _execute_get_audit_info(
 
 
 _GET_AUDIT_INFO_DECLARATION = ToolDeclaration(
+    response_contract=AUDIT_INFO_RESPONSE_CONTRACT,
     name="get_audit_info",
     handler=_execute_get_audit_info,
     kind=ToolKind.DISCOVERY,
@@ -2365,6 +2441,7 @@ def _execute_list_models(
 
 _LIST_MODELS_DECLARATION = ToolDeclaration(
     name="list_models",
+    response_contract=LIST_MODELS_RESPONSE_CONTRACT,
     handler=_execute_list_models,
     kind=ToolKind.DISCOVERY,
     description="List available LLM model identifiers. Without a provider "
@@ -4102,6 +4179,7 @@ def _execute_preview_pipeline(
 
 _PREVIEW_PIPELINE_DECLARATION = ToolDeclaration(
     name="preview_pipeline",
+    response_contract=PREVIEW_PIPELINE_RESPONSE_CONTRACT,
     handler=_execute_preview_pipeline,
     kind=ToolKind.DISCOVERY,
     description="Preview the current pipeline without executing it. The "
@@ -4172,6 +4250,7 @@ def _execute_diff_pipeline(
 
 _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     name="diff_pipeline",
+    response_contract=DIFF_PIPELINE_RESPONSE_CONTRACT,
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
     description="Show what changed since the session was loaded or created. "

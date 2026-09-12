@@ -66,6 +66,9 @@ from elspeth.web.composer.discovery_cache import (
     RuntimePreflightCache as _RuntimePreflightCache,
 )
 from elspeth.web.composer.discovery_cache import (
+    admitted_result_from_cached_discovery_payload,
+)
+from elspeth.web.composer.discovery_cache import (
     cached_discovery_payload as _cached_discovery_payload,
 )
 from elspeth.web.composer.discovery_cache import (
@@ -79,6 +82,11 @@ from elspeth.web.composer.discovery_cache import (
 )
 from elspeth.web.composer.discovery_cache import (
     tool_result_mutated_composition_state as _tool_result_mutated_composition_state,
+)
+from elspeth.web.composer.discovery_response import (
+    AdmittedDiscoveryResult,
+    admit_discovery_result,
+    serialize_admitted_discovery_result,
 )
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.pipeline_custody import (
@@ -139,7 +147,7 @@ from elspeth.web.composer.tools import (
     normalize_tool_result_validation,
 )
 from elspeth.web.composer.tools._common import _failure_result
-from elspeth.web.composer.tools._registry import resolve_tool_effects
+from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -1016,16 +1024,36 @@ async def run_tool_batch(
                         likely_next="ELSPETH will continue from the cached tool result.",
                     ),
                 )
-                cached_result = _result_from_cached_discovery_payload(
-                    state,
-                    discovery_cache[cache_key],
-                )
-                cached_result = normalize_tool_result_validation(cached_result, ctx.policy_catalog)
-                cached_payload = {
-                    "success": cached_result.success,
-                    "data": cached_result.data,
-                    "cache_hit": True,
-                }
+                try:
+                    cached_admitted = (
+                        admitted_result_from_cached_discovery_payload(tool_name, state, discovery_cache[cache_key])
+                        if response_contract_for(tool_name) is not None
+                        else None
+                    )
+                    cached_result = (
+                        cached_admitted.result
+                        if cached_admitted is not None
+                        else _result_from_cached_discovery_payload(state, discovery_cache[cache_key])
+                    )
+                    cached_result = normalize_tool_result_validation(cached_result, ctx.policy_catalog)
+                    if cached_admitted is not None:
+                        cached_admitted = AdmittedDiscoveryResult(cached_result, cached_admitted.response, cached_admitted.contract)
+                    cached_payload = {
+                        "success": cached_result.success,
+                        "data": cached_admitted.response.to_wire()
+                        if cached_admitted is not None and cached_admitted.response is not None
+                        else cached_result.data,
+                        "cache_hit": True,
+                    }
+                    cached_outcome = cached_admitted.to_tool_result() if cached_admitted is not None else cached_result
+                    cached_json = (
+                        serialize_admitted_discovery_result(cached_admitted)
+                        if cached_admitted is not None
+                        else _serialize_tool_result(cached_result)
+                    )
+                except Exception as cache_exc:
+                    recorder.record(finish_plugin_crash(audit, exc=cache_exc))
+                    raise
                 recorder.record(
                     finish_success(
                         audit,
@@ -1035,7 +1063,7 @@ async def run_tool_batch(
                     )
                 )
                 _append_tool_outcome(
-                    response=cached_result,
+                    response=cached_outcome,
                     error_class=None,
                     error_message=None,
                     post_version=state.version,
@@ -1050,7 +1078,7 @@ async def run_tool_batch(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": _serialize_tool_result(cached_result),
+                        "content": cached_json,
                     }
                 )
                 continue
@@ -2255,6 +2283,8 @@ async def run_tool_batch(
                     plugin_snapshot=ctx.plugin_snapshot,
                     policy_catalog=ctx.policy_catalog,
                 )
+            if is_discovery_tool(_tool_name) and response_contract_for(_tool_name) is not None:
+                return admit_discovery_result(_tool_name, dispatched_result)
             return dispatched_result
 
         # ``_arg_error_payload`` is a module-level helper (F2 — testable
@@ -2278,6 +2308,8 @@ async def run_tool_batch(
             # the post-mutation version inside the recorder call.
             if _prevalidated_unapplied_result is not None:
                 return _state.version
+            if isinstance(_result, AdmittedDiscoveryResult):
+                return _result.result.updated_state.version
             return cast(int, _result.updated_state.version)
 
         try:
@@ -2450,7 +2482,8 @@ async def run_tool_batch(
         # from outcome.result and continue with the LLM-message
         # append.
         version_before_tool = state.version
-        result = outcome.result
+        admitted_result = outcome.result if isinstance(outcome.result, AdmittedDiscoveryResult) else None
+        result = admitted_result.result if admitted_result is not None else outcome.result
         if prevalidated_unapplied_result is None:
             state = result.updated_state
             last_validation = result.validation
@@ -2506,10 +2539,12 @@ async def run_tool_batch(
                 anti_anchor.record_success()
         else:
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
-        result_json = _serialize_tool_result(result)
+        result_json = (
+            serialize_admitted_discovery_result(admitted_result) if admitted_result is not None else _serialize_tool_result(result)
+        )
         await emit_progress(progress, tool_completed_progress_event(tool_name, result.success))
         _append_tool_outcome(
-            response=result,
+            response=admitted_result.to_tool_result() if admitted_result is not None else result,
             error_class=None,
             error_message=None,
             post_version=state.version,
@@ -2518,7 +2553,7 @@ async def run_tool_batch(
         # Cached payloads omit rejection entries; only successful discovery is reusable.
         if is_cacheable_discovery_tool(tool_name) and result.success:
             cache_key = _make_cache_key(tool_name, arguments)
-            discovery_cache[cache_key] = _cached_discovery_payload(result)
+            discovery_cache[cache_key] = _cached_discovery_payload(admitted_result if admitted_result is not None else result)
 
         llm_messages.append(
             {

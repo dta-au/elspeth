@@ -139,6 +139,7 @@ from elspeth.web.composer.tools.sources import (
     _source_authoring_options,
     _source_component_id,
 )
+from elspeth.web.composer.tools.state_responses import PIPELINE_STATE_RESPONSE_CONTRACT
 from elspeth.web.interpretation_state import (
     BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -2300,6 +2301,7 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     name="get_pipeline_state",
     handler=_execute_get_pipeline_state,
     kind=ToolKind.DISCOVERY,
+    response_contract=PIPELINE_STATE_RESPONSE_CONTRACT,
     # Presence-keyed on the response field, never on a tool name: the planner
     # palette carries this tool but no mutating tool, so a sentence asserting
     # that a mutation already echoed the state would be false there. Keyed on

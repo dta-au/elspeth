@@ -27,21 +27,22 @@ import hmac
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, TypedDict, cast
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine, func, select
 
-from elspeth.contracts.blobs import ALLOWED_MIME_TYPES, names_same_blob
+from elspeth.contracts.blobs import ALLOWED_MIME_TYPES, BlobCreator, BlobStatus, names_same_blob
 from elspeth.contracts.blobs_inline import (
     ALLOWED_CONTENT_ENCODINGS,
     BlobInlineRef,
     ContentEncoding,
 )
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -71,6 +72,7 @@ from elspeth.web.composer.redaction import (
     GetBlobContentArgumentsModel,
     UpdateBlobArgumentsModel,
 )
+from elspeth.web.composer.response_contracts import SelectedResponseContract
 from elspeth.web.composer.state import (
     CompositionState,
 )
@@ -151,6 +153,210 @@ class BlobInlineDescriptor(TypedDict):
     size_bytes: int
     content_hash: str
     filename: str
+
+
+class BlobMetadataPayload(TypedDict):
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    content_hash: str | None
+    status: str
+
+
+class BlobInventoryPayload(TypedDict):
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    created_by: str
+    creation_modality: str
+    status: str
+
+
+class _BlobMetadataResponse(BaseModel):
+    """Immutable admitted metadata; nonready records may lack a content hash."""
+
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int = Field(ge=0)
+    content_hash: str | None
+    status: BlobStatus
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
+
+
+class _BlobInventoryItem(BaseModel):
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int = Field(ge=0)
+    created_by: BlobCreator
+    creation_modality: str
+    status: BlobStatus
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
+
+
+class _BlobInlineResponse(BaseModel):
+    """Immutable counterpart to the producer's BlobInlineDescriptor."""
+
+    blob_id: str
+    mime_type: str
+    size_bytes: int = Field(ge=0)
+    content_hash: str
+    filename: str
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerBlobsResponse:
+    blobs: tuple[_BlobInlineResponse, ...]
+
+
+class _BlobContentResponse(BaseModel):
+    """Immutable counterpart to the producer's BlobContentPayload."""
+
+    blob_id: str
+    filename: str
+    mime_type: str
+    content: str
+    truncated: bool
+    size_bytes: int = Field(ge=0)
+    created_by: BlobCreator
+    creation_modality: str
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
+
+
+_BLOB_RESPONSE_ERROR = "Blob discovery producer returned an invalid response"
+
+
+def _parse_blob_metadata_response(value: object) -> _BlobMetadataResponse:
+    if type(value) not in (_BlobMetadataResponse, dict, MappingProxyType):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    try:
+        return _BlobMetadataResponse.model_validate(dict(value) if isinstance(value, MappingProxyType) else value)
+    except (PydanticValidationError, AttributeError, TypeError):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR) from None
+
+
+def _parse_blob_content_response(value: object) -> _BlobContentResponse:
+    if type(value) not in (_BlobContentResponse, dict, MappingProxyType):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    try:
+        admitted = _BlobContentResponse.model_validate(dict(value) if isinstance(value, MappingProxyType) else value)
+    except (PydanticValidationError, AttributeError, TypeError):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR) from None
+    if admitted.creation_modality not in CreationModality:
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    return admitted
+
+
+def _parse_blob_inventory_item(value: object) -> _BlobInventoryItem:
+    if type(value) not in (_BlobInventoryItem, dict, MappingProxyType):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    try:
+        admitted = _BlobInventoryItem.model_validate(dict(value) if isinstance(value, MappingProxyType) else value)
+    except (PydanticValidationError, AttributeError, TypeError):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR) from None
+    if admitted.creation_modality not in CreationModality:
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    return admitted
+
+
+def _parse_blob_inventory_response(value: object) -> tuple[_BlobInventoryItem, ...]:
+    if not isinstance(value, list | tuple) or type(value) not in (list, tuple):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    return tuple(_parse_blob_inventory_item(item) for item in value)
+
+
+def _parse_blob_inline_response(value: object) -> _BlobInlineResponse:
+    if type(value) not in (_BlobInlineResponse, dict, MappingProxyType):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    try:
+        return _BlobInlineResponse.model_validate(dict(value) if isinstance(value, MappingProxyType) else value)
+    except (PydanticValidationError, AttributeError, TypeError):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR) from None
+
+
+def _parse_composer_blobs_response(value: object) -> _ComposerBlobsResponse:
+    if type(value) is _ComposerBlobsResponse:
+        try:
+            items = value.blobs
+        except AttributeError:
+            raise FrameworkBugError(_BLOB_RESPONSE_ERROR) from None
+        if type(items) is not tuple:
+            raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    else:
+        if not isinstance(value, Mapping) or type(value) not in (dict, MappingProxyType) or set(value) != {"blobs"}:
+            raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+        items = value["blobs"]
+    if not isinstance(items, list | tuple) or type(items) not in (list, tuple):
+        raise FrameworkBugError(_BLOB_RESPONSE_ERROR)
+    return _ComposerBlobsResponse(blobs=tuple(_parse_blob_inline_response(item) for item in items))
+
+
+def _encode_blob_metadata_response(value: _BlobMetadataResponse) -> JsonValue:
+    return {
+        "id": value.id,
+        "filename": value.filename,
+        "mime_type": value.mime_type,
+        "size_bytes": value.size_bytes,
+        "content_hash": value.content_hash,
+        "status": value.status,
+    }
+
+
+def _encode_blob_content_response(value: _BlobContentResponse) -> JsonValue:
+    return {
+        "blob_id": value.blob_id,
+        "filename": value.filename,
+        "mime_type": value.mime_type,
+        "content": value.content,
+        "truncated": value.truncated,
+        "size_bytes": value.size_bytes,
+        "created_by": value.created_by,
+        "creation_modality": value.creation_modality,
+    }
+
+
+def _encode_blob_inventory_response(value: tuple[_BlobInventoryItem, ...]) -> JsonValue:
+    return [
+        {
+            "id": item.id,
+            "filename": item.filename,
+            "mime_type": item.mime_type,
+            "size_bytes": item.size_bytes,
+            "created_by": item.created_by,
+            "creation_modality": item.creation_modality,
+            "status": item.status,
+        }
+        for item in value
+    ]
+
+
+def _encode_composer_blobs_response(value: _ComposerBlobsResponse) -> JsonValue:
+    return {
+        "blobs": [
+            {
+                "blob_id": item.blob_id,
+                "mime_type": item.mime_type,
+                "size_bytes": item.size_bytes,
+                "content_hash": item.content_hash,
+                "filename": item.filename,
+            }
+            for item in value.blobs
+        ]
+    }
+
+
+_BLOB_METADATA_RESPONSE = SelectedResponseContract(_parse_blob_metadata_response, _encode_blob_metadata_response)
+_BLOB_CONTENT_RESPONSE = SelectedResponseContract(_parse_blob_content_response, _encode_blob_content_response)
+_BLOB_INVENTORY_RESPONSE = SelectedResponseContract(_parse_blob_inventory_response, _encode_blob_inventory_response)
+_COMPOSER_BLOBS_RESPONSE = SelectedResponseContract(_parse_composer_blobs_response, _encode_composer_blobs_response)
 
 
 class BlobCreatePayload(TypedDict):
@@ -326,7 +532,7 @@ def _sync_get_blob_by_id(
         return _blob_row_to_tool_dict(row)
 
 
-def _sync_list_blobs(engine: Engine, session_id: str) -> list[dict[str, Any]]:
+def _sync_list_blobs(engine: Engine, session_id: str) -> list[BlobInventoryPayload]:
     """Synchronous blob listing for use in the tool executor thread."""
     with engine.connect() as conn:
         rows = conn.execute(
@@ -397,6 +603,7 @@ _LIST_BLOBS_DECLARATION = ToolDeclaration(
     name="list_blobs",
     handler=_handle_list_blobs,
     kind=ToolKind.BLOB_DISCOVERY,
+    response_contract=_BLOB_INVENTORY_RESPONSE,
     description=(
         "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, "
         "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
@@ -428,6 +635,7 @@ _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
     name="list_composer_blobs",
     handler=_handle_list_composer_blobs,
     kind=ToolKind.BLOB_DISCOVERY,
+    response_contract=_COMPOSER_BLOBS_RESPONSE,
     description=(
         "List ready blobs available for audited inline-content authoring. "
         "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
@@ -453,7 +661,7 @@ def _handle_get_blob_metadata(
     blob = _sync_get_blob(session_engine, validated.blob_id, session_id)
     if blob is None:
         return _failure_result(state, "Blob not found for this session.")
-    safe_blob = {
+    safe_blob: BlobMetadataPayload = {
         "id": blob["id"],
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],
@@ -468,6 +676,7 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
     name="get_blob_metadata",
     handler=_handle_get_blob_metadata,
     kind=ToolKind.BLOB_DISCOVERY,
+    response_contract=_BLOB_METADATA_RESPONSE,
     description="Get metadata for a specific blob (file) by ID: `id`, `filename`, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
     json_schema={
         "type": "object",
@@ -1687,6 +1896,7 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     name="get_blob_content",
     handler=_execute_get_blob_content,
     kind=ToolKind.BLOB_DISCOVERY,
+    response_contract=_BLOB_CONTENT_RESPONSE,
     description=(
         "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
         "Large files are truncated to 50,000 characters "

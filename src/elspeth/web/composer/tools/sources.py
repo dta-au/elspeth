@@ -25,6 +25,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
 from elspeth.plugins.sources.field_normalization import declarable_field_name
+from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchSourceOptionsArgumentsModel,
@@ -33,6 +34,7 @@ from elspeth.web.composer.redaction import (
     SetSourceFromBlobsArgumentsModel,
 )
 from elspeth.web.composer.source_inspection import (
+    SOURCE_INSPECTION_RESPONSE_CONTRACT,
     delimiter_for_filename,
     facts_to_dict,
     inspect_blob_content,
@@ -179,6 +181,7 @@ def _handle_list_sources(
 
 _LIST_SOURCES_DECLARATION = ToolDeclaration(
     name="list_sources",
+    response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
     handler=_handle_list_sources,
     kind=ToolKind.DISCOVERY,
     description=(
@@ -1837,6 +1840,7 @@ def _execute_inspect_source(
 
 _INSPECT_SOURCE_DECLARATION = ToolDeclaration(
     name="inspect_source",
+    response_contract=SOURCE_INSPECTION_RESPONSE_CONTRACT,
     handler=_execute_inspect_source,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(

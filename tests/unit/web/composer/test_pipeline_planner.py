@@ -7,7 +7,6 @@ candidate state as a provider result.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import threading
@@ -36,7 +35,7 @@ from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerCode,
     ComposerPlannerInformationClass,
 )
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -760,7 +759,11 @@ async def _plan(
             intent=intent,
             current_state=current_state or _empty_state(),
             provider_current_state=(
-                provider_current_state if provider_current_state is not None else (current_state or _empty_state()).to_dict()
+                provider_current_state
+                if provider_current_state is not None
+                else guided_redacted_current_state_context(current_state or _empty_state())
+                if surface in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE}
+                else (current_state or _empty_state()).to_dict()
             ),
             reviewed_facts={"request": "Build the requested pipeline."},
             reviewed_planner_context={"request": "Build the requested pipeline."},
@@ -2258,7 +2261,7 @@ async def test_failed_selected_schema_does_not_emit_false_gap_closure(
                 name="csv",
                 plugin_type="source",
                 description="Noncanonical selected schema.",
-                json_schema={"type": "object", "default": object()},
+                json_schema={"type": "object", "description": "x" * (49 * 1024)},
                 knob_schema={"fields": []},
             ),
         )
@@ -2476,7 +2479,7 @@ async def test_second_no_gain_event_mixed_batch_completes_protocol_before_hatch(
     assert [invocation.tool_name for invocation in recorder.invocations] == ["get_plugin_schema", "get_plugin_schema"]
 
 
-def test_noncanonical_schema_serializer_fails_closed() -> None:
+def test_noncanonical_schema_serializer_raises_framework_bug() -> None:
     current_state = _empty_state()
     result = ToolResult(
         success=True,
@@ -2498,18 +2501,13 @@ def test_noncanonical_schema_serializer_fails_closed() -> None:
         arguments={"plugin_type": "transform", "name": "noncanonical_transform"},
     )
 
-    payload = json.loads(
+    with pytest.raises(FrameworkBugError):
         _serialize_provider_discovery_result(
             call=call,
             result=result,
             surface=PlannerSurface.FREEFORM,
             provider_current_state=current_state.to_dict(),
         )
-    )
-
-    assert payload["success"] is False
-    assert payload["data"]["error_code"] == "schema_projection_unavailable"
-    assert payload["data"]["next_tool"] == "get_plugin_assistance"
 
 
 def _node_component_read(current_state: CompositionState) -> tuple[_ParsedToolCall, ToolResult]:
@@ -2529,6 +2527,65 @@ def _node_component_read(current_state: CompositionState) -> tuple[_ParsedToolCa
     return call, result
 
 
+@pytest.mark.parametrize("surface", list(PlannerSurface))
+def test_admitted_schema_projection_ignores_original_payload(surface: PlannerSurface) -> None:
+    from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
+    from elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA_RESPONSE_CONTRACT
+
+    state = _empty_state()
+    schema = create_catalog_service().get_schema("source", "csv")
+    result = ToolResult(success=True, updated_state=state, validation=state.validate(), affected_nodes=(), data=schema)
+    call = _ParsedToolCall(call_id="schema", name="get_plugin_schema", raw_arguments="{}", arguments={})
+    context = guided_redacted_current_state_context(state)
+    expected = _serialize_provider_discovery_result(call=call, result=result, surface=surface, provider_current_state=context)
+    admitted = AdmittedDiscoveryResult(
+        replace(result, data={"private": "NEVER_READ"}), PLUGIN_SCHEMA_RESPONSE_CONTRACT.admit(schema), PLUGIN_SCHEMA_RESPONSE_CONTRACT
+    )
+    assert _serialize_provider_discovery_result(call=call, result=admitted, surface=surface, provider_current_state=context) == expected
+
+
+@pytest.mark.parametrize("component", [None, "source", "node", "output"])
+def test_admitted_state_projection_ignores_original_payload(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    component: str | None,
+) -> None:
+    from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
+    from elspeth.web.composer.tools.sessions import _execute_get_pipeline_state
+    from elspeth.web.composer.tools.state_responses import PIPELINE_STATE_RESPONSE_CONTRACT
+
+    state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    if component == "node":
+        component = state.nodes[0].id
+    elif component == "output":
+        component = state.outputs[0].name
+    arguments = {} if component is None else {"component": component}
+    result = _execute_get_pipeline_state(arguments, state, tool_context)
+    assert result.success, [entry.error_code for entry in result.validation.errors]
+    call = _ParsedToolCall(call_id="state", name="get_pipeline_state", raw_arguments=json.dumps(arguments), arguments=arguments)
+    context = guided_redacted_current_state_context(state)
+    expected = _serialize_provider_discovery_result(
+        call=call,
+        result=result,
+        surface=PlannerSurface.GUIDED_STAGED,
+        provider_current_state=context,
+    )
+    admitted = AdmittedDiscoveryResult(
+        replace(result, data={"private": "NEVER_READ"}),
+        PIPELINE_STATE_RESPONSE_CONTRACT.admit(result.data),
+        PIPELINE_STATE_RESPONSE_CONTRACT,
+    )
+    assert (
+        _serialize_provider_discovery_result(
+            call=call,
+            result=admitted,
+            surface=PlannerSurface.GUIDED_STAGED,
+            provider_current_state=context,
+        )
+        == expected
+    )
+
+
 def test_malformed_projection_node_candidate_raises_instead_of_failing_closed() -> None:
     """A node candidate in the policy-owned server-computed projection that
     cannot honour the fixed block contract is an internal invariant failure:
@@ -2536,27 +2593,38 @@ def test_malformed_projection_node_candidate_raises_instead_of_failing_closed() 
     current_state = _empty_state()
     call, result = _node_component_read(current_state)
 
-    with pytest.raises(TypeError):
+    context = guided_redacted_current_state_context(current_state)
+    context["nodes"] = ["malformed-candidate"]
+    with pytest.raises(FrameworkBugError):
         _serialize_provider_discovery_result(
             call=call,
             result=result,
             surface=PlannerSurface.GUIDED_STAGED,
-            provider_current_state={"nodes": ["malformed-candidate"]},
+            provider_current_state=context,
         )
 
 
-def test_unmatched_projection_node_read_still_fails_closed() -> None:
+def test_unmatched_projection_node_read_still_fails_closed(tmp_path: Path, tool_context: ToolContext) -> None:
     """Well-formed candidates that simply do not match the selected id keep
     the closed surface_projection_unavailable outcome."""
-    current_state = _empty_state()
-    call, result = _node_component_read(current_state)
+    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    selected_id = current_state.nodes[0].id
+    call = _ParsedToolCall(
+        call_id="call-node",
+        name="get_pipeline_state",
+        raw_arguments=json.dumps({"component": selected_id}),
+        arguments={"component": selected_id},
+    )
+    result = pipeline_planner.execute_discovery_tool_with_context("get_pipeline_state", dict(call.arguments), current_state, tool_context)
+    context = guided_redacted_current_state_context(current_state)
+    context["nodes"] = []
 
     payload = json.loads(
         _serialize_provider_discovery_result(
             call=call,
             result=result,
             surface=PlannerSurface.GUIDED_STAGED,
-            provider_current_state={"nodes": [{"id": "other-node"}]},
+            provider_current_state=context,
         )
     )
 
@@ -2581,12 +2649,14 @@ def test_malformed_projection_output_candidate_raises_instead_of_failing_closed(
         arguments={"component": "rows"},
     )
 
-    with pytest.raises(TypeError):
+    context = guided_redacted_current_state_context(current_state)
+    context["outputs"] = ["malformed-candidate"]
+    with pytest.raises(FrameworkBugError):
         _serialize_provider_discovery_result(
             call=call,
             result=result,
             surface=PlannerSurface.GUIDED_STAGED,
-            provider_current_state={"outputs": ["malformed-candidate"]},
+            provider_current_state=context,
         )
 
 
@@ -3102,6 +3172,57 @@ async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_
             assert "preview_is_valid" in payload["data"]
 
 
+@pytest.fixture
+def restricted_discovery_producer(tmp_path: Path, tool_context: ToolContext) -> Any:
+    """Real discovery handlers with bounded storage and secret collaborators."""
+    import hashlib
+
+    from elspeth.web.composer.tools import blobs, sources
+    from elspeth.web.composer.tools._dispatch import execute_discovery_tool_with_context
+    from tests.unit.web.composer.test_tools import _SecretServiceDouble
+
+    path = tmp_path / "discovery.csv"
+    content = b"name,value\nexample,1\n"
+    path.write_bytes(content)
+    record = {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "filename": path.name,
+        "storage_path": str(path),
+        "mime_type": "text/csv",
+        "size_bytes": len(content),
+        "content_hash": hashlib.sha256(content).hexdigest(),
+        "status": "ready",
+        "created_by": "assistant",
+        "creation_modality": "verbatim",
+    }
+    secret_service = _SecretServiceDouble()
+    secret_service.list_refs.return_value = []
+    secret_service.has_ref.return_value = False
+    engine = create_session_engine("sqlite://")
+    context = replace(
+        tool_context,
+        data_dir=tmp_path,
+        session_id=_TEST_SESSION_ID,
+        session_engine=engine,
+        secret_service=secret_service,
+        user_id="disclosure-test",
+        baseline=_empty_state(),
+    )
+
+    def produce(tool_name: str) -> ToolResult:
+        return execute_discovery_tool_with_context(tool_name, dict(_DISCOVERY_TEST_ARGUMENTS[tool_name]), _empty_state(), context)
+
+    with (
+        patch.object(blobs, "_sync_list_blobs", autospec=True, return_value=[]),
+        patch.object(blobs, "_sync_list_ready_blob_inline_descriptors", autospec=True, return_value=[]),
+        patch.object(blobs, "_sync_get_blob", autospec=True, return_value=record),
+        patch.object(blobs, "_locked_read_ready_blob", autospec=True, return_value=(record, content)),
+        patch.object(sources, "_sync_get_blob", autospec=True, return_value=record),
+    ):
+        yield produce
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     "surface",
     [PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE],
@@ -3109,18 +3230,22 @@ async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_
 @pytest.mark.parametrize("tool_name", sorted(PLANNER_DISCOVERY_TOOL_NAMES))
 def test_every_restricted_discovery_success_uses_the_closed_provider_envelope(
     tmp_path: Path,
+    tool_context: ToolContext,
     surface: PlannerSurface,
     tool_name: str,
+    restricted_discovery_producer: Callable[[str], ToolResult],
 ) -> None:
+    from elspeth.web.composer.discovery_cache import serialize_tool_result
+
     current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
     provider_state = guided_redacted_current_state_context(current_state)
-    authoritative_data = {"inspection": "diagnostic"} if tool_name == "get_pipeline_state" else {"safe_tool_marker": tool_name}
-    result = ToolResult(
-        success=True,
+    produced = restricted_discovery_producer(tool_name)
+    assert produced.success
+    authoritative_data = json.loads(serialize_tool_result(produced))["data"]
+    result = replace(
+        produced,
         updated_state=current_state,
         validation=current_state.validate(),
-        affected_nodes=(),
-        data=authoritative_data,
     )
     call = _ParsedToolCall(
         call_id="call-1",
@@ -3146,9 +3271,8 @@ def test_every_restricted_discovery_success_uses_the_closed_provider_envelope(
         assert payload["success"] is False
         assert payload["data"]["error_code"] == "surface_projection_unavailable"
     elif tool_name == "get_plugin_schema":
-        assert payload["success"] is False
-        assert payload["data"]["error_code"] == "schema_projection_unavailable"
-        assert payload["data"]["next_tool"] == "get_plugin_assistance"
+        assert payload["success"] is True
+        assert payload["data"] == planner_plugin_contract(tool_context.catalog.get_schema("source", "csv")).to_dict()
     else:
         assert payload["success"] is True
         assert payload["data"] == authoritative_data
@@ -3161,29 +3285,32 @@ def test_every_restricted_discovery_success_uses_the_closed_provider_envelope(
 def test_restricted_preview_projection_strips_the_structural_preview_block(
     tmp_path: Path,
     surface: PlannerSurface,
+    tool_context: ToolContext,
 ) -> None:
     """elspeth-229e9e8195: the additive ``structural_preview`` block must not
     leak through the restricted provider envelope — a restricted preview
     success fail-closes to the closed error payload, block included."""
-    canary = "STRUCTURAL_PREVIEW_NOTE_CANARY_51C9"
+    from elspeth.web.composer.tools._dispatch import execute_discovery_tool_with_context
+    from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+
     current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
     provider_state = guided_redacted_current_state_context(current_state)
-    result = ToolResult(
-        success=True,
+    context = replace(
+        tool_context,
+        structural_preflight=lambda state: ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+        ),
+    )
+    produced = execute_discovery_tool_with_context("preview_pipeline", {}, _empty_state(), context)
+    assert produced.success
+    canary = produced.data["structural_preview"]["note"]
+    result = replace(
+        produced,
         updated_state=current_state,
         validation=current_state.validate(),
-        affected_nodes=(),
-        data={
-            "is_valid": False,
-            "structural_preview": {
-                "is_valid": False,
-                "confidence": "equivalent",
-                "masking_applied": False,
-                "failing_checks": [],
-                "errors": [],
-                "note": canary,
-            },
-        },
     )
     call = _ParsedToolCall(call_id="call-1", name="preview_pipeline", raw_arguments="{}", arguments={})
 
@@ -3423,12 +3550,14 @@ async def test_parallel_discovery_results_remain_correlated_by_tool_call_id(
 
     original = planner_module.execute_discovery_tool_with_context
     rendezvous = threading.Barrier(2)
+    expected_data: dict[str, Any] = {}
 
     def synchronized_discovery(*args: Any, **kwargs: Any) -> Any:
         tool_name = args[0]
         rendezvous.wait(timeout=2)
         result = original(*args, **kwargs)
-        return replace(result, data={"marker": tool_name})
+        expected_data[tool_name] = json.loads(pipeline_planner.serialize_tool_result(result))["data"]
+        return result
 
     monkeypatch.setattr(planner_module, "execute_discovery_tool_with_context", synchronized_discovery)
     completion = _ScriptedCompletion(
@@ -3440,9 +3569,10 @@ async def test_parallel_discovery_results_remain_correlated_by_tool_call_id(
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
     tool_messages = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
-    assert [(message["tool_call_id"], json.loads(message["content"])["data"]["marker"]) for message in tool_messages] == [
-        ("call-1", "list_sources"),
-        ("call-2", "list_sinks"),
+    assert expected_data["list_sources"] != expected_data["list_sinks"], "correlation witness must discriminate the two payloads"
+    assert [(message["tool_call_id"], json.loads(message["content"])["data"]) for message in tool_messages] == [
+        ("call-1", expected_data["list_sources"]),
+        ("call-2", expected_data["list_sinks"]),
     ]
     assert {call.tool_call_id: call.tool_name for call in recorder.invocations} == {
         "call-1": "list_sources",
@@ -5570,6 +5700,53 @@ async def test_discovery_crash_is_audited_from_preopened_envelope(
     assert recorder.invocations[0].status.value == "plugin_crash"
     assert recorder.invocations[0].error_message == "RuntimeError"
     assert raw_canary not in canonical_json(recorder.invocations[0].to_dict())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [{"grammar": 17}, {"grammar": "safe", "private": "CANARY"}, None])
+async def test_selected_response_corruption_is_audited_before_success(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+    data: Any,
+) -> None:
+    from elspeth.contracts.errors import FrameworkBugError
+
+    original = pipeline_planner.execute_discovery_tool_with_context
+
+    def corrupt(*args: Any, **kwargs: Any) -> ToolResult:
+        return replace(original(*args, **kwargs), data=data)
+
+    monkeypatch.setattr(pipeline_planner, "execute_discovery_tool_with_context", corrupt)
+    recorder = BufferingRecorder()
+    completion = _ScriptedCompletion(
+        _response(("get_expression_grammar", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    with pytest.raises(FrameworkBugError):
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+    assert len(completion.requests) == 1
+    assert len(recorder.invocations) == 1
+    assert recorder.invocations[0].status.value == "plugin_crash"
+    assert recorder.invocations[0].error_class == "FrameworkBugError"
+    assert "CANARY" not in canonical_json(recorder.invocations[0].to_dict())
+
+
+def test_tool_result_envelope_omits_data_without_traversal() -> None:
+    from inspect import signature
+
+    from elspeth.contracts.freeze import deep_thaw
+
+    assert "include_data" in signature(ToolResult.to_dict).parameters
+    state = _empty_state()
+    result = ToolResult(success=True, updated_state=state, validation=state.validate(), affected_nodes=(), data={"grammar": "text"})
+    expected = result.to_dict()
+    assert result.to_dict(include_data=True) == expected
+    del expected["data"]
+    with patch("elspeth.web.composer.tools._common.deep_thaw", spec=deep_thaw, side_effect=AssertionError("data traversed")):
+        assert result.to_dict(include_data=False) == expected
+        with pytest.raises(AssertionError, match="data traversed"):
+            result.to_dict()
 
 
 @pytest.mark.asyncio
@@ -10821,7 +10998,7 @@ def test_argument_rejection_projections_split_by_surface() -> None:
         "error_class": "ToolArgumentError",
     }
 
-    payload = pipeline_planner._allowlisted_argument_error_payload(error)
+    payload = pipeline_planner.argument_error_response(error).to_wire()
     assert tuple(payload) == ("argument_error",)
     assert payload["argument_error"] == entry
     assert "success" not in payload, "the envelope's success already says the call failed"
@@ -10835,27 +11012,24 @@ def test_argument_rejection_projections_split_by_surface() -> None:
     )
 
 
-def test_discovery_argument_rejection_builds_its_data_inline() -> None:
-    """The discovery ARG_ERROR result's ``data=`` IS the payload constructor call.
-
-    Built inline, the payload has no local, alias or ``cast`` target for a later
-    store to travel through, and ``ToolResult.__post_init__`` freezes it before
-    any other statement runs — the closure c6f857aa0 applied to the
-    APPROVAL_REQUIRED payload, for the same reason. Read from the AST rather
-    than from behaviour because what is pinned is that no OTHER shape can be
-    written here: a re-introduced ``feedback = _allowlisted_argument_feedback(exc)``
-    fed to ``data=dict(feedback)`` (the shape this replaced) reds this test
-    while shipping a payload a behavioural assertion on one example might miss.
-    """
-    tree = ast.parse(Path(pipeline_planner.__file__).read_text(encoding="utf-8"))
-    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "execute_one_discovery"]
-    assert len(fns) == 1, "premise: one execute_one_discovery in the planner"
-    results = [
-        node for node in ast.walk(fns[0]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ToolResult"
-    ]
-    assert len(results) == 1, "premise: the discovery arm constructs exactly one ToolResult"
-    (data_kw,) = [kw for kw in results[0].keywords if kw.arg == "data"]
-    assert isinstance(data_kw.value, ast.Call), "data= must be the payload constructor call, not a name or a dict"
-    assert isinstance(data_kw.value.func, ast.Name)
-    assert data_kw.value.func.id == "_allowlisted_argument_error_payload"
-    assert not data_kw.value.keywords and len(data_kw.value.args) == 1
+@pytest.mark.parametrize("surface", list(PlannerSurface))
+def test_discovery_argument_rejection_uses_owned_snapshot(surface: PlannerSurface) -> None:
+    """Exception fields stay frozen and original data cannot control disclosure."""
+    state = _empty_state()
+    error = ToolArgumentError(argument="plugin_type", expected="kind", actual_type="str", code="DISCOVERY_ONLY")
+    response = pipeline_planner.argument_error_response(error)
+    expected = response.to_wire()
+    with pytest.raises(AttributeError):
+        error.argument = "PRIVATE_MUTATED_ARGUMENT"
+    result = ToolResult(
+        success=False, updated_state=state, validation=state.validate(), affected_nodes=(), data={"private": "PRIVATE_DATA"}
+    )
+    rejection = pipeline_planner._PlannerArgumentRejection(result, response)
+    encoded = _serialize_provider_discovery_result(
+        call=_ParsedToolCall(call_id="arg-error", name="get_plugin_schema", raw_arguments="{}", arguments={}),
+        result=rejection,
+        surface=surface,
+        provider_current_state=guided_redacted_current_state_context(state),
+    )
+    assert json.loads(encoded)["data"] == expected
+    assert "PRIVATE" not in encoded

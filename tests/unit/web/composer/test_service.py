@@ -3647,15 +3647,18 @@ class TestDiscoveryCache:
             assert all(entry.get("error_code") != "no_source_configured" for entry in second_payload["validation"]["errors"])
 
     @pytest.mark.asyncio
-    async def test_cache_hit_rebuilds_result_envelope_from_current_state(self) -> None:
+    @pytest.mark.parametrize("tool_name", ["list_sources", "get_expression_grammar", "get_audit_info"])
+    async def test_cache_hit_rebuilds_result_envelope_from_current_state(self, tool_name: str) -> None:
         """Cacheable discovery data is reused, but validation/version stay current."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+
         catalog = _mock_catalog()
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
 
         disc1 = _make_llm_response(
-            tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}],
+            tool_calls=[{"id": "c1", "name": tool_name, "arguments": {}}],
         )
         mutate = _make_llm_response(
             tool_calls=[
@@ -3675,7 +3678,7 @@ class TestDiscoveryCache:
             ],
         )
         disc2 = _make_llm_response(
-            tool_calls=[{"id": "c3", "name": "list_sources", "arguments": {}}],
+            tool_calls=[{"id": "c3", "name": tool_name, "arguments": {}}],
         )
         text = _make_llm_response(content="Done.")
 
@@ -3683,13 +3686,19 @@ class TestDiscoveryCache:
         with (
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
         ):
             mock_llm.side_effect = [disc1, mutate, disc2, text]
             result = await service.compose("Build", [], state, session_id=session_id)
 
         assert result.state.version == 2
+        assert dispatch.call_count == 2  # one discovery miss and one mutation
         cached_tool_message = mock_llm.call_args_list[3][0][0][-1]
         cached_payload = json.loads(cached_tool_message["content"])
+        first_message = next(message for message in mock_llm.call_args_list[3][0][0] if message.get("tool_call_id") == "c1")
+        first_payload = json.loads(first_message["content"])
+        assert first_payload["version"] == 1
+        assert cached_payload["data"] == first_payload["data"]
         assert cached_payload["version"] == 2
         expected_validation = ToolResult(
             success=True,
@@ -3703,6 +3712,170 @@ class TestDiscoveryCache:
         # internal list_sources()/capability_groups() reads within one
         # compose() collapse into a single real catalog call.
         assert catalog.list_sources.call_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["get_expression_grammar", "get_audit_info"])
+    async def test_selected_response_rejects_malformed_producer_before_success(self, tool_name: str) -> None:
+        """Malformed owned output is a crash before audit success or model egress."""
+        from elspeth.contracts.composer_audit import ComposerToolStatus
+        from elspeth.web.composer import tool_batch as tool_batch_module
+
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        state = _empty_state()
+        malformed = ToolResult(
+            success=True, updated_state=state, validation=state.validate(), affected_nodes=(), data={"unexpected": "producer bug"}
+        )
+        responses = [
+            _make_llm_response(tool_calls=[{"id": "bad-response", "name": tool_name, "arguments": {}}]),
+            _make_llm_response(content="This must never see malformed output."),
+        ]
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(tool_batch_module, "execute_tool", return_value=malformed),
+            patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
+            pytest.raises(ComposerPluginCrashError) as caught,
+        ):
+            await service.compose("Describe the pipeline language", [], state)
+
+        assert isinstance(caught.value.original_exc, FrameworkBugError)
+        assert completion.call_count == 1
+        cache_payload.assert_not_called()
+        assert len(caught.value.tool_invocations) == 1
+        assert caught.value.tool_invocations[0].status is ComposerToolStatus.PLUGIN_CRASH
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["get_expression_grammar", "get_audit_info"])
+    async def test_selected_response_caller_error_remains_uncached_argument_error(self, tool_name: str) -> None:
+        """Invalid caller arguments retain their Tier-3 audit status on each attempt."""
+        from elspeth.contracts.composer_audit import ComposerToolStatus
+        from elspeth.web.composer import tool_batch as tool_batch_module
+
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        responses = [
+            _make_llm_response(tool_calls=[{"id": call_id, "name": tool_name, "arguments": {"unexpected": 1}}])
+            for call_id in ("invalid-1", "invalid-2")
+        ]
+        responses.append(_make_llm_response(content="The arguments were invalid."))
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
+            patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
+        ):
+            result = await service.compose("Describe the pipeline language", [], _empty_state())
+
+        assert dispatch.call_count == 2
+        cache_payload.assert_not_called()
+        assert [entry.status for entry in result.tool_invocations] == [ComposerToolStatus.ARG_ERROR, ComposerToolStatus.ARG_ERROR]
+        messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
+        assert len(messages) == 2
+        assert all("error" in json.loads(message["content"]) for message in messages)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("corruption", ["owned_value", "bound_contract"])
+    async def test_selected_response_cache_corruption_crashes_before_hit_egress(self, corruption: str) -> None:
+        """A real miss followed by a corrupt hit records one crash and stops egress."""
+        from elspeth.contracts.composer_audit import ComposerToolStatus
+        from elspeth.web.composer import tool_batch as tool_batch_module
+        from elspeth.web.composer.discovery_cache import cached_discovery_payload
+        from elspeth.web.composer.tools.generation import EXPRESSION_GRAMMAR_RESPONSE_CONTRACT, ExpressionGrammarResponse
+
+        def corrupt_cache(result: Any) -> Any:
+            cached = cached_discovery_payload(result)
+            assert cached.admitted_response is not None
+            if corruption == "owned_value":
+                admitted = replace(cached.admitted_response, value=ExpressionGrammarResponse(grammar=cast(str, 17)))
+            else:
+                # Equivalent functions still belong to a different declaration identity.
+                admitted = replace(cached.admitted_response, contract=replace(EXPRESSION_GRAMMAR_RESPONSE_CONTRACT))
+            return replace(cached, admitted_response=admitted)
+
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        responses = [
+            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
+            for call_id in ("miss", "corrupt-hit")
+        ]
+        responses.append(_make_llm_response(content="This must never see corrupt cached output."))
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
+            patch.object(tool_batch_module, "_cached_discovery_payload", side_effect=corrupt_cache) as cache_payload,
+            patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
+            pytest.raises(FrameworkBugError),
+        ):
+            await service.compose("Describe the pipeline language", [], _empty_state())
+
+        assert dispatch.call_count == 1
+        assert cache_payload.call_count == 1
+        assert completion.call_count == 2
+        assert [call.args[1].status for call in record.call_args_list] == [ComposerToolStatus.SUCCESS, ComposerToolStatus.PLUGIN_CRASH]
+        messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
+        assert [message["tool_call_id"] for message in messages] == ["miss"]
+
+    @pytest.mark.asyncio
+    async def test_selected_response_semantic_failure_is_never_cached(self) -> None:
+        """A selected handler's unsuccessful result keeps its absent-data envelope."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+
+        def fail_discovery(*args: Any, **kwargs: Any) -> ToolResult:
+            return replace(_strict_execute_tool(*args, **kwargs), success=False, data=None)
+
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        responses = [
+            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
+            for call_id in ("failed-1", "failed-2")
+        ]
+        responses.append(_make_llm_response(content="Discovery was unavailable."))
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(tool_batch_module, "execute_tool", side_effect=fail_discovery) as dispatch,
+            patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
+        ):
+            await service.compose("Describe the pipeline language", [], _empty_state())
+
+        assert dispatch.call_count == 2
+        cache_payload.assert_not_called()
+        messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
+        assert len(messages) == 2
+        for message in messages:
+            envelope = json.loads(message["content"])
+            assert envelope["success"] is False
+            assert "data" not in envelope
+
+    @pytest.mark.asyncio
+    async def test_selected_response_cache_encoder_failure_is_audited_before_success(self) -> None:
+        """A cache hit's encoder is inside the same crash-audit boundary as admission."""
+        from elspeth.contracts.composer_audit import ComposerToolStatus
+        from elspeth.web.composer import tool_batch as tool_batch_module
+        from elspeth.web.composer.discovery_cache import admitted_result_from_cached_discovery_payload
+
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        responses = [
+            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
+            for call_id in ("miss", "encoder-failure")
+        ]
+        responses.append(_make_llm_response(content="This must never see failed encoder output."))
+        with contextlib.ExitStack() as patches:
+
+            def fail_hit_encoder(*args: Any, **kwargs: Any) -> Any:
+                admitted = admitted_result_from_cached_discovery_payload(*args, **kwargs)
+                assert admitted.response is not None
+                patches.enter_context(patch.object(type(admitted.response), "to_wire", side_effect=FrameworkBugError("encoder bug")))
+                return admitted
+
+            with (
+                patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+                patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
+                patch.object(tool_batch_module, "admitted_result_from_cached_discovery_payload", side_effect=fail_hit_encoder),
+                patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
+                pytest.raises(FrameworkBugError, match="encoder bug"),
+            ):
+                await service.compose("Describe the pipeline language", [], _empty_state())
+
+        assert dispatch.call_count == 1
+        assert completion.call_count == 2
+        assert [call.args[1].status for call in record.call_args_list] == [ComposerToolStatus.SUCCESS, ComposerToolStatus.PLUGIN_CRASH]
+        messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
+        assert [message["tool_call_id"] for message in messages] == ["miss"]
 
     @pytest.mark.asyncio
     async def test_cache_key_includes_arguments(self) -> None:
@@ -5714,13 +5887,7 @@ class TestToolExecutionThreadOffloading:
         ) -> ToolResult:
             nonlocal tool_execution_thread
             tool_execution_thread = threading.current_thread()
-            return ToolResult(
-                success=True,
-                updated_state=current_state,
-                validation=current_state.validate(),
-                affected_nodes=(),
-                data={"sources": []},
-            )
+            return _strict_execute_tool(_tool_name, _arguments, current_state, _catalog, **kwargs)
 
         with (
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,

@@ -40,7 +40,7 @@ import pytest
 from pydantic import BaseModel
 
 from elspeth.web.catalog.schemas import PluginSchemaInfo
-from elspeth.web.composer import pipeline_planner, redaction, state, tool_batch
+from elspeth.web.composer import provider_discovery_response, redaction, state, tool_batch
 from elspeth.web.composer import tool_result_envelope as env
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.tools import _common as common
@@ -96,6 +96,10 @@ _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
         "re-envelopes a cached discovery result's own data under the current state; adds no key, and every key it "
         "carries was censused at the tool that produced it"
     ),
+    ("discovery_response.py", "to_tool_result"): (
+        "re-envelopes the declaration-selected producer encoding for legacy consumers; adds no data key, "
+        "and the original tool producer remains the census authority"
+    ),
 }
 # Sites on a surface this gate's taught side does not cover. The taught text is the COMPOSER skill
 # plus the composer tool descriptions (``_teaching_blocks``); the planner reads pipeline_capabilities.md
@@ -104,7 +108,6 @@ _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
 # test_pipeline_planner.py instead.
 _DATA_SITES_OFF_THE_COMPOSER_TOOL_SURFACE: dict[tuple[str, str], str] = {
     ("pipeline_planner.py", "_serialize_provider_discovery_result"): "planner disclosure surface",
-    ("pipeline_planner.py", "execute_one_discovery"): "planner disclosure surface",
 }
 
 
@@ -2510,11 +2513,36 @@ def test_implicit_declarative_envelope_covers_every_required_key() -> None:
     assert set(env.TOOL_RESULT_REQUIRED_KEYS) <= redaction._TOOL_RESULT_ENVELOPE_KEYS
 
 
-def test_closed_provider_discovery_payload_is_a_subset_of_the_registry() -> None:
-    keys = set(typing.get_type_hints(pipeline_planner._ClosedProviderDiscoveryPayload))
-    assert keys <= set(env.tool_result_keys(data=True))
-    nested = set(typing.get_type_hints(pipeline_planner._ClosedProviderValidationEnvelope))
-    assert nested <= set(env.VALIDATION_KEYS)
+@pytest.mark.parametrize("include_data", [False, True])
+def test_closed_provider_discovery_payload_is_a_subset_of_the_registry(include_data: bool) -> None:
+    validation = provider_discovery_response.ClosedProviderValidation(True, (), (), ())
+    envelope = provider_discovery_response.ClosedProviderDiscoveryEnvelope(
+        True,
+        validation,
+        (),
+        1,
+        provider_discovery_response.surface_projection_failure() if include_data else None,
+    )
+    keys = set(envelope.to_wire())
+    assert set(env.TOOL_RESULT_REQUIRED_KEYS) <= keys <= set(env.tool_result_keys(data=include_data)), "unregistered provider envelope keys"
+    assert ("data" in keys) is include_data
+    assert tuple(validation.to_wire()) == env.VALIDATION_KEYS, "unregistered provider validation keys"
+
+
+@pytest.mark.parametrize("validation", [False, True])
+def test_closed_provider_registry_gate_rejects_an_extra_encoded_key(monkeypatch: pytest.MonkeyPatch, validation: bool) -> None:
+    test_closed_provider_discovery_payload_is_a_subset_of_the_registry(True)
+    target = (
+        provider_discovery_response.ClosedProviderValidation if validation else provider_discovery_response.ClosedProviderDiscoveryEnvelope
+    )
+    original = target.to_wire
+
+    def with_extra_key(self):
+        return {**original(self), "unexpected_provider_key": True}
+
+    monkeypatch.setattr(target, "to_wire", with_extra_key)
+    with pytest.raises(AssertionError, match="unregistered provider"):
+        test_closed_provider_discovery_payload_is_a_subset_of_the_registry(True)
 
 
 def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:

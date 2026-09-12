@@ -60,7 +60,17 @@ from elspeth.plugins.transforms.llm.model_catalog import (
 )
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._schema_response_grammar import (
+    _JSON_SCHEMA_MAP_KEYS,
+    _JSON_SCHEMA_PROSE_KEYS,
+    _JSON_SCHEMA_SCALAR_KEYS,
+    _JSON_SCHEMA_SCHEMA_LIST_KEYS,
+    _JSON_SCHEMA_SINGLE_SCHEMA_KEYS,
+    SchemaKeywordInvalid,
+    validate_json_schema_scalar,
+)
 from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure, prohibited_plugin_section
+from elspeth.web.composer.tools._generation_schema_response import PluginSchemaSnapshot
 from elspeth.web.composer.tools.generation import get_expression_grammar
 
 # The registered shield-review constants are the contract's single source of
@@ -1081,102 +1091,6 @@ _SCHEMA_EVIDENCE_MAX_ENTRIES: Final[int] = 8
 _SCHEMA_EVIDENCE_MAX_OMISSIONS: Final[int] = 16
 _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES: Final[int] = 96 * 1024
 
-_JSON_SCHEMA_PROSE_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "$comment",
-        "title",
-        "description",
-        "examples",
-        "example",
-        "composer_description",
-        "composer_placeholder",
-        # UI-disclosure hint (elspeth-9cca900d41): presentational, not
-        # audit-bearing (mirrors knob_schema._attach_tier's own docstring).
-        # The knob_schema projection already treats "tier" as prose
-        # (_contract_knob_schema's own prose_keys); this is the raw
-        # json_schema side of the same fact, since pydantic bakes
-        # json_schema_extra={"composer_tier": ...} onto the property's
-        # generated schema the same way it does composer_description.
-        "composer_tier",
-    }
-)
-_JSON_SCHEMA_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "$schema",
-        "$id",
-        "$ref",
-        "$anchor",
-        "$dynamicRef",
-        "$dynamicAnchor",
-        "$vocabulary",
-        "type",
-        "const",
-        "enum",
-        "default",
-        "pattern",
-        "format",
-        "contentEncoding",
-        "contentMediaType",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
-        "nullable",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-        "minLength",
-        "maxLength",
-        "minItems",
-        "maxItems",
-        "uniqueItems",
-        "minProperties",
-        "maxProperties",
-        "minContains",
-        "maxContains",
-    }
-)
-_JSON_SCHEMA_MAP_KEYS: Final[frozenset[str]] = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
-_JSON_SCHEMA_SINGLE_SCHEMA_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "items",
-        "contains",
-        "not",
-        "if",
-        "then",
-        "else",
-        "propertyNames",
-        "additionalProperties",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-        "contentSchema",
-    }
-)
-_JSON_SCHEMA_SCHEMA_LIST_KEYS: Final[frozenset[str]] = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
-_JSON_SCHEMA_STRING_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "$schema",
-        "$id",
-        "$ref",
-        "$anchor",
-        "$dynamicRef",
-        "$dynamicAnchor",
-        "pattern",
-        "format",
-        "contentEncoding",
-        "contentMediaType",
-    }
-)
-_JSON_SCHEMA_BOOLEAN_SCALAR_KEYS: Final[frozenset[str]] = frozenset({"deprecated", "readOnly", "writeOnly", "nullable", "uniqueItems"})
-_JSON_SCHEMA_NUMERIC_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
-    {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"}
-)
-_JSON_SCHEMA_NONNEGATIVE_INTEGER_KEYS: Final[frozenset[str]] = frozenset(
-    {"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains", "maxContains"}
-)
-_JSON_SCHEMA_TYPES: Final[frozenset[str]] = frozenset({"null", "boolean", "object", "array", "number", "string", "integer"})
-
 
 class _SchemaContractProjectionUnsupported(ValueError):
     """A schema carries semantics this bounded projection cannot preserve."""
@@ -1204,38 +1118,11 @@ _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES: Final[int] = 8 * 1024
 
 
 def _contract_json_schema_scalar(key: str, value: object) -> object:
-    """Validate the closed scalar-keyword vocabulary before copying it."""
-    if key in _JSON_SCHEMA_STRING_SCALAR_KEYS:
-        if type(value) is not str:
-            raise _SchemaContractProjectionUnsupported
-    elif key in _JSON_SCHEMA_BOOLEAN_SCALAR_KEYS:
-        if type(value) is not bool:
-            raise _SchemaContractProjectionUnsupported
-    elif key in _JSON_SCHEMA_NUMERIC_SCALAR_KEYS:
-        if type(value) not in {int, float} or (type(value) is float and not math.isfinite(value)):
-            raise _SchemaContractProjectionUnsupported
-        numeric_value = cast(int | float, value)
-        if key == "multipleOf" and numeric_value <= 0:
-            raise _SchemaContractProjectionUnsupported
-    elif key in _JSON_SCHEMA_NONNEGATIVE_INTEGER_KEYS:
-        if type(value) is not int or value < 0:
-            raise _SchemaContractProjectionUnsupported
-    elif key == "type":
-        if type(value) is str:
-            if value not in _JSON_SCHEMA_TYPES:
-                raise _SchemaContractProjectionUnsupported
-        elif type(value) is list:
-            if not value or any(type(item) is not str or item not in _JSON_SCHEMA_TYPES for item in value) or len(set(value)) != len(value):
-                raise _SchemaContractProjectionUnsupported
-        else:
-            raise _SchemaContractProjectionUnsupported
-    elif key == "enum":
-        if type(value) is not list or not value:
-            raise _SchemaContractProjectionUnsupported
-    elif key == "$vocabulary" and (
-        type(value) is not dict or any(type(name) is not str or type(required) is not bool for name, required in value.items())
-    ):
-        raise _SchemaContractProjectionUnsupported
+    """Use the neutral keyword domains, retaining policy refusal identity."""
+    try:
+        validate_json_schema_scalar(key, value)
+    except SchemaKeywordInvalid as exc:
+        raise _SchemaContractProjectionUnsupported from exc
     return deepcopy(value)
 
 
@@ -1298,18 +1185,37 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
     """Project one admitted schema into the planner's bounded JIT contract."""
     if type(schema) is not PluginSchemaInfo:
         raise TypeError("schema must be an admitted PluginSchemaInfo")
-    _assert_projection_input_bounds(schema.json_schema)
-    _assert_projection_input_bounds(schema.knob_schema)
-    _assert_projection_input_bounds(schema.composer_hints)
-    json_schema = _contract_json_schema(schema.json_schema)
-    knob_schema = _contract_knob_schema(schema.knob_schema)
+    return _planner_plugin_contract(schema.plugin_type, schema.name, schema.json_schema, schema.knob_schema, schema.composer_hints)
+
+
+def planner_plugin_contract_from_snapshot(schema: PluginSchemaSnapshot) -> PlannerPluginContract:
+    """Project canonical admitted schema leaves without reopening producer data."""
+    if type(schema) is not PluginSchemaSnapshot:
+        raise TypeError("schema must be an admitted PluginSchemaSnapshot")
+    return _planner_plugin_contract(
+        schema.plugin_type, schema.name, schema.json_schema.to_wire(), schema.knob_schema.to_wire(), schema.composer_hints
+    )
+
+
+def _planner_plugin_contract(
+    plugin_type: PluginKind,
+    name: str,
+    raw_json_schema: Mapping[str, object],
+    raw_knob_schema: Mapping[str, object],
+    composer_hints: tuple[str, ...],
+) -> PlannerPluginContract:
+    _assert_projection_input_bounds(raw_json_schema)
+    _assert_projection_input_bounds(raw_knob_schema)
+    _assert_projection_input_bounds(composer_hints)
+    json_schema = _contract_json_schema(raw_json_schema)
+    knob_schema = _contract_knob_schema(raw_knob_schema)
     if type(json_schema) is bool:
         raise _SchemaContractProjectionUnsupported
     projected = {
-        "plugin_id": f"{schema.plugin_type}/{schema.name}",
+        "plugin_id": f"{plugin_type}/{name}",
         "json_schema": json_schema,
         "knob_schema": knob_schema,
-        "composer_hints": list(schema.composer_hints),
+        "composer_hints": list(composer_hints),
     }
     try:
         projected_size = len(canonical_json(projected).encode("utf-8"))
@@ -1319,11 +1225,11 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
         raise _SchemaContractProjectionUnsupported
     contract_shape = {"json_schema": json_schema, "knob_schema": knob_schema}
     return PlannerPluginContract(
-        plugin_id=f"{schema.plugin_type}/{schema.name}",
+        plugin_id=f"{plugin_type}/{name}",
         schema_hash=stable_hash(contract_shape),
         json_schema=deep_freeze(json_schema),
         knob_schema=deep_freeze(knob_schema),
-        composer_hints=tuple(schema.composer_hints),
+        composer_hints=tuple(composer_hints),
     )
 
 

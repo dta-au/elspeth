@@ -346,6 +346,25 @@ acceptance remain in the final campaign checkpoint below.
 
 Use the [response implementation charter](composer-wires/restricted-response-implementation-charter.md).
 
+**Implementation checkpoint — 2026-09-13.** All 19 live discovery declarations
+now select producer-owned response contracts. Actual planner and tool-batch
+dispatch admit before successful audit, re-admit cached owned values, and
+serialize the admitted value. Restricted current-state context is detached
+before provider work; schema/state projection, refusal, and budget decisions
+remain independent. Reviews exercised real producer bytes, malformed data,
+cached root and nested corruption, and post-await context mutation.
+
+The frozen Composer/MCP regression selection exited 0 with 9,919 passed and
+one warning; all 5,442 captured inputs were unchanged. Six alternating local
+performance runs preserved 37 fixture wires and semantic controls. The largest
+measured initial-admission increase was the 100-plugin fixture: local egress
+350 to 1,171 microseconds, excluding handler, database and provider work.
+A subsequent narrow refinement removed duplicate cached-default traversal;
+33 focused tests and the same 37 parity controls passed. Fresh committed
+verification must cover that final refinement before this milestone is
+accepted. Whole-repository, PostgreSQL, release-integration and live-provider
+acceptance remain outstanding campaign gates.
+
 - [ ] Reconcile the historical producer table against the live discovery registry.
   Select contracts from declarations, owned beside producers; admit real
   successful variants and permitted absence/failure families only.
@@ -511,6 +530,33 @@ explained; do not compare to zero, hand-edit signatures, hold signing keys or
 launch global restaging. Preserve necessary contract census changes honestly.
 
 ## Release integration cadence and completion boundary
+
+### Assigned repair: uploaded-source planner participation
+
+John assigned the upload-source planner bypass found during ACA/VANguard review
+to this campaign on 2026-09-12. It is an additional completion requirement.
+The route's `_prepare_step_1_uploaded_source_bind` selects a plugin and answers
+the source schema form from inspection facts; the upload branch bypasses
+`provider_runner`. Keeping committed sources empty until confirmation does not
+remove those server-authored decisions.
+
+- [ ] Pass structured upload inspection facts and custody references through the
+  real planner and its tools; apply only the planner-authored source proposal.
+- [ ] Preserve uploaded content custody, validation, inspection review and user
+  confirmation, atomic settlement, replay, and failure behavior. Add no
+  server-authored fallback or tutorial-specific path.
+- [ ] Test provider participation for each authoring transition, including a
+  conversation that has already called the provider. Verify unsuccessful
+  planner outcomes leave the upload available and do not author pending intent.
+- [ ] Reconcile the release session's guided-plan lease cleanup, guided-chat
+  integrity propagation, and admission refusal changes before integration.
+  The release session retains ACA/VANguard custody; this campaign owns the
+  planner bypass repair in its separate worktree.
+
+The originating review measured ACA `55cbf9cc8` against release `e0ee148c2`.
+Those are historical inputs; refresh the landing revision and route/test diff
+before applying the integration. Independent adversarial review must examine
+the actual authoring decision boundary, not just a conversation-wide call count.
 
 ACA/multi-replica enhancements continue on `release/0.8.1`. Work against the fixed
 incorporated revision while completing a bounded milestone; avoid rebasing under

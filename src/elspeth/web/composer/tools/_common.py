@@ -1037,7 +1037,7 @@ class ToolResult:
         if self.applied_component is not None:
             freeze_fields(self, "applied_component")
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_data: bool = True) -> dict[str, Any]:
         """Serialize to a dict suitable for LLM tool response.
 
         Validation entries are serialized as structured dicts with
@@ -1067,7 +1067,7 @@ class ToolResult:
             "affected_nodes": list(self.affected_nodes),
             "version": self.updated_state.version,
         }
-        if self.data is not None:
+        if include_data and self.data is not None:
             result["data"] = deep_thaw(self.data)
 
         if self.runtime_preflight is not None:

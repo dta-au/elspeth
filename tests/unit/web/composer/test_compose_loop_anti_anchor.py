@@ -429,26 +429,15 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
 
     arg_error = ToolArgumentError(argument="patch", expected="x", actual_type="dict")
 
-    # Mutations raise ToolArgumentError; discovery calls return a successful
-    # ToolResult with no state change (mock the cache miss path so the
-    # discovery success goes through the full dispatch instead of the cache).
-    from dataclasses import replace as dc_replace
+    # Keep the real schema producer and selected response admission. Only
+    # mutation failures are injected; a successful discovery without its
+    # owned schema data would be producer corruption, not this control.
+    from elspeth.web.composer.tools import ToolResult, execute_tool
 
-    from elspeth.web.composer.state import ValidationSummary
-    from elspeth.web.composer.tools import ToolResult
-
-    discovery_success = ToolResult(
-        success=True,
-        updated_state=dc_replace(state),
-        validation=ValidationSummary(
-            is_valid=False,
-            errors=(),
-            warnings=(),
-            suggestions=(),
-            semantic_contracts=(),
-        ),
-        affected_nodes=(),
-    )
+    def dispatch_with_mutation_failures(tool_name: str, *args: Any, **kwargs: Any) -> ToolResult:
+        if tool_name == "set_metadata":
+            raise arg_error
+        return execute_tool(tool_name, *args, **kwargs)
 
     # `get_plugin_schema` is cacheable — turn d2's identical args hit the
     # discovery cache and bypass execute_tool entirely. So execute_tool is
@@ -457,24 +446,26 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
     # mutation success that clears the tracker. (It must not — cache-hit
     # path was already gated above; this test verifies the dispatch path
     # gate too.)
-    side_effects = [
-        arg_error,  # c1 set_metadata fail
-        discovery_success,  # d1 get_plugin_schema success (cache miss → dispatch)
-        arg_error,  # c2 set_metadata fail
-        # d2 get_plugin_schema → CACHE HIT, no execute_tool call
-        arg_error,  # c3 set_metadata fail
-    ]
-
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=side_effects),
+        patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=dispatch_with_mutation_failures) as mock_execute,
     ):
         mock_llm.side_effect = turns
         await service.compose("Build something", [], state)
 
     # 6th LLM call should see the hint after the 3rd identical mutation failure.
     assert mock_llm.call_count == 6, f"expected 6 LLM calls, got {mock_llm.call_count}"
+    assert [call.args[0] for call in mock_execute.call_args_list] == [
+        "set_metadata",
+        "get_plugin_schema",
+        "set_metadata",
+        "set_metadata",
+    ]
     sixth_call_messages = mock_llm.call_args_list[5].args[0]
+    discoveries = [message for message in sixth_call_messages if message.get("tool_call_id") in {"d1", "d2"}]
+    assert [message["tool_call_id"] for message in discoveries] == ["d1", "d2"]
+    assert all(json.loads(message["content"])["success"] for message in discoveries)
+    assert json.loads(discoveries[0]["content"])["data"] == json.loads(discoveries[1]["content"])["data"]
     hint_messages = [m for m in sixth_call_messages if isinstance(m, dict) and "[ELSPETH-SYSTEM-HINT]" in str(m.get("content", ""))]
     assert len(hint_messages) == 1, (
         f"expected 1 hint after 3 identical mutation failures interleaved with discovery successes; got {len(hint_messages)}"

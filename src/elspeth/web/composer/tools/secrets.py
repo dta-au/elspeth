@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secrets import SecretInventoryItem, SecretScope, SecretUnavailabilityReason
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import _OmittableString
+from elspeth.web.composer.response_contracts import SelectedResponseContract
 from elspeth.web.composer.state import (
     CompositionState,
 )
@@ -108,6 +111,76 @@ def _inventory_item_payload(item: SecretInventoryItem) -> _SecretInventoryItemPa
     }
 
 
+_SECRET_SCOPE_ADAPTER: TypeAdapter[SecretScope] = TypeAdapter(SecretScope)
+_SECRET_REASON_ADAPTER: TypeAdapter[SecretUnavailabilityReason | None] = TypeAdapter(SecretUnavailabilityReason | None)
+
+
+@dataclass(frozen=True, slots=True)
+class _UnlistedSecretRefStatus:
+    name: str
+    available: bool
+
+
+def _admit_secret_inventory_item(value: object) -> SecretInventoryItem:
+    """Reconstruct immutable metadata after checking every owned field."""
+    if type(value) is SecretInventoryItem:
+        name, scope, available, source_kind, reason = value.name, value.scope, value.available, value.source_kind, value.reason
+    elif isinstance(value, (dict, MappingProxyType)) and set(value) == _SecretInventoryItemPayload.__required_keys__:
+        name, scope, available, source_kind, reason = (
+            value["name"],
+            value["scope"],
+            value["available"],
+            value["source_kind"],
+            value["reason"],
+        )
+    else:
+        raise FrameworkBugError("Malformed secret inventory response")
+    if type(name) is not str or type(available) is not bool or type(source_kind) is not str:
+        raise FrameworkBugError("Malformed secret inventory response")
+    try:
+        admitted_scope = _SECRET_SCOPE_ADAPTER.validate_python(scope, strict=True)
+        admitted_reason = _SECRET_REASON_ADAPTER.validate_python(reason, strict=True)
+        return SecretInventoryItem(name, admitted_scope, available, source_kind, admitted_reason)
+    except (PydanticValidationError, ValueError):
+        raise FrameworkBugError("Malformed secret inventory response") from None
+
+
+def _admit_secret_inventory(value: object) -> tuple[SecretInventoryItem, ...]:
+    if type(value) is not list and type(value) is not tuple:
+        raise FrameworkBugError("Malformed secret inventory response")
+    return tuple(_admit_secret_inventory_item(item) for item in value)
+
+
+def _admit_secret_status(value: object) -> SecretInventoryItem | _UnlistedSecretRefStatus:
+    if type(value) is _UnlistedSecretRefStatus:
+        name, available = value.name, value.available
+    elif isinstance(value, (dict, MappingProxyType)) and set(value) == {"name", "available"}:
+        name, available = value["name"], value["available"]
+    else:
+        return _admit_secret_inventory_item(value)
+    if type(name) is not str or type(available) is not bool:
+        raise FrameworkBugError("Malformed secret reference response")
+    return _UnlistedSecretRefStatus(name, available)
+
+
+def _encode_secret_inventory_item(item: SecretInventoryItem) -> JsonValue:
+    return {"name": item.name, "scope": item.scope, "available": item.available, "source_kind": item.source_kind, "reason": item.reason}
+
+
+def _encode_secret_inventory(items: tuple[SecretInventoryItem, ...]) -> JsonValue:
+    return [_encode_secret_inventory_item(item) for item in items]
+
+
+def _encode_secret_status(item: SecretInventoryItem | _UnlistedSecretRefStatus) -> JsonValue:
+    if type(item) is SecretInventoryItem:
+        return _encode_secret_inventory_item(item)
+    return {"name": item.name, "available": item.available}
+
+
+_SECRET_INVENTORY_RESPONSE = SelectedResponseContract(_admit_secret_inventory, _encode_secret_inventory)
+_SECRET_STATUS_RESPONSE = SelectedResponseContract(_admit_secret_status, _encode_secret_status)
+
+
 def _live_validation_failure_reason(item: SecretInventoryItem) -> SecretUnavailabilityReason:
     if item.reason is not None:
         return item.reason
@@ -134,6 +207,7 @@ _LIST_SECRET_REFS_DECLARATION = ToolDeclaration(
     name="list_secret_refs",
     handler=_handle_list_secret_refs,
     kind=ToolKind.SECRET_DISCOVERY,
+    response_contract=_SECRET_INVENTORY_RESPONSE,
     description=(
         "List available secret references (API keys, credentials). Each entry carries the reference `name`, its "
         "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
@@ -178,6 +252,7 @@ _VALIDATE_SECRET_REF_DECLARATION = ToolDeclaration(
     name="validate_secret_ref",
     handler=_handle_validate_secret_ref,
     kind=ToolKind.SECRET_DISCOVERY,
+    response_contract=_SECRET_STATUS_RESPONSE,
     description=(
         "Check if a secret reference exists and is accessible to the current user. Returns the checked reference `name` "
         "and `available` (true when it resolves for you). When the reference appears in your inventory, also returns "

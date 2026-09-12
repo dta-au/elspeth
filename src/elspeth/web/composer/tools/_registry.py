@@ -50,6 +50,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Final
 
+from elspeth.web.composer.response_contracts import ResponseContract
 from elspeth.web.composer.tools._common import ToolHandler
 from elspeth.web.composer.tools.blobs import (
     TOOLS_IN_MODULE as _BLOBS_TOOLS_IN_MODULE,
@@ -102,6 +103,16 @@ _REGISTERED_TOOLS: Final[tuple[ToolDeclaration, ...]] = (
 assert_unique_names(_REGISTERED_TOOLS)
 
 _DECLARATIONS_BY_NAME: Final = MappingProxyType({decl.name: decl for decl in _REGISTERED_TOOLS})
+
+
+def response_contract_for(tool_name: str) -> ResponseContract | None:
+    """Select a producer contract; unconverted declarations remain explicit.
+
+    Discovery declarations own a selected contract; mutation declarations do not.
+    Unknown tools still fail through the authoritative declaration lookup.
+    """
+    return _DECLARATIONS_BY_NAME[tool_name].response_contract
+
 
 # Async tools have no synchronous declaration. These are authored-domain
 # effects only; advisor calls still perform network, budget and audit work.

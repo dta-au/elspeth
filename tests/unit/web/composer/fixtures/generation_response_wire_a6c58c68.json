@@ -1,0 +1,65 @@
+{
+  "captured_head": "a6c58c68fe99c726805937f297a156af8f2cd3ef",
+  "cases": {
+    "diff_empty": {
+      "success": true,
+      "data": "{\"from_version\": 1, \"sources_changed\": false, \"metadata_changed\": false, \"nodes\": {\"added\": [], \"removed\": [], \"modified\": []}, \"edges\": {\"added\": [], \"removed\": [], \"modified\": []}, \"outputs\": {\"added\": [], \"removed\": [], \"modified\": []}, \"warnings_introduced\": [], \"warnings_resolved\": [], \"total_changes\": 0}"
+    },
+    "diff_sources": {
+      "success": true,
+      "data": "{\"from_version\": 1, \"sources_changed\": true, \"metadata_changed\": false, \"nodes\": {\"added\": [], \"removed\": [], \"modified\": []}, \"edges\": {\"added\": [], \"removed\": [], \"modified\": []}, \"outputs\": {\"added\": [], \"removed\": [], \"modified\": []}, \"sources\": {\"added\": [\"strange/key\"], \"removed\": [], \"modified\": []}, \"warnings_introduced\": [\"Source 'strange/key' on_success 'rows' does not match any node input or output \\u2014 data may not flow.\"], \"warnings_resolved\": [], \"total_changes\": 1}"
+    },
+    "explain_exact": {
+      "success": true,
+      "data": "{\"error_text\": \"unknown_node_type\", \"explanation\": \"The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.\", \"suggested_fix\": \"Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node \\u2014 node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases to arriving connections, input repeats the first branch value, and on_success names downstream processing.\"}"
+    },
+    "explain_noisy": {
+      "success": true,
+      "data": "{\"error_text\": \"LOG QUARANTINE_UNKNOWN_OUTPUT END\", \"error_code\": \"quarantine_unknown_output\", \"explanation\": \"The source on_validation_failure names an output that is not declared.\", \"suggested_fix\": \"Declare the intended quarantine output and reference its name in on_validation_failure, or choose 'discard' only if discarding invalid source rows is intended.\"}"
+    },
+    "explain_none": {
+      "success": true,
+      "data": "{\"error_text\": \"ZZZ_UNRECOGNIZED_QQQ\", \"explanation\": \"The text does not match any known validation message or closed error_code.\", \"suggested_fix\": \"Call explain_validation_error with the exact error_code string from the rejection feedback's validation.errors[].error_code. Closed codes: unknown_node_type, coalesce_on_success_must_be_sink, coalesce_missing_branches, coalesce_config_invalid, coalesce_policy_invalid, coalesce_merge_invalid, coalesce_branch_alias_unreachable, row_union_config_invalid, row_union_name_invalid, row_union_branches_invalid, row_union_branch_invalid, row_union_input_mismatch, row_union_on_success_invalid, row_union_timeout_invalid, row_union_branch_alias_unreachable, row_union_branch_unreachable, row_union_branch_not_downstream, row_union_branch_aggregation_invalid, row_union_nested_fork_invalid, row_union_downstream_group_invalid, row_union_schema_incompatible, row_union_on_success_must_be_connection, row_union_on_success_dangling, fork_branch_multiple_barriers, fork_mixed_closure_invalid, fork_multiple_closers_invalid, fork_roster_mismatch, bound_region_sink_inside, bound_region_aggregation_invalid, gate_duplicate_fork_branch, transform_missing_on_success, transform_missing_on_error, transform_on_success_dangling, transform_on_error_unknown_sink, gate_on_error_unknown_sink, aggregation_on_success_dangling, source_on_success_dangling, gate_missing_condition, gate_missing_routes, gate_route_labels_mismatch, fork_branch_no_destination, pipeline_decision_unregistered, interpretation_requirements_invalid, plugin_options_invalid, schema_contract_violation, sink_contract_violation, locked_input_extras, sink_locked_extras, transform_contract_violation, transform_declared_output_not_guaranteed, semantic_contract_violation, contract_config_invalid, coalesce_schema_mode_mixed, coalesce_union_type_incompatible, no_source_configured, no_sinks_configured, source_name_invalid, reserved_node_id, duplicate_node_id, duplicate_output_name, duplicate_edge_id, edge_unknown_node, duplicate_connection_producer, duplicate_connection_consumer, connection_sink_name_overlap, gate_condition_invalid, aggregation_missing_plugin, aggregation_missing_on_error, aggregation_output_mode_invalid, batch_transform_misplaced, batch_required_fields_invalid, batch_value_field_not_numeric, queue_config_invalid, collector_missing_scope, collector_scope_policy_invalid, scope_opener_unknown, scope_opener_not_multi_row, guided_collector_opener_unresolved, collector_has_trigger_invalid, collector_has_on_error_invalid, collector_missing_plugin, collector_plugin_not_batch_aware, collector_config_invalid, collector_on_success_dangling, scope_name_duplicate, scope_opener_duplicate, scope_name_invalid, node_scope_fields_unsupported, structural_node_plugin_forbidden, queue_no_consumer, queue_name_collision, coalesce_branch_unreachable, node_input_not_reachable, coalesce_on_success_unknown_sink, aggregation_trigger_invalid, web_scrape_http_identity_invalid, prompt_template_unbound_variables, query_template_unbound_row_fields, prompt_template_undeclared_row_fields, interpretation_review_contract_unsatisfied, interpretation_review_draft_malformed, vague_term_unwired, review_reconciliation_failed, file_sink_write_policy_invalid, proposal_missing_requested_transforms, guided_correction_unchanged, guided_amend_contract_violation, guided_revision_unchanged, guided_delta_unknown_stable_id, guided_delta_duplicate_stable_id, guided_delta_authority_violation, guided_delta_nonincident_route, guided_delta_unknown_reference, guided_delta_reviewed_failure_route_required, reviewed_output_projection_conflict, passthrough_cannot_produce_declared_fields, gate_condition_ignores_stated_threshold, plugin_not_enabled, plugin_not_installed, plugin_unavailable, credential_unavailable, profile_unavailable, plugin_not_allowed_on_web, on_error_closer_out_of_region, guided_output_alias_collision, guided_reviewed_name_shadowed, guided_route_target_unknown, diff_baseline_unavailable, coalesce_policy_quorum_unsupported, coalesce_best_effort_requires_timeout, coalesce_merge_select_unsupported, quarantine_unknown_output, aggregation_expected_output_count_mode_invalid.\"}"
+    },
+    "explain_hint": {
+      "success": true,
+      "data": "{\"error_text\": \"unknown node_type. Expected a gate.\", \"explanation\": \"The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.\", \"suggested_fix\": \"Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node \\u2014 node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases to arriving connections, input repeats the first branch value, and on_success names downstream processing. Expected a gate.\"}"
+    },
+    "assistance": {
+      "success": true,
+      "data": "{\"plugin_type\": \"transform\", \"plugin_name\": \"passthrough\", \"issue_code\": null, \"summary\": \"Deep-copies each row unchanged for wiring or debugging stages.\", \"suggested_fixes\": [], \"examples\": [], \"composer_hints\": [\"Use passthrough only when you need a named stage that preserves every input field.\", \"It does not rename, drop, coerce, filter, or add fields; choose another transform for data changes.\", \"Use schema.mode=observed for flexible wiring, or an explicit schema to enforce upstream shape.\"]}"
+    },
+    "assistance_none": {
+      "success": true,
+      "data": "{\"plugin_type\": \"transform\", \"plugin_name\": \"passthrough\", \"issue_code\": \"no_help\", \"summary\": null, \"suggested_fixes\": [], \"examples\": [], \"composer_hints\": []}"
+    },
+    "models_summary": {
+      "success": true,
+      "data": "{\"providers\": {\"\": 1, \"odd\": 2, \"openrouter\": 1}, \"total_models\": 4, \"hint\": \"Use provider parameter to list models for a specific provider. An empty string key means models without a provider prefix.\"}"
+    },
+    "models_filter": {
+      "success": true,
+      "data": "{\"models\": [\"odd/provider\"], \"count\": 2, \"truncated\": true}"
+    },
+    "models_empty_prefix": {
+      "success": true,
+      "data": "{\"models\": [\"plain\"], \"count\": 1, \"truncated\": false}"
+    },
+    "models_no_match": {
+      "success": true,
+      "data": "{\"models\": [], \"count\": 0, \"truncated\": false}"
+    },
+    "preview_empty": {
+      "success": true,
+      "data": "{\"preview_is_valid\": false, \"preview_errors\": [{\"component\": \"pipeline\", \"message\": \"The runtime preflight stage did not run for this preview, so this pipeline has not been checked against the real engine at all (path allowlist, plugin instantiation, graph structure, schema compatibility, secret refs, policy gates). preview_is_valid is false because no verdict on those checks exists, not because one of them failed. This is a server wiring omission, not a defect in the pipeline: do not rewrite the pipeline to try to clear it \\u2014 report that preview_pipeline returned runtime_preflight_not_run.\", \"severity\": \"high\", \"error_code\": \"runtime_preflight_not_run\"}], \"edge_contracts\": [], \"proof_diagnostics\": [], \"sources\": {}, \"node_count\": 0, \"output_count\": 0, \"nodes\": [], \"outputs\": []}"
+    },
+    "preview_proof": {
+      "success": true,
+      "data": "{\"preview_is_valid\": false, \"preview_errors\": [{\"component\": \"pipeline\", \"message\": \"The runtime preflight stage did not run for this preview, so this pipeline has not been checked against the real engine at all (path allowlist, plugin instantiation, graph structure, schema compatibility, secret refs, policy gates). preview_is_valid is false because no verdict on those checks exists, not because one of them failed. This is a server wiring omission, not a defect in the pipeline: do not rewrite the pipeline to try to clear it \\u2014 report that preview_pipeline returned runtime_preflight_not_run.\", \"severity\": \"high\", \"error_code\": \"runtime_preflight_not_run\"}], \"edge_contracts\": [], \"proof_diagnostics\": [{\"code\": \"source_inspection_failed\", \"severity\": \"blocking\", \"message\": \"A guided reviewed source claims blob custody, but the live blob is not an exact ready, session-owned path match.\", \"suggested_repair\": \"Re-select or re-upload the source blob, then confirm the guided wiring again.\", \"evidence_locator\": {\"source\": \"blob\", \"blob_id\": \"claimed-id\", \"source_name\": \"proof\"}}], \"sources\": {\"proof\": {\"plugin\": \"csv\", \"on_success\": \"rows\", \"has_schema_config\": false}}, \"node_count\": 0, \"output_count\": 0, \"nodes\": [], \"outputs\": []}"
+    },
+    "preview_structural": {
+      "success": true,
+      "data": "{\"preview_is_valid\": false, \"preview_errors\": [], \"edge_contracts\": [], \"proof_diagnostics\": [], \"sources\": {\"source\": {\"plugin\": \"csv\", \"on_success\": \"main\", \"has_schema_config\": true}}, \"node_count\": 0, \"output_count\": 1, \"nodes\": [], \"outputs\": [{\"name\": \"main\", \"plugin\": \"csv\"}], \"structural_preview\": {\"is_valid\": false, \"confidence\": \"equivalent\", \"masking_applied\": false, \"failing_checks\": [{\"name\": \"plugin_instantiation\", \"detail\": \"llm node 'summarize' rejected its configuration.\", \"outcome_code\": null, \"affected_nodes\": [\"summarize\"]}], \"errors\": [{\"component_id\": \"edge:summarize->main\", \"component_type\": \"edge\", \"message\": \"consumer requires ['colour'], producer guarantees (none)\", \"suggestion\": \"Declare the field on the producer.\", \"error_code\": null}], \"note\": \"The pending interpretation review required no placeholder substitution, so these findings were computed against the exact authored pipeline and are as reliable as a strict preflight. Repair any finding below before completing.\"}}"
+    }
+  }
+}

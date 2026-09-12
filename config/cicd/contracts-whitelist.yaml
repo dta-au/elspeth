@@ -970,11 +970,6 @@ allowed_dict_patterns:
   # untyped external-library completion surface, not a contract this codebase
   # owns the shape of.
   - "src/elspeth/web/composer/service.py:_apply_openrouter_usage_accounting:kwargs"
-  # Blob sync helpers — return dicts for LLM-visible tool response payloads.
-  # The list_composer_blobs shape is deliberately metadata-only, enforced by
-  # the construction helper; bytes/previews/storage paths stay outside the
-  # response surface.
-  - "src/elspeth/web/composer/tools/blobs.py:_sync_list_blobs:return (list)"
   # Secret tool handlers — same pattern as above, LLM-provided arguments
   - "src/elspeth/web/composer/tools/secrets.py:_handle_list_secret_refs:arguments"
   - "src/elspeth/web/composer/tools/secrets.py:_handle_validate_secret_ref:arguments"
