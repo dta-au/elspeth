@@ -941,10 +941,12 @@ def _walk_type(
     # the BaseModel arm; this fix is purely additive for the Optional[scalar]
     # case that previously emitted no node at all.
     if _is_union(origin):
-        non_none_arms = [a for a in get_args(field_type) if a is not type(None)]
+        # Schema-only metadata can wrap the None arm (SkipJsonSchema[None]);
+        # normalize before counting arms so an optional scalar stays optional.
+        arms = [_normalise(arm, ()) for arm in get_args(field_type)]
+        non_none_arms = [(arm_type, arm_metadata) for arm_type, arm_metadata in arms if arm_type is not type(None)]
         is_optional_of_scalar = len(non_none_arms) == 1
-        for arm in non_none_arms:
-            arm_type, arm_metadata = _normalise(arm, ())
+        for arm_type, arm_metadata in non_none_arms:
             if not _is_descendable(arm_type) and not _has_sensitive(arm_metadata) and not is_optional_of_scalar:
                 continue
             yield from _walk_type(

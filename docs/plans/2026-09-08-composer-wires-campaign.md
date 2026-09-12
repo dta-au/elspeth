@@ -157,6 +157,30 @@ historical exceptions is a permanent waiver on the moving release.
 
 ## Remaining execution order
 
+**Execution checkpoint — 2026-09-12.** Commit
+`73f6ea15de460065845fdb6f18f5e6b1cac6efb3` repairs safe JSON guidance readback,
+incremental trigger bounds, published review string bounds, declaration
+expectations and the unspecced mock. Fresh-worktree verification ran the same
+focused selection successfully (308 tests); five individual repair reversions
+failed at the intended assertions, with independent review. MODEL acceptance
+remains open. The broader Composer/MCP run exited 1 with **26 failed, 9,190
+passed** and a 300-second executor-shutdown warning. Its follow-up repairs cover
+annotated optional-field traversal, invalid property generators, stale tool and
+edge expectations, and an unused facade export. Do not treat this checkpoint as
+broader acceptance or release integration.
+
+The repaired, frozen snapshot subsequently reports **9,221 passed, 1 warning**
+in the same broad selection (exit 0, 141.18 seconds). The remaining warning is
+Hypothesis ignoring an unsupported Strict annotation; explicit MODEL scalar
+controls remain in the selection. The shutdown test passes unrestricted in
+0.87 seconds and reproduces its teardown stall only in the sandbox, so no
+synchronization workaround was added. The same 18-file mypy selection and
+contract checks pass. Eight additional representative charter mutations have
+green/mutant/restored evidence at `73f6ea15d`; the shared optional-field walker
+has a separate discriminating regression. LLM and systems reviews found no
+blocker. Advisor rejection remains safe but less field-specific; consider owned
+field-specific diagnostics during the existing guidance milestone.
+
 Each milestone ends with a frozen, named source state, proportionate tests,
 reconciled baseline/mutant/restored evidence and fresh review. Historical reviewed
 work is retained and regression-tested rather than automatically rewritten.
@@ -173,24 +197,28 @@ are supporting historical evidence; their pending choices are superseded.
   casts and duplicate model-enforced encoding checks, and narrow the census AST
   values. The identical 18-file mypy rerun passed; actual MODEL acceptance remains
   open in the steps below. Preserve every real admission boundary.
-- [ ] Run the exact preparation selection below after the final protocol feedback
-  repair. The September 12 rerun still has four feedback failures; diagnose the
+- [x] Run the preparation selection within the broader owned Composer suite after
+  the final protocol feedback repair. The earlier September 12 rerun had four
+  feedback failures; diagnose the
   actual exception-to-planner authority rather than assume wording placement
   fixed it. Test actual planner-visible canonicalization, idempotence, bounds and
   secret/unknown-key/cause withholding, not just caller-level text.
-- [ ] Finish advisor state/version/budget/accounting controls, valid exhausted
+- [x] Finish advisor state/version/budget/accounting controls, valid exhausted
   budget behavior, typed formatter equivalence/scrubbing/size checks and remaining
   schema/nullability/requiredness cases. Complete original input must reach owned
   public admission before budget or provider effects.
-- [ ] Repeat a consistent typing scope including `protocol.py`, Ruff/format and
+- [x] Repeat a consistent typing scope including `protocol.py`, Ruff/format and
   contracts. Compare the identical target list with an explicitly named baseline;
   the historical before/after 18-versus-17-file mismatch cannot prove parity.
-- [ ] Replace the known unspecced mock with a spec for its real collaborator and
-  rerun the mock-discipline gate alongside affected MODEL tests.
-- [ ] Resolve the fourteen measured declaration-definition expectations in
+- [x] Replace the known unspecced mock with a spec for its real collaborator and
+  rerun the mock-discipline gate alongside affected MODEL tests. The checkpoint's
+  three-test gate passes; restoring the old parity test exposes the constructor.
+- [x] Resolve the fourteen measured declaration-definition expectations in
   `tests/unit/web/composer/test_tool_declarations.py`, checking behavior and
-  teaching against the approved contract and comparing the named release base.
-- [ ] Freeze and run the broad owned Composer selection, representative charter
+  teaching against the approved contract. The identical declaration selection
+  reports 93 passed at the checkpoint and 14 failed / 79 passed with its
+  expectations restored from the named consolidation base `e50604428`.
+- [x] Freeze and run the broad owned Composer selection, representative charter
   mutations, and fresh spec/quality, LLM-feedback and systems reviews. Evaluate
   avoidable repeated validation only after correct public paths are proved.
 

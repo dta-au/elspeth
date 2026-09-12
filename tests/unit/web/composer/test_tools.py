@@ -14729,7 +14729,11 @@ class TestCreateBlobTypeGuard:
         with (
             pytest.raises(
                 ToolArgumentError,
-                match=r"'create_blob arguments' must be object conforming to CreateBlobArgumentsModel, got ValidationError",
+                match=(
+                    r"^'create_blob arguments' must be object conforming to CreateBlobArgumentsModel\. "
+                    r"Match the tool's declared JSON types\. Supply object and array fields as actual JSON objects and arrays, "
+                    r"not strings containing JSON\., got ValidationError$"
+                ),
             ) as exc_info,
             _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
         ):
@@ -14843,7 +14847,11 @@ class TestUpdateBlobTypeGuard:
         with (
             pytest.raises(
                 ToolArgumentError,
-                match=r"'update_blob arguments' must be object conforming to UpdateBlobArgumentsModel, got ValidationError",
+                match=(
+                    r"^'update_blob arguments' must be object conforming to UpdateBlobArgumentsModel\. "
+                    r"Match the tool's declared JSON types\. Supply object and array fields as actual JSON objects and arrays, "
+                    r"not strings containing JSON\., got ValidationError$"
+                ),
             ) as exc_info,
             _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
         ):
@@ -14993,7 +15001,11 @@ class TestSetSourceFromBlobTypeGuard:
         # "column=text") and its type ("got str") are not echoed.
         with pytest.raises(
             ToolArgumentError,
-            match=r"'set_source_from_blob arguments' must be object conforming to SetSourceFromBlobArgumentsModel, got ValidationError",
+            match=(
+                r"^'set_source_from_blob arguments' must be object conforming to SetSourceFromBlobArgumentsModel\. "
+                r"Match the tool's declared JSON types\. Supply object and array fields as actual JSON objects and arrays, "
+                r"not strings containing JSON\., got ValidationError$"
+            ),
         ) as exc_info:
             execute_tool(
                 "set_source_from_blob",
@@ -16463,7 +16475,11 @@ class TestInspectSourceTool:
         with (
             pytest.raises(
                 ToolArgumentError,
-                match=r"'inspect_source arguments' must be object conforming to InspectSourceArgumentsModel, got ValidationError",
+                match=(
+                    r"^'inspect_source arguments' must be object conforming to InspectSourceArgumentsModel\. "
+                    r"Match the tool's declared JSON types\. Supply object and array fields as actual JSON objects and arrays, "
+                    r"not strings containing JSON\., got ValidationError$"
+                ),
             ) as exc_info,
             _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
         ):

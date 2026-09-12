@@ -209,7 +209,9 @@ class TestSinkEdgeMirrorAtomicity:
         r2 = execute_tool("upsert_edge", _edge_args("e2", "t1", "err_a", "on_error"), r1.updated_state, catalog)
         assert r2.success is False
         assert r2.updated_state is r1.updated_state
-        assert "e1" in str(r2.data)
+        conflicts = [entry for entry in r2.validation.errors if entry.error_code == "edge_route_conflict"]
+        assert len(conflicts) == 1
+        assert "e1" in conflicts[0].message
 
     def test_remove_edge_on_legacy_duplicate_state_keeps_live_mirror(self) -> None:
         """A persisted state may carry semantic duplicates from before the

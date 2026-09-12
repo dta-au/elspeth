@@ -96,6 +96,9 @@ from elspeth.web.composer import tools as tools_module
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     MANIFEST,
+    CreateBlobArgumentsModel,
+    GetBlobContentDataModel,
+    GetBlobContentResponseModel,
     SetPipelineArgumentsModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
@@ -185,23 +188,37 @@ _OPTIONS_STRATEGY: st.SearchStrategy[dict[str, Any]] = st.dictionaries(
 
 
 def _set_source_from_blob_strategy() -> st.SearchStrategy[SetSourceFromBlobArgumentsModel]:
-    return st.builds(
-        SetSourceFromBlobArgumentsModel,
-        blob_id=st.text(),
-        on_success=st.text(),
-        plugin=st.one_of(st.none(), st.text()),
-        on_validation_failure=st.one_of(st.none(), st.text()),
-        options=_OPTIONS_STRATEGY,
-    )
+    return st.fixed_dictionaries(
+        {"blob_id": st.text(), "on_success": st.text(), "options": _OPTIONS_STRATEGY},
+        optional={"plugin": st.text(), "on_validation_failure": st.text(), "source_name": st.text()},
+    ).map(SetSourceFromBlobArgumentsModel.model_validate)
 
 
 def _set_source_from_blobs_strategy() -> st.SearchStrategy[SetSourceFromBlobsArgumentsModel]:
-    return st.builds(
-        SetSourceFromBlobsArgumentsModel,
-        blob_ids=st.lists(st.text(), min_size=1, max_size=5),
-        on_success=st.text(),
-        on_validation_failure=st.one_of(st.none(), st.text()),
-        options=_OPTIONS_STRATEGY,
+    return st.fixed_dictionaries(
+        {"blob_ids": st.lists(st.text(), min_size=1, max_size=5), "on_success": st.text(), "options": _OPTIONS_STRATEGY},
+        optional={"on_validation_failure": st.text(), "source_name": st.text()},
+    ).map(SetSourceFromBlobsArgumentsModel.model_validate)
+
+
+def _create_blob_strategy() -> st.SearchStrategy[CreateBlobArgumentsModel]:
+    return st.fixed_dictionaries(
+        {
+            "filename": st.text(),
+            "mime_type": st.sampled_from(CreateBlobArgumentsModel.model_json_schema()["properties"]["mime_type"]["enum"]),
+            "content": st.text(),
+        },
+        optional={"description": st.text()},
+    ).map(CreateBlobArgumentsModel.model_validate)
+
+
+def _get_blob_content_response_strategy() -> st.SearchStrategy[GetBlobContentResponseModel]:
+    # Success requires data; failure can omit it. Other envelope fields retain
+    # their inferred strategies, including nested sensitive repair arguments.
+    data = st.from_type(GetBlobContentDataModel)
+    return st.one_of(
+        st.builds(GetBlobContentResponseModel, success=st.just(True), data=data),
+        st.builds(GetBlobContentResponseModel, success=st.just(False), data=st.one_of(st.none(), data)),
     )
 
 
@@ -340,6 +357,8 @@ def _repair_tool_call_strategy() -> st.SearchStrategy[_RepairToolCallShadowModel
 
 st.register_type_strategy(SetSourceFromBlobArgumentsModel, _set_source_from_blob_strategy())
 st.register_type_strategy(SetSourceFromBlobsArgumentsModel, _set_source_from_blobs_strategy())
+st.register_type_strategy(CreateBlobArgumentsModel, _create_blob_strategy())
+st.register_type_strategy(GetBlobContentResponseModel, _get_blob_content_response_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
 st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())
