@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from typing import Annotated, cast
 from uuid import UUID, uuid4
@@ -74,6 +75,7 @@ from .._helpers import (
 from ..guided_operations import (
     GuidedOperationExpired,
     GuidedOperationLease,
+    guided_operation_lease_guard,
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
@@ -424,13 +426,20 @@ async def post_guided_plan(
         return reserved
 
     recorder = BufferingRecorder()
-    progress = await _composer_progress_sink(
-        _get_composer_progress_registry(request),
-        request,
-        session_id=str(session_id),
-        request_id=body.operation_id,
-        user_id=user.user_id,
-    )
+    # Claiming progress is fallible and cancellable after acquiring session
+    # authority. The shared guard owns terminal disposition and lease cleanup
+    # until the claim succeeds; then the route's audited settlement/finally
+    # below takes ownership synchronously, before any further await.
+    async with AsyncExitStack() as claim_cleanup:
+        await claim_cleanup.enter_async_context(guided_operation_lease_guard(service=service, lease=reserved))
+        progress = await _composer_progress_sink(
+            _get_composer_progress_registry(request),
+            request,
+            session_id=str(session_id),
+            request_id=body.operation_id,
+            user_id=user.user_id,
+        )
+        claim_cleanup.pop_all()
     # Set the moment this worker observes that its guided authority is gone
     # (a takeover or lapse). From then on the lease's own close reporting the
     # same loss is expected and must never replace the outcome the route
