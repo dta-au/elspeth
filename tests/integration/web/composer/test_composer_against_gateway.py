@@ -130,15 +130,16 @@ _MODEL_TARGET = "composer-gw-e2e-target"
 _OAUTH_HOST = "oauth.composer-gw-e2e.mock"
 _UPSTREAM_HOST = "upstream.composer-gw-e2e.mock"
 
-# Bounds sized for real Composer traffic (measured empirically against the
-# trained-operator tool catalog + system skill prompt): 43 registered tools
-# totalling ~39KB of tool-def JSON (largest single tool ~7.3KB), and a
-# ~68KB system message. The Phase 2 e2e suite's bounds (10 tools / 20000
+# Bounds sized for real Composer traffic. The rendered system message reached
+# 100638 characters with the campaign teaching, exceeding the previous 100000
+# fixture limit before these tests could exercise their intended round trips.
+# Allow 128 Ki characters here; production gateway bounds remain independent.
+# The Phase 2 e2e suite's bounds (10 tools / 20000
 # chars) are sized for the low-level GatewayLLMProvider's synthetic
 # messages and are far too small for a real Composer request.
 _MAX_MESSAGES = "50"
 _MAX_TOOLS = "60"
-_MAX_STRING_CHARS = "100000"
+_MAX_STRING_CHARS = "131072"
 _MAX_SCHEMA_BYTES = "65536"
 _MAX_SCHEMA_DEPTH = "15"
 
