@@ -21,6 +21,7 @@ from tests.integration.web.composer.guided.test_step_chat import (
     _fake_resolve_source_response_csv,
     _fake_source_resolution_tool_call,
     _ReturningLiteLLMCompletion,
+    _SequencedLiteLLMCompletion,
 )
 from tests.integration.web.composer.guided.test_wrong_stage_intent import _PAIR_RETAIN_ARGUMENTS
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
@@ -83,6 +84,7 @@ def _resolve_upload(
             }
         )
     )
+    completion.response.choices[0].message.tool_calls[0].id = "resolve-upload"
     monkeypatch.setattr(_CHAT_SOLVER_ACOMPLETION, completion)
     return completion
 
@@ -270,6 +272,102 @@ def test_provider_options_survive_pending_review_and_confirmation(
 
 
 @pytest.mark.parametrize("at_form", [False, True])
+@pytest.mark.parametrize("retain_later", [False, True])
+def test_invalid_uploaded_config_is_corrected_by_provider_before_binding(
+    composer_test_client: TestClient, monkeypatch: pytest.MonkeyPatch, at_form: bool, retain_later: bool
+) -> None:
+    """The recorded invalid schema must reach a retry, never server repair."""
+    client = composer_test_client
+    session_id = _create_session(client)
+    blob_id = _upload_inventory_csv(client, session_id)
+    initial = _post_respond(client, session_id, chosen=["csv"])["next_turn"] if at_form else _guided(client, session_id)["next_turn"]
+    invalid = {"schema": {"mode": "observed", "fields": {"sku": "str", "quantity": "int"}}, "encoding": "utf-8-sig"}
+    authored = {"schema": {"mode": "flexible", "fields": ["sku: str", "quantity: int"]}, "encoding": "utf-8-sig"}
+    replies = [_resolve_upload(monkeypatch, blob_id, options=options).response for options in (invalid, authored)]
+    if retain_later:
+        for reply in replies:
+            reply.choices[0].message.tool_calls.append(
+                SimpleNamespace(
+                    id="retain-later-transform",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_PAIR_RETAIN_ARGUMENTS)),
+                )
+            )
+    completion = _SequencedLiteLLMCompletion(replies)
+    monkeypatch.setattr(_CHAT_SOLVER_ACOMPLETION, completion)
+    request = _chat_body(initial, _UPLOAD_SENTINEL.format(filename="inventory.csv"))
+    response = client.post(f"/api/sessions/{session_id}/guided/chat", json=request)
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert len(completion.calls) == 2
+    assert body["next_turn"]["type"] == "inspect_and_confirm"
+    assert body["next_turn"]["payload"]["observed"]["columns"] == ["sku", "quantity"]
+    expected_options = {**authored, "path": f"blob:{blob_id}", "on_validation_failure": "discard"}
+    configured_options = {**expected_options, "columns": None, "delimiter": ",", "field_mapping": None, "skip_rows": 0}
+    guided = body["composition_state"]["composer_meta"]["guided_session"]
+    if retain_later:
+        (intent,) = guided["deferred_intents"]
+        assert intent["target_stage"] == "topology"
+    else:
+        assert guided["deferred_intents"] == []
+    (pending,) = guided["pending_source_intents"].values()
+    assert pending["options"] == configured_options
+    (form_record,) = [record for record in guided["history"] if record["turn_type"] == "schema_form"]
+    form_response = json.loads(client.app.state.payload_store.retrieve(form_record["response_hash"]))["payload"]
+    assert form_response["edited_values"] == {"plugin": "csv", "options": expected_options}
+    assert guided["reviewed_sources"] == {}
+    assert body["composition_state"]["sources"] == {}
+    refreshed = _guided(client, session_id)
+    assert refreshed["next_turn"] == body["next_turn"]
+    assert refreshed["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"] == guided["pending_source_intents"]
+    replay = client.post(f"/api/sessions/{session_id}/guided/chat", json=request)
+    assert replay.status_code == 200, replay.json()
+    assert replay.json() == body
+    assert len(completion.calls) == 2
+    confirmed = _post_respond(client, session_id, edited_values={"columns": ["sku", "quantity"]})
+    (source,) = confirmed["composition_state"]["composer_meta"]["guided_session"]["reviewed_sources"].values()
+    assert source["options"] == {key: value for key, value in configured_options.items() if key != "on_validation_failure"}
+    assert source["on_validation_failure"] == "discard"
+    assert len(completion.calls) == 2
+
+
+@pytest.mark.parametrize("at_form", [False, True])
+def test_exhausted_invalid_uploaded_config_preserves_source_custody(
+    composer_test_client: TestClient, monkeypatch: pytest.MonkeyPatch, at_form: bool
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    blob_id = _upload_inventory_csv(client, session_id)
+    if at_form:
+        _post_respond(client, session_id, chosen=["csv"])
+    before = _guided(client, session_id)
+    completion = _resolve_upload(
+        monkeypatch,
+        blob_id,
+        options={"schema": {"mode": "observed", "fields": {"sku": "str", "quantity": "int"}}, "encoding": "utf-8-sig"},
+    )
+    request = _chat_body(before["next_turn"], _UPLOAD_SENTINEL.format(filename="inventory.csv"))
+    response = client.post(f"/api/sessions/{session_id}/guided/chat", json=request)
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert len(completion.calls) == 2
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    assert body["next_turn"] == before["next_turn"]
+    for key in ("pending_source_intents", "reviewed_sources", "history"):
+        assert (
+            body["composition_state"]["composer_meta"]["guided_session"][key]
+            == before["composition_state"]["composer_meta"]["guided_session"][key]
+        )
+    assert body["composition_state"]["sources"] == {}
+    blobs = asyncio.run(client.app.state.blob_service.list_blobs(UUID(session_id)))
+    assert [str(blob.id) for blob in blobs] == [blob_id]
+    replay = client.post(f"/api/sessions/{session_id}/guided/chat", json=request)
+    assert replay.status_code == 200, replay.json()
+    assert replay.json() == body
+    assert len(completion.calls) == 2
+
+
+@pytest.mark.parametrize("at_form", [False, True])
 def test_provider_chat_only_cannot_author_an_uploaded_source(
     composer_test_client: TestClient, monkeypatch: pytest.MonkeyPatch, at_form: bool
 ) -> None:
@@ -397,7 +495,7 @@ def test_unoffered_upload_reference_is_a_model_defect_without_binding(
 
     assert response.status_code == 200, response.json()
     body = response.json()
-    assert len(completion.calls) == 1
+    assert len(completion.calls) == 2
     assert body["assistant_message_kind"] == "synthetic_failure"
     assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "model_defect"
     assert body["next_turn"] == form
@@ -418,7 +516,7 @@ def test_provider_plugin_mismatch_is_rejected_without_server_substitution(
     )
     assert response.status_code == 200, response.json()
     body = response.json()
-    assert len(completion.calls) == 1
+    assert len(completion.calls) == 2
     assert body["assistant_message_kind"] == "synthetic_failure"
     assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
     assert body["next_turn"] == before["next_turn"]
@@ -488,7 +586,7 @@ def test_rejected_provider_options_keep_grouped_deferred_intent_and_disposition(
     )
     assert response.status_code == 200, response.json()
     body = response.json()
-    assert len(completion.calls) == 1
+    assert len(completion.calls) == 2
     assert body["assistant_message_kind"] == "synthetic_failure"
     assert "couldn't apply" in body["assistant_message"]
     assert "I saved that instruction for the topology stage." in body["assistant_message"]
@@ -530,6 +628,95 @@ def test_uploaded_bind_integrity_failure_fails_the_operation_closed(
     assert str(primary) not in response.text
     assert len(completion.calls) == 1
     assert _guided(client, session_id)["composition_state"]["sources"] == {}
+
+
+@pytest.mark.parametrize("error_type", [AuditIntegrityError, InvariantError])
+@pytest.mark.parametrize("at_form", [False, True])
+def test_grouped_uploaded_config_integrity_failure_does_not_salvage_retain(
+    composer_test_client: TestClient, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception], at_form: bool
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    blob_id = _upload_inventory_csv(client, session_id)
+    if at_form:
+        _post_respond(client, session_id, chosen=["csv"])
+    before = _guided(client, session_id)
+    completion = _resolve_upload(monkeypatch, blob_id)
+    completion.response.choices[0].message.tool_calls.append(
+        SimpleNamespace(
+            id="retain-later-transform",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_PAIR_RETAIN_ARGUMENTS)),
+        )
+    )
+    primary = error_type("injected uploaded-config authority integrity failure")
+
+    def corrupt_authority(*_args: object, **_kwargs: object) -> object:
+        raise primary
+
+    monkeypatch.setattr(guided_route, "_schema8_schema_authority", corrupt_authority)
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(before["next_turn"], _UPLOAD_SENTINEL.format(filename="inventory.csv")),
+    )
+    assert response.status_code == 500, response.json()
+    assert response.json()["detail"]["failure_code"] == "integrity_error"
+    assert str(primary) not in response.text
+    assert len(completion.calls) == 1
+    after = _guided(client, session_id)
+    assert after["next_turn"] == before["next_turn"]
+    for key in ("deferred_intents", "pending_source_intents", "reviewed_sources", "history"):
+        assert (
+            after["composition_state"]["composer_meta"]["guided_session"][key]
+            == before["composition_state"]["composer_meta"]["guided_session"][key]
+        )
+    assert after["composition_state"]["sources"] == {}
+
+
+@pytest.mark.parametrize("retain_later", [False, True])
+def test_invalid_uploaded_config_then_prose_retry_never_binds_source(
+    composer_test_client: TestClient, monkeypatch: pytest.MonkeyPatch, retain_later: bool
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    blob_id = _upload_inventory_csv(client, session_id)
+    before = _guided(client, session_id)
+    invalid_reply = _resolve_upload(
+        monkeypatch, blob_id, options={"schema": {"mode": "observed", "fields": {"sku": "str", "quantity": "int"}}}
+    ).response
+    if retain_later:
+        invalid_reply.choices[0].message.tool_calls.append(
+            SimpleNamespace(
+                id="retain-later-transform",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_PAIR_RETAIN_ARGUMENTS)),
+            )
+        )
+    completion = _SequencedLiteLLMCompletion([invalid_reply, _fake_llm_reply("Please clarify the intended input schema.")])
+    monkeypatch.setattr(_CHAT_SOLVER_ACOMPLETION, completion)
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(before["next_turn"], _UPLOAD_SENTINEL.format(filename="inventory.csv")),
+    )
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert len(completion.calls) == 2
+    assert body["next_turn"] == before["next_turn"]
+    actual_guided = body["composition_state"]["composer_meta"]["guided_session"]
+    for key in ("pending_source_intents", "reviewed_sources", "history"):
+        assert actual_guided[key] == before["composition_state"]["composer_meta"]["guided_session"][key]
+    assert body["composition_state"]["sources"] == {}
+    if retain_later:
+        (intent,) = actual_guided["deferred_intents"]
+        expected_retained = {
+            **_PAIR_RETAIN_ARGUMENTS,
+            "redacted_summary": "Future topology instruction for transform plugin 'passthrough'; 1 structural constraint(s).",
+        }
+        for key, value in expected_retained.items():
+            assert intent[key] == value
+        assert body["assistant_message_kind"] == "synthetic_failure"
+        assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+        assert "I saved that instruction for the topology stage." in body["assistant_message"]
+    else:
+        assert actual_guided["deferred_intents"] == []
 
 
 class TestSourceFormBlobPrefillFallback:

@@ -590,10 +590,13 @@ async def test_existing_upload_real_solver_uses_only_provider_authored_choices(m
         seed=None,
         timeout_seconds=30,
         existing_upload=_existing_upload_context(),
+        validate_uploaded_source=lambda source: None,
     )
     assert len(captured) == 1
     wire = captured[0]
     prompt = json.dumps(wire["messages"])
+    assert "Keep `mode` `observed`" not in prompt
+    assert "fields as an array of strings" in prompt
     assert "offered-upload" in prompt and "quantity" in prompt
     assert all(canary not in prompt for canary in ("PRIVATE_STORAGE_PATH", "PRIVATE_FULL_HASH", "PRIVATE_RAW_URL"))
     upload_message = next(message for message in wire["messages"] if "Existing upload inspection" in message["content"])
@@ -601,6 +604,7 @@ async def test_existing_upload_real_solver_uses_only_provider_authored_choices(m
     schema = wire["tools"][0]["function"]["parameters"]
     assert schema["properties"]["upload_ref"]["enum"] == ["offered-upload"]
     assert len(schema["oneOf"]) == 2
+    assert "fields as an array of strings" in schema["properties"]["options"]["description"]
     if resolve:
         assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
         assert type(outcome.resolution) is chat_solver.Step1UploadedSourceChatResolution
@@ -7655,3 +7659,41 @@ class TestCommittedContextNamesWhatItPublishes:
         assert "raw option values" not in system["omitted"], "the unqualified claim is what the sibling key falsifies"
         for content in (block.system_content, self._corpus()[0][1].system_content):
             assert chat_solver._GUIDED_RAW_OPTION_OMISSION in content
+
+
+def test_uploaded_config_feedback_contains_only_closed_error_facts() -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.sources.csv_source import CSVSourceConfig
+
+    with pytest.raises(PluginConfigError) as caught:
+        CSVSourceConfig.from_dict(
+            {
+                "schema": {"mode": "observed", "fields": {"private_field_canary": "private_value_canary"}},
+                "path": "private_path_canary",
+                "on_validation_failure": "discard",
+            },
+            plugin_name="csv",
+        )
+    feedback = chat_solver._uploaded_config_feedback(caught.value)
+    assert json.loads(feedback) == {
+        "code": "uploaded_source_configuration_rejected",
+        "errors": [{"location": ["schema"], "type": "value_error"}],
+    }
+    assert "canary" not in feedback
+    assert "cannot have explicit" not in feedback
+
+
+@pytest.mark.asyncio
+async def test_upload_solver_refuses_missing_form_validation_authority() -> None:
+    with pytest.raises(chat_solver.InvariantError, match="source-form validation authority"):
+        await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Use this upload.",
+            plugin_hint=None,
+            current_source=None,
+            available_source_plugins=("csv",),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30,
+            existing_upload=_existing_upload_context(),
+        )

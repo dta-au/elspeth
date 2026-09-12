@@ -31,6 +31,7 @@ from elspeth.web.composer.guided.chat_solver import (
     GuidedChatEmptyOutcome,
     GuidedChatProseOutcome,
     GuidedToolArgumentShapeError,
+    GuidedUploadedSourceConfigError,
     Step1ExistingUploadContext,
     Step1SourceChatResolution,
     Step1SourcePluginReselectedOutcome,
@@ -491,6 +492,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
     existing_upload: Step1ExistingUploadContext | None = None,
+    validate_uploaded_source: Callable[[Step1UploadedSourceChatResolution], None] | None = None,
     allow_plugin_reselection: bool = False,
     api_base: str | None = None,
     api_key: str | None = None,
@@ -519,6 +521,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
             timeout_seconds=timeout_seconds,
             context_block=context_block,
             existing_upload=existing_upload,
+            validate_uploaded_source=validate_uploaded_source,
             allow_plugin_reselection=allow_plugin_reselection,
             api_base=api_base,
             api_key=api_key,
@@ -693,7 +696,12 @@ async def resolve_step_1_source_chat_with_auto_drop(
         )
         return GuidedStepChatOnlyResult(
             chat=StepChatResult(
-                assistant_message=_MODEL_SHAPE_REJECTED_MESSAGE,
+                assistant_message=(
+                    "I couldn't apply the uploaded source configuration, so I didn't change your pipeline. "
+                    "The file is still uploaded. Please clarify the source settings or continue with the wizard controls."
+                    if isinstance(exc, GuidedUploadedSourceConfigError)
+                    else _MODEL_SHAPE_REJECTED_MESSAGE
+                ),
                 status=ComposerChatTurnStatus.INVARIANT_VIOLATED,
                 latency_ms=latency_ms,
                 error_class=type(exc).__name__,

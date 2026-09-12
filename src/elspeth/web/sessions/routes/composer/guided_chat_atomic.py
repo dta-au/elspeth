@@ -8,7 +8,7 @@ import functools
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, Request
@@ -27,7 +27,7 @@ from elspeth.web.composer.guided.chat_solver import (
     Step1UploadedSourceChatResolution,
     resolved_sink_config_error,
 )
-from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin
+from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin, build_step_1_schema_form_turn
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.planning import (
     GuidedStructureUnprojectable,
@@ -41,6 +41,7 @@ from elspeth.web.composer.guided.stage_transitions import (
     AnsweredTurn,
     PluginSelectionResponse,
     SchemaFormResponse,
+    _validated_merged_options,
     transition_source_plugin_reselection,
     transition_source_plugin_selection,
     transition_source_schema_form,
@@ -578,6 +579,36 @@ def _guided_committed_graph_authority(
     )
 
 
+def _validate_uploaded_source_options(
+    source: Step1UploadedSourceChatResolution,
+    *,
+    upload: Step1ExistingUploadContext,
+    current_turn: Turn,
+    catalog: Any,
+) -> None:
+    """Apply the existing form authority without emitting or answering a turn."""
+    from elspeth.web.sessions.routes.composer import guided as guided_route
+
+    if source.upload_ref != upload.upload_ref:
+        raise AuditIntegrityError("uploaded source validation lost selected blob identity")
+    if not _inspection_matches_source_plugin(source.plugin, upload.facts):
+        raise PluginConfigError("planner source plugin does not match the inspected upload")
+    form = current_turn
+    if TurnType(current_turn["type"]) is TurnType.SINGLE_SELECT:
+        form = cast(Turn, deep_thaw(build_step_1_schema_form_turn(source.plugin, catalog, inspection_facts=upload.facts)))
+    options = dict(deep_thaw(source.options))
+    options["path"] = f"blob:{upload.upload_ref}"
+    options["on_validation_failure"] = source.on_validation_failure
+    authority = guided_route._schema8_schema_authority(turn=form, plugin=source.plugin, options=options, source=True, catalog=catalog)
+    _validated_merged_options(
+        SchemaFormResponse(plugin=source.plugin, options=options),
+        authority,
+        plugin_kind="source",
+        plugin_name=source.plugin,
+        structural_defaults={"on_validation_failure": "discard"},
+    )
+
+
 async def run_guided_chat_provider_attempt(
     *,
     session_id: UUID,
@@ -671,6 +702,12 @@ async def run_guided_chat_provider_attempt(
         graph_authority=graph_authority,
     )
     if step is GuidedStep.STEP_1_SOURCE:
+
+        def validate_uploaded_source(resolution: Step1UploadedSourceChatResolution) -> None:
+            if existing_upload is None or current_turn is None:
+                raise AuditIntegrityError("uploaded source validation has no frozen form authority")
+            _validate_uploaded_source_options(resolution, upload=existing_upload, current_turn=current_turn, catalog=catalog)
+
         plugin_hint = None
         allow_plugin_reselection = False
         target = guided.active_edit_target
@@ -691,6 +728,7 @@ async def run_guided_chat_provider_attempt(
             user_message=message,
             plugin_hint=plugin_hint,
             existing_upload=existing_upload,
+            validate_uploaded_source=validate_uploaded_source if existing_upload is not None else None,
             current_source=source,
             available_source_plugins=tuple(plugin.name for plugin in catalog.list_sources()),
             temperature=settings.composer_temperature,
@@ -2045,6 +2083,7 @@ async def post_guided_chat_schema8(
                             in {
                                 "SinkAdmissionRejected",
                                 "StepTransitionRejected",
+                                "GuidedUploadedSourceConfigError",
                                 "ComponentRevisionNotApplied",
                                 "InlineSourceNotApplied",
                                 "UploadedSourceTypeMismatch",
