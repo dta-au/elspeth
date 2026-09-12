@@ -77,6 +77,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
+    CompositionValidationError,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import (
@@ -1056,7 +1057,7 @@ async def test_03b_resolve_recomputes_validation_for_patched_live_state(service)
             nodes=[_llm_node()],
             metadata_={"name": "Phase 5b Test", "description": ""},
             is_valid=False,
-            validation_errors=[stale_error],
+            validation_errors=[CompositionValidationError(message=stale_error, error_code=None, component=None)],
         ),
         provenance="session_seed",
     )
@@ -1069,7 +1070,7 @@ async def test_03b_resolve_recomputes_validation_for_patched_live_state(service)
         actor="user:alice",
     )
 
-    assert stale_error not in list(new_state.validation_errors or ())
+    assert stale_error not in [error.message for error in new_state.validation_errors or ()]
 
 
 _GRAPH_STRUCTURE_ERROR = (
@@ -1169,7 +1170,7 @@ async def _seed_authoring_valid_state(
     *,
     session_id: UUID,
     is_valid: bool = True,
-    validation_errors: list[str] | None = None,
+    validation_errors: list[CompositionValidationError] | None = None,
     insert_session: bool = True,
 ) -> CompositionStateRecord:
     if insert_session:
@@ -1230,7 +1231,7 @@ async def test_resolve_persists_runtime_preflight_verdict_over_authoring_validit
         service,
         session_id=session_id,
         is_valid=False,
-        validation_errors=[_GRAPH_STRUCTURE_ERROR],
+        validation_errors=[CompositionValidationError(message=_GRAPH_STRUCTURE_ERROR, error_code=None, component=None)],
         insert_session=False,
     )
 
@@ -1243,7 +1244,7 @@ async def test_resolve_persists_runtime_preflight_verdict_over_authoring_validit
     )
 
     assert new_state.is_valid is False
-    assert _GRAPH_STRUCTURE_ERROR in list(new_state.validation_errors or ())
+    assert _GRAPH_STRUCTURE_ERROR in [error.message for error in new_state.validation_errors or ()]
     (call,) = preflight_calls
     called_state, called_user_id, called_session_id, called_snapshot = call
     assert called_user_id == "alice"
@@ -1325,14 +1326,24 @@ async def test_opt_out_auto_resolve_persists_runtime_preflight_verdict(engine) -
     current_state = await service.get_current_state(session_id)
     assert current_state is not None
     assert current_state.is_valid is False
-    assert _GRAPH_STRUCTURE_ERROR in list(current_state.validation_errors or ())
+    assert _GRAPH_STRUCTURE_ERROR in [error.message for error in current_state.validation_errors or ()]
 
 
 @pytest.mark.parametrize(
     ("composer_meta", "expected_errors"),
     [
-        ({"guided_session": GuidedSession.initial().to_dict()}, ("guided_composition_invalid",)),
-        (None, ("/home/operator/private.csv token=VALIDATION-CREDENTIAL-CANARY",)),
+        (
+            {"guided_session": GuidedSession.initial().to_dict()},
+            (CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),),
+        ),
+        (
+            None,
+            (
+                CompositionValidationError(
+                    message="/home/operator/private.csv token=VALIDATION-CREDENTIAL-CANARY", error_code=None, component="node"
+                ),
+            ),
+        ),
     ],
     ids=("guided-closes-validator-text", "freeform-preserves-validator-text"),
 )
@@ -1365,7 +1376,7 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
             nodes=[_llm_node()],
             metadata_={"name": "Phase 5b Test", "description": ""},
             is_valid=False,
-            validation_errors=["stale unresolved placeholder"],
+            validation_errors=[CompositionValidationError(message="stale unresolved placeholder", error_code=None, component=None)],
             composer_meta=composer_meta,
         ),
         provenance="session_seed",

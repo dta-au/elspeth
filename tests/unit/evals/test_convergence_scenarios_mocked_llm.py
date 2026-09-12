@@ -64,6 +64,7 @@ from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.evals.conftest import _clean_advisor_checkpoint
 
@@ -194,6 +195,7 @@ def _session_engine() -> tuple[Any, str, SessionServiceImpl, SessionOperationCon
     session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
         conn.execute(
             sessions_table.insert().values(
                 id=session_id,
@@ -505,7 +507,7 @@ class TestCsvClassifierScenario:
         scenario = _load_scenario("csv-classifier")
         assistant_messages = [{"role": "assistant", "content": result.message or ""}]
         state_dict = _state_dict_for_scoring(result)
-        verdict = score(scenario, assistant_messages, state_dict)
+        verdict = score(scenario, assistant_messages, state_dict, state_origin="mocked_harness")
 
         assert verdict["verdict"] == "GREEN", (
             f"csv-classifier did not score GREEN. red={verdict['red_reasons']} amber={verdict['amber_reasons']}"
@@ -650,6 +652,7 @@ class TestNumericGateScenario:
             scenario,
             [{"role": "assistant", "content": result.message or ""}],
             state_dict,
+            state_origin="mocked_harness",
         )
         assert verdict["verdict"] == "GREEN", (
             f"numeric-gate did not score GREEN. red={verdict['red_reasons']} amber={verdict['amber_reasons']}"
@@ -833,6 +836,7 @@ class TestNumericGateScenario:
             scenario,
             [{"role": "assistant", "content": result.message or ""}],
             state_dict,
+            state_origin="mocked_harness",
         )
         assert verdict["verdict"] == "GREEN", (
             f"numeric-gate repair flow did not score GREEN. red={verdict['red_reasons']} amber={verdict['amber_reasons']}"
@@ -1010,7 +1014,7 @@ class TestUrlTextSmokeScenario:
         scenario = _load_scenario("url-text-smoke")
         assistant_messages = [{"role": "assistant", "content": result.message or ""}]
         state_dict = _state_dict_for_scoring(result)
-        verdict = score(scenario, assistant_messages, state_dict)
+        verdict = score(scenario, assistant_messages, state_dict, state_origin="mocked_harness")
 
         assert verdict["verdict"] == "GREEN", (
             f"url-text-smoke did not score GREEN. red={verdict['red_reasons']} amber={verdict['amber_reasons']}"

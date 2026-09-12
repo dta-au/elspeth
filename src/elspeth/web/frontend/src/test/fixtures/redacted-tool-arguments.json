@@ -17,6 +17,48 @@
     "set_pipeline"
   ],
   "cases": {
+    "set_pipeline_explicit_null_inline_blob": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {},
+          "inline_blob": null
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": []
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "inline_blob": null
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": []
+      }
+    },
+    "set_source_explicit_null_description": {
+      "tool": "set_source",
+      "arguments": {
+        "plugin": "csv",
+        "on_success": "rows",
+        "options": {},
+        "on_validation_failure": "discard",
+        "description": null
+      },
+      "redacted": {
+        "plugin": "csv",
+        "on_success": "rows",
+        "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+        "on_validation_failure": "discard",
+        "description": null
+      }
+    },
     "set_pipeline_ambiguous_inline_empty_options": {
       "tool": "set_pipeline",
       "arguments": {
@@ -40,21 +82,16 @@
           "plugin": "csv",
           "on_success": "csv_rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
-          "on_validation_failure": null,
-          "description": null,
-          "blob_id": null,
           "inline_blob": {
             "filename": "chat.csv",
             "mime_type": "text/csv",
-            "content": "<inline-blob:58-bytes>",
-            "description": null
+            "content": "<inline-blob:58-bytes>"
           }
         },
-        "sources": null,
         "nodes": [],
         "edges": [],
         "outputs": [],
-        "metadata": "<metadata-patch:description,name>"
+        "metadata": "<metadata-patch:empty>"
       }
     },
     "set_pipeline_ambiguous_inline_nonempty_options": {
@@ -82,21 +119,16 @@
           "plugin": "csv",
           "on_success": "csv_rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-          "on_validation_failure": null,
-          "description": null,
-          "blob_id": null,
           "inline_blob": {
             "filename": "chat.csv",
             "mime_type": "text/csv",
-            "content": "<inline-blob:58-bytes>",
-            "description": null
+            "content": "<inline-blob:58-bytes>"
           }
         },
-        "sources": null,
         "nodes": [],
         "edges": [],
         "outputs": [],
-        "metadata": "<metadata-patch:description,name>"
+        "metadata": "<metadata-patch:empty>"
       }
     },
     "patch_source_options_two_scalars": {
@@ -267,12 +299,10 @@
         "on_validation_failure": "discard"
       },
       "redacted": {
-        "source_name": "source",
         "plugin": "csv",
         "on_success": "rows",
         "options": "{\"_option_shape\":\"mapping\",\"entry_count\":2,\"value_shape_counts\":{\"mapping\":0,\"scalar\":2,\"sequence\":0,\"set\":0}}",
-        "on_validation_failure": "discard",
-        "description": null
+        "on_validation_failure": "discard"
       }
     },
     "upsert_node_with_options": {
@@ -359,11 +389,8 @@
           "plugin": "csv",
           "on_success": "rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-          "on_validation_failure": "discard",
-          "description": null,
-          "blob_id": null
+          "on_validation_failure": "discard"
         },
-        "sources": null,
         "nodes": [
           {
             "id": "extract",
@@ -372,21 +399,7 @@
             "node_type": "transform",
             "input": "rows",
             "plugin": "field_mapper",
-            "on_success": "mapped",
-            "condition": null,
-            "routes": null,
-            "fork_to": null,
-            "branches": null,
-            "policy": null,
-            "merge": null,
-            "trigger": null,
-            "output_mode": null,
-            "expected_output_count": null,
-            "timeout_seconds": null,
-            "description": null,
-            "scope_name": null,
-            "scope_opener": null,
-            "scope_policy": null
+            "on_success": "mapped"
           }
         ],
         "edges": [
@@ -402,12 +415,9 @@
           {
             "sink_name": "results",
             "plugin": "json",
-            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-            "on_write_failure": null,
-            "description": null
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
           }
-        ],
-        "metadata": "<metadata-patch:invalid>"
+        ]
       }
     },
     "set_pipeline_plugin_changed_no_nodes": {
@@ -438,23 +448,258 @@
           "plugin": "json",
           "on_success": "rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-          "on_validation_failure": "discard",
-          "description": null,
-          "blob_id": null
+          "on_validation_failure": "discard"
         },
-        "sources": null,
         "nodes": [],
         "edges": [],
         "outputs": [
           {
             "sink_name": "results",
             "plugin": "csv",
-            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-            "on_write_failure": null,
-            "description": null
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+          }
+        ]
+      }
+    },
+    "set_pipeline_presence_omitted": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "options": {
+            "path": "input.csv"
+          },
+          "on_success": "rows",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "mapped",
+            "on_error": null,
+            "options": {
+              "mappings": {
+                "a": "b"
+              }
+            }
           }
         ],
-        "metadata": "<metadata-patch:invalid>"
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": {
+              "path": "out.json"
+            }
+          }
+        ]
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "on_error": null,
+            "node_type": "transform",
+            "input": "rows",
+            "plugin": "field_mapper",
+            "on_success": "mapped"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+          }
+        ]
+      }
+    },
+    "set_pipeline_presence_null": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "options": {
+            "path": "input.csv"
+          },
+          "on_success": "rows",
+          "on_validation_failure": "discard",
+          "description": null
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "mapped",
+            "on_error": null,
+            "options": {
+              "mappings": {
+                "a": "b"
+              }
+            },
+            "timeout_seconds": null
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": {
+              "path": "out.json"
+            },
+            "on_write_failure": null
+          }
+        ]
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard",
+          "description": null
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "on_error": null,
+            "node_type": "transform",
+            "input": "rows",
+            "plugin": "field_mapper",
+            "on_success": "mapped",
+            "timeout_seconds": null
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+            "on_write_failure": null
+          }
+        ]
+      }
+    },
+    "set_pipeline_empty_options_replaying_current_state": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "options": {},
+          "on_success": "rows",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "mapped",
+            "on_error": null,
+            "options": {}
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": {}
+          }
+        ]
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "on_error": null,
+            "node_type": "transform",
+            "input": "rows",
+            "plugin": "field_mapper",
+            "on_success": "mapped"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}"
+          }
+        ]
       }
     }
   }

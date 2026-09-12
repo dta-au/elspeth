@@ -43,6 +43,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
+    CompositionValidationError,
     GuidedForkSettlementCommand,
     GuidedOperationActive,
     GuidedOperationClaimed,
@@ -2973,7 +2974,13 @@ async def test_fork_backstop_names_validation_errors_that_retain_a_parent_storag
             },
             metadata_={"name": "Parent pipeline", "description": None},
             is_valid=False,
-            validation_errors=[parent_path if entry_shape == "exact" else f"source file not found: {parent_path}"],
+            validation_errors=[
+                CompositionValidationError(
+                    message=parent_path if entry_shape == "exact" else f"source file not found: {parent_path}",
+                    error_code=None,
+                    component=None,
+                )
+            ],
         ),
         provenance="session_seed",
     )

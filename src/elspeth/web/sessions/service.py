@@ -71,8 +71,8 @@ from elspeth.web.composer.provider_telemetry import (
 )
 from elspeth.web.composer.redaction import (
     assert_guided_custody_persistable,
-    normalize_set_pipeline_redacted_arguments,
     redact_tool_call_arguments,
+    semantic_redacted_pipeline_arguments_hash,
 )
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
@@ -209,6 +209,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
+    CompositionValidationError,
     GlobalRunRecoveryAuthority,
     GuidedAuditEvidence,
     GuidedCompositionStateResult,
@@ -296,6 +297,8 @@ from elspeth.web.sessions.protocol import (
     TransitionAssistantDraft,
     TransitionResponseSettlement,
     TrustModeAutoCommitRevokedError,
+    decode_stored_composition_validation_errors,
+    serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.protocol import (
     InterpretationResolveError as InterpretationResolveError,
@@ -1919,7 +1922,7 @@ FORK_REWRITTEN_COMPOSER_META_KEYS: frozenset[str] = frozenset({"guided_session",
 def _refuse_unrewritable_fork_custody(
     *,
     composer_meta: Mapping[str, Any] | None,
-    validation_errors: Sequence[str] | None,
+    validation_errors: Sequence[CompositionValidationError] | None,
     metadata: Mapping[str, Any] | None,
     forbidden: frozenset[str],
 ) -> None:
@@ -1947,7 +1950,9 @@ def _refuse_unrewritable_fork_custody(
                     f"Tier 1 audit anomaly: fork source composer_meta key {meta_key!r} retains parent blob custody "
                     "the fork rewriter does not model -- teach the fork path this key before forking sessions that use it"
                 )
-    if validation_errors is not None and _free_text_embeds_parent_blob(validation_errors, forbidden):
+    if validation_errors is not None and _free_text_embeds_parent_blob(
+        serialize_composition_validation_errors(validation_errors), forbidden
+    ):
         raise AuditIntegrityError(
             "Tier 1 audit anomaly: fork source validation_errors retains parent blob custody "
             "the fork rewriter does not model -- clear the validation errors before forking this session"
@@ -6380,7 +6385,7 @@ class SessionServiceImpl:
                 outputs=_enveloped_state_column(state.outputs),
                 metadata_=_enveloped_state_column(state.metadata_),
                 is_valid=state.is_valid,
-                validation_errors=deep_thaw(state.validation_errors),
+                validation_errors=serialize_composition_validation_errors(state.validation_errors),
                 composer_meta=_enveloped_state_column(state.composer_meta),
                 derived_from_state_id=derived_from_state_id,
                 provenance=provenance,
@@ -7513,10 +7518,10 @@ class SessionServiceImpl:
             cast(dict[str, Any], review_arguments),
             telemetry=NoopRedactionTelemetry(),
         )
-        normalized_redacted_arguments = normalize_set_pipeline_redacted_arguments(deep_thaw(arguments_redacted_json))
-        if normalized_redacted_arguments != expected_redacted_arguments:
+        supplied_redacted_arguments = deep_thaw(arguments_redacted_json)
+        if supplied_redacted_arguments != expected_redacted_arguments:
             raise AuditIntegrityError("pipeline proposal redacted arguments do not match the manifest projection")
-        arguments_redacted_json = normalized_redacted_arguments
+        arguments_redacted_json = supplied_redacted_arguments
         proposal = plan.proposal
         if proposal.surface in {PlannerSurface.FREEFORM, PlannerSurface.GUIDED_FULL} and proposal.reviewed_anchor_hash != stable_hash(
             {"schema": "guided.reviewed-anchors.v1", "facts": {}}
@@ -7743,7 +7748,7 @@ class SessionServiceImpl:
                     raise StaleComposeStateError("pipeline proposal draft hash echo is stale or mismatched")
                 if dispatch.tool_call_id != authority.row.tool_call_id:
                     raise AuditIntegrityError("pipeline dispatch tool call does not match proposal authority")
-                if dispatch.arguments_hash != composer_authority_hash(authority.row.arguments_redacted_json):
+                if dispatch.arguments_hash != semantic_redacted_pipeline_arguments_hash(authority.row.arguments_redacted_json):
                     raise AuditIntegrityError("pipeline dispatch arguments do not match persisted redacted proposal")
                 if _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch) != (state_content_hash,):
                     raise AuditIntegrityError("pipeline settlement requires one durable dispatch audit bound to the exact state content")
@@ -8044,7 +8049,7 @@ class SessionServiceImpl:
                 if dispatch is not None:
                     if dispatch.tool_call_id != authority.row.tool_call_id:
                         raise AuditIntegrityError("pipeline rejection dispatch tool call does not match proposal authority")
-                    if dispatch.arguments_hash != composer_authority_hash(authority.row.arguments_redacted_json):
+                    if dispatch.arguments_hash != semantic_redacted_pipeline_arguments_hash(authority.row.arguments_redacted_json):
                         raise AuditIntegrityError("pipeline rejection dispatch arguments do not match persisted redacted proposal")
                     if len(_persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch)) != 1:
                         raise AuditIntegrityError("pipeline rejection requires exactly one matching durable dispatch audit")
@@ -8764,7 +8769,10 @@ class SessionServiceImpl:
                     session_id=sid,
                     user_id=principal_user_id,
                 )
-                raw_validation_errors = [error.message for error in patched_validation.errors] or None
+                raw_validation_errors = [
+                    CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component)
+                    for error in patched_validation.errors
+                ] or None
                 patched_validation_errors = validation_errors_for_composer_surface(
                     composer_meta=state_record.composer_meta,
                     is_valid=patched_validation.is_valid,
@@ -9996,7 +10004,7 @@ class SessionServiceImpl:
             outputs=self._unwrap_envelope(row.outputs),
             metadata_=self._unwrap_envelope(row.metadata_),
             is_valid=row.is_valid,
-            validation_errors=row.validation_errors,
+            validation_errors=decode_stored_composition_validation_errors(row.validation_errors),
             created_at=self._ensure_utc(row.created_at),
             derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
             composer_meta=self._unwrap_envelope(row.composer_meta),
@@ -10562,7 +10570,7 @@ class SessionServiceImpl:
                             outputs=self._unwrap_envelope(prior_row.outputs),
                             metadata_=self._unwrap_envelope(prior_row.metadata_),
                             is_valid=prior_row.is_valid,
-                            validation_errors=prior_row.validation_errors,
+                            validation_errors=decode_stored_composition_validation_errors(prior_row.validation_errors),
                             composer_meta=reverted_composer_meta,
                         ),
                         derived_from_state_id=target_state_id,
@@ -12570,7 +12578,7 @@ class SessionServiceImpl:
                 if (
                     _composition_state_data_content_hash(command.state) != command.expected_current_content_hash
                     or command.state.is_valid is not current_record.is_valid
-                    or deep_thaw(command.state.validation_errors) != deep_thaw(current_record.validation_errors)
+                    or command.state.validation_errors != current_record.validation_errors
                 ):
                     raise AuditIntegrityError("guided back-edit candidate changed authored composition or validation authority")
 
@@ -12796,7 +12804,7 @@ class SessionServiceImpl:
         authority: AuthoritativePipelineProposal,
     ) -> PipelineDispatchRecovery | None:
         sid = str(authority.row.session_id)
-        expected_arguments_hash = composer_authority_hash(authority.row.arguments_redacted_json)
+        expected_arguments_hash = semantic_redacted_pipeline_arguments_hash(authority.row.arguments_redacted_json)
         rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.session_id == sid)).fetchall()
         matches: list[PipelineDispatchRecovery] = []
         for row in rows:
@@ -12957,7 +12965,7 @@ class SessionServiceImpl:
                     invocation_binding.tool_call_id != authority.row.tool_call_id
                     or invocation_binding.arguments_hash != authority.row.tool_arguments_hash
                     or expected_binding.tool_call_id != authority.row.tool_call_id
-                    or expected_binding.arguments_hash != composer_authority_hash(authority.row.arguments_redacted_json)
+                    or expected_binding.arguments_hash != semantic_redacted_pipeline_arguments_hash(authority.row.arguments_redacted_json)
                 ):
                     raise AuditIntegrityError("guided dispatch record differs from proposal authority")
                 existing = self._pipeline_dispatch_recovery_on_connection(conn, authority=authority)
@@ -13072,7 +13080,7 @@ class SessionServiceImpl:
                     raise AuditIntegrityError("guided proposal acceptance review checkpoint changed authored content")
                 if dispatch.tool_call_id != authority.row.tool_call_id:
                     raise AuditIntegrityError("guided proposal acceptance dispatch differs from authority")
-                if dispatch.arguments_hash != composer_authority_hash(authority.row.arguments_redacted_json):
+                if dispatch.arguments_hash != semantic_redacted_pipeline_arguments_hash(authority.row.arguments_redacted_json):
                     raise AuditIntegrityError("guided proposal acceptance dispatch arguments differ from authority")
 
                 current_guided = state_from_record(current_record).guided_session
@@ -13826,7 +13834,7 @@ class SessionServiceImpl:
                         "edges": deep_thaw(command.rewritten_state.edges),
                         "outputs": deep_thaw(command.rewritten_state.outputs),
                         "metadata": deep_thaw(command.rewritten_state.metadata_),
-                        "validation_errors": deep_thaw(command.rewritten_state.validation_errors),
+                        "validation_errors": serialize_composition_validation_errors(command.rewritten_state.validation_errors),
                         "composer_meta": deep_thaw(command.rewritten_state.composer_meta),
                     }
                 elif current_state_row is not None:

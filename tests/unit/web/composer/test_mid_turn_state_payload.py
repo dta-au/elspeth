@@ -33,6 +33,7 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     pending_execution_interpretation_sites,
 )
+from elspeth.web.sessions.protocol import CompositionValidationError
 
 
 def _node(options: dict[str, object], *, plugin: str = "llm") -> NodeSpec:
@@ -108,20 +109,25 @@ class TestMidTurnPersistedValidity:
         payload = _payload_for(state, ValidationSummary(is_valid=True, errors=()))
 
         assert payload.data.is_valid is False
-        assert any(entry.startswith("interpretation_review_pending:rate_coolness:") for entry in payload.data.validation_errors)
+        assert any(
+            entry.error_code == "interpretation_review_pending" and entry.component == "rate_coolness"
+            for entry in payload.data.validation_errors
+        )
 
     def test_pending_site_error_names_component_and_kind_not_user_term(self) -> None:
         state = _state(_pending_review_options())
 
         payload = _payload_for(state, ValidationSummary(is_valid=True, errors=()))
 
-        pending_entries = [entry for entry in payload.data.validation_errors if entry.startswith("interpretation_review_pending:")]
+        pending_entries = [entry for entry in payload.data.validation_errors if entry.error_code == "interpretation_review_pending"]
         assert pending_entries
-        assert all(entry.count(":") == 2 for entry in pending_entries)
+        assert {(entry.component, entry.message) for entry in pending_entries} == {
+            (site.component_id, site.kind.value) for site in pending_execution_interpretation_sites(state)
+        }
         # The user-authored term and the draft text never reach the persisted
         # error strings (non-content rule).
-        assert all("coolness" not in entry.split(":", 1)[1].replace("rate_coolness", "") for entry in pending_entries)
-        assert all("well-designed" not in entry for entry in pending_entries)
+        assert all("coolness" not in entry.message for entry in pending_entries)
+        assert all("well-designed" not in entry.message for entry in pending_entries)
 
     def test_clean_state_persists_stage1_verdict(self) -> None:
         state = _state({"fields": {"text": "text"}}, plugin="field_mapper")
@@ -139,12 +145,14 @@ class TestMidTurnPersistedValidity:
             state,
             ValidationSummary(
                 is_valid=False,
-                errors=(ValidationEntry("node:rate_coolness", "bad options", "high"),),
+                errors=(ValidationEntry("node:rate_coolness", "bad options", "high", error_code="invalid_options"),),
             ),
         )
 
         assert payload.data.is_valid is False
-        assert payload.data.validation_errors == ("bad options",)
+        assert payload.data.validation_errors == (
+            CompositionValidationError(message="bad options", error_code="invalid_options", component="node:rate_coolness"),
+        )
 
     def test_every_mid_turn_row_carries_authoring_only_lane_marker(self) -> None:
         for state, validation in (

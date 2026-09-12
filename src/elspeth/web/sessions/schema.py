@@ -32,7 +32,8 @@ from elspeth.web.sessions.models import (
 _SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 _SESSION_METADATA_CREATE_LOCK = Lock()
 
-_COORDINATION_HARD_CUT_EPOCH = 55
+# Coupled cut: sparse proposal display and structured stored validation errors.
+_COORDINATION_HARD_CUT_EPOCH = 56
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",

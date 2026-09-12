@@ -30,7 +30,7 @@ from elspeth.web.blobs.protocol import BlobForkWriteFence
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
-from elspeth.web.sessions.protocol import CompositionStateData, GuidedForkSettlementCommand
+from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError, GuidedForkSettlementCommand
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl, _value_references_parent_blob
@@ -446,8 +446,10 @@ async def test_unrewritable_parent_custody_refuses_the_fork_before_any_child_row
     # S1): a real validator message or description embeds the path in a sentence,
     # a shape whole-string equality can never see.
     validation_errors = {
-        "validation_errors": [pending_blob.storage_path],
-        "validation_errors_embedded": [f"source file not found: {pending_blob.storage_path}"],
+        "validation_errors": [CompositionValidationError(message=pending_blob.storage_path, error_code=None, component=None)],
+        "validation_errors_embedded": [
+            CompositionValidationError(message=f"source file not found: {pending_blob.storage_path}", error_code=None, component=None)
+        ],
     }.get(carrier)
     description = {
         "metadata": pending_blob.storage_path,
@@ -563,7 +565,13 @@ async def test_settlement_rejects_a_rewritten_state_whose_validation_errors_reta
         outputs=rewritten.outputs,
         metadata_=rewritten.metadata_,
         is_valid=False,
-        validation_errors=[blob.storage_path if entry_shape == "exact" else f"source file not found: {blob.storage_path}"],
+        validation_errors=[
+            CompositionValidationError(
+                message=blob.storage_path if entry_shape == "exact" else f"source file not found: {blob.storage_path}",
+                error_code=None,
+                component=None,
+            )
+        ],
         composer_meta=rewritten.composer_meta,
     )
 
@@ -606,7 +614,13 @@ async def test_settlement_rejects_a_staged_state_whose_validation_errors_retain_
             .values(
                 is_valid=False,
                 validation_errors=[
-                    pending_blob.storage_path if entry_shape == "exact" else f"source file not found: {pending_blob.storage_path}"
+                    {
+                        "message": pending_blob.storage_path
+                        if entry_shape == "exact"
+                        else f"source file not found: {pending_blob.storage_path}",
+                        "error_code": None,
+                        "component": None,
+                    }
                 ],
             )
         )

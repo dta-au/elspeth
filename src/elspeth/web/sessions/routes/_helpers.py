@@ -175,6 +175,7 @@ from elspeth.web.sessions.protocol import (
     CompositionProposalRecord,
     CompositionStateData,
     CompositionStateRecord,
+    CompositionValidationError,
     InterpretationEventAlreadyResolvedError,
     InterpretationEventNotFoundError,
     InterpretationNodeMissingError,
@@ -192,6 +193,7 @@ from elspeth.web.sessions.protocol import (
     SessionRecord,
     SessionServiceProtocol,
     TransitionAssistantDraft,
+    serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.schemas import (
     AcceptProposalRequest,
@@ -202,6 +204,7 @@ from elspeth.web.sessions.schemas import (
     CompositionObject,
     CompositionProposalResponse,
     CompositionStateResponse,
+    CompositionValidationErrorResponse,
     CreateSessionRequest,
     ForkSessionRequest,
     ForkSessionResponse,
@@ -758,6 +761,16 @@ def _litellm_error_detail(
     return detail
 
 
+def composition_validation_error_responses(
+    values: Sequence[CompositionValidationError] | None,
+) -> list[CompositionValidationErrorResponse] | None:
+    """Serialize checked owned errors into the strict nested HTTP shape."""
+    records = serialize_composition_validation_errors(values)
+    if records is None:
+        return None
+    return [CompositionValidationErrorResponse(**record) for record in records]
+
+
 def _state_response(
     state: CompositionStateRecord,
     live_validation: ValidationSummary | None = None,
@@ -813,7 +826,7 @@ def _state_response(
         outputs=deep_thaw(state.outputs),
         metadata=deep_thaw(state.metadata_),
         is_valid=state.is_valid,
-        validation_errors=deep_thaw(state.validation_errors),
+        validation_errors=composition_validation_error_responses(state.validation_errors),
         validation_warnings=[
             ValidationEntryResponse(component=e.component, message=e.message, severity=e.severity, error_code=e.error_code)
             for e in live_validation.warnings
@@ -1227,31 +1240,18 @@ def _runtime_preflight_failure_errors(
     exception_class: str,
     exception_message_first_line: str,
     frames: Sequence[str],
-) -> list[str]:
-    """Build the structured ``validation_errors`` list for a runtime-preflight crash.
+) -> list[CompositionValidationError]:
+    """Preserve bounded diagnostics with a directly owned failure code.
 
-    Replaces the legacy opaque ``["runtime_preflight_failed"]`` sentinel
-    with a self-describing list. The first entry remains
-    ``"runtime_preflight_failed"`` so existing parsers/UIs that key on
-    the sentinel continue to work; subsequent entries are advisory and
-    may be empty when frame capture is impossible (e.g. when only
-    ``exception_class`` is available without a live traceback).
-
-    Schema is preserved: each entry is a string, so
-    :class:`CompositionStateData.validation_errors` (typed
-    ``Sequence[str]``) does not need a migration. Operators / the LLM
-    parsing the audit row receive ``"key=value"`` shaped strings.
-
-    Bounded length: ``exception_message_first_line`` is clipped to
-    :data:`_RUNTIME_PREFLIGHT_MESSAGE_LIMIT` characters. ``frames`` is
-    limited at the caller (see :func:`_safe_frame_strings`).
+    The sentinel has a known code. Other permitted diagnostic strings remain
+    message-only records; no identity is inferred from their prose.
     """
     truncated_msg = exception_message_first_line[:_RUNTIME_PREFLIGHT_MESSAGE_LIMIT]
     return [
-        "runtime_preflight_failed",
-        f"exception_class={exception_class}",
-        f"exception_message={truncated_msg}",
-        *frames,
+        CompositionValidationError(message="runtime_preflight_failed", error_code="runtime_preflight_failed", component=None),
+        CompositionValidationError(message=f"exception_class={exception_class}", error_code=None, component=None),
+        CompositionValidationError(message=f"exception_message={truncated_msg}", error_code=None, component=None),
+        *(CompositionValidationError(message=frame, error_code=None, component=None) for frame in frames),
     ]
 
 
@@ -1636,22 +1636,13 @@ def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[Compos
 def _composer_persisted_validation(
     authoring: ValidationSummary,
     runtime_preflight: _RuntimePreflightOutcome,
-) -> tuple[bool, list[str] | None]:
+) -> tuple[bool, list[CompositionValidationError] | None]:
     """Return persisted validity/errors for a composer-produced state.
 
-    When the runtime preflight crashed unexpectedly, emit a structured
-    diagnostic list (sentinel + ``exception_class=...`` +
-    ``exception_message=...`` + ``frame=...`` entries) so the persisted
-    audit row carries the attribution the previous opaque
-    ``["runtime_preflight_failed"]`` sentinel withheld. The first entry
-    remains the legacy sentinel so external parsers keying on it (the
-    SPA / LLM recovery loop) continue to detect the failure class.
-
-    The bare-sentinel path is preserved for the
-    :data:`_RUNTIME_PREFLIGHT_FAILED` zero-arg constant — older tests
-    construct it directly and assert the legacy single-string output
-    to lock in the contract that authoring-valid + opaque-runtime-fail
-    persists as ``is_valid=False``.
+    Runtime crashes retain a directly coded failure record followed by the
+    existing bounded diagnostic messages. Validator outcomes carry their
+    owned code and component directly. No diagnostic prose is parsed to
+    manufacture identity, and opaque runtime failure remains invalid.
     """
     # Exact-type dispatch on our own ``_RuntimePreflightOutcome`` union
     # (``ValidationResult | _RuntimePreflightFailed | None``). ``type() is``
@@ -1661,18 +1652,26 @@ def _composer_persisted_validation(
     # rather than relying on negative narrowing of a single branch.
     if type(runtime_preflight) is _RuntimePreflightFailed:
         if runtime_preflight.exception_class is None:
-            return False, ["runtime_preflight_failed"]
+            return False, [
+                CompositionValidationError(message="runtime_preflight_failed", error_code="runtime_preflight_failed", component=None)
+            ]
         return False, _runtime_preflight_failure_errors(
             runtime_preflight.exception_class,
             runtime_preflight.exception_message_first_line,
             runtime_preflight.frames,
         )
     if type(runtime_preflight) is ValidationResult:
-        messages = [error.message for error in runtime_preflight.errors]
+        messages = [
+            CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component_id)
+            for error in runtime_preflight.errors
+        ]
         return runtime_preflight.is_valid, messages or None
     if authoring.is_valid:
         raise ValueError("Composer persistence for authoring-valid state requires runtime preflight outcome")
-    messages = [error.message for error in authoring.errors]
+    messages = [
+        CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component)
+        for error in authoring.errors
+    ]
     return authoring.is_valid, messages or None
 
 

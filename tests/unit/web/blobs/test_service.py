@@ -69,6 +69,7 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
     sessions_table,
 )
+from elspeth.web.sessions.protocol import CompositionValidationError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
@@ -144,6 +145,7 @@ async def _seed_active_run(
     source: dict[str, Any],
     nodes: list[dict[str, Any]] | None = None,
     status: str = "pending",
+    validation_errors: tuple[CompositionValidationError, ...] | None = None,
 ) -> str:
     """Seed a composition state through the REAL writer, attach a run, return its id.
 
@@ -180,6 +182,7 @@ async def _seed_active_run(
             outputs=[],
             metadata_={"name": "Test", "description": ""},
             is_valid=True,
+            validation_errors=validation_errors,
         ),
         provenance="session_seed",
         session_operation_context=context,
@@ -1174,8 +1177,11 @@ class TestDeleteBlob:
             await blob_service.get_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "validation_errors", [None, (), (CompositionValidationError(message="diagnostic", error_code="known", component="source"),)]
+    )
     async def test_delete_blob_rejects_when_active_run_exists_without_link(
-        self, blob_service, session_id, db_engine, compose_context
+        self, blob_service, session_id, db_engine, compose_context, validation_errors
     ) -> None:
         """Pre-link window: active run exists but blob_run_links row hasn't been created yet.
 
@@ -1201,6 +1207,7 @@ class TestDeleteBlob:
             db_engine,
             session_id,
             session_operation_context=compose_context,
+            validation_errors=validation_errors,
             source={
                 "plugin": "csv",
                 "on_success": "output",
@@ -1211,6 +1218,13 @@ class TestDeleteBlob:
 
         with pytest.raises(BlobActiveRunError):
             await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+
+        # Composite fork cleanup owns a separate locked deletion path. Exercise
+        # its actual SQL join as well as the ordinary repository-backed delete.
+        with db_engine.begin() as conn:
+            row = conn.execute(select(blobs_table).where(blobs_table.c.id == str(record.id))).one()
+            with pytest.raises(BlobActiveRunError):
+                blob_service._delete_fork_blob_row_locked(conn, row=row, blob_id_str=str(record.id))
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("key", ["blob_ref", "blob_id"])

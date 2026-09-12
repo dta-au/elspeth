@@ -641,7 +641,7 @@ class TestInterpretationReviewHandoffSegments:
         """The suffix is the operator's only sight of a preflight suggestion.
 
         ``_composer_persisted_validation`` projects runtime-preflight errors to
-        ``[error.message]``, dropping ``ValidationError.suggestion`` before it
+        owned message/code/component records, dropping ``ValidationError.suggestion`` before it
         reaches any structured surface. When this shape REPLACES the
         preflight-failure suffix (the staged-review cross-turn arm) it must
         therefore carry the suggestion, and carry it as untrusted text.

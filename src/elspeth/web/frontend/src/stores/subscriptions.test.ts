@@ -298,6 +298,7 @@ describe("subscriptions — validation result side effects", () => {
           {
             component_type: "edge",
             component_id: "rater",
+            error_code: "schema_contract_violation",
             message:
               "Schema contract violation: edge 'rater' → 'cleaner'\n  Consumer expects field 'score'",
           },
@@ -310,7 +311,7 @@ describe("subscriptions — validation result side effects", () => {
     expect(message).toContain("Validation failed");
     // The raw engine dump is replaced by a plain-language headline; the dump
     // and the internal-id prefix never reach the novice chat register.
-    expect(message).toContain("aren't connected correctly");
+    expect(message).toContain("incompatible data");
     expect(message).not.toContain("Schema contract violation");
     expect(message).not.toContain("[edge]");
     expect(message).not.toContain("rater");
@@ -812,6 +813,18 @@ describe("subscriptions — validation result side effects", () => {
 
     // Exactly one call — not zero (first fire happened), not two (second blocked).
     expect(injectSystemMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the displayed finding when only its structured code changes", () => {
+    const injectSystemMessage = vi.fn();
+    useSessionStore.setState({ activeSessionId: "sess-1", injectSystemMessage } as never);
+    useExecutionStore.setState({ validationResult: null } as never);
+    initStoreSubscriptions();
+    const error = { component_type: "source", component_id: "s1", message: "unchanged detail", suggestion: null };
+    useExecutionStore.setState({ validationResult: { is_valid: false, errors: [{...error, error_code: null}], warnings: [] } } as never);
+    useExecutionStore.setState({ validationResult: { is_valid: false, errors: [{...error, error_code: "schema_contract_violation"}], warnings: [] } } as never);
+    expect(injectSystemMessage).toHaveBeenCalledTimes(2);
+    expect(injectSystemMessage.mock.calls[1][0]).toContain("incompatible data");
   });
 
   it("does not repeat side effects for a fresh object with the same validation outcome", () => {

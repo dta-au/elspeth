@@ -329,7 +329,8 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        exporting required evidence. Preparation is not a deployed cutover.
 #        Pre-1.0 delete-and-recreate boundary; no migration,
 #        rollback_permitted: false (sessions.db only; auth.db is untouched).
-SESSION_SCHEMA_EPOCH = 55
+# Coupled cut: sparse proposal display and structured stored validation errors.
+SESSION_SCHEMA_EPOCH = 56
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

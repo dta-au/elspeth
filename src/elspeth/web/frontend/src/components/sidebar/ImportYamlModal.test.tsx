@@ -1049,7 +1049,7 @@ describe("ImportYamlModal", () => {
       id: "state-4",
       version: 4,
       is_valid: false,
-      validation_errors: ["sinks: field required"],
+      validation_errors: [{ message: "sinks: field required", error_code: null, component: null }],
     });
 
     render(<ImportYamlModal onClose={onClose} />);
@@ -1098,7 +1098,7 @@ describe("ImportYamlModal", () => {
       id: "state-disabled",
       version: 6,
       is_valid: false,
-      validation_errors: ["A saved component is unavailable."],
+      validation_errors: [{ message: "A saved component is unavailable.", error_code: null, component: null }],
       plugin_policy_findings: [
         {
           component_id: "legacy_output",
@@ -1142,7 +1142,7 @@ describe("ImportYamlModal", () => {
       id: "state-disabled",
       version: 6,
       is_valid: false,
-      validation_errors: ["A saved component is unavailable."],
+      validation_errors: [{ message: "A saved component is unavailable.", error_code: null, component: null }],
       plugin_policy_findings: [
         {
           component_id: "legacy_output",

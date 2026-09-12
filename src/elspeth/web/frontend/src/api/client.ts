@@ -54,6 +54,8 @@ import type {
   TutorialSampleResponse,
 } from "@/types/guided";
 import {
+  decodeCompositionState,
+  decodeCompositionStateVersions,
   decodeGetGuidedResponse,
   decodeGuidedChatResponse,
   decodeGuidedRespondResponse,
@@ -1113,7 +1115,7 @@ export async function fetchCompositionState(
   if (response.status === 404) {
     return null;
   }
-  return parseResponse<CompositionState>(response);
+  return decodeCompositionState(await parseResponse<unknown>(response));
 }
 
 /** Get all composition state versions for a session. */
@@ -1123,7 +1125,7 @@ export async function fetchStateVersions(
   const response = await fetch(`/api/sessions/${sessionId}/state/versions`, {
     headers: authHeaders(),
   });
-  return parseResponse<CompositionStateVersion[]>(response);
+  return decodeCompositionStateVersions(await parseResponse<unknown>(response));
 }
 
 /**
@@ -1144,7 +1146,7 @@ export async function revertToVersion(
       body: JSON.stringify({ operation_id: operationId, state_id: stateId }),
     },
   );
-  return parseResponse<CompositionState>(response);
+  return decodeCompositionState(await parseResponse<unknown>(response));
 }
 
 /** Fetch the generated YAML for the current composition state. */
@@ -1183,21 +1185,15 @@ export interface ImportCompositionYamlRequest {
 }
 
 /**
- * Composition state as returned by the YAML-import endpoint
- * (`CompositionStateResponse`, sessions/schemas.py:234). Deliberately a
- * narrow local type rather than the frontend's `CompositionState` (types/
- * index.ts) -- this route's response additionally carries `is_valid` /
- * `validation_errors`, and `edges` is always `[]` here (graph routing
- * derives from node on_success/on_error/routes, not a persisted edge list).
- * Callers that need the full canonical state re-fetch it (e.g. via
- * `selectSession`); this type only covers what an import confirmation needs
- * to render immediately.
+ * Import confirmations consume this subset of CompositionStateResponse.
+ * The HTTP boundary still decodes the full state using the shared decoder;
+ * callers re-fetch through selectSession to synchronize the session stores.
  */
 export interface ImportedCompositionState {
   id: string;
   version: number;
   is_valid: boolean;
-  validation_errors: string[] | null;
+  validation_errors: CompositionState["validation_errors"];
   plugin_policy_findings?: PluginPolicyFinding[];
 }
 
@@ -1223,7 +1219,7 @@ export async function importCompositionYaml(
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
   });
-  return parseResponse<ImportedCompositionState>(response);
+  return decodeCompositionState(await parseResponse<unknown>(response));
 }
 
 // ── Plugin Catalog ──────────────────────────────────────────────────────────

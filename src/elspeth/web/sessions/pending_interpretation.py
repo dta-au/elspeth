@@ -49,6 +49,7 @@ from elspeth.web.sessions.guided_replay import validation_errors_for_composer_su
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
+    CompositionValidationError,
     InterpretationDraftMismatchError,
     InterpretationNodeMissingError,
     InterpretationNodePluginMutatedError,
@@ -1708,6 +1709,15 @@ class _SessionPendingInterpretationValidator:
         )
 
 
+def _pending_validation_error_records(
+    validation: SessionPendingInterpretationValidationResult,
+) -> tuple[CompositionValidationError, ...] | None:
+    """Adapt digest-bound message authority only when preparing persistence."""
+    if validation.validation_errors is None:
+        return None
+    return tuple(CompositionValidationError(message=message, error_code=None, component=None) for message in validation.validation_errors)
+
+
 @final
 @dataclass(frozen=True, slots=True)
 class _PreparedPendingInterpretation:
@@ -2118,7 +2128,7 @@ class _SessionPendingInterpretationPlanner:
             validation_errors=validation_errors_for_composer_surface(
                 composer_meta=live_state.composer_meta,
                 is_valid=validation.is_valid,
-                validation_errors=list(validation.validation_errors) if validation.validation_errors is not None else None,
+                validation_errors=_pending_validation_error_records(validation),
             ),
         )
         return SessionPendingInterpretationDecision(

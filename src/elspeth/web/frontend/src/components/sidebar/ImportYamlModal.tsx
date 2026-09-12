@@ -919,7 +919,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
       setSuccessInfo({
         version: result.version,
         isValid: result.is_valid,
-        validationErrors: result.validation_errors ?? [],
+        validationErrors: result.validation_errors?.map((error) => error.message) ?? [],
         pluginPolicyFindings: result.plugin_policy_findings ?? [],
       });
       setPhase("success");

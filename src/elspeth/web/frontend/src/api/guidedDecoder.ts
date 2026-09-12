@@ -2027,8 +2027,7 @@ function decodeSession(value: unknown, path: string): GuidedSession {
   };
 }
 
-function decodeCompositionState(value: unknown, path: string): CompositionState | null {
-  if (value === null) return null;
+export function decodeCompositionState(value: unknown, path = "composition_state"): CompositionState {
   const state = exactRecord(
     value,
     path,
@@ -2223,7 +2222,15 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
   };
   const validationErrors = state.validation_errors === null
     ? null
-    : stringArray(state.validation_errors, `${path}.validation_errors`);
+    : arrayValue(state.validation_errors, `${path}.validation_errors`).map((item, index) => {
+      const itemPath = `${path}.validation_errors[${index}]`;
+      const error = exactRecord(item, itemPath, ["message", "error_code", "component"]);
+      return {
+        message: stringValue(error.message, `${itemPath}.message`),
+        error_code: nullableString(error.error_code, `${itemPath}.error_code`),
+        component: nullableString(error.component, `${itemPath}.component`),
+      };
+    });
   const validationWarnings = decodeValidationEntries("validation_warnings");
   const validationSuggestions = decodeValidationEntries("validation_suggestions");
   const policyFindings = arrayValue(state.plugin_policy_findings, `${path}.plugin_policy_findings`).map((item, index) => {
@@ -2258,6 +2265,12 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
   };
 }
 
+export function decodeCompositionStateVersions(value: unknown): CompositionState[] {
+  return arrayValue(value, "composition_states").map((state, index) =>
+    decodeCompositionState(state, `composition_states[${index}]`),
+  );
+}
+
 function decodeStateEnvelope(value: unknown, path: string): GetGuidedResponse {
   const envelope = exactRecord(value, path, ["guided_session", "next_turn", "terminal", "composition_state"]);
   const guidedSession = decodeSession(envelope.guided_session, `${path}.guided_session`);
@@ -2266,7 +2279,9 @@ function decodeStateEnvelope(value: unknown, path: string): GetGuidedResponse {
   const nextTurn = envelope.next_turn === null
     ? null
     : decodeTurn(envelope.next_turn, guidedSession.step, `${path}.next_turn`);
-  const compositionState = decodeCompositionState(envelope.composition_state, `${path}.composition_state`);
+  const compositionState = envelope.composition_state === null
+    ? null
+    : decodeCompositionState(envelope.composition_state, `${path}.composition_state`);
   return {
     guided_session: guidedSession,
     next_turn: nextTurn,

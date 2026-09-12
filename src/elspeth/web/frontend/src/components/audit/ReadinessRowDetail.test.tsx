@@ -275,14 +275,14 @@ describe("ReadinessRowDetail", () => {
             component_type: "transform",
             message: rawDump,
             suggestion: null,
-            error_code: null,
+            error_code: "schema_contract_violation",
           },
         ]}
         onClose={() => {}}
       />,
     );
     // Humanised headline shows, mapped through the gloss.
-    expect(screen.getByText(/connected correctly/i)).toBeInTheDocument();
+    expect(screen.getByText(/incompatible data/i)).toBeInTheDocument();
     // The raw engine dump is NOT a top-level body line — it lives behind the
     // Technical-details disclosure.
     expect(screen.getByText("Technical details")).toBeInTheDocument();

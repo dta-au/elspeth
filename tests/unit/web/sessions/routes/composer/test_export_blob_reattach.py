@@ -27,7 +27,7 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.composer.yaml_generator import generate_public_pipeline_dict
-from elspeth.web.sessions.protocol import CompositionStateRecord
+from elspeth.web.sessions.protocol import CompositionStateRecord, CompositionValidationError
 from elspeth.web.sessions.routes._helpers import _state_response
 from elspeth.web.sessions.routes.composer.state import _reattach_guided_blob_refs
 
@@ -191,7 +191,9 @@ def test_state_response_rejects_mixed_guided_sentinel_before_private_file_can_pr
         outputs=(),
         metadata_=None,
         is_valid=False,
-        validation_errors=("guided_composition_invalid",),
+        validation_errors=(
+            CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),
+        ),
         created_at=datetime.now(UTC),
         derived_from_state_id=None,
         composer_meta={
@@ -232,7 +234,9 @@ def test_state_response_rejects_live_blob_ref_conflicting_with_guided_sentinel()
         outputs=(),
         metadata_=None,
         is_valid=False,
-        validation_errors=("guided_composition_invalid",),
+        validation_errors=(
+            CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),
+        ),
         created_at=datetime.now(UTC),
         derived_from_state_id=None,
         composer_meta={

@@ -101,8 +101,10 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
+    CompositionValidationError,
     SessionRecord,
     TransitionResponseSettlement,
+    serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -831,7 +833,7 @@ async def _insert_legacy_composition_state(
                     outputs=_enveloped_state_column(state.outputs),
                     metadata_=_enveloped_state_column(state.metadata_),
                     is_valid=state.is_valid,
-                    validation_errors=deep_thaw(state.validation_errors),
+                    validation_errors=serialize_composition_validation_errors(state.validation_errors),
                     composer_meta=_enveloped_state_column(state.composer_meta),
                     derived_from_state_id=None,
                     provenance=provenance,
@@ -7830,7 +7832,15 @@ transforms:
 
         def _corrupt_projection(record: Any, **kwargs: Any) -> Any:
             projected = original_state_response(record, **kwargs)
-            return projected.model_copy(update={"validation_errors": ["tampered"]})
+            from elspeth.web.sessions.schemas import CompositionValidationErrorResponse
+
+            return projected.model_copy(
+                update={
+                    "validation_errors": [
+                        CompositionValidationErrorResponse(message="tampered", error_code=None, component=None),
+                    ]
+                }
+            )
 
         events_before = sorted(await service.list_interpretation_events(session.id), key=lambda e: str(e.id))
         versions_before = [record.id for record in await service.get_state_versions(session.id)]
@@ -8289,12 +8299,12 @@ sinks:
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["is_valid"] is False
-        assert body["validation_errors"] == [AWS_S3_ENDPOINT_URL_POLICY_ERROR]
+        assert [error["message"] for error in body["validation_errors"]] == [AWS_S3_ENDPOINT_URL_POLICY_ERROR]
         assert endpoint_sentinel not in repr(body["validation_errors"])
         record = await service.get_current_state(session.id)
         assert record is not None
         assert record.is_valid is False
-        assert list(record.validation_errors or ()) == [AWS_S3_ENDPOINT_URL_POLICY_ERROR]
+        assert [error.message for error in record.validation_errors or ()] == [AWS_S3_ENDPOINT_URL_POLICY_ERROR]
         assert endpoint_sentinel not in repr(record.validation_errors)
 
     @pytest.mark.asyncio
@@ -8338,12 +8348,12 @@ sinks:
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["is_valid"] is False
-        assert body["validation_errors"] == [AWS_S3_ENDPOINT_URL_POLICY_ERROR]
+        assert [error["message"] for error in body["validation_errors"]] == [AWS_S3_ENDPOINT_URL_POLICY_ERROR]
         assert endpoint_sentinel not in repr(body["validation_errors"])
         record = await service.get_current_state(session.id)
         assert record is not None
         assert record.is_valid is False
-        assert list(record.validation_errors or ()) == [AWS_S3_ENDPOINT_URL_POLICY_ERROR]
+        assert [error.message for error in record.validation_errors or ()] == [AWS_S3_ENDPOINT_URL_POLICY_ERROR]
         assert endpoint_sentinel not in repr(record.validation_errors)
 
     @pytest.mark.asyncio
@@ -11163,7 +11173,13 @@ class TestComposerProgressRoutes:
         assert body["state"] is not None
         assert body["state"]["version"] == 2
         assert body["state"]["id"] == messages[-1]["composition_state_id"]
-        assert body["state"]["validation_errors"] == ["guided_composition_invalid"]
+        assert body["state"]["validation_errors"] == [
+            {
+                "message": "guided_composition_invalid",
+                "error_code": "guided_composition_invalid",
+                "component": None,
+            }
+        ]
         assert body["state"]["composer_meta"]["guided_session"]["transition_consumed"] is True
 
     @pytest.mark.asyncio
@@ -12222,7 +12238,13 @@ def test_runtime_preflight_errors_are_used_for_composition_state_persistence() -
     is_valid, messages = _composer_persisted_validation(authoring, runtime)
 
     assert is_valid is False
-    assert messages == ["Invalid configuration for transform 'batch_stats'"]
+    assert messages == [
+        CompositionValidationError(
+            message="Invalid configuration for transform 'batch_stats'",
+            error_code=None,
+            component="agg1",
+        )
+    ]
 
 
 def test_authoring_validity_is_not_marked_valid_when_runtime_preflight_failed_internally() -> None:
@@ -12242,7 +12264,13 @@ def test_authoring_validity_is_not_marked_valid_when_runtime_preflight_failed_in
     is_valid, messages = _composer_persisted_validation(authoring, _RUNTIME_PREFLIGHT_FAILED)
 
     assert is_valid is False
-    assert messages == ["runtime_preflight_failed"]
+    assert messages == [
+        CompositionValidationError(
+            message="runtime_preflight_failed",
+            error_code="runtime_preflight_failed",
+            component=None,
+        )
+    ]
 
 
 def test_runtime_preflight_failed_with_diagnostics_emits_structured_errors() -> None:
@@ -12271,14 +12299,14 @@ def test_runtime_preflight_failed_with_diagnostics_emits_structured_errors() -> 
 
     assert is_valid is False
     assert messages is not None
-    assert messages[0] == "runtime_preflight_failed", (
-        "Legacy sentinel must remain at index 0 — SPA / LLM parsers "
-        "key on this exact string and would silently fail to detect "
-        "the failure class if it moved or changed."
+    assert messages[0] == CompositionValidationError(
+        message="runtime_preflight_failed",
+        error_code="runtime_preflight_failed",
+        component=None,
     )
-    assert "exception_class=AttributeError" in messages
-    assert any(m.startswith("exception_message=") for m in messages)
-    assert sum(1 for m in messages if m.startswith("frame=")) == 2
+    assert "exception_class=AttributeError" in [error.message for error in messages]
+    assert any(error.message.startswith("exception_message=") for error in messages)
+    assert sum(1 for error in messages if error.message.startswith("frame=")) == 2
 
 
 def test_capture_runtime_preflight_failure_redacts_locals_and_source() -> None:
@@ -12381,7 +12409,8 @@ def test_state_data_carries_structured_errors_before_save_for_atomicity() -> Non
     # transactional (see SessionServiceImpl.save_composition_state),
     # so no observable row at v(N+1) can lack these fields.
     assert state_data.is_valid is False
-    errors = list(state_data.validation_errors or ())
+    errors = [error.message for error in state_data.validation_errors or ()]
+    assert state_data.validation_errors[0].error_code == "runtime_preflight_failed"
     assert errors[0] == "runtime_preflight_failed"
     assert "exception_class=AttributeError" in errors
     assert any(e.startswith("exception_message=") for e in errors)
@@ -13013,7 +13042,7 @@ def test_recompose_success_persists_runtime_invalid_state(tmp_path) -> None:
     assert persisted.metadata_["name"] == "runtime-invalid-recompose"
     assert persisted.is_valid is False
     assert persisted.validation_errors is not None
-    assert list(persisted.validation_errors) == ["runtime failure from recompose"]
+    assert [error.message for error in persisted.validation_errors] == ["runtime failure from recompose"]
 
 
 def test_recompose_convergence_persists_runtime_invalid_partial_state(tmp_path) -> None:
@@ -13078,7 +13107,7 @@ def test_recompose_convergence_persists_runtime_invalid_partial_state(tmp_path) 
     assert persisted.metadata_["name"] == "partial-after-convergence"
     assert persisted.is_valid is False
     assert persisted.validation_errors is not None
-    assert list(persisted.validation_errors) == ["runtime failure from convergence"]
+    assert [error.message for error in persisted.validation_errors] == ["runtime failure from convergence"]
 
 
 def test_compose_plugin_crash_persists_runtime_invalid_partial_state(tmp_path) -> None:
@@ -13136,7 +13165,7 @@ def test_compose_plugin_crash_persists_runtime_invalid_partial_state(tmp_path) -
     assert persisted.metadata_["name"] == "partial-after-plugin-crash"
     assert persisted.is_valid is False
     assert persisted.validation_errors is not None
-    assert list(persisted.validation_errors) == ["runtime failure from plugin crash"]
+    assert [error.message for error in persisted.validation_errors] == ["runtime failure from plugin crash"]
 
 
 # ---------------------------------------------------------------------------
@@ -13236,7 +13265,8 @@ def test_compose_runtime_preflight_persists_partial_state(tmp_path) -> None:
     # match; subsequent entries carry exception_class + first-line message
     # + bounded file:line:function frames.
     assert persisted.validation_errors is not None
-    errors = list(persisted.validation_errors)
+    errors = [error.message for error in persisted.validation_errors]
+    assert persisted.validation_errors[0].error_code == "runtime_preflight_failed"
     assert errors[0] == "runtime_preflight_failed"
     assert "exception_class=RuntimeError" in errors
     assert any(e.startswith("exception_message=") for e in errors)
@@ -13303,7 +13333,7 @@ def test_authoring_validator_crash_persists_invalid_state_and_skips_runtime_pref
         loop.close()
     assert persisted is not None
     assert persisted.is_valid is False
-    assert list(persisted.validation_errors or []) == ["validation_failed"]
+    assert [error.message for error in persisted.validation_errors or ()] == ["validation_failed"]
 
 
 def test_recompose_runtime_preflight_persists_partial_state(tmp_path) -> None:
@@ -13358,7 +13388,8 @@ def test_recompose_runtime_preflight_persists_partial_state(tmp_path) -> None:
     # See sibling test in test_compose_runtime_preflight_persists_partial_state
     # for the structured-error rationale (elspeth-2c3d63037c).
     assert persisted.validation_errors is not None
-    errors = list(persisted.validation_errors)
+    errors = [error.message for error in persisted.validation_errors]
+    assert persisted.validation_errors[0].error_code == "runtime_preflight_failed"
     assert errors[0] == "runtime_preflight_failed"
     assert "exception_class=RuntimeError" in errors
     assert any(e.startswith("exception_message=") for e in errors)
@@ -14320,7 +14351,13 @@ def test_handle_convergence_error_persists_convergence_persist_provenance(tmp_pa
     )
     assert response.status_code == 422
     detail = response.json()["detail"]
-    assert detail["partial_state"]["validation_errors"] == ["guided_composition_invalid"]
+    assert detail["partial_state"]["validation_errors"] == [
+        {
+            "message": "guided_composition_invalid",
+            "error_code": "guided_composition_invalid",
+            "component": None,
+        }
+    ]
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
     assert deep_thaw(current.composer_meta["guided_session"]) == guided.to_dict()
@@ -14368,7 +14405,13 @@ def test_handle_plugin_crash_persists_plugin_crash_persist_provenance(tmp_path: 
     persisted_id, persisted_version = _read_persisted_state_identity(service, session_id)
     assert detail["partial_state"]["id"] == persisted_id
     assert detail["partial_state"]["version"] == persisted_version
-    assert detail["partial_state"]["validation_errors"] == ["guided_composition_invalid"]
+    assert detail["partial_state"]["validation_errors"] == [
+        {
+            "message": "guided_composition_invalid",
+            "error_code": "guided_composition_invalid",
+            "component": None,
+        }
+    ]
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
     assert deep_thaw(current.composer_meta["guided_session"]) == guided.to_dict()
@@ -14440,7 +14483,13 @@ def test_handle_runtime_preflight_failure_persists_preflight_persist_provenance(
     persisted_id, persisted_version = _read_persisted_state_identity(service, session_id)
     assert detail["partial_state"]["id"] == persisted_id
     assert detail["partial_state"]["version"] == persisted_version
-    assert detail["partial_state"]["validation_errors"] == ["guided_composition_invalid"]
+    assert detail["partial_state"]["validation_errors"] == [
+        {
+            "message": "guided_composition_invalid",
+            "error_code": "guided_composition_invalid",
+            "component": None,
+        }
+    ]
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
     assert deep_thaw(current.composer_meta["guided_session"]) == guided.to_dict()
@@ -14523,7 +14572,9 @@ def test_send_message_state_advance_preserves_existing_composer_meta(tmp_path: P
     assert response.status_code == 200
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
-    assert current.validation_errors == ("guided_composition_invalid",)
+    assert current.validation_errors == (
+        CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),
+    )
     assert current.composer_meta["guided_completed_terminal_before_user_exit"] == marker
 
 
@@ -15008,7 +15059,13 @@ async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
     legacy = _legacy_unbindable_guided_state(terminal=exited)
     legacy = replace(
         legacy,
-        validation_errors=["Source 'source' has no reachable output (E_GRAPH)"],
+        validation_errors=[
+            CompositionValidationError(
+                message="Source 'source' has no reachable output (E_GRAPH)",
+                error_code=None,
+                component=None,
+            )
+        ],
     )
     await _insert_legacy_composition_state(service, session.id, legacy, provenance="post_compose")
 
@@ -15018,7 +15075,13 @@ async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
     body = response.json()
     assert body["composer_meta"]["guided_session"]["custody_unavailable"] is True
     assert body["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
-    assert body["validation_errors"] == ["Source 'source' has no reachable output (E_GRAPH)"]
+    assert body["validation_errors"] == [
+        {
+            "message": "Source 'source' has no reachable output (E_GRAPH)",
+            "error_code": None,
+            "component": None,
+        }
+    ]
     assert _LEGACY_PRIVATE_PATH not in response.text
 
 

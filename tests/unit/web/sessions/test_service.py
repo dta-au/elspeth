@@ -45,6 +45,7 @@ from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     CompositionStateData,
     CompositionStateRecord,
+    CompositionValidationError,
     GuidedOperationClaimed,
     RunAlreadyActiveError,
     RunDiagnosticsAuditAuthority,
@@ -651,6 +652,38 @@ class TestCompositionStateVersioning:
         )
         state = await service.save_composition_state(session.id, state_data, provenance="session_seed")
         assert state.is_valid is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("errors", [None, (), (CompositionValidationError(message="detail", error_code="known", component="node"),)])
+async def test_structured_validation_errors_persist_exactly(service, engine, errors):
+    session = await service.create_session("alice", "Pipeline", "local")
+    saved = await service.save_composition_state(session.id, CompositionStateData(validation_errors=errors), provenance="session_seed")
+    loaded = await service.get_current_state(session.id)
+    assert loaded is not None
+    assert loaded.validation_errors == errors
+    with engine.connect() as conn:
+        raw = conn.execute(
+            select(composition_states_table.c.validation_errors).where(composition_states_table.c.id == str(saved.id))
+        ).scalar_one()
+    expected = (
+        None
+        if errors is None
+        else [{"message": error.message, "error_code": error.error_code, "component": error.component} for error in errors]
+    )
+    assert raw == expected
+
+
+@pytest.mark.asyncio
+async def test_current_epoch_state_rejects_legacy_string_errors(service, engine):
+    session = await service.create_session("alice", "Pipeline", "local")
+    saved = await service.save_composition_state(session.id, CompositionStateData(), provenance="session_seed")
+    with engine.begin() as conn:
+        conn.execute(
+            composition_states_table.update().where(composition_states_table.c.id == str(saved.id)).values(validation_errors=["legacy"])
+        )
+    with pytest.raises(AuditIntegrityError):
+        await service.get_current_state(session.id)
 
 
 class TestOneActiveRunEnforcement:

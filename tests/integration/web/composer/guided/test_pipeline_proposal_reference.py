@@ -129,6 +129,8 @@ def _guided() -> GuidedSession:
 
 
 def _state_data(guided: GuidedSession) -> CompositionStateData:
+    from elspeth.web.sessions.protocol import CompositionValidationError
+
     state = replace(_initial_composition_state_with_guided_session(), guided_session=guided)
     data = state.to_dict()
     return CompositionStateData(
@@ -138,7 +140,9 @@ def _state_data(guided: GuidedSession) -> CompositionStateData:
         outputs=data["outputs"],
         metadata_=data["metadata"],
         is_valid=False,
-        validation_errors=("guided_composition_invalid",),
+        validation_errors=(
+            CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),
+        ),
         composer_meta={"guided_session": guided.to_dict()},
     )
 

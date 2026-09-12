@@ -70,6 +70,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
+    CompositionValidationError,
     GuidedAuditEvidence,
     GuidedOperationClaimed,
     GuidedOperationFence,
@@ -1235,7 +1236,13 @@ def test_guided_checkpoint_replaces_raw_validation_text_with_closed_status() -> 
     replay = importlib.import_module("elspeth.web.sessions.guided_replay")
     state = CompositionStateData(
         is_valid=False,
-        validation_errors=["/home/operator/private.csv token=VALIDATION-CREDENTIAL-CANARY"],
+        validation_errors=[
+            CompositionValidationError(
+                message="/private/validation.csv token=VALIDATION-CREDENTIAL-CANARY",
+                error_code="PRIVATE-CODE-CANARY",
+                component="PRIVATE-COMPONENT-CANARY",
+            )
+        ],
     )
 
     prepared = replay.with_guided_response_descriptor(
@@ -1243,15 +1250,21 @@ def test_guided_checkpoint_replaces_raw_validation_text_with_closed_status() -> 
         GuidedResponseDescriptor(kind="guided_respond", next_turn=None, assistant_turn_seq=None),
     )
 
-    assert prepared.validation_errors == ("guided_composition_invalid",)
+    assert prepared.validation_errors == (
+        CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),
+    )
     assert "VALIDATION-CREDENTIAL-CANARY" not in repr(prepared.validation_errors)
+    assert "PRIVATE-CODE-CANARY" not in repr(prepared.validation_errors)
+    assert "PRIVATE-COMPONENT-CANARY" not in repr(prepared.validation_errors)
 
 
 def test_guided_checkpoint_preserves_closed_validation_status() -> None:
     replay = importlib.import_module("elspeth.web.sessions.guided_replay")
     state = CompositionStateData(
         is_valid=False,
-        validation_errors=["guided_composition_invalid"],
+        validation_errors=[
+            CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None)
+        ],
     )
 
     prepared = replay.with_guided_response_descriptor(
@@ -1259,7 +1272,9 @@ def test_guided_checkpoint_preserves_closed_validation_status() -> None:
         GuidedResponseDescriptor(kind="guided_respond", next_turn=None, assistant_turn_seq=None),
     )
 
-    assert prepared.validation_errors == ("guided_composition_invalid",)
+    assert prepared.validation_errors == (
+        CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),
+    )
 
 
 def test_audit_preparation_uses_real_typed_evidence_and_omits_hidden_provider_data() -> None:
@@ -1482,7 +1497,7 @@ def _replay_record(
     *,
     descriptor: GuidedResponseDescriptor,
     guided: GuidedSession,
-    validation_errors: list[str] | None = None,
+    validation_errors: list[CompositionValidationError] | None = None,
     sources: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> CompositionStateRecord:
     replay = importlib.import_module("elspeth.web.sessions.guided_replay")

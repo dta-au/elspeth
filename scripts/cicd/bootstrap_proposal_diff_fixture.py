@@ -62,6 +62,7 @@ import argparse
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,21 @@ REGENERATE_COMMAND = ".venv/bin/python scripts/cicd/bootstrap_proposal_diff_fixt
 # (ProposalDiff.test.tsx ``makeState``). The arguments below are authored to
 # line up with it: same source name, node id, sink name, and option keys.
 CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
+    (
+        "set_pipeline_explicit_null_inline_blob",
+        "set_pipeline",
+        {
+            "source": {"plugin": "csv", "on_success": "rows", "options": {}, "inline_blob": None},
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+        },
+    ),
+    (
+        "set_source_explicit_null_description",
+        "set_source",
+        {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard", "description": None},
+    ),
     (
         "set_pipeline_ambiguous_inline_empty_options",
         "set_pipeline",
@@ -292,7 +308,21 @@ def build_fixture() -> dict[str, Any]:
 
     telemetry = NoopRedactionTelemetry()
     cases: dict[str, Any] = {}
-    for case_name, tool_name, arguments in CASES:
+    replay = next(arguments for name, _tool, arguments in CASES if name == "set_pipeline_replaying_current_state")
+    explicit_null = deepcopy(replay)
+    explicit_null["source"]["description"] = None
+    explicit_null["nodes"][0]["timeout_seconds"] = None
+    explicit_null["outputs"][0]["on_write_failure"] = None
+    empty_options = deepcopy(replay)
+    empty_options["source"]["options"] = {}
+    empty_options["nodes"][0]["options"] = {}
+    empty_options["outputs"][0]["options"] = {}
+    presence_cases = (
+        ("set_pipeline_presence_omitted", "set_pipeline", replay),
+        ("set_pipeline_presence_null", "set_pipeline", explicit_null),
+        ("set_pipeline_empty_options_replaying_current_state", "set_pipeline", empty_options),
+    )
+    for case_name, tool_name, arguments in (*CASES, *presence_cases):
         cases[case_name] = {
             "tool": tool_name,
             "arguments": arguments,

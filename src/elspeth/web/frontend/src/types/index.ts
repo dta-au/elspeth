@@ -242,6 +242,12 @@ export interface ValidationEntryDTO {
   error_code?: string | null;
 }
 
+export type CompositionValidationError = Readonly<{
+  message: string;
+  error_code: string | null;
+  component: string | null;
+}>;
+
 export interface CompositionState {
   id: string;
   session_id: string;
@@ -252,7 +258,7 @@ export interface CompositionState {
   outputs: OutputSpec[];
   metadata: PipelineMetadata;
   is_valid: boolean;
-  validation_errors: string[] | null;
+  validation_errors: CompositionValidationError[] | null;
   validation_warnings: ValidationEntryDTO[] | null;
   validation_suggestions: ValidationEntryDTO[] | null;
   derived_from_state_id: string | null;

@@ -323,7 +323,7 @@ class TestStagedReviewHandoffAnnouncement:
         """Replacing the preflight suffix must not drop its repair suggestion.
 
         ``_composer_persisted_validation`` projects preflight errors to
-        ``[error.message]``, so ``ValidationError.suggestion`` reaches no
+        owned message/code/component records, so ``ValidationError.suggestion`` reaches no
         structured surface — the prose suffix is the only place the operator
         can see it. Dropping the tail's suffix without carrying the suggestion
         across would therefore lose it outright.

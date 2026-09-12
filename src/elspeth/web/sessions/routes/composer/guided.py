@@ -68,12 +68,14 @@ from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
 from elspeth.web.sessions.guided_replay import (
     guided_completed_chat_token,
     guided_turn_token,
+    guided_validation_errors,
     load_guided_json_payload,
     parse_guided_response_descriptor,
     project_guided_response,
     project_reviewed_components,
 )
 from elspeth.web.sessions.protocol import (
+    CompositionValidationError,
     GuidedAuditEvidence,
     GuidedCompositionStateResult,
     GuidedOperationActive,
@@ -630,7 +632,7 @@ def _guided_persisted_validity(
     state: CompositionState,
     *,
     catalog: PolicyCatalogView,
-) -> tuple[bool, list[str] | None]:
+) -> tuple[bool, tuple[CompositionValidationError, ...] | None]:
     """Derive is_valid/validation_errors for a guided persist site.
 
     Mirrors the freeform persist convention's authoring-only fallback
@@ -652,7 +654,7 @@ def _guided_persisted_validity(
     # Validator prose may contain paths, provider diagnostics, or operator
     # input. Guided checkpoints persist a closed status instead: this retains
     # truthful validity without widening the replay egress surface.
-    return False, ["guided_composition_invalid"]
+    return False, guided_validation_errors(is_valid=False)
 
 
 def _append_server_turn_record(

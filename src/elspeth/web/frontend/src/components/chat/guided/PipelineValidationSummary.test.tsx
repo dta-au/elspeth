@@ -259,6 +259,7 @@ describe("PipelineValidationSummary", () => {
           component_type: "transform",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
@@ -267,9 +268,9 @@ describe("PipelineValidationSummary", () => {
     // The role=status headline is the plain-language line, mapped through the
     // gloss ("rate each row" / "write a CSV"), never the raw dump.
     const status = screen.getByRole("status");
-    expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/the "Rater" step's output/);
-    expect(status.textContent).toMatch(/write a CSV/);
+    expect(status.textContent).toMatch(/incompatible data/i);
+    expect(status.textContent).not.toMatch(/step's output/);
+    expect(status.textContent).not.toMatch(/Two steps/);
     expect(status.textContent).not.toMatch(/Schema contract violation/);
     // The verbatim dump survives behind the expander for the engineer read.
     expect(screen.getByText("Technical details")).toBeInTheDocument();
@@ -297,14 +298,15 @@ describe("PipelineValidationSummary", () => {
           component_type: "output",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
     });
     render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
-    expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/the "Rater" step's output/);
+    expect(status.textContent).toMatch(/incompatible data/i);
+    expect(status.textContent).not.toMatch(/step's output/);
     expect(status.textContent).toMatch(/write a CSV/);
     expect(status.textContent).not.toMatch(/Schema contract violation/);
     expect(screen.getByText("Technical details")).toBeInTheDocument();
@@ -351,6 +353,7 @@ describe("PipelineValidationSummary", () => {
           component_type: "transform",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
@@ -358,8 +361,8 @@ describe("PipelineValidationSummary", () => {
     render(<PipelineValidationSummary />);
 
     const status = screen.getByRole("status");
-    expect(status.textContent).toMatch(/"this step" step's output/i);
-    expect(status.textContent).toMatch(/write a CSV/i);
+    expect(status.textContent).toMatch(/incompatible data/i);
+    expect(status.textContent).not.toMatch(/write a CSV/i);
     expect(status.textContent).not.toMatch(/rate each row/i);
   });
 
@@ -385,14 +388,15 @@ describe("PipelineValidationSummary", () => {
           component_type: "output",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
     });
     const { container } = render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
-    expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/process each row/i);
+    expect(status.textContent).toMatch(/incompatible data/i);
+    expect(status.textContent).not.toMatch(/process each row/i);
     expect(status.textContent).toMatch(/write a CSV/i);
     expect(status.textContent).not.toMatch(/"this step" step's output.*"this step"/i);
     expect(screen.getByText("Technical details")).toBeInTheDocument();
@@ -423,6 +427,7 @@ describe("PipelineValidationSummary", () => {
           component_type: "source",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
@@ -430,9 +435,9 @@ describe("PipelineValidationSummary", () => {
     render(<PipelineValidationSummary />);
 
     const status = screen.getByRole("status");
-    expect(status.textContent).toMatch(/aren't connected correctly/i);
+    expect(status.textContent).toMatch(/incompatible data/i);
     expect(status.textContent).toMatch(/read your CSV/i);
-    expect(status.textContent).toMatch(/process each row/i);
+    expect(status.textContent).not.toMatch(/process each row/i);
     expect(status.textContent).not.toMatch(/the "write a CSV" step's output/i);
   });
 
@@ -461,6 +466,7 @@ describe("PipelineValidationSummary", () => {
           component_type: "source",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
@@ -494,6 +500,7 @@ describe("PipelineValidationSummary", () => {
           component_type: "source",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
@@ -527,6 +534,7 @@ describe("PipelineValidationSummary", () => {
           component_type: "transform",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
@@ -535,12 +543,12 @@ describe("PipelineValidationSummary", () => {
 
     const status = screen.getByRole("status");
     expect(status.textContent).toMatch(/process each row/i);
-    expect(status.textContent).toMatch(/write a JSON file/i);
+    expect(status.textContent).not.toMatch(/write a JSON file/i);
     expect(status.textContent).not.toMatch(/the "write a CSV" step's output/i);
   });
 
   // ── elspeth-9f21f3c57d: the session-2e0c8ea3 banner names the real steps ──
-  it("names both real steps for compiled edge ids when the composition carries descriptions (session 2e0c8ea3)", () => {
+  it("names only the structured component despite two compiled ids in the detail", () => {
     useSessionStore.setState({
       compositionState: makeComposition(1, {
         sources: {},
@@ -584,6 +592,7 @@ describe("PipelineValidationSummary", () => {
           component_type: "transform",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
@@ -592,11 +601,9 @@ describe("PipelineValidationSummary", () => {
     const status = screen.getByRole("status");
     // Compiled ids strip back to the composer nodes, whose descriptions name
     // the steps — never the old "this step" / "rate each row" mislabels.
+    expect(status.textContent).not.toContain("Send each colour down both branches");
     expect(status.textContent).toContain(
-      'the "Send each colour down both branches" step\'s output',
-    );
-    expect(status.textContent).toContain(
-      'what "Ask the LLM for a complementary colour pairing for this colour" expects',
+      '"Ask the LLM for a complementary colour pairing for this colour"',
     );
     expect(status.textContent).not.toMatch(/"this step"/);
     expect(status.textContent).not.toMatch(/rate each row/);
@@ -619,14 +626,15 @@ describe("PipelineValidationSummary", () => {
           component_type: "output",
           message: rawDump,
           suggestion: null,
+          error_code: "schema_contract_violation",
         },
       ],
       warnings: [],
     });
     render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
-    expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/the "Rater" step's output/);
+    expect(status.textContent).toMatch(/incompatible data/i);
+    expect(status.textContent).not.toMatch(/step's output/);
     expect(status.textContent).toMatch(/write a CSV/);
     expect(status.textContent).not.toMatch(/Edge contract violation/);
     expect(screen.getByText("Technical details")).toBeInTheDocument();

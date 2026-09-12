@@ -41,6 +41,7 @@ from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrity
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
+from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.guided.state_machine import TerminalState
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
@@ -2275,10 +2276,11 @@ def _redact_via_schema(
     model_cls: type[BaseModel],
     *,
     telemetry: RedactionTelemetry,
+    exclude_unset: bool = False,
 ) -> dict[str, Any]:
     """Walk the validated model's schema; substitute Sensitive fields.
 
-    Operates on ``model_dump()`` output (a plain dict) and substitutes
+    Operates on ``model_dump(exclude_unset=exclude_unset)`` output and substitutes
     in-place on a deep copy so the input model and any external caller
     references are not affected.  Returns the dict ready for serialization.
 
@@ -2296,7 +2298,7 @@ def _redact_via_schema(
     is discarded by the unwind; only a fully successful walk returns it to
     the caller.
     """
-    dumped = copy.deepcopy(validated.model_dump())
+    dumped = copy.deepcopy(validated.model_dump(exclude_unset=exclude_unset))
     for node in walk_model_schema(model_cls, with_values=True):
         marker = next((m for m in node.metadata if isinstance(m, _SensitiveMarker)), None)
         if marker is None:
@@ -2452,11 +2454,12 @@ def _redact_via_policy(
 
 
 def normalize_set_pipeline_redacted_arguments(value: Any) -> Any:
-    """Remove the legacy custody field's schema-default null.
+    """Remove only singular source.inline_blob null for semantic binding.
 
     Pydantic materializes ``source.inline_blob=None`` while proposal custody
     treats an omitted field as absent. Both spellings mean no inline blob, so
-    their persisted redacted authority projection must be identical.
+    their semantic dispatch bindings agree. Displayed arguments retain the
+    authored distinction; this helper does not define display normalization.
 
     Both mapping tests name ``(dict, MappingProxyType)`` — exactly
     ``deep_freeze``'s output pair — rather than ``type(x) is dict``. Returning
@@ -2482,6 +2485,11 @@ def normalize_set_pipeline_redacted_arguments(value: Any) -> Any:
     normalized_source = dict(source)
     del normalized_source["inline_blob"]
     return {**value, "source": normalized_source}
+
+
+def semantic_redacted_pipeline_arguments_hash(arguments: Mapping[str, Any]) -> str:
+    """Bind redacted arguments using only the existing no-inline-blob equivalence."""
+    return composer_authority_hash(normalize_set_pipeline_redacted_arguments(arguments))
 
 
 def redact_tool_call_arguments(
@@ -2551,8 +2559,7 @@ def redact_tool_call_arguments(
         # validation success.
         telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
         validated = entry.argument_model.model_validate(arguments)
-        redacted = _redact_via_schema(tool_name, validated, entry.argument_model, telemetry=telemetry)
-        return normalize_set_pipeline_redacted_arguments(redacted) if tool_name == "set_pipeline" else redacted
+        return _redact_via_schema(tool_name, validated, entry.argument_model, telemetry=telemetry, exclude_unset=True)
     # Declarative branch (entry.policy is not None — ToolRedaction.__post_init__
     # guarantees exactly one of {argument_model, policy} is set).
     telemetry.manifest_dispatch(tool_name=tool_name, shape="declarative")

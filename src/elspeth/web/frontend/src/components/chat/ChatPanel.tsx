@@ -1024,7 +1024,7 @@ export function ChatPanel({
   // panel either (same error-rendering discipline).
   const wireValidationIssues = useMemo<string[]>(() => {
     const raw = clientWireBlockerMessages(compositionState?.validation_errors ?? []);
-    if (raw.length === 0) return raw;
+    if (raw.length === 0) return [];
     const phraseFor = makePhraseFor(compositionState);
     return raw.map(
       (message) => humaniseValidationMessage(message, phraseFor).headline,

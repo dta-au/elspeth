@@ -45,7 +45,7 @@ from elspeth.web.composer.pipeline_proposal import (
     owned_composition_state_execution_arguments,
     restore_owned_composition_state_authority,
 )
-from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments
+from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, semantic_redacted_pipeline_arguments_hash
 from elspeth.web.composer.reviewed_source_authority import (
     resolve_owned_composition_source_authority,
     resolve_reviewed_source_authority,
@@ -213,11 +213,15 @@ class PipelineDispatchAuditBinding:
             raise AuditIntegrityError("persisted pipeline dispatch payload is malformed") from exc
         if invocation.get("result_hash") != result_hash:
             raise AuditIntegrityError("persisted pipeline dispatch canonical hashes are malformed")
-        normalized_arguments = normalize_set_pipeline_redacted_arguments(restored_arguments)
-        if type(normalized_arguments) is not dict:
+        if type(restored_arguments) is not dict:
             raise AuditIntegrityError("persisted pipeline dispatch arguments are malformed")
+        # Restored arguments already occupy the canonical domain. Rehashing an
+        # unchanged reserved mapping would escape its canonical wrapper again.
+        normalized_arguments = normalize_set_pipeline_redacted_arguments(restored_arguments)
         semantic_arguments_hash = (
-            stored_authority_hash if normalized_arguments is restored_arguments else composer_authority_hash(normalized_arguments)
+            stored_authority_hash
+            if normalized_arguments is restored_arguments
+            else semantic_redacted_pipeline_arguments_hash(restored_arguments)
         )
         return cls(
             tool_call_id=tool_call_id,

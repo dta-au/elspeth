@@ -81,6 +81,7 @@ from elspeth.web.sessions.guided_replay import (
     project_guided_response,
 )
 from elspeth.web.sessions.protocol import (
+    CompositionValidationError,
     GuidedAuditEvidence,
     GuidedCompositionStateResult,
     GuidedOperationFailureCode,
@@ -2226,7 +2227,7 @@ async def post_guided_chat_schema8(
                     existing_meta["guided_session"] = resulting_guided.to_dict()
                     state_dict = resulting_state.to_dict()
                     is_valid: bool
-                    validation_errors: list[str] | None
+                    validation_errors: tuple[CompositionValidationError, ...] | None
                     if terminal_chat:
                         # The authored content of this row is byte-identical to
                         # the head — the settlement's content-hash fence above
@@ -2245,8 +2246,7 @@ async def post_guided_chat_schema8(
                         # propagate into a row the replay projection would then
                         # refuse.
                         is_valid = current_record.is_valid
-                        closed_status = guided_validation_errors(is_valid=is_valid)
-                        validation_errors = list(closed_status) if closed_status is not None else None
+                        validation_errors = guided_validation_errors(is_valid=is_valid)
                     else:
                         is_valid, validation_errors = guided_route._guided_persisted_validity(resulting_state, catalog=catalog)
                     state_data = CompositionStateData(

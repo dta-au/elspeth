@@ -806,7 +806,7 @@ files:
   src/elspeth/web/composer/reasoning.py:
     dict[str, object]: 1
   src/elspeth/web/composer/redaction.py:
-    Mapping[str, Any]: 13
+    Mapping[str, Any]: 14
     Mapping[str, object]: 3
     boundary: 1
     dict[str, Any]: 35
@@ -1024,10 +1024,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 867
+  Mapping[str, Any]: 868
   Mapping[str, object]: 298
   MutableMapping[str, Any]: 13
   boundary: 63
   dict[str, Any]: 1136
   dict[str, object]: 400
-  soft: 2714
+  soft: 2715

@@ -132,11 +132,12 @@ def _assert_emitted_argument_keys(tool: str, raw_arguments: dict[str, Any]) -> N
     model = redaction.MANIFEST[tool].argument_model
     assert model is not None
     accepted = _model_argument_keys(tool, model)
-    model.model_validate(raw_arguments)
+    validated = model.model_validate(raw_arguments)
     result = redact_tool_call_arguments(tool, raw_arguments, telemetry=NoopRedactionTelemetry())
-    # The current argument redactor materializes model defaults. Sparse display
-    # is a separate campaign change and must intentionally update this contract.
-    assert frozenset(result) == accepted, f"{tool}: redacted emission lost or renamed an admitted root key"
+    # Sparse argument display preserves supplied keys without materializing defaults.
+    supplied = frozenset(validated.model_dump(exclude_unset=True))
+    assert supplied <= accepted
+    assert frozenset(result) == supplied, f"{tool}: redacted emission lost or renamed a supplied root key"
 
 
 def test_every_shipped_tool_has_complete_admitted_argument_names() -> None:

@@ -1,5 +1,6 @@
 import { isEmptyRedactedOptions } from "./ChatPanel";
-import { redactedArguments } from "@/test/redactedArgumentFixture";
+import { redactedArguments, redactedCase } from "@/test/redactedArgumentFixture";
+import type { CompositionValidationError } from "@/types/index";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -3530,7 +3531,7 @@ describe("ChatPanel mode discriminator", () => {
 
     // The describe's beforeEach resets BOTH stores, so neither the seeded cards
     // nor the seeded validation errors leak into a sibling test.
-    function seedWireStep(validationErrors: string[] | null): void {
+    function seedWireStep(validationErrors: CompositionValidationError[] | null): void {
       useSessionStore.setState({
         activeSessionId: "session-guided",
         sessions: [guidedSessionFixture],
@@ -3581,7 +3582,7 @@ describe("ChatPanel mode discriminator", () => {
       // Both blockers at once: the acknowledgement arm takes precedence,
       // matching the blockers panel's own ordering (the nearer, self-service
       // blocker first).
-      seedWireStep(["Sink 'out' is missing a required field."]);
+      seedWireStep([{message: "Sink 'out' is missing a required field.", error_code: "sink_contract_violation", component: "out"}]);
 
       render(<ChatPanel />);
 
@@ -3591,10 +3592,26 @@ describe("ChatPanel mode discriminator", () => {
     });
 
     it("names the card's issues when the persisted composition is invalid", () => {
-      seedWireStep(["Sink 'out' is missing a required field."]);
+      seedWireStep([{message: "Sink 'out' is missing a required field.", error_code: "sink_contract_violation", component: "out"}]);
 
       render(<ChatPanel />);
 
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "Fix the issues named on the card, then press Confirm wiring.",
+      );
+    });
+
+    it("does not block on the structured guided deferred status", () => {
+      seedWireStep([{message: "guided placeholder", error_code: "guided_composition_invalid", component: null}]);
+      render(<ChatPanel />);
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "Press Confirm wiring on the card, or use its form to change a component.",
+      );
+    });
+
+    it("keeps a message-only status lookalike as a blocker", () => {
+      seedWireStep([{message: "guided_composition_invalid", error_code: null, component: null}]);
+      render(<ChatPanel />);
       expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
         "Fix the issues named on the card, then press Confirm wiring.",
       );
@@ -8211,8 +8228,8 @@ describe("isAmbiguousInlineProposal", () => {
       summary,
       rationale: "",
       affects: ["source"],
-      // Synthetic metadata absence isolates the classifier. Current set_pipeline
-      // redaction fills metadata defaults; live reachability awaits seam 4.4.
+      // Synthetic metadata absence isolates the classifier; the producer-backed
+      // case below separately verifies the sparse empty-metadata summary.
       arguments_redacted_json: {
         ...structuredClone(redactedArguments("set_pipeline_ambiguous_inline_empty_options")),
         metadata: null,
@@ -8226,10 +8243,11 @@ describe("isAmbiguousInlineProposal", () => {
     };
   }
 
-  it("keeps the current full producer payload on standard approval pending sparse metadata", () => {
+  it("keeps standard approval for the producer's sparse empty metadata payload", () => {
     const proposal = makeInlineProposal("I read your message as 3 rows.");
+    expect(redactedCase("set_pipeline_ambiguous_inline_empty_options").arguments.metadata).toEqual({});
     proposal.arguments_redacted_json = redactedArguments("set_pipeline_ambiguous_inline_empty_options");
-    expect(proposal.arguments_redacted_json.metadata).toBe("<metadata-patch:description,name>");
+    expect(proposal.arguments_redacted_json.metadata).toBe("<metadata-patch:empty>");
     expect(isAmbiguousInlineProposal(proposal)).toBe(false);
   });
 

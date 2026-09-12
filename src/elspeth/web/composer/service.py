@@ -2568,17 +2568,23 @@ class ComposerServiceImpl:
 
         del self
         from elspeth.web.sessions._persist_payload import StatePayload
-        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError
 
         result = cast(ToolResult, response)
         state_d = result.updated_state.to_dict()
         pending_sites = pending_execution_interpretation_sites(result.updated_state)
-        validation_errors = tuple(error.message for error in result.validation.errors)
+        validation_errors = tuple(
+            CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component)
+            for error in result.validation.errors
+        )
         if pending_sites:
             # Component id + kind only: user_term is user/planner-authored
-            # content and stays out of the persisted error strings (same
+            # content and stays out of the persisted error records (same
             # non-content rule as the runtime placeholder telemetry).
-            validation_errors += tuple(f"interpretation_review_pending:{site.component_id}:{site.kind.value}" for site in pending_sites)
+            validation_errors += tuple(
+                CompositionValidationError(message=site.kind.value, error_code="interpretation_review_pending", component=site.component_id)
+                for site in pending_sites
+            )
         return StatePayload(
             data=CompositionStateData(
                 sources=state_d["sources"],

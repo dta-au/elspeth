@@ -101,7 +101,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from typing import Any
+from typing import Any, Literal
 
 
 def _node_plugins(state: Any) -> list[str]:
@@ -654,12 +654,7 @@ def _check_discover_before_mutation(messages: list[dict[str, Any]]) -> str | Non
 
 
 def _extract_error_codes_from_entries(entries: Any) -> list[str]:
-    """Return structured validation error codes from a list-like payload.
-
-    Persisted session rows may only carry human-readable messages. Those are not
-    enough to prove an invalid terminal state belongs to an explicitly allowed
-    class, so strings are deliberately ignored and the caller fails closed.
-    """
+    """Read the independently structured mocked-harness diagnostic authority."""
     if not isinstance(entries, list):
         return []
     codes: list[str] = []
@@ -674,31 +669,35 @@ def _extract_error_codes_from_entries(entries: Any) -> list[str]:
     return codes
 
 
-def _validation_error_codes(state: Any) -> list[str]:
-    """Extract structured runtime validation error codes from scorer state.
+def _http_validation_error_codes(entries: Any) -> list[str]:
+    """Read only complete HTTP records; every error must prove its allowance.
 
-    TWO PRODUCERS FEED THIS AND THEY DISAGREE, which decides whether the
-    allowance in ``_relaxed_invalid_state_reason`` is decidable at all:
-
-    - The mocked-LLM harness (``tests/unit/evals/
-      test_convergence_scenarios_mocked_llm.py::_state_dict_for_scoring``)
-      builds ``validation_errors`` as dicts carrying ``error_code``, precisely
-      so scoring can read codes. Codes are readable.
-    - The HTTP / persisted shape does not. ``CompositionStateResponse
-      .validation_errors`` is ``list[str] | None`` (``web/sessions/schemas.py``)
-      and the protocol records agree, so every entry is a bare message and
-      ``_extract_error_codes_from_entries`` ignores it by design. Codes are
-      NOT readable, and no amount of reading harder here recovers them —
-      the structure is discarded upstream (elspeth-8fe09316ab).
-
-    ``errors`` and ``runtime_preflight`` are read for the harness's benefit;
-    neither is a field of ``CompositionStateResponse``.
-
-    An empty return therefore means "this state made no codes observable",
-    never "the run raised no coded error". The caller must not conflate them.
+    A null code is a valid message-only record, but cannot establish that all
+    errors belong to an allowed class. Malformed or historical observations
+    likewise cannot establish an allowance. Neither message nor component is
+    parsed for identity.
     """
+    if type(entries) is not list:
+        return []
+    codes: list[str] = []
+    for entry in entries:
+        if type(entry) is not dict or set(entry) != {"message", "error_code", "component"}:
+            return []
+        if type(entry["message"]) is not str or (entry["component"] is not None and type(entry["component"]) is not str):
+            return []
+        code = entry["error_code"]
+        if type(code) is not str or not code:
+            return []
+        codes.append(code)
+    return codes
+
+
+def _validation_error_codes(state: Any, origin: Literal["http", "mocked_harness"]) -> list[str]:
+    """Keep HTTP state and mocked-harness diagnostic sources separate."""
     if not isinstance(state, dict):
         return []
+    if origin == "http":
+        return _http_validation_error_codes(state.get("validation_errors"))
     codes: list[str] = []
     for entries in (state.get("validation_errors"), state.get("errors")):
         codes.extend(_extract_error_codes_from_entries(entries))
@@ -708,23 +707,20 @@ def _validation_error_codes(state: Any) -> list[str]:
     return codes
 
 
-def _relaxed_invalid_state_reason(red: dict[str, Any], state: Any) -> str | None:
+def _relaxed_invalid_state_reason(red: dict[str, Any], state: Any, origin: Literal["http", "mocked_harness"]) -> str | None:
     """Return a RED reason unless is_valid=false has explicit, proven allowance."""
     allowed_raw = red.get("allow_is_valid_false_when_error_codes")
     allowed = {code for code in allowed_raw if isinstance(code, str) and code} if isinstance(allowed_raw, list) else set()
     if not allowed:
         return "final composition state has is_valid=false and no allowed invalid validation error codes were declared"
 
-    observed = _validation_error_codes(state)
+    observed = _validation_error_codes(state, origin)
     if not observed:
-        # Say what the SCORER could see, not what the pipeline did. A state whose
-        # validation_errors are message strings — the CompositionStateResponse
-        # shape — reaches this branch even when the run raised coded errors, so
-        # "no codes were present" would be a claim about the pipeline that the
-        # scorer has no standing to make.
+        # Missing, uncoded or malformed observations cannot establish that all
+        # errors qualify. Do not turn that blindness into a claim about the run.
         return (
-            f"final composition state has is_valid=false and carried no structurally readable validation error "
-            f"codes, so the declared allowance could not be checked (allowed: {sorted(allowed)}) — this reports "
+            f"final composition state has is_valid=false without structurally readable codes for every validation error, "
+            f"so the declared allowance could not be checked (allowed: {sorted(allowed)}) — this reports "
             f"what the state made observable, not that the run raised no coded error"
         )
 
@@ -736,12 +732,16 @@ def _relaxed_invalid_state_reason(red: dict[str, Any], state: Any) -> str | None
     return None
 
 
-def score(scenario: dict[str, Any], messages: list[dict[str, Any]], state: Any) -> dict[str, Any]:
+def score(
+    scenario: dict[str, Any], messages: list[dict[str, Any]], state: Any, *, state_origin: Literal["http", "mocked_harness"] = "http"
+) -> dict[str, Any]:
     """Score a captured composer-rgr run. Pure function — no I/O.
 
     Returns a dict with verdict (RED/AMBER/GREEN), red_reasons, amber_reasons,
     and stats. Verdict precedence is RED > AMBER > GREEN.
     """
+    if state_origin not in ("http", "mocked_harness"):
+        raise ValueError("Unknown scorer state origin")
     red = scenario["red_criteria"]
     green = scenario["green_criteria"]
 
@@ -778,7 +778,7 @@ def score(scenario: dict[str, Any], messages: list[dict[str, Any]], state: Any) 
         # red_reason here), so this gate only needs the is_valid=false branch.
         red_reasons.append("final composition state has is_valid=false")
     elif is_valid is False:
-        relaxed_reason = _relaxed_invalid_state_reason(red, state)
+        relaxed_reason = _relaxed_invalid_state_reason(red, state, state_origin)
         if relaxed_reason is not None:
             red_reasons.append(relaxed_reason)
 

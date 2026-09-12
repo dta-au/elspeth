@@ -279,7 +279,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # 55 pairs with Landscape40 for identity owners and durable admission evidence.
     # _COORDINATION_HARD_CUT_EPOCH tracks this by exact equality, so a bump
     # that missed it would stop every session DB from opening.
-    assert SESSION_SCHEMA_EPOCH == 55
+    # 56 couples sparse proposal display with structured stored validation errors.
+    assert SESSION_SCHEMA_EPOCH == 56
     expected_tables = frozenset(
         {
             "web_instances",
@@ -430,6 +431,25 @@ def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> Non
     )
     assert all(not columns[name].nullable for name in columns if name != "released_at")
     assert session_operation_fences_table.primary_key.columns.keys() == ["session_id"]
+
+
+def test_previous_epoch_rejection_does_not_rewrite_store() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    previous = SESSION_SCHEMA_EPOCH - 1
+    with eng.begin() as conn:
+        conn.execute(
+            text("UPDATE elspeth_schema_identity SET schema_epoch = :previous WHERE store_kind = 'session'"), {"previous": previous}
+        )
+        conn.exec_driver_sql(f"PRAGMA user_version = {previous}")
+        before = conn.execute(text("SELECT * FROM elspeth_schema_identity")).all()
+        schema_before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
+    with pytest.raises(SessionSchemaError):
+        initialize_session_schema(eng)
+    with eng.connect() as conn:
+        assert conn.execute(text("SELECT * FROM elspeth_schema_identity")).all() == before
+        assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
+        assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == previous
 
 
 def test_epoch_36_database_is_rejected_by_epoch_44_runtime() -> None:

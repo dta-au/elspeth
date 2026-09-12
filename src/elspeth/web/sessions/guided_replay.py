@@ -31,9 +31,12 @@ from elspeth.web.sessions.protocol import (
     CompositionProposalRecord,
     CompositionStateData,
     CompositionStateRecord,
+    CompositionValidationError,
     GuidedJsonPayloadPurpose,
     GuidedResponseDescriptor,
     PreparedGuidedJsonPayload,
+    serialize_composition_validation_error,
+    serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.schemas import (
     ChatMessageResponse,
@@ -41,6 +44,7 @@ from elspeth.web.sessions.schemas import (
     ChatTurnResponse,
     CompositionProposalResponse,
     CompositionStateResponse,
+    CompositionValidationErrorResponse,
     GetGuidedResponse,
     GuidedChatResponse,
     GuidedPlanDeclinedResponse,
@@ -57,7 +61,9 @@ from elspeth.web.sessions.schemas import (
 )
 
 GUIDED_REPLAY_META_KEY = "guided_operation_replay"
-_GUIDED_INVALID_STATUS = ("guided_composition_invalid",)
+_GUIDED_INVALID_STATUS = (
+    CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),
+)
 
 
 def project_composition_proposal(record: CompositionProposalRecord) -> CompositionProposalResponse:
@@ -130,7 +136,7 @@ def project_guided_full_decline(message: ChatMessageRecord) -> GuidedPlanDecline
     )
 
 
-def guided_validation_errors(*, is_valid: bool) -> tuple[str, ...] | None:
+def guided_validation_errors(*, is_valid: bool) -> tuple[CompositionValidationError, ...] | None:
     """Return the closed persisted validity status for a guided state."""
 
     if type(is_valid) is not bool:
@@ -142,8 +148,8 @@ def validation_errors_for_composer_surface(
     *,
     composer_meta: Mapping[str, Any] | None,
     is_valid: bool,
-    validation_errors: Sequence[str] | None,
-) -> Sequence[str] | None:
+    validation_errors: Sequence[CompositionValidationError] | None,
+) -> Sequence[CompositionValidationError] | None:
     """Close validator text only for states that carry guided custody."""
 
     if composer_meta is not None and ("guided_session" in composer_meta or GUIDED_REPLAY_META_KEY in composer_meta):
@@ -408,6 +414,7 @@ def _composition_state_response(
     composer_meta = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
     sources, composer_meta = redact_guided_snapshot_storage_paths(sources, composer_meta, raw_sources=raw_sources)
     expected_errors = guided_validation_errors(is_valid=state.is_valid)
+    serialize_composition_validation_errors(state.validation_errors)
     if state.validation_errors != expected_errors:
         raise AuditIntegrityError("Guided result state has an invalid closed validation status")
     return CompositionStateResponse(
@@ -420,7 +427,11 @@ def _composition_state_response(
         outputs=deep_thaw(state.outputs),
         metadata=deep_thaw(state.metadata_),
         is_valid=state.is_valid,
-        validation_errors=list(expected_errors) if expected_errors is not None else None,
+        validation_errors=(
+            [CompositionValidationErrorResponse(**serialize_composition_validation_error(error)) for error in expected_errors]
+            if expected_errors is not None
+            else None
+        ),
         validation_warnings=None,
         validation_suggestions=None,
         derived_from_state_id=str(state.derived_from_state_id) if state.derived_from_state_id is not None else None,

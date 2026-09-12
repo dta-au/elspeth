@@ -1053,6 +1053,64 @@ class ChatMessageRecord:
             freeze_fields(self, "tool_calls")
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompositionValidationError:
+    """One surface-permitted validation diagnostic stored with session state."""
+
+    message: str
+    error_code: str | None
+    component: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.message) is not str or (self.error_code is not None and type(self.error_code) is not str):
+            raise AuditIntegrityError("Invalid composition validation error scalar")
+        if self.component is not None and type(self.component) is not str:
+            raise AuditIntegrityError("Invalid composition validation error scalar")
+
+
+class CompositionValidationErrorWire(TypedDict):
+    message: str
+    error_code: str | None
+    component: str | None
+
+
+def serialize_composition_validation_error(value: CompositionValidationError) -> CompositionValidationErrorWire:
+    """Encode an owned record explicitly, rechecking its current invariants."""
+    if type(value) is not CompositionValidationError:
+        raise AuditIntegrityError("Composition validation errors require owned records")
+    value.__post_init__()
+    return {"message": value.message, "error_code": value.error_code, "component": value.component}
+
+
+def serialize_composition_validation_errors(
+    values: Sequence[CompositionValidationError] | None,
+) -> list[CompositionValidationErrorWire] | None:
+    if values is None:
+        return None
+    if type(values) not in (list, tuple):
+        raise AuditIntegrityError("Invalid composition validation error collection")
+    return [serialize_composition_validation_error(value) for value in values]
+
+
+def decode_stored_composition_validation_errors(value: object) -> tuple[CompositionValidationError, ...] | None:
+    """Decode current-epoch SQL JSON; malformed audit records fail closed."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or type(value) is not list:
+        raise AuditIntegrityError("Invalid stored composition validation error collection")
+    errors = []
+    for item in value:
+        if not isinstance(item, dict) or type(item) is not dict or set(item) != {"message", "error_code", "component"}:
+            raise AuditIntegrityError("Invalid stored composition validation error record")
+        message, error_code, component = item["message"], item["error_code"], item["component"]
+        if type(message) is not str or (error_code is not None and type(error_code) is not str):
+            raise AuditIntegrityError("Invalid stored composition validation error scalar")
+        if component is not None and type(component) is not str:
+            raise AuditIntegrityError("Invalid stored composition validation error scalar")
+        errors.append(CompositionValidationError(message=message, error_code=error_code, component=component))
+    return tuple(errors)
+
+
 @dataclass(frozen=True, slots=True)
 class CompositionStateData:
     """Input DTO for saving a new composition state version.
@@ -1067,13 +1125,14 @@ class CompositionStateData:
     outputs: Sequence[Mapping[str, Any]] | None = None
     metadata_: Mapping[str, Any] | None = None
     is_valid: bool = False
-    validation_errors: Sequence[str] | None = None
+    validation_errors: Sequence[CompositionValidationError] | None = None
     # Operational/audit meta describing how this state was reached. Distinct
     # from ``metadata_`` which carries user-facing PipelineMetadata. ``None``
     # is honest for revert/fork paths and for non-compose write paths.
     composer_meta: Mapping[str, Any] | None = None
 
     def __post_init__(self, source: Mapping[str, Any] | None) -> None:
+        serialize_composition_validation_errors(self.validation_errors)
         if source is not None:
             if self.sources is not None:
                 raise AuditIntegrityError("CompositionStateData accepts either source or sources, not both")
@@ -1157,7 +1216,7 @@ class CompositionStateRecord:
     outputs: Sequence[Mapping[str, Any]] | None
     metadata_: Mapping[str, Any] | None
     is_valid: bool
-    validation_errors: Sequence[str] | None
+    validation_errors: Sequence[CompositionValidationError] | None
     created_at: datetime
     derived_from_state_id: UUID | None
     # Operational/audit meta describing how this state was reached. Distinct
@@ -1168,6 +1227,7 @@ class CompositionStateRecord:
     source: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        serialize_composition_validation_errors(self.validation_errors)
         non_none = []
         if self.source is not None:
             non_none.append("source")

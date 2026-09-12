@@ -4,7 +4,7 @@
  * Drawer/popover content for one row of the audit-readiness panel.
  *
  * For the `validation` row it re-humanises the structured findings through the
- * SAME humaniser the rail strip uses (humaniseValidationMessage) so that
+ * SAME humaniser the rail strip uses (humaniseExecutionError) so that
  * engine-grade dumps — raw pydantic "Field required" traces, schema-contract
  * violations, interpretation-review-pending strings — never render verbatim on
  * this novice surface (elspeth-901a404926). Each finding shows its plain
@@ -27,7 +27,7 @@ import { useSessionStore } from "../../stores/sessionStore";
 import type { ReadinessRow, ValidationError } from "../../types/api";
 import { stepLabelForNodeId } from "../chat/interpretationStepLabel";
 import {
-  humaniseValidationMessage,
+  humaniseExecutionError,
   makePhraseFor,
 } from "@/lib/validationHumaniser";
 import { UNKNOWN_COMPONENT_PHRASE } from "../chat/guided/pipelineGloss";
@@ -67,7 +67,7 @@ export function ReadinessRowDetail({
   const humanisedFindings =
     validationErrors && validationErrors.length > 0
       ? validationErrors.map((err) =>
-          humaniseValidationMessage(err.message, phraseFor, stepLabelFor),
+          humaniseExecutionError(err, phraseFor, stepLabelFor),
         )
       : null;
   const technicalDetails =

@@ -44,6 +44,7 @@ from elspeth.web.sessions._guided_step_chat import (
     StepChatResult,
 )
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.guided_replay import guided_validation_errors
 from elspeth.web.sessions.models import guided_operation_events_table, guided_operations_table
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -2562,7 +2563,7 @@ def _seed_completed_session(
                 outputs=state_dict["outputs"],
                 metadata_=state_dict["metadata"],
                 is_valid=is_valid,
-                validation_errors=None if is_valid else ["guided_composition_invalid"],
+                validation_errors=guided_validation_errors(is_valid=is_valid),
                 composer_meta={"guided_session": completed.to_dict()},
             ),
             provenance="session_seed",
@@ -2837,7 +2838,9 @@ class TestCompletedSessionChat:
 
         assert response.status_code == 200, response.json()
         assert response.json()["composition_state"]["is_valid"] is False
-        assert response.json()["composition_state"]["validation_errors"] == ["guided_composition_invalid"]
+        assert response.json()["composition_state"]["validation_errors"] == [
+            {"message": "guided_composition_invalid", "error_code": "guided_composition_invalid", "component": None}
+        ]
         assert len(captured) == 1
         messages = captured[0]["messages"]
         context = "\n".join(str(message["content"]) for message in messages)

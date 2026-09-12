@@ -12,7 +12,9 @@ import type { CompositionState, ValidationResult } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
 import { compositionContentEqual } from "@/lib/compositionContent";
 import {
-  humaniseValidationMessage,
+  humaniseExecutionError,
+  humaniseValidationWarning,
+  type HumanisedFinding,
   makePhraseFor,
   stepPrefixPhrase,
 } from "@/lib/validationHumaniser";
@@ -157,6 +159,7 @@ function validationFingerprint(result: ValidationResult | null): string | null {
       component_type: err.component_type ?? null,
       component_id: err.component_id ?? null,
       message: err.message,
+      error_code: err.error_code ?? null,
       suggestion: err.suggestion ?? null,
     })),
     warnings: (result.warnings ?? []).map((warn) => ({
@@ -185,12 +188,11 @@ function validationFingerprint(result: ValidationResult | null): string | null {
  * (elspeth-ede84df6b3). Pass `null` when the caller has none.
  */
 function humanisedValidationBullet(
-  message: string,
+  finding: HumanisedFinding,
   componentId: string | null,
   componentType: string | null,
   phraseFor: (componentId: string | null, componentType?: string | null) => string,
 ): string {
-  const finding = humaniseValidationMessage(message, phraseFor);
   const prefix = stepPrefixPhrase(finding, componentId, componentType, phraseFor);
   return prefix !== null
     ? `- **${prefix}:** ${finding.headline}`
@@ -454,7 +456,7 @@ export function initStoreSubscriptions(): void {
       const lines = ["**Validation failed** — fix the following errors before running:"];
       for (const err of result.errors) {
         lines.push(
-          humanisedValidationBullet(err.message, err.component_id ?? null, err.component_type ?? null, phraseFor),
+          humanisedValidationBullet(humaniseExecutionError(err, phraseFor), err.component_id ?? null, err.component_type ?? null, phraseFor),
         );
       }
       sessionStore.injectSystemMessage(lines.join("\n"), VALIDATION_MSG_ID);
@@ -464,7 +466,7 @@ export function initStoreSubscriptions(): void {
       const lines = ["**Validation passed with warnings:**"];
       for (const warn of result.warnings) {
         lines.push(
-          humanisedValidationBullet(warn.message, warn.component_id ?? null, warn.component_type ?? null, phraseFor),
+          humanisedValidationBullet(humaniseValidationWarning(warn), warn.component_id ?? null, warn.component_type ?? null, phraseFor),
         );
       }
       sessionStore.injectSystemMessage(lines.join("\n"), VALIDATION_MSG_ID);

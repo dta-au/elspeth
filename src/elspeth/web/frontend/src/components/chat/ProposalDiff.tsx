@@ -12,6 +12,9 @@
 // - The "after" side of every row is literally what the proposal's arguments
 //   say (identity + summary derived from the args), never a client-side
 //   simulation of the committed result.
+// - Omitted arguments stay omitted; explicitly supplied null is compared.
+//   Replacements may reset omitted settings to defaults. Every replacement
+//   projection discloses this, even when supplied comparable arguments match.
 // - Those arguments are REDACTED. The input is `arguments_redacted_json`, so
 //   structural identity (ids, plugin names, sink names) survives while open
 //   LLM-authored surfaces — plugin options and metadata values — arrive as
@@ -95,9 +98,9 @@ function outputSummaryFromArgs(args: Record<string, unknown>): string | null {
  * Records that a projection SKIPPED a comparison rather than performing it.
  *
  * The distinction is load-bearing on an approval surface. An empty entry list
- * can mean two different things, and only one of them is "nothing changed":
+ * can mean two different things:
  *
- *   * every provided key was compared and matched — a real no-difference; or
+ *   * every comparable provided key matched; or
  *   * some keys could not be compared at all, because the redactor replaced
  *     their values with shape summaries before this view ever saw them.
  *
@@ -112,6 +115,7 @@ function outputSummaryFromArgs(args: Record<string, unknown>): string | null {
  */
 interface ComparisonLedger {
   skippedRedactedOptions: boolean;
+  replacementScope: ProposalDiffResult["replacementScope"];
 }
 
 function upsertEntry(
@@ -290,15 +294,11 @@ function metadataPatchEntries(
  * sides, only the keys carried by the args are compared — a key the state
  * fragment does not hold at all is skipped rather than called a change.
  *
- * WHAT A "Changed" ROW HERE DOES AND DOES NOT MEAN. It reports that a key
- * present on both sides compares unequal. It does NOT prove the planner
- * authored that difference: this projection reads `arguments_redacted_json`,
- * whose payload has been through the redactor's argument model, and pydantic
- * materialises every unset optional field as an explicit null. "Omitted" and
- * "explicitly set to null" are therefore indistinguishable at this point, so
- * a default-filled null can present as a change (elspeth-d6147d73ed — the
- * information is destroyed upstream of this file and recovering it needs a
- * producer-side decision).
+ * A "Changed" row reports that a supplied key present on both sides compares
+ * unequal. Argument redaction preserves omitted versus explicit null, so an
+ * omitted field creates no comparison and a supplied null is compared as-is.
+ * This does not predict effective runtime values: replacement may reset an
+ * omitted setting, and null does not universally mean clear.
  *
  * Redacted option summaries are excluded from the comparison entirely; see
  * providedKeysDiffer.
@@ -498,6 +498,8 @@ function replaceCollectionEntries<T>(
 /** A projection plus what it could not compare. See ComparisonLedger. */
 export interface ProposalDiffResult {
   entries: DiffEntry[];
+  /** Replacement semantics from the projection's own dispatch arm. */
+  replacementScope: "pipeline" | "component" | null;
   /**
    * At least one key was skipped because its proposed value arrived as a
    * redacted option summary. An empty `entries` with this set means "nothing
@@ -515,18 +517,22 @@ export interface ProposalDiffResult {
  * arguments, or no current state to diff against. Callers fall back to the
  * structured argument-field rendering. Returns an empty `entries` when a
  * projection exists but finds nothing to report (e.g. a patch whose keys are
- * all no-ops) — read `optionValuesNotCompared` before calling that "no
- * difference".
+ * all no-ops). Neither that list nor `optionValuesNotCompared` predicts the
+ * effective result of replacing omitted settings; see `replacementScope`.
  */
 export function buildProposalDiff(
   toolName: string,
   args: Record<string, unknown>,
   currentState: CompositionState | null,
 ): ProposalDiffResult | null {
-  const ledger: ComparisonLedger = { skippedRedactedOptions: false };
+  const ledger: ComparisonLedger = { skippedRedactedOptions: false, replacementScope: null };
   const entries = projectEntries(toolName, args, currentState, ledger);
   if (entries === null) return null;
-  return { entries, optionValuesNotCompared: ledger.skippedRedactedOptions };
+  return {
+    entries,
+    optionValuesNotCompared: ledger.skippedRedactedOptions,
+    replacementScope: ledger.replacementScope,
+  };
 }
 
 function projectEntries(
@@ -549,7 +555,8 @@ type ToolProjector = (
 
 /** Single owner of runtime projection dispatch and fixture coverage. */
 export const TOOL_PROJECTORS = {
-  set_source: (args, currentState) => {
+  set_source: (args, currentState, ledger) => {
+    ledger.replacementScope = "component";
     const name = asString(args.source_name) ?? "source";
     const afterSummary = sourceSummaryFromArgs(name, args);
     if (afterSummary === null) return null;
@@ -571,7 +578,8 @@ export const TOOL_PROJECTORS = {
     if (before === undefined) return [];
     return [removeEntry("source", name, before, sourceEntrySummary([name, before]))];
   },
-  upsert_node: (args, currentState) => {
+  upsert_node: (args, currentState, ledger) => {
+    ledger.replacementScope = "component";
     const id = asString(args.id);
     const afterSummary = nodeSummaryFromArgs(args);
     if (id === null || afterSummary === null) return null;
@@ -594,7 +602,8 @@ export const TOOL_PROJECTORS = {
     if (before === undefined) return [];
     return [removeEntry("node", id, before, nodeSummary(before))];
   },
-  upsert_edge: (args, currentState) => {
+  upsert_edge: (args, currentState, ledger) => {
+    ledger.replacementScope = "component";
     const id = asString(args.id);
     const afterSummary = edgeSummaryFromArgs(args);
     if (id === null || afterSummary === null) return null;
@@ -617,7 +626,8 @@ export const TOOL_PROJECTORS = {
     if (before === undefined) return [];
     return [removeEntry("edge", id, before, edgeSummary(before))];
   },
-  set_output: (args, currentState) => {
+  set_output: (args, currentState, ledger) => {
+    ledger.replacementScope = "component";
     const name = asString(args.sink_name);
     const afterSummary = outputSummaryFromArgs(args);
     if (name === null || afterSummary === null) return null;
@@ -669,6 +679,7 @@ export const TOOL_PROJECTORS = {
     return optionPatchEntries(name, fragment.options, args.patch);
   },
   set_pipeline: (args, currentState, ledger) => {
+    ledger.replacementScope = "pipeline";
     return setPipelineEntries(currentState, args, ledger);
   },
 } satisfies Record<string, ToolProjector>;
@@ -721,36 +732,24 @@ interface ProposalChangesProps {
  * styling. The caller (ToolCallCard) owns the derivability/staleness gate and
  * passes only a projection it already computed.
  *
- * TWO things depend on whether the projection had to skip a comparison, and
- * both exist because this is a gate where a human commits to an irreversible
- * action, so the surface must not claim more completeness than it has.
- *
- * 1. The empty state. "No difference from the current pipeline." is only
- *    honest when every provided key was actually compared. When option values
- *    were skipped, the same empty list means the comparison could not be made
- *    — a set_pipeline that changes only plugin options is byte-identical,
- *    after redaction, to one that changes nothing.
- *
- * 2. The caveat, which renders WHENEVER a skip was recorded — rows present or
- *    not. A reviewer who sees three rows reasonably infers that is the
- *    complete set and approves; option values were never compared, so there
- *    may be differences this list cannot show. Same claim of completeness,
- *    same consequence, so the same correction.
- *
- * Both read off the ledger rather than a constant, so a future change that
- * stops skipping removes them automatically instead of stranding a caveat
- * that is no longer true.
+ * Replacement projections always qualify their empty state and disclose that
+ * omitted settings may reset to defaults. The independent option caveat
+ * renders whenever the comparison ledger recorded a redacted option skip.
+ * Both notices remain visible beside nonempty rows: a list of supplied
+ * differences is not a complete prediction of the committed result.
  */
 export function ProposalChanges({ diff }: ProposalChangesProps) {
-  const { entries, optionValuesNotCompared } = diff;
+  const { entries, optionValuesNotCompared, replacementScope } = diff;
   return (
     <div className="proposal-diff" data-testid="proposal-diff">
       <div className="proposal-diff-heading">Proposed changes</div>
       {entries.length === 0 ? (
         <p className="proposal-diff-empty">
-          {optionValuesNotCompared
-            ? "No difference in what this view can compare."
-            : "No difference from the current pipeline."}
+          {replacementScope !== null
+            ? "No difference in the supplied arguments this view can compare."
+            : optionValuesNotCompared
+              ? "No difference in what this view can compare."
+              : "No difference from the current pipeline."}
         </p>
       ) : (
         <ul className="recovery-diff-list proposal-diff-list">
@@ -763,6 +762,12 @@ export function ProposalChanges({ diff }: ProposalChangesProps) {
           ))}
         </ul>
       )}
+      {replacementScope !== null ? (
+        <p className="proposal-diff-caveat" data-testid="proposal-diff-replacement-caveat">
+          This view compares supplied arguments. Omitted settings may be reset
+          to defaults when the {replacementScope} is replaced.
+        </p>
+      ) : null}
       {optionValuesNotCompared ? (
         <p className="proposal-diff-caveat" data-testid="proposal-diff-caveat">
           Option values are not compared, so a change to them would not appear

@@ -40,7 +40,7 @@ from elspeth.web.composer.pipeline_proposal import (
     owned_composition_state_authority,
     owned_composition_state_review_arguments,
 )
-from elspeth.web.composer.redaction import redact_tool_call_arguments
+from elspeth.web.composer.redaction import redact_tool_call_arguments, semantic_redacted_pipeline_arguments_hash
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.dependencies import create_catalog_service
@@ -61,7 +61,7 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.service import SessionServiceImpl, _pipeline_audit_payload_hash
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import acquire_operation_context, fenced_operation_context
@@ -1159,6 +1159,9 @@ def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapp
     assert binding.tool_name == "set_pipeline"
     assert binding.status is ComposerToolStatus.SUCCESS
     assert binding.arguments_hash == authority_arguments_hash
+    # Session row comparisons receive the original JSON value, unlike the
+    # canonical-domain mapping restored from the persisted envelope.
+    assert binding.arguments_hash == semantic_redacted_pipeline_arguments_hash(arguments)
     assert binding.result_hash == result_hash
 
 
@@ -2500,3 +2503,127 @@ async def test_owned_pipeline_executor_mismatch_binds_hash_and_supports_recovery
     terminal = (await service.list_proposal_events(session_id))[-1].payload
     assert terminal["reason_code"] == "candidate_executor_mismatch"
     assert terminal["dispatch"] == recovery.binding.to_dict()
+
+
+async def _create_sparse_presence_dispatch(service: SessionServiceImpl, *, explicit_null: bool):
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    source = {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}
+    if explicit_null:
+        source["inline_blob"] = None
+    pipeline = {"source": source, "nodes": [], "edges": [], "outputs": []}
+    plan = replace(
+        _plan(),
+        proposal=PipelineProposal.create(
+            pipeline=pipeline,
+            base=AbsentBase(),
+            reviewed_facts={},
+            surface=PlannerSurface.FREEFORM,
+            repair_count=0,
+            skill_hash=stable_hash("skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+    )
+    display = _redacted_pipeline(pipeline)
+    row = await service.create_pipeline_composition_proposal(
+        session_id=session_id,
+        plan=plan,
+        summary="Replace pipeline",
+        rationale="Requested",
+        affects=("graph",),
+        arguments_redacted_json=display,
+        actor="user:alice",
+        composer_model_identifier="planner-model",
+        composer_model_version="planner-model-v1",
+        composer_provider="provider",
+    )
+    invocation = finish_success(
+        begin_dispatch(plan.tool_call_id, "set_pipeline", pipeline, version_before=0, actor="user:alice"),
+        result_payload=_pipeline_dispatch_result(pipeline_content_hash=_state_content_hash(_state_data())),
+        version_after=1,
+    )
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as context:
+        bindings = await _persist_tool_invocations(
+            service,
+            session_id,
+            (invocation,),
+            None,
+            plugin_crash_pending=False,
+            session_operation_context=context,
+        )
+    events = await service.list_proposal_events(session_id)
+    assert deep_thaw(row.arguments_redacted_json) == display
+    assert events[0].payload["audit_payload_hash"] == _pipeline_audit_payload_hash(
+        summary=row.summary, rationale=row.rationale, affects=row.affects, arguments_redacted_json=display
+    )
+    with service._engine.begin() as conn:
+        stored = conn.execute(
+            select(composition_proposals_table.c.arguments_redacted_json).where(composition_proposals_table.c.id == str(row.id))
+        ).scalar_one()
+    assert stored == display
+    audit_display = json.loads(_latest_audit_envelope(service)["invocation"]["arguments_canonical"])
+    assert audit_display == display
+    assert ("inline_blob" in display["source"]) is explicit_null
+    return session_id, plan, row, bindings[0], display
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_null", [False, True])
+@pytest.mark.parametrize("terminal", ["settle", "reject"])
+async def test_sparse_presence_durable_recovery_and_terminal_retry(service: SessionServiceImpl, explicit_null: bool, terminal: str) -> None:
+    session_id, plan, row, binding, display = await _create_sparse_presence_dispatch(service, explicit_null=explicit_null)
+    authority = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id, reviewed_facts={})
+    recovery = await service.get_pipeline_dispatch_recovery(authority=authority)
+    assert recovery is not None
+    assert recovery.binding == binding
+    if terminal == "settle":
+        first = await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+        second = await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+        assert first.state.id == second.state.id
+    else:
+        kwargs = {
+            "session_id": session_id,
+            "proposal_id": row.id,
+            "draft_hash": plan.proposal.draft_hash,
+            "reviewed_facts": {},
+            "reason": "candidate_executor_mismatch",
+            "dispatch": binding,
+            "actor": "system:pipeline-commit",
+        }
+        assert await service.reject_pipeline_composition_proposal(**kwargs) == await service.reject_pipeline_composition_proposal(**kwargs)
+    events = await service.list_proposal_events(session_id)
+    assert len(events) == 2
+    assert events[0].payload["audit_payload_hash"] == _pipeline_audit_payload_hash(
+        summary=row.summary, rationale=row.rationale, affects=row.affects, arguments_redacted_json=display
+    )
+    with service._engine.begin() as conn:
+        assert (
+            conn.execute(
+                select(composition_proposals_table.c.arguments_redacted_json).where(composition_proposals_table.c.id == str(row.id))
+            ).scalar_one()
+            == display
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_null", [False, True])
+@pytest.mark.parametrize("tamper", ["result_hash", "arguments_hash", "tool_call_id", "source_field"])
+async def test_sparse_presence_recovery_rejects_tampered_audit(service: SessionServiceImpl, explicit_null: bool, tamper: str) -> None:
+    session_id, plan, row, binding, _display = await _create_sparse_presence_dispatch(service, explicit_null=explicit_null)
+    envelope = _latest_audit_envelope(service)
+    invocation = envelope["invocation"]
+    if tamper == "source_field":
+        arguments = json.loads(invocation["arguments_canonical"])
+        arguments["source"]["on_success"] = "different"
+        invocation["arguments_canonical"] = canonical_json(arguments)
+        invocation["arguments_hash"] = hashlib.sha256(invocation["arguments_canonical"].encode()).hexdigest()
+        invocation["authority_arguments_canonical"] = composer_authority_canonical_json(arguments)
+        invocation["authority_arguments_hash"] = hashlib.sha256(invocation["authority_arguments_canonical"].encode()).hexdigest()
+    elif tamper == "tool_call_id":
+        invocation[tamper] = "unrelated-call"
+    else:
+        invocation[tamper] = "0" * 64
+    _replace_latest_audit_envelope(service, envelope)
+    with pytest.raises(AuditIntegrityError):
+        await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))

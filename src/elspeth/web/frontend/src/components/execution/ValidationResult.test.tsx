@@ -398,6 +398,7 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
             {
               component_id: "assess",
               component_type: "transform",
+              error_code: "schema_contract_violation",
               message:
                 "Schema contract violation: 'source' -> 'assess': required field 'case_study1' is not guaranteed by the producer",
               suggestion: null,
@@ -426,7 +427,7 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
     // never the raw id itself (elspeth-93f5621f18: this line used to assert
     // the opposite, pinning the bug this ticket fixes).
     expect(headline).not.toMatch(/\bassess\b/);
-    expect(headline).toMatch(/this step/i);
+    expect(headline).toMatch(/pipeline has incompatible data between steps/i);
   });
 
   it("never renders a bare component id when the banner has no nodes list (elspeth-93f5621f18)", () => {

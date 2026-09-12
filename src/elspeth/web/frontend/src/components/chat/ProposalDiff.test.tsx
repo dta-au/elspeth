@@ -66,8 +66,74 @@ function projectEntries(
 }
 
 describe("buildProposalDiff", () => {
+  it.each([
+    ["set_pipeline", { source: { plugin: "csv" }, nodes: [], edges: [], outputs: [] }, "pipeline"],
+    ["set_source", { plugin: "csv" }, "component"],
+    ["set_output", { sink_name: "results", plugin: "json" }, "component"],
+    ["upsert_node", { id: "extract", node_type: "transform" }, "component"],
+    ["upsert_edge", { id: "e1", from_node: "source", to_node: "extract", edge_type: "on_success" }, "component"],
+    ["clear_source", {}, null],
+    ["remove_node", { id: "extract" }, null],
+    ["remove_edge", { id: "e1" }, null],
+    ["remove_output", { sink_name: "results" }, null],
+    ["set_metadata", { patch: "<metadata-patch:empty>" }, null],
+  ] as const)("records the replacement scope for %s", (tool, args, scope) => {
+    const diff = buildProposalDiff(tool, args, makeState());
+    expect(diff).not.toBeNull();
+    expect(diff?.replacementScope).toBe(scope);
+  });
+
   it("returns null with no current state — no honest before side exists", () => {
     expect(projectEntries("upsert_node", { id: "x", node_type: "transform" }, null)).toBeNull();
+  });
+
+  it.each([false, true])("compares producer-supplied null without inventing omitted values (null=%s)", (explicitNull) => {
+    // The same populated current state faces paired real producer payloads;
+    // omitted optional keys must not become fabricated null comparisons.
+    const base = makeState();
+    const current = makeState({
+      sources: { source: { ...base.sources.source, description: "Current source" } },
+      nodes: base.nodes.map((node) => ({ ...node, timeout_seconds: 45 })),
+      outputs: base.outputs.map((output) => ({ ...output, on_write_failure: "errors" })),
+    });
+    const diff = buildProposalDiff(
+      "set_pipeline",
+      redactedArguments(explicitNull ? "set_pipeline_presence_null" : "set_pipeline_presence_omitted"),
+      current,
+    );
+    expect(diff?.entries.map(({ kind, section }) => ({ kind, section }))).toEqual(
+      explicitNull ? [
+        { kind: "changed", section: "source" },
+        { kind: "changed", section: "node" },
+        { kind: "changed", section: "output" },
+      ] : [],
+    );
+    render(<ProposalChanges diff={diff!} />);
+    expect(screen.getByTestId("proposal-diff-replacement-caveat")).toBeInTheDocument();
+    expect(screen.getByTestId("proposal-diff-caveat")).toBeInTheDocument();
+    if (!explicitNull) {
+      expect(screen.getByText("No difference in the supplied arguments this view can compare.")).toBeInTheDocument();
+    }
+  });
+
+  it("discloses replacement even when the producer summarized empty options", () => {
+    const base = makeState();
+    const diff = buildProposalDiff(
+      "set_pipeline",
+      redactedArguments("set_pipeline_empty_options_replaying_current_state"),
+      makeState({
+        sources: { source: { ...base.sources.source, options: {} } },
+        nodes: base.nodes.map((node) => ({ ...node, options: {} })),
+        outputs: base.outputs.map((output) => ({ ...output, options: {} })),
+      }),
+    );
+    expect(diff?.entries).toEqual([]);
+    render(<ProposalChanges diff={diff!} />);
+    expect(screen.getByText("No difference in the supplied arguments this view can compare.")).toBeInTheDocument();
+    expect(screen.getByTestId("proposal-diff-replacement-caveat")).toBeInTheDocument();
+    // Empty options still arrive as a summary, so the existing ledger stays
+    // authoritative; the replacement notice is independent of that fact.
+    expect(screen.getByTestId("proposal-diff-caveat")).toBeInTheDocument();
   });
 
   it("returns null for tools with no state-fragment projection", () => {
@@ -518,6 +584,9 @@ describe("buildProposalDiff", () => {
     expect(screen.getByTestId("proposal-diff-caveat")).toHaveTextContent(
       "Option values are not compared, so a change to them would not appear here.",
     );
+    expect(screen.getByTestId("proposal-diff-replacement-caveat")).toHaveTextContent(
+      "when the pipeline is replaced.",
+    );
   });
 
   it("does not raise the caveat for a projection that compared everything it was given", () => {
@@ -536,6 +605,33 @@ describe("buildProposalDiff", () => {
 });
 
 describe("ProposalChanges", () => {
+  it.each([false, true])("discloses empty pipeline replacement with options skipped=%s", (skipped) => {
+    render(<ProposalChanges diff={{ entries: [], optionValuesNotCompared: skipped, replacementScope: "pipeline" }} />);
+    expect(screen.getByText("No difference in the supplied arguments this view can compare.")).toBeInTheDocument();
+    expect(screen.getByTestId("proposal-diff-replacement-caveat")).toHaveTextContent(
+      "This view compares supplied arguments. Omitted settings may be reset to defaults when the pipeline is replaced.",
+    );
+    expect(screen.queryByTestId("proposal-diff-caveat") !== null).toBe(skipped);
+  });
+
+  it("discloses component replacement beside rows without an option caveat", () => {
+    const diff = buildProposalDiff("set_source", { plugin: "json" }, makeState());
+    render(<ProposalChanges diff={diff!} />);
+    expect(screen.getByText("Changed source")).toBeInTheDocument();
+    expect(screen.getByTestId("proposal-diff-replacement-caveat")).toHaveTextContent(
+      "This view compares supplied arguments. Omitted settings may be reset to defaults when the component is replaced.",
+    );
+    expect(screen.queryByTestId("proposal-diff-caveat")).not.toBeInTheDocument();
+  });
+
+  it("does not disclose replacement for a genuine option patch", () => {
+    const diff = buildProposalDiff("patch_node_options", redactedArguments("patch_node_options_one_mapping"), makeState());
+    render(<ProposalChanges diff={diff!} />);
+    expect(diff?.replacementScope).toBeNull();
+    expect(screen.getByText("Writes option")).toBeInTheDocument();
+    expect(screen.queryByTestId("proposal-diff-replacement-caveat")).not.toBeInTheDocument();
+  });
+
   it("renders diff rows through the shared recovery-diff row rendering", () => {
     const entries = projectEntries(
       "upsert_node",
@@ -543,7 +639,7 @@ describe("ProposalChanges", () => {
       makeState(),
     );
     render(
-      <ProposalChanges diff={{ entries: entries ?? [], optionValuesNotCompared: false }} />,
+      <ProposalChanges diff={{ entries: entries ?? [], optionValuesNotCompared: false, replacementScope: "component" }} />,
     );
 
     expect(screen.getByText("Proposed changes")).toBeInTheDocument();
@@ -554,7 +650,7 @@ describe("ProposalChanges", () => {
   });
 
   it("says so plainly when the projection finds no difference", () => {
-    render(<ProposalChanges diff={{ entries: [], optionValuesNotCompared: false }} />);
+    render(<ProposalChanges diff={{ entries: [], optionValuesNotCompared: false, replacementScope: null }} />);
     expect(
       screen.getByText("No difference from the current pipeline."),
     ).toBeInTheDocument();
@@ -565,7 +661,7 @@ describe("ProposalChanges", () => {
     // from the current pipeline." here would be an affirmative false statement
     // on a human approval gate — worse than the false "Changed" rows it
     // replaced, because it positively asserts safety.
-    render(<ProposalChanges diff={{ entries: [], optionValuesNotCompared: true }} />);
+    render(<ProposalChanges diff={{ entries: [], optionValuesNotCompared: true, replacementScope: null }} />);
 
     expect(
       screen.queryByText("No difference from the current pipeline."),
@@ -596,6 +692,7 @@ describe("ProposalChanges", () => {
             },
           ],
           optionValuesNotCompared: true,
+          replacementScope: "pipeline",
         }}
       />,
     );
@@ -630,6 +727,7 @@ describe("ProposalChanges", () => {
             },
           ],
           optionValuesNotCompared: false,
+          replacementScope: null,
         }}
       />,
     );

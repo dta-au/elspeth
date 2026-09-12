@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 import pytest_asyncio
@@ -15,12 +18,15 @@ from sqlalchemy import Engine
 from elspeth.contracts.blobs import InlineCustodyRequest
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import pipeline_commit
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.authority_hashing import project_composer_authority_payload
+from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.pipeline_commit import PipelineCommitConfig, PreparedPipelineCommit, prepare_pipeline_proposal_commit
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
@@ -35,6 +41,10 @@ from elspeth.web.sessions.protocol import AuthoritativePipelineProposal
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.composer.guided import conftest as guided_test_fixtures
+from tests.integration.web.composer.guided.test_arbitrary_dag_review import _bound_action, _stage
+
+guided_presence_client = guided_test_fixtures.composer_test_client
 
 
 @dataclass(frozen=True)
@@ -266,3 +276,138 @@ async def test_other_sessions_live_operation_cannot_prepare_this_proposal(propos
             await _prepare(proposal, context)
     finally:
         operations.release(context)
+
+
+@pytest.mark.parametrize("explicit_null", [False, True], ids=["omitted-inline", "explicit-null-inline"])
+def test_guided_first_dispatch_retry_and_accept_keep_authored_inline_presence(
+    guided_presence_client,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_null: bool,
+) -> None:
+    """Exercise durable dispatch and acceptance with a real guided service.
+
+    The fixture planner is local; every session, proposal, dispatch and
+    acceptance write still runs through the production dual-fenced service.
+    """
+    client = guided_presence_client
+    planner = client.app.state.composer_service
+    original_plan = planner.plan_guided_pipeline
+
+    async def plan_with_authored_presence(**kwargs):
+        plan, catalog_ids = await original_plan(**kwargs)
+        pipeline = deep_thaw(plan.proposal.pipeline)
+        sources = pipeline.pop("sources")
+        assert len(sources) == 1
+        source = next(iter(sources.values()))
+        blob_path = source["options"]["path"]
+        assert blob_path.startswith("blob:")
+        source["blob_id"] = blob_path.removeprefix("blob:")
+        assert "inline_blob" not in source
+        if explicit_null:
+            source["inline_blob"] = None
+        pipeline["source"] = source
+        proposal = plan.proposal
+        authored = PipelineProposal.create(
+            pipeline=pipeline,
+            base=proposal.base,
+            reviewed_facts=guided_private_reviewed_facts(kwargs["guided"]),
+            surface=proposal.surface,
+            repair_count=proposal.repair_count,
+            skill_hash=proposal.skill_hash,
+            covered_deferred_intent_ids=proposal.covered_deferred_intent_ids,
+            supersedes_draft_hash=proposal.supersedes_draft_hash,
+        )
+        return replace(plan, proposal=authored), catalog_ids
+
+    monkeypatch.setattr(planner, "plan_guided_pipeline", plan_with_authored_presence)
+    session_id, staged = _stage(client, filename="durable-inline-presence.jsonl")
+    sid = UUID(session_id)
+    service = client.app.state.session_service
+    proposal_id = UUID(staged["next_turn"]["payload"]["proposal_id"])
+
+    def assert_presence(display):
+        source = display["source"]
+        assert ("inline_blob" in source) is explicit_null
+        if explicit_null:
+            assert source["inline_blob"] is None
+
+    rows = asyncio.run(service.list_composition_proposals(sid))
+    row = next(item for item in rows if item.id == proposal_id)
+    display = deep_thaw(row.arguments_redacted_json)
+    assert_presence(display)
+    events = asyncio.run(service.list_proposal_events(sid))
+    created = next(item for item in events if item.proposal_id == proposal_id and item.event_type == "proposal.created")
+    audit_hash = stable_hash(
+        {
+            "schema": "composer.pipeline-proposal-audit-payload.v1",
+            "summary": row.summary,
+            "rationale": row.rationale,
+            "affects": list(row.affects),
+            "arguments_redacted_json": project_composer_authority_payload(display),
+        }
+    )
+    assert created.payload["audit_payload_hash"] == audit_hash
+    reviewed = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_bound_action(staged["next_turn"], chosen=["review_wiring"]),
+    )
+    assert reviewed.status_code == 200, reviewed.json()
+    record = service.record_guided_pipeline_dispatch
+    accept = service.accept_guided_pipeline_proposal
+    observed: list[str] = []
+    candidate_errors: list[object] = []
+    candidate_builder = pipeline_commit.build_set_pipeline_candidate
+
+    def require_valid_candidate(*args, **kwargs):
+        candidate = candidate_builder(*args, **kwargs)
+        candidate_errors.extend((entry.error_code, entry.message) for entry in candidate.result.validation.errors)
+        assert candidate.acceptable, candidate.result.validation.errors
+        return candidate
+
+    monkeypatch.setattr(pipeline_commit, "build_set_pipeline_candidate", require_valid_candidate)
+
+    async def record_and_retry(command, **kwargs):
+        before = await service.get_messages(sid, limit=None)
+        first = await record(command, **kwargs)
+        after_first = await service.get_messages(sid, limit=None)
+        assert len(after_first) == len(before) + 1
+        replay = await record(command, **kwargs)
+        assert replay == first
+        assert await service.get_messages(sid, limit=None) == after_first
+        observed.extend(("first_dispatch", "dispatch_retry"))
+        return first
+
+    async def accept_after_dispatch(command, **kwargs):
+        assert observed == ["first_dispatch", "dispatch_retry"]
+        result = await accept(command, **kwargs)
+        assert result.proposal.status == "committed"
+        observed.append("accepted")
+        return result
+
+    monkeypatch.setattr(service, "record_guided_pipeline_dispatch", record_and_retry)
+    monkeypatch.setattr(service, "accept_guided_pipeline_proposal", accept_after_dispatch)
+    request = _bound_action(reviewed.json()["next_turn"], chosen=["confirm_wiring"])
+    confirmed = client.post(f"/api/sessions/{session_id}/guided/respond", json=request)
+    assert confirmed.status_code == 200, (confirmed.json(), candidate_errors)
+    assert confirmed.json()["terminal"]["kind"] == "completed"
+    assert observed == ["first_dispatch", "dispatch_retry", "accepted"]
+    rows = asyncio.run(service.list_composition_proposals(sid))
+    committed = next(item for item in rows if item.id == proposal_id)
+    assert committed.status == "committed"
+    assert deep_thaw(committed.arguments_redacted_json) == display
+    events = [item for item in asyncio.run(service.list_proposal_events(sid)) if item.proposal_id == proposal_id]
+    assert [item.event_type for item in events] == ["proposal.created", "proposal.rebased", "proposal.accepted"]
+    assert events[0].payload["audit_payload_hash"] == audit_hash
+    messages = asyncio.run(service.get_messages(sid, limit=None))
+    invocations = [
+        envelope["invocation"]
+        for message in messages
+        for envelope in message.tool_calls or ()
+        if envelope.get("invocation", {}).get("tool_name") == "set_pipeline" and envelope["invocation"]["status"] == "success"
+    ]
+    assert len(invocations) == 1
+    assert_presence(json.loads(invocations[0]["arguments_canonical"]))
+    replayed = client.post(f"/api/sessions/{session_id}/guided/respond", json=request)
+    assert replayed.status_code == 200, replayed.json()
+    assert replayed.json() == confirmed.json()
+    assert asyncio.run(service.get_messages(sid, limit=None)) == messages

@@ -454,12 +454,18 @@ async def test_three_field_proposal_created_event_is_rejected_not_compatibly_rea
 
 
 @pytest.mark.asyncio
-async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_restores(service) -> None:
+@pytest.mark.parametrize("inline_presence", ["absent", "null"])
+async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_restores(service, inline_presence) -> None:
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    plan = _pipeline_plan_result()
-    public_arguments = _pipeline_public_arguments()
+    source = {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}
+    if inline_presence == "null":
+        source["inline_blob"] = None
+    pipeline = {"source": source, "nodes": [], "edges": [], "outputs": []}
+    plan = _pipeline_plan_result(pipeline=pipeline)
+    public_arguments = redact_tool_call_arguments("set_pipeline", pipeline, telemetry=NoopRedactionTelemetry())
+    assert ("inline_blob" in public_arguments["source"]) is (inline_presence == "null")
 
     async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
         row = await service.create_pipeline_composition_proposal(
@@ -512,6 +518,7 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
         reviewed_facts={},
     )
     assert restored.row == row
+    assert ("inline_blob" in restored.row.arguments_redacted_json["source"]) is (inline_presence == "null")
     assert restored.proposal == plan.proposal
     assert restored.custody_result == "not_required"
     assert restored.supersedes_proposal_id is None

@@ -21,7 +21,7 @@ import { Button, Icon } from "@/components/ui";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
 import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
 import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";
-import { humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
+import { humaniseExecutionError, humaniseValidationWarning, makePhraseFor } from "@/lib/validationHumaniser";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
@@ -260,11 +260,7 @@ export function ValidationResultBanner({
                 const isClickable =
                   Boolean(onComponentClick) &&
                   isNavigableComponent(warn.component_id, nodes, componentNames);
-                const finding = humaniseValidationMessage(
-                  warn.message,
-                  phraseFor,
-                  stepLabelFor,
-                );
+                const finding = humaniseValidationWarning(warn);
                 // The warning TEXT is what the button navigates from; the
                 // suggestion is a sibling note. See the error list below for
                 // why the two must not share one element (elspeth-7bcc3d5233).
@@ -342,7 +338,7 @@ export function ValidationResultBanner({
           const isClickable =
             Boolean(onComponentClick) &&
             isNavigableComponent(err.component_id, nodes, componentNames);
-          const finding = humaniseValidationMessage(err.message, phraseFor, stepLabelFor);
+          const finding = humaniseExecutionError(err, phraseFor, stepLabelFor);
           // elspeth-7bcc3d5233. The suggestion is a SIBLING of the button,
           // never its child: a block-level <div> inside a <button> is invalid
           // (flow content in a button), and it dragged the button's underline

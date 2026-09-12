@@ -87,6 +87,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     SessionOperationAuthority,
     SessionOperationMutationTransaction,
+    decode_stored_composition_validation_errors,
 )
 from elspeth.web.sessions.state_envelope import unwrap_state_column
 
@@ -278,7 +279,7 @@ def _active_run_pipeline_dict(active_run: Any) -> LoweredPipelineDocument:
             outputs=unwrap_state_column(active_run.outputs),
             metadata_=unwrap_state_column(active_run.metadata_),
             is_valid=bool(active_run.is_valid),
-            validation_errors=active_run.validation_errors,
+            validation_errors=decode_stored_composition_validation_errors(active_run.validation_errors),
             created_at=active_run.created_at,
             derived_from_state_id=_uuid_from_db(active_run.derived_from_state_id) if active_run.derived_from_state_id is not None else None,
             composer_meta=unwrap_state_column(active_run.composer_meta),

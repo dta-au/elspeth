@@ -38,6 +38,7 @@ from elspeth.web.sessions.protocol import (
     SessionForkParentAuthority,
     SessionGuidedOperationInProgressError,
     SessionNotFoundError,
+    serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.routes.guided_operations import (
     GuidedOperationLease,
@@ -628,7 +629,8 @@ def _rewrite_fork_state_blob_custody(
                 )
     # ``validation_errors`` is copied verbatim below and served on GET /state;
     # it is free text no rewriter can rebase, so parent custody in it is refused.
-    if state.validation_errors and parent_blob_refs and _free_text_embeds_parent_blob(state.validation_errors, parent_blob_refs):
+    serialized_errors = serialize_composition_validation_errors(state.validation_errors)
+    if serialized_errors and parent_blob_refs and _free_text_embeds_parent_blob(serialized_errors, parent_blob_refs):
         raise AuditIntegrityError(
             "Tier 1 audit anomaly: forked validation_errors retains parent blob custody the fork rewriter did not rebase "
             "-- clear the validation errors before forking this session"

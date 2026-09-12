@@ -4,7 +4,7 @@ import { Button } from "@/components/ui";
 import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";
 import { useComposer } from "@/hooks/useComposer";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
-import { humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
+import { humaniseValidationSuggestion, makePhraseFor } from "@/lib/validationHumaniser";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
@@ -75,7 +75,7 @@ function SuggestionList({
   // carrying raw text, an assistive-tech user needs both the announced
   // link AND a visually distinguishing label to tell whose dump is whose.
   const humanisedSuggestions = suggestions.map((s, i) => {
-    const finding = humaniseValidationMessage(s.message, phraseFor, stepLabelFor);
+    const finding = humaniseValidationSuggestion(s, phraseFor, stepLabelFor);
     return {
       suggestion: s,
       finding,

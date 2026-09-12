@@ -1,6 +1,22 @@
 import { describe, expect, it } from "vitest";
 
 import { decodeGetGuidedResponse } from "./guidedDecoder";
+import compositionStateFixture from "../../../../../../tests/fixtures/web/composer/composition_state_validation_errors.json";
+
+describe("shared composition state HTTP contract", () => {
+  it.each(Object.entries(compositionStateFixture.states))("decodes producer-backed %s state in a guided envelope", (_case, state) => {
+    expect(decodeGetGuidedResponse({ ...wireResponse(), composition_state: state }).composition_state).toEqual(state);
+  });
+
+  it.each([
+    { errors: ["legacy message"] },
+    { errors: [{ message: "missing nullable fields" }] },
+    { errors: [{ message: "extra", error_code: null, component: null, context: {} }] },
+  ])("rejects malformed nested guided errors $errors", ({ errors }) => {
+    const state = { ...compositionStateFixture.states.coded, validation_errors: errors };
+    expect(() => decodeGetGuidedResponse({ ...wireResponse(), composition_state: state })).toThrow(/validation_errors/);
+  });
+});
 
 function wireResponse(payloadOverrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

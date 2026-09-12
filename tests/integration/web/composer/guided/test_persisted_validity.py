@@ -35,4 +35,4 @@ class TestGuidedPersistedValidity:
         assert state["sources"] == {}
         assert state["is_valid"] is False
         errors = state["validation_errors"]
-        assert errors == ["guided_composition_invalid"]
+        assert errors == [{"message": "guided_composition_invalid", "error_code": "guided_composition_invalid", "component": None}]

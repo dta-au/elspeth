@@ -484,13 +484,14 @@ class TestSessionResponseHappyPath:
         kwargs = _valid_composition_state_kwargs()
         kwargs["sources"] = {"orders": {"kind": "csv"}, "refunds": {"kind": "json"}}
         kwargs["nodes"] = [{"id": "n1"}]
-        kwargs["validation_errors"] = ["boom"]
+        kwargs["validation_errors"] = [{"message": "boom", "error_code": None, "component": None}]
         kwargs["validation_warnings"] = [
             ValidationEntryResponse(component="c", message="m", severity="warning"),
         ]
         resp = CompositionStateResponse(**kwargs)  # type: ignore[arg-type]
         assert resp.sources == {"orders": {"kind": "csv"}, "refunds": {"kind": "json"}}
-        assert resp.validation_errors == ["boom"]
+        assert resp.validation_errors is not None
+        assert resp.validation_errors[0].model_dump() == {"message": "boom", "error_code": None, "component": None}
         assert resp.validation_warnings is not None
         assert resp.validation_warnings[0].component == "c"
 

@@ -320,6 +320,14 @@ class PluginPolicyFindingResponse(_StrictResponse):
     snapshot_fingerprint: str
 
 
+class CompositionValidationErrorResponse(_StrictResponse):
+    """Closed diagnostic identity; nullable fields remain required on the wire."""
+
+    message: str
+    error_code: str | None
+    component: str | None
+
+
 class CompositionStateResponse(_StrictResponse):
     """Response for composition state endpoints."""
 
@@ -332,7 +340,7 @@ class CompositionStateResponse(_StrictResponse):
     outputs: CompositionObjectList | None = None
     metadata: CompositionObject | None = None
     is_valid: bool
-    validation_errors: list[str] | None = None
+    validation_errors: list[CompositionValidationErrorResponse] | None = None
     validation_warnings: list[ValidationEntryResponse] | None = None
     validation_suggestions: list[ValidationEntryResponse] | None = None
     derived_from_state_id: str | None = None

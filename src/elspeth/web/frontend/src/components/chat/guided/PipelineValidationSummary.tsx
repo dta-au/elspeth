@@ -32,7 +32,8 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { stepLabelForNodeId } from "../interpretationStepLabel";
 import {
   formatFindingBody,
-  humaniseValidationMessage,
+  humaniseExecutionError,
+  humaniseValidationWarning,
   makePhraseFor,
 } from "@/lib/validationHumaniser";
 
@@ -105,7 +106,7 @@ export function PipelineValidationSummary({
     // at a heavier, more geometric weight here than everywhere else.
     glyph = "✗";
     const label = errors.length === 1 ? "problem to fix" : "problems to fix";
-    const finding = humaniseValidationMessage(first.message, phraseFor, stepLabelFor);
+    const finding = humaniseExecutionError(first, phraseFor, stepLabelFor);
     rawDetail = finding.raw;
     body = formatFindingBody(errors.length, label, finding, first.component_id, first.component_type, phraseFor);
     suggestion = first.suggestion;
@@ -115,7 +116,7 @@ export function PipelineValidationSummary({
     tone = "warning";
     glyph = "⚠";
     const label = warnings.length === 1 ? "warning" : "warnings";
-    const finding = humaniseValidationMessage(first.message, phraseFor, stepLabelFor);
+    const finding = humaniseValidationWarning(first);
     rawDetail = finding.raw;
     body = formatFindingBody(warnings.length, label, finding, first.component_id, first.component_type, phraseFor);
     suggestion = first.suggestion;
