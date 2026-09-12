@@ -56,7 +56,7 @@ from ._helpers import (
     _handle_planner_failure,
     _handle_plugin_crash,
     _handle_runtime_preflight_failure,
-    _initial_composition_state_with_guided_session,
+    _initial_composition_state,
     _is_client_disconnect_cancel,
     _litellm_error_detail,
     _llm_calls_from_exception,
@@ -148,7 +148,7 @@ def register_message_routes(router: APIRouter) -> None:
             #    for pre-send provenance (AD-7: user msg records what user saw).
             state_record = await service.get_current_state(session.id)
             if state_record is None:
-                state = _initial_composition_state_with_guided_session()
+                state = _initial_composition_state()
                 pre_send_state_id: UUID | None = None
             else:
                 state = _state_from_record(state_record)

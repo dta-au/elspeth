@@ -34,7 +34,7 @@ from .._helpers import (
     UserIdentity,
     _composition_proposal_response,
     _get_session_compose_lock_registry,
-    _initial_composition_state_with_guided_session,
+    _initial_composition_state,
     _log_last_resort_diagnostic,
     _proposal_event_response,
     _state_data_from_composer_state,
@@ -328,9 +328,7 @@ async def accept_composition_proposal(
                     status_code=409,
                     detail="The session state changed after this proposal was created. Ask ELSPETH to rebase the proposal.",
                 )
-            current_state = (
-                _state_from_record(current_record) if current_record is not None else _initial_composition_state_with_guided_session()
-            )
+            current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state()
             arguments = cast(dict[str, Any], deep_thaw(proposal.arguments_json))
             user_message_content = await _proposal_user_message_content(service, proposal)
             _ensure_inline_blob_proposal_context(

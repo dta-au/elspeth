@@ -40,7 +40,7 @@ from .._helpers import (
     Request,
     SessionServiceProtocol,
     UserIdentity,
-    _initial_composition_state_with_guided_session,
+    _initial_composition_state,
     _persist_tool_invocations,
     _state_data_from_composer_state,
     _state_from_record,
@@ -205,7 +205,7 @@ async def settle_pipeline_proposal_under_compose_lock(
         raise HTTPException(status_code=409, detail="Only pending proposals can be accepted.")
 
     current_record = await service.get_current_state(proposal.session_id)
-    current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state_with_guided_session()
+    current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state()
     user_message_content = await _proposal_user_message_content(service, proposal)
     plugin_snapshot = request.app.state.plugin_snapshot_factory(user)
     policy_catalog = PolicyCatalogView(

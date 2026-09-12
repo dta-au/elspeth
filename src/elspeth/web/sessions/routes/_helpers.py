@@ -3365,22 +3365,24 @@ async def _handle_runtime_preflight_failure(
     return response_body
 
 
+def _initial_composition_state() -> CompositionState:
+    """Initialize freeform authoring without claiming a guided checkpoint."""
+    return CompositionState(
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
 def _initial_composition_state_with_guided_session(*, profile: WorkflowProfile = EMPTY_PROFILE) -> CompositionState:
-    """Construct a fresh CompositionState with a latent guided-mode session attached.
+    """Initialize the guided endpoint's wizard state with its explicit profile.
 
-    Originally added under spec §5.2 / errata C7 ("new sessions default to
-    guided"), and still pre-attaches :func:`GuidedSession.initial` so every
-    server-side lazy-create branch (send_message, recompose, /guided
-    endpoints) reaches a uniformly-shaped state.
-
-    The user-visible default is now **freeform**: the frontend stopped
-    auto-fetching ``GET /guided`` on session selection / creation, so the
-    latent guided session is invisible until the operator clicks "Switch
-    to guided" in the freeform chat header. That click hits ``GET /guided``,
-    which surfaces (and persists, on first visit) the same wizard state
-    this helper installs in-memory. The contract is unchanged — only the
-    activation gesture moved client-side. The spec doc has not been
-    re-issued; treat the title here as descriptive, not authoritative.
+    Persisted guided metadata is the frontend's resume authority. Freeform
+    lazy creation must use _initial_composition_state instead; attaching an
+    unused wizard here would switch that session to guided on reload.
     """
     return CompositionState(
         source=None,
@@ -3621,6 +3623,7 @@ __all__ = [
     "_handle_planner_failure",
     "_handle_plugin_crash",
     "_handle_runtime_preflight_failure",
+    "_initial_composition_state",
     "_initial_composition_state_with_guided_session",
     "_inspect_latest_ready_session_blob",
     "_interpretation_event_response",
