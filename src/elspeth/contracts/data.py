@@ -11,7 +11,8 @@ This enables:
 
 TRUST BOUNDARY: PluginSchema validates "Their Data" (user rows from sources,
 transform outputs) - NOT "Our Data" (audit trail). Therefore it uses permissive
-settings (extra="ignore", strict=False, frozen=False) per the Data Manifesto.
+settings (extra="ignore", strict=False, frozen=False) per the three-tier trust
+model (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
 """
 
 from dataclasses import dataclass
@@ -399,7 +400,9 @@ def _types_compatible(
         actual: The producer's output type annotation
         expected: The consumer's input type annotation
         consumer_strict: If True, no type coercion allowed (int->float rejected).
-                        Respects Data Manifesto: transforms/sinks must NOT coerce.
+                        Respects docs/guides/data-trust-and-error-handling.md
+                        §Coercion Rules by Plugin Type: transforms/sinks must
+                        NOT coerce.
     """
     # Unwrap Annotated metadata before any comparisons.
     # Config-generated schemas may wrap types (e.g., FiniteFloat -> Annotated[float, ...]).
@@ -416,7 +419,8 @@ def _types_compatible(
         return True
 
     # Numeric compatibility (int -> float is OK) - but ONLY when consumer allows coercion
-    # Per Data Manifesto: transforms/sinks with strict=True must NOT coerce
+    # Per docs/guides/data-trust-and-error-handling.md §Coercion Rules by Plugin
+    # Type, transforms/sinks with strict=True must NOT coerce
     if expected is float and actual is int:
         return not consumer_strict
 

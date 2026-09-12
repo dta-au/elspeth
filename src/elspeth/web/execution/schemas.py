@@ -1,7 +1,8 @@
 """Pydantic response models for execution endpoints.
 
-All models in this module serialize **system-owned data** (Tier 1 in the
-Data Manifesto).  They use strict validation and forbid extra fields so
+All models in this module serialize **system-owned data** (Tier 1 in
+docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
+They use strict validation and forbid extra fields so
 that internal type drift crashes loudly instead of silently coercing
 values or dropping unknown fields.
 """
@@ -190,8 +191,8 @@ class ValidationCheck(_StrictResponse):
     detail: str
     # Structured field: node ids affected by this check (e.g. identity-node
     # advisories). Populated by the producer (validation.py) in the same
-    # commit that adds this field — no compat-shim default per CLAUDE.md
-    # No-Legacy policy.
+    # commit that adds this field — no compat-shim default, per
+    # CONTRIBUTING.md §Code Standards.
     affected_nodes: tuple[str, ...]
     # Machine-readable producer signal for checks whose detail is display prose.
     # Required-but-nullable: every construction site must either record a
@@ -214,8 +215,8 @@ class ValidationError(_StrictResponse):
     suggestion: str | None
     # Structured discriminant for semantic error routing (e.g.
     # "missing_secret_ref", "fabricated_secret"). Populated at every
-    # construction site — no compat-shim default per CLAUDE.md No-Legacy
-    # policy. Sites that have no semantic code pass None explicitly.
+    # construction site — no compat-shim default, per CONTRIBUTING.md §Code
+    # Standards. Sites that have no semantic code pass None explicitly.
     error_code: str | None
 
 
@@ -309,9 +310,10 @@ class ProgressData(_StrictResponse):
     All six counter fields are REQUIRED with no defaults.  The engine's
     ``ProgressEvent`` (contracts/cli.py) always carries real counter values
     at emission time; defaulting any of them to ``0`` on the wire would
-    fabricate "we don't know" as "definitely zero" — violating the CLAUDE.md
-    fabrication test.  Mid-run, an operator must be able to distinguish
-    "no rows have succeeded yet" from "the field was never populated".
+    fabricate "we don't know" as "definitely zero": absence is evidence, and a
+    fabricated zero is indistinguishable from a measured zero.  Mid-run, an
+    operator must be able to distinguish "no rows have succeeded yet" from
+    "the field was never populated".
 
     The old ``rows_*`` names mixed source rows and materialized token outcomes.
     Progress events are still best-known live counters, not terminal

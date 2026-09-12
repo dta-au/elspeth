@@ -52,9 +52,11 @@ class ComposerToolStatus(StrEnum):
     CANCELLED  — dispatch was intentionally cancelled by its coordinator.
                  This is a lifecycle outcome, not a plugin defect.
     PLUGIN_CRASH — any exception class other than ``ToolArgumentError``
-                 escaped the handler. Per CLAUDE.md "Plugin Ownership"
-                 this is a Tier-1/2 plugin bug; the audit record fixes
-                 the time and arguments at which the bug fired.
+                 escaped the handler. Plugins are system code, so this is
+                 a Tier-1/2 plugin bug (see
+                 docs/guides/data-trust-and-error-handling.md §Plugin Ownership);
+                 the audit record fixes the time and arguments at which
+                 the bug fired.
     """
 
     SUCCESS = "success"
@@ -128,11 +130,12 @@ class ComposerToolInvocation:
 
     Immutability
     ------------
-    Every field is a scalar, ``StrEnum``, ``datetime``, or ``str|None``;
-    per the CLAUDE.md "Frozen Dataclass Immutability" → "Scalar-Only
-    Fields Need No Guard" rule, ``frozen=True`` alone is sufficient.
+    Every field is a scalar, ``StrEnum``, ``datetime``, or ``str|None``, so
+    ``frozen=True`` alone is sufficient. Deep-freezing exists because
+    ``frozen=True`` leaves container contents mutable through the attribute
+    reference; a scalar-only record has no container to reach through.
     No ``__post_init__`` freeze guard is needed and none is defined —
-    "Don't add guards that do nothing."
+    a guard that does nothing is not worth defining.
     """
 
     tool_call_id: str
@@ -190,8 +193,10 @@ class ComposerToolRecorder(Protocol):
 
     Recorder calls happen synchronously from the dispatch site. Every
     code path through the dispatcher MUST call ``record(...)`` before
-    returning — audit primacy is contractual (CLAUDE.md: "if it's not
-    recorded, it didn't happen"). The standalone MCP and web-composer
+    returning — audit primacy is contractual: audit fires first,
+    synchronously, and an unrecorded dispatch did not happen (see the
+    ``logging-telemetry-policy`` skill §The Primacy Test).
+    The standalone MCP and web-composer
     dispatch sites both implement the same try/finally shape used by
     ``AuditedLLMClient.chat_completion`` to make "audit fires before
     return" structurally enforceable.

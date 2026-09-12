@@ -318,7 +318,8 @@ def sanitize_for_canonical(obj: Any) -> Any:
 
     Used at Tier-3 trust boundaries (quarantine path) to normalize external
     data so it can safely pass through canonical_json and stable_hash.
-    Per CLAUDE.md: sources MAY coerce to normalize external data at ingestion.
+    Per docs/guides/data-trust-and-error-handling.md §Coercion Rules by Plugin
+    Type, sources MAY coerce to normalize external data at ingestion.
 
     The quarantine error message records what was originally wrong with the data,
     so replacing NaN/Infinity with None preserves auditability.

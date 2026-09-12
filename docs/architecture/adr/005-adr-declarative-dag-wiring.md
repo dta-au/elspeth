@@ -214,6 +214,19 @@ The on_success ADR must be implemented first. It establishes the `on_success` fi
 
 YAML order still matches topological order by convention, but the processor no longer depends on it.
 
+## Original implementation record — the plan below is complete
+
+This decision shipped. `TransformSettings` in `src/elspeth/core/config.py`
+declares `name`, `input` and `on_success` as required fields with no defaults,
+and the header records commits `00d3c6bae` and `074e15e87` as its decision
+history. The remaining sections preserve the original plan as written: their
+estimates and blast-radius counts, the pending "All example YAMLs" and "All
+tests" rows, the phase markers and wave sequencing, and the source line
+numbers describe that historical programme, not the current inventory or
+execution instructions. The decisions recorded below — the Decision
+Clarifications table and the 2026-02-10 Design Decisions — remain binding.
+(Fence recorded 2026-09-11; no text below it was altered.)
+
 ## Impact Analysis
 
 ### What Changes

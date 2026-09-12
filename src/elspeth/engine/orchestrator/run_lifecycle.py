@@ -36,6 +36,7 @@ from elspeth.contracts import (
     ExportStatus,
     SecretResolutionInput,
 )
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import (
     GracefulShutdownError,
@@ -235,7 +236,11 @@ class RunLifecycleCoordinator:
                 admissions = RunStartAdmissionRepository(self._db)
                 admission = admissions.observe(run_start_permit)
                 if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
-                    raise NonResumableRunError(run.run_id, "run has crossed its first-effect boundary; checkpoint resume is required")
+                    raise NonResumableRunError(
+                        run.run_id,
+                        "run has crossed its first-effect boundary; checkpoint resume is required",
+                        cause=ResumeRefusalCause.FIRST_EFFECT_BOUNDARY_CROSSED,
+                    )
                 leader = factory.run_coordination.live_leader(run_id=run.run_id)
                 if leader is not None and leader.leader_worker_id == worker_id:
                     coordination_token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=leader.leader_epoch)
@@ -518,14 +523,15 @@ class RunLifecycleCoordinator:
         # finalize, ceremonies) as a parameter of the call that performs the
         # write — carried by value, never re-read mid-run (ADR-048 §3).
 
-        # ADR-030 §A.3 (slice 4): start the dedicated heartbeat thread AFTER
-        # the seat is minted and the token is bound, BEFORE the run body's
-        # try/except block.  The thread beats both the run_workers row and the
-        # run_coordination seat in ONE BEGIN IMMEDIATE transaction so the two
-        # liveness clocks can never skew.
+        # Option-c design §A.3 (slice 4), see
+        # docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md:
+        # start the dedicated heartbeat thread AFTER the seat is minted and the
+        # token is bound, BEFORE the run body's try/except block.  The thread
+        # beats both the run_workers row and the run_coordination seat in ONE
+        # BEGIN IMMEDIATE transaction so the two liveness clocks can never skew.
         #
-        # Sequencing invariant (design §A.3 "joined before release_seat"): the
-        # thread must NOT beat the seat after release_seat vacates it — a beat
+        # Sequencing invariant (option-c design §A.3): the thread must be joined
+        # before release_seat vacates the seat, and must NOT beat it after — a beat
         # on a vacant seat would re-set leader_heartbeat_expires_at and fool
         # the entry guard's liveness check.  So stop() is called as the FIRST
         # statement of every except arm that calls release_seat and in the

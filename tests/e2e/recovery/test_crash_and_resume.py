@@ -526,7 +526,7 @@ def _append_crashed_refund_row(ctx: _MultiSourceResumeContext) -> str:
 def _resume_multi_source_run(ctx: _MultiSourceResumeContext) -> Any:
     resume_config, resume_graph = _build_multi_source_resume_pipeline(output_path=ctx.output_path)
     # elspeth-1f5b83cd28: the advisory gate refuses interrupted sources, so
-    # get_resume_point returns None. Hand-build the resume point — these tests
+    # get_resume_point raises a refusal. Hand-build the resume point — these tests
     # prove the enforcing guard refuses (and stays side-effect-free) on its
     # own authority.
     checkpoint = ctx.checkpoint_mgr.get_latest_checkpoint(ctx.run_id)

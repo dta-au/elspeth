@@ -176,7 +176,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9f0b0a653e365a0b"
+    source_file_hash: str | None = "sha256:0ecba5e947ba4010"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -290,9 +290,10 @@ class JSONSource(BaseSource):
     def _load_jsonl(self, ctx: SourceContext) -> Iterator[SourceRow]:
         """Load from JSONL format (one JSON object per line).
 
-        Per Three-Tier Trust Model (CLAUDE.md), external data (Tier 3) that
-        fails to parse is quarantined, not crash the pipeline. This allows
-        subsequent valid lines to still be processed.
+        Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model), external data (Tier 3) that fails to parse is
+        quarantined, not crash the pipeline. This allows subsequent valid lines to
+        still be processed.
         """
         line_num = 0
         try:
@@ -356,8 +357,9 @@ class JSONSource(BaseSource):
     def _load_json_array(self, ctx: SourceContext) -> Iterator[SourceRow]:
         """Load from JSON array format.
 
-        Per Three-Tier Trust Model (CLAUDE.md), external data (Tier 3) that
-        fails to parse or decode is quarantined, not crash the pipeline.
+        Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model), external data (Tier 3) that fails to parse or
+        decode is quarantined, not crash the pipeline.
         """
         try:
             with open(self._path, encoding=self._encoding) as f:
@@ -396,8 +398,9 @@ class JSONSource(BaseSource):
             return
 
         # Extract from nested key if specified
-        # Per Three-Tier Trust Model (CLAUDE.md), structural mismatches in external
-        # data are quarantined, not exceptions. This handles:
+        # Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+        # §The Three-Tier Trust Model), structural mismatches in external data are
+        # quarantined, not exceptions. This handles:
         # 1. data_key configured but JSON root is a list (not dict)
         # 2. data_key configured but key doesn't exist in JSON object
         # 3. data_key extraction results in non-list

@@ -8,6 +8,7 @@ import pytest
 
 from elspeth.contracts import Checkpoint, ResumeCheck, ResumePoint
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 
 
 def _checkpoint() -> Checkpoint:
@@ -25,6 +26,17 @@ def test_resume_check_accepts_true_without_reason() -> None:
     check = ResumeCheck(can_resume=True)
     assert check.can_resume is True
     assert check.reason is None
+    assert check.cause is None
+
+
+def test_resume_check_requires_cause_for_refusal() -> None:
+    with pytest.raises(ValueError, match="ResumeRefusalCause"):
+        ResumeCheck(False, "refused")
+
+
+def test_resume_check_rejects_cause_for_success() -> None:
+    with pytest.raises(ValueError, match="must not have a cause"):
+        ResumeCheck(True, cause=ResumeRefusalCause.RUN_NOT_FOUND)
 
 
 def test_resume_check_rejects_true_with_reason() -> None:

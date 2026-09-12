@@ -2153,8 +2153,10 @@ async def run_tool_batch(
         #
         # Any other exception — TypeError, ValueError, UnicodeError,
         # KeyError, AttributeError — escaping execute_tool() is a
-        # plugin bug (Tier 1/2) and MUST crash.  Per CLAUDE.md,
-        # silently laundering a plugin bug as an LLM-argument error
+        # plugin bug (Tier 1/2) and MUST crash.  Per
+        # docs/guides/data-trust-and-error-handling.md §Plugin
+        # Ownership: System Code, Not User Code, silently
+        # laundering a plugin bug as an LLM-argument error
         # is worse than crashing: it pollutes the audit trail with
         # a confident but wrong Tier-3 story, and the LLM's "retry"
         # cannot correct a fault in our own code.
@@ -2331,11 +2333,12 @@ async def run_tool_batch(
             )
             continue
         except (AssertionError, MemoryError, RecursionError, SystemError):
-            # CLAUDE.md policy exception — DOCUMENTED DIVERGENCE.
+            # Plugin-ownership policy exception — DOCUMENTED DIVERGENCE.
             #
-            # CLAUDE.md "Plugin Ownership" says a defective plugin
-            # MUST crash rather than be wrapped and laundered as a
-            # recoverable error.  The web server relaxes this for
+            # docs/guides/data-trust-and-error-handling.md §Plugin
+            # Ownership: System Code, Not User Code says a defective
+            # plugin MUST crash rather than be wrapped and laundered
+            # as a recoverable error.  The web server relaxes this for
             # ordinary exception classes (see the wider except
             # Exception below) because crashing the whole ASGI
             # process on one bad request would take down every
@@ -2351,7 +2354,9 @@ async def run_tool_batch(
             #
             # - AssertionError: a plain ``assert`` fired inside
             #   plugin code.  Asserts encode Tier-1 invariants
-            #   (CLAUDE.md: "crash on any anomaly").  Writing the
+            #   (crash on any anomaly — see
+            #   docs/guides/data-trust-and-error-handling.md §The
+            #   Three-Tier Trust Model).  Writing the
             #   composition_states row after an invariant failure
             #   would persist data the invariant said was
             #   impossible.
@@ -2380,16 +2385,19 @@ async def run_tool_batch(
         except Exception as tool_exc:
             # Plugin-bug path: any exception class OTHER than
             # ToolArgumentError escaping execute_tool() is a plugin
-            # bug (CLAUDE.md tier 1/2). Capture the loop-local
-            # ``state`` — which has been rebound to
-            # result.updated_state on every successful prior
-            # iteration — so the route layer can persist the
+            # bug (docs/guides/data-trust-and-error-handling.md
+            # §Plugin Ownership: System Code, Not User Code).
+            # Capture the loop-local ``state`` — which has been
+            # rebound to result.updated_state on every successful
+            # prior iteration — so the route layer can persist the
             # accumulated mutations into composition_states before
             # returning the 500. Without this, any tool call that
             # successfully mutated state prior to the crash would
             # be silently dropped from the state history.
             #
-            # Web-server policy exception: CLAUDE.md says a
+            # Web-server policy exception: the plugin-ownership rule
+            # (docs/guides/data-trust-and-error-handling.md §Plugin
+            # Ownership: System Code, Not User Code) says a
             # defective plugin must crash.  In the pipeline engine
             # (single-shot CLI process) that is straightforward —
             # abort the run.  In the web server a single malformed

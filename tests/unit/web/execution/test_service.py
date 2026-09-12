@@ -7114,8 +7114,9 @@ class TestPostCompletionExceptionRecovery:
         #     re-raised exc once the Future completes.  Tested separately
         #     in the _on_pipeline_done test class.
         # This test must NOT pin a slog at the post-terminal-exception
-        # branch itself: per ``logging-telemetry-policy`` the logger is
-        # not the correct surface for post-audit operational signal.
+        # branch itself: per the ``logging-telemetry-policy`` skill §Logging
+        # Policy the logger is not the correct surface for post-audit
+        # operational signal.
         post_terminal_logs = [
             c for c in mock_slog.error.call_args_list if c.args and c.args[0] == "post_terminal_exception_in_run_pipeline"
         ]
@@ -7415,7 +7416,8 @@ class TestPostCompletionExceptionRecovery:
         """ValueError from the post-exception ``get_run`` probe must propagate,
         not be absorbed.
 
-        Audit-primacy contract (CLAUDE.md tier model): ``get_run`` can raise
+        Audit-primacy contract (docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model): ``get_run`` can raise
         ``ValueError`` only via Tier 1 audit-data corruption — "Run not found"
         (the row vanished mid-run), malformed UUID columns, or non-UTC
         ``started_at`` / ``finished_at``.  All three are Tier 1 invariant
@@ -7922,7 +7924,8 @@ class TestBlobSourcePathReadGuard:
     impossible to persist going forward, but the audit-integrity contract
     also requires that runtime crash informatively if a previously-
     persisted state row carries a path that disagrees with the canonical
-    ``BlobRecord.storage_path``.  Per CLAUDE.md "no defensive programming",
+    ``BlobRecord.storage_path``.  Per docs/guides/data-trust-and-error-handling.md
+    §The Defensive Programming Prohibition,
     the runtime must not silently coerce or fall back to ``FileNotFoundError``.
 
     Bug-verification protocol (cf.
@@ -10190,7 +10193,8 @@ class TestTerminalOrderingInvariant:
     blob finalization. A late finalize failure triggers a second terminal event
     via except BaseException.
 
-    CLAUDE.md invariant: "Every row reaches exactly one terminal state."
+    Per docs/contracts/system-operations.md §Complete Token State Diagram:
+    "Every token reaches exactly one terminal state — no silent drops."
     """
 
     @patch("elspeth.web.execution.service.Orchestrator")

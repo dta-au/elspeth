@@ -103,7 +103,8 @@ def _probe_instantiate(cls: type[BaseTransform]) -> BaseTransform:
     Narrow exception catches only ``NotImplementedError`` (missing
     implementation — legitimate skip) and ``TypeError`` (wrong constructor
     args — config shape mismatch). Any other exception is a plugin bug and
-    must propagate (CLAUDE.md: plugin bugs must crash).
+    must propagate — plugin bugs must crash (see
+    docs/guides/data-trust-and-error-handling.md §Plugin Ownership).
     """
     try:
         config = cls.probe_config()

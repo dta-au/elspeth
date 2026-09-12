@@ -101,7 +101,8 @@ class QuarantineRouter:
         pending_tokens = loop_ctx.pending_tokens
 
         # Route quarantined row to configured sink
-        # Per CLAUDE.md: plugin bugs must crash, no silent drops
+        # Per docs/guides/data-trust-and-error-handling.md §Plugin Ownership:
+        # plugin bugs must crash, no silent drops
         quarantine_sink = source_item.quarantine_destination
 
         # Validate destination exists - crash on plugin bug
@@ -229,7 +230,8 @@ class QuarantineRouter:
         )
 
         # Compute error_hash for QUARANTINED outcome audit trail
-        # Per CLAUDE.md: every row must reach exactly one terminal state
+        # This row's token must reach exactly one terminal state, no silent drops
+        # (the invariant is stated over tokens: docs/contracts/system-operations.md)
         # Do NOT record outcome here — record after sink durability in SinkExecutor.write()
         quarantine_error_hash = compute_error_hash(quarantine_error_msg)
 

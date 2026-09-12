@@ -441,8 +441,9 @@ class TestStepChatSuccess:
         """Slice 5.1: each chat round-trip persists a ComposerChatTurn audit row.
 
         The audit message lands as a ``role=audit`` chat message tagged
-        ``_kind=chat_turn_audit``.  Per CLAUDE.md auditability standard
-        ("no inference - if it's not recorded, it didn't happen"), the
+        ``_kind=chat_turn_audit``.  Per the auditability principle
+        (ARCHITECTURE.md §Design Principles) nothing is inferred — if it is
+        not recorded, it did not happen — so the
         per-turn audit record MUST persist; constructing it in memory
         and letting it GC at function return would be evidence
         tampering.
@@ -2014,7 +2015,9 @@ class TestStepChatProgressWiring:
 
     Deliberately drives BOTH step_1_source and step_2_sink to prove the
     wiring is uniform across guided steps (not forked on step_2_sink, and
-    not forked on "is tutorial" — CLAUDE.md's tutorial-parity doctrine): the
+    not forked on "is tutorial" — the tutorial runs the same backend as every
+    other session, with no tutorial-only branch; see
+    docs/architecture/adr/031-tutorial-is-a-fixed-script-canary.md): the
     route publishes the same starting/complete bracket regardless of step,
     and only step_2_sink's resolver additionally hops through calling_model/
     using_tools mid-flight.

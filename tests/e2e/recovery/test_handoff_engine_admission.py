@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from elspeth.contracts.checkpoint import CheckpointDraft
+from elspeth.contracts.checkpoint import CheckpointDraft, ResumeRefusalCause
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.factory import RecorderFactory
@@ -38,8 +38,9 @@ def test_changed_plugin_refuses_before_resume_cas(tmp_path: Path, changed_field:
         config.transforms[0].plugin_version = "changed-implementation"
     else:
         config.transforms[0].source_file_hash = "b" * 64
-    with pytest.raises(NonResumableRunError, match="implementation changed"):
+    with pytest.raises(NonResumableRunError, match="implementation changed") as exc_info:
         crashed.resume_orchestrator().resume(point, config, graph, payload_store=crashed.payload_store)
+    assert exc_info.value.cause is ResumeRefusalCause.PLUGIN_IMPLEMENTATION_CHANGED
     assert _coordination_events(crashed.db, crashed.run_id) == before
     assert sink.results == []
 
@@ -187,8 +188,9 @@ def test_prepared_permit_restarts_after_graph_registration_crash() -> None:
 
     events_before_retry = _coordination_events(db, binding.run_id)
     duplicate_config, duplicate_graph, duplicate_sink, _ = _build_pipeline(_SOURCE_ROWS)
-    with pytest.raises(NonResumableRunError, match="first-effect boundary"):
+    with pytest.raises(NonResumableRunError, match="first-effect boundary") as exc_info:
         Orchestrator(db).run(duplicate_config, duplicate_graph, **kwargs)
+    assert exc_info.value.cause is ResumeRefusalCause.FIRST_EFFECT_BOUNDARY_CROSSED
     assert duplicate_sink.results == []
     assert _coordination_events(db, binding.run_id) == events_before_retry
 

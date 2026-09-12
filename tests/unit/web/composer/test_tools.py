@@ -9371,7 +9371,7 @@ class TestCredentialRejectionAdvertisesInlineForm:
         )
         assert result is not None
         repair = result.data["repair"]
-        # Old key must be gone — no compatibility shim per CLAUDE.md.
+        # Old key must be gone — no compatibility shim (CONTRIBUTING.md §Code Standards).
         assert "required_tool_sequence" not in repair
         # New shape: two separately-keyed forms.
         assert "inline_form" in repair

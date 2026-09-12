@@ -1,7 +1,7 @@
 # ADR-024: Delivery Governance for Single-Maintainer Mode
 
 **Date:** 2026-05-19
-**Last amended:** 2026-08-29
+**Last amended:** 2026-09-11
 **Status:** Accepted
 **Deciders:** ELSPETH maintainer
 **Tags:** governance, project-control, reporting, cicd, release-management,
@@ -110,6 +110,14 @@ remain in ADRs, delivery decisions and scope changes remain in Filigree, policy
 overrides remain in their governing control system, and release decisions remain
 in release provenance. The PCR carries only the decisions made during the period
 and the open asks that need action from an authorized decision-maker.
+
+**Current implementation note (2026-09-11):** one of the four artifacts exists.
+`docs/project-control/README.md` records the Project Control Report, the T&M
+register, and the milestone and forecast register as "Not written"; the RAID
+register is the only one it marks as held. That folder is excluded by
+`.gitignore` apart from the README, so the RAID register is not in a clone and
+a reader outside the maintainer's checkout cannot verify its content or its
+currency.
 
 ### Authority, sources, and information handling
 

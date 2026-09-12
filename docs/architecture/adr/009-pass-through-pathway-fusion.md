@@ -12,6 +12,18 @@
 > Normative in this ADR: all four Clauses for `passes_through_input`.
 > Extended: §Clause 4 invariant-harness design now covers ALL registered contracts via the ADR-010 `negative_example` requirement, not only `passes_through_input`.
 
+> **Amended by [ADR-012](012-can-drop-rows-contract.md) on 2026-04-20.**
+> §Clause 3's empty-emission carve-out is retired mechanically, not only in
+> documentation. `verify_pass_through`
+> (`src/elspeth/engine/executors/pass_through.py`) no longer treats zero
+> emission as an unconditional no-op: measured 2026-09-11, an empty emission
+> returns early only when the transform declares `can_drop_rows=True` or there
+> were no input fields to preserve, and otherwise raises
+> `PassThroughContractViolation` (ADR-012 §Clause-3 retirement). The `can_drop_rows`
+> declaration that §Clause 3 and §Negative Consequences forward-reference as
+> Track 2 work is delivered by ADR-012's `CanDropRowsContract`; zero-emission
+> governance is owned there, not by the carve-out recorded below.
+
 ## Context
 
 ADR-007 (pass-through contract propagation) and ADR-008 (runtime contract cross-check) shipped as a partial landing. Two limitations were documented at landing time and are now closed:
@@ -56,7 +68,7 @@ Invoked from two sites:
 - **`OutputMode.TRANSFORM` (batch-homogeneous intersection).** `input_fields` is the intersection of all buffered input contracts (ADR-007 table line 53). Every emitted row must preserve the intersection — the weakest shared guarantee across the batch. A transform claiming `passes_through_input=True` must preserve what every input contributed.
 - **`OutputMode.PASSTHROUGH` (1:1 pairing).** Tokens are 1:1 with outputs (routing enforces the count match). Each `(input_token, output_row)` pair is checked independently using that specific input token's contract fields. Using the batch intersection for passthrough would create a correctness hole on heterogeneous batches — a field present on only one input token could be silently dropped on its corresponding output token.
 
-**Call-site placement (critical).** `_cross_check_flush_output` MUST run BEFORE `_emit_transform_completed` and the `_route_*` methods. A failed cross-check must not follow a COMPLETED (telemetry) or CONSUMED_IN_BATCH (Landscape) terminal-state emission on any token, or the audit trail would contain both terminal states for the same token — violating CLAUDE.md's "every row reaches exactly one terminal state" invariant.
+**Call-site placement (critical).** `_cross_check_flush_output` MUST run BEFORE `_emit_transform_completed` and the `_route_*` methods. A failed cross-check must not follow a COMPLETED (telemetry) or CONSUMED_IN_BATCH (Landscape) terminal-state emission on any token, or the audit trail would contain both terminal states for the same token — violating the "every row reaches exactly one terminal state" invariant (stated over tokens at docs/contracts/system-operations.md §Complete Token State Diagram: "Every token reaches exactly one terminal state — no silent drops.").
 
 **Violation recording.** On `PassThroughContractViolation`, `_record_flush_violation` writes per-token FAILED audit entries for every buffered token. The per-token context payload is rebuilt inside the loop so `$.context.token_id` matches each row's own token, not the triggering token's — triage queries of the form `WHERE exception_type = 'PassThroughContractViolation'` expect every affected token to resolve to its own identifier.
 
@@ -112,5 +124,5 @@ Probe instantiation uses a new `BaseTransform.probe_config()` classmethod. Every
 - [ADR-007: Pass-through contract propagation](007-pass-through-contract-propagation.md) — amended by this ADR § Clauses 1, 3, 4.
 - [ADR-008: Runtime contract cross-check](008-runtime-contract-cross-check.md) — amended by this ADR § Clause 2.
 - Track 2 declaration-framework epic: `elspeth-300abf520d`; see ADR-010.
-- CLAUDE.md §Three-Tier Trust Model, §Plugin Ownership, §"No Legacy Code Policy".
+- docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model, §Plugin Ownership: System Code, Not User Code; CONTRIBUTING.md §Code Standards (no legacy shims or backwards compatibility).
 - Implementation and regression evidence: commits `2ba34c2b6` and `09fad40f9`.

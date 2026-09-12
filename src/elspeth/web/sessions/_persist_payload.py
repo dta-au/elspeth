@@ -168,8 +168,9 @@ class AuditOutcome:
     - **Tool failed AND audit unwind failed.** ``assistant_id=None``,
       ``unwind_audit_failed=True``. Caller raises the captured plugin
       crash; the audit failure is recorded by ``persist_compose_turn``
-      via counter increment + ``slog.warning`` (permitted under
-      CLAUDE.md primacy because the audit system itself failed).
+      via counter increment + ``slog.warning`` (permitted under the
+      logging-telemetry-policy skill §Logging Policy because the audit
+      system itself failed).
 
     There is NO tier-1-violation outcome shape. When the audit
     database fails AND no plugin crash is in flight,

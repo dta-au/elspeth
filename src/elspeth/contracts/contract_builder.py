@@ -124,9 +124,10 @@ class ContractBuilder:
             if normalized_name in declared_names:
                 continue
 
-            # Per CLAUDE.md: No silent fallback - if field is in the row but not
-            # in resolution, that's a bug in the source plugin. KeyError is
-            # correct.
+            # No silent fallback - if field is in the row but not in
+            # resolution, that's a bug in the source plugin, and plugins are
+            # system code (see docs/guides/data-trust-and-error-handling.md
+            # §Plugin Ownership). KeyError is correct.
             original_name = normalized_to_original[normalized_name]
             new_field = self._inferred_field(normalized_name, original_name, value)
             updated = SchemaContract(

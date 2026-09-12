@@ -3,7 +3,8 @@
 These are strict contracts - all enum fields use proper enum types.
 Model loader layer handles string→enum conversion for DB reads.
 
-Per Data Manifesto: The audit database is OUR data. If we read
+Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model): the audit database is OUR data. If we read
 garbage from it, something catastrophic happened - crash immediately.
 """
 
@@ -1182,8 +1183,9 @@ class Checkpoint:
     def __post_init__(self) -> None:
         """Validate required fields - Tier 1 crash on invalid data.
 
-        Per Data Manifesto: Audit data is OUR data. If we receive None
-        for required hash fields, that's a bug in our code - crash immediately.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model: audit data is OUR data. If we receive None for required hash
+        fields, that's a bug in our code - crash immediately.
         """
         require_int(self.sequence_number, "sequence_number", min_value=0)
         require_int(self.format_version, "format_version", optional=True, min_value=0)
@@ -1733,8 +1735,9 @@ class SecretResolution:
     def __post_init__(self) -> None:
         """Validate Tier 1 invariants for secret provenance records.
 
-        Per Data Manifesto: The audit database is OUR data. If we read
-        garbage from it, something catastrophic happened - crash immediately.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model: the audit database is OUR data. If we read garbage from it,
+        something catastrophic happened - crash immediately.
 
         Invariants:
         - resolution_id, run_id, env_var_name, source, fingerprint must be non-empty strings

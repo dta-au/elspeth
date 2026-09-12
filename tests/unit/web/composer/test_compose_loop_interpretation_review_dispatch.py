@@ -24,7 +24,8 @@ compose-loop wiring delivered in the Task 5 follow-on commit:
   AUTO_INTERPRETED_NO_SURFACES audit row BEFORE returning the ARG_ERROR
   to the LLM.
 
-Test-path discipline (CLAUDE.md "Never bypass production code paths"):
+Test-path discipline (``engine-patterns-reference`` skill §Test Path Integrity,
+"Never bypass production code paths in tests"):
 all tests drive the compose loop through ``_run_one_turn_for_test``,
 which exercises the same ``_compose_loop`` body the live web server
 uses.

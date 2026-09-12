@@ -124,7 +124,7 @@ class RunSourceFieldResolutionRecord:
     resolution_mapping: Mapping[str, str] | None
 
     def __post_init__(self) -> None:
-        # Frozen-dataclass deep-freeze contract (CLAUDE.md): resolution_mapping
+        # Frozen-dataclass deep-freeze contract: resolution_mapping
         # is a container field, so frozen=True alone leaves its contents mutable
         # through the attribute reference. Gate on `is not None` — the field is
         # nullable (sources that resolved no headers record None).

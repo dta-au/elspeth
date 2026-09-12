@@ -29,7 +29,7 @@ Restructure CLI to instantiate plugins BEFORE graph construction:
 - **No double instantiation** - Plugins created once, reused in execution
 - **Fail-fast principle** - Plugin instantiation errors occur during validation, not execution
 - **Clean architecture** - Graph construction explicitly depends on plugin instances
-- **No legacy code** - `from_config()` deleted immediately per CLAUDE.md
+- **No legacy code** - `from_config()` deleted immediately per CONTRIBUTING.md §Code Standards
 - **Coalesce support** - Fork/join patterns fully implemented
 
 ### Negative
@@ -49,7 +49,7 @@ Add `input_schema`/`output_schema` fields to Pydantic config models, populate vi
 - Violates separation of concerns (config layer knows about plugin layer)
 - Uses `object.__setattr__()` to bypass frozen models (hacky)
 - Accumulates technical debt
-- Violates CLAUDE.md no-legacy policy
+- Violates the no-legacy-shims rule (CONTRIBUTING.md §Code Standards)
 
 ### Option B: Extract schemas from plugin classes
 
@@ -255,7 +255,7 @@ sinks:
 - **Catches typos:** `categorry` (typo) instead of `category` crashes immediately
 - **No hidden behavior:** Audit trail clearly shows intended routing
 - **Fail-fast:** Missing destinations are caught at graph construction, not runtime
-- **Aligns with CLAUDE.md:** No silent recovery, crash on configuration errors
+- **Aligns with the defensive-programming prohibition** (docs/guides/data-trust-and-error-handling.md §The Defensive Programming Prohibition): No silent recovery, crash on configuration errors
 
 **Alternative for implicit routing:** If you want fork branches to share a common destination, use gate `routes` instead:
 ```python

@@ -2,8 +2,8 @@
 """Integration test for P0 bug: Source row payloads never persisted.
 
 This test verifies that source row payloads are stored in the PayloadStore
-during normal pipeline runs, as required by CLAUDE.md's non-negotiable
-audit requirement: "Source entry - Raw data stored before any processing"
+during normal pipeline runs: raw source data is stored before any processing,
+otherwise the audit trail cannot show what the pipeline was actually given.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ from tests.fixtures.pipeline import build_production_graph
 def test_source_row_payloads_are_stored_during_run(tmp_path: Path, payload_store) -> None:
     """Test that source row payloads are persisted to PayloadStore during normal runs.
 
-    This is a P0 audit requirement from CLAUDE.md:
-    "Source entry - Raw data stored before any processing" (non-negotiable)
+    This is a non-negotiable P0 audit requirement: raw source data is stored
+    before any processing.
 
     Bug: Currently source_data_ref stays NULL and get_row_data returns NEVER_STORED
     Expected: source_data_ref populated with payload reference after run
@@ -127,8 +127,8 @@ def test_source_row_payloads_are_stored_during_run(tmp_path: Path, payload_store
     for row in rows:
         assert row.source_data_ref is not None, (
             f"Row {row.row_id} source_data_ref should be set, but is NULL. "
-            "This violates CLAUDE.md's non-negotiable audit requirement: "
-            "'Source entry - Raw data stored before any processing'"
+            "This violates the non-negotiable audit requirement that raw source "
+            "data is stored before any processing."
         )
 
         # Verify payload can be retrieved

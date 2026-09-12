@@ -1364,8 +1364,8 @@ class RowProcessor:
         Called BEFORE ``_emit_transform_completed`` and the routing methods
         (§2.5): a failed cross-check must not follow a COMPLETED or
         CONSUMED_IN_BATCH terminal-state emission on any token, which would
-        violate CLAUDE.md's "every row reaches exactly one terminal state"
-        invariant.
+        violate the "Every token reaches exactly one terminal state — no silent
+        drops" invariant (docs/contracts/system-operations.md).
 
         Raises:
             FrameworkBugError: A buffered token has no input contract.
@@ -1388,8 +1388,8 @@ class RowProcessor:
 
         try:
             # _FlushContext.__post_init__ guarantees buffered_tokens is non-empty;
-            # no defensive emptiness guard (CLAUDE.md: defensive programming
-            # forbidden for internal paths).
+            # no defensive emptiness guard (docs/guides/data-trust-and-error-handling.md
+            # §The Defensive Programming Prohibition — forbidden for internal paths).
             for i, token in enumerate(fctx.buffered_tokens):
                 if token.row_data.contract is None:
                     raise FrameworkBugError(
@@ -2428,7 +2428,7 @@ class RowProcessor:
             # Engine-classified transport signals (see PluginRetryableError's
             # contract): ConnectionError/TimeoutError are the Python runtime's
             # canonical transient network failures beneath provider SDKs, and
-            # CapacityError contract-declares retryable=True. Bare OSError is
+            # CapacityError is retryable by nominal classification. Bare OSError is
             # deliberately NOT here: it spans plugin bug-classes
             # (FileNotFoundError, PermissionError) that must crash, not retry.
             return isinstance(e, ConnectionError | TimeoutError | CapacityError)

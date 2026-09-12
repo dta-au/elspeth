@@ -2151,13 +2151,14 @@ def _create_app(
         # collector would raise here and Starlette's default 500 handler
         # leaks the traceback into the response body. /metrics is a
         # scrape endpoint — return a safe 503 with no internal detail so
-        # scrapers retry gracefully.  Audit-primacy (CLAUDE.md): this
-        # endpoint reads in-memory counter state only, so failure is a
-        # telemetry-system failure (operational, not legal) — logged, not
-        # audited. A bounded message is safe to log here (unlike the
-        # secret-bearing DB exceptions elsewhere): the route has already
-        # authenticated before collection, and the bounded message identifies
-        # which collector broke without reading request-controlled input.
+        # scrapers retry gracefully.  Audit primacy (the logging-telemetry-policy
+        # skill §The Primacy Test): this endpoint reads in-memory counter state
+        # only, so failure is a telemetry-system failure (operational, not
+        # legal) — logged, not audited. A bounded message is safe to log here
+        # (unlike the secret-bearing DB exceptions elsewhere): the route has
+        # already authenticated before collection, and the bounded message
+        # identifies which collector broke without reading request-controlled
+        # input.
         try:
             body = generate_latest()
         except Exception as scrape_exc:

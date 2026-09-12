@@ -777,8 +777,9 @@ def _patch_structured_interpretation_prompt(
     # Defense-in-depth backstop: the matched requirement must be referenced by
     # at least one ``interpretation_ref`` part, or the accepted value never
     # lands in the rendered prompt — a "resolved" review whose decision silently
-    # never reaches the runtime, i.e. the exact audit divergence CLAUDE.md
-    # forbids. Unreachable once the staging gate (vague_term_wiring_count) holds;
+    # never reaches the runtime, i.e. the exact audit divergence the
+    # auditability principle forbids (ARCHITECTURE.md §Design Principles).
+    # Unreachable once the staging gate (vague_term_wiring_count) holds;
     # present so a bypass crashes loudly instead of corrupting the prompt.
     if matched_ref_count == 0:
         raise InterpretationPlaceholderConsumedError(

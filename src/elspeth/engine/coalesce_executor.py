@@ -1151,7 +1151,8 @@ class CoalesceExecutor:
 
         # ─────────────────────────────────────────────────────────────────────
         # Defensive check: crash if any token has no contract
-        # Per CLAUDE.md: "Bad data in the audit trail = crash immediately"
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model: "Bad data in the audit trail = crash immediately"
         # A token with None contract is a bug in upstream code (fork/transform).
         # ─────────────────────────────────────────────────────────────────────
         for branch, entry in pending.branches.items():

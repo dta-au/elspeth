@@ -1050,7 +1050,8 @@ class TestLinkValidationErrorToRow:
     6. Happy-path UPDATE (line 1577-1585): error has row_id NULL,
        caller supplies a valid row_id.
 
-    Per CLAUDE.md, this method is the quarantine-lineage-exactness
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model, this method is the quarantine-lineage-exactness
     guarantee — if linkage is wrong the audit trail confidently
     misattributes which row failed which validation. Cross-run, cross-row,
     and silent-relink corruption all fail Tier 1 trust.
@@ -1508,7 +1509,8 @@ class TestValidateTokenRowOwnership:
     the comparison would go undetected because the integration tests
     cannot construct the bad input.
 
-    Per CLAUDE.md, this method is a Tier-1 audit-integrity guard:
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model, this method is a Tier-1 audit-integrity guard:
     cross-row lineage corruption produces a valid-looking audit trail
     attributing the wrong source data to a terminal decision —
     `explain()` would return a confidently-wrong answer about which

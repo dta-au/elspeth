@@ -1,7 +1,7 @@
 """Event filtering based on telemetry granularity.
 
 Telemetry events are filtered based on configured granularity level:
-- LIFECYCLE: Only run start/complete/failed and phase transitions
+- LIFECYCLE: Run lifecycle, phase transitions and bounded plugin statistics
 - ROWS: Lifecycle + row-level events (creation, transforms, gates, completion)
 - FULL: Rows + external call events (LLM, HTTP, SQL)
 
@@ -11,12 +11,15 @@ used by TelemetryManager to decide which events to emit.
 
 from elspeth.contracts.enums import TelemetryGranularity
 from elspeth.contracts.events import (
+    ChromaWriteStatistics,
+    DataverseLoadStatistics,
     EngineSpanCompleted,
     EngineSpanName,
     ExternalCallCompleted,
     FieldResolutionApplied,
     GateEvaluated,
     PhaseChanged,
+    RAGRetrievalStatistics,
     ResourceCleanupFailed,
     RowCreated,
     RunFinished,
@@ -64,6 +67,11 @@ def should_emit(event: TelemetryEvent, granularity: TelemetryGranularity) -> boo
             return True
         case EngineSpanCompleted():
             return granularity in (TelemetryGranularity.ROWS, TelemetryGranularity.FULL)
+
+        # Per-invocation operational summaries remain available at lifecycle
+        # granularity. They do not assert successful run completion.
+        case DataverseLoadStatistics() | RAGRetrievalStatistics() | ChromaWriteStatistics():
+            return True
 
         # Lifecycle events: always emit at any granularity
         case RunStarted() | RunFinished() | PhaseChanged() | ResourceCleanupFailed():

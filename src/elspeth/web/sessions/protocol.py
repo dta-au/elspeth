@@ -821,13 +821,12 @@ class ComposerSessionPreferencesTransition:
     ``composer.session.switched_total``; the B1 audit-payload extension
     records ``prior.trust_mode`` into ``proposal_events_table.payload``
     so the telemetry counter remains a strict subset of audit-recorded
-    reality (audit-primacy superset rule, CLAUDE.md
-    §"Telemetry and Logging").
+    reality (the logging-telemetry-policy skill §The Superset Rule).
 
-    Both fields hold immutable frozen dataclass instances; no container
-    fields here, so no ``__post_init__`` deep-freeze guard is required
-    (per CLAUDE.md §"Frozen Dataclass Immutability"; scalar/frozen-
-    dataclass wrappers do not need guards).
+    ``frozen=True`` leaves container contents mutable through the attribute
+    reference, so container fields are deep-frozen in ``__post_init__``.
+    Both fields here hold immutable frozen dataclass instances; there are no
+    container fields, so no deep-freeze guard is required.
     """
 
     prior: ComposerSessionPreferencesRecord
@@ -1043,8 +1042,8 @@ class ChatMessageRecord:
                 f"expected one of {sorted(CHAT_MESSAGE_WRITER_PRINCIPAL_VALUES)}"
             )
         # tool_call_id / parent_assistant_id are scalar fields and need no
-        # freeze guard (CLAUDE.md "Scalar-Only Fields Need No Guard"). Only
-        # ``tool_calls`` carries mutable contents.
+        # freeze guard — scalar-only records have nothing to deep-freeze.
+        # Only ``tool_calls`` carries mutable contents.
         if self.tool_calls is not None:
             freeze_fields(self, "tool_calls")
 
@@ -4177,9 +4176,10 @@ class SessionServiceProtocol(Protocol):
 
         ``kind`` must be supplied explicitly by the caller. Implementations
         MUST validate the affected component in the parent composition state
-        before INSERT (writer-boundary check per CLAUDE.md offensive
-        programming): ``invented_source`` targets the synthetic ``source``
-        component and requires persisted source-authoring metadata;
+        before INSERT (writer-boundary check per the engine-patterns-reference
+        skill §Offensive Programming Examples): ``invented_source`` targets
+        the synthetic ``source`` component and requires persisted
+        source-authoring metadata;
         ``pipeline_decision`` targets the node that implements the reviewed
         shape decision; prompt/vague transform kinds target real LLM nodes in
         ``composition_states.nodes``. Raises
@@ -4561,9 +4561,10 @@ class SessionServiceProtocol(Protocol):
         ``session_id``. That is a Tier 1 audit anomaly: the state was
         reachable from a run but does not belong to the session hosting
         the run. Silent coercion or a soft 404 would produce a confident
-        wrong answer — exactly the pattern CLAUDE.md forbids for our own
-        data. Raises ``ValueError`` when the state does not exist at all,
-        consistent with ``get_state``.
+        wrong answer — exactly the pattern
+        docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model forbids for our own data. Raises ``ValueError`` when the state
+        does not exist at all, consistent with ``get_state``.
         """
         ...
 

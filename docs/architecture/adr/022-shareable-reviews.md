@@ -67,7 +67,7 @@ Phase 6 follows the precedent with one deliberate sharpening: where `interpretat
 
 * If the audit insert fails, no blob is ever written. The user sees an error; no token is returned.
 * If the blob write fails after the audit insert, the audit row stands as honest evidence of the attempt; no token is returned. A future reviewer who could somehow synthesize a token for the recorded `payload_digest` would receive `ResourceNotFound` from the payload store — a clean failure mode.
-* The alternative ("blob first, audit second, retention reaps orphans") inverts CLAUDE.md's audit primacy and is explicitly forbidden. The blob's existence is not user-visible without a token, so a never-audited blob is operationally invisible — but a blob without an audit row is exactly the "evidence-without-record" anti-pattern the primacy rule exists to prevent.
+* The alternative ("blob first, audit second, retention reaps orphans") inverts audit primacy (the `logging-telemetry-policy` skill §Logging Policy: the audit write fires first, synchronously, crash-on-failure) and is explicitly forbidden. The blob's existence is not user-visible without a token, so a never-audited blob is operationally invisible — but a blob without an audit row is exactly the "evidence-without-record" anti-pattern the primacy rule exists to prevent.
 
 For `export_yaml`, there is no blob; the audit row is the entire side effect. The discipline is the same: sync write before response.
 

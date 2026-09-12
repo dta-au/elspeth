@@ -23,6 +23,90 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 
+
+@pytest.mark.parametrize("consumption", ["not_started", "partial", "closed", "empty", "discarded"])
+def test_load_statistics_distinguish_lifecycle_states(consumption: str) -> None:
+    from elspeth.contracts.events import DataverseLoadStatistics
+
+    rows = [] if consumption == "empty" else [{"contactid": "first", "fullname": "First"}, {"contactid": "second"}]
+    if consumption == "discarded":
+        rows = [{"contactid": "missing_name"}, {"fullname": "missing_id"}]
+    source = _make_source_for_load(
+        [_make_page(rows)],
+        _base_config(schema={"mode": "fixed", "fields": ["contactid: str", "fullname: str"]}, on_validation_failure="discard"),
+    )
+    ctx = _mock_lifecycle_context()
+    iterator = source.load(_mock_source_context())
+    if consumption in ("partial", "closed"):
+        next(iterator)
+        if consumption == "closed":
+            iterator.close()
+    elif consumption in ("empty", "discarded"):
+        assert list(iterator) == []
+    source.on_complete(ctx)
+    ctx.telemetry_emit.assert_called_once()
+    event = ctx.telemetry_emit.call_args.args[0]
+    assert isinstance(event, DataverseLoadStatistics)
+    assert event.run_id == ctx.run_id
+    assert event.node_id == ctx.node_id
+    assert event.pages_fetched == (0 if consumption == "not_started" else 1)
+    assert event.rows_yielded == (1 if consumption in ("partial", "closed") else 0)
+    assert event.rows_rejected == (2 if consumption == "discarded" else 0)
+    assert (
+        event.load_state
+        == {
+            "not_started": "not_started",
+            "partial": "partial",
+            "closed": "partial",
+            "empty": "exhausted",
+            "discarded": "exhausted",
+        }[consumption]
+    )
+    iterator.close()
+
+
+def test_statistics_reset_on_new_lifecycle() -> None:
+    source = _make_source_for_load([_make_page([{"count": 1}, {"count": "bad"}])], _base_config(on_validation_failure="discard"))
+    list(source.load(_mock_source_context()))
+    ctx = _mock_lifecycle_context()
+    source.on_complete(ctx)
+    assert ctx.telemetry_emit.call_args.args[0].rows_yielded == 1
+    assert ctx.telemetry_emit.call_args.args[0].rows_rejected == 1
+    source.close()
+    with (
+        patch("azure.identity.ClientSecretCredential", new=_client_secret_credential_factory),
+        patch("elspeth.plugins.sources.dataverse.DataverseClient", new=_dataverse_client_factory(_DataverseClientFake())),
+    ):
+        source.on_start(ctx)
+    source.on_complete(ctx)
+    assert ctx.telemetry_emit.call_count == 2
+    event = ctx.telemetry_emit.call_args.args[0]
+    assert (event.pages_fetched, event.rows_yielded, event.rows_rejected, event.load_state) == (0, 0, 0, "not_started")
+    source.close()
+
+
+@pytest.mark.parametrize("audit_failure", ["page", "validation"])
+def test_statistics_do_not_count_failed_audit_writes(audit_failure: str) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    source = _make_source_for_load([_make_page([{"count": 1}, {"count": "bad"}])], _base_config(on_validation_failure="discard"))
+    ctx = _mock_source_context()
+    if audit_failure == "page":
+        # Metadata audit succeeds; fail the data-page audit before counting it.
+        ctx.record_call.side_effect = iter([None, AuditIntegrityError("audit unavailable")])
+    else:
+        ctx.record_validation_error.side_effect = AuditIntegrityError("audit unavailable")
+    with pytest.raises(AuditIntegrityError, match="audit unavailable"):
+        list(source.load(ctx))
+    lifecycle = _mock_lifecycle_context()
+    source.on_complete(lifecycle)
+    event = lifecycle.telemetry_emit.call_args.args[0]
+    assert event.load_state == "failed"
+    assert event.pages_fetched == (0 if audit_failure == "page" else 1)
+    assert event.rows_yielded == (0 if audit_failure == "page" else 1)
+    assert event.rows_rejected == 0
+
+
 # Dynamic schema config for tests
 DYNAMIC_SCHEMA = {"mode": "observed"}
 FIXED_SCHEMA = {

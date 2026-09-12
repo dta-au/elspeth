@@ -223,7 +223,8 @@ function incrementResolvedCount(
       break;
     case "pending":
       // Pending is not a resolved state; the caller should not have
-      // dispatched here.  Throw offensively (CLAUDE.md decision test:
+      // dispatched here.  Throw offensively
+      // (docs/guides/data-trust-and-error-handling.md §The Decision Test:
       // bug in our code → let it crash with a meaningful message).
       throw new Error(
         "incrementResolvedCount: 'pending' is not a resolved state",

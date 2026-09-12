@@ -39,6 +39,7 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError, is_capacity_error
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema_contract import PipelineRow
@@ -294,7 +295,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:619e5be8ec8c07ce"
+    source_file_hash: str | None = "sha256:5136c0d00660fc0e"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -392,7 +393,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
 
         self._recorder: PluginAuditWriter | None = None
         self._run_id: str = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._http_clients: dict[str, Any] = {}
         self._http_clients_lock = threading.Lock()

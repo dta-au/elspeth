@@ -31,6 +31,8 @@ from elspeth.contracts.errors import (
     EmptyResumeStateError,
     GracefulShutdownError,
     IncompleteSourceResumeError,
+    RunWorkerEvictedError,
+    WriteLockHeldError,
 )
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.types import AggregationName
@@ -306,6 +308,22 @@ def _emit_schema_compatibility_error(
         err=True,
     )
     typer.echo(str(error), err=True)
+
+
+def _emit_worker_evicted_event(error: RunWorkerEvictedError, output_format: Literal["console", "json"]) -> None:
+    """Carry observed coordination loss to both CLI consumers."""
+    if output_format == "json":
+        payload = {
+            "event": "evicted",
+            "run_id": error.run_id,
+            "worker_id": error.worker_id,
+            "message": str(error),
+        }
+        if error.reason is not None:
+            payload["reason"] = error.reason
+        typer.echo(json.dumps(payload), err=True)
+    else:
+        typer.echo(str(error), err=True)
 
 
 @app.callback()
@@ -886,8 +904,6 @@ def run(
         raise typer.Exit(4) from e
 
     # Execute pipeline with pre-instantiated plugins
-    from elspeth.contracts.errors import RunWorkerEvictedError
-
     try:
         execution_result = _execute_pipeline_with_instances(
             config,
@@ -920,24 +936,11 @@ def run(
             _emit_interrupted_resume_guidance_from_url(config.landscape.url, passphrase, e.run_id)
         raise typer.Exit(3)  # noqa: B904 -- distinct exit code: 0=success, 1=error, 3=interrupted
     except RunWorkerEvictedError as e:
-        if output_format == "json":
-            import json as json_mod_evicted
-
-            typer.echo(
-                json_mod_evicted.dumps(
-                    {
-                        "event": "evicted",
-                        "run_id": e.run_id,
-                        "worker_id": e.worker_id,
-                        "message": str(e),
-                    }
-                ),
-                err=True,
-            )
-        else:
-            typer.echo(f"\nWorker evicted from run {e.run_id}.", err=True)
-            typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+        _emit_worker_evicted_event(e, output_format)
         raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
+    except WriteLockHeldError as e:
+        _emit_write_lock_held(e, output_format)
+        raise typer.Exit(1) from e
     except SchemaCompatibilityError as e:
         _emit_schema_compatibility_error(e, output_format, operation="pipeline execution")
         raise typer.Exit(1) from None
@@ -2752,6 +2755,68 @@ def _emit_leaderless_run_guidance(db: LandscapeDB, run_id: str) -> None:
         typer.echo(f"Resumability check failed ({type(exc).__name__}: {exc}); probe with: elspeth resume {run_id}")
 
 
+class _RegisteredWorkerDiagnostic(TypedDict):
+    worker_id: str
+    role: str
+    status: str
+    hostname: str | None
+    pid: int | None
+
+
+class _WriteLockHeldEvent(TypedDict):
+    event: Literal["write_lock_held"]
+    run_id: str
+    message: str
+    registered_workers: list[_RegisteredWorkerDiagnostic]
+    lock_owner_identified: Literal[False]
+    guidance: str
+
+
+def _emit_write_lock_held(error: WriteLockHeldError, output_format: str) -> None:
+    """Present registration candidates to the authorized local CLI operator.
+
+    The registry is not lock-owner detection. Generic exception messages and
+    server consumers deliberately omit this local operational roster.
+    """
+    guidance = (
+        "Registration records may be stale and PIDs may be reused; the actual lock holder may not be listed. "
+        "Verify the process identity on the recorded host/container and in its PID namespace before stopping it; "
+        "retry after the lock is released."
+    )
+    if not error.workers:
+        guidance = "No registered worker candidates available; the registry may be empty or unreadable. " + guidance
+    if output_format == "json":
+        payload: _WriteLockHeldEvent = {
+            "event": "write_lock_held",
+            "run_id": error.run_id,
+            "message": str(error),
+            "registered_workers": [
+                {
+                    "worker_id": worker.worker_id,
+                    "role": worker.role,
+                    "status": worker.status,
+                    "hostname": worker.hostname,
+                    "pid": worker.pid,
+                }
+                for worker in error.workers
+            ],
+            "lock_owner_identified": False,
+            "guidance": guidance,
+        }
+        typer.echo(json.dumps(payload), err=True)
+    else:
+        typer.echo(str(error), err=True)
+        if error.workers:
+            typer.echo("Registered worker candidates (not confirmed lock holders):", err=True)
+            for worker in error.workers:
+                typer.echo(
+                    f"  worker={worker.worker_id!r} role={worker.role!r} status={worker.status!r} "
+                    f"hostname={worker.hostname!r} pid={worker.pid!r}",
+                    err=True,
+                )
+        typer.echo(guidance, err=True)
+
+
 def _emit_not_resumable_event(
     error: EmptyResumeStateError | IncompleteSourceResumeError | NonResumableRunError,
     output_format: str,
@@ -2779,16 +2844,14 @@ def _emit_not_resumable_event(
     ``OrchestrationInvariantError`` and would otherwise be swallowed by
     the fatal-traceback path.
 
-    :class:`NonResumableRunError` is the ``resume()`` entry guard's
-    precondition refusal (run status not resumable — e.g. RUNNING). The
-    CLI's ``can_resume`` pre-flight catches the common case with a clean
-    exit 1; the guard raise is only reachable in the race window where the
-    run's status changes between pre-flight and ``--execute``, and it must
-    land on this same operator surface rather than the exit-4
-    framework-bug traceback path.
+    :class:`NonResumableRunError` carries the cause selected by the actual
+    status, checkpoint or leadership admission decision. Advisory checks and
+    enforcing guards share this surface, including a second check that
+    refuses after the first preflight passed. Later hint queries must not
+    replace that observed cause.
     """
     if isinstance(error, NonResumableRunError):
-        reason = "run_status_not_resumable"
+        reason = error.cause.value
         # str(error) already carries the "Cannot resume run ..." prefix;
         # use the bare reason so neither output path doubles it up.
         message = error.reason
@@ -3015,18 +3078,11 @@ def resume(
         check = recovery_manager.can_resume(run_id, validation_graph)
 
         if not check.can_resume:
-            typer.echo(f"Cannot resume run {run_id}: {check.reason}", err=True)
-            # elspeth-5dd23f4df9: this pre-flight is the refusal an operator
-            # actually sees for a leaderless run (the source gate fires here,
-            # before --execute). Name the verb that can finalize it.
-            _echo_leaderless_abandon_hint(run_id, *_leaderless_abandon_hint_or_failure(db, run_id))
-            raise typer.Exit(1)
+            assert check.reason is not None and check.cause is not None
+            raise NonResumableRunError(run_id, check.reason, cause=check.cause)
 
         # Get resume point information
         resume_point = recovery_manager.get_resume_point(run_id, validation_graph)
-        if resume_point is None:
-            typer.echo(f"Error: Could not get resume point for run {run_id}", err=True)
-            raise typer.Exit(1)
 
         # Get count of unprocessed rows
         unprocessed_row_ids = recovery_manager.get_unprocessed_rows(run_id)
@@ -3163,8 +3219,6 @@ def resume(
         )
 
         # Execute resume from persisted rows with the original plugin evidence.
-        from elspeth.contracts.errors import RunWorkerEvictedError
-
         try:
             result = _execute_resume_with_instances(
                 config=settings_config,
@@ -3205,24 +3259,11 @@ def resume(
             _emit_not_resumable_event(e, output_format, db=db)
             raise typer.Exit(1) from e
         except RunWorkerEvictedError as e:
-            if output_format == "json":
-                import json as json_mod_evicted
-
-                typer.echo(
-                    json_mod_evicted.dumps(
-                        {
-                            "event": "evicted",
-                            "run_id": e.run_id,
-                            "worker_id": e.worker_id,
-                            "message": str(e),
-                        }
-                    ),
-                    err=True,
-                )
-            else:
-                typer.echo(f"\nWorker evicted from run {e.run_id}.", err=True)
-                typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+            _emit_worker_evicted_event(e, output_format)
             raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
         except contract_errors.TIER_1_ERRORS as e:
             # Tier 1 violations and framework bugs MUST be clearly distinguishable
             # from config errors — same pattern as the `run` command handler.
@@ -3460,8 +3501,8 @@ def export_resume(
             "run_status": run.status.value if run is not None else None,
             "export_status": (run.export_status.value if run is not None and run.export_status is not None else None),
             "export_error": run.export_error if run is not None else None,
-            "eligible": refusal is None,
-            "reason": refusal,
+            "eligible": refusal.can_resume,
+            "reason": refusal.reason,
         }
 
         if output_format != "json":
@@ -3470,13 +3511,17 @@ def export_resume(
             if export_info["export_error"]:
                 typer.echo(f"Export error: {export_info['export_error']}")
 
-        if refusal is not None:
+        if not refusal.can_resume:
+            assert refusal.cause is not None
             if output_format == "json":
                 import json as json_module
 
-                typer.echo(json_module.dumps(export_info, indent=2))
+                typer.echo(
+                    json_module.dumps({**export_info, "event": "export_resume_refused", "cause": refusal.cause.value}, indent=2),
+                    err=True,
+                )
             else:
-                typer.echo(f"Cannot resume export for run {run_id}: {refusal}", err=True)
+                typer.echo(f"Cannot resume export for run {run_id}: {refusal.reason}", err=True)
             raise typer.Exit(1)
 
         if not execute:
@@ -3526,6 +3571,26 @@ def export_resume(
                 audit_export_content_store_resolver=audit_export_content_store_resolver,
                 worker_id=mint_worker_id(run_id),
             )
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
+        except NonResumableRunError as e:
+            if output_format == "json":
+                typer.echo(
+                    json.dumps(
+                        {
+                            "event": "export_resume_refused",
+                            "run_id": run_id,
+                            "reason": e.reason,
+                            "cause": e.cause.value,
+                            "preflight": export_info,
+                        }
+                    ),
+                    err=True,
+                )
+            else:
+                typer.echo(f"Cannot resume export for run {run_id}: {e.reason}", err=True)
+            raise typer.Exit(1) from e
         except contract_errors.TIER_1_ERRORS:
             raise  # Tier 1 errors must crash with full traceback, not Exit(1)
         except Exception as e:
@@ -3697,8 +3762,14 @@ def abandon(
             "refusal": preflight.refusal,
         }
         if not preflight.admissible:
+            assert preflight.refusal_cause is not None
             if output_format == "json":
-                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": preflight.refusal}), err=True)
+                typer.echo(
+                    json.dumps(
+                        {"event": "abandon_refused", "run_id": run_id, "reason": preflight.refusal, "cause": preflight.refusal_cause.value}
+                    ),
+                    err=True,
+                )
             else:
                 typer.echo(f"\nCannot abandon run {run_id}: {preflight.refusal}", err=True)
             raise typer.Exit(1)
@@ -3731,19 +3802,22 @@ def abandon(
 
         try:
             outcome = abandon_leaderless_run(db, run_id)
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
         except AbandonRefusedError as e:
-            # The state moved between the preflight above and the verb's own
-            # preflight (another operator finalized or resumed it first).
+            # Preserve the verb's second preflight decision, including races
+            # with finalization, disappearance or a newly live leader.
             if output_format == "json":
-                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason}), err=True)
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason, "cause": e.cause.value}), err=True)
             else:
                 typer.echo(f"\nCannot abandon run {run_id}: {e.reason}", err=True)
             raise typer.Exit(1) from e
         except NonResumableRunError as e:
-            # The takeover CAS lost: the seat came back to life after the
-            # preflight read it as dead. Zero mutation (ADR-030 §B.4).
+            # Preserve the enforcing admission's cause without inferring it
+            # from the exception class or querying the seat again.
             if output_format == "json":
-                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason}), err=True)
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason, "cause": e.cause.value}), err=True)
             else:
                 typer.echo(f"\nCannot abandon run {run_id}: {e.reason}", err=True)
             raise typer.Exit(1) from e
@@ -3815,7 +3889,7 @@ def join(
     """
     import traceback
 
-    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunWorkerEvictedError
+    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError
     from elspeth.core.landscape import LandscapeDB
 
     # Settings are REQUIRED — the joiner must produce the same config_hash
@@ -4133,23 +4207,7 @@ def join(
             follower_proc.run(ctx)
         except RunWorkerEvictedError as e:
             try:
-                if output_format == "json":
-                    import json as json_mod
-
-                    typer.echo(
-                        json_mod.dumps(
-                            {
-                                "event": "evicted",
-                                "run_id": run_id,
-                                "worker_id": e.worker_id,
-                                "message": str(e),
-                            }
-                        ),
-                        err=True,
-                    )
-                else:
-                    typer.echo(f"\nFollower evicted from run {run_id}.", err=True)
-                    typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+                _emit_worker_evicted_event(e, output_format)
                 raise typer.Exit(3)
             except BaseException as pending_exc:
                 cleanup_pending_exc = pending_exc

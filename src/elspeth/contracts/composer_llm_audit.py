@@ -93,10 +93,10 @@ class ComposerLLMCall:
     ``cache_creation_input_tokens``, ``cache_read_input_tokens``) capture
     provider-reported prompt-cache statistics. They default to ``None``
     because most providers do not report cache metadata when caching is
-    not active for the call. Per the CLAUDE.md fabrication policy, an
-    absent cache field stays ``None`` rather than coerced to zero — an
-    auditor can then distinguish "no cache reported" from "cache reported
-    zero hits."
+    not active for the call. An absent cache field stays ``None`` rather
+    than coerced to zero: absence is evidence, and a fabricated zero is
+    indistinguishable from a measured one. An auditor can therefore
+    distinguish "no cache reported" from "cache reported zero hits."
 
     ``reasoning_tokens`` and the reasoning artifact fields capture
     provider-reported reasoning metadata from APIs that expose it (for

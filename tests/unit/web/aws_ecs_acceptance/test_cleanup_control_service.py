@@ -13,6 +13,7 @@ import pytest
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web import aws_ecs_acceptance as acceptance
+from elspeth.web._acceptance_common.schema_facts import _CANDIDATE_PACKAGE_VERSION
 from elspeth.web._aws_ecs_acceptance import cleanup, control_service
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 from tests.unit.web.aws_ecs_acceptance.test_evidence_gate_ledger import (
@@ -99,7 +100,7 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
         "candidate_image_digest": "sha256:" + "d" * 64,
         "candidate_task_definition": inventory["values"]["CANDIDATE_TASK_DEFINITION"],
         "candidate_doctor_task_definition": inventory["values"]["DOCTOR_TASK_DEFINITION"],
-        "candidate_package_version": "0.8.1",
+        "candidate_package_version": _CANDIDATE_PACKAGE_VERSION,
         "previous_source_sha": "a" * 40,
         "previous_image_digest": "sha256:" + "b" * 64,
         "previous_task_definition": inventory["values"]["PREVIOUS_TASK_DEFINITION"],
@@ -168,6 +169,7 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
             now=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
         )
     for path, replacement in (
+        (("candidate_package_version",), "0.8.0"),
         (("candidate_doctor_task_definition",), inventory["values"]["CANDIDATE_TASK_DEFINITION"]),
         (("rollback_doctor_task_definition",), inventory["values"]["PREVIOUS_TASK_DEFINITION"]),
         (("previous_source_sha",), "f" * 40),

@@ -108,7 +108,9 @@ class _FakeContract(DeclarationContract):
     violation_class: ClassVar[type[DeclarationContractViolation]] = _FakeViolation
 
     def applies_to(self, plugin: object) -> bool:
-        # Direct attribute access — NOT getattr with default (CLAUDE.md).
+        # Direct attribute access — NOT getattr with default (see
+        # docs/guides/data-trust-and-error-handling.md §The Defensive
+        # Programming Prohibition).
         return isinstance(plugin, _FakePlugin) and plugin.fake_flag
 
     @implements_dispatch_site("post_emission_check")

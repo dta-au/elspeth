@@ -491,8 +491,9 @@ class JWKSTokenValidator:
                 # those classes reaching this catch would therefore be a
                 # bug in the surrounding try block, and suppressing it to
                 # serve stale keys would produce a confident-but-wrong
-                # auth decision (CLAUDE.md's "silent wrong result is worse
-                # than a crash" rule).
+                # auth decision — a silent wrong result is worse than a crash
+                # (docs/guides/data-trust-and-error-handling.md §The Three-Tier
+                # Trust Model).
                 #
                 # The remaining catches preserve the legitimate Tier 3
                 # failure modes that must serve stale cache:

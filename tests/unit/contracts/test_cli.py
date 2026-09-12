@@ -21,8 +21,9 @@ class TestS8ProgressEventFabricationGuard:
 
     The pre-fix dataclass had ``rows_routed_success: int = 0`` and
     ``rows_routed_failure: int = 0`` as default values — explicitly added
-    on 2026-05-03 (commit e8c9fbff4) as a CLAUDE.md-violation repair shim
-    with the docstring stating "engine emitters MUST pass real values".
+    on 2026-05-03 (commit e8c9fbff4) as a repair shim that fabricated a zero
+    for an absent count, with the docstring stating "engine emitters MUST pass
+    real values".
     Removing the defaults completes that migration: the constraint is now
     type-enforced at the producer site rather than relying on emitter
     discipline.

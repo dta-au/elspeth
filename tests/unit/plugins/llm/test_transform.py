@@ -267,12 +267,15 @@ class TestTransformProperties:
 
     def test_runtime_preflight_wraps_provider_failure(self) -> None:
         transform, mock_provider = _make_transform_with_mock_provider()
-        mock_provider.runtime_preflight.side_effect = LLMClientError("401 unauthorized", retryable=False)
+        provider_failure = LLMClientError("401 unauthorized", retryable=False)
+        mock_provider.runtime_preflight.side_effect = provider_failure
         ctx = make_context()
         ctx.operation_id = "op-runtime-preflight"
 
-        with pytest.raises(RuntimePreflightFailedError, match=r"pre_flight_failed.*401 unauthorized"):
+        with pytest.raises(RuntimePreflightFailedError, match=r"pre_flight_failed.*401 unauthorized") as exc_info:
             transform.runtime_preflight(ctx)
+
+        assert exc_info.value.__cause__ is provider_failure
 
 
 # ---------------------------------------------------------------------------

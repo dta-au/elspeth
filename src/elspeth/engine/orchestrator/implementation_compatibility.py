@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 
 from elspeth.contracts import ResumeCheck
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.factory import RecorderFactory
@@ -16,10 +17,18 @@ def compare_implementation_metadata(
 ) -> ResumeCheck:
     """Require the exact registered node set and implementation evidence."""
     if recorded.keys() != current.keys():
-        return ResumeCheck(can_resume=False, reason="Plugin implementation baseline has a different node set")
+        return ResumeCheck(
+            can_resume=False,
+            reason="Plugin implementation baseline has a different node set",
+            cause=ResumeRefusalCause.PLUGIN_IMPLEMENTATION_CHANGED,
+        )
     for node_id, metadata in current.items():
         if recorded[node_id] != metadata:
-            return ResumeCheck(can_resume=False, reason=f"Plugin implementation changed for node {node_id!r}")
+            return ResumeCheck(
+                can_resume=False,
+                reason=f"Plugin implementation changed for node {node_id!r}",
+                cause=ResumeRefusalCause.PLUGIN_IMPLEMENTATION_CHANGED,
+            )
     return ResumeCheck(can_resume=True)
 
 

@@ -125,8 +125,9 @@ def assistance_suggestion_for(
     # Verified method names: get_transform_by_name (manager.py:183) and
     # get_sink_by_name (manager.py:200). Both registries return protocol
     # types; assistance lives on BaseTransform/BaseSink and every in-tree
-    # plugin subclasses one of them, so the casts are sound (per CLAUDE.md
-    # plugin-as-system-code policy).
+    # plugin subclasses one of them, so the casts are sound (per
+    # docs/guides/data-trust-and-error-handling.md §Plugin Ownership: System
+    # Code, Not User Code).
     consumer_assistance = (
         cast(type[BaseSink], manager.get_sink_by_name(matching.consumer_plugin)).get_agent_assistance(issue_code=issue_code)
         if _is_sink_contract(matching)

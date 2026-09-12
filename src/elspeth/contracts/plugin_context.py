@@ -22,6 +22,7 @@ from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.contexts import RateLimitRegistryProtocol
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.node_state_context import AggregationBatchContext
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -166,7 +167,7 @@ class PluginContext:
     # Callback to emit telemetry events for external calls.
     # Always present - when telemetry is disabled, orchestrator sets this to a no-op.
     # Plugins ALWAYS call this after successful Landscape recording - no None checks.
-    telemetry_emit: Callable[[Any], None] = field(default=lambda event: None)
+    telemetry_emit: Callable[[TelemetryEvent], None] = field(default=lambda event: None)
 
     # Validation errors that must later be linked to a persisted quarantine row.
     # Entries are (match_key, error_id), where match_key hashes the raw row payload
@@ -189,7 +190,7 @@ class PluginContext:
         contract: SchemaContract | None = None,
         state_id: str | None = None,
         operation_id: str | None = None,
-        telemetry_emit: Callable[[Any], None] | None = None,
+        telemetry_emit: Callable[[TelemetryEvent], None] | None = None,
         coordination_token: CoordinationToken | None = None,
         member_token: WorkerMembershipToken | None = None,
         work_item: TokenWorkItem | None = None,

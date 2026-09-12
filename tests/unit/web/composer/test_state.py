@@ -5561,8 +5561,9 @@ class TestSchemaContractValidation:
         the producer-probe sites at ``state.py:884`` and ``state.py:1057`` and
         the semantic-validator helpers in ``_semantic_validator.py`` — is
         that the exception MUST propagate so the bug surfaces at composer-time
-        rather than being silently deferred to ``/execute``. Per CLAUDE.md
-        (plugin-as-system-code policy: a plugin method that raises is a bug
+        rather than being silently deferred to ``/execute``. Per
+        docs/guides/data-trust-and-error-handling.md §Plugin Ownership
+        (plugin-as-system-code: a plugin method that raises is a bug
         we MUST know about), Rule C swallowing every exception with a bare
         ``except Exception: continue`` would conceal genuine framework bugs.
 

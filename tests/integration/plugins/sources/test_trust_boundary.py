@@ -11,7 +11,8 @@ types or quarantine it. These tests verify:
 4. The Landscape audit trail records quarantine events
 5. Source output satisfies its schema guarantees
 
-Per CLAUDE.md Three-Tier Trust Model and the Coercion Rules table:
+Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model
+and §Coercion Rules by Plugin Type:
   Source -> allow_coercion=True (normalize external data at ingestion boundary)
 """
 

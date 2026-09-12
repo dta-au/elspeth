@@ -286,7 +286,8 @@ def _read_openrouter_catalog() -> frozenset[str]:
     error via the registered ``missing_dep_hint``.
     """
     # Direct attribute read — no defensive ``.get()`` on data we own
-    # (CLAUDE.md "Defensive Programming: Forbidden"). The lock guards
+    # (docs/guides/data-trust-and-error-handling.md §The Defensive Programming
+    # Prohibition). The lock guards
     # the write side; reads of an immutable ``frozenset`` reference
     # under the GIL are atomic on CPython, but we take the lock anyway
     # because the snapshot read happens once per validate request, not

@@ -805,8 +805,9 @@ class TestCallVerifier:
     def test_verify_hash_match_when_payload_purged(self) -> None:
         """When payload is purged but response_hash exists, hash-based match succeeds.
 
-        P1-2026-02-05: Per CLAUDE.md "Hashes survive payload deletion — integrity
-        is always verifiable." The verifier must compare stable_hash(live_response)
+        P1-2026-02-05: per docs/release/guarantees.md §1.4 Payload Retention,
+        "Hashes survive payload deletion." The verifier must compare
+        stable_hash(live_response)
         against the recorded response_hash even when the full payload is gone.
         """
         recorder = self._create_fake_recorder()

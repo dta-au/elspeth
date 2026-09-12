@@ -13,16 +13,17 @@ to each DCV child, and at loop end:
     * >=2          → wrap in ``AggregateDeclarationContractViolation`` and
                      raise.
 
-Rationale (see ADR-010 §Semantics amendment):
+Rationale (see ADR-010 §Semantics amendment; the ADR's citation is repointed
+here to the live doc):
 
-> ELSPETH's CLAUDE.md "Auditability Standard" makes "I don't know what
-> happened" structurally impermissible for any output. Under fail-fast
-> first-fire semantics, the audit trail's silence on a second contract's
-> evaluation is indistinguishable from "checked and passed" — a Repudiation
-> surface (STRIDE) the auditor cannot resolve. Under audit-complete, every
-> applicable contract's method runs; every violation is recorded; absence
-> in the audit trail means "checked and passed," not "skipped because an
-> earlier contract fired."
+> ELSPETH's auditability principle (ARCHITECTURE.md §Design Principles) makes
+> "I don't know what happened" structurally impermissible for any output.
+> Under fail-fast first-fire semantics, the audit trail's silence on a second
+> contract's evaluation is indistinguishable from "checked and passed" — a
+> Repudiation surface (STRIDE) the auditor cannot resolve. Under
+> audit-complete, every applicable contract's method runs; every violation is
+> recorded; absence in the audit trail means "checked and passed," not
+> "skipped because an earlier contract fired."
 
 Four public dispatch sites (H2 §Fix direction):
 
@@ -46,8 +47,8 @@ Catch scope (see ``_dispatch``):
 
 Non-audit-evidence exceptions (plugin bugs raising arbitrary exceptions
 from ``applies_to`` or the dispatch method) propagate UNMODIFIED per the
-CLAUDE.md plugin-ownership posture — a buggy contract is a framework bug
-that must crash.
+plugin-ownership posture (docs/guides/data-trust-and-error-handling.md
+§Plugin Ownership) — a buggy contract is a framework bug that must crash.
 """
 
 from __future__ import annotations
@@ -78,17 +79,23 @@ def _serialize_plugin_name(plugin: Any) -> str:
     """Return a stable string identifier for the plugin in aggregate messages.
 
     Direct attribute access for ``name`` — a plugin without ``name`` is a
-    framework bug per CLAUDE.md. An empty value is also a framework bug:
+    framework bug (docs/guides/data-trust-and-error-handling.md §Plugin
+    Ownership). An empty value is also a framework bug:
     aggregate audit evidence must not fabricate an identifier from the
     plugin's class name when the authoritative ``plugin.name`` is absent.
     """
     name = plugin.name
+    if not isinstance(name, str):
+        raise FrameworkBugError(
+            f"Aggregate declaration audit evidence requires plugin.name to be a string; "
+            f"got {type(name).__name__} on {type(plugin).__name__}"
+        )
     if not name:
         raise FrameworkBugError(
             f"Aggregate declaration audit evidence requires a non-empty plugin.name; "
             f"refusing to fabricate an identifier for {type(plugin).__name__} from empty plugin.name"
         )
-    return "".join((name,))
+    return name
 
 
 def _violation_message_label(violation: DeclarationContractViolation) -> str:

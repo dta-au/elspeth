@@ -914,7 +914,8 @@ class TestMetricsEndpoint:
         """A third-party collector raising inside generate_latest() must not
         leak a traceback into the response and must not drop the error
         silently. The handler returns a fixed 503 and records *why* via slog
-        (sanctioned telemetry-system-failure logging per CLAUDE.md), carrying
+        (sanctioned telemetry-system-failure logging per the
+        ``logging-telemetry-policy`` skill §Logging Policy), carrying
         a bounded detail that identifies which collector broke.
         """
         client = self._authed_client(tmp_path)

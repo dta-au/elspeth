@@ -110,8 +110,6 @@ class TestValidateRouteDestinations:
             validate_route_destinations(
                 route_resolution_map=route_map,
                 available_sinks=sinks,
-                transform_id_map={},
-                transforms=[],
                 config_gate_id_map=gate_id_map,
                 config_gates=[config_gate],
             )
@@ -121,8 +119,6 @@ class TestValidateRouteDestinations:
         validate_route_destinations(
             route_resolution_map={},
             available_sinks=set(),
-            transform_id_map={},
-            transforms=[],
         )
 
     def test_gate_discard_route_passes_without_matching_sink(self) -> None:
@@ -134,8 +130,6 @@ class TestValidateRouteDestinations:
         validate_route_destinations(
             route_resolution_map=route_map,
             available_sinks={"output"},
-            transform_id_map={},
-            transforms=[],
             config_gate_id_map=gate_id_map,
             config_gates=[config_gate],
         )
@@ -275,7 +269,6 @@ class TestValidatePipelineRouteTargets:
         validate_pipeline_route_targets(
             config=config,
             route_resolution_map={(NodeID("cfg-gate-1"), "true"): RouteDestination.sink(SinkName("output"))},
-            transform_id_map={},
             config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
         )
 
@@ -286,7 +279,6 @@ class TestValidatePipelineRouteTargets:
             validate_pipeline_route_targets(
                 config=config,
                 route_resolution_map={(NodeID("cfg-gate-1"), "true"): RouteDestination.sink(SinkName("missing"))},
-                transform_id_map={},
                 config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
             )
 
@@ -297,7 +289,6 @@ class TestValidatePipelineRouteTargets:
             validate_pipeline_route_targets(
                 config=config,
                 route_resolution_map={},
-                transform_id_map={},
                 config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
             )
 
@@ -308,7 +299,6 @@ class TestValidatePipelineRouteTargets:
             validate_pipeline_route_targets(
                 config=config,
                 route_resolution_map={},
-                transform_id_map={},
                 config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
             )
 
@@ -324,7 +314,6 @@ class TestValidatePipelineRouteTargets:
             validate_pipeline_route_targets(
                 config=config,
                 route_resolution_map={},
-                transform_id_map={},
                 config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
             )
 
@@ -337,7 +326,6 @@ class TestValidatePipelineRouteTargets:
         validate_pipeline_route_targets(
             config=config,
             route_resolution_map={},
-            transform_id_map={},
             config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
         )
 
@@ -349,7 +337,6 @@ class TestValidatePipelineRouteTargets:
         validate_pipeline_route_targets(
             config=config,
             route_resolution_map={},
-            transform_id_map={},
             config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
         )
 
@@ -360,6 +347,5 @@ class TestValidatePipelineRouteTargets:
             validate_pipeline_route_targets(
                 config=config,
                 route_resolution_map={},
-                transform_id_map={},
                 config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
             )

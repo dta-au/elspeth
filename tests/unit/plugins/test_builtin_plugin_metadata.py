@@ -1,6 +1,7 @@
 """Tests ensuring all built-in plugins have proper metadata for audit trail.
 
-Per CLAUDE.md auditability standard: every decision must be traceable to source
+Per the auditability principle (ARCHITECTURE.md §Design Principles): every
+decision must be traceable to source
 data, configuration, AND code version. The plugin_version attribute is critical
 for reproducibility - it ties audit records to specific plugin implementations.
 

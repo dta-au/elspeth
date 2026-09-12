@@ -24,6 +24,8 @@ from collections.abc import Callable
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol
 
+from elspeth.contracts.events import TelemetryEvent
+
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
     from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -99,7 +101,7 @@ class SourceContext(Protocol):
     def landscape(self) -> PluginAuditWriter | None: ...
 
     @property
-    def telemetry_emit(self) -> Callable[[Any], None]: ...
+    def telemetry_emit(self) -> Callable[[TelemetryEvent], None]: ...
 
     @property
     def shutdown_event(self) -> threading.Event | None: ...
@@ -261,7 +263,7 @@ class LifecycleContext(Protocol):
     def rate_limit_registry(self) -> RateLimitRegistryProtocol | None: ...
 
     @property
-    def telemetry_emit(self) -> Callable[[Any], None]: ...
+    def telemetry_emit(self) -> Callable[[TelemetryEvent], None]: ...
 
     @property
     def concurrency_config(self) -> RuntimeConcurrencyConfig | None: ...

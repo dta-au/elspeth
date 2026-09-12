@@ -1435,14 +1435,14 @@ export interface InlineSourceSummary {
    * SHA-256 of the raw inline content (from session blob metadata).
    *
    * NON-NULLABLE BY CONTRACT. Every persisted blob carries a hash — that's
-   * a Tier-1 audit-trail invariant on our data (CLAUDE.md "Auditability
-   * Standard": hashes survive payload deletion, integrity is always
-   * verifiable). The inline-source projection MUST throw, not
+   * a Tier-1 audit-trail invariant on our data (ARCHITECTURE.md §Design
+   * Principles — auditability: hashes survive payload deletion, integrity
+   * is always verifiable). The inline-source projection MUST throw, not
    * coerce, when the wire returns a null or empty hash: silently
    * substituting an empty string into the rendered audit-info pane
-   * gives an auditor a value the system never asserted, which is exactly
-   * the fabrication CLAUDE.md forbids. The throw lives in
-   * `projectInlineSourceSummary` — keep it there.
+   * gives an auditor a value the system never asserted — absence is
+   * evidence, and a fabricated hash is indistinguishable from a real one.
+   * The throw lives in `projectInlineSourceSummary` — keep it there.
    */
   contentHash: string;
   /**

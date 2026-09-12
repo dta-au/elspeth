@@ -7956,8 +7956,8 @@ describe("ChatPanel inline-source projection", () => {
   // The projection effect throws on this case; the throw is caught and
   // logged; the inlineSourceStore is NEVER populated; the widget does
   // NOT render.  Substituting an empty string into the rendered audit
-  // pane would assert a value the system never recorded — exactly the
-  // fabrication CLAUDE.md forbids.
+  // pane would assert a value the system never recorded: absence is
+  // evidence, and a fabricated hash is indistinguishable from a real one.
   it("does NOT render the widget when the blob's content_hash is null (audit-trail invariant)", async () => {
     (apiClient.getBlobMetadata as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...makeBlobMetadata(),

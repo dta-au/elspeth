@@ -68,7 +68,10 @@ ELSPETH pipelines process rows through a DAG of transforms (sources → transfor
 - Every external call (request hash, response hash, latency)
 - Every token's terminal outcome
 
-**Auditability requirements (CLAUDE.md):**
+**Auditability requirements, as worded in CLAUDE.md at the time of this decision.**
+The live homes are ARCHITECTURE.md §Design Principles (auditability) and
+docs/contracts/system-operations.md §Complete Token State Diagram (which states
+the invariant over *tokens* rather than rows):
 
 > "I don't know what happened" is never an acceptable answer for any output
 
@@ -335,6 +338,16 @@ class TransformActor:
      - Don't introduce row-level parallelism within orchestrator
 
 ### Implementation Status
+
+**Historical snapshot (fence recorded 2026-09-11).** The checklist below is
+the status this ADR carried when it entered the repository, in commit
+`f4f348de1` (2026-02-02); the decision itself is dated 2026-01-22. No test id,
+command or other instrument was recorded behind any "(verified)" mark, and
+none has been re-derived since; read the marks as the author's contemporaneous
+assessment, not as a current measurement. The outstanding documentation item is likewise
+left as it stands: ARCHITECTURE.md's "Documented ADRs" table now carries an
+ADR-001 row, and whether a table row discharges a request for a section is
+not adjudicated here. No mark below has been changed.
 
 - ✅ Orchestrator is single-threaded (verified)
 - ✅ `PooledExecutor` in LLM plugins uses thread pool (verified)

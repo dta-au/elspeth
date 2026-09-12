@@ -173,6 +173,24 @@ Preserve `data/auth.db` and follow the
 including account re-admission. Do not roll older code back over recreated
 databases.
 
+- **Coordination deadlines come from fresh post-lock database time.** Lease
+  deadlines are issued after locked admission instead of from a clock read
+  before the lock, and sink-effect clocks are sampled after their lease locks,
+  so two workers cannot disagree about when a lease expired.
+- **A contended PostgreSQL heartbeat is degraded liveness, not a failed run.**
+  The lock timeout is classified and retried rather than failing closed.
+- **Failures survive transaction unwind.** An invalidated Landscape
+  transaction reports the error that caused it, not the rollback's own error.
+- **Blob custody stays fenced across durable effects and recovery**, and
+  custody walkers reject null canonical sections instead of reading them as
+  empty.
+- **SSO hardening.** Dormancy is enforced on bound identities, bound profiles
+  refresh, database work moves off the request path, and response streams
+  carry size caps.
+- **Azure Container Apps.** Schema credentials are isolated from the
+  application identity, revision secret bindings survive new revisions, and
+  Key Vault write authority is confirmed before SQL bootstrap.
+
 ## What changed in 0.8.0
 
 0.8.0 hardens the production paths introduced in 0.7.1 across deployment,

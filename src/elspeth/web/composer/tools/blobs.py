@@ -1024,7 +1024,7 @@ def _prepare_blob_create(
     re-raised by the caller as :class:`ToolArgumentError` before this
     helper is invoked.  They are removed in the same commit that promotes
     ``set_pipeline`` so the dead-code surface does not linger past the
-    wave that makes it dead (CLAUDE.md "No Legacy Code Policy").
+    wave that makes it dead (CONTRIBUTING.md §Code Standards).
 
     Semantic checks below this point (MIME allowlist, filename
     sanitisation, UTF-8 encodability) ARE NOT type checks — they enforce
@@ -1038,8 +1038,8 @@ def _prepare_blob_create(
     the three LLM-authored modalities require all five.  The DB-side
     CHECK ``ck_blobs_creating_llm_provenance_nullability`` rejects any
     other combination.  We do not duplicate the biconditional in Python
-    — the constraint IS the validation, per the offensive-programming
-    discipline in CLAUDE.md ("The CHECK constraint is the validation").
+    — the constraint IS the validation, per the engine-patterns-reference
+    skill §Offensive Programming Examples.
     """
     filename = arguments["filename"]
     mime_type = arguments["mime_type"]

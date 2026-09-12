@@ -2937,6 +2937,8 @@ def test_checkpoint_terminal_refusal_rejects_non_exact_error_subclass(
     class DerivedNonResumableRunError(NonResumableRunError):
         pass
 
+    from elspeth.contracts.checkpoint import ResumeRefusalCause
+
     scenario, case = _declared_case("checkpoint-deterministic-resume", "reopen-resume")
     production_resume = inspect.unwrap(Orchestrator.resume)
     resume_calls = 0
@@ -2949,6 +2951,7 @@ def test_checkpoint_terminal_refusal_rejects_non_exact_error_subclass(
         raise DerivedNonResumableRunError(
             resume_point.checkpoint.run_id,
             "Run is terminal (status 'completed'); successful terminal runs are immutable",
+            cause=ResumeRefusalCause.RUN_TERMINAL,
         )
 
     monkeypatch.setattr(Orchestrator, "run", inspect.unwrap(Orchestrator.run))

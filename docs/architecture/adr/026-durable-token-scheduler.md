@@ -82,8 +82,9 @@ discharges that obligation.
   Persistence boundary; takes a SQLAlchemy `Engine`; every method is
   CAS-aware.
 - **Worker loop:** `_drain_scheduler_claims` in `engine/processor.py`
-  around lines 2820-3015. Per CLAUDE.md tier discipline, this is L2
-  engine code consuming an L1 repository.
+  around lines 2820-3015. Per the layer model
+  (`engine-patterns-reference` skill §Layer Architecture & Dependency
+  Analysis), this is L2 engine code consuming an L1 repository.
 - **Contracts:** `TokenWorkItem` (frozen dataclass) and
   `TokenWorkStatus` (StrEnum) at `src/elspeth/contracts/scheduler.py`.
 
@@ -242,8 +243,9 @@ it.
    of anchor>}` (see `_scrubbed_row_payload_json`,
    `scheduler_repository.py:999-1002`). The audit trail retains the
    payload's identity via the hash; the bulk content moves to the
-   payload store with its own retention policy. This is consistent
-   with the payload-store separation principle in CLAUDE.md.
+   payload store with its own retention policy. This is the guarantee
+   in docs/release/guarantees.md §1.4 Payload Retention: "Hashes
+   survive payload deletion."
 
 10. **The scheduler primitive is multi-worker-sound by
     construction; whether RC6 actually ships N>1 workers is a
@@ -315,7 +317,9 @@ it.
   function on the present branch survives only for tests and is
   marked for deletion (G7 / elspeth-b680e81bce). The production
   code path is the scheduler; the in-memory path violates *never
-  bypass production code paths in tests* (CLAUDE.md).
+  bypass production code paths in tests* (CONTRIBUTING.md §Code
+  Standards: "Test through production code paths"; worked examples in
+  the `engine-patterns-reference` skill §Test Path Integrity).
 
 ## Consequences
 
@@ -1059,11 +1063,12 @@ for the move.
 
 ### Project policy
 
-- `CLAUDE.md` — *Auditability Standard*, *Three-Tier Trust
-  Model* (Tier 1 audit-trail crash discipline that the
-  `AuditIntegrityError` paths embody), *No Legacy Code
-  Policy* (the `_drain_in_memory_work_queue` cleanup
-  precondition).
+- `ARCHITECTURE.md` §Design Principles — the auditability standard.
+- `docs/guides/data-trust-and-error-handling.md` §The Three-Tier
+  Trust Model — Tier 1 audit-trail crash discipline that the
+  `AuditIntegrityError` paths embody.
+- `CONTRIBUTING.md` §Code Standards — *No Legacy Code Policy* (the
+  `_drain_in_memory_work_queue` cleanup precondition).
 - ADR-030 and ADR-041 — historical SQLite profile and current supported
   state-engine profiles.
 - `docs/reference/configuration.md` — pre-1.0 Landscape schema policy.

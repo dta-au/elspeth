@@ -965,8 +965,9 @@ class TestOrchestratorEmptyPipeline:
         orchestrator = Orchestrator(landscape_db)
         run_result = orchestrator.run(config, graph=build_production_graph(config), payload_store=payload_store)
 
-        # All rows fail source validation and are quarantined. Per
-        # CLAUDE.md Tier-3 data manifesto, quarantine is a clean terminal
+        # All rows fail source validation and are quarantined. Per the three-tier
+        # trust model (docs/guides/data-trust-and-error-handling.md §The Three-Tier
+        # Trust Model), Tier-3 quarantine is a clean terminal
         # outcome — the pipeline made a deliberate classification on every
         # row. With ``terminal_clean_indicator`` satisfied via quarantine
         # and no uncaught ``failure_indicator``, the predicate returns

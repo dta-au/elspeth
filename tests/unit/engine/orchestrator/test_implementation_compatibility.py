@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.types import NodeID
 from elspeth.engine.orchestrator.implementation_compatibility import compare_implementation_metadata
 from elspeth.engine.orchestrator.landscape_registration import NodeAuditMetadata
@@ -19,4 +20,13 @@ def test_changed_implementation_refuses_same_graph() -> None:
     metadata = NodeAuditMetadata(plugin_version=source.plugin_version, determinism=source.determinism, source_file_hash="a" * 64)
     check = compare_implementation_metadata({NodeID("source"): metadata}, {NodeID("source"): replace(metadata, source_file_hash="b" * 64)})
     assert not check.can_resume
+    assert check.cause is ResumeRefusalCause.PLUGIN_IMPLEMENTATION_CHANGED
     assert "implementation" in check.reason
+
+
+def test_missing_implementation_baseline_has_distinct_refusal_cause() -> None:
+    source = ListSource([])
+    metadata = NodeAuditMetadata(plugin_version=source.plugin_version, determinism=source.determinism, source_file_hash="a" * 64)
+    check = compare_implementation_metadata({}, {NodeID("source"): metadata})
+    assert not check.can_resume
+    assert check.cause is ResumeRefusalCause.PLUGIN_IMPLEMENTATION_CHANGED

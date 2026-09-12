@@ -300,8 +300,8 @@ class TestRecorderFactoryTokens:
     def test_fork_token_rejects_empty_branches(self) -> None:
         """fork_token must have at least one branch (defense-in-depth).
 
-        Per CLAUDE.md "no silent drops" invariant, empty forks would cause
-        tokens to disappear without audit trail. Even if RoutingAction validates
+        Per docs/release/guarantees.md §1.2 No Silent Drops, empty forks would
+        cause tokens to disappear without an audit trail. Even if RoutingAction validates
         upstream, recorder MUST also validate as defense-in-depth.
         """
         db = LandscapeDB.in_memory()

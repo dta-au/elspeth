@@ -51,7 +51,8 @@ def find_aggregation_transform(
         Tuple of (transform, aggregation_node_id)
 
     Raises:
-        RuntimeError: If no batch-aware transform found for the aggregation
+        OrchestrationInvariantError: If no batch-aware transform is found for
+            the aggregation.
     """
     agg_transform: TransformProtocol | None = None
     agg_node_id = NodeID(agg_node_id_str)
@@ -224,8 +225,9 @@ def flush_remaining_aggregation_buffers(
         quarantined, coalesced, forked, expanded, buffered rows and routed_destinations
 
     Raises:
-        RuntimeError: If no batch-aware transform found for an aggregation
-                     (indicates bug in graph construction or pipeline config)
+        OrchestrationInvariantError: If no batch-aware transform is found for
+            an aggregation (indicates a bug in graph construction or pipeline
+            configuration).
     """
     counters = ExecutionCounters()
 

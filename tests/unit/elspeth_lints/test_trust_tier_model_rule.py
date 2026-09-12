@@ -2676,8 +2676,9 @@ class TestBannedRuleKeyValidation:
 
     Plan A Task 7: governance moved out of ``_parse_allow_hits`` (now in core)
     and into ``_validate_allowlist_governance``. The previous ``sys.exit(1)`` +
-    stderr-print pattern was replaced with ``ValueError`` per CLAUDE.md
-    audit-primacy order. Tests now exercise the validator directly.
+    stderr-print pattern was replaced with ``ValueError`` per the audit-primacy
+    order (``logging-telemetry-policy`` skill §Logging Policy). Tests now
+    exercise the validator directly.
     """
 
     def test_valid_banned_rule_in_allow_hits_rejected(self) -> None:
@@ -3281,7 +3282,7 @@ class TestCoreAllowlistConsolidation:
         assert "_load_yaml_file" not in vars(r), "duplicate yaml loader must be removed"
 
     def test_governance_validator_raises_valueerror_on_banned_rule(self) -> None:
-        """sys.exit(1) was replaced with ValueError per CLAUDE.md audit-primacy."""
+        """sys.exit(1) became ValueError per audit primacy (logging-telemetry-policy skill §Logging Policy)."""
         # Pick a banned rule from the live registry rather than hard-coding "R3"
         import re as _re
 
