@@ -7,6 +7,7 @@ Target: `release/0.8.1`. This report is in progress, not a release-readiness cer
 - Original batch: `7379e1572b426ad0d9727186e2a6f37fcdaf59f9`.
 - Reviewed heartbeat/CLI and regression repairs: `e064ecd52ad04608bc4a3402af7c826b78b7f40f`.
 - Release synchronization into the task branch: `0966eda0f17c78e97aff0c9ec2265baf0f8dae67`.
+- DAG version-oracle correction: `e19a1a23cce65bca5a59104fb94f81d8b48cfa7f`.
 - Release integration and structural remediation: pending.
 
 The original four unstaged heartbeat/error files were preserved and reviewed.
@@ -87,6 +88,13 @@ was not literally a test of only its own mock assignment.
 | Baseline default whole-tree suite | Exit 1; 21 failed, 50,657 passed, 87 skipped, two xfailed. |
 | Baseline PostgreSQL stage | Deliberately interrupted; exit 143, not verified. |
 | Baseline freeze check | Frozen=yes; overall RESULT=FAIL. |
+| Release-synced DAG suite | Exit 0; 661 passed, two existing retirement-comparator skips. |
+| Whole-tree default suite at `e19a1a23c` | Exit 1; 10 failed, 50,499 passed, 87 skipped, two xfailed. |
+| Release plugin-hash failure reproduction | Exit 1; exact failing test reproduces both stale declarations. |
+| Repaired plugin-contract module | Exit 0; 29 passed. |
+| Combined gate-repair focused selection | Exit 0; 334 passed. |
+| Isolated acceptance and release-version selection | Exit 0; 313 passed after restoration. |
+| Remove acceptance candidate-version checks | Exit 1; four rejection assertions fail. |
 
 These are separate runs, not additive counts. Five failures under each original
 heartbeat reason mutation were all heartbeat tests, not contract tests as the
@@ -110,6 +118,29 @@ case-registry digest exactly. The isolated correction passes the 17 original
 failed DAG nodes plus registry checks (23 tests, exit 0). No frozen-oracle
 writer was used.
 
+The next whole-tree run exposed release-inherited gate drift: one test rejects
+stale JSONSource and ChromaSink source hashes after release comment edits;
+nine AWS/Azure acceptance tests use compatibility fixtures still bound to
+`0.8.0`. Repairs are being verified in a separate task worktree while the
+`e19a1a23c` PostgreSQL stage keeps its inputs frozen. The source changes are
+exactly two hash literals computed by the existing canonical hash function,
+not signature changes. Positive fixtures use the current package authority;
+explicit stale-version rejection controls preserve independent negative
+coverage. Production acceptance validators are unchanged.
+
+The exact additional gate-repair paths are:
+
+- `src/elspeth/plugins/sources/json_source.py`
+- `src/elspeth/plugins/sinks/chroma_sink.py`
+- `tests/unit/web/aws_ecs_acceptance/test_cleanup_control_service.py`
+- `tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py`
+- `tests/unit/web/azure_container_apps_acceptance/test_facade_contract.py`
+- `tests/unit/web/azure_container_apps_acceptance/test_receipt_contracts.py`
+- `docs/runbooks/azure-container-apps-deployment.md`
+
+This report is also updated. Final repaired-candidate gates and release
+integration are still pending.
+
 ## Structural remediation remaining
 
 | Site | Current assessment and required work |
@@ -120,11 +151,21 @@ writer was used.
 | `NonResumableRunError` | Historical byte-identical JSON claim is false: free-text reasons differ. A stable machine-readable cause is still missing. |
 | General exception-field guard | Implement controlled discovery plus executable consumer/exclusion contracts; printing every field or finding lexical reads is insufficient. |
 
-Related leads include Dataverse's uncounted locked-contract rejection, RAG's
-raw-dictionary telemetry emission, and provider preflight status loss. Their
-production consumers must be reproduced before treating synthetic serializer
-examples as confirmed end-to-end defects. Older decisions may be revisited on
-current evidence; privacy and explicit safety constraints still apply.
+Real MCP checkout tests now reproduce three identical refusal messages for
+different active-checkout states, with class-only audit errors. Real telemetry
+manager/exporter tests reproduce raw-dictionary failures from both RAG and
+Chroma. These repairs remain pending. Dataverse also misses a locked-contract
+rejection in its counters.
+
+Provider preflight HTTP status is retained in audited child calls and safe
+operation text, but omitted from typed MCP operation-call details. This is a
+missing projection, not total audit-evidence loss; expanding generic operation
+payload access is unnecessary. The raw commencement-gate context snapshot is
+an evidenced privacy exclusion, not a proven production consumer: an actual
+CLI negative-disclosure test passes and its disclosure control fails. The
+exception needs a local explanatory note and maintained consumer coverage.
+Older decisions may be revisited on current evidence; privacy and explicit
+safety constraints still apply.
 
 ## Gate limitations and custody
 
@@ -136,7 +177,10 @@ binding diagnosis, not HMAC verification. No signatures were changed or staged.
 The explicit plugin-name type rejection adds an R5 lint finding. It preserves
 the old implicit string rejection while making invalid owned audit identity
 informative. Keep it ready for narrow adjudication; do not label owned data as
-Tier 3 or distort code to evade the lint. Final drift comparison is pending.
+Tier 3 or distort code to evade the lint. At `e19a1a23c`, a controlled normalized
+multiset comparison found only that additional finding versus release
+(1,849 versus 1,848); selected signed-entry diagnoses remained identical.
+The gate-repair candidate requires a fresh comparison after its hash repairs.
 
 The attempted code-map refresh failed at its entity-count cap and published no
 usable index. Current Git and direct source inspection were used instead.

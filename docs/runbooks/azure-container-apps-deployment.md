@@ -478,7 +478,7 @@ parity test feeds one corpus through both).
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_revision_sha256": "64-lowercase-hex",
   "candidate_doctor_job_sha256": "64-lowercase-hex",
-  "candidate_package_version": "0.8.0",
+  "candidate_package_version": "0.8.1",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_revision_sha256": "",
