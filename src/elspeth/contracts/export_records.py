@@ -10,6 +10,56 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 
 
+class AuditExportPublicConfig(TypedDict):
+    auth_events: Literal["omitted", "deployment_snapshot"]
+    chunking_algorithm_version: str
+    export_format: str
+    exporter_version: str
+    include_raw_error_rows: bool
+    per_chunk_byte_limit: int
+    per_chunk_record_limit: int
+    serialization_version: str
+    signer_key_id: str
+    signing_mode: Literal["unsigned", "hmac_sha256"]
+
+
+class AuditExportConfigRecord(TypedDict):
+    """Signed public shaping configuration, independently bound to the registry."""
+
+    record_type: Literal["audit_export_config"]
+    public_config: AuditExportPublicConfig
+
+
+class AuthEventCoverageExportRecord(TypedDict):
+    """Signed selection declaration; omission is never an empty history."""
+
+    record_type: Literal["auth_event_coverage"]
+    policy: Literal["omitted", "deployment_snapshot"]
+    selection_cutoff: str | None
+    selection_basis: Literal["visible_rows_at_or_before_run_completion"] | None
+    selected_count: int | None
+    reason: Literal["not_requested", "deployment_snapshot"]
+
+
+class AuthEventExportRecord(TypedDict):
+    """Stored auth evidence without reconstructing missing historical identity."""
+
+    record_type: Literal["auth_event"]
+    event_id: str
+    occurred_at: str
+    event_type: str
+    outcome: str
+    provider: str
+    user_id: str | None
+    username: str | None
+    failure_category: str | None
+    request_id: str | None
+    client_host: str | None
+    user_agent: str | None
+    identity_id: str | None
+    metadata: dict[str, Any]
+
+
 class RunExportRecord(TypedDict):
     record_type: Literal["run"]
     run_id: str
@@ -163,6 +213,10 @@ class CallExportRecord(TypedDict):
     request_hash: str | None
     response_hash: str | None
     resolved_prompt_template_hash: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    cached_prompt_tokens: int | None
+    reasoning_tokens: int | None
     latency_ms: float | None
     request_ref: str | None
     response_ref: str | None
@@ -452,6 +506,9 @@ class SinkEffectAttemptExportRecord(TypedDict):
 
 ExportRecord = (
     RunExportRecord
+    | AuditExportConfigRecord
+    | AuthEventExportRecord
+    | AuthEventCoverageExportRecord
     | WebPluginPolicyExportRecord
     | SecretResolutionExportRecord
     | NodeExportRecord

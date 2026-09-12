@@ -62,6 +62,7 @@ from elspeth.web.sessions.service import (
     _value_references_parent_blob,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 from tests.unit.web.sessions.test_fork import _complete_guided_start_authority, _make_fork_app
@@ -75,6 +76,8 @@ def engine():
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return engine
 
 
@@ -99,6 +102,8 @@ def durable_engine(request: pytest.FixtureRequest, tmp_path: Path):
     else:
         race_engine = create_session_engine(f"sqlite:///{tmp_path / 'fork-races.db'}")
     initialize_session_schema(race_engine)
+    with race_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     try:
         yield race_engine
     finally:

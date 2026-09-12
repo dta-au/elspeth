@@ -1590,7 +1590,8 @@ class LandscapeExportSettings(BaseModel):
     signer_key_id: str = "UNSIGNED"
     signing_secret_ref: str | None = None
     signer_rotation_policy: Literal["multi_version", "single_export"] = "multi_version"
-    exporter_version: str = Field(default="landscape-exporter-v1", min_length=1, max_length=64)
+    exporter_version: Literal["landscape-exporter-auth-v1"] = "landscape-exporter-auth-v1"
+    auth_events: Literal["omitted", "deployment_snapshot"] = "omitted"
     serialization_version: str = Field(default="audit-export-v2", min_length=1, max_length=64)
     chunking_algorithm_version: str = Field(default="record-framing-v1", min_length=1, max_length=64)
     include_raw_error_rows: bool = False
@@ -1685,7 +1686,7 @@ class LandscapeExportSettings(BaseModel):
         """Return exactly the target-independent snapshot-shaping fields."""
         if self.per_chunk_byte_limit is None or self.per_chunk_record_limit is None:
             raise ValueError("audit export chunk limits are not configured")
-        return {
+        public_config = {
             "chunking_algorithm_version": self.chunking_algorithm_version,
             "export_format": self.format,
             "exporter_version": self.exporter_version,
@@ -1696,6 +1697,8 @@ class LandscapeExportSettings(BaseModel):
             "signer_key_id": self.signer_key_id,
             "signing_mode": self.signing_mode,
         }
+        public_config["auth_events"] = self.auth_events
+        return public_config
 
     def assert_signer_rotation_allowed(self, *, existing_signer_key_id: str) -> None:
         validate_credential_free_identifier(existing_signer_key_id, "existing_signer_key_id")

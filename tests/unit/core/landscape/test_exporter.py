@@ -829,7 +829,30 @@ class TestConstructor:
                 "auth_provider_type": None,
                 "settings": {"key": "value"},
                 "reproducibility_grade": "full_reproducible",
-            }
+            },
+            {
+                "record_type": "audit_export_config",
+                "public_config": {
+                    "auth_events": "omitted",
+                    "chunking_algorithm_version": "record-framing-v1",
+                    "export_format": "json",
+                    "exporter_version": "landscape-exporter-auth-v1",
+                    "include_raw_error_rows": False,
+                    "per_chunk_byte_limit": 64 * 1024 * 1024,
+                    "per_chunk_record_limit": 1_000_000,
+                    "serialization_version": "audit-export-v2",
+                    "signer_key_id": "UNSIGNED",
+                    "signing_mode": "unsigned",
+                },
+            },
+            {
+                "record_type": "auth_event_coverage",
+                "policy": "omitted",
+                "selection_cutoff": None,
+                "selection_basis": None,
+                "selected_count": None,
+                "reason": "not_requested",
+            },
         ]
 
     def test_rejects_non_positive_row_batch_size(self) -> None:
@@ -886,10 +909,10 @@ class TestExportRunUnsigned:
         with pytest.raises(ValueError, match="Run not found"):
             list(exporter.export_run("unknown-run"))
 
-    def test_empty_run_yields_run_record_only(self) -> None:
+    def test_empty_run_yields_run_record_and_coverage(self) -> None:
         exporter = _make_exporter()
         records = list(exporter.export_run("run-1"))
-        assert len(records) == 2
+        assert len(records) == 4
         assert records[0]["record_type"] == "run"
         assert records[0]["run_id"] == "run-1"
         assert records[0]["status"] == "completed"
@@ -932,8 +955,13 @@ class TestExportRunUnsigned:
 
         records = list(exporter.export_run("run-1"))
 
-        assert [record["record_type"] for record in records[:2]] == ["run", "web_plugin_policy"]
-        assert records[1] == {
+        assert [record["record_type"] for record in records[:4]] == [
+            "run",
+            "audit_export_config",
+            "auth_event_coverage",
+            "web_plugin_policy",
+        ]
+        assert records[3] == {
             "record_type": "web_plugin_policy",
             "run_id": "run-1",
             "schema_version": 1,
@@ -1019,7 +1047,7 @@ class TestExportRunSigned:
         manifest = records[-1]
         assert manifest["record_type"] == "manifest"
         assert manifest["run_id"] == "run-1"
-        assert manifest["record_count"] == 1  # Just the run record
+        assert manifest["record_count"] == 3  # Run, public config, explicit auth coverage
         assert manifest["hash_algorithm"] == "sha256"
         assert manifest["signature_algorithm"] == "hmac_sha256"
         assert manifest["schema"] == "elspeth.audit-export-manifest.v2"
@@ -1034,8 +1062,8 @@ class TestExportRunSigned:
         )
         records = list(exporter.export_run("run-1", sign=True))
         manifest = records[-1]
-        # run + node + edge = 3
-        assert manifest["record_count"] == 3
+        # run + public config + auth coverage + node + edge = 5
+        assert manifest["record_count"] == 5
 
 
 # ===========================================================================
@@ -1936,6 +1964,8 @@ class TestSparseLookupMemory:
 
         assert [record["record_type"] for record in records] == [
             "run",
+            "audit_export_config",
+            "auth_event_coverage",
             "operation",
             "row",
             "token",
@@ -2189,7 +2219,7 @@ class TestExportRunGrouped:
         )
         groups = exporter.export_run_grouped("run-1", sign=True)
 
-        assert groups["manifest"][0]["record_count"] == 3
+        assert groups["manifest"][0]["record_count"] == 5
         assert "signature" in groups["validation_error"][0]
         assert "signature" in groups["transform_error"][0]
 
@@ -2395,6 +2425,8 @@ class TestFullPipelineExport:
 
         assert type_counts == {
             "run": 1,
+            "audit_export_config": 1,
+            "auth_event_coverage": 1,
             "secret_resolution": 1,
             "node": 1,
             "edge": 1,

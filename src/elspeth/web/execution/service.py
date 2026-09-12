@@ -2154,6 +2154,10 @@ class ExecutionServiceImpl:
                 purpose=SinkEffectExecutionPurpose.FRESH,
             )
             export_settings = validate_landscape_export_settings_from_raw_config(raw_eligibility_config)
+            # Session download authority does not grant access to deployment-wide
+            # authentication history, including for restored or operator-authored runs.
+            if export_settings.auth_events == "deployment_snapshot":
+                raise ValueError("landscape.export.auth_events=deployment_snapshot is not permitted in Web execution")
             if export_settings.enabled:
                 validate_sink_effect_eligibility_from_raw_config(
                     raw_eligibility_config,

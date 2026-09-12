@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import IdentityRowCorruptionError
@@ -39,7 +40,7 @@ def engine():
 
 @pytest.fixture
 def authority(engine) -> RepositoryIdentityAuthority:
-    return RepositoryIdentityAuthority(engine)
+    return RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
 
 def _noop(_identity_id: str, _username: str, _quota_written: bool) -> None:

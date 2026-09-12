@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from sqlalchemy import (
     DDL,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -2086,6 +2087,16 @@ calls_table = Table(
     # the session service (write at resolve time) and the runtime plugin (write
     # at execution time), so the hashes are comparable byte-for-byte.
     Column("resolved_prompt_template_hash", String(64), nullable=True),
+    # Missing provider usage is unknown, never zero. Provider-specific totals
+    # and Anthropic cache measures remain in the retained response payload.
+    Column("prompt_tokens", BigInteger, nullable=True),
+    Column("completion_tokens", BigInteger, nullable=True),
+    Column("cached_prompt_tokens", BigInteger, nullable=True),
+    Column("reasoning_tokens", BigInteger, nullable=True),
+    CheckConstraint("prompt_tokens >= 0", name="calls_prompt_tokens_nonnegative"),
+    CheckConstraint("completion_tokens >= 0", name="calls_completion_tokens_nonnegative"),
+    CheckConstraint("cached_prompt_tokens >= 0", name="calls_cached_prompt_tokens_nonnegative"),
+    CheckConstraint("reasoning_tokens >= 0", name="calls_reasoning_tokens_nonnegative"),
     Column("error_json", Text),
     Column("latency_ms", Float),
     Column("created_at", DateTime(timezone=True), nullable=False),

@@ -16,6 +16,7 @@ from elspeth.contracts.call_data import HTTPCallRequest, HTTPCallResponse
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from tests.fixtures.mock_audit import mock_audit_authority
 
@@ -55,6 +56,7 @@ class _RecordingExecution:
         resolved_prompt_template_hash: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> _RecordedCall:
         kwargs = {
             "state_id": state_id,
@@ -91,6 +93,7 @@ class _RecordingExecution:
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
         coordination_token: CoordinationToken,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> _RecordedCall:
         return _RecordedCall()
 

@@ -23,6 +23,7 @@ from elspeth.contracts.call_data import CallPayload, HTTPCallError, HTTPCallRequ
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.canonical import stable_hash
 from elspeth.core.security.web import (
     SSRFSafeRequest,
@@ -202,6 +203,7 @@ class AuditedHTTPClient(AuditedClientBase):
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Sanitize HTTP error URLs at the shared audit persistence boundary."""
         if isinstance(error, HTTPCallError):
@@ -219,6 +221,7 @@ class AuditedHTTPClient(AuditedClientBase):
             error=error,
             latency_ms=latency_ms,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
 
     def _extract_provider(self, url: str) -> str:

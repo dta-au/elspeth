@@ -34,6 +34,7 @@ from elspeth.web.sessions.protocol import CompositionStateData, GuidedForkSettle
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl, _value_references_parent_blob
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import create_blob_under_fence, get_blob_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.test_fork import _complete_guided_start_authority, _make_fork_app
@@ -51,6 +52,8 @@ def engine():
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return engine
 
 

@@ -14,6 +14,7 @@ from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import MissingFieldViolation, SinkDiversionReason, TransformErrorReason
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.plugin_audit_writer import PluginAuditWriterAdapter
@@ -144,6 +145,7 @@ class TestCallRecordingRoutesToExecution:
             # the kwarg so the LLM transform plugin path can pass-through
             # without per-call-site adapter changes.
             resolved_prompt_template_hash=None,
+            token_usage=UNKNOWN_TOKEN_USAGE,
         )
 
 
@@ -240,6 +242,7 @@ class TestOperationCallRoutesToExecution:
             # Phase 5b Task 9: cross-DB hash anchor; None unless the caller
             # is an LLM operation downstream of a resolved interpretation.
             resolved_prompt_template_hash=None,
+            token_usage=UNKNOWN_TOKEN_USAGE,
         )
 
 

@@ -27,9 +27,11 @@ from sqlalchemy import Engine, select, update
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import auth_events_table
 from elspeth.web.app import _build_local_auth_provider
+from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.local import AccessPending, LocalAuthProvider
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
@@ -64,13 +66,16 @@ def _local_settings(tmp_path: Path, **overrides: Any) -> WebSettings:
 def substrate(tmp_path: Path) -> tuple[Engine, RepositoryIdentityAuthority]:
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
-    return engine, RepositoryIdentityAuthority(engine)
+    return engine, RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
 
-def _provider(settings: WebSettings, authority: RepositoryIdentityAuthority) -> LocalAuthProvider:
-    """The provider the app factory builds, with its own recorder and callbacks."""
+def _provider(settings: WebSettings, authority: RepositoryIdentityAuthority, request: pytest.FixtureRequest) -> LocalAuthProvider:
+    """The provider the app factory builds, with a test-owned recorder."""
     (settings.data_dir / "runs").mkdir(parents=True, exist_ok=True)
-    return _build_local_auth_provider(settings, authority, resolved_state_mode="sqlite-single")
+    recorder = AuthAuditRecorder.from_settings(settings, "sqlite-single")
+    request.addfinalizer(recorder.close)
+    recorder.start()
+    return _build_local_auth_provider(settings, authority, audit_recorder=recorder)
 
 
 def _auth_event_rows(settings: WebSettings) -> list[Any]:
@@ -103,7 +108,7 @@ def _identity_id(authority: RepositoryIdentityAuthority, username: str) -> str:
 
 
 async def test_a_dormant_local_login_is_re_pended_and_refused_at_the_admission_wall(
-    tmp_path: Path, substrate: tuple[Engine, RepositoryIdentityAuthority]
+    tmp_path: Path, substrate: tuple[Engine, RepositoryIdentityAuthority], request: pytest.FixtureRequest
 ) -> None:
     """R9 is wired for local auth, not only for SSO -- and the window is the container's.
 
@@ -120,7 +125,7 @@ async def test_a_dormant_local_login_is_re_pended_and_refused_at_the_admission_w
     """
     engine, authority = substrate
     settings = _local_settings(tmp_path, identity_dormancy_days=30)
-    provider = _provider(settings, authority)
+    provider = _provider(settings, authority, request)
     provider.create_user("ada", "password123", display_name="Ada")
     await provider.login("ada", "password123")
     ada_id = _identity_id(authority, "ada")
@@ -142,14 +147,14 @@ async def test_a_dormant_local_login_is_re_pended_and_refused_at_the_admission_w
 
 
 async def test_the_last_local_admins_dormancy_is_exempted_and_only_this_row_records_it(
-    tmp_path: Path, substrate: tuple[Engine, RepositoryIdentityAuthority], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, substrate: tuple[Engine, RepositoryIdentityAuthority], monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
     """The local wiring records D34 before advancing the login timestamp."""
     from elspeth.web.auth.audit import AuthAuditRecorder
 
     engine, authority = substrate
     settings = _local_settings(tmp_path, identity_dormancy_days=30)
-    provider = _provider(settings, authority)
+    provider = _provider(settings, authority, request)
     provider.create_user("root", "password123", display_name="Root")
     await provider.login("root", "password123")
     root_id = _identity_id(authority, "root")

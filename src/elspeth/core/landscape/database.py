@@ -363,6 +363,10 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     # Phase 5b interpretation-review audit anchor — runtime LLM calls must
     # carry the resolved prompt hash used to join back to session DB events.
     ("calls", "resolved_prompt_template_hash"),
+    ("calls", "prompt_tokens"),
+    ("calls", "completion_tokens"),
+    ("calls", "cached_prompt_tokens"),
+    ("calls", "reasoning_tokens"),
     # Phase 4 tutorial audit-story projection fields.
     ("runs", "llm_call_count"),
     ("runs", "seeded_from_cache"),
@@ -682,6 +686,10 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("scheduler_events", "ck_scheduler_events_from_attempt_non_negative"),
     ("scheduler_events", "ck_scheduler_events_to_attempt_non_negative"),
     ("calls", "calls_has_parent"),
+    ("calls", "calls_prompt_tokens_nonnegative"),
+    ("calls", "calls_completion_tokens_nonnegative"),
+    ("calls", "calls_cached_prompt_tokens_nonnegative"),
+    ("calls", "calls_reasoning_tokens_nonnegative"),
     ("preflight_results", "ck_preflight_result_type"),
     ("runs", "ck_runs_openrouter_catalog_source"),
     # Epoch 21: multi-worker coordination substrate (ADR-030).
@@ -1896,58 +1904,65 @@ class LandscapeDB:
             if engine_kwargs:
                 raise ValueError("SQLCipher construction does not accept SQLAlchemy engine kwargs")
             engine = cls._create_sqlcipher_engine(url, passphrase, read_only=read_only)
-            cls._configure_sqlite(engine, read_only=read_only)
-            if not read_only:
-                # Tier-1 PRAGMA probe — see _verify_sqlite_pragmas docstring.
-                cls._verify_sqlite_pragmas(engine, url)
         else:
             engine_url = cls._sqlite_read_only_url(url) if read_only and url.startswith("sqlite") else url
             engine = create_engine(engine_url, echo=False, **engine_kwargs)
+
+        try:
             # SQLite-specific configuration
-            if url.startswith("sqlite"):
+            if passphrase is not None or url.startswith("sqlite"):
                 cls._configure_sqlite(engine, read_only=read_only)
                 if not read_only:
+                    # Tier-1 PRAGMA probe — see _verify_sqlite_pragmas docstring.
                     cls._verify_sqlite_pragmas(engine, url)
 
-        journal: LandscapeJournal | None = None
-        if dump_to_jsonl:
-            journal_path = cls._resolve_journal_path(
+            journal: LandscapeJournal | None = None
+            if dump_to_jsonl:
+                journal_path = cls._resolve_journal_path(
+                    url,
+                    explicit_path=dump_to_jsonl_path,
+                    worker_suffix=dump_to_jsonl_worker_suffix,
+                )
+                journal = LandscapeJournal(
+                    journal_path,
+                    fail_on_error=dump_to_jsonl_fail_on_error,
+                    include_payloads=dump_to_jsonl_include_payloads,
+                    payload_base_path=dump_to_jsonl_payload_base_path,
+                )
+                journal.attach(engine)
+
+            install_deadline_guard(engine)
+
+            instance = cls._from_parts(
                 url,
-                explicit_path=dump_to_jsonl_path,
-                worker_suffix=dump_to_jsonl_worker_suffix,
+                engine,
+                passphrase=passphrase,
+                journal=journal,
+                require_existing_schema=not create_tables,
+                read_only=read_only,
             )
-            journal = LandscapeJournal(
-                journal_path,
-                fail_on_error=dump_to_jsonl_fail_on_error,
-                include_payloads=dump_to_jsonl_include_payloads,
-                payload_base_path=dump_to_jsonl_payload_base_path,
-            )
-            journal.attach(engine)
 
-        install_deadline_guard(engine)
+            # Validate BEFORE create_all - catches old schema with missing columns
+            # before we try to use it. For fresh DBs, validation passes (no tables yet).
+            instance._validate_schema()
 
-        instance = cls._from_parts(
-            url,
-            engine,
-            passphrase=passphrase,
-            journal=journal,
-            require_existing_schema=not create_tables,
-            read_only=read_only,
-        )
-
-        # Validate BEFORE create_all - catches old schema with missing columns
-        # before we try to use it. For fresh DBs, validation passes (no tables yet).
-        instance._validate_schema()
-
-        if create_tables:
-            instance._sync_sqlite_schema_epoch()
-            metadata.create_all(engine)
-            instance._create_additive_indexes()
-            instance._sync_schema_identity()
-            instance._sync_sqlite_schema_epoch()
-        if journal is not None:
-            journal.recover_pending(engine)
-        return instance
+            if create_tables:
+                instance._sync_sqlite_schema_epoch()
+                metadata.create_all(engine)
+                instance._create_additive_indexes()
+                instance._sync_schema_identity()
+                instance._sync_sqlite_schema_epoch()
+            if journal is not None:
+                journal.recover_pending(engine)
+            return instance
+        except BaseException as exc:
+            # Ownership transfers only on a successful return. Schema or
+            # initialization failures must not abandon a newly-created pool.
+            try:
+                engine.dispose()
+            except BaseException as cleanup_exc:
+                exc.add_note(f"Landscape engine disposal also failed: {type(cleanup_exc).__name__}")
+            raise
 
     @staticmethod
     def _resolve_journal_path(

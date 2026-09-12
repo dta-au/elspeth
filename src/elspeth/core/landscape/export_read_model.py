@@ -5,16 +5,17 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.engine import Connection, Engine
 
 from elspeth.contracts import RunStatus, SecretResolution
 from elspeth.contracts.audit_export import AuditExportTerminalWitness
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.export_records import AuthEventExportRecord
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.core.landscape.model_loaders import (
@@ -42,6 +43,7 @@ from elspeth.core.landscape.model_loaders import (
 )
 from elspeth.core.landscape.schema import (
     artifacts_table,
+    auth_events_table,
     batch_members_table,
     batches_table,
     calls_table,
@@ -138,6 +140,60 @@ class ConnectionBoundExportReadModel:
     def get_run(self, run_id: str) -> Any | None:
         row = self._connection.execute(select(runs_table).where(runs_table.c.run_id == run_id)).one_or_none()
         return None if row is None else self._run_loader.load(row)
+
+    def iter_auth_events(self, cutoff: datetime, *, batch_size: int) -> Iterator[AuthEventExportRecord]:
+        """Page the deployment history visible in this transaction up to cutoff.
+
+        A timestamp cutoff does not include transactions committed after this
+        snapshot, even when their event timestamps precede the cutoff.
+        """
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("batch_size must be a positive exact integer")
+        last_time: datetime | None = None
+        last_id: str | None = None
+        while True:
+            query = select(auth_events_table).where(auth_events_table.c.occurred_at <= cutoff)
+            if last_time is not None:
+                query = query.where(
+                    or_(
+                        auth_events_table.c.occurred_at > last_time,
+                        and_(auth_events_table.c.occurred_at == last_time, auth_events_table.c.event_id > last_id),
+                    )
+                )
+            rows = self._connection.execute(
+                query.order_by(auth_events_table.c.occurred_at, auth_events_table.c.event_id).limit(batch_size)
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                try:
+                    metadata = json.loads(row.metadata_json)
+                except (TypeError, ValueError) as exc:
+                    raise AuditIntegrityError(f"Auth event {row.event_id} metadata is corrupt") from exc
+                if type(metadata) is not dict:
+                    raise AuditIntegrityError(f"Auth event {row.event_id} metadata must be an object")
+                occurred_at = row.occurred_at
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=UTC)
+                yield {
+                    "record_type": "auth_event",
+                    "event_id": row.event_id,
+                    "occurred_at": occurred_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    "event_type": row.event_type,
+                    "outcome": row.outcome,
+                    "provider": row.provider,
+                    "user_id": row.user_id,
+                    "username": row.username,
+                    "failure_category": row.failure_category,
+                    "request_id": row.request_id,
+                    "client_host": row.client_host,
+                    "user_agent": row.user_agent,
+                    "identity_id": row.identity_id,
+                    "metadata": metadata,
+                }
+            last_time, last_id = rows[-1].occurred_at, rows[-1].event_id
+            if len(rows) < batch_size:
+                return
 
     def get_run_attribution(self, run_id: str) -> tuple[str, str] | None:
         row = self._connection.execute(

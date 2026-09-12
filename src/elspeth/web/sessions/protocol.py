@@ -270,7 +270,8 @@ CompositionStateProvenance = Literal[
     "interpretation_resolve",
 ]
 
-AUDIT_GRADE_VIEW_WRITER_PRINCIPAL = "audit_grade_view"
+AuditAccessWriterPrincipal = Literal["audit_grade_view", "admin_tool", "workflow_inspect"]
+AUDIT_GRADE_VIEW_WRITER_PRINCIPAL: Literal["audit_grade_view"] = "audit_grade_view"
 AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST: frozenset[str] = frozenset(
     {
         "include_tool_rows",
@@ -2889,9 +2890,11 @@ class AuditAccessLogRecord:
     request_path: str
     query_args: Mapping[str, str]
     ip_address: str | None
-    writer_principal: str
+    writer_principal: AuditAccessWriterPrincipal
 
     def __post_init__(self) -> None:
+        if self.writer_principal not in {"audit_grade_view", "admin_tool", "workflow_inspect"}:
+            raise AuditIntegrityError("audit_access_log.writer_principal is invalid")
         freeze_fields(self, "query_args")
 
 

@@ -215,7 +215,7 @@ def _config(**overrides: object) -> LandscapeExportSettings:
         format="json",
         signing_mode="unsigned",
         signer_key_id="UNSIGNED",
-        exporter_version="landscape-exporter-v1",
+        exporter_version="landscape-exporter-auth-v1",
         serialization_version="audit-export-v2",
         chunking_algorithm_version="record-framing-v1",
         total_record_limit=10_000,
@@ -604,9 +604,10 @@ def test_hmac_snapshot_streaming_derivation_and_production_verification(
             content_store=store,
         )
 
-        record = json.loads(next(snapshot.reader.iter_verified_chunks()))
+        records = [json.loads(line) for chunk in snapshot.reader.iter_verified_chunks() for line in chunk.splitlines()]
         manifest = json.loads(snapshot.reader.read_verified_signed_manifest())
-        assert isinstance(record["signature"], str) and len(record["signature"]) == 64
+        assert [record["record_type"] for record in records] == ["run", "audit_export_config", "auth_event_coverage"]
+        assert all(isinstance(record["signature"], str) and len(record["signature"]) == 64 for record in records)
         assert isinstance(manifest["signature"], str) and len(manifest["signature"]) == 64
     finally:
         db.close()

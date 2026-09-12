@@ -21,6 +21,7 @@ from typer.testing import CliRunner
 from elspeth.cli import app
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import auth_events_table
+from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.models import AccessPending
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
@@ -219,7 +220,18 @@ class TestComposerUsersCommand:
             1,
         )
 
-    def test_remove_user_deletes_local_auth_user(self, tmp_path: Path) -> None:
+    def test_remove_user_deletes_local_auth_user(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth import cli
+
+        recorders: list[AuthAuditRecorder] = []
+        original = cli._composer_auth_audit_recorder
+
+        def build(url: str) -> AuthAuditRecorder:
+            recorder = original(url)
+            recorders.append(recorder)
+            return recorder
+
+        monkeypatch.setattr(cli, "_composer_auth_audit_recorder", build)
         auth_db = tmp_path / "auth.db"
         add_result = runner.invoke(
             app,
@@ -256,6 +268,9 @@ class TestComposerUsersCommand:
         assert result.exit_code == 0
         assert "Removed composer user alice" in result.output
         assert _auth_user_row(auth_db, "alice") is None
+        assert len(recorders) == 1
+        with pytest.raises(RuntimeError, match="closed"):
+            recorders[0].start()
 
     def test_remove_missing_auth_db_does_not_create_new_database(self, tmp_path: Path) -> None:
         auth_db = tmp_path / "missing" / "auth.db"
@@ -477,6 +492,25 @@ class TestComposerUsersBootstrapAdmin:
         finally:
             engine.dispose()
         assert len(_auth_event_rows(f"sqlite:///{tmp_path / 'runs' / 'audit.db'}")) == 2
+
+    def test_bootstrap_owns_and_closes_audit_engine_on_success_and_refusal(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth import cli
+
+        recorders: list[AuthAuditRecorder] = []
+        original = cli._composer_auth_audit_recorder
+
+        def build(url: str) -> AuthAuditRecorder:
+            recorder = original(url)
+            recorders.append(recorder)
+            return recorder
+
+        monkeypatch.setattr(cli, "_composer_auth_audit_recorder", build)
+        assert self._invoke(tmp_path).exit_code == 0
+        assert self._invoke(tmp_path, subject="bob").exit_code == 1
+        assert len(recorders) == 2
+        for recorder in recorders:
+            with pytest.raises(RuntimeError, match="closed"):
+                recorder.start()
 
     def test_bootstrap_admin_refuses_an_unknown_provider_and_half_a_quota(self, tmp_path: Path) -> None:
         unknown = self._invoke(tmp_path, provider="ldap")

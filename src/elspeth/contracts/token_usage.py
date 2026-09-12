@@ -265,6 +265,10 @@ class TokenUsage:
         )
 
 
+# Immutable default for recording paths whose provider reported no usage.
+UNKNOWN_TOKEN_USAGE = TokenUsage()
+
+
 @observation_boundary(
     tier=3,
     source=(

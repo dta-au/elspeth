@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
+from threading import Lock
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, Self, TypedDict, cast
 
 import jwt as pyjwt
 import structlog
@@ -426,13 +427,49 @@ def classify_authentication_failure(exc: AuthenticationError) -> str:
     return "authentication_error"
 
 
-@dataclass(frozen=True)
+@dataclass
 class AuthAuditRecorder:
-    """Synchronous Landscape writer for web authentication events."""
+    """One owned Landscape engine shared by authentication event writes.
+
+    Start before entering identity transactions; close after all users have
+    stopped. Individual writes keep their own repository transactions.
+    """
 
     landscape_url: str
     landscape_passphrase: str | None
     create_tables: bool
+    _db: LandscapeDB | None = field(default=None, init=False, repr=False)
+    _lifecycle_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def start(self) -> LandscapeDB:
+        """Initialize once, outside the Sessions write lock, before serving auth."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Auth audit recorder is closed")
+            if self._db is None:
+                self._db = LandscapeDB.from_url(
+                    self.landscape_url,
+                    passphrase=self.landscape_passphrase,
+                    create_tables=self.create_tables,
+                    **postgres_engine_kwargs(self.landscape_url),
+                )
+            return self._db
+
+    def close(self) -> None:
+        """Dispose the owned engine once; a closed recorder cannot reopen it."""
+        with self._lifecycle_lock:
+            self._closed = True
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+
+    def __enter__(self) -> Self:
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: object) -> None:
+        self.close()
 
     @classmethod
     def from_settings(
@@ -455,13 +492,7 @@ class AuthAuditRecorder:
     @contextmanager
     def _open_landscape(self, operation: AuthAuditOperation) -> Iterator[LandscapeDB]:
         try:
-            with LandscapeDB.from_url(
-                self.landscape_url,
-                passphrase=self.landscape_passphrase,
-                create_tables=self.create_tables,
-                **postgres_engine_kwargs(self.landscape_url),
-            ) as db:
-                yield db
+            yield self.start()
         except (SchemaCompatibilityError, LandscapeRecordError, SQLAlchemyError, OSError) as exc:
             _slog.error(
                 "auth_audit_write_failed",

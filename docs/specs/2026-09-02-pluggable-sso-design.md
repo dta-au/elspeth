@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
 Date: 2026-09-02. Status: design, revision 2.11, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username. Revision 2.11 corrects a framing error, marked **[rev2.11]**: identity-provider client registrations were written as external dependencies owed to the project, when this is a public repository that stores no provider credential and a registration is a deployment-time input supplied by whoever deploys ELSPETH. A real client gates live verification and nothing else; §External dependencies is now §Deployment-time inputs, the AWS Terraform is recorded as creating the Cognito confidential client itself, and the VANguard spike is a live confirmation of a profile that is already written. **This revision narrows what it claims, and does not disturb D5.** It means the build and every test wait on nothing: steps 2 to 5 complete without any registration. It does not mean live verification left delivery scope. D5 stands as ruled — Cognito's client the repository's Terraform now mints itself, while VANguard's is issued by the operating organisation on its ABN-gated admin page (§Deployment-time inputs), so VANguard live verification remains a delivery obligation this project cannot discharge alone and must wait on that registration to close. A reader who takes "gates live verification and nothing else" as "nothing remains owed" has read it too broadly. Revision 2.12 corrects claims this document made about the tree that the tree does not support, marked **[rev2.12]**, found by sweeping the whole file for them rather than fixing them one at a time as they surfaced — three had surfaced separately on 2026-09-07 before the sweep was run, which is what made a sweep the right response. The corrections sort by what it costs to make each claim true, which turned out to be the useful axis. **Three are stranded one-way-window items** — placed inside the delivery's epoch window, none rode it, and the window has cut, so each now costs the second `rollback_permitted: false` cutover this spec was structured to avoid: the `audit_access_log` `writer_principal` third value D27 required (elspeth-e6c2d254b2), the four `calls` token columns rev2.1 specified (elspeth-255ae1a544, which also leaves `token_usage_ledger`'s `run` source arm with no data path), and the `run_web_plugin_policy` quota-row-id and wiring-allowlist-hash additions (elspeth-ff89d2bea0). They should ride whichever bump happens next for another reason, so the project pays one window rather than three. **The rest cost only code or a test**, and that distinction is worth keeping when reading them: the `auth_events` export path (elspeth-4699ddccc3), the exported-row identity snapshot, the per-login profile snapshot designated as the history of record, the five `compartment_id` stampings, and three claims that a test pins something it does not — the `WebPluginPolicyEvidence` field gate, worklist items 5 and 6, and the service-identity role revoke. **One correction runs the other way:** the `ck_auth_events_event_type` enumeration here listed twenty-one values where the tree ships twenty-three, omitting D26's two `review_requests` lifecycle events; there the tree was right and this document was incomplete. **Three more claims are true but were credited to the wrong thing** — the per-request `access_state` read, the pins on worklist items 5 and 6, and the AST deletion guard's scope — which is the subtlest failure here, because each passes a spot-check and each misdirects whoever next refactors the component that actually provides the guarantee. Wrong pointers and stale counts are corrected in place. The epoch literals in §Discriminator widening were removed rather than corrected: this spec states elsewhere that epoch numbers come from the runbook's compatibility record and never from here, and a document carrying that rule should not print the number. **This revision changes no ruling.** Every correction is to a statement of fact about what is built; where a requirement went unbuilt, the requirement stands and is now traceable to a ticket instead of reading as already satisfied.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username. Revision 2.11 corrects a framing error, marked **[rev2.11]**: identity-provider client registrations were written as external dependencies owed to the project, when this is a public repository that stores no provider credential and a registration is a deployment-time input supplied by whoever deploys ELSPETH. §External dependencies became §Deployment-time inputs; AWS Terraform creates the Cognito confidential client, and VANguard's profile is already implemented. **The operator's 2026-09-10 ruling supersedes the former live-verification obligation:** delivery acceptance uses desktop and testcontainer proofs; no live IdP, live AWS run, or operator trial gates this sprint. Provider registration remains deployment configuration. Unexpected deployed-provider behavior is an incident input, not deferred delivery work. Revision 2.12 corrects claims this document made about the tree that the tree does not support, marked **[rev2.12]**, found by sweeping the whole file for them rather than fixing them one at a time as they surfaced — three had surfaced separately on 2026-09-07 before the sweep was run, which is what made a sweep the right response. The corrections sort by what it costs to make each claim true, which turned out to be the useful axis. **Three are stranded one-way-window items** — placed inside the delivery's epoch window, none rode it, and the window has cut, so each now costs the second `rollback_permitted: false` cutover this spec was structured to avoid: the `audit_access_log` `writer_principal` third value D27 required (elspeth-e6c2d254b2), the four `calls` token columns rev2.1 specified (elspeth-255ae1a544, which also leaves `token_usage_ledger`'s `run` source arm with no data path), and the `run_web_plugin_policy` quota-row-id and wiring-allowlist-hash additions (elspeth-ff89d2bea0). They should ride whichever bump happens next for another reason, so the project pays one window rather than three. **The rest cost only code or a test**, and that distinction is worth keeping when reading them: the `auth_events` export path (elspeth-4699ddccc3), the exported-row identity snapshot, the per-login profile snapshot designated as the history of record, the five `compartment_id` stampings, and three claims that a test pins something it does not — the `WebPluginPolicyEvidence` field gate, worklist items 5 and 6, and the service-identity role revoke. **One correction runs the other way:** the `ck_auth_events_event_type` enumeration here listed twenty-one values where the tree ships twenty-three, omitting D26's two `review_requests` lifecycle events; there the tree was right and this document was incomplete. **Three more claims are true but were credited to the wrong thing** — the per-request `access_state` read, the pins on worklist items 5 and 6, and the AST deletion guard's scope — which is the subtlest failure here, because each passes a spot-check and each misdirects whoever next refactors the component that actually provides the guarantee. Wrong pointers and stale counts are corrected in place. The epoch literals in §Discriminator widening were removed rather than corrected: this spec states elsewhere that epoch numbers come from the runbook's compatibility record and never from here, and a document carrying that rule should not print the number. **This revision changes no ruling.** Every correction is to a statement of fact about what is built; where a requirement went unbuilt, the requirement stands and is now traceable to a ticket instead of reading as already satisfied.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -46,15 +46,15 @@ The tech-debt-free window is weeks, not months.
 | # | Decision | Ruling |
 |---|----------|--------|
 | D1 | Persisted provider discriminator | Per-IdP values: `local`, `oidc`, `entra`, `vanguard`, `google`. |
-| D2 | Who exchanges the authorization code | The backend, as a confidential client. Browser-side PKCE is deleted, not kept as a fallback. Cognito re-registers as confidential in this delivery. |
+| D2 | Who exchanges the authorization code | The backend, as a confidential client. Browser-side PKCE is deleted, not kept as a fallback. Cognito's confidential-client configuration is a deployment input; delivery proves the exchange with fixtures. |
 | D3 | Where an SSO profile lives | `identities` table in the web state (sessions) store. Session JWT stays minimal. |
 | D4 | Staff relationships | Directed typed edges in `identity_relationships`, curated manually via admin routes. No derivation from IdP data, no approval enforcement in this delivery. |
-| D5 | Delivery scope | Framework + all four profiles + Cognito migration + old path deleted. VANguard and Cognito verified live; Google verified live when a client exists. |
+| D5 | Delivery scope | Framework + all four profiles + Cognito migration + old path deleted. **Operator ruling 2026-09-10:** desktop and testcontainer proofs establish delivery acceptance; no live IdP, AWS run, or operator trial is a sprint gate. |
 | D6 **[rev2]** | Session subject and ownership key | `sub` = `identity_id`. `sessions`, `user_secrets`, `user_preferences`, and Landscape `run_attributions` are keyed on `identity_id`. Accepted on reviewer recommendation; reversible until phase 1 lands. |
 | D7 **[rev2]** | Local users | Get an `identities` row on first login (`provider='local'`, `subject=username`). `auth.db` becomes credentials only. Accepted on recommendation. |
 | D8 **[rev2]** | `relationship_type` | Closed CHECK + L0 Literal (`approver` only now, per D16), widened per delivery. Accepted on recommendation. |
 | D9 **[rev2]** | Roles | `identity_roles` table ships now (`admin`, `curator`); `sso_admin_subjects` only seeds the first admin. Accepted on recommendation. |
-| D10 **[rev2]** | Principal above identity | No `principals` table. The VANguard spike asks for a stable non-email subject; if none, detection columns plus a refusal (§Refusals R3). Identity merge is an unbuilt admin action. |
+| D10 **[rev2]** | Principal above identity | No `principals` table. VANguard fixtures exercise opaque and email-shaped subjects; detection columns and refusal protect rebound (§Refusals R3). Identity merge is an unbuilt admin action. |
 | D11 **[rev2.1]** | Operator facts, now ruled | Quota is **per person**, the aggregate of tokens used in the composer and tokens used in runs. Approval quorum is one (a count column is "for but not with"). The term is **flex teams**, not hybrid teams: anyone in the organisation can log on to any container (deployment) of that organisation, but permissions are federated within that container only. The system takes SSO accounts; a container administrator (a container-operations person, D14) grants `user`, `approver`, or `reviewer` permission and wires them into that container's org **tree**. The organisation console (§Terminology) is the later cross-container affordance and is explicitly not built now. |
 | D12 **[rev2.1]** | Default access | **No access, even with SSO, until an administrator gives the tick of approval.** A first login creates an identity in `pending`; no session token is issued until an admin activates it. |
 | D13 **[rev2.1]** | Workflow tables | Built "for but not with": basic columns now, fleshed out later, all in the same epoch pass. See §Workflow tables. |
@@ -76,14 +76,12 @@ The tech-debt-free window is weeks, not months.
 | D32 **[rev2.8]** | Does R3 disable the identity | Yes: `disabled`, `disable_reason='rebound'`, actor `system`, audit row. It honours R5 on the last active human admin rather than bricking the container, and it does **not** run the edge-revocation cascade, which is unrecoverable and fires most often on a marriage or a rename. |
 | D34 **[rev2.8]** | Dormancy versus the last admin | R9 carries R5's last-admin exemption. Otherwise a single-admin container reaches zero active admins at day 91 by doing nothing, and the first-login-only seed cannot re-fire. |
 
-**[rev2.11] D10's narration, not its ruling.** D10 says "the VANguard
-**spike**". rev2.11 renamed that section to §VANguard live confirmation, so
-the word now names nothing; read it as pointing there. Its conditional has
-also moved: the profile is written and keys on `sub` either way
-(`map_vanguard`), and the detection columns `subject_email_at_first_seen`
-and `rebound_at` are on `identities`. What a live token pair still settles
-is whether that `sub` is stable and non-email — the subject is an email
-today — which is exactly why those columns exist.
+**D10's implementation and desktop evidence (2026-09-10).** The former
+VANguard spike is superseded by §VANguard fixture contracts. The profile
+keys on `sub` (`map_vanguard`); `subject_email_at_first_seen` and `rebound_at`
+exist on `identities`. Synthetic fixtures exercise subject and email changes
+without a real token pair. An unexpected deployed subject contract is an
+incident to investigate, not an outstanding registration or acceptance task.
 
 **[rev2.13] R3 is now implemented** (elspeth-9c25083a03).
 `ensure_identity` compares every IdP login's verified email against
@@ -988,32 +986,41 @@ origin; `S256`; `RS256`; `token_endpoint_auth_methods_supported` =
 `client_secret_post`, `client_secret_basic`, `private_key_jwt`; no
 `claims_supported` published.
 
-### VANguard live confirmation [rev2.11]
+### VANguard fixture contracts [operator ruling 2026-09-10]
 
-**[rev2.11: this read "spike (before the profile is written)". The profile is
-written — it keys on `sub` and calls userinfo — so these are the assumptions it
-already ships on, and a deployment holding a real confidential client and token
-pair confirms them. It is not a gate on writing the profile.]** In this order:
+The profile is implemented: it keys on `sub` and calls userinfo. The former
+registration spike is superseded. Desktop fixtures exercise these contracts;
+they do not claim observation of a deployed VANguard token:
 
-1. Does the ID token carry any **stable, non-email subject**? (D10 hinges
-   on it. If yes, the profile keys on it and `email` is a claim.)
-2. Exact ID-token claim set (`nonce` presence, `aud` shape).
-3. Exact userinfo body (`given_name`, `family_name`, `abn` key names/types).
-4. Whether the JWKS entries carry `alg`.
-5. Whether the token endpoint accepts `client_secret_basic` for that client.
+1. Subject identity and email-change/rebound behavior (D10, R3).
+2. Required ID-token claims, nonce binding and audience shape.
+3. Userinfo subject binding and `given_name`, `family_name`, `abn` parsing.
+4. JWKS key and algorithm validation, including malformed entries.
+5. Confidential-client `client_secret_basic` exchange.
 
-A real token pair, once a deployment has one, can be added as a fixture
-(redacted signature, pinned claims). It is an addition to the synthetic
-fixtures, never a precondition for them [rev2.11].
+`tests/helpers/fake_idp.py` supplies the signed-token and userinfo boundary.
+`test_sso_callback.py` proves name/ABN mapping and refuses a mismatched
+userinfo subject before identity upsert. Report any later deployed mismatch
+through the incident channel; collecting a real token pair is not sprint work.
 
-### Google facts measured 2026-09-02 (by review)
+### Google published contract checked 2026-09-10
 
-Discovery: authorization `accounts.google.com/o/oauth2/v2/auth`, token
+The [published discovery document](https://accounts.google.com/.well-known/openid-configuration)
+pins issuer `https://accounts.google.com`: authorization `accounts.google.com/o/oauth2/v2/auth`, token
 `oauth2.googleapis.com/token`, jwks `www.googleapis.com/oauth2/v3/certs`,
 userinfo `openidconnect.googleapis.com/v1/userinfo`. `claims_supported`
-does not list `hd`; it is emitted for Workspace accounts only. A live check
-needs a client from whoever owns the Workspace domain, which is a deployment
-errand; the profile and its tests do not wait for one [rev2.11].
+does not list `hd`. The [Google OIDC token contract](https://developers.google.com/identity/openid-connect/openid-connect)
+accepts exactly `https://accounts.google.com` and `accounts.google.com` as
+token issuers. Only the Google profile declares the latter alias; discovery
+still requires the canonical HTTPS issuer, with no URL normalization.
+
+The signed `hd` claim identifies a Workspace or Cloud organization domain;
+absence means no hosted domain. ELSPETH requires verified email and an exact
+match to `google_hosted_domain`. The request's `hd` parameter is a UI hint,
+not authorization. These facts come from documentation, not discovery's
+claim list or a live account. Signed fixtures cover both issuer forms and
+refuse foreign spellings; existing claim fixtures cover missing/wrong `hd`.
+No OAuth registration or live account gates delivery.
 
 ## Refusals [rev2]
 
@@ -1214,12 +1221,11 @@ errand; the profile and its tests do not wait for one [rev2.11].
   typo: repo-root `tests/e2e/` exists and holds only Python suites, so a
   reader following it lands in a real directory containing none of these
   files and no TypeScript at all.
-- **Live.** ECS runbook §Authentication rewritten: `prepare_scenario_b_oidc`
-  asserts `hasClientSecret == true`; the Playwright evidence flow drives
-  start → IdP → callback → fragment code → complete and captures the ELSPETH
-  token, not the IdP's; the compatibility-record example and its two pinned
-  tests carry the new epochs. VANguard live once the client exists. Google
-  live once a client exists.
+- **Desktop delivery acceptance (2026-09-10).** Fake-IdP tests drive the
+  confidential-client exchange, callback and handoff; PostgreSQL tests prove
+  persistence and contention. Provider facts use published discovery/docs.
+  The ECS/Playwright staging harness remains optional deployment diagnostics,
+  not a required live run or an operator-owned sprint gate.
 
 ### Workflow governance [rev2.8, D30]
 
@@ -1266,8 +1272,8 @@ phase 4 closes, not after.
    AWS the repository's own Terraform creates the Cognito client and mints its
    secret, so there is nothing to land by hand. Steps 2 to 5 do not wait on
    any of this — the profiles and the login path are proved against the
-   in-process fake IdP — and a real client gates only the live checks in
-   steps 6 and 7. **[rev2.11: this read "Operator, first: register the
+   in-process fake IdP. Delivery does not wait for a deployment or live trial.
+   **[rev2.11: this read "Operator, first: register the
    confidential Cognito client …", which made a deployer's errand a
    precondition of the build and produced a ruling that had to be reversed.]**
 2. Contracts and schema: both epochs, new tables, re-key, widened CHECKs,
@@ -1279,10 +1285,12 @@ phase 4 closes, not after.
 4. Frontend switch, deletion of the old path, `dist/` rebuild, AST
    no-deleted-imports assertion — one commit.
 5. Runbook and Playwright harness rewrite; task definition; proxy headers.
-6. Cutover: one service-stop window, both stores recreated on ECS,
-   compatibility record countersigned, session-invalidation notice, Cognito
-   live check.
-7. VANguard live check; Google when a client exists.
+6. Prepare the operator's cutover instructions and compatibility record;
+   verify schema creation and refusal behavior in desktop/testcontainer
+   proofs. Performing the cutover is an operator deployment decision, not
+   this sprint's work or acceptance gate.
+7. Close provider desk tasks with published-contract references and signed
+   fixture tests. No VANguard or Google live registration dependency remains.
 
 ## Future seams
 
@@ -1474,9 +1482,9 @@ registration is configuration a deployment brings — `sso_client_id`,
 dependency the project waits on. No source file, and no unit or integration
 test, needs one: every profile is proved against the in-process fake IdP
 (`tests/helpers/fake_idp.py`), which signs with a real RSA key and serves
-discovery, JWKS, token and the userinfo leg VANguard alone calls. The live
-acceptance layer needs one by definition (§Testing, the **Live** bullet) —
-`tests/e2e/aws-ecs-oidc.staging.spec.ts` is a checked-in test whose
+discovery, JWKS, token and the userinfo leg VANguard alone calls. Optional
+deployment diagnostics need one by definition —
+`src/elspeth/web/frontend/tests/e2e/aws-ecs-oidc.staging.spec.ts` is a checked-in test whose
 `playwright.oidc.config.ts` refuses to start without `STAGING_BASE_URL`, and
 it drives a deployed stack, not a fixture. And `auth_provider=local` needs no
 registration at all. **[rev2.11 replaces
@@ -1484,8 +1492,9 @@ registration at all. **[rev2.11 replaces
 it could proceed; that framing produced a ruling that had to be reversed, see
 §Rollout order step 1.]**
 
-The one thing a real client gates is **live verification against a running
-provider**. Unit and integration coverage runs entirely against the in-process
+Real credentials are required to operate authentication against a running
+provider; obtaining them is not sprint acceptance work. Unit and integration
+coverage runs entirely against the in-process
 fake IdP (§Testing) — it serves discovery, JWKS, token and userinfo and signs
 with its own key — so every profile, claim check, origin policy and refusal is
 provable with no account anywhere.

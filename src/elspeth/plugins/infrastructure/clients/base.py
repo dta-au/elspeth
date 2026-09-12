@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
@@ -152,6 +153,7 @@ class AuditedClientBase:
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record a call under the configured audit parent.
 
@@ -174,6 +176,7 @@ class AuditedClientBase:
                 error=error,
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=token_usage,
             )
         if self._state_id is None:
             raise FrameworkBugError("Audited client has neither state_id nor operation_id")
@@ -189,6 +192,7 @@ class AuditedClientBase:
             error=error,
             latency_ms=latency_ms,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
 
     def _acquire_rate_limit(self) -> None:

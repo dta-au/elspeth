@@ -1994,7 +1994,7 @@ def _composer_auth_audit_recorder(landscape_url: str) -> AuthAuditRecorder:
     )
 
 
-def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetired], None]:
+def _composer_retirement_recorder(recorder: AuthAuditRecorder) -> Callable[[IdentityRetired], None]:
     """The CLI's audit sink for a retirement: the SAME Landscape row app.py writes.
 
     A credential deletion disables the identity and retires its binding, and
@@ -2005,7 +2005,6 @@ def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetir
     allows; it writes ``identity_disabled`` with ``cause=credential_deleted``
     through the same recorder, resolved from the same URL rule.
     """
-    recorder = _composer_auth_audit_recorder(landscape_url)
 
     def record(outcome: IdentityRetired) -> None:
         recorder.record_identity_retired(
@@ -2038,12 +2037,17 @@ def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> Retir
     user to. So ``add`` binds the real authority, with the real audit sink,
     behind a first-call open.
     """
+    from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
 
     def retire(username: str) -> None:
         engine = _composer_session_engine(session_db_url)
         try:
-            local_identity_retirer(RepositoryIdentityAuthority(engine), _composer_retirement_recorder(landscape_url))(username)
+            with _composer_auth_audit_recorder(landscape_url) as recorder:
+                local_identity_retirer(
+                    RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
+                    _composer_retirement_recorder(recorder),
+                )(username)
         finally:
             engine.dispose()
 
@@ -2154,6 +2158,7 @@ def composer_users_remove(
     ),
 ) -> None:
     """Remove a local Composer web user and retire the identity it was bound to."""
+    from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
     from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 
@@ -2166,32 +2171,33 @@ def composer_users_remove(
         raise typer.Exit(1)
     resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
     session_engine = _composer_session_engine(resolved_session_db_url)
-    provider = _composer_auth_provider(
-        db_path,
-        retire_identity=local_identity_retirer(
-            RepositoryIdentityAuthority(session_engine),
-            _composer_retirement_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url)),
-        ),
-    )
     # The store must carry the current schema BEFORE the credential goes:
     # a deletion whose retirement then fails is the inheritance defect with
     # extra steps. Same create-or-validate rule the web app applies to this
     # URL at boot -- an empty store is initialised, a stale one is refused
     # unaltered, and the credential is untouched either way until this
     # returns.
-    if session_engine.dialect.name == "sqlite":
-        sqlite_store = session_engine.url.database
-        if sqlite_store is not None and sqlite_store != ":memory:":
-            Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
     try:
-        initialize_session_schema(session_engine)
-    except SessionSchemaError as exc:
-        typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    try:
-        if not provider.delete_user(username):
-            typer.echo(f"Error: composer user not found: {username}", err=True)
-            raise typer.Exit(1)
+        if session_engine.dialect.name == "sqlite":
+            sqlite_store = session_engine.url.database
+            if sqlite_store is not None and sqlite_store != ":memory:":
+                Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            initialize_session_schema(session_engine)
+        except SessionSchemaError as exc:
+            typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        with _composer_auth_audit_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url)) as recorder:
+            provider = _composer_auth_provider(
+                db_path,
+                retire_identity=local_identity_retirer(
+                    RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
+                    _composer_retirement_recorder(recorder),
+                ),
+            )
+            if not provider.delete_user(username):
+                typer.echo(f"Error: composer user not found: {username}", err=True)
+                raise typer.Exit(1)
     finally:
         session_engine.dispose()
     typer.echo(f"Removed composer user {username} from {db_path}")
@@ -2284,6 +2290,7 @@ def composer_users_bootstrap_admin(
         )
 
     try:
+        recorder.start()
         if session_engine.dialect.name == "sqlite":
             sqlite_store = session_engine.url.database
             if sqlite_store is not None and sqlite_store != ":memory:":
@@ -2294,7 +2301,11 @@ def composer_users_bootstrap_admin(
             typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
             raise typer.Exit(1) from exc
         try:
-            activated = RepositoryIdentityAuthority(session_engine).bootstrap_admin(
+            from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+
+            activated = RepositoryIdentityAuthority(
+                session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply
+            ).bootstrap_admin(
                 claims=claims,
                 note=note,
                 quota_tokens_per_day=quota_tokens_per_day,
@@ -2311,7 +2322,10 @@ def composer_users_bootstrap_admin(
             typer.echo(f"Error: the identity for {provider}:{subject} is a service identity; admin is a human role", err=True)
             raise typer.Exit(1) from exc
     finally:
-        session_engine.dispose()
+        try:
+            recorder.close()
+        finally:
+            session_engine.dispose()
     typer.echo(f"Bootstrapped admin {activated.record.username} ({activated.record.identity_id}) for {provider}:{subject}")
 
 

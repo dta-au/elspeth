@@ -408,7 +408,8 @@ sessions_table = Table(
     "sessions",
     metadata,
     Column("id", String, primary_key=True),
-    Column("user_id", String, nullable=False, index=True),
+    # The historical column name is retained; values are canonical identity IDs.
+    Column("user_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False, index=True),
     Column("auth_provider_type", String, nullable=False, default="local"),
     Column("title", String, nullable=False),
     # Default trust_mode is auto_commit, not explicit_approve.
@@ -3046,7 +3047,7 @@ user_secrets_table = Table(
     metadata,
     Column("id", String, primary_key=True),
     Column("name", String, nullable=False),
-    Column("user_id", String, nullable=False),
+    Column("user_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False),
     Column("auth_provider_type", String, nullable=False),
     Column("encrypted_value", LargeBinary, nullable=False),
     Column("salt", LargeBinary, nullable=False),
@@ -3076,18 +3077,10 @@ Index("ix_user_secrets_user_provider", user_secrets_table.c.user_id, user_secret
 # ``routes.py`` writes ``user_id=identity.identity_id`` and the session token's
 # ``sub`` is that same id) and matches ``sessions_table.user_id``.
 #
-# No FK is declared, and the reason is COST, not impossibility. The original
-# reason recorded here — "auth providers vary across deployments and there is
-# no canonical users table in the session DB to reference" — was true when it
-# was written and was invalidated by this very epoch, which created
-# ``identities_table`` on this same ``metadata``. An FK is therefore available.
-# It is deferred because adding one to three tables is a TABLE SHAPE change,
-# and shape changes cost a one-way pre-1.0 epoch window under the
-# delete-the-old-DB migration policy; it must ride a window already being paid
-# for rather than opening one alone. Tracked as elspeth-2371269e07.
-#
-# Do not restore the old justification: a reader who takes it at face value
-# concludes no FK is possible, which is no longer true.
+# The identity FK completes D6's ownership constraint (elspeth-2371269e07).
+# Retain the existing column name across all three owner tables; it describes
+# the same canonical identity ID, not a provider username. RESTRICT preserves
+# owned data when an identity is retired; retirement is not a cascading purge.
 #
 # CLOSED-LIST default_composer_mode. Permitted values are exactly
 # {"guided", "freeform"} — enforced at the Tier-3 boundary by Pydantic
@@ -3099,7 +3092,7 @@ Index("ix_user_secrets_user_provider", user_secrets_table.c.user_id, user_secret
 user_preferences_table = Table(
     "user_preferences",
     metadata,
-    Column("user_id", String, primary_key=True),
+    Column("user_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), primary_key=True),
     Column(
         "default_composer_mode",
         String,
@@ -3155,13 +3148,9 @@ user_preferences_table = Table(
 
 # ``audit_access_log`` — INERT IN PHASE 1A.
 #
-# This table records who viewed audit-grade message data (the eventual
-# ``include_tool_rows=true`` route surface). 1A lands the table SCHEMA
-# ONLY: no route writes it, no service method writes it, no fixture
-# writes it. The destructive session-DB schema reset
-# boundary, so deferring this table to a later phase would force a
-# second staging DB recreation for a table whose ownership, FK shape,
-# and writer_principal enum are already known.
+# This table records who viewed audit-grade message data through the
+# ``include_tool_rows=true`` surface. D27 reserves the workflow inspection
+# principal in the paired schema batch before its authorization path ships.
 #
 # DO NOT ADD A WRITER WITHOUT THE PRIVACY GATE. The table holds
 # privacy-sensitive request context (``requesting_principal``,
@@ -3181,14 +3170,11 @@ user_preferences_table = Table(
 #    reach the writer call site, even via misconfigured routes or
 #    unhandled exception paths.
 #
-# CLOSED-LIST WRITER PRINCIPAL ENUM. The two values
-# ``('audit_grade_view', 'admin_tool')`` are the entire universe of
-# permitted writers. Adding a third value here is a governance
-# action, not a coding action: it requires (a) a design review of
-# the new writer's privacy posture, (b) a destructive session-DB
-# recreation per ``project_db_migration_policy`` (no Alembic in this
-# project), and (c) a corresponding spec amendment. The friction is
-# the design — do not extend silently.
+# CLOSED-LIST WRITER PRINCIPAL ENUM. D27 reserves ``workflow_inspect`` for
+# authenticated approver/reviewer reads. Reserving it does not authorize a
+# workflow read or relax the owner-only audit-grade view. Its future writer
+# still needs per-request live role/request authorization and the privacy
+# gate above. The paired identity residual schema window adds this value.
 audit_access_log_table = Table(
     "audit_access_log",
     metadata,
@@ -3206,7 +3192,7 @@ audit_access_log_table = Table(
     Column("ip_address", String, nullable=True),
     Column("writer_principal", String, nullable=False),
     CheckConstraint(
-        "writer_principal IN ('audit_grade_view', 'admin_tool')",
+        "writer_principal IN ('audit_grade_view', 'admin_tool', 'workflow_inspect')",
         name="ck_audit_access_log_writer_principal",
     ),
     Index("ix_audit_access_log_session_timestamp", "session_id", "timestamp"),
@@ -3564,6 +3550,9 @@ approvals_table = Table(
     Column("requested_at", DateTime(timezone=True), nullable=False),
     Column("decided_at", DateTime(timezone=True), nullable=True),
     Column("decision", String, nullable=True),
+    Column("revoked_by_identity_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=True),
+    Column("revocation_actor_kind", String, nullable=True),
+    Column("revocation_event_id", String, nullable=True),
     # Quorum 1 is what this delivery enforces; > 1 stays reserved. The count
     # lives over ``approval_decisions`` rows, so raising it later is not a
     # schema change.
@@ -3576,6 +3565,15 @@ approvals_table = Table(
     # clear. A UI convenience, NEVER a control: nothing gates on it.
     Column("decision_seen_at", DateTime(timezone=True), nullable=True),
     CheckConstraint(_APPROVAL_DECISION_CHECK, name="ck_approvals_decision"),
+    CheckConstraint(
+        "(decision IS NOT NULL AND decision = 'revoked' AND decided_at IS NOT NULL AND revocation_event_id IS NOT NULL "
+        "AND length(revocation_event_id) > 0 AND revocation_actor_kind IS NOT NULL "
+        "AND ((revocation_actor_kind = 'identity' AND revoked_by_identity_id IS NOT NULL) "
+        "OR (revocation_actor_kind IN ('system', 'operator') AND revoked_by_identity_id IS NULL))) "
+        "OR ((decision IS NULL OR decision <> 'revoked') AND revoked_by_identity_id IS NULL "
+        "AND revocation_actor_kind IS NULL AND revocation_event_id IS NULL)",
+        name="ck_approvals_revocation_provenance",
+    ),
     CheckConstraint(
         "requested_by_identity_id <> approver_identity_id",
         name="ck_approvals_author_is_not_approver",

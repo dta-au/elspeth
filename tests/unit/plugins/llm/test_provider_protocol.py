@@ -20,8 +20,23 @@ from elspeth.plugins.transforms.llm.provider import (
     LLMQueryResult,
     UnrecognizedFinishReason,
     classify_finish_reason_failure,
+    observe_http_token_usage,
     parse_finish_reason,
 )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b'{"usage":{"reasoning_tokens":0,"cache_read_input_tokens":9}}', TokenUsage(reasoning_tokens=0, cache_read_input_tokens=9)),
+        (b'{"usage":{"reasoning_tokens":true,"cache_read_input_tokens":-1}}', TokenUsage()),
+        (b'{"usage":null}', TokenUsage()),
+        (b"[]", TokenUsage()),
+        (b"invalid json", TokenUsage()),
+    ],
+)
+def test_http_usage_observation_retains_only_reported_counters(body: bytes, expected: TokenUsage) -> None:
+    assert observe_http_token_usage(body) == expected
 
 
 class _IdentifierEnum(StrEnum):

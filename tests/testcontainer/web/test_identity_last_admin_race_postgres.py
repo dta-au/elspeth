@@ -40,8 +40,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine, make_url
 
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
+    AdminBootstrapMode,
     IdentityActivated,
     IdentityAdminActor,
     IdentityDisabled,
@@ -150,8 +152,8 @@ def test_two_replicas_disabling_the_last_two_admins_leave_exactly_one(external_d
     observer = create_session_engine(race_url)
     try:
         initialize_session_schema(first_engine)
-        first = RepositoryIdentityAuthority(first_engine)
-        second = RepositoryIdentityAuthority(second_engine)
+        first = RepositoryIdentityAuthority(first_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        second = RepositoryIdentityAuthority(second_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
         root = first.bootstrap_admin(
             claims=_claims("root"),
@@ -234,7 +236,15 @@ def _bootstrap_rendezvous(observer: Engine, arrived: tuple[Event, Event], index:
     return record
 
 
-def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(external_deployment_postgres_url: str) -> None:
+class _SeedAuditFailed(Exception):
+    pass
+
+
+@pytest.mark.parametrize("mode", list(AdminBootstrapMode))
+@pytest.mark.parametrize("rollback_first", [False, True])
+def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(
+    external_deployment_postgres_url: str, mode: AdminBootstrapMode, rollback_first: bool
+) -> None:
     """D20 across replicas: the population the inert check counts is EMPTY, so no row lock can serialise it.
 
     Two replicas bootstrap different subjects at the same moment.  With only
@@ -258,8 +268,8 @@ def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(external_depl
     observer = create_session_engine(race_url)
     try:
         initialize_session_schema(first_engine)
-        first = RepositoryIdentityAuthority(first_engine)
-        second = RepositoryIdentityAuthority(second_engine)
+        first = RepositoryIdentityAuthority(first_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        second = RepositoryIdentityAuthority(second_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
         assert first.count_active_human_admins() == 0
 
         arrived = (Event(), Event())
@@ -267,16 +277,25 @@ def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(external_depl
 
         def bootstrap(authority: RepositoryIdentityAuthority, subject: str, index: int) -> str:
             barrier.wait(timeout=10)
+
+            def record(outcome: IdentityActivated) -> None:
+                _bootstrap_rendezvous(observer, arrived, index)(outcome)
+                if rollback_first and not arrived[1 - index].is_set():
+                    raise _SeedAuditFailed()
+
             try:
                 authority.bootstrap_admin(
                     claims=_claims(subject),
                     note="first admin",
                     quota_tokens_per_day=None,
                     quota_storage_bytes=None,
-                    record=_bootstrap_rendezvous(observer, arrived, index),
+                    record=record,
+                    mode=mode,
                 )
             except AdminAlreadyBootstrapped:
                 return "refused"
+            except _SeedAuditFailed:
+                return "audit_failed"
             return "bootstrapped"
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -286,7 +305,7 @@ def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(external_depl
             )
             outcomes = sorted(future.result(timeout=60) for future in futures)
 
-        assert outcomes == ["bootstrapped", "refused"]
+        assert outcomes == (["audit_failed", "bootstrapped"] if rollback_first else ["bootstrapped", "refused"])
         assert first.count_active_human_admins() == 1
         # The loser wrote nothing: its subject never became an identity.
         minted = [

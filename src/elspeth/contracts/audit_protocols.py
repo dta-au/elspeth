@@ -26,6 +26,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.errors import ContractViolation, TransformErrorReason
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 
 if TYPE_CHECKING:
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
@@ -60,6 +61,7 @@ class CallRecorder(Protocol):
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
     ) -> Call: ...
@@ -78,6 +80,7 @@ class CallRecorder(Protocol):
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         coordination_token: CoordinationToken,
     ) -> Call: ...
 
@@ -113,6 +116,7 @@ class PluginAuditWriter(Protocol):
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
     ) -> Call: ...
@@ -131,6 +135,7 @@ class PluginAuditWriter(Protocol):
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         coordination_token: CoordinationToken,
     ) -> Call: ...
 

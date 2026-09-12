@@ -164,6 +164,42 @@ def empty_choices_response(
     )
 
 
+@pytest.mark.parametrize("processing_error", [None, ValueError("unserializable response")])
+@pytest.mark.parametrize("sdk_usage", [False, True])
+def test_provider_usage_reaches_audit_even_when_response_processing_fails(processing_error: Exception | None, sdk_usage: bool) -> None:
+    from openai.types import CompletionUsage
+
+    execution = FakeExecutionRepository()
+    raw_usage = {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 4},
+        "completion_tokens_details": {"reasoning_tokens": 2},
+        "cache_creation_input_tokens": 3,
+        "cache_read_input_tokens": 1,
+    }
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(
+            response=provider_response(
+                usage=CompletionUsage.model_validate({**raw_usage, "total_tokens": 15}) if sdk_usage else raw_usage,
+                model_dump_error=processing_error,
+            )
+        ),
+        **mock_audit_authority(),
+    )
+    if processing_error is None:
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+    else:
+        with pytest.raises(LLMClientError, match="serialize"):
+            client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+    expected = {**raw_usage, "total_tokens": 15} if sdk_usage else raw_usage
+    assert execution.last_record_call_kwargs["token_usage"] == TokenUsage.from_dict(expected)
+
+
 def test_telemetry_failure_is_acknowledged_without_formatting_external_error() -> None:
     from structlog.testing import capture_logs
 

@@ -52,7 +52,13 @@ from elspeth.plugins.llm.config_validation import (
     validate_openrouter_base_url,
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import (
+    LLMAuditParent,
+    LLMQueryResult,
+    ParsedFinishReason,
+    observe_http_token_usage,
+    parse_finish_reason,
+)
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
 if TYPE_CHECKING:
@@ -363,6 +369,7 @@ class OpenRouterLLMProvider:
 
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
+        observed_usage = TokenUsage.unknown()
         try:
             # Build request body
             wire = wire_messages(messages)
@@ -408,6 +415,7 @@ class OpenRouterLLMProvider:
             except httpx.RequestError as e:
                 raise NetworkError(f"Network error: {e}") from e
 
+            observed_usage = observe_http_token_usage(response.content)
             data, content, usage, finish_reason, response_model = _validate_chat_completion_response(response)
 
             result = LLMQueryResult(
@@ -433,6 +441,7 @@ class OpenRouterLLMProvider:
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 exc=exc,
+                usage=observed_usage,
             )
             raise
         except BaseException as exc:
@@ -504,6 +513,7 @@ class OpenRouterLLMProvider:
                 usage=usage,
                 raw_response=raw_response,
             ),
+            token_usage=usage,
             latency_ms=(time.perf_counter() - started_at) * 1000,
             resolved_prompt_template_hash=self._resolved_prompt_template_hash,
         )
@@ -515,6 +525,7 @@ class OpenRouterLLMProvider:
         started_at: float,
         request_payload: LLMCallRequest,
         exc: LLMClientError,
+        usage: TokenUsage,
     ) -> None:
         call_index = audit_parent.allocate_call_index(self._recorder)
         message = str(exc) or type(exc).__name__
@@ -523,6 +534,7 @@ class OpenRouterLLMProvider:
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.ERROR,
+            token_usage=usage,
             request_data=request_payload,
             error=LLMCallError(
                 type=type(exc).__name__,

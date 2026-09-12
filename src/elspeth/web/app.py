@@ -80,6 +80,7 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 from elspeth.web.coordination.identity_authority import (
     IdentityDormancyExempted,
@@ -211,6 +212,20 @@ def _run_session_engine_finalizer(
 def _close_readiness_runner(runner: ReadinessProbeRunner) -> None:
     """Close readiness workers for app instances that never run lifespan."""
     runner.close()
+
+
+def _run_auth_audit_finalizer(finalizer: Callable[[], object], *, primary_error: BaseException | None = None) -> None:
+    """Close the audit pool without replacing an application failure."""
+    try:
+        finalizer()
+    except BaseException as exc:
+        if primary_error is None:
+            raise
+        structlog.get_logger().error(
+            "auth_audit_finalization_failed",
+            primary_exc_class=type(primary_error).__name__,
+            finalization_exc_class=type(exc).__name__,
+        )
 
 
 def _parse_worker_count(raw_value: str, *, signal_name: str) -> int:
@@ -488,16 +503,20 @@ async def _boot_prime_openrouter_catalog(settings: WebSettings) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Own the session engine for the complete application lifespan."""
+    """Own session and authentication audit engines for the application lifespan."""
     primary_error: BaseException | None = None
     try:
+        app.state.auth_audit_recorder.start()
         async with _service_lifespan(app):
             yield
     except BaseException as exc:
         primary_error = exc
         raise
     finally:
-        _run_session_engine_finalizer(app.state._session_engine_finalizer, primary_error=primary_error)
+        try:
+            _run_auth_audit_finalizer(app.state._auth_audit_finalizer, primary_error=primary_error)
+        finally:
+            _run_session_engine_finalizer(app.state._session_engine_finalizer, primary_error=primary_error)
 
 
 @asynccontextmanager
@@ -987,7 +1006,7 @@ def _build_local_auth_provider(
     settings: WebSettings,
     identity_authority: RepositoryIdentityAuthority,
     *,
-    resolved_state_mode: Literal["sqlite-single", "external-postgresql"],
+    audit_recorder: AuthAuditRecorder,
 ) -> LocalAuthProvider:
     """Assemble the local provider from its three separate concerns.
 
@@ -999,11 +1018,6 @@ def _build_local_auth_provider(
     never as the engine, so nothing built here can reach those tables around
     it (P4-D6).
     """
-    # The SAME resolved mode the app-state recorder gets. Letting this one
-    # re-resolve would be two recorders that can disagree about which
-    # landscape_url to open and whether to create tables — the admission pair
-    # would land in a different database from the login row it belongs to.
-    audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
 
     def _principal_is_active(identity_id: str) -> bool:
         record = identity_authority.read_identity(identity_id=identity_id)
@@ -1126,6 +1140,11 @@ def _build_local_auth_provider(
 def create_app(settings: WebSettings | None = None) -> FastAPI:
     """Create the application and synchronously clean up failed engine ownership."""
     session_engine_finalizer: weakref.finalize[..., FastAPI] | None = None
+    auth_audit_finalizer: weakref.finalize[..., FastAPI] | None = None
+
+    def register_auth_audit_finalizer(finalizer: weakref.finalize[..., FastAPI]) -> None:
+        nonlocal auth_audit_finalizer
+        auth_audit_finalizer = finalizer
 
     def register_session_engine_finalizer(finalizer: weakref.finalize[..., FastAPI]) -> None:
         nonlocal session_engine_finalizer
@@ -1134,8 +1153,10 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         session_engine_finalizer = finalizer
 
     try:
-        return _create_app(settings, register_session_engine_finalizer)
+        return _create_app(settings, register_session_engine_finalizer, register_auth_audit_finalizer)
     except BaseException as exc:
+        if auth_audit_finalizer is not None:
+            _run_auth_audit_finalizer(auth_audit_finalizer, primary_error=exc)
         if session_engine_finalizer is not None:
             _run_session_engine_finalizer(session_engine_finalizer, primary_error=exc)
         raise
@@ -1144,6 +1165,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 def _create_app(
     settings: WebSettings | None,
     register_session_engine_finalizer: Callable[[weakref.finalize[..., FastAPI]], None],
+    register_auth_audit_finalizer: Callable[[weakref.finalize[..., FastAPI]], None],
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -1504,7 +1526,7 @@ def _create_app(
     # (and the quota row an admission grants). Built before the auth provider
     # because a local provider admits and retires through it, and published
     # on app.state for the identity routes.
-    identity_authority = RepositoryIdentityAuthority(session_engine)
+    identity_authority = RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
     app.state.identity_authority = identity_authority
 
     # --- Auth provider setup ---
@@ -1513,6 +1535,13 @@ def _create_app(
     # provider needs the identities substrate to mint a token at all -- ``sub``
     # is the identity_id. It used to run before the engine existed.
     auth_provider: AuthProvider
+    audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
+    app.state.auth_audit_recorder = audit_recorder
+    # Lifespan starts the audit engine before any auth callback can acquire
+    # the Sessions write lock, and shares it with both provider callbacks.
+    auth_audit_finalizer = weakref.finalize(app, audit_recorder.close)
+    register_auth_audit_finalizer(auth_audit_finalizer)
+    app.state._auth_audit_finalizer = auth_audit_finalizer
     # Wired for SSO when the active profile has every setting it requires
     # (the same rule readiness reports on). ``None`` for a non-local provider
     # means the deployment cannot serve anyone and boot refuses below; the
@@ -1522,11 +1551,11 @@ def _create_app(
         settings,
         session_engine=session_engine,
         identity_authority=identity_authority,
-        resolved_state_mode=resolved_state_mode,
+        audit_recorder=audit_recorder,
     )
     app.state.sso_wiring = sso_wiring
     if settings.auth_provider == "local":
-        local_provider = _build_local_auth_provider(settings, identity_authority, resolved_state_mode=resolved_state_mode)
+        local_provider = _build_local_auth_provider(settings, identity_authority, audit_recorder=audit_recorder)
         local_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
         auth_provider = local_provider
     elif sso_wiring is not None:
@@ -1541,7 +1570,6 @@ def _create_app(
         # object, not the operator-facing message.
         raise RuntimeError(f"{settings.auth_provider} is not wired for single sign-on: missing {', '.join(sso_missing_settings(settings))}")
     app.state.auth_provider = auth_provider
-    app.state.auth_audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
 
     # --- Preferences service ---
     # Per-user composer settings (default_composer_mode, banner_dismissed_at,

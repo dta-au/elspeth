@@ -3729,6 +3729,14 @@ class TestDeploymentStateModeStartup:
         monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         app = create_app(settings)
 
+        # The audit engine now starts before services. Model the externally
+        # provisioned Landscape alongside the provisioned Sessions stand-in;
+        # the recorder still validates it with create_tables=False.
+        audit_url = f"sqlite:///{tmp_path / 'external-audit.db'}"
+        with LandscapeDB.from_url(audit_url):
+            pass
+        monkeypatch.setattr(app.state.auth_audit_recorder, "landscape_url", audit_url)
+
         with (
             patch("elspeth.web.app.ExecutionServiceImpl", return_value=_RecordingExecutionService()),
             patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
@@ -4018,13 +4026,16 @@ class TestAwsEcsValidateOnlyStartup:
             )
         ]
         assert app.state.session_engine is engine
-        assert len(finalizers) == 2
+        assert len(finalizers) == 3
         assert finalizers[0][0] is app
         assert finalizers[0][1] is app_module._dispose_session_engine
         assert finalizers[0][2] == (engine,)
         assert finalizers[1][0] is app
-        assert finalizers[1][1] is app_module._close_readiness_runner
-        assert finalizers[1][2] == (app.state.readiness_probe_runner,)
+        assert finalizers[1][1] == app.state.auth_audit_recorder.close
+        assert finalizers[1][2] == ()
+        assert finalizers[2][0] is app
+        assert finalizers[2][1] is app_module._close_readiness_runner
+        assert finalizers[2][2] == (app.state.readiness_probe_runner,)
         assert settings.data_dir not in mkdir_calls
         assert settings.data_dir / "runs" not in mkdir_calls
         engine.dispose()

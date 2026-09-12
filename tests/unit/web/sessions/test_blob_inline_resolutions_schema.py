@@ -19,12 +19,15 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture
 def engine():
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="schema-test-user")
     return eng
 
 
