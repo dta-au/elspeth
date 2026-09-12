@@ -61,6 +61,7 @@ from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.tree_gate import iter_gate_files, iter_gate_sources
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -369,6 +370,7 @@ def _seed_session_blob(tmp_path: Path) -> tuple[sa.engine.Engine, str, str]:
     storage_path = storage_dir / f"{blob_id}_urls.json"
     storage_path.write_bytes(body)
     with engine.begin() as connection:
+        ensure_test_identity(connection, identity_id="matrix-user")
         connection.execute(
             sessions_table.insert().values(
                 id=session_id,
@@ -817,6 +819,8 @@ def test_server_profile_scope_survives_lowering_and_same_name_user_shadow(
     engine: sa.engine.Engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
     user_store = UserSecretStore(engine=engine, master_key="profile-scope-test-master-key")
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     user_store.set_secret(
         "SHARED_LLM_KEY",
         value="user-value",
@@ -875,6 +879,8 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
     engine: sa.engine.Engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
     user_store = UserSecretStore(engine=engine, master_key="profile-validation-master-key")
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     user_store.set_secret(
         "SHARED_LLM_KEY",
         value="user-value",

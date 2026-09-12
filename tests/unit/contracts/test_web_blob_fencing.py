@@ -34,6 +34,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth_lints.core.ast_dump import stable_ast_dump
+from tests.fixtures.identities import ensure_test_identity
 
 _ROOT = Path(__file__).parents[3]
 _BLOB_ROUTES = _ROOT / "src/elspeth/web/blobs/routes.py"
@@ -3184,13 +3185,14 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     session schema does -- 51 for the coordination substrate, 52 once the
     pluggable-SSO identity substrate landed on top of it, 53 once the read
     admissions took their own rows (elspeth-f98e0ae8b2), and 54 for durable
-    Composer progress and inflight requests. The claim the test
+    Composer progress and inflight requests, then 55 for identity ownership
+    constraints and admission evidence. The claim the test
     makes is unchanged either way: the fence vocabulary lives in the session
     schema and the web coordination PROTOCOL version does not move with it.
     The assertion exists to fail when someone bumps one without the other.
     """
     assert SessionOperationKind.BLOB_READ.value == "blob_read"
-    assert SESSION_SCHEMA_EPOCH == 54
+    assert SESSION_SCHEMA_EPOCH == 55
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"
@@ -3206,6 +3208,8 @@ async def test_stale_blob_read_context_changes_neither_row_nor_canonical_bytes(t
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     authority = SQLiteLocalSessionOperationAuthority(engine)
     created = authority.create_session_with_initial_fence(
         user_id="alice",

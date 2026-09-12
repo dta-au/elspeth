@@ -799,14 +799,18 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("aggregation_result_outputs", "ix_aggregation_result_outputs_ref"),
 )
 
-_REQUIRED_TRIGGERS: tuple[str, ...] = (
-    "trg_audit_export_chunk_insert_validate",
-    "trg_audit_export_snapshot_insert_seal",
-    "trg_audit_export_snapshot_immutable",
-    "trg_audit_export_snapshot_immutable_delete",
-    "trg_audit_export_chunk_immutable",
-    "trg_audit_export_chunk_immutable_delete",
+# PostgreSQL tgtype bits: ROW=1, BEFORE=2, INSERT=4, DELETE=8, UPDATE=16.
+_REQUIRED_POSTGRES_TRIGGERS: Mapping[str, tuple[str, str, int]] = MappingProxyType(
+    {
+        "trg_audit_export_chunk_insert_validate": ("audit_export_snapshot_chunks", "fn_audit_export_chunk_insert_validate", 7),
+        "trg_audit_export_snapshot_insert_seal": ("audit_export_snapshots", "fn_audit_export_snapshot_insert_seal", 7),
+        "trg_audit_export_snapshot_immutable": ("audit_export_snapshots", "fn_audit_export_snapshot_immutable", 19),
+        "trg_audit_export_snapshot_immutable_delete": ("audit_export_snapshots", "fn_audit_export_snapshot_immutable", 11),
+        "trg_audit_export_chunk_immutable": ("audit_export_snapshot_chunks", "fn_audit_export_chunk_immutable", 19),
+        "trg_audit_export_chunk_immutable_delete": ("audit_export_snapshot_chunks", "fn_audit_export_chunk_immutable", 11),
+    }
 )
+_REQUIRED_TRIGGERS: tuple[str, ...] = tuple(_REQUIRED_POSTGRES_TRIGGERS)
 
 _ADDITIVE_INDEX_OWNERS: Mapping[str, str] = MappingProxyType({"ix_tokens_run_id": "tokens"})
 _ADDITIVE_INDEX_NAMES: frozenset[str] = frozenset(_ADDITIVE_INDEX_OWNERS)
@@ -1642,11 +1646,27 @@ class LandscapeDB:
                 if self.engine.dialect.name == "sqlite":
                     trigger_names = set(connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'trigger'").scalars())
                 else:
-                    trigger_names = set(
-                        connection.exec_driver_sql(
-                            "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = current_schema()"
-                        ).scalars()
+                    # information_schema.triggers hides real triggers from
+                    # SELECT-only nonowners. Catalog inspection needs no write
+                    # privilege and binds each trigger to its actual relation,
+                    # function, event, and origin-enabled execution mode.
+                    trigger_rows = connection.exec_driver_sql(
+                        "SELECT trigger.tgname, relation.relname, function.proname, trigger.tgtype "
+                        "FROM pg_catalog.pg_trigger AS trigger "
+                        "JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid "
+                        "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+                        "JOIN pg_catalog.pg_proc AS function ON function.oid = trigger.tgfoid "
+                        "WHERE namespace.nspname = pg_catalog.current_schema() "
+                        "AND function.pronamespace = namespace.oid "
+                        "AND NOT trigger.tgisinternal AND trigger.tgenabled IN ('O', 'A') "
+                        "AND trigger.tgqual IS NULL AND trigger.tgnargs = 0"
                     )
+                    trigger_names = {
+                        row.tgname
+                        for row in trigger_rows
+                        if row.tgname in _REQUIRED_POSTGRES_TRIGGERS
+                        and (row.relname, row.proname, row.tgtype) == _REQUIRED_POSTGRES_TRIGGERS[row.tgname]
+                    }
             missing_triggers = sorted(set(_REQUIRED_TRIGGERS) - trigger_names)
 
         epoch_incompatible = bool(present_landscape_tables) and epoch_incompatible

@@ -19,6 +19,7 @@ from elspeth.web.sessions.models import (
     websocket_tickets_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 def seed_ticket_run(engine: Engine) -> tuple[str, str, UserIdentity]:
@@ -82,7 +83,9 @@ def test_consumption_rechecks_live_authorization(ticket_engine, refusal):
         elif refusal == "disabled":
             conn.execute(update(identities_table).values(access_state="disabled"))
         elif refusal == "wrong-owner":
-            conn.execute(update(sessions_table).where(sessions_table.c.id == session_id).values(user_id=str(uuid4())))
+            other_owner = str(uuid4())
+            ensure_test_identity(conn, identity_id=other_owner)
+            conn.execute(update(sessions_table).where(sessions_table.c.id == session_id).values(user_id=other_owner))
         elif refusal == "archived":
             conn.execute(update(sessions_table).values(archived_at=datetime.now(UTC)))
         elif refusal == "provider":

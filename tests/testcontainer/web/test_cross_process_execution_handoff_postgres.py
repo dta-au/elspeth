@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
 import os
 import time
 from pathlib import Path
@@ -11,7 +12,8 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from tests.fixtures.identities import ensure_test_identity
 from tests.testcontainer.web.test_cross_process_run_reconciliation_postgres import (
     _expire_dead_owner,
     _process,
@@ -20,12 +22,14 @@ from tests.testcontainer.web.test_cross_process_run_reconciliation_postgres impo
 from tests.testcontainer.web.test_cross_process_run_reconciliation_postgres import recovery_databases as recovery_databases
 from tests.unit.web.test_app import _settings
 
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionDecision
 from elspeth.contracts.enums import RunStatus
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import rows_table, run_start_admissions_table, token_outcomes_table
 from elspeth.core.landscape.schema import runs_table as landscape_runs_table
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run
 from elspeth.plugins.llm.model_catalog import read_openrouter_catalog_snapshot_id
+from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
@@ -36,7 +40,7 @@ from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.recovery import RunRecoveryCoordinator
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import run_events_table, run_execution_inputs_table, run_start_permits_table, runs_table
+from elspeth.web.sessions.models import identities_table, run_events_table, run_execution_inputs_table, run_start_permits_table, runs_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -80,6 +84,8 @@ def _die_during_web_dispatch(session_url, landscape_url, data_dir, seam, connect
         execution, _blobs = _execution(sessions, engine, session_url, landscape_url, data_dir)
         with LandscapeDB.from_url(landscape_url):
             pass
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await sessions.create_session("alice", "durable CSV admission", "local")
         source_path = root / "blobs" / str(session.id) / "input.csv"
         output_path = root / "outputs" / str(session.id) / "result.csv"
@@ -246,6 +252,54 @@ def _recover_unavailable_retained_source(session_url, landscape_url, data_dir, r
     asyncio.run(recover())
 
 
+def _cancel_refused_recovery(session_url, landscape_url, data_dir, run_id, connection):
+    async def cancel():
+        engine = create_session_engine(session_url)
+        sessions = _service(engine, f"fresh-cancellation-{uuid4()}")
+        execution, blobs = _execution(sessions, engine, session_url, landscape_url, data_dir)
+        coordinator = RunRecoveryCoordinator(sessions, execution, blobs, landscape_url=landscape_url, create_tables=False)
+        try:
+            await execution.cancel(UUID(run_id), user=UserIdentity(user_id="alice", username="Alice"))
+            await coordinator.recover()
+            run = await sessions.get_run(UUID(run_id))
+            assert run.status == "cancelled"
+            assert run.saga_state == "terminal_cancelled"
+            assert not execution.get_live_run_ids()
+            connection.send((str(run.id), run.status, run.saga_state))
+        finally:
+            await execution.shutdown()
+            engine.dispose()
+
+    asyncio.run(cancel())
+
+
+def _recover_disabled_owner(session_url, landscape_url, data_dir, run_id, connection):
+    async def recover():
+        engine = create_session_engine(session_url)
+        sessions = _service(engine, f"disabled-recovery-{uuid4()}")
+        execution, blobs = _execution(sessions, engine, session_url, landscape_url, data_dir)
+        coordinator = RunRecoveryCoordinator(sessions, execution, blobs, landscape_url=landscape_url, create_tables=False)
+        try:
+            with (
+                patch.object(
+                    execution, "_restore_admitted_run", side_effect=AssertionError("Disabled owner must not restore inputs")
+                ) as restore,
+                patch.object(execution._executor, "submit", side_effect=AssertionError("Disabled owner must not dispatch")) as submit,
+            ):
+                await coordinator.recover()
+                restore.assert_not_called()
+                submit.assert_not_called()
+            run = await sessions.get_run(UUID(run_id))
+            assert run.status == "failed"
+            assert not execution.get_live_run_ids()
+            connection.send((str(run.id), run.status))
+        finally:
+            await execution.shutdown()
+            engine.dispose()
+
+    asyncio.run(recover())
+
+
 @pytest.mark.parametrize("damage", ["missing", "changed"])
 def test_fresh_process_refuses_unavailable_retained_source(request, tmp_path, damage):
     session_url, landscape_url = request.getfixturevalue("recovery_databases")
@@ -292,6 +346,62 @@ def test_fresh_process_refuses_unavailable_retained_source(request, tmp_path, da
             assert not {"failed", "completed", "cancelled"}.intersection(events)
         with LandscapeDB.from_url(landscape_url, create_tables=False) as landscape, landscape.engine.connect() as conn:
             assert conn.execute(select(func.count()).select_from(landscape_runs_table)).scalar_one() == 0
+        assert _process(
+            _cancel_refused_recovery,
+            session_url,
+            landscape_url,
+            str(tmp_path),
+            run_id,
+            expected_exit=0,
+        ) == (run_id, "cancelled", "terminal_cancelled")
+        with engine.connect() as conn:
+            permit = conn.execute(select(run_start_permits_table).where(run_start_permits_table.c.run_id == run_id)).one()
+            assert permit.start_state == "cancelled_before_permit"
+            assert permit.permit_subject_hash is None
+            assert permit.issued_at is None
+            events = conn.execute(select(run_events_table.c.event_type).where(run_events_table.c.run_id == run_id)).scalars().all()
+            assert events.count("cancelled") == 1
+            assert not {"failed", "completed"}.intersection(events)
+        assert not Path(output_path).exists()
+        with LandscapeDB.from_url(landscape_url, create_tables=False) as landscape, landscape.engine.connect() as conn:
+            assert conn.execute(select(func.count()).select_from(landscape_runs_table)).scalar_one() == 0
+            assert conn.execute(select(func.count()).select_from(run_start_admissions_table)).scalar_one() == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("seam", ["admission", "permit"])
+def test_fresh_process_refuses_disabled_owner_before_restore_or_dispatch(request, tmp_path, seam):
+    session_url, landscape_url = request.getfixturevalue("recovery_databases")
+    run_id, session_id, owner, source_path, output_path = _process(
+        _die_during_web_dispatch, session_url, landscape_url, str(tmp_path), seam, expected_exit=75
+    )
+    engine = create_session_engine(session_url)
+    try:
+        with engine.begin() as conn:
+            original = conn.execute(select(run_start_permits_table).where(run_start_permits_table.c.run_id == run_id)).one()
+            conn.execute(update(identities_table).where(identities_table.c.identity_id == "alice").values(access_state="disabled"))
+        _expire_dead_owner(session_url, session_id, owner)
+        assert _process(_recover_disabled_owner, session_url, landscape_url, str(tmp_path), run_id, expected_exit=0) == (run_id, "failed")
+        with engine.connect() as conn:
+            permit = conn.execute(select(run_start_permits_table).where(run_start_permits_table.c.run_id == run_id)).one()
+            if seam == "admission":
+                assert permit.start_state == "refused"
+                assert permit.permit_subject_hash is None
+                assert permit.issued_at is None
+                decision = ChargeableAdmissionDecision.model_validate_json(json.dumps(permit.admission_decision))
+            else:
+                assert permit.start_state == "start_permitted"
+                assert permit.permit_subject_hash == original.permit_subject_hash
+                assert permit.issued_at == original.issued_at
+                assert permit.admission_decision == original.admission_decision
+                decision = ChargeableAdmissionDecision.model_validate_json(json.dumps(permit.execution_refusal))
+            assert decision.refusal_reason is AdmissionRefusalReason.IDENTITY_DISABLED
+        assert Path(source_path).read_text() == _ADMITTED_CSV
+        assert not Path(output_path).exists()
+        with LandscapeDB.from_url(landscape_url, create_tables=False) as landscape, landscape.engine.connect() as conn:
+            assert conn.execute(select(func.count()).select_from(landscape_runs_table)).scalar_one() == 0
+            assert conn.execute(select(func.count()).select_from(run_start_admissions_table)).scalar_one() == 0
     finally:
         engine.dispose()
 

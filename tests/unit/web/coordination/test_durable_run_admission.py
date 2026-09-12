@@ -32,6 +32,56 @@ from elspeth.web.sessions.protocol import RunAlreadyActiveError
 NO_QUOTA_POLICY = ChargeableAdmissionPolicy(secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
 
 
+def test_pre_restore_assessment_leaves_success_pending_and_cancellable(engine):
+    authority, context, run, _ = _admission(engine)
+    assessed = authority.mutate(context, lambda tx: tx.runs.assess_start_admission(run_id=run.id, policy=NO_QUOTA_POLICY))
+    assert assessed.state is StartPermitState.PENDING
+    assert assessed.admission_decision is None and assessed.permit_id is None
+    with engine.connect() as conn:
+        assert conn.execute(select(runs_table.c.saga_state)).scalar_one() == "start_intent"
+    RepositoryRunCancellationAuthority(engine).request(run.id, session_id=run.session_id, user_id="alice", auth_provider_type="local")
+    cancelled = authority.mutate(context, lambda tx: tx.runs.observe_start_permit_for_cleanup(run_id=run.id))
+    assert cancelled.state is StartPermitState.CANCELLED_BEFORE_PERMIT
+    assert cancelled.permit_id is None
+
+
+@pytest.mark.parametrize("disable_after_assessment", [False, True])
+def test_post_restore_mint_rechecks_identity(engine, disable_after_assessment):
+    authority, context, run, _ = _admission(engine)
+    assert (
+        authority.mutate(context, lambda tx: tx.runs.assess_start_admission(run_id=run.id, policy=NO_QUOTA_POLICY)).state
+        is StartPermitState.PENDING
+    )
+    if disable_after_assessment:
+        with engine.begin() as conn:
+            conn.execute(update(identities_table).where(identities_table.c.identity_id == "alice").values(access_state="disabled"))
+    issued = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    assert issued.state is (StartPermitState.REFUSED if disable_after_assessment else StartPermitState.START_PERMITTED)
+    assert issued.admission_decision.allowed is not disable_after_assessment
+
+
+@pytest.mark.parametrize("already_issued", [False, True])
+def test_pre_restore_assessment_records_refusal_preserving_issued_history(engine, already_issued):
+    authority, context, run, _ = _admission(engine)
+    first = (
+        authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY)) if already_issued else None
+    )
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == "alice").values(access_state="disabled"))
+    refused = authority.mutate(context, lambda tx: tx.runs.assess_start_admission(run_id=run.id, policy=NO_QUOTA_POLICY))
+    if first is not None:
+        assert refused.subject_hash == first.subject_hash
+        assert refused.admission_decision == first.admission_decision
+        assert refused.execution_refusal.refusal_reason is AdmissionRefusalReason.IDENTITY_DISABLED
+    else:
+        assert refused.state is StartPermitState.REFUSED
+        assert refused.admission_decision.refusal_reason is AdmissionRefusalReason.IDENTITY_DISABLED
+        assert refused.permit_id is None
+    with engine.connect() as conn:
+        assert conn.execute(select(runs_table.c.saga_state)).scalar_one() == "admission_refusal_pending"
+        assert conn.execute(select(func.count()).select_from(run_events_table)).scalar_one() == 1
+
+
 def _admission(engine):
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")

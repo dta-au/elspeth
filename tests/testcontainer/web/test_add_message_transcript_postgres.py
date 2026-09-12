@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import structlog
 from sqlalchemy import Engine, func, select
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -55,6 +56,8 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
     postgres_service: SessionServiceImpl,
     postgres_engine: Engine,
 ) -> None:
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session = await postgres_service.create_session("alice", "PG stale reader", "local")
 
     def _count(conn) -> int:

@@ -761,6 +761,19 @@ def mock_session_service() -> MagicMock:
         )
 
     svc.issue_run_start_permit.side_effect = issue_run_start_permit
+
+    async def assess_run_start_admission(run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+        return RunStartPermitRecord(
+            run_id=str(run_id),
+            state=StartPermitState.PENDING,
+            permit_id=None,
+            permit_epoch=None,
+            subject_hash=None,
+            issued_at=None,
+            cancelled_at=None,
+        )
+
+    svc.assess_run_start_admission.side_effect = assess_run_start_admission
     # state_record needs fields that state_from_record() accesses
     state = SimpleNamespace(
         id=uuid4(),
@@ -6072,6 +6085,8 @@ def test_durable_recovery_refusal_preserves_reason_without_terminalizing(
             durable_admission=True,
         )
     transaction.runs.mark_recovery_required.assert_called_once_with(run_id=run_id, reason=reason)
+    mock_session_service.assess_run_start_admission.assert_awaited_once()
+    mock_session_service.issue_run_start_permit.assert_not_called()
     mock_session_service.update_run_status.assert_not_called()
     finalize.assert_not_called()
 

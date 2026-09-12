@@ -42,6 +42,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from elspeth.web.shareable_reviews.service import ShareableReviewService
 from elspeth.web.shareable_reviews.signer import ShareTokenSigner
+from tests.fixtures.identities import ensure_test_identity
 
 _VALID_SIGNING_KEY = b"k" * 32
 
@@ -176,6 +177,8 @@ def session_engine_with_row(  # type: ignore[no-untyped-def]
     """Insert the parent session + composition_state rows so the FK on
     ``composer_completion_events`` resolves at audit-insert time.
     """
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=session_record.user_id)
     authority = SQLiteLocalSessionOperationAuthority(engine)
     monkeypatch.setattr(coordination_repository, "_new_session_id", lambda: session_record.id)
     created = authority.create_session_with_initial_fence(

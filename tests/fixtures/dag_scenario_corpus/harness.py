@@ -21,6 +21,7 @@ from sqlalchemy import select
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import RunStatus
 from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
     AUDIT_EXPORT_MAX_CHUNK_BYTES,
     AUDIT_EXPORT_MAX_CHUNK_RECORDS,
     AUDIT_EXPORT_SERIALIZATION_VERSION,
@@ -30,6 +31,7 @@ from elspeth.contracts.audit_export import (
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import CoalesceCollisionError
+from elspeth.contracts.export_records import AuditExportConfigRecord, AuthEventCoverageExportRecord
 from elspeth.contracts.hashing import canonical_json as contract_canonical_json
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
@@ -1864,6 +1866,8 @@ def _validate_durable_sink_effect_material(records: list[dict[str, Any]]) -> Non
 
 
 _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("audit_export_config", (), ("public_config",)),
+    ("auth_event_coverage", (), ("policy", "selection_cutoff", "selection_basis", "selected_count", "reason")),
     (
         "run",
         ("run_id",),
@@ -2156,10 +2160,11 @@ def _validate_portable_manifest(records: list[dict[str, Any]]) -> None:
         source_status=str(run["status"]),
         source_completed_at=expected_completed_at,
         export_format="json",
-        exporter_version="landscape-exporter-v1",
+        exporter_version=AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
         serialization_version=AUDIT_EXPORT_SERIALIZATION_VERSION,
         chunking_algorithm_version="record-framing-v1",
         include_raw_error_rows=False,
+        auth_events="omitted",
         per_chunk_byte_limit=AUDIT_EXPORT_MAX_CHUNK_BYTES,
         per_chunk_record_limit=AUDIT_EXPORT_MAX_CHUNK_RECORDS,
         signing_mode="unsigned",
@@ -2211,7 +2216,33 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
     def project(record_type: str, row: Mapping[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
         return {"record_type": record_type, **{field: row[field] for field in fields}}
 
-    records: list[dict[str, Any]] = []
+    # These export declarations describe the harness's explicit current
+    # unsigned/omitted-auth policy. They are independently constructed, never
+    # copied from the exporter under test, and checked by the parity schema.
+    export_config: AuditExportConfigRecord = {
+        "record_type": "audit_export_config",
+        "public_config": {
+            "auth_events": "omitted",
+            "chunking_algorithm_version": "record-framing-v1",
+            "export_format": "json",
+            "exporter_version": AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
+            "include_raw_error_rows": False,
+            "per_chunk_byte_limit": AUDIT_EXPORT_MAX_CHUNK_BYTES,
+            "per_chunk_record_limit": AUDIT_EXPORT_MAX_CHUNK_RECORDS,
+            "serialization_version": AUDIT_EXPORT_SERIALIZATION_VERSION,
+            "signer_key_id": "UNSIGNED",
+            "signing_mode": "unsigned",
+        },
+    }
+    auth_coverage: AuthEventCoverageExportRecord = {
+        "record_type": "auth_event_coverage",
+        "policy": "omitted",
+        "selection_cutoff": None,
+        "selection_basis": None,
+        "selected_count": None,
+        "reason": "not_requested",
+    }
+    records: list[dict[str, Any]] = [dict(export_config), dict(auth_coverage)]
     with db.connection() as connection:
         run_fields = ("run_id", "status", "canonical_version", "config_hash", "settings_json", "reproducibility_grade")
         run_rows = fetch(runs_table, run_fields)

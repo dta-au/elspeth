@@ -64,6 +64,14 @@ def test_guided_reservation_requires_the_exact_parent_session_context(owner: typ
     assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
 
 
+@pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
+@pytest.mark.parametrize("method_name", ["assess_run_start_admission", "issue_run_start_permit"])
+def test_run_admission_requires_the_exact_session_context(owner: type[Any], method_name: str) -> None:
+    parameter = _required_parameter(owner, method_name, "session_operation_context")
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
+
+
 def test_route_guided_reservation_adapter_cannot_omit_parent_authority() -> None:
     source = textwrap.dedent(inspect.getsource(reserve_or_replay_guided_operation))
     assert "SessionOperationLease.acquire" in source
@@ -465,6 +473,13 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         (
             (run_protocol, implementation_types[2]),
             {
+                "assess_start_admission": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("policy", inspect.Parameter.KEYWORD_ONLY, ChargeableAdmissionPolicy),
+                    ),
+                    sessions_protocol.RunStartPermitRecord,
+                ),
                 "issue_start_permit": (
                     (
                         ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),

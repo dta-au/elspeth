@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import Connection, event
+from tests.fixtures.identities import ensure_test_identity
 from tests.testcontainer.web import test_blob_custody_lock_isolation_postgres as custody_fixtures
 
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
@@ -27,6 +28,8 @@ deployment = custody_fixtures.deployment
 async def test_composer_storage_pause_does_not_hold_sessions_lock(deployment, monkeypatch: pytest.MonkeyPatch, operation: str) -> None:
     session_engine, blob_engine, sessions, shared = deployment
     custody_fixtures._register_instance(session_engine, sessions.session_operation_owner_instance_id)
+    with session_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="lease-progress")
     session = await sessions.create_session("lease-progress", "Composer", "local")
     authority = sessions.session_operation_authority
     context = authority.acquire(

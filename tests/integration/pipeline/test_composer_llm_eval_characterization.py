@@ -1143,7 +1143,11 @@ def test_scenario_3_get_pipeline_state_preserves_redacted_patched_blob_path_that
 async def _failed_progress_for_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ComposerProgressEvent:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     settings = _web_settings(tmp_path / "data", composer_timeout_seconds=0.05)
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
+    sessions_service = _session_service_for_characterization(
+        data_dir=tmp_path / "data",
+        session_id=SCENARIO_1A_SESSION_ID,
+    )
+    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings, sessions_service=sessions_service)
     events: list[ComposerProgressEvent] = []
 
     async def record_progress(event: ComposerProgressEvent) -> None:

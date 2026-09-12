@@ -26,6 +26,7 @@ from elspeth.web.sessions.protocol import CompositionStateData, CompositionState
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 
 
 class ProfileSessionService(SessionServiceImpl):
@@ -105,6 +106,8 @@ async def create_profile_session(
 ) -> tuple[Engine, ProfileSessionService, UUID]:
     engine = create_session_engine(f"sqlite:///{root / 'sessions.db'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
     sessions = ProfileSessionService(engine, root=root, run_id=run_id, snapshot=snapshot, user_id=user_id)
     session = await sessions.create_session(user_id, "web CLI profile", "local")
     compose = await SessionOperationLease.acquire(

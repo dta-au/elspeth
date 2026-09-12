@@ -10,12 +10,13 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts import CallType, Determinism, TransformResult
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.engine.batch_adapter import ExceptionResult
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError, LLMClientError
@@ -52,6 +53,7 @@ class RecordedAuditCall:
     request_ref: str | None = None
     response_ref: str | None = None
     resolved_prompt_template_hash: str | None = None
+    token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE
 
 
 @dataclass
@@ -85,6 +87,7 @@ class InMemoryAuditWriter:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> RecordedAuditCall:
         call = RecordedAuditCall(
             state_id=state_id,
@@ -99,6 +102,7 @@ class InMemoryAuditWriter:
             request_ref=request_ref,
             response_ref=response_ref,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
         self.calls.append(call)
         return call
@@ -118,6 +122,7 @@ class InMemoryAuditWriter:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> RecordedAuditCall:
         if call_index is None:
             call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
@@ -134,6 +139,7 @@ class InMemoryAuditWriter:
             request_ref=request_ref,
             response_ref=response_ref,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
         self.operation_calls.append(call)
         return call
@@ -573,6 +579,7 @@ class TestLLMTransformOpenRouterPipelining:
 
     def test_successful_api_call_emits_enriched_row(
         self,
+        audit_writer: InMemoryAuditWriter,
         ctx: PluginContext,
         transform: LLMTransform,
         collector: CollectorOutputPort,
@@ -600,6 +607,9 @@ class TestLLMTransformOpenRouterPipelining:
             "prompt_tokens": 10,
             "completion_tokens": 25,
         }
+        assert [call.call_type for call in audit_writer.calls] == [CallType.HTTP, CallType.LLM]
+        assert audit_writer.calls[0].token_usage == UNKNOWN_TOKEN_USAGE
+        assert audit_writer.calls[1].token_usage == TokenUsage(prompt_tokens=10, completion_tokens=25)
         assert result.success_reason is not None
         assert "llm_response_template_hash" in result.success_reason["metadata"]
         assert "llm_response_variables_hash" in result.success_reason["metadata"]
@@ -1089,6 +1099,8 @@ class TestLLMTransformOpenRouterIntegration:
         assert result.status == "success"
         assert result.row is not None
         assert result.row["llm_response_usage"] == {}
+        assert [call.call_type for call in audit_writer.calls] == [CallType.HTTP, CallType.LLM]
+        assert all(call.token_usage == UNKNOWN_TOKEN_USAGE for call in audit_writer.calls)
 
     def test_connection_error_raises_network_error(
         self, audit_writer: InMemoryAuditWriter, collector: CollectorOutputPort, chaosllm_server

@@ -354,6 +354,9 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
         "src/elspeth/web/coordination/run_start_permit_authority.py", "RepositoryRunStartPermitAuthority.issue", "RunStartPermitAuthority"
     ),
     AuthoritySymbol(
+        "src/elspeth/web/coordination/run_start_permit_authority.py", "RepositoryRunStartPermitAuthority._assess", "RunStartPermitAuthority"
+    ),
+    AuthoritySymbol(
         "src/elspeth/web/coordination/run_cancellation_authority.py",
         "RepositoryRunCancellationAuthority.request",
         "RunCancellationAuthority",
@@ -1203,37 +1206,37 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ab417310ef40b484",
         1,
         "SessionRunMutationAuthority",
-        line=1586,
+        line=1600,
     ),
     # The identity-locked permit decision either records initial refusal or
     # attaches a recovery refusal without rewriting the historical allowance.
     # The run stays failed/admission_refusal_pending until cleanup settles.
     WriterIdentity(
         "src/elspeth/web/coordination/run_start_permit_authority.py",
-        "RepositoryRunStartPermitAuthority.issue",
+        "RepositoryRunStartPermitAuthority._assess",
         "run_start_permits",
         "update",
-        "bc844f1f0fc528d6",
+        "2f5970706a950c82",
         1,
         "RunStartPermitAuthority",
         line=61,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/run_start_permit_authority.py",
-        "RepositoryRunStartPermitAuthority.issue",
+        "RepositoryRunStartPermitAuthority._assess",
         "run_start_permits",
         "update",
-        "bc844f1f0fc528d6",
+        "2f5970706a950c82",
         2,
         "RunStartPermitAuthority",
         line=72,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/run_start_permit_authority.py",
-        "RepositoryRunStartPermitAuthority.issue",
+        "RepositoryRunStartPermitAuthority._assess",
         "runs",
         "update",
-        "bc844f1f0fc528d6",
+        "2f5970706a950c82",
         1,
         "RunStartPermitAuthority",
         line=80,
@@ -1592,7 +1595,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d8e2ea36cf4bd35c",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3485,
+        line=3499,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1625,7 +1628,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="911ff034cb757589",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1613,
+        line=1627,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1636,7 +1639,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="1822dba79eb9ed3d",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1629,
+        line=1643,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1647,7 +1650,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="6613984de3a26bff",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1648,
+        line=1662,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1688,10 +1691,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="RepositoryRunStartPermitAuthority.issue",
         table="run_start_permits",
         operation="update",
-        fingerprint="39136d2fd7d9a919",
+        fingerprint="6e53f9d56ee85506",
         ordinal=1,
         authority="RunStartPermitAuthority",
-        line=115,
+        line=130,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1699,10 +1702,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="RepositoryRunStartPermitAuthority.issue",
         table="runs",
         operation="update",
-        fingerprint="39136d2fd7d9a919",
+        fingerprint="6e53f9d56ee85506",
         ordinal=1,
         authority="RunStartPermitAuthority",
-        line=128,
+        line=143,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1733,7 +1736,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "2f1a2d64948bf4b7",
         1,
         "SessionBlobMutationAuthority",
-        line=3235,
+        line=3249,
     ),
     # append_audit_message -> append_audit_messages (7e1f1f86e): one locked
     # transaction inserts the whole audit cohort and bumps the session once.
@@ -2065,7 +2068,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "8c66fbb679cf7fa3",
         1,
         "SessionBlobMutationAuthority",
-        line=3060,
+        line=3074,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2075,7 +2078,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "bca2ee74a8a93022",
         1,
         "SessionBlobMutationAuthority",
-        line=2239,
+        line=2253,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2085,7 +2088,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "6128417bd9a69f02",
         1,
         "SessionBlobMutationAuthority",
-        line=2302,
+        line=2316,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2095,7 +2098,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "2ecd759927d60392",
         1,
         "SessionBlobMutationAuthority",
-        line=2356,
+        line=2370,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2105,7 +2108,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d2ea73ee0e8472e4",
         1,
         "SessionBlobMutationAuthority",
-        line=2364,
+        line=2378,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2115,7 +2118,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "75415f0d12b7a661",
         1,
         "SessionBlobMutationAuthority",
-        line=2416,
+        line=2430,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2125,7 +2128,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "75415f0d12b7a661",
         1,
         "SessionBlobMutationAuthority",
-        line=2436,
+        line=2450,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2298,7 +2301,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "3d19f2b10e4f6a34",
         1,
         "SessionOperationAuthority",
-        line=4549,
+        line=4563,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2308,7 +2311,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "3d19f2b10e4f6a34",
         1,
         "SessionOperationAuthority",
-        line=4559,
+        line=4573,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2318,7 +2321,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "3d19f2b10e4f6a34",
         1,
         "SessionOperationAuthority",
-        line=4573,
+        line=4587,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2328,7 +2331,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "83981192adddd83f",
         1,
         "SessionOperationAuthority",
-        line=4666,
+        line=4680,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2338,7 +2341,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ff923dcba8b3e8e7",
         1,
         "SessionOperationAuthority",
-        line=4867,
+        line=4881,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2348,7 +2351,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d41bbaef242667cd",
         1,
         "SessionOperationAuthority",
-        line=4946,
+        line=4960,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2358,7 +2361,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "6be0e794bca1608d",
         1,
         "SessionOperationAuthority",
-        line=5492,
+        line=5506,
     ),
     # session_read_admissions (epoch 53, elspeth-f98e0ae8b2): admission sweeps
     # the session's expired rows and inserts its own; renew is the only
@@ -2372,7 +2375,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "8cf4bc5cc87457bd",
         1,
         "SessionOperationAuthority",
-        line=4744,
+        line=4758,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2382,7 +2385,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "8cf4bc5cc87457bd",
         1,
         "SessionOperationAuthority",
-        line=4752,
+        line=4766,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2392,7 +2395,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d41bbaef242667cd",
         1,
         "SessionOperationAuthority",
-        line=4933,
+        line=4947,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2402,7 +2405,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "6be0e794bca1608d",
         1,
         "SessionOperationAuthority",
-        line=5482,
+        line=5496,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2412,7 +2415,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "66cc108182d86009",
         1,
         "SessionOperationAuthority",
-        line=5512,
+        line=5526,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2422,7 +2425,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "b964b22650d92b97",
         1,
         "SessionOperationAuthority",
-        line=5251,
+        line=5265,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2432,7 +2435,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d5ab9aa3497d191a",
         1,
         "SessionOperationAuthority",
-        line=5266,
+        line=5280,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2442,7 +2445,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "7326f9c03db2a1c7",
         1,
         "SessionOperationAuthority",
-        line=5280,
+        line=5294,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2452,7 +2455,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "988ac755147ef9bc",
         1,
         "SessionOperationAuthority",
-        line=5341,
+        line=5355,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2462,7 +2465,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ae78f92031e7eebb",
         1,
         "SessionForkChildMutations",
-        line=3871,
+        line=3885,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2472,7 +2475,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "b3fcd50e04854888",
         1,
         "SessionForkChildMutations",
-        line=3924,
+        line=3938,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2482,7 +2485,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "16cc2a98abfd1f5e",
         1,
         "SessionForkParentGuidedMutations",
-        line=4057,
+        line=4071,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2502,7 +2505,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "f926157e24accee8",
         1,
         "SessionRunMutationAuthority",
-        line=1708,
+        line=1722,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/run_recovery_authority.py",
@@ -2532,7 +2535,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "b0eb63d6e0d9027b",
         1,
         "SessionComposerMutationAuthority",
-        line=5705,
+        line=5719,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2542,7 +2545,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "2e42be4b632cb581",
         1,
         "SessionComposerMutationAuthority",
-        line=5729,
+        line=5743,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -2626,7 +2629,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "950a5b666e6a29e8",
         1,
         "SessionForkAuthority",
-        line=13876,
+        line=13886,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -2636,7 +2639,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "950a5b666e6a29e8",
         1,
         "SessionForkAuthority",
-        line=13887,
+        line=13897,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -2646,7 +2649,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "950a5b666e6a29e8",
         2,
         "SessionForkAuthority",
-        line=13907,
+        line=13917,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -2656,7 +2659,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "950a5b666e6a29e8",
         1,
         "SessionForkAuthority",
-        line=13955,
+        line=13965,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -2666,7 +2669,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "950a5b666e6a29e8",
         1,
         "SessionForkAuthority",
-        line=14009,
+        line=14019,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3396,7 +3399,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "4f9e61b1cf7247b0",
         1,
         "SessionBlobMutationAuthority",
-        line=3384,
+        line=3398,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3406,7 +3409,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "32bd4fca1428b085",
         1,
         "SessionBlobMutationAuthority",
-        line=3325,
+        line=3339,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3416,7 +3419,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "87f41b9adb5c8772",
         1,
         "SessionBlobMutationAuthority",
-        line=3332,
+        line=3346,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3426,7 +3429,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "0e357be387ddc260",
         1,
         "SessionBlobMutationAuthority",
-        line=2762,
+        line=2776,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3436,7 +3439,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d2eb84d546dbcdd2",
         1,
         "SessionBlobMutationAuthority",
-        line=2537,
+        line=2551,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3446,7 +3449,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "4c42110eaa7c5994",
         1,
         "SessionBlobMutationAuthority",
-        line=3716,
+        line=3730,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3456,7 +3459,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "05fd90838bf9a030",
         1,
         "SessionBlobMutationAuthority",
-        line=3409,
+        line=3423,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3466,7 +3469,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "afe03ed89b5a16c7",
         1,
         "SessionBlobMutationAuthority",
-        line=3284,
+        line=3298,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3476,7 +3479,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "3fd8ace829dbb08b",
         1,
         "SessionBlobMutationAuthority",
-        line=2731,
+        line=2745,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3486,7 +3489,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "f7b3307ef1e90c89",
         1,
         "SessionBlobMutationAuthority",
-        line=3633,
+        line=3647,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3496,7 +3499,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "a2e525368ada9268",
         1,
         "SessionBlobMutationAuthority",
-        line=3605,
+        line=3619,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3506,7 +3509,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "850298970c19565f",
         1,
         "SessionBlobMutationAuthority",
-        line=3137,
+        line=3151,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3516,7 +3519,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d4eba14bc84728e8",
         1,
         "SessionBlobMutationAuthority",
-        line=2609,
+        line=2623,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3526,7 +3529,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d112eae374c9b904",
         1,
         "SessionBlobMutationAuthority",
-        line=2651,
+        line=2665,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3536,7 +3539,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c997a216a1a51351",
         1,
         "SessionBlobMutationAuthority",
-        line=2455,
+        line=2469,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3546,7 +3549,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d22b3792b721f8ac",
         1,
         "SessionBlobMutationAuthority",
-        line=2829,
+        line=2843,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -3556,7 +3559,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "4f9e61b1cf7247b0",
         1,
         "SessionBlobMutationAuthority",
-        line=3366,
+        line=3380,
     ),
     # src/elspeth/web/coordination/repository.py :: SessionMutationAuthority
     WriterIdentity(
@@ -3578,7 +3581,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "b268c9591db479c5",
         1,
         "SessionOperationAuthority",
-        line=5050,
+        line=5064,
     ),
     # src/elspeth/web/coordination/repository.py :: SessionRunMutationAuthority
     WriterIdentity(
@@ -3589,7 +3592,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "5009526a773c2d16",
         1,
         "SessionRunMutationAuthority",
-        line=1807,
+        line=1821,
     ),
     # src/elspeth/web/coordination/run_recovery_authority.py :: GlobalRunRecoveryAuthority
     WriterIdentity(
@@ -3684,7 +3687,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "2a24f2fb856584b3",
         1,
         "SessionOperationAuthority",
-        line=5387,
+        line=5401,
     ),
     # src/elspeth/web/blobs/service.py :: SessionBlobMutationAuthority
     #
@@ -4011,7 +4014,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="060f65def285276f",
         ordinal=1,
         authority=None,
-        line=10109,
+        line=10119,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4278,7 +4281,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f98bc6d74193a045",
         1,
         "SessionOperationAuthority",
-        line=4604,
+        line=4618,
     ),
     # ── family R (D6 burn-down, elspeth-e483fe7f85 stage 3): non-escaping
     # acquisitions whose symbol carries no other row tree-wide -- the scanner
@@ -4566,7 +4569,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "5bc478ef3c0f3159",
         1,
         None,
-        line=10140,
+        line=10150,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4576,7 +4579,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "0b7e7759f27b0141",
         1,
         None,
-        line=10155,
+        line=10165,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4586,7 +4589,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3d5bacc9c0cc086c",
         1,
         None,
-        line=10204,
+        line=10214,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4596,7 +4599,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e2674828bb9717c7",
         1,
         None,
-        line=10299,
+        line=10309,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4606,7 +4609,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "48cf615d2b446722",
         1,
         None,
-        line=10318,
+        line=10328,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4616,7 +4619,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "af0aa9fb126f5b07",
         1,
         None,
-        line=13291,
+        line=13301,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4626,7 +4629,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3a0d4f58a95545b6",
         1,
         None,
-        line=14080,
+        line=14090,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4636,7 +4639,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "79cbcb06fa877308",
         1,
         None,
-        line=14336,
+        line=14346,
     ),
     # src/elspeth/web/shareable_reviews/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -4705,7 +4708,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "1084a431b73718a3",
         1,
         None,
-        line=833,
+        line=837,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): the connection is handed
     # to ``read_schema_identities`` behind a plain import, whose body executes
@@ -4718,7 +4721,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "54f25c9b2650a66b",
         1,
         None,
-        line=858,
+        line=862,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -4728,7 +4731,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f95bb339c5816e92",
         1,
         None,
-        line=956,
+        line=960,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -4738,7 +4741,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "7b14f45607d6611f",
         1,
         None,
-        line=1176,
+        line=1180,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -4748,7 +4751,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bc4b6272008ed6ec",
         1,
         None,
-        line=1321,
+        line=1325,
         connection_escape=True,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
@@ -4761,7 +4764,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b92e2e573b8362dd",
         1,
         None,
-        line=1342,
+        line=1346,
     ),
     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
     # in-file wrapper hop is transparent and ``self`` carries the declared
@@ -4774,7 +4777,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "91a7ddcfb7d2279c",
         1,
         None,
-        line=1355,
+        line=1359,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4785,17 +4788,17 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4644a6cc893b4d09",
         1,
         None,
-        line=1382,
+        line=1386,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "LandscapeDB._validate_schema",
         "<non-session-write-connection>",
         "write_connection",
-        "026fc33c365235c4",
+        "a6bc0744250eff32",
         1,
         None,
-        line=1641,
+        line=1645,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -4805,7 +4808,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2110,
+        line=2130,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4816,7 +4819,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "222b5f4b0d258dbe",
         1,
         None,
-        line=2092,
+        line=2112,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -10643,13 +10646,46 @@ def test_identity_approval_lifecycle_writer_is_exact_and_update_only() -> None:
 
 def test_chargeable_admission_writers_match_their_exact_authorities() -> None:
     root = _repo_root()
-    symbols = {"RepositoryRunStartPermitAuthority.issue", "_RepositoryRunMutations.complete_admission_refusal"}
+    symbols = {
+        "RepositoryRunStartPermitAuthority.issue",
+        "RepositoryRunStartPermitAuthority._assess",
+        "_RepositoryRunMutations.complete_admission_refusal",
+    }
     paths = [root / "src/elspeth/web/coordination/run_start_permit_authority.py", root / "src/elspeth/web/coordination/repository.py"]
     live = [site for site in scan_production_writers(paths, anchor=root) if site.symbol in symbols]
     reviewed = [site for site in _REVIEWED_WRITERS if site.symbol in symbols]
     assert len(live) == len(reviewed) == 6
     assert inventory_drift(live, reviewed) == ([], [])
     assert authority_policy_violations(live, _TABLE_POLICIES) == ([], [])
+
+
+@pytest.mark.parametrize("mutation", ["renamed_assessment", "unrelated_table"])
+def test_permit_assessment_writer_admission_rejects_other_symbols_and_tables(tmp_path: Path, mutation: str) -> None:
+    path = "src/elspeth/web/coordination/run_start_permit_authority.py"
+    source = (_repo_root() / path).read_text()
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_text(source)
+    baseline = scan_production_writers([target], anchor=tmp_path)
+    assert authority_policy_violations(baseline, _TABLE_POLICIES) == ([], [])
+    assert len([site for site in baseline if site.symbol == "RepositoryRunStartPermitAuthority._assess"]) == 3
+    if mutation == "renamed_assessment":
+        assert source.count("def _assess(") == 1
+        source = source.replace("def _assess(", "def _assess_replacement(", 1)
+    else:
+        before = "        decision = RepositoryChargeableAdmissionAuthority.assess("
+        assert source.count(before) == 1
+        source = source.replace(
+            before,
+            "        from elspeth.web.sessions.models import sessions_table\n"
+            "        conn.execute(update(sessions_table).values(name='changed'))\n" + before,
+            1,
+        )
+    target.write_text(source)
+    changed = scan_production_writers([target], anchor=tmp_path)
+    unclassified, mismatched = authority_policy_violations(changed, _TABLE_POLICIES)
+    assert unclassified or mismatched
+    assert inventory_drift(changed, baseline) != ([], [])
 
 
 def test_configured_bootstrap_read_does_not_admit_an_identity_write(tmp_path: Path) -> None:
@@ -18013,7 +18049,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "145b5590f940eae3",
             1,
             None,
-            line=1394,
+            line=1398,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",

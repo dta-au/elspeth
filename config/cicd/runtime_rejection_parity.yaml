@@ -1042,15 +1042,6 @@ sites:
   disposition: not_authorable
   note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
     the composer never emits; Field constraint enumerated 2026-08-17.
-- key: e239a11a9100383f
-  path: src/elspeth/core/config.py
-  qualname: LandscapeExportSettings
-  exception: FieldConstraint
-  message: 'exporter_version: max_length, min_length'
-  ordinal: 0
-  disposition: not_authorable
-  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
-    the composer never emits; Field constraint enumerated 2026-08-17.
 - key: fb75d2375641e5b9
   path: src/elspeth/core/config.py
   qualname: LandscapeExportSettings

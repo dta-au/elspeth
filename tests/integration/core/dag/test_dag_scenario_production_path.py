@@ -1705,6 +1705,28 @@ def test_exact_runtime_projection_rejects_corrupted_portable_manifest_material(
         run_scenario_case(scenario, case, tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("record_type", "field", "value"),
+    (
+        ("audit_export_config", "public_config", {}),
+        ("auth_event_coverage", "selected_count", 0),
+        ("auth_event_coverage", "policy", "deployment_snapshot"),
+    ),
+)
+def test_exact_runtime_projection_rejects_corrupted_export_declarations(
+    record_type: str,
+    field: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    _mutate_portable_export(monkeypatch, record_type=record_type, field=field, value=value)
+    install_corpus_plugin_manager(monkeypatch)
+    with pytest.raises(AssertionError, match=rf"portable {record_type} integrity"):
+        run_scenario_case(scenario, case, tmp_path)
+
+
 @pytest.mark.parametrize("field", ("request_hash", "response_hash"))
 def test_exact_runtime_projection_rejects_corrupted_portable_sink_effect_call_hash(
     field: str,

@@ -1929,7 +1929,7 @@ class ExecutionServiceImpl:
                 # A still-live Landscape seat is retryable; do not project it.
                 return False
             return False
-        permit = await self._session_service.issue_run_start_permit(run.id, session_operation_context=session_operation_lease.context)
+        permit = await self._session_service.assess_run_start_admission(run.id, session_operation_context=session_operation_lease.context)
         if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
             return False
         if permit.state is StartPermitState.REFUSED or permit.execution_refusal is not None:
@@ -2444,7 +2444,7 @@ class ExecutionServiceImpl:
                 from elspeth.web.coordination.contracts import StartPermitState
 
                 permit = self._call_async(
-                    self._session_service.issue_run_start_permit(run_uuid, session_operation_context=session_operation_context)
+                    self._session_service.assess_run_start_admission(run_uuid, session_operation_context=session_operation_context)
                 )
                 if (
                     permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}
@@ -2454,7 +2454,6 @@ class ExecutionServiceImpl:
                         admission_refusal_pending = True
                         self._call_async(self._settle_admission_refusal(run_uuid, session_operation_lease))
                     return None
-                admission_decision = permit.admission_decision
                 if restored_envelope is None:
                     admitted_run = self._call_async(self._session_service.get_run(run_uuid))
                     restored_envelope = self._call_async(
@@ -2466,6 +2465,18 @@ class ExecutionServiceImpl:
                         )
                     )
                     frozen_run_settings = restored_envelope.settings
+                permit = self._call_async(
+                    self._session_service.issue_run_start_permit(run_uuid, session_operation_context=session_operation_context)
+                )
+                if (
+                    permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}
+                    or permit.execution_refusal is not None
+                ):
+                    if permit.state is not StartPermitState.CANCELLED_BEFORE_PERMIT:
+                        admission_refusal_pending = True
+                        self._call_async(self._settle_admission_refusal(run_uuid, session_operation_lease))
+                    return None
+                admission_decision = permit.admission_decision
                 assert permit.permit_id is not None and permit.permit_epoch is not None and permit.subject_hash is not None
                 run_start_permit = RunStartPermitBinding(run_id, permit.permit_id, permit.permit_epoch, permit.subject_hash)
                 from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState

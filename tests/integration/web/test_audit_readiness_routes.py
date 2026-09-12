@@ -41,6 +41,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.fixtures.identities import ensure_test_identity
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
@@ -228,6 +229,8 @@ def test_secrets_row_surfaces_disallowed_secret_ref_from_real_validate_pipeline(
     (settings.data_dir / "blobs").mkdir(parents=True, exist_ok=True)
     (settings.data_dir / "outputs").mkdir(parents=True, exist_ok=True)
     session_service = audit_readiness_test_client.app.state.session_service
+    with audit_readiness_test_client.app.state.session_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice", provider=settings.auth_provider)
     session_id = uuid.uuid4()
 
     async def _seed() -> None:

@@ -21,6 +21,7 @@ import pytest
 import structlog
 from sqlalchemy import Engine, event, func, insert, select, update
 from sqlalchemy.engine import Connection
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.blobs import BlobForkWriteFence
@@ -106,6 +107,13 @@ def deployment(
         second_engine.dispose()
 
 
+def _create_session_owner(engine: Engine, prefix: str) -> str:
+    identity_id = f"{prefix}-{uuid4()}"
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=identity_id)
+    return identity_id
+
+
 def _register_instance(engine: Engine, instance_id: str) -> None:
     with engine.begin() as conn:
         now = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
@@ -173,7 +181,7 @@ async def test_postgres_composer_proposal_stale_predecessor_writes_nothing_befor
     first_engine, second_engine, first, second, _shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session_id = (await first.create_session(f"pg-proposal-{uuid4()}", "Proposal takeover", "local")).id
+    session_id = (await first.create_session(_create_session_owner(first_engine, "pg-proposal"), "Proposal takeover", "local")).id
     predecessor = first.session_operation_authority.acquire(
         session_id=session_id,
         operation_kind=SessionOperationKind.COMPOSE,
@@ -291,7 +299,9 @@ async def test_postgres_composer_proposal_reject_stale_predecessor_writes_nothin
     first_engine, second_engine, first, second, _shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session_id = (await first.create_session(f"pg-proposal-reject-{uuid4()}", "Proposal reject takeover", "local")).id
+    session_id = (
+        await first.create_session(_create_session_owner(first_engine, "pg-proposal-reject"), "Proposal reject takeover", "local")
+    ).id
     compose_context = first.session_operation_authority.acquire(
         session_id=session_id,
         operation_kind=SessionOperationKind.COMPOSE,
@@ -418,7 +428,9 @@ async def test_postgres_composer_proposal_accept_stale_predecessor_writes_nothin
     first_engine, second_engine, first, second, _shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session_id = (await first.create_session(f"pg-proposal-accept-{uuid4()}", "Proposal accept takeover", "local")).id
+    session_id = (
+        await first.create_session(_create_session_owner(first_engine, "pg-proposal-accept"), "Proposal accept takeover", "local")
+    ).id
     compose_context = first.session_operation_authority.acquire(
         session_id=session_id,
         operation_kind=SessionOperationKind.COMPOSE,
@@ -590,7 +602,7 @@ async def test_postgres_composer_preferences_concurrent_updates_serialise_under_
     first_engine, second_engine, first, second, _shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session_id = (await first.create_session(f"pg-preferences-{uuid4()}", "Preferences contention", "local")).id
+    session_id = (await first.create_session(_create_session_owner(first_engine, "pg-preferences"), "Preferences contention", "local")).id
 
     entered = threading.Event()
     release = threading.Event()
@@ -764,7 +776,7 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
     blobs = BlobServiceImpl(second_engine, shared)
-    parent = await first.create_session(f"pg-fork-{uuid4()}", "Parent", "local")
+    parent = await first.create_session(_create_session_owner(first_engine, "pg-fork"), "Parent", "local")
     create_lease = await SessionOperationLease.acquire(
         second.session_operation_authority,
         session_id=parent.id,
@@ -1031,7 +1043,7 @@ async def test_postgres_target_rename_holds_no_connection_and_release_cannot_dea
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
     blobs = BlobServiceImpl(second_engine, shared)
-    parent = await first.create_session(f"pg-pair-{uuid4()}", "Parent", "local")
+    parent = await first.create_session(_create_session_owner(first_engine, "pg-pair"), "Parent", "local")
     create_lease = await SessionOperationLease.acquire(
         second.session_operation_authority,
         session_id=parent.id,
@@ -1162,7 +1174,7 @@ async def test_postgres_target_rename_paused_copy_reds_at_finalize_when_the_pare
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
     blobs = BlobServiceImpl(second_engine, shared)
-    parent = await first.create_session(f"pg-pair-{uuid4()}", "Parent", "local")
+    parent = await first.create_session(_create_session_owner(first_engine, "pg-pair"), "Parent", "local")
     create_lease = await SessionOperationLease.acquire(
         second.session_operation_authority,
         session_id=parent.id,
@@ -1245,7 +1257,7 @@ async def test_postgres_archive_first_paused_gap_admits_no_guided_row_or_child(
     first_engine, second_engine, first, second, shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    parent = await first.create_session(f"pg-archive-{uuid4()}", "Parent", "local")
+    parent = await first.create_session(_create_session_owner(first_engine, "pg-archive"), "Parent", "local")
     message = await _add_message(first, parent.id, "user", "fork", writer_principal="route_user_message")
     blob_dir = shared / "blobs" / str(parent.id)
     blob_dir.mkdir(parents=True)
@@ -1313,7 +1325,7 @@ async def test_postgres_archive_filesystem_phase_holds_no_database_connection(
     first_engine, second_engine, first, second, shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session = await first.create_session(f"pg-archive-fs-{uuid4()}", "Filesystem phase", "local")
+    session = await first.create_session(_create_session_owner(first_engine, "pg-archive-fs"), "Filesystem phase", "local")
     blob_dir = shared / "blobs" / str(session.id)
     blob_dir.mkdir(parents=True)
     (blob_dir / "payload.csv").write_bytes(b"row\n")
@@ -1391,7 +1403,7 @@ async def test_postgres_failed_archive_restores_before_contender_can_acquire(
     first_engine, second_engine, first, second, shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session = await first.create_session(f"pg-archive-current-{uuid4()}", "Rollback ordering", "local")
+    session = await first.create_session(_create_session_owner(first_engine, "pg-archive-current"), "Rollback ordering", "local")
     blob_dir = shared / "blobs" / str(session.id)
     blob_dir.mkdir(parents=True)
     blob = blob_dir / "payload.csv"
@@ -1461,7 +1473,7 @@ async def test_postgres_consumed_archive_purges_exactly_once(
     first_engine, second_engine, first, second, shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session = await first.create_session(f"pg-archive-consumed-{uuid4()}", "Consumed cleanup", "local")
+    session = await first.create_session(_create_session_owner(first_engine, "pg-archive-consumed"), "Consumed cleanup", "local")
     blob_dir = shared / "blobs" / str(session.id)
     blob_dir.mkdir(parents=True)
     (blob_dir / "payload.csv").write_bytes(b"row\n")
@@ -1516,7 +1528,7 @@ async def test_postgres_winner_reconciles_stale_manifest_and_stale_archiver_cann
     first_engine, _second_engine, first, second, shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session = await first.create_session(f"pg-archive-takeover-{uuid4()}", "Archive takeover", "local")
+    session = await first.create_session(_create_session_owner(first_engine, "pg-archive-takeover"), "Archive takeover", "local")
     blob_dir = shared / "blobs" / str(session.id)
     blob_dir.mkdir(parents=True)
     (blob_dir / "payload.csv").write_bytes(b"winner bytes\n")
@@ -1598,7 +1610,7 @@ async def test_postgres_postcommit_purge_failure_remains_discoverable(
     first_engine, second_engine, first, second, shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session = await first.create_session(f"pg-archive-purge-{uuid4()}", "Discoverable cleanup", "local")
+    session = await first.create_session(_create_session_owner(first_engine, "pg-archive-purge"), "Discoverable cleanup", "local")
     blob_dir = shared / "blobs" / str(session.id)
     blob_dir.mkdir(parents=True)
     (blob_dir / "payload.csv").write_bytes(b"recover me\n")
@@ -1643,8 +1655,8 @@ async def test_postgres_archive_faults_never_touch_unrelated_session_rows(
     first_engine, second_engine, first, second, shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    target = await first.create_session(f"pg-archive-fault-{uuid4()}", "Fault target", "local")
-    unrelated = await first.create_session(f"pg-archive-control-{uuid4()}", "Untouched control", "local")
+    target = await first.create_session(_create_session_owner(first_engine, "pg-archive-fault"), "Fault target", "local")
+    unrelated = await first.create_session(_create_session_owner(first_engine, "pg-archive-control"), "Untouched control", "local")
     await _add_message(first, unrelated.id, "user", "control message", writer_principal="route_user_message")
     target_dir = shared / "blobs" / str(target.id)
     control_dir = shared / "blobs" / str(unrelated.id)
@@ -1751,14 +1763,14 @@ def test_postgres_reverse_logical_pair_requests_both_complete(
     repository_a = PostgresSessionOperationRepository(first_engine)
     repository_b = PostgresSessionOperationRepository(second_engine)
     first_session = first.session_operation_authority.create_session_with_initial_fence(
-        user_id=f"pair-a-{uuid4()}",
+        user_id=_create_session_owner(first_engine, "pair-a"),
         title="Pair A",
         auth_provider_type="local",
         owner_instance_id=first.session_operation_owner_instance_id,
         lease_seconds=30,
     )
     second_session = first.session_operation_authority.create_session_with_initial_fence(
-        user_id=f"pair-b-{uuid4()}",
+        user_id=_create_session_owner(first_engine, "pair-b"),
         title="Pair B",
         auth_provider_type="local",
         owner_instance_id=first.session_operation_owner_instance_id,

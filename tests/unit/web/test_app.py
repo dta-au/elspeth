@@ -79,6 +79,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from elspeth.web.sso_wiring import SsoWiring
+from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import expire_leader_seat
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -420,6 +421,8 @@ class TestCreateApp:
         from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         async def _mock_user() -> UserIdentity:
             return UserIdentity(user_id="test-user", username="test-user")
@@ -1640,6 +1643,8 @@ class TestLifespanShutdown:
             )
         )
         session_service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await session_service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(session_service, session.id)
         authority = session_service.session_operation_authority
@@ -1707,6 +1712,8 @@ class TestLifespanShutdown:
             )
         )
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         authority = service.session_operation_authority
@@ -1753,6 +1760,8 @@ class TestLifespanShutdown:
             )
         )
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         authority = service.session_operation_authority
@@ -1783,6 +1792,8 @@ class TestLifespanShutdown:
     async def test_marker_failure_after_landscape_completion_retries_idempotently(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         landscape_run_id = "landscape-marker-retry"
@@ -3001,6 +3012,8 @@ class TestValidationErrorRedaction:
         from elspeth.web.auth.models import UserIdentity
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         identity = UserIdentity(user_id="test-user", username="test-user")
 
@@ -3166,6 +3179,8 @@ class TestSecretsExceptionHandlers:
         from elspeth.web.auth.models import UserIdentity
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
         identity = UserIdentity(user_id="test-user", username="test-user")
 
         async def _mock_user() -> UserIdentity:

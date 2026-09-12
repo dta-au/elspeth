@@ -1547,6 +1547,17 @@ class _RepositoryRunMutations:
             saga_state=RunSagaState.START_INTENT if execution_input is not None else RunSagaState.DRAFT,
         )
 
+    def assess_start_admission(self, *, run_id: UUID, policy: ChargeableAdmissionPolicy) -> RunStartPermitRecord:
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        permit = RepositoryRunStartPermitAuthority.assess(
+            state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy
+        )
+        self._record_admission_refusal(run_id, permit)
+        return permit
+
     def issue_start_permit(self, *, run_id: UUID, policy: ChargeableAdmissionPolicy) -> RunStartPermitRecord:
         state = self.__state
         state._require_active()
@@ -1555,17 +1566,20 @@ class _RepositoryRunMutations:
         permit = RepositoryRunStartPermitAuthority.issue(
             state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy
         )
+        self._record_admission_refusal(run_id, permit)
+        return permit
+
+    def _record_admission_refusal(self, run_id: UUID, permit: RunStartPermitRecord) -> None:
         refusal = permit.execution_refusal or permit.admission_decision
         if refusal is not None and not refusal.allowed:
             reason = refusal.refusal_reason
             assert reason is not None
             self.append_terminal_run_event_once(
                 run_id=run_id,
-                timestamp=state._database_now,
+                timestamp=self.__state._database_now,
                 event_type="failed",
                 data={"status": "failed", "detail": f"Run admission refused: {reason.value}", "node_id": None},
             )
-        return permit
 
     def observe_start_permit_for_cleanup(self, *, run_id: UUID) -> RunStartPermitRecord:
         state = self.__state

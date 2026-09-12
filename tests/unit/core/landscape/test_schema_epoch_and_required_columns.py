@@ -36,7 +36,7 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 
-def test_epoch_is_thirty_eight() -> None:
+def test_epoch_is_forty() -> None:
     # Epoch 37 (elspeth-07cd19ba73, pluggable SSO) widened the auth provider
     # CHECKs. Epoch 38 (elspeth-2d436dd6e8, elspeth-5d66fc5ed1): scheduler_events
     # gains an AUTOINCREMENT ``seq`` primary key that every reader orders by,
@@ -45,7 +45,8 @@ def test_epoch_is_thirty_eight() -> None:
     # transaction, so (recorded_at, event_id) replayed in hash order and two
     # identical same-second transitions collided on the old primary key.
     # Epoch 39 binds recoverable web starts to immutable permit subjects.
-    assert SQLITE_SCHEMA_EPOCH == 39
+    # Epoch 40 adds nullable call usage and persisted admission policy evidence.
+    assert SQLITE_SCHEMA_EPOCH == 40
 
 
 def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:
@@ -244,6 +245,8 @@ def test_epoch_23_web_plugin_policy_table_is_one_to_one_with_runs() -> None:
         "plugin_code_identities_json",
         "binding_generation_fingerprint",
         "decision_codes_json",
+        "admission_decision_json",
+        "admission_decision_hash",
     }
 
 

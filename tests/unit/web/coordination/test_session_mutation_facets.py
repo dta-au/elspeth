@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import select
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.repository import SessionDerivedCustodyError, _RepositoryMutationState, _RepositorySessionMutations
@@ -26,6 +27,8 @@ def file_engine(tmp_path: Path):
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
     try:
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         yield engine
     finally:
         engine.dispose()

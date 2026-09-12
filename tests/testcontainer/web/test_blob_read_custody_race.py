@@ -14,6 +14,7 @@ from uuid import uuid4
 import pytest
 import structlog
 from sqlalchemy import Connection, Engine, event, select, text
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.blobs import test_fork_deletion_recovery_ack as fork_ack_proofs
 from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog
 
@@ -43,6 +44,8 @@ async def test_postgres_fork_cleanup_reconciles_actual_commit_outcome(
     outcome: fork_ack_proofs.ForkDeletionCommitOutcome,
 ) -> None:
     writer_engine, reader_engine, sessions, shared = blob_read_race_deployment
+    with writer_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     session = await sessions.create_session("test-user", "Fork acknowledgement", "local")
     authority = sessions.session_operation_authority
     context = authority.acquire(
@@ -146,7 +149,10 @@ def test_postgres_content_reader_waits_for_live_deletion_before_reconciliation(
     writer_engine, reader_engine, sessions, shared = blob_read_race_deployment
     writer = BlobServiceImpl(writer_engine, shared)
     reader = BlobServiceImpl(reader_engine, shared)
-    session = asyncio.run(sessions.create_session(f"read-race-{uuid4()}", "Read race", "local"))
+    owner_id = f"read-race-{uuid4()}"
+    with writer_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = asyncio.run(sessions.create_session(owner_id, "Read race", "local"))
     authority = sessions.session_operation_authority
     context = authority.acquire(
         session_id=session.id,
@@ -269,7 +275,10 @@ def test_postgres_atomic_cleanup_producer_is_recoverable_by_public_delete(
     writer_engine, reader_engine, sessions, shared = blob_read_race_deployment
     writer = BlobServiceImpl(writer_engine, shared)
     recovery = BlobServiceImpl(reader_engine, shared)
-    session = asyncio.run(sessions.create_session(f"atomic-retry-{uuid4()}", "Atomic retry", "local"))
+    owner_id = f"atomic-retry-{uuid4()}"
+    with writer_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = asyncio.run(sessions.create_session(owner_id, "Atomic retry", "local"))
     authority = sessions.session_operation_authority
     context = authority.acquire(
         session_id=session.id,

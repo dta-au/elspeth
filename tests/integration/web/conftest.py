@@ -453,6 +453,8 @@ def _seed_session_with_state(
     # paths inside the persisted CompositionState satisfy
     # web/paths.py's resolve_data_path() invariants.
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=settings.auth_provider)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness fixture",
@@ -491,6 +493,8 @@ def _seed_session_without_state(
     settings: WebSettings = client.app.state.settings
 
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=settings.auth_provider)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness empty fixture",
@@ -594,6 +598,8 @@ def _seed_session_with_mismatched_auth_provider(
     settings: WebSettings = client.app.state.settings
 
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness mismatched-provider fixture",

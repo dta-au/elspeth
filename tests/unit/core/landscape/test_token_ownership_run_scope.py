@@ -38,7 +38,8 @@ def test_current_epoch_preserves_token_row_run_ownership_for_sqlite_and_postgres
     # scheduler_events seq key) do not touch the tokens/rows composite FK
     # this test pins; bumped to track the live constant.
     # Epoch 39 adds the durable web admission binding.
-    assert SQLITE_SCHEMA_EPOCH == 39
+    # Epoch 40 adds call usage and admission policy evidence, retaining this FK.
+    assert SQLITE_SCHEMA_EPOCH == 40
     assert (
         "tokens",
         ("row_id", "run_id"),

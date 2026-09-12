@@ -23,6 +23,7 @@ from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.mock_audit import mock_item_audit_authority
@@ -61,7 +62,9 @@ class _RecordCallRecorder:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
+        assert token_usage == UNKNOWN_TOKEN_USAGE
         kwargs = {
             "state_id": state_id,
             "call_index": call_index,
@@ -74,6 +77,7 @@ class _RecordCallRecorder:
             "request_ref": request_ref,
             "response_ref": response_ref,
             "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "token_usage": token_usage,
         }
         self.calls.append(_RecordedCall((), kwargs))
         return Call(

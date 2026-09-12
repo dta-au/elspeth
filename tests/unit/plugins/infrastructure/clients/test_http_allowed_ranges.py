@@ -24,6 +24,7 @@ import pytest
 
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.security.web import SSRFSafeRequest
 from tests.fixtures.mock_audit import mock_item_audit_authority
 
@@ -53,6 +54,7 @@ class RecordedCall:
     latency_ms: float | None = None
     request_ref: str | None = None
     response_ref: str | None = None
+    token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE
 
 
 @dataclass
@@ -85,8 +87,10 @@ class FakeCallRecorder:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> RecordedCall:
         del resolved_prompt_template_hash
+        assert token_usage == UNKNOWN_TOKEN_USAGE
         call = RecordedCall(
             state_id=state_id,
             operation_id=None,
@@ -99,6 +103,7 @@ class FakeCallRecorder:
             latency_ms=latency_ms,
             request_ref=request_ref or f"request-{call_index}",
             response_ref=response_ref or f"response-{call_index}",
+            token_usage=token_usage,
         )
         self.calls.append(call)
         return call
@@ -117,8 +122,10 @@ class FakeCallRecorder:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> RecordedCall:
         del resolved_prompt_template_hash
+        assert token_usage == UNKNOWN_TOKEN_USAGE
         index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
         call = RecordedCall(
             state_id=None,
@@ -132,6 +139,7 @@ class FakeCallRecorder:
             latency_ms=latency_ms,
             request_ref=request_ref or f"operation-request-{index}",
             response_ref=response_ref or f"operation-response-{index}",
+            token_usage=token_usage,
         )
         self.calls.append(call)
         return call

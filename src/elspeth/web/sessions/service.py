@@ -10044,6 +10044,16 @@ class SessionServiceImpl:
             ),
         )
 
+    async def assess_run_start_admission(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+        return cast(
+            "RunStartPermitRecord",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.runs.assess_start_admission(run_id=run_id, policy=self._chargeable_admission_policy),
+            ),
+        )
+
     async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
         return cast(
             "RunStartPermitRecord",

@@ -7714,7 +7714,7 @@ _REVIEWED_REGISTRY_MODULES = {
     # VANguard adds required admission/token schema fields and disposes the
     # engine if construction fails. Guard installation still follows journal
     # attachment and precedes schema initialization/return on both dialects.
-    "src/elspeth/core/landscape/database.py": "0da498712352bd340c8f5db2c12764b3ea25015ca3cc0082c4a594c7216e15cb",
+    "src/elspeth/core/landscape/database.py": "5f3a0ca9871f010e56154db28fa1ec2bf41ea6db34d40232f77dbbdc828da365",
 }
 
 

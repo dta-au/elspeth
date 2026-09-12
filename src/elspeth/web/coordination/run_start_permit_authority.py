@@ -34,9 +34,9 @@ class RepositoryRunStartPermitAuthority:
         _resolve_mutation_connection(connection_token).execute(insert(run_start_permits_table).values(run_id=run_id, start_state="pending"))
 
     @staticmethod
-    def issue(
+    def _assess(
         connection_token: str, *, run_id: str, context: SessionOperationContext, now: datetime, policy: ChargeableAdmissionPolicy
-    ) -> RunStartPermitRecord:
+    ) -> tuple[Row[Any], ChargeableAdmissionDecision]:
         conn = _resolve_mutation_connection(connection_token)
         decision = RepositoryChargeableAdmissionAuthority.assess(connection_token, session_id=context.fence.session_id, policy=policy)
         run = conn.execute(select(runs_table).where(runs_table.c.id == run_id).with_for_update()).one()
@@ -44,7 +44,7 @@ class RepositoryRunStartPermitAuthority:
             raise AuditIntegrityError("Run permit session custody mismatch")
         row = conn.execute(select(run_start_permits_table).where(run_start_permits_table.c.run_id == run_id).with_for_update()).one()
         if row.start_state in {"refused", "cancelled_before_permit"} or row.execution_refusal is not None:
-            return RepositoryRunStartPermitAuthority._record(row)
+            return row, decision
         if row.start_state == "start_permitted":
             previous = RepositoryRunStartPermitAuthority._record(row)
             assert previous.admission_decision is not None
@@ -86,10 +86,25 @@ class RepositoryRunStartPermitAuthority:
                     error=f"Run admission refused: {decision.refusal_reason.value}",
                 )
             )
-            return RepositoryRunStartPermitAuthority._record(
-                conn.execute(select(run_start_permits_table).where(run_start_permits_table.c.run_id == run_id)).one()
-            )
+            row = conn.execute(select(run_start_permits_table).where(run_start_permits_table.c.run_id == run_id)).one()
+        return row, decision
+
+    @staticmethod
+    def assess(
+        connection_token: str, *, run_id: str, context: SessionOperationContext, now: datetime, policy: ChargeableAdmissionPolicy
+    ) -> RunStartPermitRecord:
+        """Persist refusals before restoration without authorizing a start."""
+        row, _ = RepositoryRunStartPermitAuthority._assess(connection_token, run_id=run_id, context=context, now=now, policy=policy)
+        return RepositoryRunStartPermitAuthority._record(row)
+
+    @staticmethod
+    def issue(
+        connection_token: str, *, run_id: str, context: SessionOperationContext, now: datetime, policy: ChargeableAdmissionPolicy
+    ) -> RunStartPermitRecord:
+        row, decision = RepositoryRunStartPermitAuthority._assess(connection_token, run_id=run_id, context=context, now=now, policy=policy)
+        conn = _resolve_mutation_connection(connection_token)
         if row.start_state == "pending":
+            run = conn.execute(select(runs_table).where(runs_table.c.id == run_id)).one()
             if run.status != "pending" or run.cancel_requested_at is not None:
                 raise AuditIntegrityError("Pending permit has an inconsistent run state")
             envelope = conn.execute(select(run_execution_inputs_table).where(run_execution_inputs_table.c.run_id == run_id)).one()
