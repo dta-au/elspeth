@@ -3382,7 +3382,9 @@ class TestForkEndpoint:
         composition_states.source is our own data (Tier 1).  blob_ref is
         written by composer/tools.py as a UUID string; a malformed value at
         fork time indicates a write-path bug, DB corruption, or tampering
-        and must crash per CLAUDE.md's Tier 1 trust model.  Silently skipping
+        and must crash under the Tier 1 rules in
+        docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model.  Silently skipping
         the remap would leave the forked session's blob_ref pointing at the
         source session's blob (cross-session reference, audit-contradictory).
 

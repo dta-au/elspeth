@@ -236,7 +236,8 @@ Analyze these entries:
 
         We distinguish None (no lookup configured) from {} (empty lookup).
         An empty lookup is still a valid configuration that should be auditable.
-        Per CLAUDE.md: "No inference - if it's not recorded, it didn't happen."
+        Per the auditability principle (ARCHITECTURE.md §Design Principles)
+        nothing is inferred: if it is not recorded, it did not happen.
         """
         template = PromptTemplate("Hello, {{ row.name }}!", lookup_data={})
         assert template.lookup_hash is not None  # Empty dict still gets hashed

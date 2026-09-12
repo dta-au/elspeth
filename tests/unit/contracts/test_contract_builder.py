@@ -542,7 +542,8 @@ class TestContractBuilderEdgeCases:
     def test_field_in_row_not_in_resolution_crashes(self) -> None:
         """Field in row but not in resolution raises KeyError (Tier 1 integrity).
 
-        Per CLAUDE.md: Sources are system code. If a field is in the row but
+        Per docs/guides/data-trust-and-error-handling.md §Plugin Ownership:
+        sources are system code. If a field is in the row but
         not in field_resolution, that's a bug in the source plugin.
         Silent fallback corrupts the audit trail with wrong original_name.
         """

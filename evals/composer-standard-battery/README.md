@@ -46,4 +46,5 @@ pasted into the same file was dropped. The prompt text is otherwise unchanged
 composer has to cope with.
 
 `vendor_risk` has a completed reference run: the operator's screenshot
-`vendor-risk-run-complete.png` (repo root, untracked, 2026-09-01).
+`vendor-risk-run-complete.png` (2026-09-01), formerly at the repository root
+and now retrievable from git history.

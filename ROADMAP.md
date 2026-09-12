@@ -13,7 +13,9 @@ Supplemented by the [web API seam design, 8 September 2026](docs/specs/2026-09-0
 the [Composer wires remediation plan, 8 September 2026](docs/plans/2026-09-08-composer-wires-campaign.md)
 and the compiler specifications linked below.
 Multi-replica implementation remediation also draws on the
-[0.8.0 changelog](CHANGELOG.md#080---2026-09-07-unified-lineage-and-production-hardening).
+[0.8.0 changelog](CHANGELOG.md#080---2026-09-07-unified-lineage-and-production-hardening)
+and the
+[0.8.1 changelog](CHANGELOG.md#081---2026-09-10-coordination-clock-correctness-and-deployment-hardening).
 This roadmap summarises their scope and proposed dependencies. It
 does not report current completion status; work may have progressed since the
 assessment. Delivery dates are not committed. Confirm remaining scope against

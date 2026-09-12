@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -28,8 +29,13 @@ from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
 from elspeth.web.execution.progress import ProgressBroadcaster
+from elspeth.web.execution.secret_guard import ExecutionSecretApprovalRequired
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.secrets.server_store import ServerSecretStore
+from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
+from elspeth.web.secrets.user_store import UserSecretStore
+from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -57,6 +63,18 @@ def sessions_service(engine) -> SessionServiceImpl:
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.sessions"),
     )
+
+
+@pytest.fixture
+def secret_resolver(engine, monkeypatch: pytest.MonkeyPatch) -> ScopedSecretResolver:
+    """Use the real scoped resolver so durable admission pins the fingerprint."""
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "run-backstop-fingerprint")
+    monkeypatch.setenv("RUN_BACKSTOP_PROVIDER_KEY", "fixture-provider-material")
+    service = WebSecretService(
+        user_store=UserSecretStore(engine=engine, master_key="run-backstop-test-master-key-32chars"),
+        server_store=ServerSecretStore(allowlist=("RUN_BACKSTOP_PROVIDER_KEY",)),
+    )
+    return ScopedSecretResolver(service, auth_provider_type="local")
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +117,7 @@ def _composer(tmp_path: Path, sessions_service: SessionServiceImpl) -> ComposerS
 def _build_execution_service(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
+    secret_resolver: ScopedSecretResolver,
 ) -> ExecutionServiceImpl:
     """Real ExecutionServiceImpl over the REAL SessionServiceImpl so execute()'s
     get_current_state(session_id) (~execution/service.py:484) loads the persisted
@@ -133,6 +152,9 @@ def _build_execution_service(
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=b"\x00" * 32,
         landscape_url=f"sqlite:///{tmp_path}/audit.db",
+        secret_wiring_allowlist=(
+            SecretWiringRuleSettings(secret="RUN_BACKSTOP_PROVIDER_KEY", component_type="transform", plugin="llm", option_key="api_key"),
+        ),
     )
     svc = ExecutionServiceImpl.for_trained_operator(
         loop=loop,
@@ -140,6 +162,7 @@ def _build_execution_service(
         settings=settings,
         session_service=sessions_service,
         yaml_generator=real_yaml_generator,
+        secret_service=secret_resolver,
         telemetry=build_sessions_telemetry(),
     )
     return svc
@@ -171,7 +194,7 @@ def _llm_node() -> NodeSpec:
         options={
             "provider": "openrouter",
             "model": MODEL,
-            "api_key": "test-key-literal",
+            "api_key": {"secret_ref": "RUN_BACKSTOP_PROVIDER_KEY"},
             "prompt_template": PROMPT,
             "required_input_fields": ["text"],
             "schema": {"mode": "observed"},
@@ -317,9 +340,10 @@ async def _persist_state_with_unresolved_node(
 async def test_unresolved_card_blocks_run_resolving_permits(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
+    secret_resolver: ScopedSecretResolver,
 ) -> None:
     composer = _composer(tmp_path, sessions_service)
-    execution_service = _build_execution_service(tmp_path, sessions_service)
+    execution_service = _build_execution_service(tmp_path, sessions_service, secret_resolver)
     session_id, _state_id, pt_event_id, mc_event_id, _state = await _persist_state_with_unresolved_node(
         sessions_service, composer, tmp_path
     )
@@ -338,6 +362,8 @@ async def test_unresolved_card_blocks_run_resolving_permits(
                 await execution_service.execute(
                     session_id=session_id,
                     session_operation_lease=blocked_lease,
+                    user_id="alice",
+                    auth_provider_type="local",
                 )
 
         # 3. resolve BOTH pending cards as accepted-as-drafted (the prompt_template
@@ -358,6 +384,24 @@ async def test_unresolved_card_blocks_run_resolving_permits(
         # complete LLM pipeline (text source + llm node + json sink + edge) and
         # accepts it; only _run_pipeline is stubbed, to avoid a live engine run.
         # create_run still runs for real, so execute() returns a real run_id.
+        # The secret reference retains the real destination policy and
+        # out-of-band approval gate before durable envelope capture.
+        approval_lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        async with approval_lease:
+            with pytest.raises(ExecutionSecretApprovalRequired) as approval:
+                await execution_service.execute(
+                    session_id=session_id,
+                    session_operation_lease=approval_lease,
+                    user_id="alice",
+                    auth_provider_type="local",
+                )
+
         execute_lease = await SessionOperationLease.acquire(
             sessions_service.session_operation_authority,
             session_id=session_id,
@@ -371,6 +415,9 @@ async def test_unresolved_card_blocks_run_resolving_permits(
                 run_id = await execution_service.execute(
                     session_id=session_id,
                     session_operation_lease=execute_lease,
+                    user_id="alice",
+                    auth_provider_type="local",
+                    secret_ack_token=approval.value.guard.ack_token,
                 )
             transferred = True
         finally:
@@ -379,3 +426,18 @@ async def test_unresolved_card_blocks_run_resolving_permits(
         assert run_id is not None
     finally:
         await execution_service.shutdown()
+
+    execution_input = await sessions_service.get_run_execution_input(run_id)
+    assert execution_input is not None
+    resolved = secret_resolver.resolve("alice", "RUN_BACKSTOP_PROVIDER_KEY")
+    assert resolved is not None
+    envelope = json.loads(execution_input.envelope_json)
+    assert envelope["secret_versions"] == [
+        {
+            "name": "RUN_BACKSTOP_PROVIDER_KEY",
+            "requested_scope": None,
+            "scope": "server",
+            "fingerprint": resolved.fingerprint,
+        }
+    ]
+    assert resolved.value not in execution_input.envelope_json

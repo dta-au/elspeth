@@ -200,6 +200,10 @@ def test_real_web_tree_has_only_the_reviewed_direct_call_map() -> None:
         ("src/elspeth/web/execution/diagnostics.py", "from_url"),
         ("src/elspeth/web/execution/discard_summary.py", "from_url"),
         ("src/elspeth/web/execution/outputs.py", "from_url"),
+        # observe_run and _reconcile_resumable_terminal both pass the
+        # explicit deployment-owned create_tables policy into LandscapeDB.
+        ("src/elspeth/web/execution/recovery.py", "from_url"),
+        ("src/elspeth/web/execution/recovery.py", "from_url"),
         ("src/elspeth/web/landscape_access.py", "from_url"),
         ("src/elspeth/web/sessions/routes/runs.py", "from_url"),
     )

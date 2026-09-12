@@ -61,6 +61,7 @@ from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import run_attributions_table, runs_table
 from elspeth.telemetry.manager import TelemetryManager
+from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
     BlobFinalizationResult,
     BlobIntegrityError,
@@ -72,6 +73,7 @@ from elspeth.web.blobs.protocol import (
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
+from elspeth.web.execution.envelope import RunExecutionInput, validate_run_execution_input
 from elspeth.web.execution.errors import (
     BlobRowsSourceAdmissionError,
     CompletionGateIntegrityError,
@@ -132,6 +134,7 @@ class _WebSettingsStub:
 
     def __init__(self) -> None:
         self.deployment_target = "default"
+        self.auth_provider = "local"
         self.deployment_state_mode = "sqlite-single"
         self.landscape_url = "sqlite:///test_audit.db"
         self.payload_store_path = Path("/tmp/test_payloads")
@@ -176,6 +179,7 @@ def _run_record_stub(**overrides: Any) -> SimpleNamespace:
         "error": None,
         "landscape_run_id": None,
         "pipeline_yaml": None,
+        "cancel_requested_at": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -968,8 +972,7 @@ class TestExecutionFlow:
 
     @pytest.mark.asyncio
     async def test_execute_creates_run_via_session_service(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
-        """AC #17: Run creation delegates to session_service.create_run()
-        with R6 expanded params (session_id, state_id, pipeline_yaml)."""
+        """Admission persists the immutable execution input under the exact EXECUTE lease."""
         session_id = uuid4()
         state_record = mock_session_service.get_current_state.return_value
         authority = RecordingSessionOperationAuthority()
@@ -979,11 +982,18 @@ class TestExecutionFlow:
         assert len(acquired) == 1
         mock_session_service.create_run.assert_awaited_once()
         create_call = mock_session_service.create_run.await_args
+        execution_input = create_call.kwargs["execution_input"]
+        assert type(execution_input) is RunExecutionInput
+        validate_run_execution_input(execution_input)
+        envelope_document = json.loads(execution_input.envelope_json)
+        assert envelope_document["executable_config"] == {"source": {"plugin": "csv", "options": {}}}
+        assert envelope_document["audit_safe_config"] == envelope_document["executable_config"]
         assert create_call.args == ()
         assert create_call.kwargs == {
             "session_id": session_id,
             "state_id": state_record.id,
             "pipeline_yaml": _RESOLVED_TEST_PIPELINE_YAML,
+            "execution_input": execution_input,
             # The exact context of the EXECUTE lease execute() was handed.
             "session_operation_context": acquired[0],
         }
@@ -1069,7 +1079,7 @@ class TestExecutionFlow:
             selected=unrestricted.selected,
             usable_profile_aliases=((PluginId("transform", "llm"), ("tutorial",)),),
             selected_profile_aliases=((PluginId("transform", "llm"), "tutorial"),),
-            binding_generation_fingerprint="runtime-policy-generation",
+            binding_generation_fingerprint=stable_hash("runtime-policy-generation"),
         )
         session_id = uuid4()
         (tmp_path / "blobs").mkdir()
@@ -5980,7 +5990,7 @@ class TestStructuralFramePath:
             # Package frames render from the package root.
             ("/opt/venv/lib/python3.12/site-packages/elspeth/web/execution/service.py", "elspeth/web/execution/service.py"),
             # A checkout directory sharing the package name must not widen the path.
-            ("/home/dev/elspeth/src/elspeth/engine/coalesce_executor.py", "elspeth/engine/coalesce_executor.py"),
+            ("/opt/project/elspeth/src/elspeth/engine/coalesce_executor.py", "elspeth/engine/coalesce_executor.py"),
             # Non-package frames degrade to the bare filename.
             ("/usr/lib/python3.12/json/decoder.py", "decoder.py"),
             ("/opt/venv/lib/python3.12/site-packages/sqlalchemy/engine/base.py", "base.py"),
@@ -5995,7 +6005,7 @@ class TestStructuralFramePath:
         """The trailing-component cap, not the anchor, is the disclosure guarantee."""
         from elspeth.web.execution.service import _MAX_FRAME_PATH_PARTS, _structural_frame_path
 
-        rendered = _structural_frame_path("/home/dev/elspeth/.claude/worktrees/wt/tests/unit/web/test_x.py")
+        rendered = _structural_frame_path("/opt/project/elspeth/.claude/worktrees/wt/tests/unit/web/test_x.py")
         assert not rendered.startswith("/")
         assert "/home/" not in rendered
         assert ".claude" not in rendered
@@ -6003,6 +6013,45 @@ class TestStructuralFramePath:
 
 
 # ── Cancel Mechanism ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("refusal", ["missing_baseline", "incomplete_source", "compatibility_mismatch", "unsafe_effect"])
+def test_durable_recovery_refusal_preserves_reason_without_terminalizing(
+    service: ExecutionServiceImpl, mock_session_service: MagicMock, refusal: str
+) -> None:
+    from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
+    from elspeth.web.coordination.contracts import RecoveryRequiredReason
+    from elspeth.web.execution.service import _RunRecoveryRequired
+    from elspeth.web.sessions.protocol import SessionOperationMutationTransaction, SessionOperationRunMutations
+
+    reason = RecoveryRequiredReason(refusal)
+    transaction = MagicMock(spec=SessionOperationMutationTransaction)
+    transaction.runs = MagicMock(spec=SessionOperationRunMutations)
+    mock_session_service.session_operation_authority.mutate.side_effect = lambda _context, action: action(transaction)
+    with (
+        patch.object(
+            service,
+            "_restore_admitted_run",
+            new=AsyncMock(
+                spec=service._restore_admitted_run,
+                side_effect=SinkEffectCapabilityError("unsafe recovery effect")
+                if reason is RecoveryRequiredReason.UNSAFE_EFFECT
+                else _RunRecoveryRequired(reason),
+            ),
+        ),
+        patch.object(service, "_finalize_output_blobs") as finalize,
+    ):
+        run_id = uuid4()
+        service._run_pipeline(
+            str(run_id),
+            _TEST_PIPELINE_YAML,
+            threading.Event(),
+            session_operation_lease=_execute_lease(),
+            durable_admission=True,
+        )
+    transaction.runs.mark_recovery_required.assert_called_once_with(run_id=run_id, reason=reason)
+    mock_session_service.update_run_status.assert_not_called()
+    finalize.assert_not_called()
 
 
 @pytest.mark.usefixtures("mock_pipeline_config_assembly")
@@ -6013,12 +6062,12 @@ class TestCancelMechanism:
         event = threading.Event()
         service._shutdown_events[str(run_id)] = event
 
-        await service.cancel(run_id)
+        await service.cancel(run_id, user=UserIdentity(user_id="peer-user", username="peer-user"))
 
         assert event.is_set(), "cancel() must set the threading.Event so the Orchestrator detects it during row processing"
 
     @pytest.mark.asyncio
-    async def test_get_status_marks_active_set_event_as_cancel_requested(
+    async def test_get_status_reads_durable_cancel_without_local_event(
         self,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
@@ -6034,7 +6083,9 @@ class TestCancelMechanism:
             finished_at=None,
             error=None,
             landscape_run_id=None,
+            cancel_requested_at=datetime.now(UTC),
         )
+        del service._shutdown_events[str(run_id)]
 
         status = await service.get_status(run_id)
 
@@ -6042,25 +6093,25 @@ class TestCancelMechanism:
         assert status.cancel_requested is True
 
     @pytest.mark.asyncio
-    async def test_cancel_pending_run_without_local_execute_authority_fails_closed(
+    async def test_peer_cancel_is_persisted_without_local_worker(
         self,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """A pending run with no local shutdown event is not ours to cancel.
+        from elspeth.web.auth.models import UserIdentity
 
-        The shutdown event is registered by the instance that holds the run's
-        EXECUTE lease. Its absence means this process has no authority over the
-        run, so ``cancel()`` must refuse (``service.py``, the pending arm of
-        ``cancel``) rather than write a ``cancelled`` status another instance's
-        worker would then race. Terminal runs stay an idempotent no-op; that is
-        pinned separately by ``test_cancel_terminal_run_is_noop``.
-        """
         run_id = uuid4()
-        assert mock_session_service.get_run.return_value.status == "pending"
-        # No event in _shutdown_events — no local EXECUTE authority for this run.
-        with pytest.raises(RuntimeError, match="Cannot cancel a non-terminal run without local EXECUTE authority"):
-            await service.cancel(run_id)
+        run = _run_record_stub(id=run_id, status="running")
+        mock_session_service.get_run.return_value = run
+        mock_session_service.request_run_cancellation.return_value = run
+        user = UserIdentity(user_id="peer-user", username="peer-user")
+        await service.cancel(run_id, user=user)
+        mock_session_service.request_run_cancellation.assert_awaited_once_with(
+            run_id,
+            session_id=run.session_id,
+            user_id=user.user_id,
+            auth_provider_type=service._settings.auth_provider,
+        )
         mock_session_service.update_run_status.assert_not_called()
 
     @pytest.mark.parametrize("terminal_status", ["completed", "completed_with_failures", "failed", "empty", "cancelled"])
@@ -6074,7 +6125,7 @@ class TestCancelMechanism:
         """Cancelling any terminal run does nothing."""
         run_id = uuid4()
         mock_session_service.get_run.return_value = _run_record_stub(status=terminal_status)
-        await service.cancel(run_id)
+        await service.cancel(run_id, user=UserIdentity(user_id="peer-user", username="peer-user"))
         mock_session_service.update_run_status.assert_not_called()
 
     @pytest.mark.asyncio
@@ -6086,7 +6137,7 @@ class TestCancelMechanism:
         service._shutdown_events[str(run_id)] = event
 
         # Should not raise
-        await service.cancel(run_id)
+        await service.cancel(run_id, user=UserIdentity(user_id="peer-user", username="peer-user"))
         assert event.is_set()
 
     @patch("elspeth.web.execution.service.Orchestrator")
@@ -7063,8 +7114,9 @@ class TestPostCompletionExceptionRecovery:
         #     re-raised exc once the Future completes.  Tested separately
         #     in the _on_pipeline_done test class.
         # This test must NOT pin a slog at the post-terminal-exception
-        # branch itself: per ``logging-telemetry-policy`` the logger is
-        # not the correct surface for post-audit operational signal.
+        # branch itself: per the ``logging-telemetry-policy`` skill §Logging
+        # Policy the logger is not the correct surface for post-audit
+        # operational signal.
         post_terminal_logs = [
             c for c in mock_slog.error.call_args_list if c.args and c.args[0] == "post_terminal_exception_in_run_pipeline"
         ]
@@ -7364,7 +7416,8 @@ class TestPostCompletionExceptionRecovery:
         """ValueError from the post-exception ``get_run`` probe must propagate,
         not be absorbed.
 
-        Audit-primacy contract (CLAUDE.md tier model): ``get_run`` can raise
+        Audit-primacy contract (docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model): ``get_run`` can raise
         ``ValueError`` only via Tier 1 audit-data corruption — "Run not found"
         (the row vanished mid-run), malformed UUID columns, or non-UTC
         ``started_at`` / ``finished_at``.  All three are Tier 1 invariant
@@ -7871,7 +7924,8 @@ class TestBlobSourcePathReadGuard:
     impossible to persist going forward, but the audit-integrity contract
     also requires that runtime crash informatively if a previously-
     persisted state row carries a path that disagrees with the canonical
-    ``BlobRecord.storage_path``.  Per CLAUDE.md "no defensive programming",
+    ``BlobRecord.storage_path``.  Per docs/guides/data-trust-and-error-handling.md
+    §The Defensive Programming Prohibition,
     the runtime must not silently coerce or fall back to ``FileNotFoundError``.
 
     Bug-verification protocol (cf.
@@ -10139,7 +10193,8 @@ class TestTerminalOrderingInvariant:
     blob finalization. A late finalize failure triggers a second terminal event
     via except BaseException.
 
-    CLAUDE.md invariant: "Every row reaches exactly one terminal state."
+    Per docs/contracts/system-operations.md §Complete Token State Diagram:
+    "Every token reaches exactly one terminal state — no silent drops."
     """
 
     @patch("elspeth.web.execution.service.Orchestrator")
@@ -10354,9 +10409,9 @@ class TestSanitizeErrorForClient:
         """Unexpected exceptions get a generic message with class name only."""
         from elspeth.web.execution.service import _sanitize_error_for_client
 
-        exc = RuntimeError("internal traceback details here /home/john/elspeth/src")
+        exc = RuntimeError("internal traceback details here /opt/project/elspeth/src")
         result = _sanitize_error_for_client(exc)
-        assert "/home/john" not in result
+        assert "/opt/project" not in result
         assert "RuntimeError" in result
 
     def test_os_error_returns_generic_message(self) -> None:

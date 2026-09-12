@@ -782,8 +782,9 @@ class TestLLMTransformOpenRouterPipelining:
     ) -> None:
         """Missing state_id causes exception propagation, not error result.
 
-        Per CLAUDE.md crash-on-exception policy: a missing state_id is a bug
-        in calling code (our internal code, not user data), so it should crash
+        Per docs/guides/data-trust-and-error-handling.md §The Decision Test: a
+        missing state_id is a bug in code we control (our internal code, not
+        user data), so it should crash
         rather than be converted to an error result.
 
         BatchTransformMixin wraps such exceptions in ExceptionResult for

@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.0](https://img.shields.io/badge/status-0.8.0-green.svg)
+![Status: 0.8.1](https://img.shields.io/badge/status-0.8.1-green.svg)
 
 > **Pre-release status:** ELSPETH may be suitable for carefully evaluated,
 > use-case-specific applications, but it is not yet ready for general production use.
@@ -33,6 +33,7 @@ inputs into one compiled artifact that the executor runs directly.
 
 - [Why ELSPETH exists](#why-elspeth-exists)
 - [Architecture at a glance](#architecture-at-a-glance)
+- [What changed in 0.8.1](#what-changed-in-081)
 - [What changed in 0.8.0](#what-changed-in-080)
 - [Getting started](#getting-started)
   - [YAML operator path](#yaml-operator-path)
@@ -155,6 +156,41 @@ runtime check that holds a plugin to its own declaration; see
 
 ---
 
+## What changed in 0.8.1
+
+0.8.1 extends the PostgreSQL replica runtime with durable run admission,
+Composer progress, single-use tickets and shared budgets. The bounded runtime
+contract and remaining acceptance limits are documented in
+[Deployment Platforms](docs/reference/deployment-platforms.md); live ACA
+acceptance is not claimed.
+
+**Operational:** 0.8.1 is a pre-1.0 database cutover from session epoch 53
+to 54 and Landscape epoch 38 to 39; guided schema remains at 11. Archive or
+export required evidence, stop the old service, recreate both stale databases
+in the same service-stop window, and install 0.8.1.
+Preserve `data/auth.db` and follow the
+[session DB reset runbook](docs/runbooks/staging-session-db-recreation.md),
+including account re-admission. Do not roll older code back over recreated
+databases.
+
+- **Coordination deadlines come from fresh post-lock database time.** Lease
+  deadlines are issued after locked admission instead of from a clock read
+  before the lock, and sink-effect clocks are sampled after their lease locks,
+  so two workers cannot disagree about when a lease expired.
+- **A contended PostgreSQL heartbeat is degraded liveness, not a failed run.**
+  The lock timeout is classified and retried rather than failing closed.
+- **Failures survive transaction unwind.** An invalidated Landscape
+  transaction reports the error that caused it, not the rollback's own error.
+- **Blob custody stays fenced across durable effects and recovery**, and
+  custody walkers reject null canonical sections instead of reading them as
+  empty.
+- **SSO hardening.** Dormancy is enforced on bound identities, bound profiles
+  refresh, database work moves off the request path, and response streams
+  carry size caps.
+- **Azure Container Apps.** Schema credentials are isolated from the
+  application identity, revision secret bindings survive new revisions, and
+  Key Vault write authority is confirmed before SQL bootstrap.
+
 ## What changed in 0.8.0
 
 0.8.0 hardens the production paths introduced in 0.7.1 across deployment,
@@ -164,9 +200,11 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   Docker Compose/PostgreSQL and native Linux systemd bundles, retains the AWS
   ECS acceptance controller, and packages the Web Composer in a pinned,
   non-root container image. The Azure Container Apps Bicep bundle ships in
-  `deploy/azure-container-apps/` with its receipts, replica-count probes and
-  runbooks; its replica > 1 live acceptance is an operator-run step on dev
-  hardware, and the support claim waits for that receipt.
+  `deploy/azure-container-apps/` with receipt validators, replica-count probes
+  and runbooks. Its Single/sticky configuration received desktop acceptance
+  on 2026-09-10; live cloud acceptance is not claimed. PostgreSQL supplies
+  the coordination substrate; the durable progress, single-use tickets and
+  shared budgets described above are 0.8.1 extensions.
 - **Committed blob deletion is recoverable.** Durable cleanup state remains
   until both the staged unlink and parent-directory fsync succeed, so restart
   recovery does not retain unaccounted files.
@@ -598,10 +636,18 @@ Current 0.8.0 behaviour:
 - A run can be driven by a single process or by a leader plus claim-only
   followers across multiple processes on one host (`elspeth join`), backed by
   one write-ahead logging (WAL) SQLite audit database.
-- Maintained web deployment profiles run one process or replica. Cross-instance
-  web coordination remains deferred; production Compose, AWS ECS, Azure VM, and
-  Kubernetes BYO deployments use external PostgreSQL where the deployment
-  contract requires it.
+- Maintained web deployment profiles run one process per replica. ACA uses
+  Single/sticky routing with PostgreSQL membership and session fencing;
+  durable run-event replay, renewable Composer inflight accounting and shared
+  budgets work across replicas. Interrupted provider requests are not
+  automatically resumed. Durable run admission, PREPARED restart and eligible
+  checkpoint handoff are implemented with fresh web and Landscape authority;
+  integrated verification is recorded in the
+  [ACA plan](docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification). See the
+  [handoff limits](docs/reference/deployment-platforms.md#durable-run-handoff).
+  Other maintained targets retain one replica and
+  stop-before-start replacement. Production deployments use external PostgreSQL
+  where the deployment contract requires it.
 - Each web process serves all blocking work from one shared 16-thread worker
   pool with bounded, fail-fast admission; the pool is not yet partitioned by
   purpose (see [Web worker pool capacity](#web-worker-pool-capacity)).
@@ -1147,7 +1193,7 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 **Development setup:**
 
 ```bash
-uv sync --frozen --extra dev --extra azure
+uv sync --frozen --all-extras
 source .venv/bin/activate
 
 # Install the git hook dispatchers (pre-commit + commit-msg policy gates)

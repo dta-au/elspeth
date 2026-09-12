@@ -515,8 +515,9 @@ describe("preferencesStore", () => {
   // (named for incident response) was completely invisible to the user.
   //
   // The new contract: bootstrap() NEVER rejects. On failure it sets
-  // loaded:true + writeError but LEAVES defaultMode null (the
-  // no-fabrication shape per CLAUDE.md). Setting defaultMode="guided"
+  // loaded:true + writeError but LEAVES defaultMode null — an absent
+  // value stays null rather than coerced to a default, because absence is
+  // evidence. Setting defaultMode="guided"
   // on failure would attribute a preference choice to the user that
   // they never made. resolveDefaultMode() continues to throw on the
   // null branch; sessionStore.createSession catches that and tells the

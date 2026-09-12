@@ -127,7 +127,6 @@ def _create_failed_run(
     """
     from elspeth.contracts import NodeType
     from elspeth.contracts.contract_records import ContractAuditRecord
-    from elspeth.contracts.enums import Determinism
     from elspeth.core.landscape.schema import nodes_table, run_sources_table
 
     run = factory.run_lifecycle.begin_run(
@@ -140,28 +139,40 @@ def _create_failed_run(
     # crashed leader never releases it, so lapse it deterministically — the
     # post-window image resume's takeover CAS requires (vacant-or-expired).
     expire_leader_seat(factory.run_lifecycle._db, run.run_id)
+    config, graph = _build_pipeline()
+    source_node_id = graph.get_sources()[0]
+    sink_node_id = graph.get_sink_id_map()["default"]
+    now = datetime.now(UTC)
+    # Persist the exact implementation baseline even for an early source failure;
+    # only the source lifecycle/contract record is absent in that scenario.
+    with factory.run_lifecycle._db.write_connection() as conn:
+        for node_id, plugin, node_type in [
+            (source_node_id, config.sources["primary"], NodeType.SOURCE),
+            (sink_node_id, config.sinks["default"], NodeType.SINK),
+        ]:
+            conn.execute(
+                nodes_table.insert().values(
+                    node_id=node_id,
+                    run_id=run.run_id,
+                    plugin_name=plugin.name,
+                    node_type=node_type,
+                    plugin_version=plugin.plugin_version,
+                    determinism=plugin.determinism,
+                    source_file_hash=plugin.source_file_hash,
+                    config_hash="resume-guardrails",
+                    config_json="{}",
+                    registered_at=now,
+                )
+            )
     if include_contract:
         contract = _make_schema_contract()
         audit_record = ContractAuditRecord.from_contract(contract)
         now = datetime.now(UTC)
         with factory.run_lifecycle._db.write_connection() as conn:
             conn.execute(
-                nodes_table.insert().values(
-                    node_id="source-node",
-                    run_id=run.run_id,
-                    plugin_name="list_source",
-                    node_type=NodeType.SOURCE,
-                    plugin_version="1.0.0",
-                    determinism=Determinism.DETERMINISTIC,
-                    config_hash="resume-guardrails",
-                    config_json="{}",
-                    registered_at=now,
-                )
-            )
-            conn.execute(
                 run_sources_table.insert().values(
                     run_id=run.run_id,
-                    source_node_id="source-node",
+                    source_node_id=source_node_id,
                     source_name="primary",
                     plugin_name="list_source",
                     lifecycle_state="loaded",
@@ -273,7 +284,7 @@ class TestResumeGuardrails:
                     ResumedRow(
                         row_id="row-1",
                         row_index=0,
-                        source_node_id=NodeID("source-node"),
+                        source_node_id=NodeID(graph.get_sources()[0]),
                         row_data={"id": 1, "value": "alpha"},
                     ),
                 ),

@@ -7,9 +7,11 @@ connections.
 
 from __future__ import annotations
 
+import json
 import secrets
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final
@@ -57,6 +59,8 @@ from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
     FenceLossReason,
+    RecoveryRequiredReason,
+    RunSagaState,
     SessionOperationContext,
     SessionOperationFence,
     SessionOperationFenceLost,
@@ -67,6 +71,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
     _resolve_mutation_connection,
     _unregister_mutation_connection,
 )
+from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
@@ -89,6 +94,7 @@ from elspeth.web.sessions.models import (
     review_attestations_table,
     review_requests_table,
     run_events_table,
+    run_execution_inputs_table,
     runs_table,
     session_operation_fences_table,
     session_read_admissions_table,
@@ -111,6 +117,7 @@ from elspeth.web.sessions.protocol import (
     RunAlreadyActiveError,
     RunEventRecord,
     RunRecord,
+    RunStartPermitRecord,
     SessionArchiveDisposition,
     SessionCompositionStateCreation,
     SessionForkAuthority,
@@ -145,6 +152,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from elspeth.contracts.auth import AuthProviderType
+    from elspeth.web.execution.envelope import RunExecutionInput
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
@@ -1447,6 +1455,7 @@ class _RepositoryRunMutations:
         state_id: UUID,
         pipeline_yaml: str | None,
         started_at: datetime,
+        execution_input: RunExecutionInput | None = None,
     ) -> RunRecord:
         """Create the one pending run owned by this exact EXECUTE lease."""
         state = self.__state
@@ -1497,6 +1506,15 @@ class _RepositoryRunMutations:
             )
         except IntegrityError as exc:
             raise RunAlreadyActiveError(state._session_id) from exc
+        if execution_input is not None:
+            envelope_values = asdict(execution_input)
+            envelope_values["envelope"] = json.loads(envelope_values.pop("envelope_json"))
+            connection.execute(
+                insert(run_execution_inputs_table).values(run_id=str(run_id), created_at=state._database_now, **envelope_values)
+            )
+            RepositoryRunStartPermitAuthority.create_pending(state._connection_token, run_id=str(run_id))
+            self.rebind_run_ownership(run_id=run_id)
+            connection.execute(update(runs_table).where(runs_table.c.id == str(run_id)).values(saga_state="start_intent"))
         return RunRecord(
             id=run_id,
             session_id=UUID(state._session_id),
@@ -1513,7 +1531,87 @@ class _RepositoryRunMutations:
             error=None,
             landscape_run_id=None,
             pipeline_yaml=pipeline_yaml,
+            saga_state=RunSagaState.START_INTENT if execution_input is not None else RunSagaState.DRAFT,
         )
+
+    def issue_start_permit(self, *, run_id: UUID) -> RunStartPermitRecord:
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        return RepositoryRunStartPermitAuthority.issue(
+            state._connection_token, run_id=str(run_id), context=context, now=state._database_now
+        )
+
+    def rebind_run_ownership(self, *, run_id: UUID) -> RunSagaState:
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        conn = _resolve_mutation_connection(state._connection_token)
+        run = conn.execute(select(runs_table).where(runs_table.c.id == str(run_id)).with_for_update()).one()
+        if run.session_id != state._session_id:
+            raise SessionDerivedCustodyError
+        fence = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == state._session_id)
+        ).one()
+        if conn.dialect.name == "postgresql" and run.owner_instance_id is not None and run.owner_instance_id != fence.owner_instance_id:
+            previous_member = conn.execute(
+                select(web_instances_table.c.lease_expires_at)
+                .where(
+                    web_instances_table.c.instance_id == run.owner_instance_id,
+                )
+                .with_for_update()
+            ).one_or_none()
+            if previous_member is None or _ensure_utc(previous_member.lease_expires_at) > state._database_now:
+                raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+        _RepositoryBlobMutations(state)._adopt_pending_run_outputs(run_id=run_id)
+        conn.execute(
+            update(runs_table)
+            .where(runs_table.c.id == str(run_id))
+            .values(
+                owner_instance_id=fence.owner_instance_id,
+                owner_epoch=context.fence.operation_epoch,
+                owner_lease_expires_at=fence.lease_expires_at,
+            )
+        )
+        return RunSagaState(run.saga_state)
+
+    def mark_recovery_outputs_finalized(self, *, run_id: UUID) -> None:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            update(runs_table)
+            .where(
+                runs_table.c.id == str(run_id),
+                runs_table.c.session_id == state._session_id,
+                runs_table.c.status.in_(tuple(SESSION_TERMINAL_RUN_STATUS_VALUES)),
+            )
+            .values(saga_state="terminal")
+        )
+        if result.rowcount != 1:
+            raise SessionDerivedCustodyError
+
+    def mark_recovery_required(self, *, run_id: UUID, reason: RecoveryRequiredReason) -> None:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        if type(reason) is not RecoveryRequiredReason:
+            raise TypeError("reason must be an exact RecoveryRequiredReason")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            update(runs_table)
+            .where(
+                runs_table.c.id == str(run_id),
+                runs_table.c.session_id == state._session_id,
+                runs_table.c.status.in_(("pending", "running")),
+            )
+            .values(saga_state="recovery_required", recovery_required_reason=reason.value)
+        )
+        if result.rowcount != 1:
+            raise SessionDerivedCustodyError
 
     def transition_run_status(
         self,
@@ -1548,6 +1646,8 @@ class _RepositoryRunMutations:
         if status == "failed" and not error:
             raise ValueError("failed status requires error")
         values: dict[str, Any] = {"status": status}
+        if status == "running":
+            values["saga_state"] = "running"
         if status in SESSION_TERMINAL_RUN_STATUS_VALUES:
             values["finished_at"] = state._database_now
         optional_values = {
@@ -1597,6 +1697,37 @@ class _RepositoryRunMutations:
             event_type=cast(SessionRunEventType, row.event_type),
             data=cast(Mapping[str, Any], row.data),
         )
+
+    def append_terminal_run_event_once(
+        self,
+        *,
+        run_id: UUID,
+        timestamp: datetime,
+        event_type: SessionRunEventType,
+        data: Mapping[str, Any],
+    ) -> RunEventRecord:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        state._require_run(run_id)
+        if event_type not in {"completed", "failed", "cancelled"}:
+            raise ValueError("terminal event type required")
+        row = (
+            _resolve_mutation_connection(state._connection_token)
+            .execute(
+                select(run_events_table).where(
+                    run_events_table.c.run_id == str(run_id),
+                    run_events_table.c.event_type.in_(("completed", "failed", "cancelled")),
+                )
+            )
+            .one_or_none()
+        )
+        if row is not None:
+            if row.event_type != event_type:
+                raise AuditIntegrityError("Run terminal event contradicts the authoritative result")
+            return self._event_record(row)
+        return self.append_run_event(run_id=run_id, timestamp=timestamp, event_type=event_type, data=data)
 
     def append_run_event(
         self,
@@ -3283,6 +3414,40 @@ class _RepositoryBlobMutations:
         )
         return tuple(self._blob_record(state._require_blob(UUID(blob_id))) for blob_id in blob_ids)
 
+    def _adopt_pending_run_outputs(self, *, run_id: UUID) -> None:
+        """Move linked pending outputs with their run under the fresh EXECUTE fence."""
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        run = state._require_run(run_id)
+        conn = _resolve_mutation_connection(state._connection_token)
+        rows = conn.execute(
+            select(blobs_table)
+            .join(blob_run_links_table, blob_run_links_table.c.blob_id == blobs_table.c.id)
+            .where(
+                blob_run_links_table.c.run_id == str(run_id),
+                blob_run_links_table.c.direction == "output",
+                blobs_table.c.session_id == state._session_id,
+                blobs_table.c.status == "pending",
+            )
+            .with_for_update()
+        ).all()
+        previous_operation_ids = {row.custody_operation_id for row in rows}
+        if len(previous_operation_ids) > 1:
+            raise AuditIntegrityError("Pending outputs disagree about their previous EXECUTE owner")
+        for row in rows:
+            if run.owner_epoch is None or row.custody_operation_epoch != run.owner_epoch or row.custody_operation_kind != "execute":
+                raise AuditIntegrityError("Pending output custody does not match its run owner")
+            conn.execute(
+                update(blobs_table)
+                .where(blobs_table.c.id == row.id)
+                .values(
+                    custody_operation_id=context.fence.operation_id,
+                    custody_operation_epoch=context.fence.operation_epoch,
+                    custody_operation_kind=context.operation_kind.value,
+                )
+            )
+
     def list_pending_run_output_blobs(self, *, run_id: UUID) -> tuple[BlobRecord, ...]:
         state = self.__state
         state._require_active()
@@ -3486,8 +3651,26 @@ class _RepositoryBlobMutations:
                     "resolved_at": resolved_at,
                 }
             )
+        connection = _resolve_mutation_connection(state._connection_token)
+        existing = connection.execute(
+            select(blob_inline_resolutions_table).where(
+                blob_inline_resolutions_table.c.run_id == str(run_id),
+                blob_inline_resolutions_table.c.attempt == attempt,
+            )
+        ).all()
+        if existing:
+            recorded_manifest = sorted(
+                (row.field_path, row.blob_id, row.content_hash, row.byte_length, row.mime_type, row.encoding) for row in existing
+            )
+            requested_manifest = sorted(
+                (item.field_path, str(item.blob_id), item.content_hash, item.byte_length, item.mime_type, item.encoding)
+                for item in resolutions
+            )
+            if recorded_manifest != requested_manifest:
+                raise AuditIntegrityError("Run inline resolution retry does not match its immutable manifest")
+            return
         if rows:
-            _resolve_mutation_connection(state._connection_token).execute(insert(blob_inline_resolutions_table), rows)
+            connection.execute(insert(blob_inline_resolutions_table), rows)
 
 
 @final

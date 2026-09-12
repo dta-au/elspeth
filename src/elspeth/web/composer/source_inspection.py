@@ -9,10 +9,12 @@ Contract:
   * **Redacted identity only.** Filename, MIME, byte size, and content
     hash prefix are safe to surface; storage paths and full content
     hashes are not.
-  * **Coerce, don't fabricate.** Per CLAUDE.md tier model, source-level
-    inspection MAY coerce ``"42"`` → int hint and ``"true"`` → bool hint
-    because we are observing what *would* be coerced when the source
-    plugin runs. We never fabricate a value the blob did not contain;
+  * **Coerce, don't fabricate.** Per the trust model
+    (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model), source-level inspection MAY coerce ``"42"`` → int hint and
+    ``"true"`` → bool hint because we are observing what *would* be coerced
+    when the source plugin runs. We never fabricate a value the blob did not
+    contain;
     if a column is empty in every sampled row, we record ``"null"``,
     not a guessed type.
 """
@@ -98,9 +100,10 @@ class SourceInspectionFacts:
         if self.inferred_types is not None:
             freeze_fields(self, "inferred_types")
         # Tier-1 invariants on dataclass fields the audit trail will record.
-        # Per CLAUDE.md offensive-programming policy: detect invalid states and
-        # raise meaningful errors at construction so a malformed inspection
-        # cannot propagate into proof diagnostics or the Landscape.
+        # Per the engine-patterns-reference skill §Offensive Programming
+        # Examples: detect invalid states and raise meaningful errors at
+        # construction so a malformed inspection cannot propagate into proof
+        # diagnostics or the Landscape.
         start, end = self.byte_range_inspected
         if start < 0 or end < start:
             raise ValueError(f"SourceInspectionFacts.byte_range_inspected must satisfy 0 <= start <= end; got ({start}, {end})")

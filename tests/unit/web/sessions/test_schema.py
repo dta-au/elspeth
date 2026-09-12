@@ -273,10 +273,10 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
 
     # 48 -> 51 by the multi-replica merge (elspeth-4d6c0dd0f5), then -> 52
     # when the pluggable-SSO identity substrate landed (elspeth-07cd19ba73),
-    # then -> 53 for the per-admission read records (elspeth-f98e0ae8b2).
+    # then -> 53 for per-admission reads and 54 for durable Composer progress.
     # _COORDINATION_HARD_CUT_EPOCH tracks this by exact equality, so a bump
     # that missed it would stop every session DB from opening.
-    assert SESSION_SCHEMA_EPOCH == 53
+    assert SESSION_SCHEMA_EPOCH == 54
     expected_tables = frozenset(
         {
             "web_instances",
@@ -285,6 +285,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
             "run_start_permits",
             "run_execution_inputs",
             "websocket_tickets",
+            "composer_inflight_requests",
+            "composer_progress_snapshots",
             "rate_limit_buckets",
             "rate_limit_events",
             "sessions_cleanup_claims",
@@ -301,6 +303,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
         "run_start_permits": {"ix_run_start_permits_retention_expires_at"},
         "run_execution_inputs": set(),
         "websocket_tickets": {"ix_websocket_tickets_expires_at", "ix_websocket_tickets_run_id"},
+        "composer_inflight_requests": {"ix_composer_inflight_requests_expires_at", "ix_composer_inflight_session_expiry"},
+        "composer_progress_snapshots": {"ix_composer_progress_snapshots_expires_at"},
         "rate_limit_buckets": {"ix_rate_limit_buckets_expires_at"},
         "rate_limit_events": {"ix_rate_limit_events_expires_at", "ix_rate_limit_events_subject_occurred"},
         "sessions_cleanup_claims": {"ix_sessions_cleanup_claims_lease_expires_at"},
@@ -366,6 +370,16 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
             "ck_websocket_tickets_digest_sha256",
             "ck_websocket_tickets_run_id_nonblank",
             "ck_websocket_tickets_user_id_nonblank",
+        },
+        "composer_inflight_requests": {
+            "ck_composer_inflight_token_nonblank",
+            "ck_composer_inflight_owner_nonblank",
+            "ck_composer_inflight_time_order",
+        },
+        "composer_progress_snapshots": {
+            "ck_composer_progress_generation_nonblank",
+            "ck_composer_progress_time_order",
+            "ck_composer_progress_bounded",
         },
         "rate_limit_buckets": {
             "ck_rate_limit_buckets_digest_sha256",

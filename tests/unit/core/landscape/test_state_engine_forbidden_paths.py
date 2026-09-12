@@ -699,6 +699,9 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "terminalize_pending_sinks_with_terminal_outcomes",
         "update_run_source_contract",
         "update_run_status",
+        "web_terminal_reconciliation",
+        "run-start-reset-prepared",
+        "run-start-effects",
     }
     member_verbs = {
         "update_node_output_contract",
@@ -757,6 +760,18 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
     assert actual_items == item_verbs
 
     retained_tests = {
+        "web_terminal_reconciliation": (
+            "tests/unit/web/execution/test_recovery_coordinator.py",
+            "test_stale_reconciliation_leader_refuses_before_projection",
+        ),
+        "run-start-reset-prepared": (
+            "tests/unit/core/landscape/test_run_start_admission.py",
+            "test_stale_leader_cannot_change_start_admission_or_setup",
+        ),
+        "run-start-effects": (
+            "tests/unit/core/landscape/test_run_start_admission.py",
+            "test_stale_leader_cannot_change_start_admission_or_setup",
+        ),
         "allocate_call_index": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_item_cannot_allocate_or_record_calls"),
         "fork_token": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_reclaimed_item_refuses_without_payload_mutation"),
         "record_call": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_item_cannot_allocate_or_record_calls"),
@@ -1077,6 +1092,18 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
                 if call_name in local_functions:
                     pending.append(local_functions[call_name])
         source_entry_points = {
+            "web_terminal_reconciliation": (
+                "src/elspeth/web/execution/recovery.py",
+                "_reconcile_resumable_terminal",
+            ),
+            "run-start-reset-prepared": (
+                "src/elspeth/core/landscape/run_start_admission.py",
+                "reset_prepared_initialization",
+            ),
+            "run-start-effects": (
+                "src/elspeth/core/landscape/run_start_admission.py",
+                "mark_executing",
+            ),
             "_transition": ("src/elspeth/core/landscape/scheduler/dispositions.py", "mark_terminal"),
             "_transition_with_ready_children": (
                 "src/elspeth/core/landscape/scheduler/dispositions.py",

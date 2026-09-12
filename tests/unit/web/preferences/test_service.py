@@ -675,7 +675,8 @@ def test_corrupt_prior_blocks_patch_via_prior_load(service):
 
     This intentionally reverses the pre-B2 Finding-7 behaviour
     (corrupt stored + valid PATCH body → PATCH succeeds). The reversal
-    is consistent with CLAUDE.md §"Three-Tier Trust Model" Tier-1
+    is consistent with docs/guides/data-trust-and-error-handling.md
+    §The Three-Tier Trust Model, the Tier-1
     rule: "Bad data in the audit trail = crash immediately. No
     coercion, no defaults, no silent recovery." B1's audit-payload
     extension records ``prior_trust_mode``; recording a corrupt prior

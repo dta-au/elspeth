@@ -40,7 +40,9 @@ class AuditRunStatusProjection:
         emits N children — yet each contributes exactly its *source rows* to
         ``rows_processed`` (1, 3, 1 respectively).
 
-        ``row_id`` is the stable source-row identity (CLAUDE.md DAG model):
+        ``row_id`` is the stable source-row identity — it never changes across
+        fork, coalesce or aggregation (docs/contracts/system-operations.md
+        §Identity Semantics):
         fork and expand children inherit their parent's ``row_id``
         (``tokens.expand_token`` / ``fork_token`` pass ``row_id=parent.row_id``),
         and aggregation's ``BATCH_CONSUMED`` tokens retain their own source

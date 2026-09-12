@@ -4,6 +4,45 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
+
+**Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
+to 54 for durable Composer progress snapshots and exact request lifecycle
+leases. Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 39 for immutable
+web run-start permit binding and recoverable pre-effect admission state.
+
+ELSPETH does not migrate either predecessor database in place before 1.0.
+Archive or export required evidence, stop the old service, recreate stale
+session and Landscape stores, then install 0.8.1. Session databases below
+epoch 54 and Landscape databases below epoch 39 must be recreated together.
+Preserve `data/auth.db` and follow the account re-admission guidance in the
+[session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
+Do not roll older code back over the recreated databases; keep the service
+drained and repair this release forward.
+
+- **Coordination deadlines are decided from fresh post-lock database time.**
+  Lease deadlines are now issued after locked admission rather than from a
+  clock sampled before it, and sink-effect clocks are sampled after their lease
+  locks. A deadline derived from a pre-lock reading could be stale by the width
+  of the lock wait, so two workers could disagree about when a lease expired.
+- **A PostgreSQL heartbeat lock timeout is degraded liveness, not failure.**
+  A contended heartbeat no longer fails the run closed; the lock timeout is
+  classified as degraded liveness and retried.
+- **Landscape failures survive transaction unwind.** An invalidated
+  transaction no longer discards the failure that caused it, so the original
+  error reaches the audit trail instead of the rollback's own error.
+- **Blob custody stays fenced across durable effects and recovery.** Collector
+  blob custody and fatal archive failures are preserved, and custody walkers
+  reject null canonical sections rather than treating them as empty.
+- **SSO hardening.** Dormancy is enforced on bound identities, bound profiles
+  refresh, database work is offloaded off the request path, and response
+  streams carry size caps.
+- **Azure Container Apps deployment.** Schema credentials are isolated from
+  the application identity, revision secret bindings are retained across
+  revisions, and Key Vault write authority is confirmed before SQL bootstrap.
+
+---
+
 ## 0.8.0 - 2026-09-07 (Unified lineage and production hardening)
 
 0.8.0 unifies ELSPETH's group-lineage and settlement model while carrying
@@ -108,7 +147,7 @@ transitions of one work item in one second collided on the primary key.
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.0. A Landscape database below
-epoch 38 is not current and must be recreated. Do not roll older code back over
+epoch 38 is not current for 0.8.0 and must be recreated. Do not roll older code back over
 the recreated databases; keep the service drained and repair this release
 forward.
 

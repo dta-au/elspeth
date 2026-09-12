@@ -161,8 +161,9 @@ class _SessionsTelemetry:
     reference whose internal state (call list / aggregated value) is
     mutable by design — that's what makes a counter useful.  ``frozen``
     blocks slot reassignment, which is the only invariant we want.  The
-    CLAUDE.md ``deep_freeze`` contract applies to ``Mapping/Sequence/Set``
-    container fields; ``_Counter`` is neither.
+    ``deep_freeze`` contract exists because ``frozen=True`` leaves container
+    contents mutable through the attribute reference; it applies to
+    ``Mapping/Sequence/Set`` container fields, and ``_Counter`` is neither.
     """
 
     tool_row_tier1_violation_total: _Counter
@@ -361,7 +362,8 @@ def build_sessions_telemetry(*, meter: _Meter | None = None) -> _SessionsTelemet
                 "aggregates over committed audit rows in that table; "
                 "no UI-only verbs (e.g. save_for_review) and no "
                 "run-completion verbs (e.g. run_pipeline — see runs/) "
-                "appear here, per the CLAUDE.md superset rule."
+                "appear here, per the logging-telemetry-policy skill "
+                "§The Superset Rule."
             ),
         ),
         share_token_verify_failure_total=meter.create_counter(

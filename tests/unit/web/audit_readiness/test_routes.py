@@ -25,8 +25,9 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 # ``project_phase2c_implementation_complete.md``); the probe is now a
 # hard precondition rather than a skip-gate so a future route rename
 # surfaces loud at test-import time instead of silently skipping the
-# four Sub-task 7f telemetry-emit tests below.  CLAUDE.md "no silent
-# failures": a silent-skip on telemetry-emit regression is exactly the
+# four Sub-task 7f telemetry-emit tests below.  Per the ``logging-telemetry-policy``
+# skill §Telemetry (Operational Visibility), "No Silent Failures":
+# a silent-skip on telemetry-emit regression is exactly the
 # audit-trail gap the policy forbids. Decoupled from the production
 # app so test discovery doesn't pay full-app-import cost.
 _router_for_probe = create_audit_readiness_router()
@@ -117,7 +118,8 @@ def test_snapshot_fetch_failure_emits_audit_fetch_failure_counter() -> None:
     read path. The route emits ``composer.audit.fetch_failure_total``
     exactly once and re-raises so the failure remains visible (no
     silent swallow to a 200 response). Telemetry-only signal under
-    the CLAUDE.md non-decision read superset exception.
+    the non-decision read exception in the ``logging-telemetry-policy``
+    skill §The Superset Rule.
     """
     client = _client()
     with (

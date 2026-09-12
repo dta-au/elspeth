@@ -110,8 +110,9 @@ class TestRoutingAction:
     def test_fork_to_paths_rejects_empty_list(self) -> None:
         """fork_to_paths must have at least one destination.
 
-        Per CLAUDE.md "no silent drops" invariant, empty forks would cause
-        tokens to disappear without audit trail. This MUST raise immediately.
+        Per docs/release/guarantees.md §1.2 No Silent Drops, empty forks would
+        cause tokens to disappear without an audit trail. This MUST raise
+        immediately.
         """
         with pytest.raises(ValueError, match="at least one destination"):
             RoutingAction.fork_to_paths([])

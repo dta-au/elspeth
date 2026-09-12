@@ -31,6 +31,7 @@ FrameworkBugError = tier_1_error(
 )(_FrameworkBugError)
 
 if TYPE_CHECKING:
+    from elspeth.contracts.checkpoint import ResumeRefusalCause
     from elspeth.contracts.coalesce_metadata import CoalesceMetadata
     from elspeth.contracts.coordination import RegisteredWorker
 
@@ -1144,7 +1145,7 @@ class RunMembershipLostError(Exception):
 # SchedulerLeaseLostError discipline.
 # TIER-2: Legitimate multi-worker coordination — registry eviction/departure is a clean abandon signal handled by the drain loop, not audit corruption.
 class RunWorkerEvictedError(Exception):
-    """Raised when a worker discovers its registry row is no longer ``active``.
+    """Raised when a worker observes membership loss or leader-seat deposition.
 
     Latched from the heartbeat CAS miss (slice-4 thread) or raised directly
     when a membership-fenced verb (``claim_ready`` / ``claim_pending_sink`` /
@@ -1155,15 +1156,34 @@ class RunWorkerEvictedError(Exception):
     Attributes:
         worker_id: The evicted/departed worker identity.
         run_id: The run the registration belonged to.
+        reason: Which coordination loss was observed, when the raiser carried
+            that observation forward (the heartbeat latch distinguishes "the
+            membership fence refused the beat" from "the seat was taken by
+            another leader"); ``None`` when it did not, in which case the
+            message is unchanged. All four membership-fenced raise sites pass
+            ``None``, for two different reasons: two probe a boolean
+            ``active_worker_fence_clause`` EXISTS and hold no status to
+            report, while the other two read ``run_workers.status`` to branch
+            on and do not carry the observed value forward. ``None`` therefore
+            asserts only that no observation was supplied — never that none
+            was available.
     """
 
-    def __init__(self, *, worker_id: str, run_id: str) -> None:
+    def __init__(self, *, worker_id: str, run_id: str, reason: str | None = None) -> None:
         self.worker_id = worker_id
         self.run_id = run_id
+        self.reason: str | None = reason
+        # Appended only when the raiser supplied an observed loss, so a caller
+        # that passes none still produces the original message verbatim.
+        detail = f" Observed: {reason}." if reason is not None else ""
+        summary = (
+            f"Worker {worker_id!r} is no longer an active member of run {run_id!r} (evicted or departed)."
+            if reason is None
+            else f"Worker {worker_id!r} lost coordination for run {run_id!r}."
+        )
         super().__init__(
-            f"Worker {worker_id!r} is no longer an active member of run {run_id!r} "
-            "(evicted or departed). Worker identities are single-use; abandon "
-            "in-flight work and re-admit under a fresh identity if appropriate."
+            f"{summary} Worker identities are single-use; abandon "
+            f"in-flight work and re-admit under a fresh identity if appropriate.{detail}"
         )
 
 
@@ -1233,18 +1253,16 @@ class AbandonRefusedError(Exception):
     :class:`~elspeth.core.checkpoint.recovery.NonResumableRunError`.
     """
 
-    def __init__(self, run_id: str, reason: str) -> None:
+    def __init__(self, run_id: str, reason: str, *, cause: "ResumeRefusalCause") -> None:
         self.run_id = run_id
         self.reason = reason
+        self.cause = cause
         super().__init__(f"Cannot abandon run {run_id!r}: {reason}")
 
 
-# The audit DB write lock is held by a live or frozen process, so the takeover
-# CAS could not even begin (SQLITE_BUSY after the busy_timeout poll). NOT
-# "leadership held": ADR-030 §B.4 requires BUSY to be reported distinctly from a
-# clean CAS loss. The remediation is operator SIGKILL of the wedged holder
-# (locks release on process death); registered-worker forensics remain structured
-# on the exception for trusted operator surfaces.
+# ADR-030 §B.4 distinguishes write contention from a clean seat-CAS loss.
+# Registration records identify candidates for local operator investigation,
+# not confirmed lock holders. Generic error surfaces omit those records.
 # TIER-2: Operator-actionable environmental refusal — a held WAL write lock surfaced with pid forensics for remediation; the audit DB is intact, not corruption.
 class WriteLockHeldError(Exception):
     """Raised when a coordination write times out on the audit DB write lock.
@@ -1253,13 +1271,15 @@ class WriteLockHeldError(Exception):
     leader): a busy timeout means some process — live or frozen — holds the
     WAL write lock. Carries the run's registered workers (pid/hostname/role
     forensics from ``run_workers``) as structured data for trusted operator
-    surfaces, while the default string is safe for generic CLI/API error paths.
+    surfaces. The local CLI explicitly renders these candidates; the default
+    string remains safe for generic API and logging paths.
 
     Attributes:
         run_id: The run whose coordination write was refused.
         workers: Registered ``run_workers`` rows for the run at refusal time
             (read on a plain read connection; WAL readers don't block on the
-            writer). May be empty if the registry could not be read.
+            writer). Empty means no rows were available or the registry could
+            not be read. Records may be stale and may omit the actual holder.
     """
 
     def __init__(self, *, run_id: str, workers: tuple["RegisteredWorker", ...]) -> None:
@@ -1268,10 +1288,10 @@ class WriteLockHeldError(Exception):
         worker_count = len(workers)
         worker_label = "registered worker" if worker_count == 1 else "registered workers"
         super().__init__(
-            f"The audit DB write lock is held by a live or frozen process; the "
-            f"coordination write for run {run_id!r} timed out at BEGIN IMMEDIATE. "
-            f"Registered workers: {worker_count} {worker_label}. If a worker is frozen inside a "
-            "transaction, SIGKILL it (SQLite locks release on process death) and retry."
+            f"The audit database write lock prevented a coordination write for run {run_id!r}. "
+            f"Registered workers: {worker_count} {worker_label}. "
+            "Inspect the database writer and verify its process identity before stopping it; "
+            "retry after the lock is released."
         )
 
 
@@ -1522,6 +1542,7 @@ class SchemaConfigFieldMetadataMismatch(TypedDict):
 class SchemaConfigModePayload(TypedDict):
     """Audit payload for ADR-014 schema-mode/runtime-semantic mismatches."""
 
+    emitted_index: Required[int]
     declared_mode: Required[str]
     observed_mode: Required[str]
     declared_locked: Required[bool]
@@ -1579,7 +1600,7 @@ class PluginRetryableError(Exception):
     Deliberate engine-classified carve-out: the processor additionally treats
     the Python runtime's canonical transient transport signals —
     ``ConnectionError`` and ``TimeoutError`` — and the contract-owned
-    ``CapacityError`` (``retryable`` always True) as retryable, because they
+    ``CapacityError`` as retryable by nominal classification, because they
     can surface from beneath provider SDKs without a plugin seam to classify
     them. No other unclassified exception is retried; in particular bare
     ``OSError`` (``FileNotFoundError``, ``PermissionError``, ...) is a plugin
@@ -1614,7 +1635,6 @@ class RuntimePreflightFailedError(AuditEvidenceBase, Exception):
         self.cause_type = type(cause).__name__
         retryable_cause = cast(PluginRetryableError, cause) if issubclass(type(cause), PluginRetryableError) else None
         self.retryable = retryable_cause.retryable if retryable_cause is not None else False
-        self.status_code = retryable_cause.status_code if retryable_cause is not None else None
         message = (
             f"{self.error_class}: {plugin_name} provider {provider} failed runtime preflight "
             f"before row processing: {self.cause_type}: {cause}"
@@ -1913,7 +1933,8 @@ def __getattr__(name: str) -> tuple[type[Exception], ...]:
 # Schema Contract Violation Types (Tier 3 - External Data)
 # =============================================================================
 # These exceptions represent validation failures on external/user data.
-# They result in row quarantine, NOT crashes. Per CLAUDE.md Three-Tier Trust Model,
+# They result in row quarantine, NOT crashes. Per the three-tier trust model
+# (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
 # Tier 3 data (external) can be "literal trash" and must be handled gracefully.
 #
 # Error messages follow "'original' (normalized)" format for debuggability:
@@ -2186,7 +2207,14 @@ class DependencyFailedError(Exception):
 
 # TIER-2: Commencement gate failure signal — config-driven pre-flight check rejected the run; not a framework bug or audit corruption.
 class CommencementGateFailedError(Exception):
-    """A commencement gate evaluated to falsy or raised an error."""
+    """A commencement gate evaluated to falsy or raised an error.
+
+    Note:
+        Raw ``context_snapshot`` is retained for programmatic inspection, but
+        deliberately excluded from generic messages, CLI output and telemetry
+        because its nested values may contain sensitive context. Retention does
+        not imply that failed snapshots are persisted in the audit trail.
+    """
 
     def __init__(
         self,
@@ -2276,7 +2304,6 @@ class CapacityError(Exception):
 
     Attributes:
         status_code: HTTP status code that triggered this error
-        retryable: Always True for capacity errors
     """
 
     def __init__(self, status_code: int, message: str) -> None:
@@ -2284,7 +2311,6 @@ class CapacityError(Exception):
             raise ValueError(f"CapacityError.status_code must be a valid HTTP status (100-599), got {status_code}")
         super().__init__(message)
         self.status_code = status_code
-        self.retryable = True
 
 
 # TIER-2: telemetry-subsystem configuration/initialization failure.

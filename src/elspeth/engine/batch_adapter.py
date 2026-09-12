@@ -25,7 +25,8 @@ Retry Safety:
     waiter (which will be garbage collected), not to the retry's waiter.
 
 Exception Propagation:
-    Plugin bugs should crash the orchestrator (CLAUDE.md compliance). Worker threads
+    Plugin bugs should crash the orchestrator (see
+    docs/guides/data-trust-and-error-handling.md §Plugin Ownership). Worker threads
     wrap uncaught exceptions in ExceptionResult so they propagate through the async
     pattern. RowWaiter.wait() detects these and re-raises the original exception.
 """

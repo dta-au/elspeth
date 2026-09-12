@@ -39,6 +39,7 @@ def test_support_matrix_links_only_shipped_deployment_artifacts() -> None:
     for label in (
         "Docker Compose",
         "AWS ECS",
+        "Azure Container Apps",
         "Azure Ubuntu VM",
         "Kubernetes (BYO manifests)",
         "Native Linux",
@@ -66,8 +67,8 @@ def test_support_matrix_links_only_shipped_deployment_artifacts() -> None:
         assert (REPO_ROOT / shipped_path).is_file()
 
     # deploy/azure-container-apps/ ships from Phase 6b (its own contract test is
-    # tests/unit/deployment/test_azure_container_apps_bundle.py); the support
-    # claim for the platform flips only with the sanitized receipt.
+    # tests/unit/deployment/test_azure_container_apps_bundle.py). Desktop
+    # acceptance does not manufacture a sanitized live receipt.
     for absent_bundle in ("kubernetes", "platforms"):
         bundle_path = REPO_ROOT / "deploy" / absent_bundle
         assert not bundle_path.exists() or not any(bundle_path.rglob("*"))
@@ -86,7 +87,7 @@ def test_support_matrix_includes_runtime_connection_and_doctor_inputs() -> None:
         assert phrase in text
 
 
-def test_azure_support_is_one_stop_before_start_linux_vm() -> None:
+def test_azure_vm_retains_one_stop_before_start_linux_vm() -> None:
     matrix = _read(PLATFORM_DOC)
     runbook = _read(UBUNTU_RUNBOOK)
     combined = f"{matrix}\n{runbook}"
@@ -105,10 +106,34 @@ def test_azure_support_is_one_stop_before_start_linux_vm() -> None:
     assert "azure-container-apps" in matrix
     assert "runtime contract and" in matrix
     assert "are implemented" in matrix
-    assert "Live Azure acceptance remains pending" in " ".join(matrix.split())
+    assert "desktop acceptance" in matrix
     assert "elspeth-5ec3befc1a" in matrix
-    assert "sanitized live receipt" in matrix
-    assert "| Azure Container Apps |" not in matrix
+    assert "| Azure Container Apps |" in matrix
+
+
+def test_aca_configuration_and_evidence_are_distinct_from_single_host_targets() -> None:
+    matrix = _normalized(PLATFORM_DOC)
+    for phrase in (
+        "closed on 2026-09-10",
+        "`Single` revision mode",
+        "`sticky` session affinity",
+        "2 to 4 replicas",
+        "one web process per replica",
+        "single-use WebSocket tickets",
+        "durable ordered run events",
+        "renewable Composer request leases",
+        "shared rate-limit budgets",
+        "reconnect",
+        "transparent run handoff",
+        "interrupted provider request is not automatically resumed",
+        "local PostgreSQL",
+        "legacy v2 P4b",
+        "`cannot_pass`",
+        "No live cloud acceptance is claimed",
+    ):
+        assert phrase in matrix
+    assert "Live Azure acceptance remains pending" not in matrix
+    assert "Run one web process or replica" not in matrix
 
 
 def test_kubernetes_is_an_explicit_byo_zero_overlap_contract() -> None:
@@ -265,10 +290,15 @@ def test_navigation_and_repository_structure_are_honest() -> None:
     assert "docs/reference/deployment-platforms.md" in readme
     assert "Deployment Platforms" in runbook_index
     assert "Azure Container Apps" in runbook_index
-    assert "deferred" in runbook_index.lower()
+    assert "desktop acceptance" in runbook_index
     assert "Kubernetes" in runbook_index
     assert "BYO" in runbook_index
 
     assert "`deploy/compose/`" in structure
     assert "`deploy/aws-ecs/terraform/`" in structure
     assert "`deploy/linux-systemd/`" in structure
+    for text in (_normalized(README), _normalized(REPOSITORY_STRUCTURE)):
+        assert "desktop acceptance" in text
+        assert "Single/sticky" in text
+    assert "support claim waits for that receipt" not in readme
+    assert "not a supported target in this release" not in _normalized(REPOSITORY_STRUCTURE)

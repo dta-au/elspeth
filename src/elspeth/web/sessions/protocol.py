@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
     from elspeth.web.composer.pipeline_proposal import PipelineProposal, ProposalBase
+    from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 ChatMessageRole = Literal["user", "assistant", "system", "tool", "audit"]
@@ -821,13 +822,12 @@ class ComposerSessionPreferencesTransition:
     ``composer.session.switched_total``; the B1 audit-payload extension
     records ``prior.trust_mode`` into ``proposal_events_table.payload``
     so the telemetry counter remains a strict subset of audit-recorded
-    reality (audit-primacy superset rule, CLAUDE.md
-    §"Telemetry and Logging").
+    reality (the logging-telemetry-policy skill §The Superset Rule).
 
-    Both fields hold immutable frozen dataclass instances; no container
-    fields here, so no ``__post_init__`` deep-freeze guard is required
-    (per CLAUDE.md §"Frozen Dataclass Immutability"; scalar/frozen-
-    dataclass wrappers do not need guards).
+    ``frozen=True`` leaves container contents mutable through the attribute
+    reference, so container fields are deep-frozen in ``__post_init__``.
+    Both fields here hold immutable frozen dataclass instances; there are no
+    container fields, so no deep-freeze guard is required.
     """
 
     prior: ComposerSessionPreferencesRecord
@@ -1043,8 +1043,8 @@ class ChatMessageRecord:
                 f"expected one of {sorted(CHAT_MESSAGE_WRITER_PRINCIPAL_VALUES)}"
             )
         # tool_call_id / parent_assistant_id are scalar fields and need no
-        # freeze guard (CLAUDE.md "Scalar-Only Fields Need No Guard"). Only
-        # ``tool_calls`` carries mutable contents.
+        # freeze guard — scalar-only records have nothing to deep-freeze.
+        # Only ``tool_calls`` carries mutable contents.
         if self.tool_calls is not None:
             freeze_fields(self, "tool_calls")
 
@@ -2920,6 +2920,10 @@ class RunRecord:
     error: str | None
     landscape_run_id: str | None
     pipeline_yaml: str | None
+    cancel_requested_at: datetime | None = None
+    cancellation_source: CancellationSource | None = None
+    saga_state: RunSagaState = RunSagaState.DRAFT
+    recovery_required_reason: RecoveryRequiredReason | None = None
 
     def __post_init__(self) -> None:
         self._validate_counters()
@@ -3317,6 +3321,23 @@ class SessionOperationInterpretationMutations(Protocol):
 class SessionOperationRunMutations(Protocol):
     """Run mutations available inside one exact EXECUTE operation fence."""
 
+    def issue_start_permit(self, *, run_id: UUID) -> RunStartPermitRecord: ...
+
+    def rebind_run_ownership(self, *, run_id: UUID) -> RunSagaState: ...
+
+    def mark_recovery_outputs_finalized(self, *, run_id: UUID) -> None: ...
+
+    def mark_recovery_required(self, *, run_id: UUID, reason: RecoveryRequiredReason) -> None: ...
+
+    def append_terminal_run_event_once(
+        self,
+        *,
+        run_id: UUID,
+        timestamp: datetime,
+        event_type: SessionRunEventType,
+        data: Mapping[str, Any],
+    ) -> RunEventRecord: ...
+
     def create_pending_run(
         self,
         *,
@@ -3324,6 +3345,7 @@ class SessionOperationRunMutations(Protocol):
         state_id: UUID,
         pipeline_yaml: str | None,
         started_at: datetime,
+        execution_input: RunExecutionInput | None = None,
     ) -> RunRecord: ...
 
     def transition_run_status(
@@ -4157,9 +4179,10 @@ class SessionServiceProtocol(Protocol):
 
         ``kind`` must be supplied explicitly by the caller. Implementations
         MUST validate the affected component in the parent composition state
-        before INSERT (writer-boundary check per CLAUDE.md offensive
-        programming): ``invented_source`` targets the synthetic ``source``
-        component and requires persisted source-authoring metadata;
+        before INSERT (writer-boundary check per the engine-patterns-reference
+        skill §Offensive Programming Examples): ``invented_source`` targets
+        the synthetic ``source`` component and requires persisted
+        source-authoring metadata;
         ``pipeline_decision`` targets the node that implements the reviewed
         shape decision; prompt/vague transform kinds target real LLM nodes in
         ``composition_states.nodes``. Raises
@@ -4541,9 +4564,10 @@ class SessionServiceProtocol(Protocol):
         ``session_id``. That is a Tier 1 audit anomaly: the state was
         reachable from a run but does not belong to the session hosting
         the run. Silent coercion or a soft 404 would produce a confident
-        wrong answer — exactly the pattern CLAUDE.md forbids for our own
-        data. Raises ``ValueError`` when the state does not exist at all,
-        consistent with ``get_state``.
+        wrong answer — exactly the pattern
+        docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model forbids for our own data. Raises ``ValueError`` when the state
+        does not exist at all, consistent with ``get_state``.
         """
         ...
 
@@ -4574,7 +4598,18 @@ class SessionServiceProtocol(Protocol):
         pipeline_yaml: str | None = None,
         *,
         session_operation_context: SessionOperationContext,
+        execution_input: RunExecutionInput | None = None,
     ) -> RunRecord: ...
+
+    async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord: ...
+
+    async def request_run_cancellation(
+        self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType
+    ) -> RunRecord: ...
+
+    async def get_run_execution_input(self, run_id: UUID) -> RunExecutionInput | None: ...
+
+    async def list_recoverable_run_records(self) -> tuple[RunRecord, ...]: ...
 
     async def get_run(self, run_id: UUID) -> RunRecord: ...
 

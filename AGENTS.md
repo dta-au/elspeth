@@ -29,6 +29,18 @@ none of it is required to contribute.
 - After any status claim ("fix landed", "ticket closed", "branch merged"),
   re-verify against the current HEAD before writing it into a checkpoint or
   handoff doc.
+- State no conclusion by inference — coverage gap, branch landed, root cause,
+  file size, row count. Run the measuring command first and show its raw
+  output beside the claim.
+- Control an ad-hoc instrument before you trust a number it produced: run it
+  against a known-positive case it must match and a known-negative case it
+  must not. A `grep`, `find -size`, glob or regex that silently matches
+  nothing returns exactly what a correct one returns when there is nothing
+  to find, so a clean answer is not evidence the instrument works.
+- A positive assertion over a filtered subset is still a negative claim, and
+  a partial capture (`.*?` under `re.S`, `git rev-parse` echoing a missing
+  path back) fails toward passing. When an instrument decides a gate, mutate
+  the thing it should catch and confirm it goes red.
 
 ## Quick reference
 
@@ -199,6 +211,23 @@ working around it.
   you (per-stage logs, recorded exit codes, a frozen-tree check); read its
   `summary.txt`, not its terminal output.
 
+## Subagent Reporting
+
+- Brief every subagent to write its findings to a file and return only the
+  path plus a short summary. The message channel truncates long reports, and
+  a truncated report is indistinguishable from a complete short one.
+- Coordination and lane state go under `.claude/lanes/<run>/` — the
+  `lane-manager` convention, already gitignored and already named in Commit
+  Hygiene as never-stage.
+- A durable deliverable (a review, an inventory, a design note, an evidence
+  bundle) goes to a tracked path under `docs/`. Confirm it with
+  `git check-ignore -v <path>` before writing: no output means the path is
+  safe. `scratch/` and `.scratch/` are ignored and have swallowed a finished
+  report before.
+- Dispatch to an agent type that can write. A read-only type must answer
+  inline, so either scope its brief narrow enough to survive the channel or
+  pick a different type.
+
 ## Editing Rules
 
 - Do not use `sed`, `awk`, or scripted line-number rewrites to resolve merge
@@ -216,6 +245,23 @@ working around it.
   before every commit, rebase or push.
 - Run the lint gate (ruff) locally before pushing; do not rely on CI to
   surface unused imports or formatting.
+
+## Scope Discipline
+
+- The reported defect is the deliverable. Do not ship a cosmetic or adjacent
+  change while deferring the actual fix into new tickets unless the developer
+  approved that split first.
+- If the smallest change that actually fixes the defect turns out to be out
+  of scope, stop and say so plainly. Filing follow-up tickets is not a
+  substitute for reporting that the fix did not land.
+- Confirm the target version and branch before editing docs, changelogs or
+  release notes. Which release a change belongs to is a decision to check,
+  not an inference from the current checkout.
+- This is not a budget cap. Wide dispatch and deep analysis are standing
+  policy for the maintainer's own agents
+  ([docs/maintainer/toolchain.md](docs/maintainer/toolchain.md) § Standing
+  authorization); this section constrains what you hand back, not what you
+  spend getting there.
 
 ## Project delivery posture
 

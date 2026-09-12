@@ -29,6 +29,19 @@ class MockWebSocket {
 }
 
 describe("connectToRun", () => {
+  it("resumes after the last delivered sequence and suppresses replay duplicates", async () => {
+    const handlers = callbacks();
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket"), handlers);
+    await flushPromises();
+    const event = { event_type: "progress", event_sequence: 3, data: {} };
+    MockWebSocket.instances[0].onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
+    MockWebSocket.instances[0].closeWith(1006);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(new URL(MockWebSocket.instances[1].url).searchParams.get("after_sequence")).toBe("3");
+    MockWebSocket.instances[1].onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
+    expect(handlers.onProgress).toHaveBeenCalledTimes(1);
+  });
   function callbacks() {
     return {
       onProgress: vi.fn(),

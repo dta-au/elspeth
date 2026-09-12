@@ -2,9 +2,10 @@
 
 Handles the seam between SQLAlchemy rows (strings) and domain objects
 (strict enum types). This is NOT a trust boundary - if the database
-has bad data, we crash. That's intentional per Data Manifesto.
+has bad data, we crash. That's intentional.
 
-Per Data Manifesto: The audit database is OUR data. Bad data = crash.
+Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model): the audit database is OUR data. Bad data = crash.
 """
 
 from typing import Any

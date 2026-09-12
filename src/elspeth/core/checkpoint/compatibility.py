@@ -6,14 +6,9 @@ compatibility.
 """
 
 from elspeth.contracts import Checkpoint, ResumeCheck
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.core.canonical import compute_full_topology_hash
 from elspeth.core.dag import ExecutionGraph
-
-
-class IncompatibleCheckpointError(Exception):
-    """Raised when attempting to resume from an incompatible checkpoint."""
-
-    pass
 
 
 class CheckpointCompatibilityValidator:
@@ -88,6 +83,7 @@ class CheckpointCompatibilityValidator:
         if checkpoint.format_version is None:
             return ResumeCheck(
                 can_resume=False,
+                cause=ResumeRefusalCause.CHECKPOINT_FORMAT_MISSING,
                 reason=f"Checkpoint '{checkpoint.checkpoint_id}' is missing format_version. "
                 "Resume not supported for unversioned checkpoints. "
                 "Please restart pipeline from beginning.",
@@ -96,6 +92,7 @@ class CheckpointCompatibilityValidator:
         if checkpoint.format_version != Checkpoint.CURRENT_FORMAT_VERSION:
             return ResumeCheck(
                 can_resume=False,
+                cause=ResumeRefusalCause.CHECKPOINT_FORMAT_INCOMPATIBLE,
                 reason=f"Checkpoint '{checkpoint.checkpoint_id}' has incompatible format version "
                 f"(checkpoint: v{checkpoint.format_version}, current: v{Checkpoint.CURRENT_FORMAT_VERSION}). "
                 "Resume requires exact format version match. "
@@ -136,6 +133,7 @@ class CheckpointCompatibilityValidator:
         # For now, provide hash comparison for audit trail
         return ResumeCheck(
             can_resume=False,
+            cause=ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED,
             reason=f"Pipeline configuration changed since checkpoint was created. "
             f"Resuming would produce outputs under a different configuration, "
             f"violating audit integrity (one run_id must map to one configuration). "

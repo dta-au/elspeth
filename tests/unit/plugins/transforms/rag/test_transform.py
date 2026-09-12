@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
-from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, RetrievalNotReadyError, TelemetryExporterError
+from elspeth.contracts.events import RAGRetrievalStatistics, TelemetryEvent
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
@@ -20,7 +21,11 @@ from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProviderConfig
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+from elspeth.telemetry.exporters.console import ConsoleExporter
+from elspeth.telemetry.manager import TelemetryManager
 from elspeth.testing import make_field
+from tests.fixtures.factories import make_context
+from tests.fixtures.telemetry import MockTelemetryConfig
 
 # Observed mode forbids explicit field definitions, so author-declared output
 # field metadata reaches the emitted contract only under fixed/flexible mode.
@@ -105,9 +110,9 @@ class _TransformContextFake:
 
 @dataclass
 class _TelemetrySinkFake:
-    payloads: list[Any] = field(default_factory=list)
+    payloads: list[TelemetryEvent] = field(default_factory=list)
 
-    def __call__(self, payload: Any) -> None:
+    def __call__(self, payload: TelemetryEvent) -> None:
         self.payloads.append(payload)
 
 
@@ -151,7 +156,7 @@ class _LifecycleContextFake:
     member_token: WorkerMembershipToken | None = field(default_factory=lambda: _LEADER_TOKEN.membership)
     telemetry_emit: _TelemetrySinkFake = field(default_factory=_TelemetrySinkFake)
     rate_limit_registry: None = None
-    node_id: str | None = None
+    node_id: str | None = "retrieval"
     operation_id: str | None = None
     payload_store: None = None
     concurrency_config: None = None
@@ -671,6 +676,24 @@ class TestProcessFlow:
 
 
 class TestOnComplete:
+    @pytest.mark.parametrize(
+        "error", [AuditIntegrityError("audit failure"), RuntimeError("bug"), TelemetryExporterError("console", "down")]
+    )
+    def test_callback_failure_propagates(self, error):
+        transform, _ = _setup_transform_with_mock_provider()
+        callback = Mock(spec=_TelemetrySinkFake, side_effect=error)
+        transform._telemetry_emit = callback
+        with pytest.raises(type(error)):
+            transform.on_complete(_mock_lifecycle_ctx())
+        callback.assert_called_once()
+
+    def test_completion_requires_node_identity(self):
+        transform, _ = _setup_transform_with_mock_provider()
+        lifecycle = _mock_lifecycle_ctx()
+        lifecycle.node_id = None
+        with pytest.raises(FrameworkBugError, match="node_id"):
+            transform.on_complete(lifecycle)
+
     def test_emits_telemetry(self):
         transform, _ = _setup_transform_with_mock_provider()
         # on_complete uses the telemetry_emit captured during on_start
@@ -684,10 +707,95 @@ class TestOnComplete:
         assert isinstance(transform._telemetry_emit, _TelemetrySinkFake)
         assert len(transform._telemetry_emit.payloads) == 1
         payload = transform._telemetry_emit.payloads[0]
-        assert payload["event"] == "rag_retrieval_complete"
-        assert "run_id" in payload
-        assert payload["total_queries"] == 0
-        assert payload["quarantine_count"] == 0
+        assert isinstance(payload, RAGRetrievalStatistics)
+        assert payload.run_id == "run-1"
+        assert payload.total_queries == 0
+        assert payload.quarantine_count == 0
+
+    @pytest.mark.parametrize("scores", [[], [0.5], [0.5, 1.0]])
+    def test_real_console_statistics_and_run_reset(self, capsys, scores):
+        exporter = ConsoleExporter()
+        exporter.configure({"format": "json"})
+        manager = TelemetryManager(MockTelemetryConfig(), [exporter])
+        provider = _RetrievalProviderFake(readiness_result=_ready_provider_result())
+        factory = _ProviderFactoryFake(provider=provider)
+        transform = _make_transform()
+        capsys.readouterr()
+        try:
+            with patch.dict(
+                "elspeth.plugins.transforms.rag.transform.PROVIDERS",
+                {"azure_search": (AzureSearchProviderConfig, factory)},
+            ):
+                for run_id in ("first-run", "second-run"):
+                    ctx = make_context(run_id=run_id, node_id="retrieval")
+                    ctx.telemetry_emit = manager.handle_event
+                    transform.on_start(ctx)
+                    if run_id == "first-run":
+                        for score in scores:
+                            provider.chunks = [RetrievalChunk(content="private-document", score=score, source_id="private-id", metadata={})]
+                            transform.process(_make_row({"question": "private-query"}), _mock_ctx())
+                        transform.process(_make_row({}), _mock_ctx())
+                    transform.on_complete(ctx)
+                    manager.flush()
+                    output = capsys.readouterr().out
+                    payload = json.loads(output)
+                    assert payload["event_type"] == "RAGRetrievalStatistics"
+                    assert payload["run_id"] == run_id
+                    assert payload["node_id"] == "retrieval"
+                    assert payload["plugin_name"] == "rag_retrieval"
+                    assert payload["provider"] == "azure_search"
+                    assert "private-" not in output
+                    expected_scores = scores if run_id == "first-run" else []
+                    assert payload["total_queries"] == len(expected_scores)
+                    assert payload["total_chunks"] == len(expected_scores)
+                    assert payload["quarantine_count"] == (1 if run_id == "first-run" else 0)
+                    assert payload["score_count"] == len(expected_scores)
+                    assert payload["score_mean"] == (sum(expected_scores) / len(expected_scores) if expected_scores else None)
+                    assert payload["score_std"] == (pytest.approx(0.3535533905932738) if len(expected_scores) == 2 else None)
+        finally:
+            transform.close()
+            manager.close()
+
+    def test_real_console_distinguishes_queries_chunks_and_score_observations(self, capsys):
+        exporter = ConsoleExporter()
+        exporter.configure({"format": "json"})
+        manager = TelemetryManager(MockTelemetryConfig(), [exporter])
+        provider = _RetrievalProviderFake(
+            readiness_result=_ready_provider_result(),
+            chunks=[
+                RetrievalChunk(content="private-document", score=score, source_id=f"private-id-{index}", metadata={})
+                for index, score in enumerate((0.9, 0.6, 0.2))
+            ],
+        )
+        transform = _make_transform(on_no_results="continue")
+        ctx = make_context(run_id="distinct-counts", node_id="retrieval")
+        ctx.telemetry_emit = manager.handle_event
+        capsys.readouterr()
+        try:
+            with patch.dict(
+                "elspeth.plugins.transforms.rag.transform.PROVIDERS",
+                {"azure_search": (AzureSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
+            ):
+                transform.on_start(ctx)
+            assert transform.process(_make_row({"question": "private-query"}), _mock_ctx()).status == "success"
+            provider.chunks = []
+            assert transform.process(_make_row({"question": "private-empty-query"}), _mock_ctx()).status == "success"
+            transform.on_complete(ctx)
+            manager.flush()
+            output = capsys.readouterr().out
+            payload = json.loads(output)
+            assert payload["event_type"] == "RAGRetrievalStatistics"
+            assert payload["run_id"] == "distinct-counts"
+            assert payload["total_queries"] == 2
+            assert payload["total_chunks"] == 3
+            assert payload["score_count"] == 1
+            assert payload["quarantine_count"] == 0
+            assert payload["score_mean"] == 0.9
+            assert payload["score_std"] is None
+            assert "private-" not in output
+        finally:
+            transform.close()
+            manager.close()
 
     def test_zero_rows_no_statistics_error(self):
         """Welford accumulators with zero rows should not raise."""

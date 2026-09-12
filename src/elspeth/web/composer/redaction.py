@@ -1394,9 +1394,10 @@ def _coerce_stringified_json_object(value: Any) -> Any:
 
     A JSON string is an equivalent wire encoding of the object it encodes;
     parsing it back is *meaning-preserving coercion*, not fabrication
-    (CLAUDE.md "Data Manifesto" — Tier-3 boundary, the ``"42" -> 42`` class),
-    and is therefore exempt from the defensive-programming ban as a documented
-    trust-boundary deserialisation. The raw stringified form is recorded in the
+    (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model —
+    a Tier-3 boundary, the ``"42" -> 42`` class), and is therefore exempt from
+    the defensive-programming ban as a documented trust-boundary
+    deserialisation. The raw stringified form is recorded in the
     per-dispatch audit envelope (``service.py`` ``begin_dispatch_or_arg_error``,
     opened from the pre-coercion ``json.loads`` result) BEFORE this validator
     runs, so the audit trail still records exactly what the model emitted.
@@ -1567,8 +1568,9 @@ class SetSourceFromBlobArgumentsModel(BaseModel):
     ``_resolve_source_blob``; ``on_validation_failure`` absent falls back
     to ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard").  A default of
     ``""`` would conflate "operator did not specify" with "operator
-    specified empty string" — fabrication (CLAUDE.md trust model).  The
-    model deliberately does NOT judge an authored ``""`` either: what an
+    specified empty string" — fabrication (see
+    docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
+    The model deliberately does NOT judge an authored ``""`` either: what an
     empty string means is owned by exactly one place, the handler-side
     ``canonicalize_source_validation_failure`` (``tools/_common``), which
     folds it into "discard" because "" can never name a sink route
@@ -1836,7 +1838,8 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
     fold shared by every source-authoring seam (elspeth-bcd7051143).  The
     model preserves operator-omitted-vs-specified semantics with
     ``str | None = None`` so the handler can apply the fold explicitly
-    (not via fabrication; CLAUDE.md trust model).
+    (not via fabrication; see docs/guides/data-trust-and-error-handling.md
+    §The Three-Tier Trust Model).
 
     ``blob_id`` / ``inline_blob`` exclusivity
     ------------------------------------------

@@ -16,7 +16,8 @@ Two semantically distinct exception categories arise in guided mode:
     ``from_dict`` raise sites embed ``{d!r}`` of the corrupted Tier-1 record,
     which can carry Tier-3 ``sample_rows`` content (PR #37 review finding B1).
     Diagnostic detail is preserved via ``slog`` with ``exc_class`` + bounded
-    frames only, under the CLAUDE.md audit-system-failure logging exemption.
+    frames only, under the audit-system-failure logging exemption in the
+    logging-telemetry-policy skill §Logging Policy.
     Examples: a ``from_dict`` method read a malformed Tier-1 record, a staging
     field that should have been set before the current code path was reached
     is ``None``, or a current guided-state discriminator names an unsupported

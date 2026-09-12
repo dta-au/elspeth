@@ -11,6 +11,7 @@ complete copy-paste command is ``_SEQUENTIAL_TEST_COMMAND`` in the sibling
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib
 import json
@@ -26,6 +27,7 @@ from typing import Any, Literal, cast
 import psycopg
 import pytest
 from click.testing import Result
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from psycopg import sql
 from pydantic import SecretBytes
@@ -451,6 +453,51 @@ def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
     finally:
         session_owner.dispose()
         landscape_owner.dispose()
+
+
+def test_external_apps_share_all_web_rate_budgets(tmp_path: Path, database_pair: _DatabasePair) -> None:
+    """Real startup wiring must enforce one budget across separate app instances."""
+    environment = _doctor_environment(
+        tmp_path,
+        target="kubernetes",
+        session_url=database_pair.session_owner_url,
+        landscape_url=database_pair.landscape_owner_url,
+    )
+    initialized = _invoke_doctor(environment, init_schema=True)
+    assert initialized.exit_code == 0, initialized.output
+    settings = _settings(
+        tmp_path,
+        target="kubernetes",
+        session_url=database_pair.session_owner_url,
+        landscape_url=database_pair.landscape_owner_url,
+    ).model_copy(
+        update={
+            "composer_rate_limit_per_minute": 2,
+            "write_rate_limit_per_minute": 2,
+            "auth_rate_limit_per_minute": 2,
+        }
+    )
+    first = create_app(settings)
+    second = create_app(settings)
+
+    async def check_budgets() -> None:
+        for left, right in (
+            (first.state.rate_limiter, second.state.rate_limiter),
+            (first.state.write_rate_limiter, second.state.write_rate_limiter),
+            (first.state.auth_rate_limiter, second.state.auth_rate_limiter),
+        ):
+            await left.check("shared-subject")
+            await right.check("shared-subject")
+            with pytest.raises(HTTPException) as refused:
+                await right.check("shared-subject")
+            assert refused.value.status_code == 429
+            assert int(refused.value.headers["Retry-After"]) > 0
+
+    try:
+        asyncio.run(check_budgets())
+    finally:
+        first.state.session_engine.dispose()
+        second.state.session_engine.dispose()
 
 
 def test_doctor_rejects_same_database_without_leaking_credentials(

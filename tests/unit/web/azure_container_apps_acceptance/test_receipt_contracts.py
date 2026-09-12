@@ -32,7 +32,7 @@ from elspeth.web._acceptance_common.replica_probes import (
     decide_cross_replica_progress,
     decide_lease_takeover,
 )
-from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts
+from elspeth.web._acceptance_common.schema_facts import _CANDIDATE_PACKAGE_VERSION, _expected_schema_facts
 from elspeth.web._acceptance_common.testcontainer_run import (
     REQUIRED_POSTGRES_PROOF_IDS,
     TESTCONTAINER_RUN_RECEIPT_KIND,
@@ -429,6 +429,34 @@ def test_every_kind_accepts_its_valid_details_and_round_trips_through_the_envelo
     assert decoded["details"] == details
     assert decoded["replica_binding_sha256"] == BINDING.sha256
     assert receipt.kind == kind and receipt.subject_sha256 == BINDING.sha256
+
+
+@pytest.mark.parametrize("kind", ["replica-progress", "single-revision-progress"])
+@pytest.mark.parametrize(
+    "reason",
+    ["progress_stream_and_websocket_ticket_are_process_local", "legacy_p4b_contract_does_not_measure_durable_progress"],
+)
+def test_legacy_p4b_reasons_preserve_envelope_and_stored_admission(kind: str, reason: str) -> None:
+    details = VALID[kind]()
+    affine = cast(dict[str, object], details["owner_affine"])
+    affine["reasons"] = [reason]
+    line = encode_exec_receipt(kind, cast(contracts.CheckDetails, details), candidate_sha=CANDIDATE, binding=BINDING, scenario_id="A")
+    extracted = extract_exec_receipt(
+        line, expected_candidate_sha=CANDIDATE, expected_binding=BINDING, expected_scenario_id="A", expected_check=kind
+    )
+    document = json.loads(extracted.canonical_json)
+    admitted = validate_stored_receipt(document, kind=kind, scenario_id="A", subject_sha256=BINDING.sha256, candidate_sha=CANDIDATE)
+    assert json.loads(admitted.canonical_json) == document
+    assert document["details"]["owner_affine"] == {
+        "probe": "P4b",
+        "outcome": "cannot_pass",
+        "mechanism": "owner_affine",
+        "reasons": [reason],
+        "evidence": {"mitigation": "single_revision_sticky_sessions"},
+    }
+    affine.update({"outcome": "pass", "reasons": []})
+    with pytest.raises(AcceptanceCheckError, match="exec_receipt_schema"):
+        _validate(kind, details)
 
 
 def _scalar_paths(value: object, prefix: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
@@ -863,7 +891,7 @@ def _record() -> dict[str, object]:
         "candidate_image_digest": f"sha256:{SHA}",
         "candidate_revision_sha256": "1" * 64,
         "candidate_doctor_job_sha256": "2" * 64,
-        "candidate_package_version": "0.8.0",
+        "candidate_package_version": _CANDIDATE_PACKAGE_VERSION,
         "previous_source_sha": "",
         "previous_image_digest": "",
         "previous_revision_sha256": "",
@@ -919,6 +947,14 @@ def test_compatibility_record_rejects_open_field_sets_and_foreign_facts() -> Non
             validate_compatibility_record(record, bindings=BINDINGS, now=NOW)
     with pytest.raises(AcceptanceCheckError, match="compatibility_record_schema"):
         validate_compatibility_record(["not", "a", "record"], bindings=BINDINGS, now=NOW)
+
+
+def test_compatibility_record_rejects_stale_candidate_package_version() -> None:
+    record = _record()
+    record["candidate_package_version"] = "0.8.0"
+
+    with pytest.raises(AcceptanceCheckError, match="compatibility_record_binding"):
+        validate_compatibility_record(record, bindings=BINDINGS, now=NOW)
 
 
 def test_schema_facts_are_byte_equal_with_the_ecs_derivation_through_the_shared_core() -> None:

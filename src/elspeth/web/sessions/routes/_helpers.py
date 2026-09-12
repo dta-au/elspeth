@@ -11,11 +11,12 @@ import contextlib
 import json
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Final, Literal, cast
+from typing import Annotated, Any, Final, Literal, cast
 from uuid import UUID, uuid4
 from weakref import WeakValueDictionary
 
@@ -104,6 +105,7 @@ from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.progress import (
     ComposerProgressRegistry,
     ComposerProgressSnapshot,
+    ComposerRequestLease,
     client_cancelled_progress_event,
     convergence_progress_event,
 )
@@ -132,6 +134,7 @@ from elspeth.web.composer.telemetry_phase8 import (
 )
 from elspeth.web.composer.tools import _DATA_ERROR_KEY, ToolResult, execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import (
     COMPLETION_GATES_META_KEY,
@@ -142,7 +145,7 @@ from elspeth.web.execution.completion_gates import (
 )
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
+from elspeth.web.middleware.rate_limit import WebRateLimiter, get_rate_limiter
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_authored_composition_state
@@ -349,9 +352,9 @@ def _get_session_compose_lock_registry(request: Request) -> _SessionComposeLockR
     return cast(_SessionComposeLockRegistry, request.app.state.session_compose_lock_registry)
 
 
-def _get_composer_progress_registry(request: Request) -> ComposerProgressRegistry:
+def _get_composer_progress_registry(request: Request) -> ComposerProgressRegistry | DatabaseComposerProgressRegistry:
     """Return the app-scoped composer progress registry."""
-    return cast(ComposerProgressRegistry, request.app.state.composer_progress_registry)
+    return cast(ComposerProgressRegistry | DatabaseComposerProgressRegistry, request.app.state.composer_progress_registry)
 
 
 def _request_plugin_policy_context(
@@ -364,8 +367,9 @@ def _request_plugin_policy_context(
     return PolicyCatalogView(catalog, snapshot, request.app.state.operator_profile_registry), snapshot
 
 
-def _composer_progress_sink(
-    registry: ComposerProgressRegistry,
+async def _composer_progress_sink(
+    registry: ComposerProgressRegistry | DatabaseComposerProgressRegistry,
+    request: Request,
     *,
     session_id: str,
     request_id: str | None,
@@ -379,7 +383,8 @@ def _composer_progress_sink(
     composer request.
     """
 
-    return registry.bind_request(
+    return await registry.claim_request(
+        lease=cast(ComposerRequestLease, request.state.composer_request_lease),
         session_id=session_id,
         request_id=request_id,
         user_id=user_id,
@@ -1745,8 +1750,9 @@ async def _persist_tool_invocations(
       was already written and we are about to return success. A
       SQLAlchemyError here means the assistant message exists in the
       audit trail but the tool rows that prove what the LLM saw are
-      missing. That is a Tier-1 audit corruption (CLAUDE.md: "I don't
-      know what happened" is never an acceptable answer). Increment the
+      missing. That is a Tier-1 audit corruption ("I don't know what
+      happened" is never an acceptable answer — ARCHITECTURE.md §Design
+      Principles). Increment the
       Tier-1 counter and raise :class:`AuditIntegrityError` chained
       through the SQLAlchemyError. The request will 500 with the chained
       cause visible to the operator.
@@ -1759,7 +1765,8 @@ async def _persist_tool_invocations(
       AuditIntegrityError here would mask the original failure, which is
       what the operator needs to see. Increment the
       "persist failed during unwind" counter, slog the audit-system
-      failure (the slog is permitted under CLAUDE.md primacy because the
+      failure (the slog is permitted under the logging-telemetry-policy skill
+      §Logging Policy because the
       audit system itself failed — telemetry has nowhere to write the
       structured event), and continue. The unwind disposition is
       observable via the counter increment + slog event; the partial
@@ -2272,9 +2279,13 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
             watcher.cancel()
 
 
+_COMPOSER_HEARTBEAT_SECONDS = 15.0
+
+
 async def _track_compose_inflight(
     session_id: UUID,
     request: Request,
+    user: Annotated[UserIdentity, Depends(get_current_user)],
 ) -> AsyncIterator[None]:
     """Count this request in the session's in-flight compose tally.
 
@@ -2291,20 +2302,35 @@ async def _track_compose_inflight(
     not yet published progress (queued on the lock, immediate Stop), where
     the registry still holds the previous turn's terminal snapshot.
 
-    Keyed by the raw path ``session_id`` (pre-ownership-check): a request
-    rejected by the ownership guard still transits the counter briefly,
-    which is harmless — the counter only ever delays a resync while
-    non-zero, and rejected requests decrement within the same request
-    lifecycle.
+    Admission follows authenticated session ownership verification. Each request
+    owns an exact server token, renewed until teardown, including long provider
+    calls and lock waits. Losing renewal cancels the owning request.
     """
+    await _verify_session_ownership(session_id, user, request)
     registry = _get_composer_progress_registry(request)
     sid = str(session_id)
     # This dependency is mounted only on Composer endpoints. Collapse the
     # route family to a closed surface label; never export the raw path.
     surface: Literal["freeform", "guided"] = "guided" if "/guided/" in request.url.path else "freeform"
+    lease = await registry.start_request(sid, user.user_id)
+    request.state.composer_request_lease = lease
     metrics_token = begin_composer_request_metrics(surface=surface)
     terminal_status: _ComposerRequestTerminalStatus = "completed"
-    registry.begin_request(sid)
+
+    owner_task = asyncio.current_task()
+    if owner_task is None:
+        raise RuntimeError("Composer lifecycle requires an owning task")
+
+    async def renew() -> None:
+        try:
+            while True:
+                await asyncio.sleep(_COMPOSER_HEARTBEAT_SECONDS)
+                await registry.renew_request(lease)
+        except Exception:
+            owner_task.cancel()
+            raise
+
+    heartbeat = asyncio.create_task(renew())
     try:
         yield
     except asyncio.CancelledError:
@@ -2327,7 +2353,12 @@ async def _track_compose_inflight(
     finally:
         primary_error = sys.exception()
         try:
-            registry.end_request(sid)
+            heartbeat.cancel()
+            try:
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+            finally:
+                await registry.finish_request(lease)
         finally:
             finish_composer_request_metrics(
                 metrics_token,
@@ -2846,7 +2877,8 @@ async def _handle_convergence_error(
         # Persistence guard: DB write failure should not upgrade the
         # response from 422 (convergence error) to 500 (internal).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics.
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model.
         # _state_data_from_composer_state's internal validate() guard catches
         # (ValueError, TypeError, KeyError) from structurally damaged partial
         # state — those are acceptable there. A TypeError/KeyError from
@@ -3006,7 +3038,8 @@ async def _handle_plugin_crash(
         # plugin crash (response stays as the 500 below, the save failure
         # is recorded as a separate audit-system-failure slog event).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics.
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model.
         # _state_data_from_composer_state's validate() guard catches
         # (ValueError, TypeError, KeyError) from structurally damaged partial
         # state — those are acceptable there. TypeError/KeyError from
@@ -3248,7 +3281,8 @@ async def _handle_runtime_preflight_failure(
         # slog event — that slog event is the persistence-fallback
         # exemption, NOT a normal-flow log).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics,
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model,
         # symmetric with the sibling _handle_plugin_crash /
         # _handle_convergence_error helpers. See the comment in
         # _handle_convergence_error for the full rationale on the
@@ -3293,9 +3327,10 @@ async def _handle_runtime_preflight_failure(
         # state is captured (the path-1 cached re-raise with no LLM
         # mutation case), the persist_invalid re-call above is skipped,
         # so its source=runtime_preflight emission inside
-        # _state_data_from_composer_state never fires. CLAUDE.md
-        # telemetry primacy ("every telemetry emission point must send
-        # or explicitly acknowledge 'nothing to send.'") requires the
+        # _state_data_from_composer_state never fires. The no-silent-failures
+        # rule (the logging-telemetry-policy skill §Telemetry (Operational
+        # Visibility)) — every telemetry emission point must send what it has
+        # or explicitly acknowledge "I have nothing" — requires the
         # recovery handler to count its own invocation regardless of
         # whether persistence work occurred — otherwise dashboards
         # filtering composer.runtime_preflight.total{source=
@@ -3457,7 +3492,6 @@ __all__ = [
     "ComposerProgressRegistry",
     "ComposerProgressSink",
     "ComposerProgressSnapshot",
-    "ComposerRateLimiter",
     "ComposerRuntimePreflightError",
     "ComposerService",
     "ComposerServiceError",
@@ -3553,6 +3587,7 @@ __all__ = [
     "ValidationEntryResponse",
     "ValidationResult",
     "ValidationSummary",
+    "WebRateLimiter",
     "_BadRequestLLMError",
     "_ComposerPreflightTelemetryResult",
     "_ComposerPreflightTelemetrySource",

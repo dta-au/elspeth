@@ -204,7 +204,7 @@ files:
   src/elspeth/core/landscape/run_coordination_repository.py:
     Mapping[str, object]: 2
   src/elspeth/core/landscape/run_lifecycle_repository.py:
-    Mapping[str, Any]: 1
+    Mapping[str, Any]: 2
     Mapping[str, object]: 1
     dict[str, Any]: 4
   src/elspeth/core/landscape/scheduler/barrier.py:
@@ -554,7 +554,7 @@ files:
   src/elspeth/plugins/transforms/rag/query.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/rag/transform.py:
-    dict[str, Any]: 6
+    dict[str, Any]: 5
   src/elspeth/plugins/transforms/reference_join.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
@@ -888,7 +888,7 @@ files:
   src/elspeth/web/coordination/membership_authority.py:
     dict[str, Any]: 1
   src/elspeth/web/coordination/repository.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 3
     dict[str, Any]: 2
     dict[str, object]: 2
   src/elspeth/web/coordination/run_diagnostics_authority.py:
@@ -910,6 +910,8 @@ files:
   src/elspeth/web/execution/diagnostics.py:
     dict[str, Any]: 1
     dict[str, object]: 2
+  src/elspeth/web/execution/envelope.py:
+    Mapping[str, Any]: 1
   src/elspeth/web/execution/failure_samples.py:
     dict[str, object]: 1
   src/elspeth/web/execution/fanout_guard.py:
@@ -972,7 +974,7 @@ files:
   src/elspeth/web/sessions/proposal_blob_refs.py:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/protocol.py:
-    Mapping[str, Any]: 59
+    Mapping[str, Any]: 60
     dict[str, object]: 5
   src/elspeth/web/sessions/routes/_helpers.py:
     Mapping[str, Any]: 4
@@ -1012,10 +1014,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 861
+  Mapping[str, Any]: 865
   Mapping[str, object]: 293
   MutableMapping[str, Any]: 13
   boundary: 64
-  dict[str, Any]: 1142
+  dict[str, Any]: 1141
   dict[str, object]: 399
-  soft: 2708
+  soft: 2711

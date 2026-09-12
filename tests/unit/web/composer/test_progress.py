@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
+from starlette.requests import Request
 
 from elspeth.contracts.composer_progress import (
     COMPOSER_PROGRESS_MAX_EVIDENCE,
@@ -198,14 +199,20 @@ class TestComposerProgressRegistry:
     ) -> None:
         """Freeform and guided surfaces participate in one latest-request domain."""
         registry = ComposerProgressRegistry()
-        older = _composer_progress_sink(
+        older_request = Request({"type": "http"})
+        older_request.state.composer_request_lease = await registry.start_request("session-1", "user-1")
+        older = await _composer_progress_sink(
             registry,
+            older_request,
             session_id="session-1",
             request_id=older_request_id,
             user_id="user-1",
         )
-        newer = _composer_progress_sink(
+        newer_request = Request({"type": "http"})
+        newer_request.state.composer_request_lease = await registry.start_request("session-1", "user-1")
+        newer = await _composer_progress_sink(
             registry,
+            newer_request,
             session_id="session-1",
             request_id=newer_request_id,
             user_id="user-1",
@@ -626,3 +633,82 @@ def test_composer_progress_reason_typescript_mirror_is_complete() -> None:
         f"missing from TypeScript: {sorted(set(get_args(ComposerProgressReason.__value__)) - declared)}; "
         f"absent from Python: {sorted(declared - set(get_args(ComposerProgressReason.__value__)))}"
     )
+
+
+@pytest.mark.asyncio
+async def test_queued_request_is_active_before_any_progress_and_exact_cleanup() -> None:
+    registry = ComposerProgressRegistry()
+    first = await registry.start_request("session", "user")
+    second = await registry.start_request("session", "user")
+    active = await registry.list_active(user_id="user")
+    assert len(active) == 1
+    assert active[0].inflight_requests == 2
+    assert await registry.list_active(user_id="other") == ()
+    await registry.finish_request(first)
+    assert (await registry.get_latest("session")).inflight_requests == 1
+    with pytest.raises(KeyError):
+        await registry.finish_request(first)
+    assert (await registry.get_latest("session")).inflight_requests == 1
+    await registry.finish_request(second)
+    assert await registry.list_active(user_id="user") == ()
+
+
+@pytest.mark.asyncio
+async def test_database_admission_cancellation_joins_and_releases_exact_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellation during a committed admission cannot orphan its inflight token."""
+    import asyncio
+    from threading import Event
+
+    from sqlalchemy import create_engine
+
+    from elspeth.web.composer.progress import ComposerRequestLease
+    from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry, SessionComposerProgressAuthority
+
+    # The nominal authority is retained; only the blocking database methods are
+    # replaced so both worker completion races are controlled without a server.
+    engine = create_engine("postgresql+psycopg://localhost/composer_cancellation_test")
+    authority = SessionComposerProgressAuthority(engine, owner_instance_id="replica")
+    registry = DatabaseComposerProgressRegistry(authority)
+    lease = ComposerRequestLease(request_token="request-token", session_id="session", user_id="user")
+    entered, release, cleaning, cleaned = Event(), Event(), Event(), Event()
+    released: list[ComposerRequestLease] = []
+
+    def begin(session_id: str, user_id: str) -> ComposerRequestLease:
+        assert (session_id, user_id) == (lease.session_id, lease.user_id)
+        entered.set()
+        assert release.wait(10), "test did not release database admission"
+        return lease
+
+    def end(request_lease: ComposerRequestLease) -> None:
+        released.append(request_lease)
+        cleaning.set()
+        assert cleaned.wait(10), "test did not release database cleanup"
+
+    monkeypatch.setattr(authority, "begin_request", begin)
+    monkeypatch.setattr(authority, "end_request", end)
+
+    async def wait_for_event(event: Event) -> None:
+        async with asyncio.timeout(10):
+            while not event.is_set():
+                await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(registry.start_request("session", "user"))
+    try:
+        await wait_for_event(entered)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        release.set()
+        await wait_for_event(cleaning)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "request exited before exact-token cleanup finished"
+        cleaned.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert released == [lease]
+    finally:
+        release.set()
+        cleaned.set()
+        await asyncio.gather(task, return_exceptions=True)
+        engine.dispose()

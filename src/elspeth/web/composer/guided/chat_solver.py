@@ -4634,7 +4634,8 @@ async def solve_step_chat(
     Raises:
         InvariantError: when the LLM response has no message content (a
             defective response we cannot recover from — surface loudly per
-            CLAUDE.md offensive-programming discipline).
+            the engine-patterns-reference skill §Offensive Programming
+            Examples).
     """
     if not user_message:
         # Defensive against empty string only: route handler should have caught
@@ -4694,10 +4695,10 @@ async def solve_step_chat(
         # LiteLLM's typed contract: message.content is str | None (None when the
         # response is a tool-call only).  Phase A doesn't attach tools, so a None
         # or empty content is a defective response from the model — crash loudly
-        # per CLAUDE.md offensive-programming discipline.  We trust LiteLLM's
-        # type contract for "is a string"; if the dependency violates its own
-        # typing, .strip() raises AttributeError immediately at this site (still
-        # loud, no silent degradation).
+        # per the engine-patterns-reference skill §Offensive Programming
+        # Examples.  We trust LiteLLM's type contract for "is a string"; if the
+        # dependency violates its own typing, .strip() raises AttributeError
+        # immediately at this site (still loud, no silent degradation).
         content = message.content
         if content is None or not content.strip():
             raise InvariantError(f"solve_step_chat: LLM response missing message content (step={step.value}, model={model!r})")

@@ -70,8 +70,8 @@ accept this trade-off.
 ## First-deploy operator action
 
 For 0.8.0, shareable-review state is part of the broader web session database
-contract. The release expects `SESSION_SCHEMA_EPOCH=53` and
-`SQLITE_SCHEMA_EPOCH=38`. Session epoch 29 introduced durable guided
+contract. The release expects `SESSION_SCHEMA_EPOCH=54` and
+`SQLITE_SCHEMA_EPOCH=39`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed
 proposal admission, retryable blob cleanup, ordinary guided-plan decline
@@ -92,8 +92,11 @@ discriminators are retired and `token_lineage_frames`/`lineage_path_json`
 become the sole lineage truth. Epoch 36 binds coalesce effects to their
 non-null lineage group. Epoch 37 widens the auth provider CHECK constraints on
 `auth_events` and `run_attributions`, and epoch 38 adds the
-`scheduler_events.seq` replay key that orders scheduler transitions. A
-Landscape store below epoch 38 is stale and must be recreated. When
+`scheduler_events.seq` replay key that orders scheduler transitions. Epoch 39
+adds immutable web run-start permit binding and recoverable pre-effect admission
+state. Session epoch 54 adds durable Composer progress snapshots and exact
+request lifecycle leases. A
+Landscape store below epoch 39 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this

@@ -42,10 +42,13 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Session epoch 53 (elspeth-f98e0ae8b2) adds the per-admission read
     # records on the session side only. Landscape epoch 38 (elspeth-2d436dd6e8,
     # elspeth-5d66fc5ed1) adds the scheduler_events ``seq`` replay key on the
-    # Landscape side only, so the pair is (53, 38) and both stores still name
-    # the same release.
-    assert SESSION_SCHEMA_EPOCH == 53
-    assert SQLITE_SCHEMA_EPOCH == 38
+    # Landscape side only, giving the previous pair (53, 38).
+    # Session epoch 54 adds durable Composer progress snapshots and exact
+    # request lifecycle leases. Landscape epoch 39 adds immutable web
+    # run-start permit binding and recoverable pre-effect admission state.
+    # The current product schema pair is therefore (54, 39).
+    assert SESSION_SCHEMA_EPOCH == 54
+    assert SQLITE_SCHEMA_EPOCH == 39
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:

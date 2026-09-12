@@ -1,7 +1,7 @@
 """Purpose-separated key derivation from the web ``secret_key``.
 
-The property under test is INDEPENDENCE: three consumers of one operator
-secret must receive three keys, none of which can be computed from another
+The property under test is INDEPENDENCE: four consumers of one operator
+secret must receive four keys, none of which can be computed from another
 without the master. A test that only checked "returns 32 bytes" would pass
 against an implementation that returned the same key three times, which is
 the exact defect this module exists to prevent.
@@ -15,6 +15,7 @@ import pytest
 
 from elspeth.web.key_derivation import (
     derive_binding_generation_key,
+    derive_rate_limit_key,
     derive_session_token_key,
     derive_user_secret_master_key,
 )
@@ -27,8 +28,9 @@ def test_each_purpose_gets_a_different_key_from_one_master() -> None:
     session = derive_session_token_key(_MASTER)
     generation = derive_binding_generation_key(_MASTER)
     user_secret = base64.urlsafe_b64decode(derive_user_secret_master_key(_MASTER))
+    rate_limit = derive_rate_limit_key(_MASTER)
 
-    assert len({session, generation, user_secret}) == 3
+    assert len({session, generation, user_secret, rate_limit}) == 4
 
 
 def test_no_derived_key_is_the_master_itself() -> None:
@@ -36,6 +38,7 @@ def test_no_derived_key_is_the_master_itself() -> None:
     raw = _MASTER.encode("utf-8")
     assert derive_session_token_key(_MASTER) != raw
     assert derive_binding_generation_key(_MASTER) != raw
+    assert derive_rate_limit_key(_MASTER) != raw
     assert derive_user_secret_master_key(_MASTER) != _MASTER
 
 
@@ -43,6 +46,7 @@ def test_derivation_is_deterministic_across_calls() -> None:
     """Boots must agree, or every token from the previous boot is invalid."""
     assert derive_session_token_key(_MASTER) == derive_session_token_key(_MASTER)
     assert derive_binding_generation_key(_MASTER) == derive_binding_generation_key(_MASTER)
+    assert derive_rate_limit_key(_MASTER) == derive_rate_limit_key(_MASTER)
     assert derive_user_secret_master_key(_MASTER) == derive_user_secret_master_key(_MASTER)
 
 
@@ -50,6 +54,7 @@ def test_a_different_master_gives_a_different_key_everywhere() -> None:
     other = _MASTER + "-rotated"
     assert derive_session_token_key(_MASTER) != derive_session_token_key(other)
     assert derive_binding_generation_key(_MASTER) != derive_binding_generation_key(other)
+    assert derive_rate_limit_key(_MASTER) != derive_rate_limit_key(other)
     assert derive_user_secret_master_key(_MASTER) != derive_user_secret_master_key(other)
 
 
@@ -57,6 +62,7 @@ def test_derived_keys_are_full_width() -> None:
     """A short key would silently weaken HS256 and the evidence HMAC."""
     assert len(derive_session_token_key(_MASTER)) == 32
     assert len(derive_binding_generation_key(_MASTER)) == 32
+    assert len(derive_rate_limit_key(_MASTER)) == 32
     assert len(base64.urlsafe_b64decode(derive_user_secret_master_key(_MASTER))) == 32
 
 
@@ -69,7 +75,7 @@ def test_the_user_secret_key_survives_the_text_round_trip() -> None:
 
 @pytest.mark.parametrize(
     "derive",
-    [derive_session_token_key, derive_user_secret_master_key, derive_binding_generation_key],
+    [derive_session_token_key, derive_user_secret_master_key, derive_binding_generation_key, derive_rate_limit_key],
 )
 def test_an_empty_master_is_refused(derive) -> None:
     """Deriving from nothing would produce a stable, publicly computable key."""
@@ -79,7 +85,7 @@ def test_an_empty_master_is_refused(derive) -> None:
 
 @pytest.mark.parametrize(
     "derive",
-    [derive_session_token_key, derive_user_secret_master_key, derive_binding_generation_key],
+    [derive_session_token_key, derive_user_secret_master_key, derive_binding_generation_key, derive_rate_limit_key],
 )
 def test_a_non_string_master_is_refused(derive) -> None:
     with pytest.raises(TypeError, match="must be a string"):

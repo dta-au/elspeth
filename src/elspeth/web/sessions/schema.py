@@ -32,13 +32,15 @@ from elspeth.web.sessions.models import (
 _SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 _SESSION_METADATA_CREATE_LOCK = Lock()
 
-_COORDINATION_HARD_CUT_EPOCH = 53
+_COORDINATION_HARD_CUT_EPOCH = 54
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
     "session_read_admissions": "ix_session_read_admissions_expires_at",
     "run_start_permits": "ix_run_start_permits_retention_expires_at",
     "websocket_tickets": "ix_websocket_tickets_expires_at",
+    "composer_inflight_requests": "ix_composer_inflight_requests_expires_at",
+    "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
     "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
     "rate_limit_events": "ix_rate_limit_events_expires_at",
     "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",

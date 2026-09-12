@@ -3244,7 +3244,8 @@ class TestForkRecoveryInvariant:
 
         DEVIATION FROM PLAN NAME: the plan says "sink fails → FAILED terminal".
         A sink whose write() RAISES would crash the whole run (plugin-crash
-        semantics, CLAUDE.md), not produce a bounded terminal.  Instead we use
+        semantics — docs/guides/data-trust-and-error-handling.md §Plugin
+        Ownership), not produce a bounded terminal.  Instead we use
         DivertingSink on the failing branch: it diverts every row, and the
         production SinkExecutor discard branch records a clean
         (FAILURE, SINK_DISCARDED) terminal outcome with completed=1 — the same

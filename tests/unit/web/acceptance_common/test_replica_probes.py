@@ -366,6 +366,7 @@ class TestOwnerAffineProgress:
         assert result.probe == "P4b"
         assert result.outcome == "cannot_pass"
         assert result.mechanism == "owner_affine"
+        assert result.reasons == ("legacy_p4b_contract_does_not_measure_durable_progress",)
         assert result.evidence == {"mitigation": "single_revision_sticky_sessions"}
 
 

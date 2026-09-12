@@ -529,7 +529,8 @@ class TestUserSecretStore:
     ) -> None:
         """Transactional guarantee: a failed set_secret must leave no DB row.
 
-        CLAUDE.md's audit-primacy rule requires that unfingerprinted secrets
+        The audit-primacy rule (``logging-telemetry-policy`` skill §Logging
+        Policy) requires that unfingerprinted secrets
         are never persisted. Regression test: the fingerprint check must
         precede the upsert so the DB stays consistent with the audit trail.
         """

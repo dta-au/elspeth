@@ -107,7 +107,7 @@ class RegisterRequest(BaseModel):
         if not has_visible_content(trimmed):
             raise ValueError("must contain at least one visible character")
         local, separator, domain = trimmed.partition("@")
-        if separator != "@" or not local or not domain:
+        if separator != "@" or trimmed.count("@") != 1 or not local or not domain:
             raise ValueError("must be a valid email address")
         return trimmed
 

@@ -33,6 +33,7 @@ from elspeth.contracts.chat_parts import ChatMessage, ContentPart, ImagePart, Te
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ContentTrust, PluginCapability, WebConfigAuthority
@@ -1204,7 +1205,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f96bcabaaaf9158f"
+    source_file_hash: str | None = "sha256:45cf69ab26b012aa"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1623,7 +1624,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # Recorder, telemetry, rate limit, payload store (set in on_start)
         self._recorder: PluginAuditWriter | None = None
         self._run_id: str = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._shutdown_event: threading.Event | None = None
         self._payload_store: PayloadStore | None = None

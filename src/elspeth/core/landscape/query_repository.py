@@ -575,7 +575,8 @@ class QueryRepository:
         Returns:
             List of NodeState models, ordered by token_id then step_index then attempt
         """
-        # node_states has run_id denormalized (per CLAUDE.md composite FK pattern)
+        # node_states has run_id denormalized (see the engine-patterns-reference
+        # skill §Composite Primary Key Pattern: nodes Table)
         query = (
             select(node_states_table)
             .where(node_states_table.c.run_id == run_id)

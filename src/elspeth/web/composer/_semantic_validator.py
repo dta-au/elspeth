@@ -138,7 +138,8 @@ def _instantiate_consumer(node: NodeSpec, probe_cache: ValidationProbeCache) -> 
     failure, preserving the vacuousness guard.
 
     Unexpected exceptions PROPAGATE — a plugin method raising mid-construction
-    is a system bug per CLAUDE.md plugin-as-system-code policy.
+    is a system bug per docs/guides/data-trust-and-error-handling.md
+    §Plugin Ownership: System Code, Not User Code.
     """
     if node.plugin is None:
         return None
@@ -217,8 +218,9 @@ def _safe_output_semantics(
     - Plugin construction fails with an expected draft/config probe error
 
     Unexpected exceptions PROPAGATE — they indicate a framework bug
-    (per CLAUDE.md plugin-as-system-code policy: a plugin method that
-    raises is a bug we MUST know about).
+    (per docs/guides/data-trust-and-error-handling.md §Plugin Ownership:
+    System Code, Not User Code — a plugin method that raises is a bug we
+    MUST know about).
     """
     # Recognize both the legacy "source" id and named "source:<name>" ids;
     # a named source must never be mis-probed as a transform.

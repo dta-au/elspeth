@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, TypedDict
 
+import pytest
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
 
 from elspeth.contracts import NodeStateFailed, NodeType
@@ -256,6 +257,7 @@ class TestSchemaConfigModeRoundTrip:
             "observed_mode": "observed",
             "declared_locked": True,
             "observed_locked": True,
+            "emitted_index": 0,
         }
 
     def test_batch_flush_aggregate_round_trip_with_pass_through(self) -> None:
@@ -348,3 +350,70 @@ class TestSchemaConfigModeRoundTrip:
         assert "sk-abcdef" not in json.dumps(context)
         assert context["contract_name"] == "schema_config_mode_secret_roundtrip"
         assert context["payload"]["marker"] == "<redacted-secret>"
+
+
+@pytest.mark.parametrize("batch_flush", [False, True], ids=["post-emission", "batch-flush"])
+@pytest.mark.parametrize("valid_prefix_length", [1, 2])
+def test_nonzero_emitted_index_survives_landscape_round_trip(batch_flush: bool, valid_prefix_length: int) -> None:
+    snapshot = _snapshot_registry_for_tests()
+    _clear_registry_for_tests()
+    try:
+        register_declaration_contract(SchemaConfigModeContract())
+        run_id = "run-output-attribution"
+        row_id = "row-output-attribution"
+        token_id = "token-output-attribution"
+        node_id = "node-output-attribution"
+        setup = _setup_landscape(run_id=run_id, row_id=row_id, token_id=token_id, node_id=node_id)
+        plugin = _plugin(node_id=node_id, output_schema_config=_schema_config(mode="fixed", fields=("source",)))
+        input_row = _row(("source",), mode="FIXED")
+        emitted_rows = (
+            *(_row(("source",), mode="FIXED") for _ in range(valid_prefix_length)),
+            _row(("source",), mode="OBSERVED"),
+        )
+        with pytest.raises(SchemaConfigModeViolation) as raised:
+            if batch_flush:
+                run_batch_flush_checks(
+                    inputs=BatchFlushInputs(
+                        plugin=plugin,
+                        node_id=node_id,
+                        run_id=run_id,
+                        row_id=row_id,
+                        token_id=token_id,
+                        buffered_tokens=(input_row,),
+                        static_contract=frozenset({"source"}),
+                        effective_input_fields=frozenset({"source"}),
+                    ),
+                    outputs=BatchFlushOutputs(emitted_rows=emitted_rows),
+                )
+            else:
+                run_post_emission_checks(
+                    inputs=PostEmissionInputs(
+                        plugin=plugin,
+                        node_id=node_id,
+                        run_id=run_id,
+                        row_id=row_id,
+                        token_id=token_id,
+                        input_row=input_row,
+                        static_contract=frozenset({"source"}),
+                        effective_input_fields=frozenset({"source"}),
+                    ),
+                    outputs=PostEmissionOutputs(emitted_rows=emitted_rows),
+                )
+        violation = raised.value
+        context = _record_failure(
+            setup,
+            token_id=token_id,
+            node_id=node_id,
+            run_id=run_id,
+            error=ExecutionError(
+                exception=str(violation),
+                exception_type=type(violation).__name__,
+                phase="executor_post_process",
+                context=violation.to_audit_dict(),
+            ),
+        )
+        assert context["contract_name"] == "schema_config_mode"
+        assert context["payload"]["emitted_index"] == valid_prefix_length
+        assert context["payload"]["observed_mode"] == "observed"
+    finally:
+        _restore_registry_snapshot_for_tests(snapshot)

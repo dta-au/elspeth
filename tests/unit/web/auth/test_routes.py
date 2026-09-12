@@ -170,6 +170,12 @@ def test_bounded_principal_truncates_oversized_passes_normal_and_preserves_none(
     assert len(bounded) == AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
 
 
+@pytest.mark.parametrize("email", ["a@b@c", "alice@@example.com", "alice@example.com@extra"])
+def test_register_request_rejects_multiple_at_signs(email: str) -> None:
+    with pytest.raises(ValueError, match="valid email address"):
+        RegisterRequest(username="alice", password="pw123", display_name="Alice", email=email)
+
+
 def _only_auth_event(rows, event_type: str, *, issuance_path: str | None = None):
     matches = []
     for row in rows:

@@ -16,7 +16,8 @@ its minted default title. The outbound naming call likewise never ships
 raw first-message content: credential/PII-shaped substrings are redacted
 and only a fenced, truncated excerpt leaves the process. No
 Landscape audit entry is emitted — this is UI metadata, not a pipeline
-decision. See CLAUDE.md "Three-Tier Trust Model" for the rationale.
+decision. See docs/guides/data-trust-and-error-handling.md §The Three-Tier
+Trust Model for the rationale.
 
 Known gap: each first-message call is paid LLM traffic that bypasses
 ``composer_rate_limit_per_minute``. For demo-scale traffic this is

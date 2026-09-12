@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
     from elspeth.contracts.preflight import PreflightResult
+    from elspeth.contracts.run_start import RunStartPermitBinding
     from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
     from elspeth.core.checkpoint import CheckpointManager
     from elspeth.core.config import ElspethSettings
@@ -190,6 +191,8 @@ class Orchestrator:
         openrouter_catalog_sha256: str,
         openrouter_catalog_source: str,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
     ) -> tuple[RecorderFactory, Any, CoordinationToken]:
         """DATABASE-phase delegator (test seam — see RunLifecycleCoordinator)."""
         return self._run_lifecycle.initialize_database_phase(
@@ -202,6 +205,8 @@ class Orchestrator:
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_start_permit=run_start_permit,
+            pre_effect_guard=pre_effect_guard,
         )
 
     def run(
@@ -224,6 +229,8 @@ class Orchestrator:
         openrouter_catalog_source: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
     ) -> RunResult:
         """Execute a pipeline run.
 
@@ -251,6 +258,12 @@ class Orchestrator:
                 Landscape generates a run ID.
             initiated_by_user_id: Optional authenticated web user that initiated the run.
             auth_provider_type: Optional auth provider namespace for the initiating user.
+            run_start_permit: Immutable admission binding. An exact prepared
+                retry regenerates initialization under fresh Landscape authority.
+            pre_effect_guard: Revalidates caller ownership after acquiring
+                Landscape authority and before plugin effects.
+            check_coordination_latch: Revalidates caller ownership at execution
+                admission points throughout the run.
 
         Raises:
             OrchestrationInvariantError: If graph or payload_store is not provided
@@ -279,6 +292,8 @@ class Orchestrator:
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
             check_coordination_latch=check_coordination_latch,
+            pre_effect_guard=pre_effect_guard,
+            run_start_permit=run_start_permit,
             # Bound AT CALL TIME (not construction) so monkeypatch.setattr on
             # the class and patch.object on this instance keep intercepting.
             initialize_database_phase=self._initialize_database_phase,
@@ -308,6 +323,7 @@ class Orchestrator:
         shutdown_event: threading.Event | None = None,
         coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
+        before_plugin_effects: Callable[[], None] | None = None,
     ) -> RunResult:
         """Run-body delegator (test seam — see LeaderDrainCoordinator).
 
@@ -324,6 +340,7 @@ class Orchestrator:
             shutdown_event=shutdown_event,
             coordination_token=coordination_token,
             check_coordination_latch=check_coordination_latch,
+            before_plugin_effects=before_plugin_effects,
             register_graph_nodes_and_edges=self._register_graph_nodes_and_edges,
         )
 
@@ -336,12 +353,19 @@ class Orchestrator:
         payload_store: PayloadStore,
         settings: ElspethSettings | None = None,
         shutdown_event: threading.Event | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
         """Resume a failed run from a checkpoint.
 
         Delegates to :class:`ResumeCoordinator`, which owns the resume-path
         orchestration extracted from this class. The public signature is the
         stable contract; the implementation lives in resume.py.
+
+        ``pre_effect_guard`` runs after winning Landscape leadership, before
+        repair writes. ``check_coordination_latch`` checks caller authority
+        throughout processing. Refusal releases the seat without declaring
+        the pipeline failed.
         """
         require_sink_effect_admission(
             config.sinks,
@@ -356,6 +380,8 @@ class Orchestrator:
             payload_store=payload_store,
             settings=settings,
             shutdown_event=shutdown_event,
+            pre_effect_guard=pre_effect_guard,
+            check_coordination_latch=check_coordination_latch,
         )
 
     def join_run(

@@ -219,7 +219,8 @@ export function GuidedTurn({
       // a matching case here, TypeScript will report a compile error on this
       // line because `turn.type` narrows to `never` only when all cases are
       // handled.  The throw is retained for the runtime path (JS callers,
-      // stale type declarations) per the CLAUDE.md offensive-programming rule.
+      // stale type declarations) per the engine-patterns-reference skill
+      // §Offensive Programming Examples.
       const _exhaustive: never = turn;
       throw new Error(
         `GuidedTurn: unknown turn: ${String(_exhaustive)} (exhaustiveness check failed)`,

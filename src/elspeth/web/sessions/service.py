@@ -88,7 +88,10 @@ from elspeth.web.composer.telemetry_phase8 import record_interpretation_opt_out
 from elspeth.web.composer.tools import is_blob_store_only_mutation_tool
 from elspeth.web.coordination.contracts import (
     ArchiveManifestRelation,
+    CancellationSource,
     FenceLossReason,
+    RecoveryRequiredReason,
+    RunSagaState,
     SessionOperationContext,
     SessionOperationFenceLost,
     SessionOperationKind,
@@ -102,6 +105,7 @@ from elspeth.web.coordination.repository import (
     _RepositoryMutationState,
     _RepositorySessionMutations,
 )
+from elspeth.web.coordination.run_cancellation_authority import RepositoryRunCancellationAuthority
 from elspeth.web.coordination.run_diagnostics_authority import RepositoryRunDiagnosticsAuditAuthority
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -153,6 +157,7 @@ from elspeth.web.sessions.models import (
     proposal_blob_effect_receipts_table,
     proposal_events_table,
     run_events_table,
+    run_execution_inputs_table,
     runs_table,
     session_operation_fences_table,
     sessions_table,
@@ -266,6 +271,7 @@ from elspeth.web.sessions.protocol import (
     RunDiagnosticsAuditMutationAuthority,
     RunEventRecord,
     RunRecord,
+    RunStartPermitRecord,
     SessionArchiveDisposition,
     SessionCompositionStateCreation,
     SessionForkAuthority,
@@ -305,6 +311,7 @@ if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
     from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedProposalRef, GuidedSession
     from elspeth.web.composer.state import CompositionState, ValidationSummary
+    from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
@@ -3050,7 +3057,9 @@ def _pipeline_public_metadata(authority: AuthoritativePipelineProposal) -> Pipel
 def _interpretation_event_record_from_row(row: Any) -> InterpretationEventRecord:
     """Convert a SQLAlchemy row to an InterpretationEventRecord.
 
-    Per the Tier-1 audit-trust contract (CLAUDE.md), this conversion crashes
+    Per the Tier-1 audit-trust contract
+    (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
+    this conversion crashes
     loudly on any anomaly — the enum constructors raise ValueError on an
     unrecognised string, and the UUID/datetime constructors raise on
     malformed values. The schema CHECK constraints guarantee the closed-
@@ -6141,8 +6150,10 @@ class SessionServiceImpl:
         messages whose visible ``content`` was rewritten by runtime
         preflight redaction. It MUST be persisted as supplied —
         silently discarding it would regress the pre-rev-4
-        ``add_message`` behaviour and create audit-data loss (per
-        CLAUDE.md, silent wrong results are worse than a crash).
+        ``add_message`` behaviour and create audit-data loss (silent wrong
+        results are worse than a crash — see
+        docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model).
 
         If ``role == "tool"``, this helper additionally verifies that
         ``parent_assistant_id`` references an assistant row in the
@@ -6709,8 +6720,9 @@ class SessionServiceImpl:
             #    a separate ``AuditIntegrityError`` here would mask
             #    the original tool failure (which is what the operator
             #    needs to see). Record the audit failure via counter
-            #    + slog (the slog call is permitted under CLAUDE.md
-            #    primacy because the audit system itself failed —
+            #    + slog (the slog call is permitted under the
+            #    logging-telemetry-policy skill §Logging Policy
+            #    because the audit system itself failed —
             #    telemetry has nowhere to write the structured event)
             #    and return ``AuditOutcome(unwind_audit_failed=True)``
             #    so the caller can raise the captured plugin
@@ -6719,7 +6731,9 @@ class SessionServiceImpl:
             #
             # 2. ``plugin_crash_pending=False`` — the tool succeeded
             #    but the audit insert failed. This is a Tier-1 audit
-            #    corruption per CLAUDE.md doctrine: the system did
+            #    corruption per the trust model
+            #    (docs/guides/data-trust-and-error-handling.md §The
+            #    Three-Tier Trust Model): the system did
             #    work that it cannot prove it did. Returning a flag
             #    would let the caller proceed with corrupted audit
             #    state (synthesised review finding H1).
@@ -7356,8 +7370,9 @@ class SessionServiceImpl:
                     interpretation_review_disabled=bool(prior_row.interpretation_review_disabled),
                     updated_at=self._ensure_utc(prior_row.updated_at),
                 )
-                # Audit fires before state mutation per CLAUDE.md
-                # §"Telemetry and Logging" primacy rule. B1 (load-bearing):
+                # Audit fires before state mutation per the
+                # logging-telemetry-policy skill §The Primacy Test.
+                # B1 (load-bearing):
                 # the payload now carries ``prior_trust_mode`` so a
                 # downstream telemetry counter emitting
                 # ``{from_mode, to_mode}`` attributes remains a strict
@@ -8361,7 +8376,8 @@ class SessionServiceImpl:
         converts to ARG_ERROR. Genuine audit anomalies (missing state row,
         malformed structures) raise bare :class:`ValueError` and crash.
 
-        Per CLAUDE.md offensive-programming rules, the writer-boundary
+        Per the engine-patterns-reference skill §Offensive Programming
+        Examples, the writer-boundary
         validation reads the parent composition_states row inside the
         locked transaction and inspects its ``nodes`` JSON before INSERT —
         a malformed reference is a Tier-1 audit anomaly we crash on rather
@@ -9987,6 +10003,7 @@ class SessionServiceImpl:
         pipeline_yaml: str | None = None,
         *,
         session_operation_context: SessionOperationContext,
+        execution_input: RunExecutionInput | None = None,
     ) -> RunRecord:
         """Create a new pending run, enforcing one active run per session (B6).
 
@@ -10016,9 +10033,73 @@ class SessionServiceImpl:
                     state_id=state_id,
                     pipeline_yaml=pipeline_yaml,
                     started_at=now,
+                    execution_input=execution_input,
                 ),
             ),
         )
+
+    async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+        return cast(
+            "RunStartPermitRecord",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.runs.issue_start_permit(run_id=run_id),
+            ),
+        )
+
+    async def request_run_cancellation(
+        self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType
+    ) -> RunRecord:
+        return cast(
+            "RunRecord",
+            await self._run_sync(
+                RepositoryRunCancellationAuthority(self._engine).request,
+                run_id,
+                session_id=session_id,
+                user_id=user_id,
+                auth_provider_type=auth_provider_type,
+            ),
+        )
+
+    async def list_recoverable_run_records(self) -> tuple[RunRecord, ...]:
+        return cast(
+            "tuple[RunRecord, ...]",
+            await self._run_sync(
+                RepositoryGlobalRunRecoveryAuthority(self._engine).list_recoverable_run_records,
+            ),
+        )
+
+    async def get_run_execution_input(self, run_id: UUID) -> RunExecutionInput | None:
+        from elspeth.web.execution.envelope import RunExecutionInput
+
+        def _sync() -> RunExecutionInput | None:
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(run_execution_inputs_table).where(run_execution_inputs_table.c.run_id == str(run_id))
+                ).one_or_none()
+                if row is None:
+                    return None
+                return RunExecutionInput(
+                    schema_version=row.schema_version,
+                    envelope_json=json.dumps(row.envelope, sort_keys=True, separators=(",", ":")),
+                    canonical_input_digest=row.canonical_input_digest,
+                    topology_digest=row.topology_digest,
+                    source_manifest_digest=row.source_manifest_digest,
+                    application_fingerprint=row.application_fingerprint,
+                    plugin_registry_fingerprint=row.plugin_registry_fingerprint,
+                    configuration_fingerprint=row.configuration_fingerprint,
+                    graph_fingerprint=row.graph_fingerprint,
+                    runtime_fingerprint=row.runtime_fingerprint,
+                    implementation_fingerprint=row.implementation_fingerprint,
+                    deployment_generation=row.deployment_generation,
+                    session_epoch=row.session_epoch,
+                    landscape_epoch=row.landscape_epoch,
+                    coordination_protocol=row.coordination_protocol,
+                    automatic_recovery_eligible=row.automatic_recovery_eligible,
+                )
+
+        return cast("RunExecutionInput | None", await self._run_sync(_sync))
 
     async def get_run(self, run_id: UUID) -> RunRecord:
         """Fetch a run by ID. Raises ValueError if not found."""
@@ -13935,6 +14016,12 @@ class SessionServiceImpl:
             error=row.error,
             landscape_run_id=row.landscape_run_id,
             pipeline_yaml=row.pipeline_yaml,
+            cancel_requested_at=self._ensure_utc(row.cancel_requested_at) if row.cancel_requested_at is not None else None,
+            cancellation_source=CancellationSource(row.cancellation_source) if row.cancellation_source is not None else None,
+            saga_state=RunSagaState(row.saga_state),
+            recovery_required_reason=RecoveryRequiredReason(row.recovery_required_reason)
+            if row.recovery_required_reason is not None
+            else None,
         )
 
     def _row_to_run_event_record(self, row: Any) -> RunEventRecord:

@@ -745,7 +745,7 @@ def test_interrupted_llm_source_refuses_resume_before_exhaustion(
         output_before_resume = output_path.read_bytes()
 
         # elspeth-1f5b83cd28: the advisory gate refuses the interrupted
-        # source, so get_resume_point returns None. Hand-build the resume
+        # source, so get_resume_point raises a refusal. Hand-build the resume
         # point — the enforcing guard must refuse on its own authority.
         recovery = RecoveryManager(db, checkpoint_manager)
         check = recovery.can_resume(run_id, graph)

@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import RunStatus
-from elspeth.contracts.checkpoint import CheckpointDraft
+from elspeth.contracts.checkpoint import CheckpointDraft, ResumeRefusalCause
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AbandonRefusedError
 from elspeth.core.checkpoint import CheckpointManager
@@ -152,6 +152,7 @@ class TestInspectLeaderlessRun:
         assert preflight.run_status is None
         assert preflight.refusal is not None
         assert "not found" in preflight.refusal
+        assert preflight.refusal_cause is ResumeRefusalCause.RUN_NOT_FOUND
 
     def test_live_seat_is_refused_and_names_the_leader(self) -> None:
         setup, _token_ids = _leaderless_run(expire_seat=False)
@@ -163,6 +164,7 @@ class TestInspectLeaderlessRun:
         assert preflight.refusal is not None
         assert _LEADER_WORKER_ID in preflight.refusal
         assert "elspeth join" in preflight.refusal
+        assert preflight.refusal_cause is ResumeRefusalCause.LEADER_LIVE
 
     @pytest.mark.parametrize("terminal", [RunStatus.INTERRUPTED, RunStatus.FAILED, RunStatus.COMPLETED])
     def test_terminal_run_is_refused(self, terminal: RunStatus) -> None:
@@ -178,6 +180,7 @@ class TestInspectLeaderlessRun:
         assert preflight.run_status is terminal
         assert preflight.refusal is not None
         assert terminal.value in preflight.refusal
+        assert preflight.refusal_cause is ResumeRefusalCause.RUN_NOT_RUNNING
 
 
 class TestAbandonLeaderlessRun:
@@ -231,6 +234,7 @@ class TestAbandonLeaderlessRun:
             abandon_leaderless_run(setup.db, setup.run_id)
 
         assert exc_info.value.run_id == setup.run_id
+        assert exc_info.value.cause is ResumeRefusalCause.LEADER_LIVE
         assert _LEADER_WORKER_ID in exc_info.value.reason
         assert _run_status(setup) is RunStatus.RUNNING
         assert _abandoned_token_ids(setup) == []
@@ -257,8 +261,9 @@ class TestAbandonLeaderlessRun:
 
         monkeypatch.setattr("elspeth.engine.orchestrator.abandon.inspect_leaderless_run", inspect_then_revive)
 
-        with pytest.raises(NonResumableRunError):
+        with pytest.raises(NonResumableRunError) as exc_info:
             abandon_leaderless_run(setup.db, setup.run_id)
 
+        assert exc_info.value.cause is ResumeRefusalCause.LEADER_LIVE
         assert _run_status(setup) is RunStatus.RUNNING
         assert _abandoned_token_ids(setup) == []

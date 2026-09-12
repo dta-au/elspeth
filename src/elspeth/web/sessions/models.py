@@ -309,7 +309,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        ``SessionOperationAuthority``. New table ships by DB recreation
 #        (sessions.db only — auth.db is never touched); no migration,
 #        rollback_permitted: false.
-SESSION_SCHEMA_EPOCH = 53
+#   54 -> Durable Composer progress snapshots and exact request lifecycle leases.
+#        Pre-release delete-and-recreate boundary; no migration or rollback.
+SESSION_SCHEMA_EPOCH = 54
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1181,9 +1183,10 @@ guided_operation_events_table = Table(
     ),
 )
 
-# Per-event ``payload`` JSON contract (Tier-1 schema; CLAUDE.md
-# §"Three-Tier Trust Model" — values written here are our own data and
-# must satisfy the contract on read or crash):
+# Per-event ``payload`` JSON contract (Tier-1 schema; see
+# docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model —
+# values written here are our own data and must satisfy the contract on read
+# or crash):
 #
 # Payload contract for event_type="trust_mode.changed":
 #   trust_mode: str — the new value the PATCH set
@@ -1196,9 +1199,10 @@ guided_operation_events_table = Table(
 #       counter to satisfy the audit-primacy superset rule).
 #   density_default: str — the new density_default value
 #       (vocabulary per the column's CHECK constraint).
-# Adding a new key here is a Tier-1 schema-cohort change (per
-# CLAUDE.md "DB migration = delete the old DB"); document the
-# key, its vocabulary, and the owning phase at the same time.
+# Adding a new key here is a Tier-1 schema-cohort change: pre-release, a
+# schema change gets no migration shim — the old DB is deleted (per
+# CONTRIBUTING.md §Code Standards). Document the key, its vocabulary, and
+# the owning phase at the same time.
 #
 # Payload contract for event_type="proposal.created":
 #   Generic tool proposals use the closed current
@@ -2571,6 +2575,37 @@ websocket_tickets_table = Table(
     *_non_blank_text_constraints("run_id", name="ck_websocket_tickets_run_id_nonblank"),
     *_non_blank_text_constraints("user_id", name="ck_websocket_tickets_user_id_nonblank"),
     CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK, name="ck_websocket_tickets_auth_provider_type"),
+)
+
+composer_inflight_requests_table = Table(
+    "composer_inflight_requests",
+    metadata,
+    Column("request_token", String(36), primary_key=True),
+    Column("session_id", String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False),
+    Column("identity_id", String(36), ForeignKey("identities.identity_id", ondelete="CASCADE"), nullable=False),
+    Column("owner_instance_id", String(128), nullable=False),
+    Column("begun_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("request_token", name="ck_composer_inflight_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_composer_inflight_owner_nonblank"),
+    CheckConstraint("expires_at > begun_at", name="ck_composer_inflight_time_order"),
+    Index("ix_composer_inflight_session_expiry", "session_id", "expires_at"),
+)
+
+composer_progress_snapshots_table = Table(
+    "composer_progress_snapshots",
+    metadata,
+    Column("session_id", String(36), ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True),
+    Column("identity_id", String(36), ForeignKey("identities.identity_id", ondelete="CASCADE"), nullable=False),
+    Column("generation", String(36), nullable=False),
+    Column("request_token", String(36), nullable=True),
+    Column("request_id", String(256), nullable=True),
+    Column("snapshot_json", Text, nullable=True),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("generation", name="ck_composer_progress_generation_nonblank"),
+    CheckConstraint("expires_at > updated_at", name="ck_composer_progress_time_order"),
+    CheckConstraint("snapshot_json IS NULL OR length(snapshot_json) <= 16384", name="ck_composer_progress_bounded"),
 )
 
 rate_limit_buckets_table = Table(

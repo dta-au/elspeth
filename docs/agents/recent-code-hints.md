@@ -76,7 +76,8 @@ the same commit; the rules live there, the history lives here.
   `elspeth-lints --root src/elspeth` tier gate. Ruff `T20` (print) is ignored there
   by `per-file-ignores`, the same treatment as `scripts/`. First occupant:
   `.claude/skills/lane-manager/` (hub-side lane orchestration; state under
-  `.claude/lanes/`, tests in `tests/unit/test_lane_manager_skill.py`).
+  `.claude/lanes/`). Agent tooling is not tested in this repo — it carries no
+  suite under `tests/`.
   See [CONTRIBUTING: Gate walker and scratch directory](../../CONTRIBUTING.md#gate-walker-and-scratch-directory).
 
 - **2026-08-29 — five tier_model precision classes are FIXED; do not reshape code around them or expect the pre-fix finding sets** (elspeth-8d46db34ff, ae34b48b3, df3463583)

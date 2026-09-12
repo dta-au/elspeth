@@ -55,7 +55,7 @@ def _log_fingerprint_missing_rate_limited() -> None:
     ``SecretResolutionError``) — so the typed signal is converted into an
     operational breadcrumb instead of a per-request 503.
 
-    Per CLAUDE.md ``logging-telemetry-policy``: this is a deployment
+    Per the logging-telemetry-policy skill §Logging Policy: this is a deployment
     misconfiguration event, not pipeline activity.  The audit trail
     (Landscape) records WHAT the pipeline did; it does not have a slot
     for "server-wide secrets subsystem is misconfigured."  Telemetry

@@ -5,7 +5,8 @@ Ticket: elspeth-6c9972ccbf (Composer tools — ToolDeclaration paradigm).
 Step 1 introduces ``ToolDeclaration`` and migrates ``create_blob`` as the
 exemplar. The migration must be byte-identity-preserving — the schema the LLM
 sees pre- and post-migration is identical — and the declaration's invariants
-must crash early when violated (offensive-programming policy, see CLAUDE.md).
+must crash early when violated (see the ``engine-patterns-reference`` skill
+§Offensive Programming Examples).
 
 These tests guard the migration's correctness independent of the import-time
 parity assertions in ``_dispatch.py``: parity asserts the declaration agrees

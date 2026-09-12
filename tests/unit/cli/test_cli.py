@@ -1120,12 +1120,12 @@ sinks:
         from unittest.mock import patch
 
         from elspeth.cli import app
-        from elspeth.contracts.checkpoint import ResumeCheck
+        from elspeth.contracts.checkpoint import ResumeCheck, ResumeRefusalCause
 
         settings_file, _db_path = self._make_settings_with_landscape_db(tmp_path)
 
         # Mock can_resume to return False with a reason
-        mock_check = ResumeCheck(can_resume=False, reason="Run already completed successfully")
+        mock_check = ResumeCheck(can_resume=False, reason="Run already completed successfully", cause=ResumeRefusalCause.RUN_TERMINAL)
 
         with patch("elspeth.core.checkpoint.RecoveryManager") as MockRecovery:
             MockRecovery.return_value.can_resume.return_value = mock_check

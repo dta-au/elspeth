@@ -1,7 +1,7 @@
 # tests/e2e/audit/test_attributability.py
-"""E2E tests implementing CLAUDE.md's Attributability Test.
+"""E2E tests implementing the Attributability Test.
 
-From CLAUDE.md:
+From the ``engine-patterns-reference`` skill §The Attributability Test:
     For any output, the system must prove complete lineage:
 
         lineage = landscape.explain(run_id, token_id=token_id, field=field)
@@ -87,7 +87,7 @@ def _run_pipeline(
 
 
 class TestAttributability:
-    """The Attributability Test from CLAUDE.md.
+    """The Attributability Test (``engine-patterns-reference`` skill §The Attributability Test).
 
     For EVERY output row, the system must prove complete lineage.
     """
@@ -113,7 +113,7 @@ class TestAttributability:
             lineage = explain(factory.query, factory.data_flow, run_id=run_id, row_id=row.row_id)
             assert lineage is not None, f"Row {row.row_id} (index={row.row_index}) has no lineage"
 
-            # Attributability Test from CLAUDE.md
+            # Attributability Test (engine-patterns-reference skill §The Attributability Test)
             assert lineage.source_row is not None, f"Row {row.row_id}: lineage.source_row is None"
             assert len(lineage.node_states) > 0, f"Row {row.row_id}: no node_states in lineage"
             assert lineage.source_row.source_data is not None, f"Row {row.row_id}: source_data is None (payload unavailable)"

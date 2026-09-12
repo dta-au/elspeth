@@ -21,7 +21,7 @@ from elspeth.web.composer.telemetry_phase8 import (
     record_mode_opted_out,
 )
 from elspeth.web.middleware.rate_limit import (
-    ComposerRateLimiter,
+    WebRateLimiter,
     get_write_rate_limiter,
 )
 from elspeth.web.preferences.models import (
@@ -47,7 +47,7 @@ def create_preferences_router() -> APIRouter:
         body: UpdateComposerPreferencesRequest,
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
-        rate_limiter: ComposerRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> ComposerPreferences:
         # Panel C1: per-user rate limit — metered by the WRITE bucket
         # (app.state.write_rate_limiter), not the composer LLM bucket.

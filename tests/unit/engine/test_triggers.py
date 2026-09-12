@@ -569,7 +569,8 @@ class TestTriggerConditionLatching:
 class TestTriggerConditionBooleanValidation:
     """Tests for P2-2026-01-31: Trigger condition must return boolean.
 
-    Per CLAUDE.md Three-Tier Trust Model: trigger config is "our data" (Tier 1).
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model: trigger config is "our data" (Tier 1).
     Non-boolean results should be rejected, not silently coerced with bool().
     """
 

@@ -311,7 +311,8 @@ class TestBatchStatsFloatOverflow:
     def test_none_value_skipped_and_reported(self, ctx: PluginContext) -> None:
         """None in value_field is a missing value: skipped-and-reported, never a crash.
 
-        Per CLAUDE.md Tier 2/3 doctrine and every sibling batch transform
+        Per the Tier 2/3 rules in docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model and every sibling batch transform
         (batch_distribution_profile etc.), None is missing data — it is skipped
         from the computation and reported in skipped_missing, NOT raised as a
         TypeError that aborts the whole run (plugins review C2).

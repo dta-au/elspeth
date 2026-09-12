@@ -96,7 +96,7 @@ discriminator via `AuditEvidenceBase` — no regression.
 
 ### Tier placement for cross-check data
 
-The cross-check crosses trust tiers. Each tier is explicit per CLAUDE.md's Three-Tier Trust Model:
+The cross-check crosses trust tiers. Each tier is explicit per the three-tier trust model (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model):
 
 | Input / Output | Tier | Handling |
 |---|---|---|
@@ -140,7 +140,7 @@ Future ADRs may extend the pattern. This ADR establishes the architectural templ
 
 ### Neutral Consequences
 
-- `NodeStateGuard.__exit__` gains an `isinstance(exc_val, PluginContractViolation)` discriminator. This is a Tier-2/Tier-1 boundary type-check, not defensive programming (CLAUDE.md permits `isinstance` at trust boundaries).
+- `NodeStateGuard.__exit__` gains an `isinstance(exc_val, PluginContractViolation)` discriminator. This is a Tier-2/Tier-1 boundary type-check, not defensive programming (the trust model permits `isinstance` at trust boundaries — docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
 - Landscape-unavailable failure mode: when DB recording itself fails, `__exit__` raises `AuditIntegrityError` chaining the original violation. Triage SQL filtering on `error_exception_type = 'PassThroughContractViolation'` returns zero rows in this scenario — the telemetry counter (incremented before the raise) is the reliable secondary signal. Documented in §Observability of the implementation plan.
 - Cross-check is skipped entirely when `transform.passes_through_input` is False. Non-annotated transforms pay exactly the cost of one attribute read per row — negligible.
 
@@ -184,5 +184,5 @@ parent-class change does not weaken it.
 - Decision and implementation record: commits `329213880` and `d22115c5c`
 - Companion ADR: `ADR-007: Pass-through contract propagation — declaration, semantics, and composer parity`
 - Related bug report: `elspeth-87f6d5dea5` (composer/runtime schema-contract divergence)
-- CLAUDE.md §Three-Tier Trust Model (tier boundary rules)
-- CLAUDE.md §Plugin Ownership (plugin bugs must crash)
+- docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model (tier boundary rules)
+- docs/guides/data-trust-and-error-handling.md §Plugin Ownership: System Code, Not User Code (plugin bugs must crash)

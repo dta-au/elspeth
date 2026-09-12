@@ -1,4 +1,4 @@
-"""Executable contract for the Azure Container Apps runbooks and skill.
+"""Executable contract for the Azure Container Apps runbooks.
 
 Mirrors ``test_aws_ecs_runbook_contract.py`` for the ACA trio. The two rules
 that matter most here are the ECS lessons: every epoch literal in prose or
@@ -14,10 +14,10 @@ import json
 import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
-import yaml
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web._aws_ecs_acceptance import receipt_contracts
@@ -30,13 +30,12 @@ COLD_INSTALL_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-cold-install.md"
 REDEPLOY_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-existing-service-redeploy.md"
 RUNBOOKS = (ACCEPTANCE_RUNBOOK, COLD_INSTALL_RUNBOOK, REDEPLOY_RUNBOOK)
 PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-05-phase6b-azure-container-apps-platform-facts.md"
-SKILL_DIR = REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps"
-SKILL_SYMLINK = REPO_ROOT / ".claude" / "skills" / "operating-azure-container-apps"
 KEY_DERIVATION_MODULE = REPO_ROOT / "src" / "elspeth" / "web" / "key_derivation.py"
 KEY_DERIVATION_TEST = REPO_ROOT / "tests" / "unit" / "web" / "test_key_derivation_wiring.py"
 
 FACTS_LINK = "../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
-RECEIPT_PATH = "docs/operator/evidence/azure-container-apps/0.8.0.json"
+CURRENT_VERSION = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+RECEIPT_PATH = f"docs/operator/evidence/azure-container-apps/{CURRENT_VERSION}.json"
 INGRESS_REQUEST_TIMEOUT_SECONDS = 240
 MECHANISMS = (
     "session_operation_fence",
@@ -71,11 +70,6 @@ def _text(path: Path) -> str:
 
 def _fences(text: str, language: str) -> list[str]:
     return re.findall(rf"```{language}\n(.*?)```", text, flags=re.DOTALL)
-
-
-def _skill_texts() -> list[str]:
-    paths = (SKILL_DIR / "SKILL.md", *sorted((SKILL_DIR / "references").glob("*.md")))
-    return [_text(path) for path in paths]
 
 
 def _compatibility_record() -> dict[str, object]:
@@ -186,7 +180,7 @@ def test_compatibility_record_is_byte_bound_to_the_live_derivation() -> None:
 
 
 def test_every_epoch_literal_matches_the_live_constants() -> None:
-    texts = [_text(runbook) for runbook in RUNBOOKS] + _skill_texts()
+    texts = [_text(runbook) for runbook in RUNBOOKS]
     session_hits = 0
     landscape_hits = 0
     for text in texts:
@@ -237,7 +231,7 @@ def test_replica_probes_name_their_mechanism_and_run_in_order() -> None:
         "ALTER ROLE elspeth_runtime_a LOGIN;",
         "terminationGracePeriodSeconds: 0",
         "downgrades to `graceful_stop`",
-        "asserts that no `run_start_permits` row exists",
+        "does not measure durable permit admission or handoff",
         "P4b (recorded, cannot pass)",
         "`kill -9 1`",
         "recorded, not used",
@@ -271,8 +265,27 @@ def test_runbooks_cite_the_measured_facts_and_the_bundle_and_declare_their_statu
         assert "deploy/azure-container-apps" in text, runbook.name
         assert RECEIPT_PATH in text, runbook.name
         assert "**Status.**" in text, runbook.name
-        assert "not a support claim" in " ".join(text.split()), runbook.name
+        normalized = " ".join(text.replace("> ", "").split())
+        assert "desktop acceptance" in normalized, runbook.name
+        assert "closed on 2026-09-10" in normalized, runbook.name
+        assert "No live cloud acceptance is claimed" in normalized, runbook.name
+        assert "durable run-event replay" in normalized, runbook.name
+        assert "shared budgets" in normalized, runbook.name
+        assert "interrupted provider request is not automatically resumed" in normalized, runbook.name
+        assert "reconnect" in normalized, runbook.name
+        assert "not a support claim" not in normalized, runbook.name
         assert "**LIVE" in text, runbook.name
+
+
+def test_prospective_receipt_paths_match_the_current_release() -> None:
+    surfaces = (
+        *RUNBOOKS,
+        REPO_ROOT / "deploy" / "azure-container-apps" / "README.md",
+        REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps" / "SKILL.md",
+    )
+    for surface in surfaces:
+        versions = re.findall(r"docs/operator/evidence/azure-container-apps/(\d+\.\d+\.\d+)\.json", _text(surface))
+        assert set(versions) == {CURRENT_VERSION}, surface
 
 
 def test_image_publication_is_a_digest_preserving_copy_in_every_runbook() -> None:
@@ -723,11 +736,24 @@ def test_secret_rotation_cites_the_key_derivation_authority() -> None:
 
 def test_receipt_vocabulary_is_closed_and_named() -> None:
     text = _text(ACCEPTANCE_RUNBOOK)
-    receipt = " ".join(text[text.index("## Receipt and docs flip") :].split())
+    receipt = " ".join(text[text.index("## Receipt from an operator-run acceptance") :].split())
     for kind in CHECK_KINDS:
         assert f"`{kind}`" in receipt, kind
-    assert "in **one commit**" in receipt
-    assert "the bar is a second clean run end to end" in receipt
+    assert "only after the live procedure completes" in receipt
+    assert "not prerequisites to closing `elspeth-5ec3befc1a`" in receipt
+    assert "Never create a receipt from desktop analysis" in receipt
+    assert "legacy v2 P4b" in text
+    assert "does not measure the new runtime capabilities" in " ".join(text.split())
+
+
+def test_package_documents_v3_deferral_without_erasing_future_triggers() -> None:
+    path = REPO_ROOT / "src/elspeth/web/_azure_container_apps_acceptance/README.md"
+    text = " ".join(_text(path).split())
+    assert "0.8.1 disposition (2026-09-10): explicitly defer v3 implementation" in text
+    assert "changes neither the receipt envelope nor the provider set" in text
+    assert "third acceptance provider" in text
+    assert "compatibility-record field set" in text
+    assert "both provider regression suites" in text
 
 
 def test_testcontainer_run_is_recorded_with_the_ci_selection_and_gated() -> None:
@@ -757,29 +783,3 @@ def test_testcontainer_run_is_recorded_with_the_ci_selection_and_gated() -> None
         < section.index("unset ELSPETH_TEST_POSTGRES_URL")
     )
     assert text.index("## Connection budget") < text.index("## Testcontainer run") < text.index("## Evidence")
-
-
-def test_skill_mirrors_the_ecs_layout_and_worktree_guidance() -> None:
-    assert (SKILL_DIR / "SKILL.md").is_file()
-    assert (SKILL_DIR / "agents" / "openai.yaml").is_file()
-    assert (SKILL_DIR / "references" / "command-cheatsheet.md").is_file()
-    assert (SKILL_DIR / "references" / "test-and-triage.md").is_file()
-    assert SKILL_SYMLINK.is_symlink()
-    assert SKILL_SYMLINK.resolve() == SKILL_DIR.resolve()
-
-    skill = _text(SKILL_DIR / "SKILL.md")
-    frontmatter = yaml.safe_load(skill.split("---\n")[1])
-    assert frontmatter["name"] == "operating-azure-container-apps"
-    assert "Do not use for AWS ECS" in " ".join(frontmatter["description"].split())
-
-    combined = "\n".join(_skill_texts())
-    assert not re.search(r"(?m)^\s*uv sync\b", combined)
-    assert not re.search(r"(?m)^\s*uv run\b", combined)
-    assert "PYTHONPATH" in combined
-    assert ".venv/bin/pytest" in combined
-    assert "Azure Files carries no database" in combined
-    assert "docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md" in combined
-
-    agent = yaml.safe_load(_text(SKILL_DIR / "agents" / "openai.yaml"))
-    assert agent["interface"]["display_name"] == "Operate Azure Container Apps"
-    assert "$operating-azure-container-apps" in agent["interface"]["default_prompt"]

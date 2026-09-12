@@ -1,10 +1,10 @@
 """Expected boundary partition for the audit-readiness panel.
 
-ELSPETH's Three-Tier Trust Model (CLAUDE.md) treats external data as
-crossing Tier-3 at sources, at sinks, and at transforms that make
-external calls (HTTP, LLM, blob store, downstream service). The
-audit-readiness panel uses this partition to highlight which catalog
-entries an auditor must trace to source on every run.
+ELSPETH's three-tier trust model (docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model) treats external data as crossing Tier-3 at
+sources, at sinks, and at transforms that make external calls (HTTP, LLM,
+blob store, downstream service). The audit-readiness panel uses this partition
+to highlight which catalog entries an auditor must trace to source on every run.
 
 Runtime classification lives in
 ``elspeth.web.audit_readiness.service._build_plugin_trust_row`` via the

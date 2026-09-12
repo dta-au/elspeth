@@ -1,9 +1,28 @@
 # ADR-018: Producer-Site Outcome Discrimination
 
 **Date:** 2026-05-02
-**Status:** Accepted
+**Status:** Superseded by ADR-019 (Two-Axis Terminal Model, 2026-05-04)
 **Deciders:** ELSPETH maintainers
 **Tags:** contracts, audit, row-outcomes, public-api
+
+> **Reader orientation (added 2026-09-11).** The current authority for row
+> terminal classification is [ADR-019](019-two-axis-terminal-model.md)
+> (Two-Axis Terminal Model, 2026-05-04), which supersedes this ADR and splits
+> the single `RowOutcome` axis into `TerminalOutcome` (the lifecycle answer)
+> and `TerminalPath` (the provenance answer). The `RowOutcome` enum this ADR
+> governs no longer exists: `TerminalOutcome` and `TerminalPath` are the live
+> contract types in `src/elspeth/contracts/enums.py`, and `RowOutcome` has no
+> remaining references under `src/`. Read the mapping table below as the
+> record of the retired enum, and the procedural instructions around it —
+> adding a variant, the closed-set partition assertion — as instructions for
+> that retired enum, not for current code. ADR-019's mapping table is the
+> current form of this contract.
+>
+> The decision itself is not withdrawn. ADR-019 §Decision continues "ADR-018's
+> mechanical-prompt discipline": a producer that emits a new circumstance must
+> add a `TerminalPath` value AND classify it in ADR-019's mapping table.
+> ADR-019 §Consequences records the intent explicitly — treat ADR-018's table
+> "as the input that ADR-019 generalizes, not as a mistake."
 
 ## Context
 
@@ -36,8 +55,9 @@ secondary field.
 `RowOutcome` variants name the producer/audit circumstance. Aggregate row
 counters that feed run-status predicates name the predicate role.
 
-The current canonical mapping is recorded below so a future producer can
-apply the rule mechanically rather than re-deriving it from prose. Sources
+The canonical mapping at the time of this decision (2026-05-02) is recorded
+below so a future producer can apply the rule mechanically rather than
+re-deriving it from prose. Sources
 of truth: live accumulator at
 `engine/orchestrator/outcomes.py::accumulate_row_outcomes`, resume
 aggregation at `engine/orchestrator/core.py` (the `match` over
@@ -161,6 +181,7 @@ L0, L3, and frontend predicate-role fields identical is the mechanical guard.
 
 ## Related Decisions
 
+- **Superseded by:** ADR-019 (Two-Axis Terminal Model, 2026-05-04)
 - ADR-004: Explicit Sink Routing
 - Historical implementation plan: `2026-05-02-rows-routed-counter-split.md`
   (retained in git history, not active docs)

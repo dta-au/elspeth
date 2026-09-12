@@ -18,10 +18,11 @@ and a ``TYPE_CHECKING`` import of ``ComposerProgressEvent`` from
 ``.github/codeql/codeql-config.yml``) flagged the TYPE_CHECKING-deferred
 import as a static-analysis-visible cycle even though no runtime cycle
 exists.  Moving the event class down to L0 dissolves the cycle entirely
-and is the architecturally-clean fix preferred by CLAUDE.md's "Layer
-Dependency Rules → When a New Cross-Layer Need Arises" guidance: "Move
-the code down. If the needed code has no upward dependencies, move it
-to the lower layer."
+and is the architecturally-clean fix under ELSPETH's layer model (L0
+contracts → L1 core → L2 engine → L3 plugins/web/mcp/tui/cli; see the
+``engine-patterns-reference`` skill §Layer Architecture & Dependency
+Analysis): code the lower layer needs, and which itself has no upward
+dependencies, moves down rather than being imported upward.
 
 The L3-dependent residue (``ComposerProgressSnapshot``, ``ComposerProgressRegistry``,
 event-factory functions, tool-name helpers) stays in

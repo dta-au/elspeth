@@ -674,7 +674,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # Merged 2026-09-01: the two rotations above landed on separate branches and
 # touch different plugins, so both provenance pins are live on the merged
 # manifest and this digest covers both.
-EXPECTED_CASE_REGISTRY_SHA256 = "fc99a2fd10d8d7b0d5540f9e68a8e4a3f222db535ee2db93dac3b7144d0eca53"
+# Release 0.8.1: refresh only engine-owned node plugin_version audit metadata.
+# Frozen semantic oracles and behavioral expectations are unchanged.
+# JSON source provenance refresh: update its one exact audit-record hash pin
+# after the plugin hash repair; behavioral and frozen semantic oracles stay fixed.
+EXPECTED_CASE_REGISTRY_SHA256 = "25d4bc8d7ee2d22151653d05c5c0c44df849e77d0d5407bb647aad84148a851c"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -8,7 +8,7 @@ These tests verify the full integration of:
 4. extract_jinja2_fields_with_names for field discovery
 5. Hash stability across access styles
 
-Per CLAUDE.md Test Path Integrity: These tests use production code paths
+Per the ``engine-patterns-reference`` skill §Test Path Integrity: these tests use production code paths
 (SchemaContract, PipelineRow, PromptTemplate, extract_jinja2_fields_with_names)
 rather than manual construction.
 """

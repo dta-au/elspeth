@@ -6,7 +6,7 @@ These tests verify the full integration of:
 2. Validation errors including contract violation details
 3. Contract round-trip through audit trail with full fidelity
 
-Per CLAUDE.md Test Path Integrity: These tests use production code paths
+Per the ``engine-patterns-reference`` skill §Test Path Integrity: these tests use production code paths
 (CSVSource, RecorderFactory, SchemaContract, PipelineRow) rather than
 manual construction.
 

@@ -1427,8 +1427,9 @@ async def post_guided_chat_schema8(
             progress_started = False
             progress_registry = _get_composer_progress_registry(request)
             try:
-                progress_sink = _composer_progress_sink(
+                progress_sink = await _composer_progress_sink(
                     progress_registry,
+                    request=request,
                     session_id=str(session_id),
                     request_id=body.operation_id,
                     user_id=str(user.user_id),

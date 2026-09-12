@@ -23,6 +23,7 @@ from elspeth.contracts import (
     TerminalPath,
 )
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.contract_records import ContractAuditRecord
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError, OrchestrationInvariantError
@@ -32,8 +33,7 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.checkpoint import CheckpointCorruptionError, CheckpointManager, RecoveryManager
 from elspeth.core.checkpoint import recovery as recovery_module
-from elspeth.core.checkpoint.manager import IncompatibleCheckpointError
-from elspeth.core.checkpoint.recovery import _DELEGATION_PATHS, IncompleteTokenSpec
+from elspeth.core.checkpoint.recovery import _DELEGATION_PATHS, IncompleteTokenSpec, NonResumableRunError
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
@@ -336,6 +336,7 @@ def test_can_resume_returns_false_for_missing_run(recovery_manager: RecoveryMana
     check = recovery_manager.can_resume("missing", _create_graph())
     assert check.can_resume is False
     assert check.reason == "Run missing not found"
+    assert check.cause is ResumeRefusalCause.RUN_NOT_FOUND
 
 
 def test_can_resume_rejects_completed_run(db: LandscapeDB, recovery_manager: RecoveryManager) -> None:
@@ -345,6 +346,7 @@ def test_can_resume_rejects_completed_run(db: LandscapeDB, recovery_manager: Rec
     check = recovery_manager.can_resume("run-completed", _create_graph())
     assert check.can_resume is False
     assert check.reason == "Run already completed successfully"
+    assert check.cause is ResumeRefusalCause.RUN_TERMINAL
 
 
 def test_can_resume_rejects_running_run_with_live_seat(db: LandscapeDB, recovery_manager: RecoveryManager) -> None:
@@ -412,6 +414,7 @@ def test_can_resume_rejects_failed_run_without_checkpoint(db: LandscapeDB, recov
     check = recovery_manager.can_resume("run-no-checkpoint", _create_graph())
     assert check.can_resume is False
     assert check.reason == "Run has no resume baseline (run predates run-start checkpointing or checkpointing was disabled)"
+    assert check.cause is ResumeRefusalCause.CHECKPOINT_MISSING
 
 
 def test_can_resume_reason_for_missing_baseline_is_journal_flavoured(db: LandscapeDB, recovery_manager: RecoveryManager) -> None:
@@ -432,18 +435,21 @@ def test_can_resume_reason_for_missing_baseline_is_journal_flavoured(db: Landsca
 
 
 def test_can_resume_returns_reason_when_checkpoint_format_is_incompatible(
-    db: LandscapeDB, recovery_manager: RecoveryManager, monkeypatch: pytest.MonkeyPatch
+    db: LandscapeDB, checkpoint_manager: CheckpointManager, recovery_manager: RecoveryManager
 ) -> None:
-    with db.write_connection() as conn:
-        _insert_run(conn, "run-incompatible", status=RunStatus.FAILED)
-
-    def _raise_incompatible(_run_id: str) -> None:
-        raise IncompatibleCheckpointError("bad checkpoint format")
-
-    monkeypatch.setattr(recovery_manager._checkpoint_manager, "get_latest_checkpoint", _raise_incompatible)
-    check = recovery_manager.can_resume("run-incompatible", _create_graph())
+    run_id = "run-incompatible"
+    graph = _create_failed_run_with_checkpoint(db, checkpoint_manager, run_id)
+    with db.engine.begin() as conn:
+        conn.execute(
+            update(checkpoints_table)
+            .where(checkpoints_table.c.run_id == run_id)
+            .values(format_version=Checkpoint.CURRENT_FORMAT_VERSION + 1)
+        )
+    check = recovery_manager.can_resume(run_id, graph)
     assert check.can_resume is False
-    assert check.reason == "bad checkpoint format"
+    assert check.reason is not None
+    assert "incompatible format version" in check.reason
+    assert check.cause is ResumeRefusalCause.CHECKPOINT_FORMAT_INCOMPATIBLE
 
 
 def test_get_unprocessed_rows_rejects_incompatible_checkpoint_format(
@@ -456,8 +462,9 @@ def test_get_unprocessed_rows_rejects_incompatible_checkpoint_format(
     with db.engine.begin() as conn:
         conn.execute(update(checkpoints_table).where(checkpoints_table.c.run_id == run_id).values(format_version=None))
 
-    with pytest.raises(IncompatibleCheckpointError, match="missing format_version"):
+    with pytest.raises(NonResumableRunError, match="missing format_version") as exc_info:
         recovery_manager.get_unprocessed_rows(run_id)
+    assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_FORMAT_MISSING
 
 
 def test_can_resume_rejects_topology_mismatch(
@@ -478,6 +485,7 @@ def test_can_resume_rejects_topology_mismatch(
     check = recovery_manager.can_resume(run_id, changed_graph)
     assert check.can_resume is False
     assert check.reason is not None
+    assert check.cause is ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED
 
 
 def test_can_resume_true_for_failed_run_with_valid_checkpoint(
@@ -518,7 +526,11 @@ def test_can_resume_rejects_incomplete_source_lifecycle(
     assert f"primary={lifecycle_state}" in check.reason
 
     # get_resume_point delegates to can_resume, so it must refuse too.
-    assert recovery_manager.get_resume_point(run_id, graph) is None
+    assert check.cause is ResumeRefusalCause.SOURCE_NOT_EXHAUSTED
+    with pytest.raises(NonResumableRunError) as exc_info:
+        recovery_manager.get_resume_point(run_id, graph)
+    assert exc_info.value.cause is check.cause
+    assert exc_info.value.reason == check.reason
 
 
 @pytest.mark.parametrize("lifecycle_state", ["exhausted", "loaded"])
@@ -539,11 +551,13 @@ def test_can_resume_accepts_complete_source_lifecycle(
     assert check.reason is None
 
 
-def test_get_resume_point_returns_none_when_run_cannot_resume(recovery_manager: RecoveryManager) -> None:
-    assert recovery_manager.get_resume_point("missing", _create_graph()) is None
+def test_get_resume_point_refuses_when_run_cannot_resume(recovery_manager: RecoveryManager) -> None:
+    with pytest.raises(NonResumableRunError) as exc_info:
+        recovery_manager.get_resume_point("missing", _create_graph())
+    assert exc_info.value.cause is ResumeRefusalCause.RUN_NOT_FOUND
 
 
-def test_get_resume_point_returns_none_if_checkpoint_missing_after_can_resume(
+def test_get_resume_point_refuses_if_checkpoint_missing_after_can_resume(
     db: LandscapeDB,
     recovery_manager: RecoveryManager,
     monkeypatch: pytest.MonkeyPatch,
@@ -554,7 +568,9 @@ def test_get_resume_point_returns_none_if_checkpoint_missing_after_can_resume(
     monkeypatch.setattr(recovery_manager, "can_resume", lambda _run_id, _graph: type("Check", (), {"can_resume": True})())
     monkeypatch.setattr(recovery_manager._checkpoint_manager, "get_latest_checkpoint", lambda _run_id: None)
 
-    assert recovery_manager.get_resume_point("run-race", _create_graph()) is None
+    with pytest.raises(NonResumableRunError) as exc_info:
+        recovery_manager.get_resume_point("run-race", _create_graph())
+    assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_MISSING
 
 
 def test_get_resume_point_propagates_checkpoint_corruption(
@@ -564,7 +580,7 @@ def test_get_resume_point_propagates_checkpoint_corruption(
 ) -> None:
     """Tier 1: persisted-checkpoint corruption CRASHES get_resume_point.
 
-    Pins the elspeth-ca0a7e71b1 fix: the dead ``except IncompatibleCheckpointError``
+    Pins the elspeth-ca0a7e71b1 fix: the dead compatibility-exception
     swallow around ``get_latest_checkpoint`` is gone — the raw persistence read
     raises CheckpointCorruptionError on malformed data and nothing converts a
     checkpoint-load failure into a silent "no resume point".
@@ -1622,7 +1638,9 @@ def test_get_resume_point_revalidates_checkpoint_loaded_after_can_resume(
     # Simulate a checkpoint appearing after can_resume validated an earlier checkpoint.
     monkeypatch.setattr(recovery_manager, "can_resume", lambda _run_id, _graph: type("Check", (), {"can_resume": True})())
 
-    assert recovery_manager.get_resume_point(run_id, graph) is None
+    with pytest.raises(NonResumableRunError) as exc_info:
+        recovery_manager.get_resume_point(run_id, graph)
+    assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED
 
 
 def test_get_unprocessed_rows_excludes_diverted_rows(

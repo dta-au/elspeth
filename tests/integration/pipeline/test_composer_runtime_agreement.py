@@ -3101,8 +3101,9 @@ class TestComposerRuntimeRunStatusAgreement:
         COMPLETED_WITH_FAILURES.
 
         Two rows, both fail via ``on_error: discard`` (the engine's
-        quarantine terminal state).  Per CLAUDE.md Tier-3 data manifesto,
-        quarantine is a deliberate clean determination on every row, not a
+        quarantine terminal state).  Per the three-tier trust model
+        (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
+        Tier-3 quarantine is a deliberate clean determination on every row, not a
         framework failure. The predicate sees ``terminal_clean_indicator``
         via ``rows_quarantined > 0`` with no uncaught ``failure_indicator``
         (rows_failed - rows_quarantined == 0) and lifts the verdict from
@@ -3555,7 +3556,9 @@ class TestComposerRuntimeFileSinkCollisionAgreement:
     The fix extends the step-4 catch list to include ``FileExistsError``
     and converts it to a structured ``ValidationCheck(passed=False)`` on
     the ``plugin_instantiation`` step with an ``auto_increment``
-    suggestion. Per CLAUDE.md trust tiers, the existing-file condition is
+    suggestion. Per the three-tier trust model
+    (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
+    the existing-file condition is
     a Tier 3 boundary fact (external fs state) at a validation seam — the
     correct shape is a structured 422-class diagnostic, not a 500.
 

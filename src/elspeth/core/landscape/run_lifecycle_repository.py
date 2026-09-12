@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, get_args
@@ -41,6 +41,7 @@ from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariant
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.preflight import PreflightResult
+from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.runtime_val_manifest import (
     RuntimeValRegistryFingerprint,
     _assert_runtime_val_registries_frozen,
@@ -66,6 +67,7 @@ from elspeth.core.landscape.run_coordination_repository import (
     fenced_member_transaction,
     record_coordination_events,
 )
+from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
 from elspeth.core.landscape.schema import (
     SOURCE_COMPLETE_LIFECYCLE_STATES,
     RunSourceLifecycleState,
@@ -77,6 +79,7 @@ from elspeth.core.landscape.schema import (
     preflight_results_table,
     run_attributions_table,
     run_sources_table,
+    run_start_admissions_table,
     run_web_plugin_policy_table,
     run_workers_table,
     runs_table,
@@ -121,7 +124,7 @@ class RunSourceFieldResolutionRecord:
     resolution_mapping: Mapping[str, str] | None
 
     def __post_init__(self) -> None:
-        # Frozen-dataclass deep-freeze contract (CLAUDE.md): resolution_mapping
+        # Frozen-dataclass deep-freeze contract: resolution_mapping
         # is a container field, so frozen=True alone leaves its contents mutable
         # through the attribute reference. Gate on `is not None` — the field is
         # nullable (sources that resolved no headers record None).
@@ -302,6 +305,7 @@ class RunLifecycleRepository:
         openrouter_catalog_source: str,
         leader_worker_id: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
     ) -> Run:
         """Begin a new pipeline run.
 
@@ -362,6 +366,8 @@ class RunLifecycleRepository:
             raise AuditIntegrityError("web_plugin_policy_evidence must be a WebPluginPolicyEvidence value")
 
         run_id = run_id or generate_id()
+        if run_start_permit is not None and (type(run_start_permit) is not RunStartPermitBinding or run_start_permit.run_id != run_id):
+            raise AuditIntegrityError("Run start permit must bind the exact run UUID")
         settings_json = canonical_json(config)
         config_hash = stable_hash(config)
         timestamp = now()
@@ -399,6 +405,22 @@ class RunLifecycleRepository:
         coordination = self._coordination_repo
         try:
             with self._db.write_connection() as conn:
+                if run_start_permit is not None:
+                    existing = self._observe_permitted_run_on(
+                        conn,
+                        run_start_permit,
+                        config_hash=config_hash,
+                        canonical_version=canonical_version,
+                        openrouter_catalog_sha256=openrouter_catalog_sha256,
+                        openrouter_catalog_source=openrouter_catalog_source,
+                        initiated_by_user_id=initiated_by_user_id,
+                        auth_provider_type=auth_provider_type,
+                        source_schema_json=source_schema_json,
+                        runtime_val_manifest_json=runtime_val_manifest_json,
+                        web_plugin_policy_evidence=web_plugin_policy_evidence,
+                    )
+                    if existing is not None:
+                        return existing
                 conn.execute(
                     runs_table.insert().values(
                         run_id=run.run_id,
@@ -417,6 +439,16 @@ class RunLifecycleRepository:
                         openrouter_catalog_source=openrouter_catalog_source,
                     )
                 )
+                if run_start_permit is not None:
+                    conn.execute(
+                        run_start_admissions_table.insert().values(
+                            run_id=run_id,
+                            permit_id=run_start_permit.permit_id,
+                            permit_epoch=run_start_permit.permit_epoch,
+                            subject_hash=run_start_permit.subject_hash,
+                            state="prepared",
+                        )
+                    )
                 if initiated_by_user_id is not None and auth_provider_type is not None:
                     conn.execute(
                         run_attributions_table.insert().values(
@@ -445,12 +477,191 @@ class RunLifecycleRepository:
                 )
                 coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
         except SQLAlchemyError as exc:
+            # A concurrent identical creator may win the unique run UUID.
+            # Observe only after our failed transaction has rolled back; never
+            # return its initial token or allocate a second leadership epoch.
+            if run_start_permit is not None:
+                with self._db.engine.connect() as conn:
+                    existing = self._observe_permitted_run_on(
+                        conn,
+                        run_start_permit,
+                        config_hash=config_hash,
+                        canonical_version=canonical_version,
+                        openrouter_catalog_sha256=openrouter_catalog_sha256,
+                        openrouter_catalog_source=openrouter_catalog_source,
+                        initiated_by_user_id=initiated_by_user_id,
+                        auth_provider_type=auth_provider_type,
+                        source_schema_json=source_schema_json,
+                        runtime_val_manifest_json=runtime_val_manifest_json,
+                        web_plugin_policy_evidence=web_plugin_policy_evidence,
+                    )
+                    if existing is not None:
+                        return existing
             # Preserve the pre-epoch-21 error contract: begin_run surfaced
             # constraint violations (e.g. duplicate run_id) as
             # LandscapeRecordError via DatabaseOps.execute_insert.
             raise LandscapeRecordError(f"begin_run — database rejected audit write: {type(exc).__name__}: {exc}") from exc
 
         return run
+
+    def _observe_permitted_run_on(
+        self,
+        conn: Connection,
+        binding: RunStartPermitBinding,
+        *,
+        config_hash: str,
+        canonical_version: str,
+        openrouter_catalog_sha256: str,
+        openrouter_catalog_source: str,
+        initiated_by_user_id: str | None,
+        auth_provider_type: str | None,
+        source_schema_json: str | None,
+        runtime_val_manifest_json: str | None,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None,
+    ) -> Run | None:
+        row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
+        if row is None:
+            return None
+        if RunStartAdmissionRepository.observe_on(conn, binding) is None:
+            raise AuditIntegrityError("Existing legacy run has no permit-bound baseline")
+        if (row.config_hash, row.canonical_version, row.openrouter_catalog_sha256, row.openrouter_catalog_source) != (
+            config_hash,
+            canonical_version,
+            openrouter_catalog_sha256,
+            openrouter_catalog_source,
+        ):
+            raise AuditIntegrityError("Permit retry changed immutable run configuration or catalog")
+        attribution = conn.execute(select(run_attributions_table).where(run_attributions_table.c.run_id == binding.run_id)).one_or_none()
+        actual_attribution = (None, None) if attribution is None else (attribution.initiated_by_user_id, attribution.auth_provider_type)
+        if actual_attribution != (initiated_by_user_id, auth_provider_type):
+            raise AuditIntegrityError("Permit retry changed run attribution")
+        if row.source_schema_json != source_schema_json or row.runtime_val_manifest_json != runtime_val_manifest_json:
+            raise AuditIntegrityError("Permit retry changed source schema or runtime VAL manifest")
+        policy = conn.execute(
+            select(run_web_plugin_policy_table).where(run_web_plugin_policy_table.c.run_id == binding.run_id)
+        ).one_or_none()
+        if web_plugin_policy_evidence is None:
+            if policy is not None:
+                raise AuditIntegrityError("Permit retry removed web plugin policy evidence")
+        elif policy is None:
+            raise AuditIntegrityError("Permit retry added web plugin policy evidence")
+        else:
+            evidence = web_plugin_policy_evidence
+            if (
+                policy.schema_version,
+                policy.policy_hash,
+                policy.snapshot_hash,
+                policy.authorized_plugin_ids_json,
+                policy.available_plugin_ids_json,
+                policy.control_modes_json,
+                policy.selected_implementations_json,
+                policy.selected_profile_aliases_json,
+                policy.plugin_code_identities_json,
+                policy.binding_generation_fingerprint,
+                policy.decision_codes_json,
+            ) != (
+                evidence.schema_version,
+                evidence.policy_hash,
+                evidence.snapshot_hash,
+                canonical_json(evidence.authorized_plugin_ids),
+                canonical_json(evidence.available_plugin_ids),
+                canonical_json(evidence.control_modes),
+                canonical_json(evidence.selected_implementations),
+                canonical_json(evidence.selected_profile_aliases),
+                canonical_json(evidence.plugin_code_identities),
+                evidence.binding_generation_fingerprint,
+                canonical_json(evidence.decision_codes),
+            ):
+                raise AuditIntegrityError("Permit retry changed web plugin policy evidence")
+        return self._run_loader.load(row)
+
+    def materialize_cancelled_permit(
+        self,
+        binding: RunStartPermitBinding,
+        config: Mapping[str, Any],
+        canonical_version: str,
+        *,
+        openrouter_catalog_sha256: str,
+        openrouter_catalog_source: str,
+        initiated_by_user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+    ) -> Run:
+        """Record issued-permit cancellation without loading any pipeline plugin.
+
+        A retry observes immutable terminal truth. An incumbent live leader
+        defers through the ordinary leadership CAS; no token is refreshed.
+        """
+        if pre_effect_guard is not None:
+            pre_effect_guard()
+        worker_id = mint_worker_id(binding.run_id)
+        # Cancellation does not execute under this image's runtime registry or
+        # source schema. Preserve those original facts on an existing header.
+        with self._db.engine.connect() as conn:
+            header = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
+            run = (
+                None
+                if header is None
+                else self._observe_permitted_run_on(
+                    conn,
+                    binding,
+                    config_hash=stable_hash(config),
+                    canonical_version=canonical_version,
+                    openrouter_catalog_sha256=openrouter_catalog_sha256,
+                    openrouter_catalog_source=openrouter_catalog_source,
+                    initiated_by_user_id=initiated_by_user_id,
+                    auth_provider_type=auth_provider_type,
+                    source_schema_json=header.source_schema_json,
+                    runtime_val_manifest_json=header.runtime_val_manifest_json,
+                    web_plugin_policy_evidence=web_plugin_policy_evidence,
+                )
+            )
+        if run is None:
+            run = self.begin_run(
+                config,
+                canonical_version,
+                run_id=binding.run_id,
+                openrouter_catalog_sha256=openrouter_catalog_sha256,
+                openrouter_catalog_source=openrouter_catalog_source,
+                initiated_by_user_id=initiated_by_user_id,
+                auth_provider_type=auth_provider_type,
+                web_plugin_policy_evidence=web_plugin_policy_evidence,
+                leader_worker_id=worker_id,
+                run_start_permit=binding,
+            )
+        if run.status in _TERMINAL_RUN_STATUSES:
+            return run
+        admission = RunStartAdmissionRepository(self._db).observe(binding)
+        if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+            raise AuditIntegrityError("Cancellation materialization requires a prepared admission")
+        leader = self._coordination_repo.live_leader(run_id=binding.run_id)
+        if leader is not None and leader.leader_worker_id == worker_id:
+            # This invocation just minted this identity. No prior owner's
+            # token can reach this arm, including an exact duplicate retry.
+            token = CoordinationToken(binding.run_id, worker_id, leader.leader_epoch)
+        else:
+            token = self._coordination_repo.acquire_run_leadership(
+                run_id=binding.run_id,
+                worker_id=worker_id,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                entry_point="cancel-prepared",
+            )
+        try:
+            if pre_effect_guard is not None:
+                pre_effect_guard()
+            # The pre-acquisition observation was advisory. A predecessor may
+            # have crossed the first-effect boundary before losing its seat.
+            admission = RunStartAdmissionRepository(self._db).observe(binding)
+            if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+                raise AuditIntegrityError("Prepared cancellation lost its pre-effect baseline")
+            self.complete_run(RunStatus.INTERRUPTED, coordination_token=token)
+        finally:
+            self._coordination_repo.release_seat(token=token)
+        result = self.get_run(binding.run_id)
+        if result is None:
+            raise AuditIntegrityError("Cancelled admission lost its run record")
+        return result
 
     def _insert_web_plugin_policy_evidence(
         self,

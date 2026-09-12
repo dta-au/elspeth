@@ -55,8 +55,8 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 - **`docs/`** → see its own [index](README.md); plans/specs that are implemented are removed from active docs and may be preserved by maintainers in the ignored local archive.
 - **`deploy/`** → `compose/` (PostgreSQL and web Compose overlays),
   `aws-ecs/terraform/` (disposable single-replica AWS cold-install source),
-  `azure-container-apps/` (Container Apps Bicep source; the platform is not a
-  supported target in this release), and `linux-systemd/` (portable
+  `azure-container-apps/` (Container Apps Bicep source; desktop acceptance for
+  Single/sticky; runtime evidence is local PostgreSQL), and `linux-systemd/` (portable
   native-Linux service and environment example). Kubernetes remains BYO and has
   no shipped directory in this release.
 
@@ -109,8 +109,9 @@ tool; a helper that lints, tests, deploys, or generates fixtures is a script.
 
 ✓ Distinct by *target*: `deploy/compose/` = maintained database/web overlays;
 `deploy/aws-ecs/terraform/` = maintained disposable AWS ECS infrastructure;
-`deploy/azure-container-apps/` = Container Apps Bicep source (the platform is not
-a supported target in this release); `deploy/linux-systemd/` = portable host
+`deploy/azure-container-apps/` = Container Apps Bicep source (desktop acceptance
+for Single/sticky; no live cloud acceptance claimed);
+`deploy/linux-systemd/` = portable host
 service and environment example; root `Dockerfile`/`docker-compose.yaml` =
 container image and CLI-oriented base;
 `scripts/deploy-vm.sh` + `validate_deployment.py` = automation that drives a

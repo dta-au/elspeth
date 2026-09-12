@@ -220,7 +220,8 @@ def test_current_session_schema_epoch_is_52() -> None:
     # 53: per-admission read records (session_read_admissions,
     # elspeth-f98e0ae8b2) so a released or expired BLOB_READ context is
     # refused on its next proof.
-    assert SESSION_SCHEMA_EPOCH == 53
+    # 54: durable Composer progress and inflight request records.
+    assert SESSION_SCHEMA_EPOCH == 54
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

@@ -14,7 +14,8 @@ the demo + hello-world tutorial) was intermittently unbuildable.
 The fix is a Tier-3 boundary ``BeforeValidator`` that parses a JSON-string
 encoding an object back into the object it encodes. The string is an
 equivalent wire encoding of the object — parsing it is meaning-preserving
-coercion, not fabrication (CLAUDE.md "Data Manifesto", ``"42" -> 42`` class),
+coercion, not fabrication (docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model, the ``"42" -> 42`` class),
 and is exempt from the defensive-programming ban as a documented trust-boundary
 deserialisation.
 

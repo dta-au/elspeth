@@ -9,13 +9,29 @@ the resource group. This runbook is the Azure equivalent of
 **evidence**, not in code: where the Azure control plane already produces a
 fact, the receipt records a sanitized projection of it.
 
-> **Status.** This runbook is a skeleton prepared by Phase 6b before the first
-> live run. Every step marked **LIVE** is filled in by the operator-run
-> acceptance (6b-7) and its receipt. Until the sanitized receipt exists at
-> `docs/operator/evidence/azure-container-apps/0.8.0.json`, this runbook is
-> not a support claim. The public support statement in
-> [Deployment Platforms](../reference/deployment-platforms.md) flips in the
-> same commit as that receipt.
+> **Status.** The implemented ACA slice received desktop acceptance:
+> `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
+> acceptance is claimed. This executable procedure can produce a future receipt
+> at `docs/operator/evidence/azure-container-apps/0.8.1.json`. Steps marked
+> **LIVE** require measurements from that operator run. Neither a live run nor
+> a receipt is an outstanding closure condition. See
+> [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
+
+The supported configuration retains `Single` revision mode, `sticky` session
+affinity and 2–4 replicas with one web process per replica. External PostgreSQL
+provides single-use tickets and durable run-event replay on authorized peer
+reconnect, renewable Composer request leases with saved progress and current
+inflight accounting, and shared budgets for auth, writes and Composer/execution
+work. An interrupted provider request is not automatically resumed. Automatic
+run handoff covers durable admission, permit-bound PREPARED initialization and
+eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
+effects, incomplete sources and identity/compatibility failures remain
+`recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
+Integrated verification is recorded in the
+[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+Evidence remains limited to
+local PostgreSQL mechanism and integration evidence, with no cloud receipt or
+no-affinity deployment qualification.
 
 > **Scope.** The tracked Bicep bundle is
 > [`deploy/azure-container-apps/`](../../deploy/azure-container-apps/README.md)
@@ -38,10 +54,9 @@ Use this runbook when you need to:
 - provision, exercise at replicas > 1, and destroy the disposable Azure
   Container Apps acceptance environment for one release candidate;
 - prove schema, persistence, identity-based blob access, replica fencing,
-  run-start coordination, lease takeover and cross-replica progress before
-  admitting traffic; or
-- produce the sanitized receipt that flips the Azure Container Apps support
-  claim.
+  run-start coordination, lease takeover and shared state visibility, while
+  recording the legacy P4b receipt's conservative limitation; or
+- produce a sanitized receipt of an actual cloud acceptance run.
 
 Do not use it to publish a durable image, to operate a long-lived
 environment, to automate a destructive database reset, or to infer that Log
@@ -74,7 +89,7 @@ Analytics evidence replaces the Landscape audit record.
   Vault; Entra token authentication is excluded on the record (plan D4).
 - Every response carries `X-Elspeth-Instance` and `/api/system/status`
   reports `instance_id`, `CONTAINER_APP_REVISION` and
-  `CONTAINER_APP_REPLICA_NAME` (facts §2.1) once 6b-3 lands; the probe driver
+  `CONTAINER_APP_REPLICA_NAME` (facts §2.1); the probe driver
   refuses to score a trial until it has seen two distinct values.
 - No credential enters a receipt. Receipts record secret **names and
   versions**, never values.
@@ -91,7 +106,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The epoch-53 image (session epoch 53, Landscape epoch 38) in the registry.
+- The epoch-54 image (session epoch 54, Landscape epoch 39) in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -400,8 +415,8 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both schemas at session epoch 53
-  and Landscape epoch 38.
+  with the schema-owner URLs and initializes both schemas at session epoch 54
+  and Landscape epoch 39.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
   `session_tls`, `landscape_tls`, `payload_store_writable` and
@@ -412,9 +427,11 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   cases inside the environment, the one auth mode whose truth depends on
   where the process runs.
 
-> **LIVE:** the no-schema dry run against the current `release/0.8.0` image
-> (expected: both schema checks red, everything else green) proves the wiring
-> before the epoch-53 image exists; record its execution names.
+> **LIVE:** for 0.8.1 acceptance, run the Jobs with the candidate digest and
+> require both schema checks to pass after initialization at session epoch 54
+> and Landscape epoch 39. Record the execution names. Any no-schema dry run
+> against a `release/0.8.0` image is predecessor-only wiring evidence; it
+> cannot establish the candidate's schema compatibility or acceptance.
 
 ## 4. Deploy the production shape and prove the rollout
 
@@ -478,14 +495,14 @@ parity test feeds one corpus through both).
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_revision_sha256": "64-lowercase-hex",
   "candidate_doctor_job_sha256": "64-lowercase-hex",
-  "candidate_package_version": "0.8.0",
+  "candidate_package_version": "0.8.1",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_revision_sha256": "",
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 53, "landscape_epoch": 38, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 54, "landscape_epoch": 39, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
@@ -582,9 +599,19 @@ tree proves, and overclaiming is a schema violation rather than a convention.
 | probe | action | passing evidence | `mechanism` |
 |---|---|---|---|
 | **P1** concurrent guided ops from two replicas | 20 trials; the same `POST /api/sessions/{id}/guided/respond` fired at `LABEL_A_URL` and `LABEL_B_URL` within 5 ms | per trial exactly one 2xx and one 409 `"Session operation is already active"`; the fence's `operation_epoch` advances by exactly one; exactly one `guided_operations` row; two distinct `owner_instance_id` values across the run | `session_operation_fence` |
-| **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. The receipt asserts that no `run_start_permits` row exists: the table has no writer, and the driver has no code path that could claim one | `session_operation_fence_execute` |
-| **P4** cross-replica progress | session and run created via `LABEL_A_URL`; status, outputs, messages and a blob written by `rA` read via `LABEL_B_URL` | **P4a (must pass):** all DB-backed state visible from `rB` within one poll interval; blob bytes identical through NFS; terminal status observed on `rB`. **P4b (recorded, cannot pass):** the live progress stream and the WebSocket ticket are owner-affine; the driver records the production sticky-session setting as the mitigation | `postgresql_and_nfs` (P4a); `owner_affine` (P4b) |
+| **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. This legacy receipt does not measure durable permit admission or handoff; its field set records run-start contention only | `session_operation_fence_execute` |
+| **P4** cross-replica progress | session and run created via `LABEL_A_URL`; status, outputs, messages and a blob written by `rA` read via `LABEL_B_URL` | **P4a (must pass):** all DB-backed state visible from `rB` within one poll interval; blob bytes identical through NFS; terminal status observed on `rB`. **P4b (recorded, cannot pass):** the legacy v2 receipt conservatively retains its owner-affine result and records production sticky sessions; it does not measure the new durable ticket/event replay mechanisms | `postgresql_and_nfs` (P4a); `owner_affine` (P4b) |
 | **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); observe the survivor before and after the session-operation and membership lease deadlines; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `role_revocation_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
+
+P3 retains the legacy receipt's cancellation-shaped oracle; it does not measure
+the new automatic dispatch or checkpoint-resume transitions. A run that takes
+one of those transitions must not be relabelled as satisfying that oracle.
+
+The legacy v2 P4b result remains `cannot_pass` and does not measure the new
+runtime capabilities. Receipt evolution is explicitly deferred; keep its
+existing mechanism and validators. Local PostgreSQL progress, Composer and
+shared-budget tests do not promote this receipt or qualify routing without
+affinity.
 
 ### Final Single-revision pass
 
@@ -837,7 +864,7 @@ approvals are not reproduced for this disposable group (plan D1).
 
 ---
 
-## Receipt and docs flip
+## Receipt from an operator-run acceptance
 
 The facade validates the bundle of receipts (`verify-doctor-job`,
 `verify-storage-job`, `verify-blob-managed-identity`, `verify-log-analytics`,
@@ -847,9 +874,11 @@ The facade validates the bundle of receipts (`verify-doctor-job`,
 `resource-graph-cleanup`, `testcontainer-run` — the last
 through the shared gate, which refuses the bundle without exactly one passing
 run) and writes the sanitized
-receipt to `docs/operator/evidence/azure-container-apps/0.8.0.json`. That
-receipt, the support-claim flip in
-[Deployment Platforms](../reference/deployment-platforms.md) and the CHANGELOG
-rewording land in **one commit** with a three-seat sign-off. The first run is
-expected to fail forward on the platform-facing pieces; the bar is a second
-clean run end to end.
+receipt to `docs/operator/evidence/azure-container-apps/0.8.1.json` only after
+the live procedure completes and its evidence passes validation. Never create
+a receipt from desktop analysis or treat skipped or failed probes as passes.
+If a run fails, retain its diagnostics, fix the defect and rerun before claiming
+live acceptance. A first run, second clean run and receipt-conditioned docs
+promotion are not prerequisites to closing `elspeth-5ec3befc1a`; that task
+already closed through desktop acceptance. Any later documentation claim about
+live results must cite the actual validated receipt and its measured scope.

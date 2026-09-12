@@ -59,6 +59,7 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionDerivedCustodyError, SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution import service as execution_service_module
+from elspeth.web.execution.envelope import restore_execution_envelope
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.execution.routes import create_execution_router
@@ -646,7 +647,7 @@ async def test_submitted_worker_retains_exact_lease_until_every_terminal_outcome
     assert len(executor.submit_calls) == 1
     submitted = executor.submit_calls[0]
     assert submitted[0] == service._run_pipeline
-    assert submitted[2] == {"session_operation_lease": lease}
+    assert submitted[2] == {"session_operation_lease": lease, "durable_admission": True}
     assert all(argument is not lease.context for argument in submitted[1])
     submitted_authorities = (*submitted[1], *submitted[2].values())
     assert sum(argument is lease for argument in submitted_authorities) == 1
@@ -707,7 +708,6 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
     lease, authority = await _real_lease(
         _context(session_id),
         renew_interval_seconds=0.01,
-        renew_error=loss,
     )
     validation = ValidationResult(
         is_valid=True,
@@ -730,6 +730,8 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
     assert isinstance(worker_shutdown_event, threading.Event)
     assert not worker_shutdown_event.is_set()
     effect_counts_after_submit = _durable_effect_call_counts(session_service)
+    authority.renew_called.clear()
+    authority.renew_error = loss
 
     await asyncio.wait_for(asyncio.to_thread(authority.renew_called.wait, 2), timeout=2)
     assert authority.renew_called.is_set()
@@ -1300,6 +1302,32 @@ def _is_exact_worker_delegation_edge(call: ast.Call, callback: ast.AST) -> bool:
     )
 
 
+def _is_exact_envelope_blob_verifier_edge(call: ast.Call, keyword: ast.keyword) -> bool:
+    """The trusted worker forwards this verifier to the trusted envelope restorer."""
+    expected_keywords = {
+        "current_snapshot",
+        "user_id",
+        "auth_provider_type",
+        "resolver",
+        "implementation_fingerprint",
+        "deployment_generation",
+        "blob_verifier",
+    }
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "run_sync_in_worker"
+        and len(call.args) == 2
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == "restore_execution_envelope"
+        and not isinstance(call.args[1], ast.Starred)
+        and len(call.keywords) == len(expected_keywords)
+        and {candidate.arg for candidate in call.keywords} == expected_keywords
+        and keyword.arg == "blob_verifier"
+        and any(candidate is keyword for candidate in call.keywords)
+        and isinstance(keyword.value, ast.Name)
+    )
+
+
 def _is_exact_blob_metadata_callback_edge(call: ast.Call, keyword: ast.keyword) -> bool:
     """``validate_pipeline(..., blob_get_metadata=<local def>)``: the validator's per-ref metadata lookup."""
     return (
@@ -1502,6 +1530,7 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
             function, live_nodes, name="compute_proof_diagnostics", module=_PROOF_DIAGNOSTICS_MODULE
         )
         exact_worker_bound = _binding_nodes(function, live_nodes, name="run_sync_in_worker") == ()
+        exact_envelope_bound = _binding_nodes(function, live_nodes, name="restore_execution_envelope") == ()
         for call in (candidate for candidate in live_nodes if isinstance(candidate, ast.Call)):
             if (
                 isinstance(call.func, ast.Attribute)
@@ -1530,6 +1559,11 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
                 keyword.value
                 for keyword in call.keywords
                 if exact_validator_bound and isinstance(keyword.value, ast.Name) and _is_exact_blob_metadata_callback_edge(call, keyword)
+            )
+            delegated_edges.extend(
+                keyword.value
+                for keyword in call.keywords
+                if exact_worker_bound and exact_envelope_bound and _is_exact_envelope_blob_verifier_edge(call, keyword)
             )
             admitted.update(id(edge) for edge in delegated_edges)
             callable_edges.extend(delegated_edges)
@@ -1743,6 +1777,9 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
     ]
     assert execution_service_module.EventBus is EventBus, "execution callback bus constructor provenance changed"
     assert execution_service_module.run_sync_in_worker is run_sync_in_worker, "execution worker delegation provenance changed"
+    assert execution_service_module.restore_execution_envelope is restore_execution_envelope, (
+        "execution envelope consumer provenance changed"
+    )
     assert [function.name for function in exact_event_bus_functions] == ["_run_pipeline"]
     assert findings.escaped_local_helpers == (), (
         f"local execution helper callable escapes direct analysis: {findings.escaped_local_helpers}"
@@ -2696,3 +2733,74 @@ def test_controllable_executor_and_lease_doubles_model_real_resource_seams() -> 
     assert executor.submit_calls == [(executor.submit_calls[0][0], (lease.context,), {})]
     assert not future.done()
     assert not lease.close_started.is_set()
+
+
+_ENVELOPE_BLOB_VERIFIER_EDGE = """
+    def _entry(self, state, *, session_id, session_operation_context):
+        {rebinding}
+
+        def verify_blob(blob_id):
+            return self._call_async({receiver}.get_blob(blob_id, session_operation_context={context}))
+
+        return {worker}({consumer}, state{extra_argument}, current_snapshot=state, user_id=None,
+            auth_provider_type=None, resolver=None, implementation_fingerprint="implementation",
+            deployment_generation="generation", {keyword}=verify_blob{extra_keyword})
+"""
+
+
+def _envelope_blob_verifier_case(
+    *,
+    worker: str = "run_sync_in_worker",
+    consumer: str = "restore_execution_envelope",
+    keyword: str = "blob_verifier",
+    rebinding: str = "",
+    extra_argument: str = "",
+    extra_keyword: str = "",
+    receiver: str = "self._blob_service",
+    context: str = "session_operation_context",
+    admitted: bool,
+    context_offenders: tuple[str, ...] = (),
+    unresolved_receiver_count: int = 0,
+) -> _EdgeControlCase:
+    return _EdgeControlCase(
+        body=_ENVELOPE_BLOB_VERIFIER_EDGE.format(
+            worker=worker,
+            consumer=consumer,
+            keyword=keyword,
+            rebinding=rebinding,
+            extra_argument=extra_argument,
+            extra_keyword=extra_keyword,
+            receiver=receiver,
+            context=context,
+        ),
+        closure="verify_blob",
+        admitted=admitted,
+        context_offenders=context_offenders,
+        unresolved_receiver_count=unresolved_receiver_count,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "case"),
+    [
+        ("exact-shape-admitted", _envelope_blob_verifier_case(admitted=True)),
+        ("other-worker-escapes", _envelope_blob_verifier_case(worker="other_worker", admitted=False)),
+        ("other-consumer-escapes", _envelope_blob_verifier_case(consumer="other_restore", admitted=False)),
+        ("other-keyword-escapes", _envelope_blob_verifier_case(keyword="verify_blob", admitted=False)),
+        ("extra-positional-escapes", _envelope_blob_verifier_case(extra_argument=", state", admitted=False)),
+        ("expanded-keywords-escape", _envelope_blob_verifier_case(extra_keyword=", **state", admitted=False)),
+        ("rebound-worker-escapes", _envelope_blob_verifier_case(rebinding="run_sync_in_worker = self._runner", admitted=False)),
+        ("rebound-consumer-escapes", _envelope_blob_verifier_case(rebinding="restore_execution_envelope = self._restore", admitted=False)),
+        (
+            "other-module-consumer-escapes",
+            _envelope_blob_verifier_case(
+                rebinding="from elspeth.web.execution.staging import restore_execution_envelope",
+                admitted=False,
+            ),
+        ),
+        ("wrong-context-flagged", _envelope_blob_verifier_case(admitted=True, context="other_context", context_offenders=("get_blob",))),
+        ("wrong-receiver-flagged", _envelope_blob_verifier_case(admitted=True, receiver="self._staging", unresolved_receiver_count=1)),
+    ],
+)
+def test_envelope_blob_verifier_callback_requires_exact_worker_and_restore_consumer(case_id: str, case: _EdgeControlCase) -> None:
+    _assert_edge_control(case)
