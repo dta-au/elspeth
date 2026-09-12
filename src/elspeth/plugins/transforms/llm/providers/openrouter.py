@@ -3,7 +3,8 @@
 Handles raw HTTP transport with full Tier 3 boundary validation:
 - JSON parsing with NaN/Infinity rejection
 - Content extraction from choices[0].message.content
-- Null content → ContentPolicyError
+- Missing content with explicit refusal or filtering → ContentPolicyError
+- Malformed, unexplained missing, or budget-exhausted output → LLMClientError
 - Non-finite usage values → LLMClientError
 - HTTP status code → typed exception mapping
 
@@ -162,17 +163,20 @@ def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[s
     content = message["content"]
     raw_finish_reason = first_choice.get("finish_reason")
 
-    if content is None:
-        raise ContentPolicyError("LLM returned null content (likely content-filtered by provider)")
-
-    if not isinstance(content, str):
+    if content is not None and not isinstance(content, str):
         raise LLMClientError(f"Expected string content, got {type(content).__name__}", retryable=False)
 
-    if not content.strip():
+    if content is None or not content.strip():
+        refusal = message.get("refusal")
+        missing_content = "null content" if content is None else "empty content"
+        if raw_finish_reason == "content_filter" or (isinstance(refusal, str) and refusal.strip()):
+            raise ContentPolicyError(f"LLM returned {missing_content}: provider refused or filtered the response")
+        if raw_finish_reason == "length":
+            raise LLMClientError("LLM exhausted the output token budget before returning content", retryable=False)
         if raw_finish_reason == "tool_calls":
             raise LLMClientError("LLM returned tool_calls response (not supported by ELSPETH)", retryable=False)
-        # finish_reason is provider-controlled data — never interpolated.
-        raise ContentPolicyError("LLM returned empty content")
+        # Missing content alone does not establish a content-policy refusal.
+        raise LLMClientError(f"LLM returned {missing_content} without an explicit refusal", retryable=False)
 
     raw_usage = data.get("usage")
     if isinstance(raw_usage, dict):
@@ -354,8 +358,10 @@ class OpenRouterLLMProvider:
             RateLimitError: HTTP 429 (retryable)
             ServerError: HTTP 5xx (retryable)
             NetworkError: Connection/timeout failures (retryable)
-            ContentPolicyError: Null content from provider (not retryable)
-            LLMClientError: Other failures (not retryable)
+            ContentPolicyError: Missing content with explicit provider refusal
+                or filtering (not retryable)
+            LLMClientError: Malformed, unexplained missing, budget-exhausted
+                output, or other failures (not retryable)
         """
         cache_key = audit_parent.cache_key
         llm_request_payload = self._build_llm_request_payload(
@@ -564,11 +570,11 @@ class OpenRouterLLMProvider:
                 "model": model,
                 "messages": wire_messages([ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]),
                 "temperature": 0.0,
-                # Underlying providers behind OpenRouter enforce different minimums
-                # on max_output_tokens. Azure-backed routes require >= 16; values
-                # below that 400 with "integer_below_min_value". 32 gives margin
-                # without materially affecting smoke-test cost.
-                "max_tokens": 32,
+                # The output allowance also pays for reasoning tokens. A 32-token
+                # probe exhausted that allowance before producing even "ok".
+                # Keep the smoke test bounded, with room for reasoning and text;
+                # this also clears the Azure-backed route minimum of 16.
+                "max_tokens": 256,
             }
             response = http_client.post(
                 "/chat/completions",

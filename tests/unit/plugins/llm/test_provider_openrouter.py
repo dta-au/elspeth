@@ -453,7 +453,7 @@ class TestExecuteQuery:
             request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
         )
         http_client = FakeHTTPClient(response=resp)
-        with _provider_http_client(provider, http_client), pytest.raises(ContentPolicyError, match="null content"):
+        with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="null content"):
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
@@ -589,8 +589,8 @@ class TestExecuteQuery:
         assert audit_recorder.calls[-1]["token_usage"].reasoning_tokens == 4
         assert audit_recorder.calls[-1]["token_usage"].prompt_tokens is None
 
-    def test_whitespace_only_content_raises_content_policy_error(self, provider: OpenRouterLLMProvider) -> None:
-        """Whitespace-only content must raise ContentPolicyError."""
+    def test_whitespace_only_content_without_refusal_raises_client_error(self, provider: OpenRouterLLMProvider) -> None:
+        """Whitespace alone does not establish a provider policy refusal."""
         body = json.dumps(
             {
                 "choices": [{"message": {"content": "   "}, "finish_reason": "stop"}],
@@ -605,7 +605,7 @@ class TestExecuteQuery:
             request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
         )
         http_client = FakeHTTPClient(response=resp)
-        with _provider_http_client(provider, http_client), pytest.raises(ContentPolicyError, match="empty content"):
+        with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="empty content"):
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
@@ -1022,6 +1022,73 @@ class TestRuntimePreflight:
        remote body into persisted diagnostics. The full body remains in the
        audited HTTP payload, not web-visible exception text.
     """
+
+    @pytest.mark.parametrize("content", [None, "", "   "])
+    @pytest.mark.parametrize(
+        ("finish_reason", "refusal", "expected_type", "diagnostic"),
+        [
+            ("length", None, LLMClientError, "output token budget"),
+            ("stop", None, LLMClientError, "without an explicit refusal"),
+            ("content_filter", None, ContentPolicyError, "provider refused or filtered"),
+            ("stop", "private refusal detail", ContentPolicyError, "provider refused or filtered"),
+        ],
+    )
+    def test_preflight_missing_content_classification(
+        self,
+        provider: OpenRouterLLMProvider,
+        content: str | None,
+        finish_reason: str,
+        refusal: str | None,
+        expected_type: type[LLMClientError],
+        diagnostic: str,
+    ) -> None:
+        # Captured live failure shape: all 32 completion tokens were reasoning,
+        # finish_reason=length, content=null, refusal=null. No text was emitted.
+        response = httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": content, "refusal": refusal}, "finish_reason": finish_reason}],
+                "model": "test-reasoning-model",
+                "usage": {
+                    "prompt_tokens": 43,
+                    "completion_tokens": 32,
+                    "total_tokens": 75,
+                    "completion_tokens_details": {"reasoning_tokens": 32},
+                },
+            },
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        )
+        http_client = FakeHTTPClient(response=response)
+        with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
+            client_cls.return_value = http_client
+            with pytest.raises(expected_type, match=diagnostic) as exc_info:
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="test-reasoning-model")
+        assert type(exc_info.value) is expected_type
+        assert exc_info.value.retryable is False
+        assert "private refusal detail" not in str(exc_info.value)
+
+    def test_preflight_reserves_bounded_reasoning_allowance(self, provider: OpenRouterLLMProvider) -> None:
+        # Captured successful control used 25 reasoning tokens plus two text
+        # tokens. Success must still require visible provider-authored content.
+        response = httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok", "refusal": None}, "finish_reason": "stop"}],
+                "model": "test-reasoning-model",
+                "usage": {
+                    "prompt_tokens": 43,
+                    "completion_tokens": 27,
+                    "total_tokens": 70,
+                    "completion_tokens_details": {"reasoning_tokens": 25},
+                },
+            },
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        )
+        http_client = FakeHTTPClient(response=response)
+        with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
+            client_cls.return_value = http_client
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="test-reasoning-model")
+        assert http_client.last_post.kwargs["json"]["max_tokens"] == 256
 
     def test_preflight_request_max_tokens_meets_azure_floor(self, provider: OpenRouterLLMProvider) -> None:
         """Preflight request body must include max_tokens >= 16 (Azure backend floor)."""
