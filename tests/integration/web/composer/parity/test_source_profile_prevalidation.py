@@ -230,8 +230,18 @@ def test_set_source_rejects_conflicting_duplicate_validation_failure_route(
 
     assert result.success is False
     assert result.updated_state is profiled_source_harness.empty_state
-    assert "on_validation_failure" in str(result.data)
-    assert "conflicts" in str(result.data)
+    assert result.affected_nodes == ()
+    assert result.data is None
+    assert result.validation.is_valid is False
+    rejection = result.validation.errors[0]
+    assert rejection.component == "rejected_mutation"
+    assert rejection.error_code == "plugin_options_invalid"
+    assert rejection.severity == "high"
+    assert rejection.plugin_identity == ("source", "llm")
+    assert rejection.message == (
+        "Invalid options for source 'llm': options.on_validation_failure conflicts with the source routing field on_validation_failure"
+    )
+    assert result.validation.errors[1:] == profiled_source_harness.empty_state.validate().errors
 
 
 def test_patch_source_options_revalidates_profile_without_persisting_private_binding(
@@ -300,7 +310,16 @@ def test_set_source_rejects_unknown_profile_alias_atomically(
 
     assert result.success is False
     assert result.updated_state is profiled_source_harness.empty_state
-    assert "profile_unavailable" in str(result.data)
+    assert result.affected_nodes == ()
+    assert result.data is None
+    assert result.validation.is_valid is False
+    rejection = result.validation.errors[0]
+    assert rejection.component == "rejected_mutation"
+    assert rejection.error_code == "plugin_options_invalid"
+    assert rejection.severity == "high"
+    assert rejection.plugin_identity == ("source", "llm")
+    assert "profile_unavailable" in rejection.message
+    assert result.validation.errors[1:] == profiled_source_harness.empty_state.validate().errors
 
 
 @pytest.mark.parametrize(
