@@ -2080,8 +2080,13 @@ class TestOpenRouterRuntimePreflightValidation:
             ({"model": _OPENROUTER_MODEL, "choices": [{"message": {}}]}, LLMClientError, "Malformed response structure"),
             (
                 {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": None}}]},
-                ContentPolicyError,
+                LLMClientError,
                 "null content",
+            ),
+            (
+                {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": None}, "finish_reason": "content_filter"}]},
+                ContentPolicyError,
+                "provider refused or filtered",
             ),
             (
                 {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": 123}}]},
@@ -2090,7 +2095,7 @@ class TestOpenRouterRuntimePreflightValidation:
             ),
             (
                 {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": "   "}, "finish_reason": "stop"}]},
-                ContentPolicyError,
+                LLMClientError,
                 "empty content",
             ),
             (
