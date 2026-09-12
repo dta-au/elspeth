@@ -52,6 +52,7 @@ Invariant: Token outcomes only recorded after sink durability (crash recovery sa
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1151,28 +1152,6 @@ class TestTransformExecutor:
             ctx,
         )
 
-        assert error_sink == "discard"
-
-    def test_on_error_is_always_set_invariant(self) -> None:
-        """on_error is now required at config time — transforms always have it set.
-
-        Previously on_error=None would raise RuntimeError at execution time.
-        Now TransformSettings requires on_error, so the None case cannot occur
-        in production. This test documents the invariant.
-        """
-        # Every transform constructed via TransformSettings will have on_error set.
-        # Verify a transform with on_error="discard" works (the minimum valid value).
-        factory = _make_factory()
-        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
-        transform = _make_transform(on_error="discard")
-        transform.process.return_value = TransformResult.error(
-            reason={"reason": "test_error"},
-        )
-        token = _make_token()
-        ctx = make_context()
-        ctx.landscape = factory.execution
-
-        _, _, error_sink = executor.execute_transform(transform, token, ctx)
         assert error_sink == "discard"
 
     def test_error_path_records_failed_state(self) -> None:
@@ -3469,18 +3448,17 @@ class TestAggregationExecutor:
         with pytest.raises(OrchestrationInvariantError, match="No batch exists"):
             executor.execute_flush(nid, transform, ctx, TriggerType.COUNT)
 
-    def test_execute_flush_empty_buffer_raises_runtime_error(self) -> None:
-        """Flushing with empty buffer raises RuntimeError.
+    def test_execute_flush_empty_buffer_raises_before_execution(self) -> None:
+        """An opened batch cannot execute before any adopted row reaches its buffer."""
+        executor, factory, nid = self._make_agg_executor()
+        executor.open_batch_membership(nid, coordination_token=_AGGREGATION_LEADER)
+        transform = _make_aggregation_transform()
 
-        To reproduce this: buffer a row, flush successfully (which clears buffer),
-        then try to flush again - the batch_id is None so it hits 'No batch exists'.
-        Actually, getting empty buffer with a batch requires manual state manipulation.
-        We'll skip this edge case since the production code guards against it
-        (buffer_row creates batch, and batch is reset on flush).
-        """
-        # This state is hard to reach without direct manipulation.
-        # The guard exists for internal consistency checking.
-        pass
+        with pytest.raises(OrchestrationInvariantError, match="Cannot flush empty buffer for node agg_1"):
+            executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT)
+
+        factory.execution.update_batch_status.assert_not_called()
+        transform.process.assert_not_called()
 
     def test_execute_flush_success_completes_batch_and_state(self) -> None:
         """Successful flush commits node, batch, and result receipt in ONE atomic call.
@@ -6231,6 +6209,8 @@ class TestTransformExecutorBatchPath:
 
     def test_register_called_before_accept(self) -> None:
         """register() is called before accept() for correct waiter ordering."""
+        from elspeth.contracts.plugin_context import PluginContext
+
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
         contract = _make_contract()
@@ -6244,18 +6224,31 @@ class TestTransformExecutorBatchPath:
         mock_adapter = _BatchAdapterDouble(mock_waiter)
         _install_batch_adapter(executor, mock_adapter)
 
+        invocation_order: list[str] = []
+
+        def register(token_id: str, state_id: str) -> _BatchWaiterDouble:
+            invocation_order.append("register")
+            return mock_waiter
+
+        def accept(row: PipelineRow, context: PluginContext) -> None:
+            invocation_order.append("accept")
+
+        def wait(*, timeout: float, shutdown_event: threading.Event | None) -> TransformResult:
+            invocation_order.append("wait")
+            return success_result
+
+        mock_adapter.register.side_effect = register
+        transform.accept.side_effect = accept
+        mock_waiter.wait.side_effect = wait
+
         token = _make_token(contract=contract)
         ctx = make_context()
 
         executor.execute_transform(transform, token, ctx)
 
-        # Verify ordering: register called with (token_id, state_id)
+        assert invocation_order == ["register", "accept", "wait"]
         mock_adapter.register.assert_called_once_with(token.token_id, "state_001")
         transform.accept.assert_called_once()
-
-        # Verify register was called before accept (via call_args_list order is not
-        # available across objects, so we verify both were called — the production code
-        # structurally guarantees register-before-accept by line order)
         mock_waiter.wait.assert_called_once_with(timeout=transform.batch_wait_timeout, shutdown_event=None)
 
     # --- Timeout and eviction ---

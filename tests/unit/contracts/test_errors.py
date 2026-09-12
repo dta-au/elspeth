@@ -276,6 +276,42 @@ class TestWriteLockHeldError:
         assert "build-host.internal" not in message
 
 
+class TestRunWorkerEvictedError:
+    """Tests for the optional observed-loss detail (ADR-030 slice 4)."""
+
+    def test_no_reason_leaves_the_base_message_verbatim(self) -> None:
+        """A raiser that supplies no observed loss must not imply it saw one.
+
+        All four membership-fenced raise sites (scheduler/leases.py,
+        scheduler/queue.py) construct this error without a reason: two because
+        a boolean EXISTS fence probe leaves them nothing to report, the other
+        two because they read ``run_workers.status`` to branch on and do not
+        carry it forward. That
+        path must render exactly as it did before ``reason`` existed — absence
+        of an observation is reported as absence, not as a default diagnosis.
+        """
+        from elspeth.contracts.errors import RunWorkerEvictedError
+
+        err = RunWorkerEvictedError(worker_id="worker:run-x:abc", run_id="run-x")
+
+        assert err.reason is None
+        assert str(err) == (
+            "Worker 'worker:run-x:abc' is no longer an active member of run 'run-x' "
+            "(evicted or departed). Worker identities are single-use; abandon "
+            "in-flight work and re-admit under a fresh identity if appropriate."
+        )
+        assert "Observed:" not in str(err)
+
+    def test_reason_is_appended_as_an_observation(self) -> None:
+        """A raiser that DID observe the loss names it, after the base message."""
+        from elspeth.contracts.errors import RunWorkerEvictedError
+
+        err = RunWorkerEvictedError(worker_id="w-1", run_id="r-1", reason="seat taken by 'w-2'")
+
+        assert err.reason == "seat taken by 'w-2'"
+        assert str(err).endswith(" Observed: seat taken by 'w-2'.")
+
+
 class TestRoutingReasonSchema:
     """Tests for RoutingReason union type schema introspection."""
 

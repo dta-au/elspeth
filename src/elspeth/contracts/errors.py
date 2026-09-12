@@ -1144,7 +1144,7 @@ class RunMembershipLostError(Exception):
 # SchedulerLeaseLostError discipline.
 # TIER-2: Legitimate multi-worker coordination — registry eviction/departure is a clean abandon signal handled by the drain loop, not audit corruption.
 class RunWorkerEvictedError(Exception):
-    """Raised when a worker discovers its registry row is no longer ``active``.
+    """Raised when a worker observes membership loss or leader-seat deposition.
 
     Latched from the heartbeat CAS miss (slice-4 thread) or raised directly
     when a membership-fenced verb (``claim_ready`` / ``claim_pending_sink`` /
@@ -1155,15 +1155,34 @@ class RunWorkerEvictedError(Exception):
     Attributes:
         worker_id: The evicted/departed worker identity.
         run_id: The run the registration belonged to.
+        reason: Which coordination loss was observed, when the raiser carried
+            that observation forward (the heartbeat latch distinguishes "the
+            membership fence refused the beat" from "the seat was taken by
+            another leader"); ``None`` when it did not, in which case the
+            message is unchanged. All four membership-fenced raise sites pass
+            ``None``, for two different reasons: two probe a boolean
+            ``active_worker_fence_clause`` EXISTS and hold no status to
+            report, while the other two read ``run_workers.status`` to branch
+            on and do not carry the observed value forward. ``None`` therefore
+            asserts only that no observation was supplied — never that none
+            was available.
     """
 
-    def __init__(self, *, worker_id: str, run_id: str) -> None:
+    def __init__(self, *, worker_id: str, run_id: str, reason: str | None = None) -> None:
         self.worker_id = worker_id
         self.run_id = run_id
+        self.reason: str | None = reason
+        # Appended only when the raiser supplied an observed loss, so a caller
+        # that passes none still produces the original message verbatim.
+        detail = f" Observed: {reason}." if reason is not None else ""
+        summary = (
+            f"Worker {worker_id!r} is no longer an active member of run {run_id!r} (evicted or departed)."
+            if reason is None
+            else f"Worker {worker_id!r} lost coordination for run {run_id!r}."
+        )
         super().__init__(
-            f"Worker {worker_id!r} is no longer an active member of run {run_id!r} "
-            "(evicted or departed). Worker identities are single-use; abandon "
-            "in-flight work and re-admit under a fresh identity if appropriate."
+            f"{summary} Worker identities are single-use; abandon "
+            f"in-flight work and re-admit under a fresh identity if appropriate.{detail}"
         )
 
 

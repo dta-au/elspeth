@@ -31,6 +31,7 @@ from elspeth.contracts.errors import (
     EmptyResumeStateError,
     GracefulShutdownError,
     IncompleteSourceResumeError,
+    RunWorkerEvictedError,
 )
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.types import AggregationName
@@ -306,6 +307,22 @@ def _emit_schema_compatibility_error(
         err=True,
     )
     typer.echo(str(error), err=True)
+
+
+def _emit_worker_evicted_event(error: RunWorkerEvictedError, output_format: Literal["console", "json"]) -> None:
+    """Carry observed coordination loss to both CLI consumers."""
+    if output_format == "json":
+        payload = {
+            "event": "evicted",
+            "run_id": error.run_id,
+            "worker_id": error.worker_id,
+            "message": str(error),
+        }
+        if error.reason is not None:
+            payload["reason"] = error.reason
+        typer.echo(json.dumps(payload), err=True)
+    else:
+        typer.echo(str(error), err=True)
 
 
 @app.callback()
@@ -886,8 +903,6 @@ def run(
         raise typer.Exit(4) from e
 
     # Execute pipeline with pre-instantiated plugins
-    from elspeth.contracts.errors import RunWorkerEvictedError
-
     try:
         execution_result = _execute_pipeline_with_instances(
             config,
@@ -920,23 +935,7 @@ def run(
             _emit_interrupted_resume_guidance_from_url(config.landscape.url, passphrase, e.run_id)
         raise typer.Exit(3)  # noqa: B904 -- distinct exit code: 0=success, 1=error, 3=interrupted
     except RunWorkerEvictedError as e:
-        if output_format == "json":
-            import json as json_mod_evicted
-
-            typer.echo(
-                json_mod_evicted.dumps(
-                    {
-                        "event": "evicted",
-                        "run_id": e.run_id,
-                        "worker_id": e.worker_id,
-                        "message": str(e),
-                    }
-                ),
-                err=True,
-            )
-        else:
-            typer.echo(f"\nWorker evicted from run {e.run_id}.", err=True)
-            typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+        _emit_worker_evicted_event(e, output_format)
         raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
     except SchemaCompatibilityError as e:
         _emit_schema_compatibility_error(e, output_format, operation="pipeline execution")
@@ -3176,8 +3175,6 @@ def resume(
         )
 
         # Execute resume with execution graph (NullSource)
-        from elspeth.contracts.errors import RunWorkerEvictedError
-
         try:
             result = _execute_resume_with_instances(
                 config=settings_config,
@@ -3218,23 +3215,7 @@ def resume(
             _emit_not_resumable_event(e, output_format, db=db)
             raise typer.Exit(1) from e
         except RunWorkerEvictedError as e:
-            if output_format == "json":
-                import json as json_mod_evicted
-
-                typer.echo(
-                    json_mod_evicted.dumps(
-                        {
-                            "event": "evicted",
-                            "run_id": e.run_id,
-                            "worker_id": e.worker_id,
-                            "message": str(e),
-                        }
-                    ),
-                    err=True,
-                )
-            else:
-                typer.echo(f"\nWorker evicted from run {e.run_id}.", err=True)
-                typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+            _emit_worker_evicted_event(e, output_format)
             raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
         except contract_errors.TIER_1_ERRORS as e:
             # Tier 1 violations and framework bugs MUST be clearly distinguishable
@@ -3828,7 +3809,7 @@ def join(
     """
     import traceback
 
-    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunWorkerEvictedError
+    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError
     from elspeth.core.landscape import LandscapeDB
 
     # Settings are REQUIRED — the joiner must produce the same config_hash
@@ -4146,23 +4127,7 @@ def join(
             follower_proc.run(ctx)
         except RunWorkerEvictedError as e:
             try:
-                if output_format == "json":
-                    import json as json_mod
-
-                    typer.echo(
-                        json_mod.dumps(
-                            {
-                                "event": "evicted",
-                                "run_id": run_id,
-                                "worker_id": e.worker_id,
-                                "message": str(e),
-                            }
-                        ),
-                        err=True,
-                    )
-                else:
-                    typer.echo(f"\nFollower evicted from run {run_id}.", err=True)
-                    typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+                _emit_worker_evicted_event(e, output_format)
                 raise typer.Exit(3)
             except BaseException as pending_exc:
                 cleanup_pending_exc = pending_exc
