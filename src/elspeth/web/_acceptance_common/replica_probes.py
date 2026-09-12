@@ -1,7 +1,7 @@
 """The replicas > 1 probes: one driver, one decision table, a closed ``mechanism`` vocabulary.
 
-The four probes (plan §7) are what an acceptance run must prove before a
-deployment target may claim "replicas > 1". They are written once here and
+The legacy probes (plan §7) define this acceptance receipt's evidence scope,
+not the complete current multi-replica runtime. They are written once here and
 driven against a :class:`ReplicaController` port (address a replica, partition
 or stop the owner, restore it) and an :class:`EvidenceObserver` port (read the
 database facts a probe scores). Each provider supplies its two ports; the
@@ -16,8 +16,8 @@ constructed with any outcome but ``cannot_pass``:
   a fence conflict, never a double dispatch — ``session_operation_fence``.
 - **P2** concurrent run starts end in one run and one 409 —
   ``session_operation_fence_execute``. The result has no field for a
-  ``run_start_permits`` row because nothing in the tree writes one; the
-  durable permit saga is a recorded follow-up, not a claim.
+  ``run_start_permits`` row: the legacy receipt measures fence contention,
+  not a durable permit saga or cross-database dispatch recovery.
 - **P3** a survivor takes a dead owner's lease over only after it expires —
   ``role_revocation_lease_expiry`` (the primary primitive: the owner's
   database role is revoked with ``ALTER ROLE … NOLOGIN`` and its backends
@@ -25,14 +25,13 @@ constructed with any outcome but ``cannot_pass``:
   ``revision_deactivate_lease_expiry`` (the secondary, a grace-0 platform
   stop). If the owner's membership row reads ``stopped`` or ``draining`` the
   owner *did* reach its lifecycle release path, so the result **downgrades**
-  to ``graceful_stop``: a takeover happened, but not from a dead owner. Until
-  the membership authority ships (6b-2) no row exists and the probe is
-  reported ``unreachable``, stated as such.
+  to ``graceful_stop``: a takeover happened, but not from a dead owner. Missing
+  owner membership is reported ``unreachable`` rather than inferred.
 - **P4a** database-backed state and blob bytes written on one replica are
   visible from the other within one poll interval — ``postgresql_and_nfs``.
-- **P4b** the live progress stream and the WebSocket ticket are owner-affine
-  today; the probe records ``owner_affine`` and the production mitigation and
-  **cannot** pass.
+- **P4b** the legacy contract does not measure durable progress or peer ticket
+  consumption. It retains ``owner_affine`` and the production mitigation and
+  **cannot** pass, independently of newer runtime capabilities.
 
 **Timezones.** Every datetime a decision compares must be timezone-aware; the
 driver converts to UTC before comparing and refuses a naive value with
@@ -218,8 +217,8 @@ class FenceConflictTrial:
 class RunStartTrial:
     """P2: one concurrent pair of run starts and the run rows they produced.
 
-    There is deliberately no ``run_start_permit`` field: nothing in the tree
-    writes ``run_start_permits``, so a receipt has no way to assert one.
+    There is deliberately no ``run_start_permit`` field: the legacy receipt
+    measures run-start contention, not permit durability or dispatch recovery.
     """
 
     responses: tuple[ReplicaResponse, ReplicaResponse]
@@ -471,13 +470,13 @@ def decide_cross_replica_progress(observation: CrossReplicaProgressObservation) 
 
 
 def record_owner_affine_progress(*, mitigation: Literal["single_revision_sticky_sessions"]) -> ProbeResult:
-    """P4b: the live progress stream and WebSocket ticket are owner-affine; recorded, never passed."""
+    """P4b retains its legacy mechanism; durable progress is not measured and cannot pass here."""
 
     return ProbeResult(
         probe="P4b",
         outcome="cannot_pass",
         mechanism="owner_affine",
-        reasons=("progress_stream_and_websocket_ticket_are_process_local",),
+        reasons=("legacy_p4b_contract_does_not_measure_durable_progress",),
         evidence={"mitigation": mitigation},
     )
 

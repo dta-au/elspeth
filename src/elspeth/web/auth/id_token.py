@@ -193,9 +193,13 @@ class JWKSTokenValidator:
         *,
         algorithms: tuple[str, ...],
         jwks_uri: str,
+        token_issuer_aliases: tuple[str, ...] = (),
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._issuer = validate_oidc_issuer(issuer)
+        # Profile-owned exact spellings, never inferred from the token or
+        # normalised. Discovery remains pinned to the canonical HTTPS issuer.
+        self._token_issuers = (self._issuer, *token_issuer_aliases)
         # THE PIN. ``algorithms`` is the profile's declared list
         # (``IdPProfile.id_token_algorithms``) and is the only algorithm
         # list any decode on this validator will ever pass to PyJWT. It is
@@ -471,7 +475,7 @@ class JWKSTokenValidator:
                 self._next_refresh_at = failure_at + self._jwks_failure_retry_seconds
                 slog.debug(
                     "JWKS shape validation failed; throttling refresh",
-                    issuer=self._issuer,
+                    issuer=self._token_issuers,
                     has_stale_cache=stale_jwks is not None,
                     next_refresh_in_seconds=self._jwks_failure_retry_seconds,
                 )
@@ -528,7 +532,7 @@ class JWKSTokenValidator:
                     # Serve stale cache -- JWKS keys are long-lived
                     slog.debug(
                         "JWKS fetch failed, serving stale cache",
-                        issuer=self._issuer,
+                        issuer=self._token_issuers,
                         exc_class=type(exc).__name__,
                         next_refresh_in_seconds=self._jwks_failure_retry_seconds,
                     )
@@ -536,7 +540,7 @@ class JWKSTokenValidator:
                 if stale_jwks is not None:
                     slog.debug(
                         "JWKS fetch failed after cached keys exceeded maximum stale age",
-                        issuer=self._issuer,
+                        issuer=self._token_issuers,
                         exc_class=type(exc).__name__,
                         max_stale_seconds=self._jwks_max_stale_seconds,
                         next_refresh_in_seconds=self._jwks_failure_retry_seconds,
@@ -544,7 +548,7 @@ class JWKSTokenValidator:
                     self._raise_max_stale_age_exceeded()
                 slog.debug(
                     "JWKS cold-start fetch failed; throttling retry",
-                    issuer=self._issuer,
+                    issuer=self._token_issuers,
                     exc_class=type(exc).__name__,
                     next_refresh_in_seconds=self._jwks_failure_retry_seconds,
                 )
@@ -694,7 +698,7 @@ class JWKSTokenValidator:
                 matched_jwk.key,
                 algorithms=list(self._algorithms),
                 audience=audience,
-                issuer=self._issuer,
+                issuer=self._token_issuers,
                 leeway=_ID_TOKEN_LEEWAY_SECONDS,
                 options={"require": ["exp", "iat", "iss", "sub", "aud"]},
             )

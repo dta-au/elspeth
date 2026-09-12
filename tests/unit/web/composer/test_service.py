@@ -53,6 +53,7 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
+    ComposerAdmissionRefused,
     ComposerAvailability,
     ComposerServiceImpl,
     _compose_preflight_repair_message,
@@ -89,7 +90,8 @@ from elspeth.web.sessions.protocol import GuidedOperationFence
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.helpers.session_fences import fenced_operation_context, make_compose_context
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     FakeFunction,
@@ -102,9 +104,21 @@ from tests.unit.web.composer._helpers import (
     _mock_catalog,
     _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
 )
+from tests.unit.web.conftest import _make_session
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _REAL_RUN_ADVISOR_CHECKPOINT = ComposerServiceImpl._run_advisor_checkpoint
+
+
+@pytest.fixture
+def guided_session_authority(composer_service_with_real_sessions: ComposerServiceImpl):
+    """Persist a real owner/session and hold its production COMPOSE lease."""
+    sessions = composer_service_with_real_sessions._require_sessions_service()
+    session_id = uuid4()
+    with sessions._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="test-user")
+    with fenced_operation_context(sessions._engine, session_id) as context:
+        yield session_id, context
 
 
 def test_service_rejects_uninferrable_advisor_provider() -> None:
@@ -124,6 +138,7 @@ def test_service_rejects_uninferrable_advisor_provider() -> None:
 )
 async def test_guided_service_routes_step3_through_the_planner_only_capability_prompt(
     composer_service_with_real_sessions: ComposerServiceImpl,
+    guided_session_authority,
     monkeypatch: pytest.MonkeyPatch,
     profile: Any,
     expected_surface: PlannerSurface,
@@ -166,7 +181,7 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
 
     monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
     current_state = _empty_state()
-    session_id = uuid4()
+    session_id, session_context = guided_session_authority
     # F2: the guided planner threads the same per-session schema tracker the
     # freeform batch writes — seeded here so the threading is observable.
     composer_service_with_real_sessions._mark_plugin_schema_loaded(str(session_id), "source", "csv")
@@ -177,7 +192,7 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
         attempt=1,
     )
     result, _catalog_ids = await composer_service_with_real_sessions.plan_guided_pipeline(
-        session_operation_context=make_compose_context(str(session_id)),
+        session_operation_context=session_context,
         intent="Build the reviewed pipeline.",
         current_state=current_state,
         guided=guided,
@@ -250,6 +265,7 @@ def _reviewed_guided_for_revision() -> GuidedSession:
 @pytest.mark.asyncio
 async def test_guided_service_names_the_root_goal_beside_a_revision_never_inside_its_intent(
     composer_service_with_real_sessions: ComposerServiceImpl,
+    guided_session_authority,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The session's goal reaches a revision as a NAMED fact with a precedence rule.
@@ -277,7 +293,7 @@ async def test_guided_service_names_the_root_goal_beside_a_revision_never_inside
         return object()
 
     monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
-    session_id = uuid4()
+    session_id, session_context = guided_session_authority
     goal = "Route rows scoring over 8 to the review sink and everything else to the archive."
     instruction = "Actually put everything in one sink; no routing."
 
@@ -302,7 +318,7 @@ async def test_guided_service_names_the_root_goal_beside_a_revision_never_inside
                 lease_token=uuid4().hex,
                 attempt=1,
             ),
-            session_operation_context=make_compose_context(str(session_id)),
+            session_operation_context=session_context,
             **overrides,
         )
 
@@ -336,6 +352,7 @@ async def test_guided_service_names_the_root_goal_beside_a_revision_never_inside
 @pytest.mark.asyncio
 async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_repair(
     composer_service_with_real_sessions: ComposerServiceImpl,
+    guided_session_authority,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_id = "11111111-1111-4111-8111-111111111111"
@@ -411,9 +428,9 @@ async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_rep
         return object()
 
     monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
-    session_id = uuid4()
+    session_id, session_context = guided_session_authority
     await composer_service_with_real_sessions.plan_guided_pipeline(
-        session_operation_context=make_compose_context(str(session_id)),
+        session_operation_context=session_context,
         intent="Add a normalization transform.",
         current_state=predecessor,
         guided=guided,
@@ -479,7 +496,7 @@ async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_rep
 
     captured.clear()
     await composer_service_with_real_sessions.plan_guided_pipeline(
-        session_operation_context=make_compose_context(str(session_id)),
+        session_operation_context=session_context,
         intent="Replace the current transform topology.",
         current_state=predecessor,
         guided=guided,
@@ -518,6 +535,7 @@ async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_rep
 @pytest.mark.asyncio
 async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provider_requests(
     composer_service_with_real_sessions: ComposerServiceImpl,
+    guided_session_authority,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
@@ -530,7 +548,7 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
         sessions_service=sessions,
         session_engine=sessions._engine,
     )
-    session = await sessions.create_session("test-user", "Planner parity", "local")
+    session = await sessions.get_session(guided_session_authority[0])
     source_id = "11111111-1111-4111-8111-111111111111"
     output_id = "22222222-2222-4222-8222-222222222222"
     ordinary = GuidedSession(
@@ -584,7 +602,7 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
     for guided in (ordinary, replace(ordinary, profile=TUTORIAL_PROFILE)):
         with pytest.raises(AuditIntegrityError, match="planner call inputs changed"):
             await actual_service.plan_guided_pipeline(
-                session_operation_context=make_compose_context(str(session.id)),
+                session_operation_context=guided_session_authority[1],
                 intent="Build the reviewed pipeline.",
                 current_state=_empty_state(),
                 guided=guided,
@@ -719,7 +737,7 @@ def _assert_no_mutation_empty_state_blocker(
     assert expected_detail in blocker_detail
 
 
-def _session_engine_with_session() -> tuple[Any, str]:
+def _session_engine_with_session(*, user_id: str = "test-user") -> tuple[Any, str]:
     engine = create_session_engine(
         "sqlite:///:memory:",
         poolclass=StaticPool,
@@ -729,10 +747,11 @@ def _session_engine_with_session() -> tuple[Any, str]:
     session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
         conn.execute(
             sessions_table.insert().values(
                 id=session_id,
-                user_id="test-user",
+                user_id=user_id,
                 auth_provider_type="local",
                 title="Test Session",
                 trust_mode="auto_commit",
@@ -1034,17 +1053,14 @@ class TestComposerTextOnlyResponse:
         """Non-build text-only replies still terminate without mutation."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(
-            catalog=catalog,
-            settings=settings,
-        )
+        service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
 
         llm_response = _make_llm_response(content="I'll help you build a pipeline!")
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.return_value = llm_response
-            result = await service.compose("What can this composer do?", [], state)
+            result = await service.compose("What can this composer do?", [], state, session_id=session_id)
 
         assert isinstance(result, ComposerResult)
         assert result.message == "I'll help you build a pipeline!"
@@ -1055,14 +1071,14 @@ class TestComposerTextOnlyResponse:
         """A build request cannot end with conceptual prose when no mutation ran."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
         model_prose = "I set up the workflow conceptually and can continue."
         llm_response = _make_llm_response(content=model_prose)
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.return_value = llm_response
-            result = await service.compose("Set this up to actually run from leads_q3.csv.", [], state)
+            result = await service.compose("Set this up to actually run from leads_q3.csv.", [], state, session_id=session_id)
 
         assert result.state.version == state.version
         assert result.raw_assistant_content == model_prose
@@ -1084,7 +1100,7 @@ class TestComposerTextOnlyResponse:
         """A failed mutation followed by final prose must surface the tool error."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
         failed_set_pipeline = _make_llm_response(
             tool_calls=[
@@ -1105,7 +1121,7 @@ class TestComposerTextOnlyResponse:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [failed_set_pipeline, text_response]
-            result = await service.compose("Build the CSV workflow now.", [], state)
+            result = await service.compose("Build the CSV workflow now.", [], state, session_id=session_id)
 
         assert result.state.version == state.version
         assert result.raw_assistant_content == final_prose
@@ -1125,7 +1141,7 @@ class TestComposerSingleToolCall:
     async def test_tool_dispatch_receives_configured_blob_quota(self) -> None:
         """Composer dispatch must thread WebSettings blob quota into tool execution."""
 
-        service = ComposerServiceImpl.for_trained_operator(
+        service, session_id = _composer_service_with_session(
             catalog=_mock_catalog(),
             settings=_make_settings(max_blob_storage_per_session_bytes=3),
         )
@@ -1166,7 +1182,7 @@ class TestComposerSingleToolCall:
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [turn, done]
-            await service.compose("Update metadata", [], state)
+            await service.compose("Update metadata", [], state, session_id=session_id)
 
         assert captured_quota == [3]
 
@@ -1174,7 +1190,7 @@ class TestComposerSingleToolCall:
     async def test_tool_dispatch_receives_composer_source_provenance_context(self) -> None:
         """Sync tool dispatch receives the user message and audited composer provenance."""
 
-        service = ComposerServiceImpl.for_trained_operator(
+        service, session_id = _composer_service_with_session(
             catalog=_mock_catalog(),
             settings=_make_settings(composer_model="gpt-5.5"),
         )
@@ -1221,10 +1237,7 @@ class TestComposerSingleToolCall:
         ):
             mock_llm.side_effect = [turn, done]
             await service.compose(
-                "Create generated source content.",
-                [],
-                state,
-                user_message_id="11111111-1111-1111-1111-111111111111",
+                "Create generated source content.", [], state, user_message_id="11111111-1111-1111-1111-111111111111", session_id=session_id
             )
 
         assert captured_kwargs["user_message_id"] == "11111111-1111-1111-1111-111111111111"
@@ -1670,7 +1683,7 @@ class TestComposerSingleToolCall:
         """Progress summaries derive from visible lifecycle/tool names, not raw args."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         progress_events: list[ComposerProgressEvent] = []
 
@@ -1697,12 +1710,7 @@ class TestComposerSingleToolCall:
             patch("elspeth.web.composer.service.asyncio.to_thread", side_effect=inline_to_thread),
         ):
             mock_llm.side_effect = [tool_response, text_response]
-            result = await service.compose(
-                "Use my OpenRouter secret",
-                [],
-                state,
-                progress=record_progress,
-            )
+            result = await service.compose("Use my OpenRouter secret", [], state, progress=record_progress, session_id=session_id)
 
         assert result.message == "I checked the available credentials."
         phases = [event.phase for event in progress_events]
@@ -1910,7 +1918,7 @@ class TestComposerMultiTurnToolCalls:
         (which carry the real state change) must NOT be elided."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -1958,7 +1966,7 @@ class TestComposerMultiTurnToolCalls:
             patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
-            result = await service.compose("Review this pipeline", [], state)
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
         assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
         assert len(captured_messages) == 3
@@ -2093,7 +2101,7 @@ class TestComposerMultiTurnToolCalls:
     @pytest.mark.asyncio
     async def test_advisor_rereview_carries_prior_finding_mutation_and_current_evidence(self) -> None:
         catalog = _mock_catalog()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -2126,7 +2134,7 @@ class TestComposerMultiTurnToolCalls:
                 side_effect=[(prior_finding, {}), ("CLEAN", {})],
             ) as advisor_call,
         ):
-            result = await service.compose("Review this pipeline", [], state)
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
         assert result.runtime_preflight is None or result.runtime_preflight.is_valid
         first_arguments = advisor_call.await_args_list[0].args[0]
@@ -2141,7 +2149,7 @@ class TestComposerMultiTurnToolCalls:
 
     @pytest.mark.asyncio
     async def test_advisor_rereview_without_mutation_is_explicit_not_a_blind_replay(self) -> None:
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -2172,7 +2180,7 @@ class TestComposerMultiTurnToolCalls:
                 side_effect=[("FLAGGED: missing output", {}), ("CLEAN", {})],
             ) as advisor_call,
         ):
-            result = await service.compose("Review this pipeline", [], state)
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
         assert result.runtime_preflight is None or result.runtime_preflight.is_valid
         second_arguments = advisor_call.await_args_list[1].args[0]
@@ -2193,7 +2201,7 @@ class TestComposerMultiTurnToolCalls:
         right up until a turn that actually mutates state."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -2242,7 +2250,7 @@ class TestComposerMultiTurnToolCalls:
             patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
-            result = await service.compose("Review this pipeline", [], state)
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
         assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
         assert len(captured_messages) == 4
@@ -2260,7 +2268,7 @@ class TestComposerMultiTurnToolCalls:
         """A real but irrelevant mutation cannot mint advisor clearance."""
         catalog = _mock_catalog()
         settings = _make_settings()  # composer_advisor_checkpoint_max_passes default 2
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -2305,7 +2313,7 @@ class TestComposerMultiTurnToolCalls:
             patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
-            result = await service.compose("Review this pipeline", [], state)
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
         # Completion remains withheld, while the already-green runtime shape
         # stays truthful about authoring and execution readiness.
@@ -2401,7 +2409,7 @@ class TestComposerConvergence:
         """Discovery-only turns exhaust the discovery budget."""
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_discovery_turns=1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Two different discovery tools to avoid cache hits
@@ -2415,7 +2423,7 @@ class TestComposerConvergence:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [disc1, disc2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("Loop forever", [], state)
+                await service.compose("Loop forever", [], state, session_id=session_id)
             assert exc_info.value.budget_exhausted == "discovery"
 
     @pytest.mark.asyncio
@@ -2423,7 +2431,7 @@ class TestComposerConvergence:
         """Mutation turns exhaust the composition budget."""
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_composition_turns=1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         mut = _make_llm_response(
@@ -2449,7 +2457,7 @@ class TestComposerConvergence:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [mut, mut2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("Keep mutating", [], state)
+                await service.compose("Keep mutating", [], state, session_id=session_id)
             assert exc_info.value.budget_exhausted == "composition"
 
     @pytest.mark.asyncio
@@ -2457,7 +2465,7 @@ class TestComposerConvergence:
         """B-4D-3: LLM makes mutation on final turn, then text on bonus call."""
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_composition_turns=1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         mut = _make_llm_response(
@@ -2477,7 +2485,7 @@ class TestComposerConvergence:
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [mut, text]
-            result = await service.compose("Do it", [], state)
+            result = await service.compose("Do it", [], state, session_id=session_id)
 
         assert result.message == "Done after final correction."
         assert result.state.metadata.name == "Final"
@@ -2494,7 +2502,7 @@ class TestComposerConvergence:
             composer_max_composition_turns=2,
             composer_max_discovery_turns=2,
         )
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: discovery (list_sources) — discovery counter = 1
@@ -2520,7 +2528,7 @@ class TestComposerConvergence:
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [disc, mut, text]
-            result = await service.compose("Build", [], state)
+            result = await service.compose("Build", [], state, session_id=session_id)
 
         assert result.message == "Done."
         assert result.state.metadata.name == "Works"
@@ -2538,7 +2546,7 @@ class TestFailedMutationBudgetClassification:
             composer_max_composition_turns=1,
             composer_max_discovery_turns=10,
         )
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: set_source with missing required key → KeyError
@@ -2568,7 +2576,7 @@ class TestFailedMutationBudgetClassification:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_mutation, bad_mutation2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("Setup source", [], state)
+                await service.compose("Setup source", [], state, session_id=session_id)
             assert exc_info.value.budget_exhausted == "composition"
 
     @pytest.mark.asyncio
@@ -2580,7 +2588,7 @@ class TestFailedMutationBudgetClassification:
             composer_max_composition_turns=1,
             composer_max_discovery_turns=10,
         )
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Build a tool call with invalid JSON manually
@@ -2608,7 +2616,7 @@ class TestFailedMutationBudgetClassification:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [response, response2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("Setup source", [], state)
+                await service.compose("Setup source", [], state, session_id=session_id)
             assert exc_info.value.budget_exhausted == "composition"
 
     @pytest.mark.asyncio
@@ -2620,7 +2628,7 @@ class TestFailedMutationBudgetClassification:
             composer_max_composition_turns=10,
             composer_max_discovery_turns=1,
         )
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # list_sources with invalid JSON → still a discovery turn
@@ -2642,7 +2650,7 @@ class TestFailedMutationBudgetClassification:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [response, disc2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("Explore", [], state)
+                await service.compose("Explore", [], state, session_id=session_id)
             assert exc_info.value.budget_exhausted == "discovery"
 
 
@@ -2652,7 +2660,7 @@ class TestComposerErrorHandling:
         """Unknown tool name returns error message, LLM can retry."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: invalid tool
@@ -2670,7 +2678,7 @@ class TestComposerErrorHandling:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Do something", [], state)
+            result = await service.compose("Do something", [], state, session_id=session_id)
 
         assert result.message == "Sorry, let me try again."
         # State unchanged — the bad tool call didn't modify anything
@@ -2681,7 +2689,7 @@ class TestComposerErrorHandling:
         """Malformed tool arguments return error, not crash."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: set_source with missing required field
@@ -2699,7 +2707,7 @@ class TestComposerErrorHandling:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Set up the pipeline.", [], state)
+            result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -2719,7 +2727,7 @@ class TestComposerErrorHandling:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: tool call that triggers ToolArgumentError from Tier 3 type guard
@@ -2752,7 +2760,7 @@ class TestComposerErrorHandling:
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Set up the pipeline.", [], state)
+            result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -2771,7 +2779,7 @@ class TestComposerErrorHandling:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         bad_call = _make_llm_response(
@@ -2817,7 +2825,7 @@ class TestComposerErrorHandling:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Set up the pipeline.", [], state)
+            result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -2847,7 +2855,7 @@ class TestComposerErrorHandling:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         good_call = _make_llm_response(
@@ -2900,7 +2908,7 @@ class TestComposerErrorHandling:
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [good_call, text]
-            await service.compose("Setup", [], state)
+            await service.compose("Setup", [], state, session_id=session_id)
 
         # The pre-dispatch validator must not have rejected the call.
         # Verify by inspecting the tool-result message content: the
@@ -2929,7 +2937,7 @@ class TestComposerErrorHandling:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         partial_call = _make_llm_response(
@@ -2977,7 +2985,7 @@ class TestComposerErrorHandling:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [partial_call, text]
-            result = await service.compose("Set up the pipeline.", [], state)
+            result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -3001,7 +3009,7 @@ class TestComposerErrorHandling:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Provide all required arguments so pre-validation passes,
@@ -3030,7 +3038,7 @@ class TestComposerErrorHandling:
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError) as exc_info:
-                await service.compose("Setup", [], state)
+                await service.compose("Setup", [], state, session_id=session_id)
         # The underlying KeyError is preserved on the wrapper so callers
         # (server logs, route handler, capture_logs assertions) can still
         # identify the original plugin-internal class.
@@ -3043,7 +3051,7 @@ class TestComposerErrorHandling:
         """Missing required arguments should produce a clear error listing the keys."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # set_source requires plugin, on_success, options, on_validation_failure
@@ -3060,7 +3068,7 @@ class TestComposerErrorHandling:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
-            await service.compose("Setup", [], state)
+            await service.compose("Setup", [], state, session_id=session_id)
 
         # Verify the error message sent back to the LLM mentions the missing keys
         tool_msg = mock_llm.call_args_list[1][0][0][-1]  # last message in second call
@@ -3074,7 +3082,7 @@ class TestComposerErrorHandling:
         """Non-object mutation arguments are Tier-3 tool errors, not plugin crashes."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         bad_call = _make_llm_response(
@@ -3096,7 +3104,7 @@ class TestComposerErrorHandling:
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Set up the pipeline.", [], state)
+            result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -3114,7 +3122,7 @@ class TestComposerErrorHandling:
         """Non-object discovery arguments are rejected before cache lookup or execution."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         bad_call = _make_llm_response(
@@ -3136,7 +3144,7 @@ class TestComposerErrorHandling:
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Explore", [], state)
+            result = await service.compose("Explore", [], state, session_id=session_id)
 
         assert result.message == "Recovered."
         mock_execute_tool.assert_not_called()
@@ -3342,7 +3350,7 @@ class TestProviderCacheTokenAudit:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         response = self._response_with_usage(
@@ -3356,7 +3364,7 @@ class TestProviderCacheTokenAudit:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.return_value = response
-            result = await service.compose("Hi", [], state)
+            result = await service.compose("Hi", [], state, session_id=session_id)
 
         assert len(result.llm_calls) == 1
         call_record = result.llm_calls[0]
@@ -3503,11 +3511,15 @@ class TestDiscoveryCache:
             factory_calls.append(user_id)
             return snapshot
 
+        settings = _make_settings()
+        engine, session_id = _session_engine_with_session(user_id="user-1")
         service = ComposerServiceImpl(
             catalog=catalog,
-            settings=_make_settings(),
+            settings=settings,
             plugin_snapshot_factory=snapshot_factory,
             operator_profile_registry=MagicMock(spec=OperatorProfileRegistry),
+            sessions_service=_test_sessions_service(engine, Path(settings.data_dir)),
+            session_engine=engine,
         )
         real_build_messages = service_module.build_messages
         real_execute_tool = tool_batch_module.execute_tool
@@ -3527,7 +3539,7 @@ class TestDiscoveryCache:
             patch.object(service_module, "build_messages", side_effect=capture_prompt),
             patch.object(tool_batch_module, "execute_tool", side_effect=capture_tool),
         ):
-            await service.compose("List sources", [], _empty_state(), user_id="user-1")
+            await service.compose("List sources", [], _empty_state(), user_id="user-1", session_id=session_id)
 
         assert factory_calls == ["user-1"]
         assert prompt_snapshots == [snapshot]
@@ -3542,7 +3554,7 @@ class TestDiscoveryCache:
 
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_discovery_turns=2)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: list_sources (first call — executes, charges discovery: 1/2)
@@ -3561,7 +3573,7 @@ class TestDiscoveryCache:
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
         ):
             mock_llm.side_effect = [disc1, disc2, text]
-            result = await service.compose("List sources", [], state)
+            result = await service.compose("List sources", [], state, session_id=session_id)
 
         # Should NOT have raised — second list_sources was a cache hit
         assert result.message == "Found sources."
@@ -3882,7 +3894,7 @@ class TestDiscoveryCache:
         """Different arguments = different cache entries = both execute."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         schema1 = _make_llm_response(
@@ -3907,7 +3919,7 @@ class TestDiscoveryCache:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [schema1, schema2, text]
-            await service.compose("Get schemas", [], state)
+            await service.compose("Get schemas", [], state, session_id=session_id)
 
         # Both calls should have executed (different arguments)
         assert catalog.get_schema.call_count == 4
@@ -3917,7 +3929,7 @@ class TestDiscoveryCache:
         """Mutation tool results are never cached — always execute."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         mut1 = _make_llm_response(
@@ -3942,7 +3954,7 @@ class TestDiscoveryCache:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [mut1, mut2, text]
-            result = await service.compose("Update metadata", [], state)
+            result = await service.compose("Update metadata", [], state, session_id=session_id)
 
         assert result.state.metadata.name == "Y"
 
@@ -3958,7 +3970,7 @@ class TestComposeTimeout:
 
         catalog = _mock_catalog()
         settings = _make_settings(composer_timeout_seconds=0.1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         async def slow_llm(*args: Any, **kwargs: Any) -> Any:
@@ -3968,7 +3980,7 @@ class TestComposeTimeout:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = slow_llm
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("Slow pipeline", [], state)
+                await service.compose("Slow pipeline", [], state, session_id=session_id)
             assert exc_info.value.budget_exhausted == "timeout"
 
     @pytest.mark.asyncio
@@ -3979,7 +3991,7 @@ class TestComposeTimeout:
         """An expired compose budget is not a fabricated advisor outage."""
         import asyncio
 
-        service = ComposerServiceImpl.for_trained_operator(
+        service, session_id = _composer_service_with_session(
             catalog=_mock_catalog(),
             settings=_make_settings(composer_timeout_seconds=0.005),
         )
@@ -4015,7 +4027,7 @@ class TestComposeTimeout:
             patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
             pytest.raises(ComposerConvergenceError) as exc_info,
         ):
-            await service.compose("Review this pipeline", [], state, progress=record_progress)
+            await service.compose("Review this pipeline", [], state, progress=record_progress, session_id=session_id)
 
         assert advisor_call.await_count == 0
         checkpoint_persist.assert_not_awaited()
@@ -4035,11 +4047,11 @@ class TestComposeTimeout:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """EARLY expiry publishes the completed tool turn before timeout."""
-        import asyncio
+        import time
 
-        service = ComposerServiceImpl.for_trained_operator(
+        service, session_id = _composer_service_with_session(
             catalog=_mock_catalog(),
-            settings=_make_settings(composer_timeout_seconds=0.005),
+            settings=_make_settings(composer_timeout_seconds=1.0),
         )
         service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
         checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
@@ -4059,6 +4071,8 @@ class TestComposeTimeout:
             **_kwargs: Any,
         ) -> ToolResult:
             updated_state = current_state.with_source(SourceSpec(**source_arguments))
+            # The mutation completes after expiry; the advisor must still retain its audit.
+            time.sleep(1.01)
             return ToolResult(
                 success=True,
                 updated_state=updated_state,
@@ -4067,8 +4081,7 @@ class TestComposeTimeout:
                 data=None,
             )
 
-        async def mutation_response_after_deadline(*_args: object, **_kwargs: object) -> Any:
-            await asyncio.sleep(0.01)
+        async def mutation_response(*_args: object, **_kwargs: object) -> Any:
             return _make_llm_response(
                 tool_calls=[
                     {
@@ -4080,19 +4093,33 @@ class TestComposeTimeout:
             )
 
         with (
-            patch.object(service, "_call_llm_before_deadline", new_callable=AsyncMock, side_effect=mutation_response_after_deadline),
+            patch.object(service, "_call_llm_before_deadline", new_callable=AsyncMock, side_effect=mutation_response),
             patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=mutate_source),
             pytest.raises(ComposerConvergenceError) as exc_info,
         ):
-            await service.compose("Build a CSV pipeline", [], _empty_state())
+            await service.compose("Build a CSV pipeline", [], _empty_state(), session_id=session_id)
 
         assert advisor_call.await_count == 0
         checkpoint_persist.assert_not_awaited()
         assert exc_info.value.budget_exhausted == "timeout"
         assert exc_info.value.llm_calls == ()
-        assert len(exc_info.value.tool_invocations) == 1
-        assert exc_info.value.tool_invocations[0].tool_name == "set_source"
+        # Durable P4 audit must not be replayed from the exception payload.
+        assert exc_info.value.tool_invocations == ()
+        sessions = service._require_sessions_service()
+        with sessions._engine.connect() as conn:
+            tool_rows = conn.execute(
+                select(chat_messages_table.c.tool_call_id, chat_messages_table.c.composition_state_id).where(
+                    chat_messages_table.c.session_id == session_id,
+                    chat_messages_table.c.role == "tool",
+                )
+            ).all()
+        assert len(tool_rows) == 1
+        assert tool_rows[0].tool_call_id == "source-1"
+        assert tool_rows[0].composition_state_id is not None
+        current = await sessions.get_current_state(UUID(session_id))
+        assert current is not None
+        assert current.sources["source"]["plugin"] == "csv"
         assert exc_info.value.partial_state is not None
         assert exc_info.value.partial_state.sources["source"].plugin == "csv"
 
@@ -4171,7 +4198,7 @@ class TestComposeTimeout:
 
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         call_count = 0
@@ -4234,7 +4261,7 @@ class TestComposeTimeout:
             ),
             pytest.raises(ComposerConvergenceError) as exc_info,
         ):
-            await service.compose("Build pipeline", [], state)
+            await service.compose("Build pipeline", [], state, session_id=session_id)
 
         assert exc_info.value.budget_exhausted == "timeout"
         assert call_count == 2
@@ -4266,7 +4293,7 @@ class TestConvergenceProgressDispatch:
     async def test_composition_budget_emits_distinct_failure_event(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_composition_turns=1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         progress_events: list[ComposerProgressEvent] = []
 
@@ -4295,7 +4322,7 @@ class TestConvergenceProgressDispatch:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [mut1, mut2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("loop forever", [], state, progress=record_progress)
+                await service.compose("loop forever", [], state, progress=record_progress, session_id=session_id)
         assert exc_info.value.budget_exhausted == "composition"
 
         failed_events = [e for e in progress_events if e.phase == "failed"]
@@ -4307,7 +4334,7 @@ class TestConvergenceProgressDispatch:
     async def test_discovery_budget_emits_distinct_failure_event(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_discovery_turns=1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         progress_events: list[ComposerProgressEvent] = []
 
@@ -4324,7 +4351,7 @@ class TestConvergenceProgressDispatch:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [disc1, disc2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("discover forever", [], state, progress=record_progress)
+                await service.compose("discover forever", [], state, progress=record_progress, session_id=session_id)
         assert exc_info.value.budget_exhausted == "discovery"
 
         failed_events = [e for e in progress_events if e.phase == "failed"]
@@ -4338,7 +4365,7 @@ class TestConvergenceProgressDispatch:
 
         catalog = _mock_catalog()
         settings = _make_settings(composer_timeout_seconds=0.1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         progress_events: list[ComposerProgressEvent] = []
 
@@ -4352,7 +4379,7 @@ class TestConvergenceProgressDispatch:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = slow_llm
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("slow pipeline", [], state, progress=record_progress)
+                await service.compose("slow pipeline", [], state, progress=record_progress, session_id=session_id)
         assert exc_info.value.budget_exhausted == "timeout"
 
         failed_events = [e for e in progress_events if e.phase == "failed"]
@@ -4372,7 +4399,7 @@ class TestConvergenceProgressDispatch:
             llm_side_effect: Any,
         ) -> str | None:
             catalog = _mock_catalog()
-            service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+            service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
             state = _empty_state()
             events: list[ComposerProgressEvent] = []
 
@@ -4382,7 +4409,7 @@ class TestConvergenceProgressDispatch:
             with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
                 mock_llm.side_effect = llm_side_effect
                 with contextlib.suppress(ComposerConvergenceError):
-                    await service.compose("x", [], state, progress=record)
+                    await service.compose("x", [], state, progress=record, session_id=session_id)
             failed = [e for e in events if e.phase == "failed"]
             return failed[-1].reason if failed else None
 
@@ -4473,7 +4500,7 @@ class TestPartialStatePreservation:
         """When no mutations occurred, partial_state is None."""
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_discovery_turns=1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         disc1 = _make_llm_response(
@@ -4486,7 +4513,7 @@ class TestPartialStatePreservation:
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [disc1, disc2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
-                await service.compose("Just looking", [], state)
+                await service.compose("Just looking", [], state, session_id=session_id)
 
             assert exc_info.value.partial_state is None
 
@@ -4503,7 +4530,7 @@ class TestComposerSamplingConfig:
     async def test_call_llm_sends_configured_temperature_and_seed(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings(composer_temperature=0.0, composer_seed=42)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Single text-only response converges the loop immediately.
@@ -4519,7 +4546,7 @@ class TestComposerSamplingConfig:
             ) as mock_acomp,
             contextlib.suppress(ComposerServiceError),
         ):
-            await service.compose("Hello", [], state)
+            await service.compose("Hello", [], state, session_id=session_id)
 
         assert mock_acomp.call_count >= 1
         first_call_kwargs = mock_acomp.call_args_list[0].kwargs
@@ -4596,7 +4623,7 @@ class TestEmptyChoicesValidation:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Patch the lazy LiteLLM wrapper (not _call_llm) so the validation
@@ -4610,7 +4637,7 @@ class TestEmptyChoicesValidation:
             ),
             pytest.raises(ComposerServiceError, match="empty choices"),
         ):
-            await service.compose("Hello", [], state)
+            await service.compose("Hello", [], state, session_id=session_id)
 
     @pytest.mark.asyncio
     async def test_empty_choices_on_bonus_turn_raises_service_error(self) -> None:
@@ -4623,7 +4650,7 @@ class TestEmptyChoicesValidation:
         # Budget of 1 composition turn — first mutation exhausts it,
         # then the bonus _call_llm returns empty choices.
         settings = _make_settings(composer_max_composition_turns=1)
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # First call: valid response with a mutation tool call
@@ -4652,7 +4679,7 @@ class TestEmptyChoicesValidation:
             ) as mock_acomp,
             pytest.raises(ComposerServiceError, match="empty choices"),
         ):
-            await service.compose("Setup CSV", [], state)
+            await service.compose("Setup CSV", [], state, session_id=session_id)
 
         # Confirm both LLM calls happened — the error is from the bonus
         # turn (second call), not from a tool handler fault on the first.
@@ -4689,7 +4716,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         bad_request = LiteLLMBadRequestError(
             message="bad model leaked-detail",
@@ -4705,7 +4732,7 @@ class TestComposerAvailabilityAndBadRequest:
             ),
             pytest.raises(ComposerServiceError) as exc_info,
         ):
-            await service.compose("Hello", [], state)
+            await service.compose("Hello", [], state, session_id=session_id)
 
         assert str(exc_info.value) == "LLM request rejected (BadRequestError)"
         assert "leaked-detail" not in str(exc_info.value)
@@ -4720,7 +4747,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         catalog = _mock_catalog()
         settings = _make_settings(composer_model="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         access_key = "AKIA" + ("Z" * 16)
         sentinels = (
@@ -4746,7 +4773,7 @@ class TestComposerAvailabilityAndBadRequest:
             capture_logs() as captured_logs,
             pytest.raises(_BadRequestLLMError) as exc_info,
         ):
-            await service.compose("Hello", [], state)
+            await service.compose("Hello", [], state, session_id=session_id)
 
         exc = exc_info.value
         assert str(exc) == "LLM request rejected (BadRequestError)"
@@ -4787,7 +4814,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         bad_request = LiteLLMBadRequestError(
             message="provider says bad",
@@ -4803,7 +4830,7 @@ class TestComposerAvailabilityAndBadRequest:
             ),
             pytest.raises(_BadRequestLLMError) as exc_info,
         ):
-            await service.compose("Hello", [], state)
+            await service.compose("Hello", [], state, session_id=session_id)
 
         # str(exc) unchanged from the existing redacted wrap message.
         assert str(exc_info.value) == "LLM request rejected (BadRequestError)"
@@ -4823,7 +4850,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         # LiteLLM's BadRequestError formats the message into a longer string;
         # passing an empty message still yields a non-empty rendered str.
@@ -4842,7 +4869,7 @@ class TestComposerAvailabilityAndBadRequest:
             ),
             pytest.raises(_BadRequestLLMError) as exc_info,
         ):
-            await service.compose("Hello", [], state)
+            await service.compose("Hello", [], state, session_id=session_id)
 
         # str(bad_request) is "" so provider_detail should collapse to None.
         # provider_status_code is still set from the .status_code attribute.
@@ -4855,7 +4882,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         transient_error = LiteLLMAPIError(
             status_code=503,
@@ -4873,7 +4900,7 @@ class TestComposerAvailabilityAndBadRequest:
             ) as mock_llm,
             patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
         ):
-            result = await service.compose("Hello", [], state)
+            result = await service.compose("Hello", [], state, session_id=session_id)
 
         assert result.message == "Recovered."
         assert mock_llm.call_count == 2
@@ -4898,7 +4925,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         bad_request = LiteLLMBadRequestError(
             message="model gpt-foo does not exist",
@@ -4915,7 +4942,7 @@ class TestComposerAvailabilityAndBadRequest:
             patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
             pytest.raises(_BadRequestLLMError),
         ):
-            await service.compose("Hello", [], state)
+            await service.compose("Hello", [], state, session_id=session_id)
 
         # Pins the no-retry contract: exactly one provider call, and no
         # backoff sleep was awaited (the retry path's only observable
@@ -4941,7 +4968,7 @@ class TestPluginBugCrashesFromToolExecution:
     async def test_plugin_value_error_is_not_swallowed(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         valid_call = _make_llm_response(
@@ -4968,7 +4995,7 @@ class TestPluginBugCrashesFromToolExecution:
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError) as exc_info:
-                await service.compose("Setup", [], state)
+                await service.compose("Setup", [], state, session_id=session_id)
         # Crash on first tool call → no prior mutations → partial_state is None.
         assert exc_info.value.partial_state is None
         assert isinstance(exc_info.value.original_exc, ValueError)
@@ -4979,7 +5006,7 @@ class TestPluginBugCrashesFromToolExecution:
     async def test_plugin_type_error_is_not_swallowed(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         valid_call = _make_llm_response(
@@ -5006,7 +5033,7 @@ class TestPluginBugCrashesFromToolExecution:
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError) as exc_info:
-                await service.compose("Setup", [], state)
+                await service.compose("Setup", [], state, session_id=session_id)
         assert exc_info.value.partial_state is None
         assert isinstance(exc_info.value.original_exc, TypeError)
         assert "plugin bug" in str(exc_info.value.original_exc)
@@ -5016,7 +5043,7 @@ class TestPluginBugCrashesFromToolExecution:
     async def test_plugin_unicode_error_is_not_swallowed(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         valid_call = _make_llm_response(
@@ -5043,7 +5070,7 @@ class TestPluginBugCrashesFromToolExecution:
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError) as exc_info:
-                await service.compose("Setup", [], state)
+                await service.compose("Setup", [], state, session_id=session_id)
         assert exc_info.value.partial_state is None
         assert isinstance(exc_info.value.original_exc, UnicodeDecodeError)
         assert exc_info.value.exc_class == "UnicodeDecodeError"
@@ -5065,7 +5092,7 @@ class TestPluginBugCrashesFromToolExecution:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
         initial_version = state.version
 
@@ -5123,7 +5150,7 @@ class TestPluginBugCrashesFromToolExecution:
         ):
             mock_llm.return_value = two_calls
             with pytest.raises(ComposerPluginCrashError) as exc_info:
-                await service.compose("Setup", [], state)
+                await service.compose("Setup", [], state, session_id=session_id)
 
         assert call_count["n"] == 2, "both tool calls should have been attempted"
         crash = exc_info.value
@@ -5138,7 +5165,7 @@ class TestPluginBugCrashesFromToolExecution:
         """Positive case: ToolArgumentError IS caught, error fed back for LLM retry."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         valid_call = _make_llm_response(
@@ -5169,7 +5196,7 @@ class TestPluginBugCrashesFromToolExecution:
             ),
         ):
             mock_llm.side_effect = [valid_call, text]
-            result = await service.compose("Setup", [], state)
+            result = await service.compose("Setup", [], state, session_id=session_id)
 
         assert isinstance(result, ComposerResult)
         second_call_messages = mock_llm.call_args_list[1].args[0]
@@ -5220,7 +5247,7 @@ class TestPluginBugCrashesFromToolExecution:
             raise AssertionError("model_validate should have raised")
         assert cause_error is not None
 
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         state = _empty_state()
         tool_call = _make_llm_response(
             tool_calls=[
@@ -5254,7 +5281,7 @@ class TestPluginBugCrashesFromToolExecution:
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=leaky),
         ):
             mock_llm.side_effect = [tool_call, text]
-            result = await service.compose("Setup", [], state)
+            result = await service.compose("Setup", [], state, session_id=session_id)
 
         second_call_messages = mock_llm.call_args_list[1].args[0]
         prompt_blob = json.dumps(second_call_messages, sort_keys=True)
@@ -5303,6 +5330,7 @@ class TestPluginCrashSessionPersistence:
         # crash-path bump is unambiguously distinguishable from the seed.
         self.seeded_at = datetime(2020, 1, 1, tzinfo=UTC)
         with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
             conn.execute(
                 sessions_table.insert().values(
                     id=self.session_id,
@@ -5435,17 +5463,21 @@ class TestPluginCrashSessionPersistence:
             ],
         )
 
+        def fail_tool(*_args: Any, **_kwargs: Any) -> None:
+            mutation.side_effect = OperationalError("UPDATE sessions", {}, Exception("db unavailable"))
+            raise ValueError("original plugin bug")
+
         with (
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
-                side_effect=ValueError("original plugin bug"),
+                side_effect=fail_tool,
             ),
             patch.object(
                 sessions_service.session_operation_authority,
                 "mutate",
-                side_effect=OperationalError("UPDATE sessions", {}, Exception("db unavailable")),
-            ),
+                wraps=sessions_service.session_operation_authority.mutate,
+            ) as mutation,
             capture_logs() as cap_logs,
         ):
             mock_llm.return_value = valid_call
@@ -5702,19 +5734,15 @@ class TestPluginCrashSessionPersistence:
 
     @pytest.mark.asyncio
     async def test_session_bound_compose_without_its_lease_never_writes_the_breadcrumb(self) -> None:
-        """A session-bound compose that crashes without a COMPOSE context
-        must not write the breadcrumb on a raw engine.
+        """A session-bound compose without a COMPOSE context is refused
+        before any provider call or crash breadcrumb write.
 
         The breadcrumb is a ``sessions`` write and every such write goes
         through the fenced authority (P4-D3 elspeth-f3bbe79753). Before D3
         this path fell back to an unfenced ``UPDATE sessions`` on the raw
-        engine. Now two gates refuse it, in order: the crashed tool's turn
-        audit is persisted under the same authority BEFORE the crash arm
-        runs, and refuses an unleased session-bound turn
-        (``AuditIntegrityError``); were a crash ever to reach the arm
-        without a context, the arm itself raises ``RuntimeError`` rather
-        than mutate unfenced. Either way nothing is logged as an audit-path
-        failure (that catch is for the authority's own refusals) and the
+        engine. Chargeable admission now rejects the missing authority
+        with ``ComposerAdmissionRefused`` before the provider or tool can
+        run. Nothing is logged as a crash-persistence failure, and the
         seeded ``updated_at`` stays untouched.
 
         The conftest lease adapter fences every legacy ``compose(session_id=
@@ -5766,8 +5794,10 @@ class TestPluginCrashSessionPersistence:
             capture_logs() as cap_logs,
         ):
             mock_llm.return_value = valid_call
-            with pytest.raises(AuditIntegrityError, match="session operation authority"):
+            with pytest.raises(ComposerAdmissionRefused, match="session authority"):
                 await real_compose(service, "Setup", [], state, session_id=self.session_id)
+
+        mock_llm.assert_not_called()
 
         persistence_failure_events = [entry for entry in cap_logs if entry.get("event") == "composer_crash_persistence_failed"]
         assert persistence_failure_events == [], cap_logs
@@ -5830,10 +5860,14 @@ class TestPluginCrashSessionPersistence:
             ],
         )
 
+        def fail_tool(*_args: Any, **_kwargs: Any) -> None:
+            mutation.side_effect = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+            raise ValueError("plugin bug")
+
         with (
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=ValueError("plugin bug")),
-            patch.object(authority, "mutate", side_effect=SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)),
+            patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=fail_tool),
+            patch.object(authority, "mutate", wraps=authority.mutate) as mutation,
             capture_logs() as cap_logs,
         ):
             mock_llm.return_value = valid_call
@@ -5872,7 +5906,7 @@ class TestToolExecutionThreadOffloading:
 
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         event_loop_thread = threading.current_thread()
@@ -5897,7 +5931,7 @@ class TestToolExecutionThreadOffloading:
             ),
         ):
             mock_llm.side_effect = [tool_call_response, text_response]
-            await service.compose(user_message, [], state)
+            await service.compose(user_message, [], state, session_id=session_id)
 
         assert tool_execution_thread is not None, "execute_tool was never called"
         assert tool_execution_thread is not event_loop_thread, (
@@ -5954,7 +5988,7 @@ class TestToolExecutionThreadOffloading:
 
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Blocking duration must be much larger than the gap threshold
@@ -6014,7 +6048,7 @@ class TestToolExecutionThreadOffloading:
             mock_llm.side_effect = [tool_call, text]
             hb_task = asyncio.create_task(heartbeat())
             try:
-                await service.compose("List sources", [], state)
+                await service.compose("List sources", [], state, session_id=session_id)
             finally:
                 hb_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -6489,6 +6523,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         self.data_dir = tmp_path
         now = datetime.now(UTC)
         with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
             conn.execute(
                 sessions_table.insert().values(
                     id=self.session_id,

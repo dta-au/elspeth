@@ -47,6 +47,7 @@ from elspeth.web.composer.guided.state_machine import (
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.redaction import assert_guided_custody_persistable
+from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_INTEGRITY_ERRORS,
     SourceInspectionBlobLifecycleError,
@@ -4275,8 +4276,9 @@ async def post_guided_respond(
                             # path had no sink, so the indicator showed elapsed
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
-                            planner_progress = _composer_progress_sink(
+                            planner_progress = await _composer_progress_sink(
                                 progress_registry,
+                                request=request,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,
@@ -4748,8 +4750,9 @@ async def post_guided_respond(
                             # path had no sink, so the indicator showed elapsed
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
-                            planner_progress = _composer_progress_sink(
+                            planner_progress = await _composer_progress_sink(
                                 progress_registry,
+                                request=request,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,
@@ -5396,8 +5399,9 @@ async def post_guided_respond(
                             # path had no sink, so the indicator showed elapsed
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
-                            planner_progress = _composer_progress_sink(
+                            planner_progress = await _composer_progress_sink(
                                 progress_registry,
+                                request=request,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,
@@ -5725,7 +5729,7 @@ async def post_guided_respond(
                     else "integrity_error"
                     if isinstance(exc, (AuditIntegrityError, *SOURCE_INSPECTION_INTEGRITY_ERRORS, InvariantError))
                     else _guided_full_failure_code(exc)
-                    if isinstance(exc, PipelinePlannerError)
+                    if isinstance(exc, (PipelinePlannerError, ComposerAdmissionRefused))
                     else "operation_failed"
                 )
                 _log_last_resort_diagnostic(

@@ -415,7 +415,7 @@ class TestRunEvent:
         assert "tokens_routed_success" in progress_fields
         assert "tokens_routed_failure" in progress_fields
 
-    def test_event_sequence_is_internal_to_json_and_schema(self) -> None:
+    def test_event_sequence_is_public_reconnect_cursor_in_json_and_schema(self) -> None:
         event = RunEvent(
             run_id="run-1",
             timestamp=datetime.now(tz=UTC),
@@ -424,8 +424,8 @@ class TestRunEvent:
         ).with_event_sequence(7)
 
         assert event.event_sequence == 7
-        assert "event_sequence" not in event.model_dump(mode="json")
-        assert "event_sequence" not in RunEvent.model_json_schema()["properties"]
+        assert event.model_dump(mode="json")["event_sequence"] == 7
+        assert "event_sequence" in RunEvent.model_json_schema()["properties"]
 
     def test_completed_event_valid(self) -> None:
         event = RunEvent(

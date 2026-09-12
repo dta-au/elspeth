@@ -36,7 +36,8 @@ from elspeth.contracts import (
     ExportStatus,
     SecretResolutionInput,
 )
-from elspeth.contracts.coordination import CoordinationToken, mint_worker_id
+from elspeth.contracts.checkpoint import ResumeRefusalCause
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import (
     GracefulShutdownError,
     OrchestrationInvariantError,
@@ -49,9 +50,12 @@ from elspeth.contracts.events import (
     PipelinePhase,
     RunStarted,
 )
+from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
 from elspeth.engine._best_effort import best_effort
+from elspeth.engine.orchestrator.authority_guard import CallerAuthorityGuard
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run
 from elspeth.engine.orchestrator.export import (
     _validate_audit_export_binding_provenance,
@@ -77,6 +81,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
     from elspeth.contracts.preflight import PreflightResult
+    from elspeth.contracts.run_start import RunStartPermitBinding
     from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
     from elspeth.core.config import ElspethSettings
     from elspeth.core.dag import ExecutionGraph
@@ -103,6 +108,8 @@ class InitializeDatabasePhase(Protocol):
         openrouter_catalog_sha256: str,
         openrouter_catalog_source: str,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
     ) -> tuple[RecorderFactory, Any, CoordinationToken]: ...
 
 
@@ -121,6 +128,7 @@ class ExecuteRun(Protocol):
         shutdown_event: threading.Event | None = None,
         coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
+        before_plugin_effects: Callable[[], None] | None = None,
     ) -> RunResult: ...
 
 
@@ -156,6 +164,8 @@ class RunLifecycleCoordinator:
         openrouter_catalog_sha256: str,
         openrouter_catalog_source: str,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
     ) -> tuple[RecorderFactory, Any, CoordinationToken]:
         """Execute the DATABASE phase: create factory, begin run, record secrets.
 
@@ -169,10 +179,10 @@ class RunLifecycleCoordinator:
 
         Returns:
             Tuple of (factory, run, coordination_token) where run has run_id
-            and config_hash attributes. The token is the epoch-1 leader seat
-            minted atomically with the runs row (ADR-030 uniformity rule:
-            N=1 = leader-of-its-own-run); epoch 1 is a constant on the fresh
-            path so no read-back is needed.
+            and config_hash attributes. Fresh runs mint their epoch-1 seat
+            atomically with the run header. An exact prepared-permit retry
+            acquires a new seat before regenerating its pure initialization
+            metadata; observing an existing run never confers its old token.
 
         Raises:
             Exception: Re-raises any database connection or initialization failure.
@@ -205,7 +215,7 @@ class RunLifecycleCoordinator:
             # the run_coordination seat (epoch 1) atomically with the runs
             # row. The token is constructed locally — epoch 1 is a constant
             # on the fresh path, no read-back.
-            run_id = run_id or generate_id()
+            run_id = run_id or (run_start_permit.run_id if run_start_permit is not None else generate_id())
             worker_id = mint_worker_id(run_id)
             run = factory.run_lifecycle.begin_run(
                 config=config.config,
@@ -218,8 +228,36 @@ class RunLifecycleCoordinator:
                 openrouter_catalog_source=openrouter_catalog_source,
                 leader_worker_id=worker_id,
                 web_plugin_policy_evidence=web_plugin_policy_evidence,
+                run_start_permit=run_start_permit,
             )
-            coordination_token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=1)
+            if run_start_permit is None:
+                coordination_token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=1)
+            else:
+                admissions = RunStartAdmissionRepository(self._db)
+                admission = admissions.observe(run_start_permit)
+                if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+                    raise NonResumableRunError(
+                        run.run_id,
+                        "run has crossed its first-effect boundary; checkpoint resume is required",
+                        cause=ResumeRefusalCause.FIRST_EFFECT_BOUNDARY_CROSSED,
+                    )
+                leader = factory.run_coordination.live_leader(run_id=run.run_id)
+                if leader is not None and leader.leader_worker_id == worker_id:
+                    coordination_token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=leader.leader_epoch)
+                else:
+                    coordination_token = factory.run_coordination.acquire_run_leadership(
+                        run_id=run.run_id,
+                        worker_id=worker_id,
+                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                        entry_point="prepared-restart",
+                    )
+                try:
+                    if pre_effect_guard is not None:
+                        pre_effect_guard()
+                    admissions.reset_prepared_initialization(run_start_permit, coordination_token=coordination_token)
+                except BaseException:
+                    factory.run_coordination.release_seat(token=coordination_token)
+                    raise
 
             # Record secret resolutions in audit trail (deferred from pre-run loading)
             # Resolutions already contain pre-computed fingerprints (no plaintext values)
@@ -387,6 +425,8 @@ class RunLifecycleCoordinator:
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
         initialize_database_phase: InitializeDatabasePhase,
+        pre_effect_guard: Callable[[], None] | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
         execute_run: ExecuteRun,
     ) -> RunResult:
         """Execute a pipeline run (see ``Orchestrator.run`` for the public contract).
@@ -466,9 +506,17 @@ class RunLifecycleCoordinator:
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_start_permit=run_start_permit,
+            pre_effect_guard=pre_effect_guard if run_start_permit is not None else None,
         )
 
         # Record pre-flight results (deferred from bootstrap_and_run)
+        if pre_effect_guard is not None:
+            try:
+                pre_effect_guard()
+            except BaseException:
+                factory.run_coordination.release_seat(token=coordination_token)
+                raise
         self._record_preflight_results(factory, preflight_results, coordination_token=coordination_token)
 
         # The token reaches every fenced collaborator (checkpoint writes,
@@ -496,16 +544,23 @@ class RunLifecycleCoordinator:
         )
         _heartbeat.start()
 
+        caller_authority = CallerAuthorityGuard(check_coordination_latch)
+
         def _check_combined_coordination_latch() -> None:
             """Require both the engine seat and optional caller authority."""
             _heartbeat.check_and_raise()
-            if check_coordination_latch is not None:
-                check_coordination_latch()
+            caller_authority.check()
+
+        def begin_plugin_effects() -> None:
+            _check_combined_coordination_latch()
+            if run_start_permit is not None:
+                RunStartAdmissionRepository(self._db).mark_executing(run_start_permit, coordination_token=coordination_token)
 
         run_completed = False
         run_start_time = time.perf_counter()
         run_span_stack = ExitStack()
         try:
+            _check_combined_coordination_latch()
             run_span_stack.enter_context(
                 self._span_factory.run_span(
                     run.run_id,
@@ -532,6 +587,7 @@ class RunLifecycleCoordinator:
                     # epoch/membership fences — both independently refuse the same
                     # writes — but the latch surfaces the condition proactively.
                     check_coordination_latch=_check_combined_coordination_latch,
+                    before_plugin_effects=begin_plugin_effects,
                 )
 
             # ADR-030 §D (audit-derived terminal status on ALL paths — bug
@@ -645,6 +701,7 @@ class RunLifecycleCoordinator:
         except GracefulShutdownError as shutdown_exc:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
             with best_effort("Interrupted ceremony on graceful shutdown", run_id=run.run_id):
                 self._ceremony.emit_interrupted_ceremony(
                     run.run_id, factory, shutdown_exc, run_start_time, coordination_token=coordination_token
@@ -658,6 +715,7 @@ class RunLifecycleCoordinator:
         except _RunFailedWithPartialResultError as failed_exc:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
             with best_effort(
                 "Failed/partial-result ceremony on run failure",
                 run_id=run.run_id,
@@ -687,6 +745,7 @@ class RunLifecycleCoordinator:
             # not mask the original; the outer catch re-raises after.
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
             with best_effort(
                 "Generic failure ceremony on run failure",
                 run_id=run.run_id,

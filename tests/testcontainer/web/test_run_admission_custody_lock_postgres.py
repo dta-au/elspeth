@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 import structlog
 from sqlalchemy import Engine, event
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer.test_tools import _empty_state, _insert_user_message, _trained_tool_context
@@ -131,11 +132,15 @@ async def _operation(service: SessionServiceImpl, session_id: uuid.UUID, kind: S
 async def _seed_session_with_blob(
     service: SessionServiceImpl,
     blob_service: BlobServiceImpl,
+    engine: Engine,
     *,
     reference_blob: bool,
 ) -> tuple[Any, Any, BlobRecord]:
     """One session, one blob, and one saved state that does or does not reference it."""
-    session = await service.create_session(f"alice-{uuid.uuid4().hex[:8]}", "Lock domain", "local")
+    owner_id = f"alice-{uuid.uuid4().hex[:8]}"
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = await service.create_session(owner_id, "Lock domain", "local")
     async with _operation(service, session.id, SessionOperationKind.CREATE) as create:
         blob = await blob_service.create_blob(session.id, "tickets.csv", _BLOB_CONTENT, "text/csv", session_operation_context=create)
     sources = {
@@ -233,7 +238,7 @@ def test_create_run_waits_for_session_custody_lock_postgres(
 ) -> None:
     """The bare custody lock excludes run admission (the original 3d1d1fcb6c proof)."""
     service = postgres_service
-    session, state, _blob = asyncio.run(_seed_session_with_blob(service, blob_service, reference_blob=False))
+    session, state, _blob = asyncio.run(_seed_session_with_blob(service, blob_service, postgres_engine, reference_blob=False))
 
     lock_held = threading.Event()
     release = threading.Event()
@@ -295,7 +300,7 @@ def test_delete_blob_past_its_guard_excludes_run_admission_on_another_replica(
     commit after the delete commits — never inside the guard window.
     """
     service = postgres_service
-    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, reference_blob=True))
+    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, postgres_engine, reference_blob=True))
 
     parked, release, park_listener = _park_after_statement(postgres_engine, "INSERT INTO blob_deletion_cleanups")
     attempted, backend, probe_listener = _install_advisory_lock_probe(second_engine)
@@ -363,7 +368,7 @@ def test_update_blob_past_its_guard_excludes_run_admission_on_another_replica(
 ) -> None:
     """update-vs-run: same proof through the composer's update_blob custody transaction."""
     service = postgres_service
-    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, reference_blob=True))
+    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, postgres_engine, reference_blob=True))
     new_content = "id,value\n1,beta\n"
     message_content = f"Use this exact content:\n{new_content}"
     user_message_id = _insert_user_message(postgres_engine, str(session.id), message_content)
@@ -449,7 +454,7 @@ def test_run_admitted_first_is_observed_by_blob_delete_and_update(
 ) -> None:
     """The mirror order: a committed pending run is visible to both guards on the other replica."""
     service = postgres_service
-    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, reference_blob=True))
+    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, postgres_engine, reference_blob=True))
     run = _admit_run(second_service, session.id, state.id)
     assert run.status == "pending"
 

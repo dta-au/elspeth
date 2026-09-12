@@ -106,6 +106,10 @@ def engine():
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
+    from tests.fixtures.identities import ensure_test_identity
+
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return eng
 
 

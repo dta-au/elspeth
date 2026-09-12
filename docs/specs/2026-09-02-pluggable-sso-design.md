@@ -1,7 +1,19 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
-Date: 2026-09-02. Status: design, revision 2.11, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username. Revision 2.11 corrects a framing error, marked **[rev2.11]**: identity-provider client registrations were written as external dependencies owed to the project, when this is a public repository that stores no provider credential and a registration is a deployment-time input supplied by whoever deploys ELSPETH. A real client gates live verification and nothing else; §External dependencies is now §Deployment-time inputs, the AWS Terraform is recorded as creating the Cognito confidential client itself, and the VANguard spike is a live confirmation of a profile that is already written. **This revision narrows what it claims, and does not disturb D5.** It means the build and every test wait on nothing: steps 2 to 5 complete without any registration. It does not mean live verification left delivery scope. D5 stands as ruled — Cognito's client the repository's Terraform now mints itself, while VANguard's is issued by the operating organisation on its ABN-gated admin page (§Deployment-time inputs), so VANguard live verification remains a delivery obligation this project cannot discharge alone and must wait on that registration to close. A reader who takes "gates live verification and nothing else" as "nothing remains owed" has read it too broadly. Revision 2.12 corrects claims this document made about the tree that the tree does not support, marked **[rev2.12]**, found by sweeping the whole file for them rather than fixing them one at a time as they surfaced — three had surfaced separately on 2026-09-07 before the sweep was run, which is what made a sweep the right response. The corrections sort by what it costs to make each claim true, which turned out to be the useful axis. **Three are stranded one-way-window items** — placed inside the delivery's epoch window, none rode it, and the window has cut, so each now costs the second `rollback_permitted: false` cutover this spec was structured to avoid: the `audit_access_log` `writer_principal` third value D27 required (elspeth-e6c2d254b2), the four `calls` token columns rev2.1 specified (elspeth-255ae1a544, which also leaves `token_usage_ledger`'s `run` source arm with no data path), and the `run_web_plugin_policy` quota-row-id and wiring-allowlist-hash additions (elspeth-ff89d2bea0). They should ride whichever bump happens next for another reason, so the project pays one window rather than three. **The rest cost only code or a test**, and that distinction is worth keeping when reading them: the `auth_events` export path (elspeth-4699ddccc3), the exported-row identity snapshot, the per-login profile snapshot designated as the history of record, the five `compartment_id` stampings, and three claims that a test pins something it does not — the `WebPluginPolicyEvidence` field gate, worklist items 5 and 6, and the service-identity role revoke. **One correction runs the other way:** the `ck_auth_events_event_type` enumeration here listed twenty-one values where the tree ships twenty-three, omitting D26's two `review_requests` lifecycle events; there the tree was right and this document was incomplete. **Three more claims are true but were credited to the wrong thing** — the per-request `access_state` read, the pins on worklist items 5 and 6, and the AST deletion guard's scope — which is the subtlest failure here, because each passes a spot-check and each misdirects whoever next refactors the component that actually provides the guarantee. Wrong pointers and stale counts are corrected in place. The epoch literals in §Discriminator widening were removed rather than corrected: this spec states elsewhere that epoch numbers come from the runbook's compatibility record and never from here, and a document carrying that rule should not print the number. **This revision changes no ruling.** Every correction is to a statement of fact about what is built; where a requirement went unbuilt, the requirement stands and is now traceable to a ticket instead of reading as already satisfied.
+Date: 2026-09-02. Revision 2.13 (2026-09-12): design and implementation status, tracker milestone elspeth-07cd19ba73. This revision describes the VANguard residual prepared for release 0.8.1. Its schema definitions prepare an operator-owned cutover; installing code does not execute that procedure.
+
+## Current residual status [rev2.13]
+
+- **Audit export:** the current signed format explicitly distinguishes omitted auth history from an included empty selection. CLI/operator export can include deployment history visible in its read snapshot through run completion; Web execution refuses that deployment-wide scope, including recovery. Export preserves stored facts and does not manufacture historical identity snapshots.
+- **Prepared schema window:** Landscape **39 → 40** and Sessions **54 → 55**, following the ACA 39/54 definitions, contain the token columns, admission-policy evidence, ownership constraints, workflow read principal and lifecycle/refusal metadata. The named trigger is the operator's deployment of this prepared 0.8.1 schema pair under the existing archive/recreate runbook with `rollback_permitted: false`. These definitions must travel together; another unrelated bump is not a prerequisite. Preparing the code does not execute the cutover.
+- **Identity lifecycle:** configured admin seeding uses retained human-admin history; operator recovery remains a separate zero-active-admin operation. Authentication audit reuses an application-lifetime Landscape engine. Identity withdrawal reaches approval revocation and chargeable admission; the detailed behavior and remaining requirements are stated below.
+- **Token quota posture:** accounting is unavailable, so applicable active quota policies refuse chargeable work explicitly, even when boot issuance defaults are absent. Required missing policy slots also refuse. Only an active identity with neither configured policy requirements nor an applicable active identity/container policy can receive the explicit no-quota allowance. An absent ledger total is never treated as zero. This is a fail-closed delivery, not a claim that token-ledger aggregation is implemented.
+- **Acceptance:** desktop and PostgreSQL testcontainer proofs are the delivery gates. Live IdP registration, live cloud trials and operator-run acceptance are not sprint obligations. Deployment registration remains an operator input.
+
+The revision history below describes earlier findings. Statements about the then-current tree and advice to wait for an unrelated epoch bump are historical; this revision's status and corrected sections supersede them.
+
+## Revision history
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username. Revision 2.11 corrects a framing error, marked **[rev2.11]**: identity-provider client registrations were written as external dependencies owed to the project, when this is a public repository that stores no provider credential and a registration is a deployment-time input supplied by whoever deploys ELSPETH. §External dependencies became §Deployment-time inputs; AWS Terraform creates the Cognito confidential client, and VANguard's profile is already implemented. **The operator's 2026-09-10 ruling supersedes the former live-verification obligation:** delivery acceptance uses desktop and testcontainer proofs; no live IdP, live AWS run, or operator trial gates this sprint. Provider registration remains deployment configuration. Unexpected deployed-provider behavior is an incident input, not deferred delivery work. Revision 2.12 corrects claims this document made about the tree that the tree does not support, marked **[rev2.12]**, found by sweeping the whole file for them rather than fixing them one at a time as they surfaced — three had surfaced separately on 2026-09-07 before the sweep was run, which is what made a sweep the right response. The corrections sort by what it costs to make each claim true, which turned out to be the useful axis. **Three are stranded one-way-window items** — placed inside the delivery's epoch window, none rode it, and the window has cut, so each now costs the second `rollback_permitted: false` cutover this spec was structured to avoid: the `audit_access_log` `writer_principal` third value D27 required (elspeth-e6c2d254b2), the four `calls` token columns rev2.1 specified (elspeth-255ae1a544, which also leaves `token_usage_ledger`'s `run` source arm with no data path), and the `run_web_plugin_policy` quota-row-id and wiring-allowlist-hash additions (elspeth-ff89d2bea0). They should ride whichever bump happens next for another reason, so the project pays one window rather than three. **The rest cost only code or a test**, and that distinction is worth keeping when reading them: the `auth_events` export path (elspeth-4699ddccc3), the exported-row identity snapshot, the per-login profile snapshot designated as the history of record, the five `compartment_id` stampings, and three claims that a test pins something it does not — the `WebPluginPolicyEvidence` field gate, worklist items 5 and 6, and the service-identity role revoke. **One correction runs the other way:** the `ck_auth_events_event_type` enumeration here listed twenty-one values where the tree ships twenty-three, omitting D26's two `review_requests` lifecycle events; there the tree was right and this document was incomplete. **Three more claims are true but were credited to the wrong thing** — the per-request `access_state` read, the pins on worklist items 5 and 6, and the AST deletion guard's scope — which is the subtlest failure here, because each passes a spot-check and each misdirects whoever next refactors the component that actually provides the guarantee. Wrong pointers and stale counts are corrected in place. The epoch literals in §Discriminator widening were removed rather than corrected: this spec states elsewhere that epoch numbers come from the runbook's compatibility record and never from here, and a document carrying that rule should not print the number. **This revision changes no ruling.** Every correction is to a statement of fact about what is built; where a requirement went unbuilt, the requirement stands and is now traceable to a ticket instead of reading as already satisfied.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -46,29 +58,29 @@ The tech-debt-free window is weeks, not months.
 | # | Decision | Ruling |
 |---|----------|--------|
 | D1 | Persisted provider discriminator | Per-IdP values: `local`, `oidc`, `entra`, `vanguard`, `google`. |
-| D2 | Who exchanges the authorization code | The backend, as a confidential client. Browser-side PKCE is deleted, not kept as a fallback. Cognito re-registers as confidential in this delivery. |
+| D2 | Who exchanges the authorization code | The backend, as a confidential client. Browser-side PKCE is deleted, not kept as a fallback. Cognito's confidential-client configuration is a deployment input; delivery proves the exchange with fixtures. |
 | D3 | Where an SSO profile lives | `identities` table in the web state (sessions) store. Session JWT stays minimal. |
 | D4 | Staff relationships | Directed typed edges in `identity_relationships`, curated manually via admin routes. No derivation from IdP data, no approval enforcement in this delivery. |
-| D5 | Delivery scope | Framework + all four profiles + Cognito migration + old path deleted. VANguard and Cognito verified live; Google verified live when a client exists. |
+| D5 | Delivery scope | Framework + all four profiles + Cognito migration + old path deleted. **Operator ruling 2026-09-10:** desktop and testcontainer proofs establish delivery acceptance; no live IdP, AWS run, or operator trial is a sprint gate. |
 | D6 **[rev2]** | Session subject and ownership key | `sub` = `identity_id`. `sessions`, `user_secrets`, `user_preferences`, and Landscape `run_attributions` are keyed on `identity_id`. Accepted on reviewer recommendation; reversible until phase 1 lands. |
 | D7 **[rev2]** | Local users | Get an `identities` row on first login (`provider='local'`, `subject=username`). `auth.db` becomes credentials only. Accepted on recommendation. |
 | D8 **[rev2]** | `relationship_type` | Closed CHECK + L0 Literal (`approver` only now, per D16), widened per delivery. Accepted on recommendation. |
 | D9 **[rev2]** | Roles | `identity_roles` table ships now (`admin`, `curator`); `sso_admin_subjects` only seeds the first admin. Accepted on recommendation. |
-| D10 **[rev2]** | Principal above identity | No `principals` table. The VANguard spike asks for a stable non-email subject; if none, detection columns plus a refusal (§Refusals R3). Identity merge is an unbuilt admin action. |
+| D10 **[rev2]** | Principal above identity | No `principals` table. VANguard fixtures exercise opaque and email-shaped subjects; detection columns and refusal protect rebound (§Refusals R3). Identity merge is an unbuilt admin action. |
 | D11 **[rev2.1]** | Operator facts, now ruled | Quota is **per person**, the aggregate of tokens used in the composer and tokens used in runs. Approval quorum is one (a count column is "for but not with"). The term is **flex teams**, not hybrid teams: anyone in the organisation can log on to any container (deployment) of that organisation, but permissions are federated within that container only. The system takes SSO accounts; a container administrator (a container-operations person, D14) grants `user`, `approver`, or `reviewer` permission and wires them into that container's org **tree**. The organisation console (§Terminology) is the later cross-container affordance and is explicitly not built now. |
 | D12 **[rev2.1]** | Default access | **No access, even with SSO, until an administrator gives the tick of approval.** A first login creates an identity in `pending`; no session token is issued until an admin activates it. |
 | D13 **[rev2.1]** | Workflow tables | Built "for but not with": basic columns now, fleshed out later, all in the same epoch pass. See §Workflow tables. |
 | D14 **[rev2.3]** | Admin separation of duties | **(a).** `admin` is *container operations*, held by someone technical (CTO branch or similar), not a workload role. An identity holding `admin` may not hold `approver`, `reviewer`, `user`, or `curator` in the same container, and vice versa (R8). |
-| D15 **[rev2.3]** | Quota numbers | `quota_default_tokens_per_day` is a **required container setting** (`WebSettings`, required unless `local`). Activation writes a `quota_policies` row with that number; an admin may override it per identity afterwards. `quota_container_tokens_per_day` is an optional ceiling. No applicable policy ⇒ refuse (only reachable through corruption, since every activated identity gets a row). |
+| D15 **[rev2.3, rev2.13]** | Quota numbers | Token quota settings are optional issuance defaults and required-policy declarations, not enforcement-disable switches. Explicit operator/CLI policy rows remain authoritative when those defaults are absent. Missing required policy refuses; otherwise applicable active identity/container policies refuse unavailable accounting (R14). Only no requirements plus no applicable active policy permits the explicit no-quota allowance. Per-identity overrides and an optional container ceiling remain the policy model. The earlier required-unless-local assertion did not describe the implementation. |
 | D16 **[rev2.3]** | Role and edge names | `approver` (was `manager`) and `reviewer`. Role `approver` may decide approvals and hold `approver` edges; the tree edge type is `approver` ("A is B's default approver"). Role `reviewer` may attest. "Manager" and "lead" appear nowhere in schema, API, or UI. |
 | D17 **[rev2.3]** | IdP groups | Dropped. `groups_json` is removed; the Entra profile no longer extracts `groups`/`roles` and the group-overage check is gone with them; `UserProfile.groups` is always empty for SSO. |
-| D18 **[rev2.5]** | Disk quota for uploaded blobs | Per person, a **level** not a rate: `SUM(blobs.size_bytes)` over the live blob rows of every session the identity owns (fork copies bytes, so each session's rows are real disk). `quota_default_storage_bytes` is a required container setting written into the identity's `quota_policies` row at activation, overridable per identity by an admin; `quota_container_storage_bytes` is an optional ceiling. Enforced at both upload routes under the existing per-session blob lock, before bytes are written; the existing `max_blob_storage_per_session_bytes` stays as the inner per-session bound. Over quota refuses and writes `quota_exceeded` with `dimension=storage`; accounting unavailable refuses (R13). |
+| D18 **[rev2.5, rev2.13]** | Disk quota for uploaded blobs | Per person, a **level** not a rate: `SUM(blobs.size_bytes)` over live rows of every session the identity owns. `quota_default_storage_bytes` and the container ceiling are optional in current `WebSettings`; a configured regime writes its policy on activation. R13 specifies the required admission behavior; this residual does not claim to complete storage-quota enforcement. The existing per-session blob bound remains separate. |
 | D19 **[rev2.7]** | `service` in the provider discriminator | Two L0 types. `AuthProviderType` keeps the five login values and governs settings, the registry, session tokens, `sessions`, `user_secrets` and both Landscape CHECKs. `IdentityProviderType = Literal[AuthProviderType, "service"]` (nested, so `get_args` flattens) governs `identities.provider` alone, under its own named CHECK constant. Putting `service` in `AuthProviderType` fails the import-time parity assert and the app does not boot. **Applied on review recommendation; reversible until phase 1 lands.** |
-| D20 **[rev2.7]** | Bootstrap admin | The seed and the operator CLI each write `access_state='active'`, an `admin` role, no workload role, and the audit pair in one transaction; the seed fires only while the container has zero active human admins. Activation accepts `role=none`, which is what an `admin` must be activated with under R8. The contradicting "lockout recovery is a config change" sentence is deleted. **Applied on review recommendation.** |
+| D20 **[rev2.7, rev2.13]** | Bootstrap admin | The seed and operator CLI each write active access, an admin role without a workload role, and the audit pair in one transaction. Configured seeding is consumed once any human-admin role has existed, including revoked or expired history. The operator CLI separately permits recovery when there are zero active human admins. Activation accepts `role=none` for admins under R8. |
 | D21 **[rev2.7]** | VM in-place rebuild | Withdrawn. Both deployment paths use the existing reset runbook, because the pre-1.0 gate this spec cites for ECS forbids in-place migration everywhere, and the promised byte-for-byte preservation of `user_secrets` is false across a key-derivation change. Re-admission of the known cohort moves inside the cutover window. **Applied on review recommendation; the fact it rests on is the runbook's own standing rule, not an assumption.** |
 | D24 **[rev2.8]** | Storage quota exactness | **Eventually consistent, not exact.** The per-session lock does not serialise two sessions of one identity, and making it exact needs an identity-scoped lock held across the fork copy loop, which would serialise every other upload by that identity for the duration of a fork. R13 instead enumerates all four byte-admitting sites, which is where the real hole was. Revisit only if measurement shows real overshoot. |
 | D26 **[rev2.8]** | Record of a requested review | A sibling `review_requests` table. Widening `review_attestations` with a `requested` verdict contradicts its own append-only, non-null-reviewer, ledger-not-control design and would fill the audit view with requests nobody completed. |
-| D27 **[rev2.8]** | Approver's read of another identity's session | Authorized per request over roles plus the live request row, minting no token, never through the shareable-review bearer capability. It writes an `audit_access_log` row under a new `writer_principal` value, which this ruling required be added in the delivery's epoch because adding it later costs the one-way window. **That value was never added and the epoch has since cut [rev2.12].** `web/sessions/models.py` still constrains the column to `('audit_grade_view', 'admin_tool')`; the window closed at sessions epoch 52 and the head is past it. D27's own cost argument therefore now applies to D27: implementing the approver read costs exactly the second window this ruling was written to avoid. Tracked as elspeth-e6c2d254b2 — the cheap remedy is to fold the value into whatever epoch bump happens next for another reason, which is why it is filed now rather than when the mailbox is built. |
+| D27 **[rev2.8, rev2.13]** | Approver's read of another identity's session | Authorized per request over roles plus the live request row, minting no token, never through the shareable-review bearer capability. The prepared Sessions schema reserves `workflow_inspect` alongside `audit_grade_view` and `admin_tool`. Reserving this writer principal resolves the schema gap (elspeth-e6c2d254b2); it does not implement the future approver-read API or its authorization. |
 | D28 **[rev2.8]** | Actor column on the container-ceiling quota row | Nullable FK plus a closed `set_by_actor` CHECK (`identity`, `config`, `operator`, `system`), mirroring `writer_principal`. A placeholder identity would put a fake row in the table R5 counts. |
 | D29 **[rev2.8]** | Workflow-table FK deletion rule | `RESTRICT`, declared explicitly, plus `durable_history_exists` extended to count approvals, attestations and library entries so archive refuses instead of discarding them. `published_from_session_id` becomes a provenance column, not an FK. Declaring nothing was never neutral: it ships `RESTRICT` by accident. |
 | D30 **[rev2.8]** | Acceptance criteria for the workflow half | Ship them with it. §Testing gains a workflow-governance subsection, R11 refuses at startup loudly rather than switching enforcement off silently, and the suite runs against a closed local deployment. |
@@ -76,14 +88,12 @@ The tech-debt-free window is weeks, not months.
 | D32 **[rev2.8]** | Does R3 disable the identity | Yes: `disabled`, `disable_reason='rebound'`, actor `system`, audit row. It honours R5 on the last active human admin rather than bricking the container, and it does **not** run the edge-revocation cascade, which is unrecoverable and fires most often on a marriage or a rename. |
 | D34 **[rev2.8]** | Dormancy versus the last admin | R9 carries R5's last-admin exemption. Otherwise a single-admin container reaches zero active admins at day 91 by doing nothing, and the first-login-only seed cannot re-fire. |
 
-**[rev2.11] D10's narration, not its ruling.** D10 says "the VANguard
-**spike**". rev2.11 renamed that section to §VANguard live confirmation, so
-the word now names nothing; read it as pointing there. Its conditional has
-also moved: the profile is written and keys on `sub` either way
-(`map_vanguard`), and the detection columns `subject_email_at_first_seen`
-and `rebound_at` are on `identities`. What a live token pair still settles
-is whether that `sub` is stable and non-email — the subject is an email
-today — which is exactly why those columns exist.
+**D10's implementation and desktop evidence (2026-09-10).** The former
+VANguard spike is superseded by §VANguard fixture contracts. The profile
+keys on `sub` (`map_vanguard`); `subject_email_at_first_seen` and `rebound_at`
+exist on `identities`. Synthetic fixtures exercise subject and email changes
+without a real token pair. An unexpected deployed subject contract is an
+incident to investigate, not an outstanding registration or acceptance task.
 
 **[rev2.13] R3 is now implemented** (elspeth-9c25083a03).
 `ensure_identity` compares every IdP login's verified email against
@@ -305,10 +315,13 @@ produced.
 **The quota row is written only where a quota regime exists [rev2.10].**
 D31 requires every activating path to write the per-identity row from
 `quota_default_tokens_per_day` / `quota_default_storage_bytes`. Both are
-OPTIONAL settings, and a container that configures neither has no quota regime
-at all: there is no allowance to record, and inventing a number would impose a
-limit the operator never chose. So activation writes the row when both
-defaults are configured, and writes nothing when they are not. **Consequence
+OPTIONAL issuance settings: when neither supplies an allowance, activation
+must not invent one. Activation writes the row when both defaults are
+configured, and writes nothing from defaults when they are not. **This does
+not disable an explicit policy [rev2.13]:** an operator may have created an
+active identity or container policy independently, including through the
+bootstrap CLI. Admission always reads those rows and preserves their IDs in
+the decision, even when boot defaults are absent. **Consequence
 to close with the enforcement:** enabling quotas on a container that has
 already admitted people needs a backfill, and phase 4's enforcement must
 refuse on "a regime is configured and this identity has no row", never on
@@ -571,6 +584,13 @@ and the cross-check that should have caught this instead confirmed it.
 
 ### Two epochs, one window [rev2]
 
+**Prepared residual update [rev2.13]:** the source histories now bind the
+VANguard additions to Landscape 40 and Sessions 55 after ACA 39/54. This is
+the prepared 0.8.1 pair, not evidence that any deployed store has been reset.
+The trigger is deployment of that pair after release verification and the
+operator's archive/recreate decision. Include all additions in this batch;
+do not defer them to the next unrelated schema change.
+
 Landscape compares declared CHECK text against the reflected constraint
 structurally, so the widened constraints trip its schema validator exactly as
 the 2026-08-14 index change did. Both epochs bump in the same delivery and
@@ -706,46 +726,23 @@ whole state in **one audited transaction**: `access_state='active'`,
 `admin` role row, **no workload role** (R8), and the `identity_activated` +
 `role_granted` audit pair.
 
-- `sso_admin_subjects` seeds a listed subject at first login **only while the
-  container has zero active human admins**.
-- The operator CLI (`elspeth composer users bootstrap-admin`) does the same
-  thing on demand.
+- `sso_admin_subjects` uses `AdminBootstrapMode.CONFIGURED_SEED`. A retained
+  human `admin` role consumes the seed permanently for that store, even if
+  the role expires or is revoked, or the identity becomes inactive. The
+  population transaction serializes this check with the grant. No new flag
+  or fabricated bootstrap identity is needed (elspeth-f4e69fe3bc).
+- The operator CLI uses `AdminBootstrapMode.OPERATOR_RECOVERY`, gated on zero
+  active human admins. It can recover after the configured seed is consumed;
+  it cannot override an active human administrator. A credential lockout with
+  an active administrator requires the operator's existing retirement/recovery
+  procedure, not a configuration change.
 
-**Both are gated on the same live count, and it is a count, not a lifecycle
-fact [rev2.11].** `bootstrap_admin` refuses when
-`_active_human_admin_count(...) > 0`, re-evaluated inside the transaction
-under the population lock; no durable "has ever been bootstrapped" flag
-exists in the schema, and no column could answer that question. Two
-consequences the earlier text had backwards:
-
-- The seed **re-arms**. It is inert *while* an active human admin exists, not
-  permanently. Should the container fall back to zero — the sole admin
-  disabled, deleted, or offboarded — every subject still listed self-grants
-  `admin` at their next login. A deployment must therefore DELETE the setting
-  once the first administrator is activated; leaving it is a standing grant
-  in all but name (elspeth-f4e69fe3bc).
-- The CLI is **not** the path once an admin exists. It calls the same guarded
-  method and is refused under the identical condition, so it recovers only
-  the zero-admin case — the same case in which the seed re-arms. It is
-  preferable to the seed because it leaves nothing behind in configuration,
-  not because it reaches further. A lockout where the admin row is active but
-  that person can no longer authenticate is recoverable by neither, and needs
-  direct work against the sessions store.
-
-An earlier revision said "once one exists the list is inert, so it never
-becomes a standing grant", and that lockout recovery is "**not** a config
-edit" [rev2.2]. The first is false whenever the count returns to zero; the
-second is true only while an admin exists, which is precisely the state in
-which nobody is locked out. R5 counts only *active human* identities with an
-unexpired, unrevoked `admin` role. Grant and revoke are admin-only in this
-delivery; delegated administration is phase 4.
-
-The D20 walk is proved at UNIT level. An integration-level pin — a fresh
-`--init-schema` store plus one listed subject, walked through
-`start → callback → complete`, yielding a session token and a role list of
-exactly `admin` — is **outstanding work, not a shipped test**
-(elspeth-b9a109f9f0). rev2.7 wrote it in the present tense as "pinned by an
-integration test"; no such test exists in the tree [rev2.11].
+`tests/integration/web/test_sso_configured_bootstrap.py` now exercises the
+real fake-IdP HTTP `start → callback → complete` walk for generic OIDC and
+VANguard against the identity store, asserting active access and the sole
+`admin` role. This supplies the missing integration pin
+(elspeth-b9a109f9f0). Final integrated release verification is separate from
+the existence of these tests.
 
 ### `identity_relationships` (sessions store) [rev2]
 
@@ -776,6 +773,28 @@ and makes its `user_secrets` unresolvable while not `active`. The tree
 carries one job: who oversees whom, for the approver's audit view. Approver
 eligibility and leave cover are role questions, not tree questions.
 
+**Implemented withdrawal effects [rev2.13, elspeth-dcd26dcfe5]:** identity
+authority emits an owned lifecycle event through a required injected effect
+on its existing Sessions transaction. Approval authority owns the SQL and
+revokes only open requests whose requester or approver is the affected
+identity. It records `revoked_by_identity_id`, `revocation_actor_kind` and
+`revocation_event_id` with `decided_at`; system/operator actions carry no
+invented identity. This event ID identifies the lifecycle transition, not a
+foreign key to a Landscape auth row. Re-enabling does not revive requests.
+Administrator disable, rebound, dormancy and operator retirement use this
+effect; rebound still does not perform the irreversible relationship-edge
+cascade. Effect or audit-callback failure rolls back the Sessions transaction;
+the separate Landscape store is not claimed to share that transaction.
+
+Run admission locks and rechecks identity authority before granting a permit
+or restoring executable inputs. A pending/disabled/missing owner receives a
+durable refusal and bounded terminal event rather than disappearing from
+recovery discovery. The persisted `admission_refusal_pending` marker remains
+until cleanup is reconciled; cancellation cleanup uses its existing custody
+and does not request fresh chargeable authority. Previously issued permit
+facts are retained when a later recovery attempt is refused. Final integrated
+race and cleanup verification remains a release gate.
+
 ### `sso_handoffs` (sessions store) [rev2]
 
 As in §Handoff.
@@ -783,7 +802,11 @@ As in §Handoff.
 ### Ownership re-key [rev2, D6]
 
 `sessions.user_id`, `user_secrets.user_id`, `user_preferences.user_id` carry
-`identity_id` with a foreign key to `identities`. Landscape
+`identity_id` with explicit `ON DELETE RESTRICT` foreign keys to
+`identities.identity_id` in the prepared Sessions schema [rev2.13]. The
+column names remain `user_id`; no second ownership identifier is introduced.
+This constraint change joins the paired recreation window
+(elspeth-2371269e07 and elspeth-93e7d5ff6a). Landscape
 `run_attributions.initiated_by_user_id` carries `identity_id` (no cross-store
 FK). `auth_provider_type` columns stay for the audit reader. The contract
 test keeps pinning that none of these boundaries widens to `str`.
@@ -823,23 +846,15 @@ test keeps pinning that none of these boundaries widens to `str`.
   Business-rule refusals (R5, R7, R8, R10) keep their own categories and are
   **not** filed as authorization denials: an authorized caller hitting a rule
   is not an escalation attempt, and conflating them poisons the audit view.
-- `calls` gains nullable `prompt_tokens`, `completion_tokens`,
-  `cached_prompt_tokens`, `reasoning_tokens` written from the provider's
-  `TokenUsage` at call-record time **[rev2.1]**. Measured 2026-09-02: the
-  `calls` table stores only request/response hashes and refs; LLM token
-  counts live inside the response payload blob and are not queryable, and
-  the MCP "LLM usage report" counts pipeline row-tokens, not LLM tokens.
-  So "tokens used in runs" is NOT exposed today; these columns expose it.
-  **None of the four was added, and the Landscape epoch has cut [rev2.12].**
-  `core/landscape/schema.py`'s `calls_table` carries none of them, and the
-  epoch-37 history entry records what actually rode that window —
-  `auth_events.identity_id`, the `event_type` widening, the provider
-  discriminator — with no `calls` change. The 2026-09-02 measurement above
-  therefore still describes the tree exactly: run token counts remain
-  unqueryable. Note what made this hard to see: `contracts/token_usage.py`
-  defines all four field names on `TokenUsage`, so a tree-wide grep for them
-  succeeds and reads as confirmation. The contract exists; nothing persists
-  it. Tracked as elspeth-255ae1a544.
+- `calls` now has nullable nonnegative `prompt_tokens`, `completion_tokens`,
+  `cached_prompt_tokens` and `reasoning_tokens` in the prepared Landscape
+  schema [rev2.13, elspeth-255ae1a544]. State and operation call writers,
+  readers and signed exports preserve the provider's admitted `TokenUsage`.
+  Missing measures remain NULL; reported zero remains zero. Known usage
+  survives completion/serialization rejection and HTTP error responses.
+  Transport rows do not duplicate the logical LLM call's token charge.
+  These queryable measures do not themselves populate `token_usage_ledger`;
+  configured token-quota admission therefore refuses as described in R14.
 - New nullable indexed column `identity_id`.
 - `login` is written at callback, `token_issued` at complete, joined by
   `request_id`. `metadata_json` for `login` is `{identity_id, provider,
@@ -853,36 +868,51 @@ test keeps pinning that none of these boundaries widens to `str`.
   unlike the three stranded items above it costs no epoch window.
 - Every admin mutation writes its row synchronously, crash-on-failure, before
   the response (ADR-022 D2 ordering).
-- `auth_events` gains an export path in the existing signed exporter **in
-  this delivery** [rev2.2]: it is the only record of admission, role, and
-  tree changes, and the record an accreditor asks for first. Every exported
-  Landscape row that carries `identity_id` also carries the `(provider,
-  subject, organisation_id, username)` snapshot at write time, so the export
-  is self-describing without the sessions store. The per-run policy record
-  (`run_web_plugin_policy`) also records the `quota_policies` row ids and the
-  secret-wiring allowlist hash in force. Long-term retention remains a
-  separate product question.
-  **None of those three is true at HEAD [rev2.12], and they fail at two
-  different costs.** Taking them in order:
-  1. There is no export path. `auth_events` is referenced by exactly three
-     source files — the table, the name list in `database.py`, and its
-     writer — and by none of the exporter modules; the signed exporter is
-     run-scoped. No step of §Rollout order owns this work either.
-     Tracked as elspeth-4699ddccc3. Cost: **code, not a window** — an
-     exporter change needs no cutover.
-  2. The identity snapshot is not on the row: `auth_events` has `provider`,
-     `username` and `identity_id`, but no `subject` and no
-     `organisation_id`, and `organisation_id` never crosses into Landscape
-     at all. Cost: also code — `metadata_json` is free-form Text and can
-     carry both. So a reader deciding an export is sufficient evidence, or
-     scoping sessions-store retention against it, is wrong twice over: the
-     keys are not on the row and the row is not exported.
-  3. `run_web_plugin_policy` records neither addition — 12 columns, ending
-     `binding_generation_fingerprint`, `decision_codes_json`. Cost: **a
-     one-way window**, because it is a Landscape column addition. Tracked as
-     elspeth-ff89d2bea0, and it should ride the same bump as
-     elspeth-e6c2d254b2 and elspeth-255ae1a544 so the project pays one
-     window rather than three.
+  Authentication audit now starts one Landscape engine before application
+  traffic and reuses it across login/admission transactions. Application and
+  CLI ownership close that engine on shutdown or failed initialization;
+  engine construction is no longer nested inside the Sessions admission lock
+  (elspeth-290ef95744).
+- **Auth export [rev2.13, elspeth-4699ddccc3]:** current producer
+  `landscape-exporter-auth-v1` signs both `audit_export_config` and
+  `auth_event_coverage`. The default `auth_events=omitted` carries a null
+  selected count/cutoff and `reason=not_requested`; it does not assert there
+  were no events. `deployment_snapshot` includes the deployment's event
+  rows visible in one read transaction with `occurred_at <= run.completed_at`.
+  Its coverage records the actual selected count, including zero, and
+  `selection_basis=visible_rows_at_or_before_run_completion`. Bounded keyset
+  pages share that snapshot; later commits and post-completion events are
+  outside its stated scope. Producer and registered reader check the signed
+  public configuration hash and coverage count/policy/cutoff. Legacy v1/v2
+  readers retain their old contracts; absence of coverage in an old bundle
+  is unknown coverage, never an included-empty claim.
+  CLI/operator settings may request this deployment-wide history. Web workers
+  refuse it independently of the export enabled flag, including restored
+  execution envelopes: session download authority does not authorize other
+  identities' history. No export-specific schema change was needed.
+- **Identity snapshot claim explicitly refuted [rev2.13]:** an exported
+  `identity_id` does not guarantee a write-time `(provider, subject,
+  organisation_id, username)` tuple. Auth rows retain their stored provider,
+  user ID, username and metadata; subject/organisation snapshots are not
+  universally recorded, and login metadata is not a full profile history.
+  Export performs no join to current Sessions identities to invent a past
+  snapshot and does not backfill missing facts. Do not discard identity
+  history on the assumption that this export reconstructs it. Long-term
+  retention remains a separate product decision.
+- **Admission evidence [rev2.13, elspeth-ff89d2bea0]:** the prepared
+  `run_web_plugin_policy` row adds paired nullable `admission_decision_json`
+  and `admission_decision_hash`. The strict owned decision contains the
+  actual identity/container quota-policy row IDs, explicit quota disposition
+  and canonical secret-wiring allowlist hash (including a real hash for
+  deny-all). It is bound to the durable permit decision, not re-sampled from
+  mutable configuration at export time. Absent historical assessment,
+  explicitly unconfigured quotas and unavailable accounting remain distinct.
+  Recovery preserves original admission facts and records a later refusal
+  separately. The exporter includes this evidence with the preparation
+  policy. This schema addition joins the paired residual window; it must not
+  wait for a later unrelated bump. The export bug and broader step
+  elspeth-5b01e59986 overlap, but policy evidence and identity-history limits
+  remain distinct concerns.
 
 ## Settings (`WebSettings`) [rev2]
 
@@ -896,9 +926,9 @@ test keeps pinning that none of these boundaries widens to `str`.
 | add | `sso_transaction_secret: SecretStr` | required unless local; `secret_key` strength validators apply |
 | add | `google_hosted_domain: str` | required for `google`; forbidden otherwise |
 | add | `sso_admin_subjects: tuple[str, ...]` | bootstrap only; seeds the first `admin` role row |
-| add | `quota_default_tokens_per_day: int` | **required unless local** (D15); every activation writes a `quota_policies` row with this value, overridable per identity by an admin |
-| add | `quota_container_tokens_per_day: int \| None` | optional container ceiling row (D15) |
-| add | `quota_default_storage_bytes: int` | **required unless local** (D18); written into the same `quota_policies` row at activation |
+| add | `quota_default_tokens_per_day: int \| None` | optional issuance default and identity-policy requirement; absence does not disable existing explicit policy (D15, R14) |
+| add | `quota_container_tokens_per_day: int \| None` | optional container ceiling requirement; an active explicit container policy applies even when this setting is absent (D15, R14) |
+| add | `quota_default_storage_bytes: int \| None` | optional in current settings; a configured regime writes it into the activation policy (D18) |
 | add | `quota_container_storage_bytes: int \| None` | optional container disk ceiling (D18) |
 | keep | `max_upload_bytes`, `max_blob_storage_per_session_bytes` | per-file and per-session inner bounds; the identity quota is the outer bound |
 | add | `compartment_id: str` | required unless local; the marking stamped into exports, library rows, and audit metadata |
@@ -978,7 +1008,7 @@ this paragraph previously said the opposite of the paragraph that ruled it].
 | oidc (Cognito) | `sso_issuer` | issuer + `sso_endpoint_origins` | none | `preferred_username` → `cognito:username` → `sub` | no | confidential app client with the ELSPETH callback URL; on AWS the repository's Terraform creates it in `upgrade` mode with `generate_secret = true` and passes the minted secret to the task by ARN [rev2.11] |
 | entra | derived from tenant | `login.microsoftonline.com` | `tid` | `preferred_username` → `sub` | no | groups and roles are not collected (D17); the group-overage check is gone with them |
 | vanguard | `sso_issuer` | same as issuer | none | `sub` (email today) | yes | `given_name`, `family_name`, `abn` → `organisation_id`; display name from name parts |
-| google | `https://accounts.google.com` (the bare `accounts.google.com` form is rejected) | the four Google origins above | `email_verified` true; `hd` = `google_hosted_domain` (absent for non-Workspace accounts, fails closed) | `email` → `sub` | no | refuses to start without a hosted domain |
+| google | Discovery: `https://accounts.google.com`; token issuer: that exact value or `accounts.google.com` | the four Google origins above | `email_verified` true; signed `hd` = `google_hosted_domain` (absent for non-Workspace accounts, fails closed) | `email` → `sub` | no | refuses to start without a hosted domain; issuer alias belongs only to Google |
 
 ### VANguard facts measured 2026-09-02
 
@@ -988,32 +1018,41 @@ origin; `S256`; `RS256`; `token_endpoint_auth_methods_supported` =
 `client_secret_post`, `client_secret_basic`, `private_key_jwt`; no
 `claims_supported` published.
 
-### VANguard live confirmation [rev2.11]
+### VANguard fixture contracts [operator ruling 2026-09-10]
 
-**[rev2.11: this read "spike (before the profile is written)". The profile is
-written — it keys on `sub` and calls userinfo — so these are the assumptions it
-already ships on, and a deployment holding a real confidential client and token
-pair confirms them. It is not a gate on writing the profile.]** In this order:
+The profile is implemented: it keys on `sub` and calls userinfo. The former
+registration spike is superseded. Desktop fixtures exercise these contracts;
+they do not claim observation of a deployed VANguard token:
 
-1. Does the ID token carry any **stable, non-email subject**? (D10 hinges
-   on it. If yes, the profile keys on it and `email` is a claim.)
-2. Exact ID-token claim set (`nonce` presence, `aud` shape).
-3. Exact userinfo body (`given_name`, `family_name`, `abn` key names/types).
-4. Whether the JWKS entries carry `alg`.
-5. Whether the token endpoint accepts `client_secret_basic` for that client.
+1. Subject identity and email-change/rebound behavior (D10, R3).
+2. Required ID-token claims, nonce binding and audience shape.
+3. Userinfo subject binding and `given_name`, `family_name`, `abn` parsing.
+4. JWKS key and algorithm validation, including malformed entries.
+5. Confidential-client `client_secret_basic` exchange.
 
-A real token pair, once a deployment has one, can be added as a fixture
-(redacted signature, pinned claims). It is an addition to the synthetic
-fixtures, never a precondition for them [rev2.11].
+`tests/helpers/fake_idp.py` supplies the signed-token and userinfo boundary.
+`test_sso_callback.py` proves name/ABN mapping and refuses a mismatched
+userinfo subject before identity upsert. Report any later deployed mismatch
+through the incident channel; collecting a real token pair is not sprint work.
 
-### Google facts measured 2026-09-02 (by review)
+### Google published contract checked 2026-09-10
 
-Discovery: authorization `accounts.google.com/o/oauth2/v2/auth`, token
+The [published discovery document](https://accounts.google.com/.well-known/openid-configuration)
+pins issuer `https://accounts.google.com`: authorization `accounts.google.com/o/oauth2/v2/auth`, token
 `oauth2.googleapis.com/token`, jwks `www.googleapis.com/oauth2/v3/certs`,
 userinfo `openidconnect.googleapis.com/v1/userinfo`. `claims_supported`
-does not list `hd`; it is emitted for Workspace accounts only. A live check
-needs a client from whoever owns the Workspace domain, which is a deployment
-errand; the profile and its tests do not wait for one [rev2.11].
+does not list `hd`. The [Google OIDC token contract](https://developers.google.com/identity/openid-connect/openid-connect)
+accepts exactly `https://accounts.google.com` and `accounts.google.com` as
+token issuers. Only the Google profile declares the latter alias; discovery
+still requires the canonical HTTPS issuer, with no URL normalization.
+
+The signed `hd` claim identifies a Workspace or Cloud organization domain;
+absence means no hosted domain. ELSPETH requires verified email and an exact
+match to `google_hosted_domain`. The request's `hd` parameter is a UI hint,
+not authorization. These facts come from documentation, not discovery's
+claim list or a live account. Signed fixtures cover both issuer forms and
+refuse foreign spellings; existing claim fixtures cover missing/wrong `hd`.
+No OAuth registration or live account gates delivery.
 
 ## Refusals [rev2]
 
@@ -1128,6 +1167,25 @@ errand; the profile and its tests do not wait for one [rev2.11].
   a control with no number gets no adversarial test. Eventually consistent on
   the same terms as R13. The day boundary is UTC midnight, named in the test.
 
+  **Implemented admission posture [rev2.13]:** the accounting adapter is not
+  complete, so there is no measured daily total to compare. Admission reads
+  active identity and container policies regardless of boot defaults. A
+  configured requirement whose policy slot is missing refuses with
+  `quota_policy_missing`; otherwise any applicable active policy refuses with
+  `token_accounting_unavailable`, recording the actual policy IDs. Defaults
+  supply issuance policy, not an enforcement-disable switch. This is not
+  `quota_exceeded`, and no zero usage is fabricated. Only when there are no
+  configured token-policy requirements **and** neither applicable active
+  policy exists does admission record `not_configured` and potentially allow
+  an active identity. Storage-only settings with no applicable active policy
+  preserve that allowance; an explicit policy cannot be ignored merely
+  because boot token defaults are absent. The checks cover durable run start and
+  recovery, public Composer entries (including guided, diagnostics and
+  signoff), and auto-title before provider work. Missing admission authority
+  refuses. Provider-unavailable or retry advice must not mask an admission
+  refusal. Complete ledger aggregation and daily-limit enforcement remain
+  future work behind this refusal.
+
 ## Frontend [rev2]
 
 - `LoginPage.tsx`: the SSO button is a plain navigation to `sso_start_url`.
@@ -1163,15 +1221,10 @@ errand; the profile and its tests do not wait for one [rev2.11].
   identity reading another's work is the disclosure an auditor will ask
   about, and adding the value after this delivery's epoch cut costs exactly
   the window this spec is structured to take only once.
-  **It was not added, and that cut has happened [rev2.12].** The column is
-  still `('audit_grade_view', 'admin_tool')` in `web/sessions/models.py`,
-  whose own comment calls those two "the entire universe of" the enum and
-  requires a design review, a destructive session-DB recreation and a spec
-  amendment to widen it. Everything else in that window rode it — the four
-  identity tables and all five workflow governance tables shipped — so this
-  is a single stranded item, not an unbuilt half. Read the paragraph above
-  as the requirement it always was; do not read it as a description of the
-  tree. Tracked as elspeth-e6c2d254b2.
+  **The prepared schema now reserves `workflow_inspect` [rev2.13]**, closing
+  elspeth-e6c2d254b2's missing CHECK arm in the paired residual window.
+  Reservation does not implement this read route, mailbox or authorization;
+  those remain the workflow requirements described here.
   *Sent*: my own requests with their state, the decider, the decision
   note, and when; opening one sets `decision_seen_at`. A badge on the
   navigation shows unread counts from one summary endpoint. It needs its own
@@ -1214,12 +1267,11 @@ errand; the profile and its tests do not wait for one [rev2.11].
   typo: repo-root `tests/e2e/` exists and holds only Python suites, so a
   reader following it lands in a real directory containing none of these
   files and no TypeScript at all.
-- **Live.** ECS runbook §Authentication rewritten: `prepare_scenario_b_oidc`
-  asserts `hasClientSecret == true`; the Playwright evidence flow drives
-  start → IdP → callback → fragment code → complete and captures the ELSPETH
-  token, not the IdP's; the compatibility-record example and its two pinned
-  tests carry the new epochs. VANguard live once the client exists. Google
-  live once a client exists.
+- **Desktop delivery acceptance (2026-09-10).** Fake-IdP tests drive the
+  confidential-client exchange, callback and handoff; PostgreSQL tests prove
+  persistence and contention. Provider facts use published discovery/docs.
+  The ECS/Playwright staging harness remains optional deployment diagnostics,
+  not a required live run or an operator-owned sprint gate.
 
 ### Workflow governance [rev2.8, D30]
 
@@ -1266,8 +1318,8 @@ phase 4 closes, not after.
    AWS the repository's own Terraform creates the Cognito client and mints its
    secret, so there is nothing to land by hand. Steps 2 to 5 do not wait on
    any of this — the profiles and the login path are proved against the
-   in-process fake IdP — and a real client gates only the live checks in
-   steps 6 and 7. **[rev2.11: this read "Operator, first: register the
+   in-process fake IdP. Delivery does not wait for a deployment or live trial.
+   **[rev2.11: this read "Operator, first: register the
    confidential Cognito client …", which made a deployer's errand a
    precondition of the build and produced a ruling that had to be reversed.]**
 2. Contracts and schema: both epochs, new tables, re-key, widened CHECKs,
@@ -1279,10 +1331,12 @@ phase 4 closes, not after.
 4. Frontend switch, deletion of the old path, `dist/` rebuild, AST
    no-deleted-imports assertion — one commit.
 5. Runbook and Playwright harness rewrite; task definition; proxy headers.
-6. Cutover: one service-stop window, both stores recreated on ECS,
-   compatibility record countersigned, session-invalidation notice, Cognito
-   live check.
-7. VANguard live check; Google when a client exists.
+6. Prepare the operator's cutover instructions and compatibility record;
+   verify schema creation and refusal behavior in desktop/testcontainer
+   proofs. Performing the cutover is an operator deployment decision, not
+   this sprint's work or acceptance gate.
+7. Close provider desk tasks with published-contract references and signed
+   fixture tests. No VANguard or Google live registration dependency remains.
 
 ## Future seams
 
@@ -1313,8 +1367,9 @@ the bullet, not the heading.
 - **Delegated administration:** an approver appointing a curator, or
   reading their own edges for an approver picker, is a scoped authorization check on
   top of `identity_roles` and `identity_relationships`; route-layer only.
-- **Per-day token quota:** sum of LLM usage over `run_attributions` by
-  `identity_id` per day; enforcement at execute. Subject scope is D11.
+- **Per-day token quota accounting:** complete the Composer/run/auto-title
+  ledger adapters and daily policy checks before replacing R14's current
+  `token_accounting_unavailable` refusal. Subject scope is D11.
 - **Disk quota:** `SUM(blobs.size_bytes)` per identity, enforced at upload
   (D18, R13).
 - **Notification transport [rev2.6]:** the mailbox is in-app only. Email
@@ -1363,8 +1418,8 @@ table R5 counts.
 | review_attestations | attestation_id PK; session_id FK; state_id; payload_digest; reviewer_identity_id FK; attested_at; verdict CHECK `('signed_off','changes_requested','withdrawn')` [rev2.2]; note NULL | Append-only; `note` bounded at 4 KiB like the approval notes, and required non-blank when `verdict='changes_requested'` [rev2.8]. Reviewer ≠ author (CHECK); the reviewer must hold an active `reviewer` role [rev2.3]. **"Reviewer ≠ author" needs the author on the row to be a CHECK at all [rev2.8]:** add `author_identity_id`, denormalised as an **immutable snapshot taken at attestation time**, never a mirror of `sessions.identity_id`. A mirror would be a second source of truth that drifts when a session changes hands, the failure this codebase has already documented elsewhere. With the snapshot the rule is a single-row CHECK; without it, it is a cross-table invariant no dialect can express. **Named "reviewer attestations" everywhere — schema, API, UI [rev2.2].** It is a ledger, not a control: nothing refuses on it. The phrase "two-person rule" is reserved for something that refuses; a UI must never say "two-person rule satisfied" over an unenforced count. |
 | review_requests **[rev2.8, D26]** | request_id PK; session_id FK; state_id; requested_by_identity_id FK; reviewer_identity_id NULL FK; requested_at; cancelled_at NULL; request_note NULL (4 KiB) | The rev2.6 mailbox promises an Inbox of "review requests addressed to me" and nothing recorded one: `review_attestations` is append-only with a non-null reviewer and exists only once a review has *happened*. A sibling table, rather than nullable columns and a `requested` verdict on the attestation ledger, because that would contradict the ledger's own append-only, "not a control" design and would fill the approver's audit view with requests nobody ever completed. `reviewer_identity_id` NULL means "any active `reviewer`", matching the role-based eligibility already ruled for approvals. Closed by an attestation on the same `(session_id, state_id)`, or by `cancelled_at`. The badge counts open rows addressed to the caller plus open unaddressed rows the caller is eligible for. |
 | library_entries | entry_id PK; published_from_session_id provenance column (**not an FK** [rev2.8, D29]); payload_digest; compartment_id; title; version int; published_by_identity_id FK; curated_by_identity_id NULL FK; published_at; accepted_at NULL; rejected_at NULL; rejection_note NULL; deprecated_at NULL; recalled_at NULL; note NULL | Frozen, content-addressed. **A library entry is the public projection (`generate_public_yaml` shape), never a session reference, and it is config-only [rev2.2]:** publishing a pipeline that reads an uploaded blob is refused with a named `error_type` ("publish a profile-bound source instead"), because blob custody proves same-principal on fork and a cross-user fork of a blob-backed source cannot copy the blob without becoming an intra-container exfiltration path. Forking a library entry instantiates the projection into the forker's own staging session; `forked_from_session_id` points at that staging session and the entry's `payload_digest` carries provenance. Visible deployment-wide once `accepted_at` is set by a `curator`. Curator ≠ publisher (CHECK). Recall flags, never deletes. `rejection_note` is required non-blank on rejection and bounded at 4 KiB [rev2.8]. `library_published` audit rows carry `payload_digest` and `compartment_id` so the same artifact appearing in two containers is detectable later. |
-| quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; storage_bytes int [rev2.5, D18]; dual_control_above_tokens NULL int; set_by_identity_id FK; set_at; revoked_at NULL | Per person (D11) **plus the container ceiling row (`identity_id` NULL) shipped now [rev2.2]**, because activation otherwise grants unbounded spend on the container's shared LLM credential. Two partial uniques, both dialects: active per identity, and active `WHERE identity_id IS NULL` (NULLs are distinct for uniqueness in Postgres, so one predicate does not cover both). **Every path that makes an identity `active` writes the per-identity row** from `quota_default_tokens_per_day` and `quota_default_storage_bytes` [rev2.8, D31] — `POST activate`, local registration under `registration_mode=open`, pre-provisioning, the D20 bootstrap seed and operator CLI, and the D21 cutover re-admission. "At activation" was true of one path of six, and on the other five the identity's first run or upload refused with the audit record this spec defines as evidence of corruption. No applicable policy still refuses; it is now genuinely unreachable. Every `quota_set` / `quota_exceeded` event records the cap and the ceiling in force. **Storage [rev2.5]:** `storage_bytes` is a standing level, not a daily rate; usage is `SUM(blobs.size_bytes)` joined through `sessions.identity_id` over live rows (deleted blobs leave no row), evaluated at each of the four byte-admitting sites R13 enumerates. The bound is eventually consistent, not exact: the existing blob lock is keyed on `session_id` alone, so two sessions of one identity do not serialise against each other [rev2.8, D24]. Blobs created by the system on the identity's behalf (inline custody, fork copies) count against the identity; the `system` exemption applies to tokens only. Admin set/revoke is one route for both dimensions. |
-| token_usage_ledger | entry_id PK; identity_id NULL FK; source CHECK `('composer','run','auto_title','system')` [rev2.2]; session_id NULL FK; run_id NULL; model; prompt_tokens; completion_tokens; cached_prompt_tokens NULL; reasoning_tokens NULL; recorded_at | Operational accounting index, not audit truth (Landscape `calls` is). Composer writes one row per LLM call from `ComposerLLMCall`'s token fields (today persisted only inside JSON audit payloads, not queryable) — **there is no `.usage` attribute [rev2.12]**; `ComposerLLMCall` carries `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_prompt_tokens` and `reasoning_tokens` as flat fields, so an implementer following the old wording reaches for something that does not exist. Note the asymmetry this creates: the composer arm CAN be fed from those flat fields today, while the run arm cannot be fed at all. Auto-titling (a paid background call per first message, which its own docstring flags as bypassing rate limits) writes `auto_title`; the boot probe writes `system` with `identity_id` NULL. Runs write one row per run at finalisation from the new `calls` token columns — **a source that does not exist [rev2.12]**, so the `run` arm of this table's own `source` CHECK has no data path (elspeth-255ae1a544). The table shipped; that arm did not. Since the quota check below is a `SUM` over this ledger and the rule is "accounting unavailable ⇒ refuse", whoever wires the run arm decides whether run spend has been silently uncounted or is refusing — the answer is not settled here, and must not be assumed from this row. Quota check = `SUM` over the ledger for the identity in the current UTC day, evaluated at execute and at composer turn start only; post-response spend lands in the next window. Over quota refuses and writes `quota_exceeded`. Accounting unavailable ⇒ refuse (fail closed); the `system` arm is exempt from the check. |
+| quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; storage_bytes int [rev2.5, D18]; dual_control_above_tokens NULL int; set_by_identity_id NULL FK; set_by_actor CHECK `('identity','config','operator','system')`; set_at; revoked_at NULL | Per-person policy (D11) and container ceiling (`identity_id` NULL), with separate partial uniqueness constraints in both dialects. **Current behavior [rev2.13]:** activation writes a policy when defaults configure a quota regime; an explicitly unconfigured deployment need not have a row. Enabling quotas after identities already exist can leave policy missing, which R14 refuses explicitly. Do not infer completeness from identity activation alone. Storage is a standing level over live blob rows joined through `sessions.user_id`, which carries the identity ID. R13/D24 remain the storage-enforcement requirements; this residual implements token admission's unavailable-accounting refusal, not a complete storage or daily-token quota service. |
+| token_usage_ledger | entry_id PK; identity_id NULL FK; source CHECK `('composer','run','auto_title','system')` [rev2.2]; session_id NULL FK; run_id NULL; model; prompt_tokens; completion_tokens; cached_prompt_tokens NULL; reasoning_tokens NULL; recorded_at | Operational accounting index, not audit truth. **Adapters remain unimplemented [rev2.13]:** the prepared Landscape `calls` columns now provide the run measures; `ComposerLLMCall` exposes flat token fields, not a `.usage` attribute. A complete adapter must cover Composer, runs and auto-title without double counting transport calls, preserving unknown usage. Until then, R14 refuses missing required policy with `quota_policy_missing` and otherwise refuses any applicable active policy with `token_accounting_unavailable`, retaining its ID even when boot issuance defaults are absent. Only no requirements and no applicable active policy permit the explicit no-quota allowance. An empty ledger is never measured zero. Public user work cannot claim the reserved `system` exemption. Daily aggregation and exhaustion checks remain future work; the table's existence does not imply complete quota enforcement. |
 
 ## Terminology
 
@@ -1474,9 +1529,9 @@ registration is configuration a deployment brings — `sso_client_id`,
 dependency the project waits on. No source file, and no unit or integration
 test, needs one: every profile is proved against the in-process fake IdP
 (`tests/helpers/fake_idp.py`), which signs with a real RSA key and serves
-discovery, JWKS, token and the userinfo leg VANguard alone calls. The live
-acceptance layer needs one by definition (§Testing, the **Live** bullet) —
-`tests/e2e/aws-ecs-oidc.staging.spec.ts` is a checked-in test whose
+discovery, JWKS, token and the userinfo leg VANguard alone calls. Optional
+deployment diagnostics need one by definition —
+`src/elspeth/web/frontend/tests/e2e/aws-ecs-oidc.staging.spec.ts` is a checked-in test whose
 `playwright.oidc.config.ts` refuses to start without `STAGING_BASE_URL`, and
 it drives a deployed stack, not a fixture. And `auth_provider=local` needs no
 registration at all. **[rev2.11 replaces
@@ -1484,8 +1539,9 @@ registration at all. **[rev2.11 replaces
 it could proceed; that framing produced a ruling that had to be reversed, see
 §Rollout order step 1.]**
 
-The one thing a real client gates is **live verification against a running
-provider**. Unit and integration coverage runs entirely against the in-process
+Real credentials are required to operate authentication against a running
+provider; obtaining them is not sprint acceptance work. Unit and integration
+coverage runs entirely against the in-process
 fake IdP (§Testing) — it serves discovery, JWKS, token and userinfo and signs
 with its own key — so every profile, claim check, origin policy and refusal is
 provable with no account anywhere.

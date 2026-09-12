@@ -16,7 +16,8 @@
 # the report is against whatever `origin/*` was last fetched, and says so.
 #
 # Checks, and the incident each one encodes:
-#   in-progress    a merge/rebase/cherry-pick left half-done                         FAIL
+#   in-progress    unfinished operations FAIL; commit may finish a resolved merge
+#                  only when no other operation or unmerged index entries remain
 #   protected      on main or release/*: commit WARNs; rebase/push FAIL unless
 #                  --allow-protected (never move release/main unless asked)
 #   staged-paths   .claude/lanes|handovers|red-team|worktrees, *.log, *.done, *.pid,
@@ -100,9 +101,23 @@ echo
 
 # --- in-progress operations --------------------------------------------------
 inprog=""
-for f in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do [ -e "$GIT_DIR/$f" ] && inprog="$inprog $f"; done
-for d in rebase-merge rebase-apply; do [ -d "$GIT_DIR/$d" ] && inprog="$inprog $d"; done
-if [ -n "$inprog" ]; then report FAIL in-progress "unfinished:$inprog" "ls $GIT_DIR"; else report PASS in-progress "none" "ls $GIT_DIR"; fi
+for f in CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do [ -e "$GIT_DIR/$f" ] && inprog="$inprog $f"; done
+for d in rebase-merge rebase-apply sequencer; do [ -d "$GIT_DIR/$d" ] && inprog="$inprog $d"; done
+if ! unmerged="$(git ls-files --unmerged)"; then
+    report FAIL in-progress "could not inspect unmerged index entries" "git ls-files --unmerged"
+elif [ -n "$unmerged" ]; then
+    report FAIL in-progress "unmerged index entries remain" "git ls-files --unmerged"
+elif [ -n "$inprog" ]; then
+    report FAIL in-progress "unfinished:$inprog" "ls $GIT_DIR"
+elif [ -e "$GIT_DIR/MERGE_HEAD" ]; then
+    if [ "$INTENT" = commit ]; then
+        report PASS in-progress "resolved merge ready for completion by commit; no other operation" "ls $GIT_DIR; git ls-files --unmerged"
+    else
+        report FAIL in-progress "unfinished: MERGE_HEAD; complete the merge before $INTENT" "ls $GIT_DIR"
+    fi
+else
+    report PASS in-progress "none" "ls $GIT_DIR; git ls-files --unmerged"
+fi
 
 # --- detached / protected ----------------------------------------------------
 if [ -z "$BRANCH" ]; then

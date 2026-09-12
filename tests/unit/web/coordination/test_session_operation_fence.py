@@ -12,6 +12,7 @@ import pytest
 import structlog
 from sqlalchemy import event, insert, select, update
 from sqlalchemy.engine import Connection, Engine, Transaction
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.conftest import _make_session
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -42,6 +43,8 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 @pytest.fixture
 def service(engine, tmp_path) -> SessionServiceImpl:
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,

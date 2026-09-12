@@ -7,6 +7,12 @@ from uuid import uuid4
 import pytest
 from litellm import ModelResponse
 
+from elspeth.contracts.chargeable_admission import (
+    AdmissionPolicyEvidence,
+    ChargeableAdmissionDecision,
+    ChargeableOperation,
+    QuotaDisposition,
+)
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions.telemetry import _FakeCounter
@@ -15,6 +21,16 @@ from elspeth.web.sessions.telemetry import _FakeCounter
 class _TitleService:
     def __init__(self) -> None:
         self.updates: list[tuple[object, str]] = []
+
+    async def assess_chargeable_operation(
+        self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision:
+        assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+        assert operation is ChargeableOperation.AUTO_TITLE
+        return ChargeableAdmissionDecision(
+            refusal_reason=None,
+            evidence=AdmissionPolicyEvidence(quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash="a" * 64),
+        )
 
     async def update_session_title(
         self,
@@ -39,7 +55,8 @@ def _compose_context(session_id: object) -> SessionOperationContext:
     )
 
 
-_TEST_CONTEXT = _compose_context(uuid4())
+_TEST_SESSION_ID = uuid4()
+_TEST_CONTEXT = _compose_context(_TEST_SESSION_ID)
 
 
 def _completion(content: str | None) -> ModelResponse:
@@ -316,7 +333,7 @@ async def test_auto_title_threads_exact_compose_context_to_title_write(monkeypat
     context = _compose_context(session_id)
     observed: list[tuple[object, str, SessionOperationContext]] = []
 
-    class _FencedTitleService:
+    class _FencedTitleService(_TitleService):
         async def update_session_title(
             self,
             session_id: object,
@@ -357,7 +374,7 @@ async def test_auto_title_timeout_records_telemetry_and_returns(monkeypatch) -> 
 
     await _auto_title.maybe_auto_title_session(
         service=service,
-        session_id=uuid4(),
+        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
@@ -382,7 +399,7 @@ async def test_auto_title_malformed_provider_response_records_telemetry_and_retu
 
     await _auto_title.maybe_auto_title_session(
         service=service,
-        session_id=uuid4(),
+        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
@@ -407,7 +424,7 @@ async def test_auto_title_null_provider_content_is_an_explicit_no_title(monkeypa
 
     await _auto_title.maybe_auto_title_session(
         service=service,
-        session_id=uuid4(),
+        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
@@ -432,7 +449,7 @@ async def test_auto_title_rejects_non_string_provider_content(monkeypatch) -> No
 
     await _auto_title.maybe_auto_title_session(
         service=service,
-        session_id=uuid4(),
+        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
@@ -457,7 +474,7 @@ async def test_auto_title_programmer_error_propagates(monkeypatch) -> None:
     with pytest.raises(TypeError, match="signature drift"):
         await _auto_title.maybe_auto_title_session(
             service=_TitleService(),
-            session_id=uuid4(),
+            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
@@ -493,7 +510,7 @@ async def test_auto_title_title_write_failure_propagates(monkeypatch, error_type
     with pytest.raises(error_type, match="database unavailable"):
         await _auto_title.maybe_auto_title_session(
             service=_FailingService(),
-            session_id=uuid4(),
+            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
@@ -517,7 +534,7 @@ async def test_auto_title_cancellation_propagates_after_accounting(monkeypatch) 
     with pytest.raises(asyncio.CancelledError) as caught:
         await _auto_title.maybe_auto_title_session(
             service=_TitleService(),
-            session_id=uuid4(),
+            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,

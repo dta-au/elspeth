@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -20,6 +21,7 @@ import structlog
 from elspeth.contracts import Determinism, TransformResult, propagate_contract
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError, TransformErrorReason
+from elspeth.contracts.events import RAGRetrievalStatistics, TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
@@ -58,7 +60,7 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:79ed8a9c575e117f"
+    source_file_hash: str | None = "sha256:08baab28843851f1"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
@@ -222,13 +224,19 @@ class RAGRetrievalTransform(BaseTransform):
 
         # Lifecycle dependencies — set in on_start()
         self._run_id: str = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
 
     def on_start(self, ctx: LifecycleContext) -> None:
         """Capture lifecycle context and construct the search provider."""
         super().on_start(ctx)
         self._run_id = ctx.run_id
         self._telemetry_emit = ctx.telemetry_emit
+        self._total_queries = 0
+        self._quarantine_count = 0
+        self._total_chunks = 0
+        self._score_count = 0
+        self._score_mean = 0.0
+        self._score_m2 = 0.0
 
         # Construct provider from registry
         provider_name = self._rag_config.provider
@@ -485,21 +493,26 @@ class RAGRetrievalTransform(BaseTransform):
     def on_complete(self, ctx: LifecycleContext) -> None:
         """Emit telemetry with run statistics."""
         super().on_complete(ctx)
+        if ctx.node_id is None:
+            raise FrameworkBugError("RAG completion requires a node_id")
         score_std = 0.0
         if self._score_count >= 2:
             score_std = math.sqrt(self._score_m2 / (self._score_count - 1))
 
-        payload: dict[str, Any] = {
-            "event": "rag_retrieval_complete",
-            "run_id": self._run_id,
-            "provider": self._rag_config.provider,
-            "total_queries": self._total_queries,
-            "total_chunks": self._total_chunks,
-            "quarantine_count": self._quarantine_count,
-            "score_mean": self._score_mean if self._score_count > 0 else None,
-            "score_std": score_std if self._score_count >= 2 else None,
-        }
-        self._telemetry_emit(payload)
+        event = RAGRetrievalStatistics(
+            timestamp=datetime.now(UTC),
+            run_id=self._run_id,
+            node_id=ctx.node_id,
+            plugin_name=self.name,
+            provider=self._rag_config.provider,
+            total_queries=self._total_queries,
+            total_chunks=self._total_chunks,
+            quarantine_count=self._quarantine_count,
+            score_count=self._score_count,
+            score_mean=self._score_mean if self._score_count > 0 else None,
+            score_std=score_std if self._score_count >= 2 else None,
+        )
+        self._telemetry_emit(event)
 
     def close(self) -> None:
         """Release provider and query builder resources."""

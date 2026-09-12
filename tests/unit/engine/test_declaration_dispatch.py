@@ -498,6 +498,16 @@ def test_serialize_plugin_name_raises_when_plugin_name_empty() -> None:
         _serialize_plugin_name(_EmptyNamePlugin())
 
 
+def test_serialize_plugin_name_rejects_truthy_non_string() -> None:
+    from elspeth.contracts.errors import FrameworkBugError
+
+    class _NonStringNamePlugin:
+        name = 42
+
+    with pytest.raises(FrameworkBugError, match=r"plugin\.name to be a string.*int"):
+        _serialize_plugin_name(_NonStringNamePlugin())
+
+
 def test_aggregate_to_audit_dict_carries_children() -> None:
     """Aggregate's to_audit_dict emits is_aggregate=True and the full
     violations list — no contract_name field (C5 closure)."""

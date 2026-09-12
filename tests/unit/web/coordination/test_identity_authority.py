@@ -22,6 +22,7 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
     AdminAuthorityRequired,
@@ -83,7 +84,7 @@ def engine():
 
 @pytest.fixture
 def authority(engine) -> RepositoryIdentityAuthority:
-    return RepositoryIdentityAuthority(engine)
+    return RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
 
 class _Recorder:
@@ -262,7 +263,7 @@ def _insert_service_identity(engine, identity_id: str = "console-service") -> st
 def test_unsupported_dialect_is_refused_at_construction() -> None:
     fake_engine: Any = SimpleNamespace(dialect=SimpleNamespace(name="mysql"))
     with pytest.raises(NotImplementedError, match="mysql"):
-        RepositoryIdentityAuthority(fake_engine)
+        RepositoryIdentityAuthority(fake_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
 
 @pytest.mark.parametrize("field", ["identity_id", "on_behalf_of", "console_request_id"])
@@ -394,6 +395,52 @@ def test_a_failed_bootstrap_audit_rolls_everything_back(engine, authority) -> No
     with engine.connect() as conn:
         assert conn.execute(select(identity_roles_table)).all() == []
         assert conn.execute(select(quota_policies_table)).all() == []
+
+
+def test_configured_seed_uses_manual_admin_history_but_operator_recovery_remains_available(engine, authority) -> None:
+    from elspeth.web.coordination.identity_authority import AdminBootstrapMode
+
+    root = _bootstrap(authority, "manual-admin")
+    _expire_role(engine, _admin_role_id(root))
+    assert authority.count_active_human_admins() == 0
+    assert authority.configured_admin_seed_consumed()
+    with pytest.raises(AdminAlreadyBootstrapped):
+        authority.bootstrap_admin(
+            claims=_claims("configured"),
+            note="configured seed",
+            quota_tokens_per_day=_TOKENS,
+            quota_storage_bytes=_STORAGE,
+            record=_noop,
+            mode=AdminBootstrapMode.CONFIGURED_SEED,
+        )
+    assert authority.read_identity_by_natural_key(provider="local", subject="configured") is None
+    assert _bootstrap(authority, "operator-recovery").record.access_state == "active"
+
+
+def test_configured_seed_audit_rollback_does_not_consume_the_seed(engine, authority) -> None:
+    from elspeth.web.coordination.identity_authority import AdminBootstrapMode
+
+    with pytest.raises(_AuditOutage):
+        authority.bootstrap_admin(
+            claims=_claims("configured"),
+            note="configured seed",
+            quota_tokens_per_day=_TOKENS,
+            quota_storage_bytes=_STORAGE,
+            record=_refuse_audit,
+            mode=AdminBootstrapMode.CONFIGURED_SEED,
+        )
+    assert not authority.configured_admin_seed_consumed()
+    assert authority.read_identity_by_natural_key(provider="local", subject="configured") is None
+    outcome = authority.bootstrap_admin(
+        claims=_claims("configured"),
+        note="retry",
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record=_noop,
+        mode=AdminBootstrapMode.CONFIGURED_SEED,
+    )
+    assert outcome.record.access_state == "active"
+    assert authority.configured_admin_seed_consumed()
 
 
 # --------------------------------------------------------------------------

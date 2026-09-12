@@ -415,6 +415,9 @@ def test_resume_calls_prepare_for_run() -> None:
     prepare_for_run() call the registries are never frozen — leaving a window
     where register_declaration_contract() could succeed after bootstrap.
     """
+    from collections.abc import Callable
+    from typing import Never
+
     from elspeth.contracts import Checkpoint, ResumePoint
     from elspeth.engine.orchestrator import PipelineConfig
     from elspeth.engine.orchestrator import resume as resume_module
@@ -433,7 +436,15 @@ def test_resume_calls_prepare_for_run() -> None:
     def fake_prepare_for_run() -> None:
         calls.append("prepare_for_run")
 
-    def fake_reconstruct_resume_state(self, resume_point, payload_store, *, worker_id=None):  # type: ignore[no-untyped-def]
+    def fake_reconstruct_resume_state(
+        self: ResumeCoordinator,
+        resume_point: ResumePoint,
+        payload_store: MockPayloadStore,
+        *,
+        worker_id: str | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        on_resume_point_refreshed: Callable[[ResumePoint], None] | None = None,
+    ) -> Never:
         assert calls == ["prepare_for_run"], (
             "Orchestrator.resume() must invoke prepare_for_run() before reconstructing resume state (ADR-010 §Decision 3)"
         )
@@ -496,6 +507,14 @@ def test_resume_calls_prepare_for_run() -> None:
             resume_module.CheckpointCompatibilityValidator,
             "validate",
             lambda self, cp, graph: ResumeCheck(can_resume=True),
+        )
+        # This unit isolates registry-bootstrap ordering; implementation
+        # compatibility is an earlier prerequisite, like topology above.
+        # Its real metadata refusal paths have dedicated compatibility tests.
+        monkeypatch.setattr(
+            resume_module,
+            "check_implementation_compatibility",
+            lambda factory, run_id, config, graph: ResumeCheck(can_resume=True),
         )
         config = PipelineConfig(
             sources={"primary": as_source(ListSource([]))},

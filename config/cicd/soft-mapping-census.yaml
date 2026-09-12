@@ -27,7 +27,7 @@ files:
   src/elspeth/contracts/audit_evidence.py:
     Mapping[str, Any]: 1
   src/elspeth/contracts/audit_export.py:
-    Mapping[str, object]: 5
+    Mapping[str, object]: 8
     dict[str, object]: 1
   src/elspeth/contracts/audit_protocols.py:
     Mapping[str, object]: 1
@@ -73,6 +73,7 @@ files:
   src/elspeth/contracts/events.py:
     dict[str, Any]: 4
   src/elspeth/contracts/export_records.py:
+    dict[str, Any]: 1
     dict[str, object]: 1
   src/elspeth/contracts/node_state_context.py:
     dict[str, Any]: 9
@@ -203,7 +204,7 @@ files:
   src/elspeth/core/landscape/run_coordination_repository.py:
     Mapping[str, object]: 2
   src/elspeth/core/landscape/run_lifecycle_repository.py:
-    Mapping[str, Any]: 1
+    Mapping[str, Any]: 2
     Mapping[str, object]: 1
     dict[str, Any]: 4
   src/elspeth/core/landscape/scheduler/barrier.py:
@@ -553,7 +554,7 @@ files:
   src/elspeth/plugins/transforms/rag/query.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/rag/transform.py:
-    dict[str, Any]: 6
+    dict[str, Any]: 5
   src/elspeth/plugins/transforms/reference_join.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
@@ -897,7 +898,7 @@ files:
   src/elspeth/web/coordination/membership_authority.py:
     dict[str, Any]: 1
   src/elspeth/web/coordination/repository.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 3
     dict[str, Any]: 2
     dict[str, object]: 2
   src/elspeth/web/coordination/run_diagnostics_authority.py:
@@ -919,6 +920,8 @@ files:
   src/elspeth/web/execution/diagnostics.py:
     dict[str, Any]: 1
     dict[str, object]: 2
+  src/elspeth/web/execution/envelope.py:
+    Mapping[str, Any]: 1
   src/elspeth/web/execution/failure_samples.py:
     dict[str, object]: 1
   src/elspeth/web/execution/fanout_guard.py:
@@ -981,7 +984,7 @@ files:
   src/elspeth/web/sessions/proposal_blob_refs.py:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/protocol.py:
-    Mapping[str, Any]: 59
+    Mapping[str, Any]: 60
     dict[str, object]: 5
   src/elspeth/web/sessions/routes/_helpers.py:
     Mapping[str, Any]: 4
@@ -1021,10 +1024,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 863
-  Mapping[str, object]: 295
+  Mapping[str, Any]: 867
+  Mapping[str, object]: 298
   MutableMapping[str, Any]: 13
   boundary: 63
   dict[str, Any]: 1137
   dict[str, object]: 401
-  soft: 2709
+  soft: 2716

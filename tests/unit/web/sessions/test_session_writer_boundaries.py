@@ -19,12 +19,15 @@ from elspeth.web.sessions.protocol import CompositionStateData, InterpretationCh
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture
 def file_engine(tmp_path: Path):
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     try:
         yield engine
     finally:

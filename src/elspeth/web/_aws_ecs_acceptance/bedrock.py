@@ -29,7 +29,8 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.config.runtime import RuntimeTelemetryConfig
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken, mint_worker_id
-from elspeth.contracts.errors import ExecutionError
+from elspeth.contracts.errors import ExecutionError, FrameworkBugError
+from elspeth.contracts.events import ExternalCallCompleted, TelemetryEvent
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -605,7 +606,7 @@ def verify_bedrock_guardrails(
     member_token: WorkerMembershipToken,
     work_item: TokenWorkItem,
     checker: Callable[..., Any] = run_guardrail_live_check,
-    telemetry_emit: Callable[[Any], None] = lambda _event: None,
+    telemetry_emit: Callable[[TelemetryEvent], None] = lambda _event: None,
     state_id: str = "guardrail-acceptance-state",
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> dict[str, object]:
@@ -779,7 +780,9 @@ def run_bedrock_guardrails_live(
                 )
                 audit_proofs: list[bool] = []
 
-                def emit_after_persisted_audit(event: Any) -> None:
+                def emit_after_persisted_audit(event: TelemetryEvent) -> None:
+                    if not isinstance(event, ExternalCallCompleted):
+                        raise FrameworkBugError("Guardrail audit forwarding requires ExternalCallCompleted")
                     calls = repositories.query.get_calls(state.state_id)
                     latest = calls[-1] if calls else None
                     expected_index = len(audit_proofs)

@@ -583,6 +583,10 @@ class TestCallLoader:
             "error_json": None,
             "latency_ms": None,
             "resolved_prompt_template_hash": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "cached_prompt_tokens": None,
+            "reasoning_tokens": None,
         }
         defaults.update(overrides)
         return _make_sa_row(**defaults)
@@ -604,6 +608,12 @@ class TestCallLoader:
         sa_row = self._make_call_row(call_type="llm", resolved_prompt_template_hash=digest)
         result = CallLoader().load(sa_row)
         assert result.resolved_prompt_template_hash == digest
+
+    @pytest.mark.parametrize("field", ["prompt_tokens", "completion_tokens", "cached_prompt_tokens", "reasoning_tokens"])
+    @pytest.mark.parametrize("value", [-1, True, "3", 1.5])
+    def test_rejects_corrupt_persisted_usage(self, field: str, value: object) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            CallLoader().load(self._make_call_row(**{field: value}))
 
     def test_valid_load_operation_parented(self) -> None:
         sa_row = self._make_call_row(

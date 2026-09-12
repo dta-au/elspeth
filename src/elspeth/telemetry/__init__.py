@@ -43,9 +43,12 @@ Usage:
 """
 
 from elspeth.contracts.events import (
+    ChromaWriteStatistics,
+    DataverseLoadStatistics,
     ExternalCallCompleted,
     FieldResolutionApplied,
     PhaseChanged,
+    RAGRetrievalStatistics,
     ResourceCleanupFailed,
     RowCreated,
     RunFinished,
@@ -59,11 +62,14 @@ from elspeth.telemetry.manager import TelemetryManager
 from elspeth.telemetry.protocols import ExporterProtocol
 
 __all__ = [
+    "ChromaWriteStatistics",
     "ConsoleExporter",
+    "DataverseLoadStatistics",
     "ExporterProtocol",
     "ExternalCallCompleted",
     "FieldResolutionApplied",
     "PhaseChanged",
+    "RAGRetrievalStatistics",
     "ResourceCleanupFailed",
     "RowCreated",
     "RunFinished",

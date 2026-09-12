@@ -63,6 +63,7 @@ from elspeth.web.plugin_policy.validation import (
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.composer_fences import fenced_tool_context
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
@@ -503,6 +504,8 @@ def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="review-owner")
     first_session = str(uuid4())
     second_session = str(uuid4())
     now = datetime.now(UTC)
@@ -2246,6 +2249,8 @@ def _session_with_user_message() -> tuple[Any, str, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="candidate-user")
     session_id = str(uuid4())
     message_id = str(uuid4())
     now = datetime.now(UTC)

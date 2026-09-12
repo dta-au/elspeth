@@ -61,6 +61,7 @@ from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, 
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape._database_ops import DatabaseOps
@@ -608,6 +609,7 @@ class ExecutionRepository:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record an external call for a node state."""
         return self.calls.record_call(
@@ -624,6 +626,7 @@ class ExecutionRepository:
             request_ref=request_ref,
             response_ref=response_ref,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
 
     # === Operations (Source/Sink I/O) ===
@@ -685,6 +688,7 @@ class ExecutionRepository:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record an external call made during an operation."""
         return self.calls.record_operation_call(
@@ -700,6 +704,7 @@ class ExecutionRepository:
             request_ref=request_ref,
             response_ref=response_ref,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
 
     def get_operation(self, operation_id: str) -> Operation | None:

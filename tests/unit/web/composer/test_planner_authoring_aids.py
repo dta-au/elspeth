@@ -50,6 +50,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
 
 
@@ -512,6 +513,8 @@ def _session_with_user_message(content: str) -> tuple[Any, str, str, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="authoring-aids-user")
     session_id = str(uuid4())
     message_id = str(uuid4())
     message_content = f"Use this exact content:\n{content}"

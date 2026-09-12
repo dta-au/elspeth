@@ -6,12 +6,21 @@ multi-replica programme independently resumable.
 **Baseline:** Desktop review on 2026-09-10, `release/0.8.1` at `7090aae27`.
 The checkout also contains unrelated auth/identity changes; those are not
 delivery evidence for this plan. No tests or cloud operations were run for
-this reconciliation. Tracker states below were retrieved on this date.
+the original desktop reconciliation. Tracker states below were retrieved on
+this date; subsequent implementation evidence is distinguished below.
+
+**Integration update (2026-09-10):** A–E have feature implementations. The
+merge with `release/0.8.1` and recovery/ticket review repairs require fresh
+verification; that verification is pending. Earlier feature-tree results are
+recorded under [Final verification](#final-verification) as historical evidence
+only. F adopts explicit deferral of receipt v3 and the listed
+provider work. No live ACA acceptance receipt or cloud test is claimed.
 
 **Architecture:** Keep the delivered ACA environment/workload bundle and
 PostgreSQL-backed membership/session fencing. Retain Single revision mode
-with sticky sessions for the owner-affine surfaces. Treat durable run handoff,
-cross-replica streaming and shared quotas as separate runtime extensions.
+with sticky sessions until routing without affinity is separately qualified.
+Durable run handoff, cross-replica streaming and shared quotas are runtime
+extensions distinct from the unchanged legacy receipt contract.
 
 **Prerequisites for implementation:** Re-read current `AGENTS.md` and
 `CONTRIBUTING.md`, inspect the current tracker and source, and use an isolated
@@ -45,12 +54,14 @@ This does not re-plan the unrelated release, Composer or signing programmes.
   The old roll-up `elspeth-a5b07ac072` and ACA prerequisite
   `elspeth-3bbf9a9731` were superseded; do not restore their old dependency cycle.
 
-## What the delivered slice actually covers
+## Original delivered slice — historical baseline
 
-These are source-backed capabilities, not a fresh passing-test or live-cloud
-verdict. Preserve them while extending the runtime.
+This table records the source-backed baseline before B–E implementation, not
+the current runtime or a fresh passing-test/live-cloud verdict. In particular,
+the recovery-only and owner-affine limitations below are superseded by the
+dated task statuses; the legacy receipt's measurement limits remain.
 
-| Area | Current implementation and boundary |
+| Area | Original implementation and boundary |
 | --- | --- |
 | Infrastructure | `deploy/azure-container-apps/main.bicep`, `environment.bicep`, `workload.bicep`: environment plus workload, not the July workload-only module. Separate external PostgreSQL databases; shared NFS for files, never SQLite on that share. |
 | Installation | `scripts/bootstrap-acceptance.sh`, `resolve-workload-parameters.sh`, `run-job.sh` under that bundle: concrete versioned-secret parameters, Jobs deployed before execution, runtime app admitted after provisioning/doctors. Preserve the existing-registry and non-root runtime contracts. |
@@ -62,7 +73,10 @@ verdict. Preserve them while extending the runtime.
 | P4a / P4b | P4a proves shared database state and blob visibility. P4b records owner-affine live progress/tickets and structurally cannot pass. Sticky routing is a mitigation, not durable state. |
 | Lease clock | The 2026-09-08 Landscape clock plan (retired from active docs; retrievable from git history) and ADR-047 describe the separate engine authority contract. New web ownership must preserve Landscape fencing and fresh post-lock time decisions. |
 
-## July work mapped to the ACA pivot
+## Original July work mapping — historical baseline
+
+The deferred/owner-affine labels in this original mapping describe the starting
+point. The dated implementation statuses below govern the current disposition.
 
 | Original work | Disposition for resumption |
 | --- | --- |
@@ -78,6 +92,12 @@ verdict. Preserve them while extending the runtime.
 
 ## A. Reconcile public documentation with desktop acceptance
 
+**Status (2026-09-10): implemented; release integration verification pending.**
+See [Final verification](#final-verification).
+Public documentation separates desktop acceptance, bounded runtime capability
+and available evidence. Documentation contracts and current epoch checks
+must pass again against the release integration.
+
 **Files:** `docs/reference/deployment-platforms.md`,
 `deploy/azure-container-apps/README.md`,
 `src/elspeth/web/_azure_container_apps_acceptance/README.md`,
@@ -92,7 +112,7 @@ verdict. Preserve them while extending the runtime.
    configuration and available evidence in the wording.
 2. Reconcile the reference page's blanket one-replica/stop-before-start text
    with ACA's delivered Single/sticky configuration. Keep other targets'
-   restrictions intact. State owner-affine loss/reconnect limitations explicitly.
+   restrictions intact. State the current loss/reconnect limitations explicitly.
 3. Retain cloud commands as an executable operator procedure, not an outstanding
    tracker closure condition. Never add an invented receipt to satisfy a docs gate.
 4. Update any documentation-contract assertions which encode the superseded
@@ -100,9 +120,46 @@ verdict. Preserve them while extending the runtime.
 
 **Done when:** the named pages agree about desktop acceptance and runtime
 limitations, and their contract tests pass. No cloud deployment is required.
-This follow-up is outside the current `docs/plans` edit scope.
+The subsequent instruction to execute this plan authorizes this follow-up.
 
 ## B. Durable run admission, handoff and cancellation
+
+**Status (2026-09-10): implemented; release integration verification pending.** The
+integrated implementation provides immutable execution envelopes, atomic run/permit
+admission, retained input bytes and version-pinned secrets, authenticated peer
+cancellation, and fresh web/Landscape ownership for automatic dispatch,
+PREPARED restart and eligible checkpoint resume. Landscape advances to epoch
+39; the integrated Sessions schema is epoch 54. These are the 0.8.1 boundaries;
+0.8.0 remains Sessions 53 / Landscape 38. Local PostgreSQL process-crash tests
+exercise admission/permit/linkage death, PREPARED and checkpoint recovery,
+stale-owner refusal, terminal/output crash retry and CLI takeover races.
+Earlier suite results under [Final verification](#final-verification) precede
+the release merge and review repairs. They do not establish correctness of
+this integration or live ACA acceptance.
+
+Supported transitions preserve one active Landscape scheduler leader per run
+and the original run UUID. PREPARED replay requires proof of no effects;
+EXECUTING is marked before plugin initialization. Resume selects the latest
+checkpoint after fresh leadership acquisition and continuously checks web
+custody. FAILED/INTERRUPTED reconciliation holds status-preserving Landscape
+authority and the row lock through web/output finalization. Unsafe effects,
+incomplete sources and identity/compatibility failures remain
+`recovery_required`. Cancellation before a baseline uses the admitted envelope
+without resolving changed secrets/runtime/policy or invoking plugins. Retained
+input objects are content-addressed and fsynced with no automatic pruning.
+
+Resume identity qualification (closure review, `elspeth-f321e3ff21` comment
+10110): central plugin version, source and determinism checks cover CLI and
+web. The full engine/runtime source and distribution fingerprint applies to
+the web handoff envelope. Direct CLI resume across unchanged-version engine
+or interpreter drift remains open; B does not close universal CLI resume
+identity compatibility.
+
+The [public handoff contract](../reference/deployment-platforms.md#durable-run-handoff)
+and [ADR-041 amendment](../architecture/adr/041-state-engine-supported-profiles.md#amendment-2026-09-10-bounded-aca-runtime-acceptance)
+record this bounded runtime acceptance. They do not promote the frozen v3
+state-engine catalog or change legacy receipt schemas. The steps below remain
+the implementation and integration acceptance checklist.
 
 **Inspect/modify:** `src/elspeth/web/execution/service.py`, `routes.py`,
 `protocol.py` in the same directory; `src/elspeth/web/coordination/repository.py`,
@@ -110,7 +167,8 @@ This follow-up is outside the current `docs/plans` edit scope.
 `src/elspeth/engine/orchestrator/resume.py`.
 **Extend tests:** `tests/unit/web/execution/test_service.py`,
 `tests/testcontainer/web/test_global_run_recovery_postgres.py`.
-**Proposed new test:** `tests/testcontainer/web/test_cross_process_run_control_postgres.py`.
+**Added tests:** `tests/testcontainer/web/test_cross_process_run_control_postgres.py`,
+`tests/testcontainer/web/test_cross_process_run_reconciliation_postgres.py`.
 
 1. Inventory the current production admission, ownership, cancellation and
    recovery writers through the authority registry and their real callers.
@@ -125,16 +183,27 @@ This follow-up is outside the current `docs/plans` edit scope.
 4. Implement only the missing transitions through owned typed authorities.
    Automatic resume must acquire valid Landscape authority and revalidate web
    ownership; failure must not refresh an old token or replay external effects.
-5. Reconcile `elspeth-f321e3ff21` (currently `fixing`, implementation identity
-   omitted from resume compatibility) before claiming safe resume across image
-   changes. The separate cleanup bug `elspeth-245b21351b` is closed; reuse its
+5. Preserve the `elspeth-f321e3ff21` identity qualification above before claiming
+   safe resume across image changes; direct CLI unchanged-version engine or
+   interpreter drift remains open. The separate cleanup bug
+   `elspeth-245b21351b` is closed; reuse its
    regressions rather than treat it as unimplemented.
 
 **Done when:** every documented crash state has a deterministic recovery/refusal
 outcome, non-owner cancellation is durable, and stale owners cannot project or
-finalize. Until then the ACA claim remains recovery, not transparent run handoff.
+finalize. Integration verification must cover those transitions and the explicit
+refusal cases above, including archived-session recovery races, unavailable
+retained inputs, and failed-run output parity with ordinary execution.
 
 ## C. Durable tickets and reconnectable run progress
+
+**Status (2026-09-10): implemented; release integration verification pending.**
+See [Final verification](#final-verification).
+External PostgreSQL stores ticket digests for atomic single-use consumption
+and ordered run events for authorized peer replay. Local process/socket tests
+exercise expiry, races, reconnect and owner loss. The local adapter remains
+process-local. Legacy v2 P4b remains conservative `cannot_pass`; its unchanged
+owner-affine mechanism does not measure these durable runtime capabilities.
 
 **Files:** `src/elspeth/web/execution/websocket_ticket.py`, `progress.py`,
 `routes.py`, `service.py`; Sessions models/protocol and the appropriate authority.
@@ -156,6 +225,14 @@ new mechanism/schema tests; task D is also needed before removing affinity globa
 
 ## D. Durable Composer progress and inflight accounting
 
+**Status (2026-09-10): implemented; release integration verification pending.**
+See [Final verification](#final-verification).
+Renewable PostgreSQL request leases, bounded redacted progress snapshots and
+per-request inflight records support peer reads and current cluster activity.
+Local process/HTTP integration evidence exercises the production path.
+Interrupted provider requests are not automatically resumed; guided, freeform
+and tutorial transitions retain the same provider-backed Composer behavior.
+
 **Files:** `src/elspeth/web/composer/progress.py`, `service.py`;
 `src/elspeth/web/sessions/routes/composer/compose.py`, `guided_plan.py`;
 Sessions models/protocol and owning authorities.
@@ -176,14 +253,21 @@ registry is empty, and snapshots expose no raw tool content or secrets.
 
 ## E. Cluster-wide rate limits — omitted from the short follow-up list
 
+**Status (2026-09-10): implemented; release integration verification pending.**
+See [Final verification](#final-verification).
+External PostgreSQL provides shared auth-IP, cheap-write and Composer budgets
+through privacy-preserving keys, fresh post-lock clock decisions and bounded
+cleanup. Local independent-process tests exercise shared admission and refusal
+without local fallback. The explicitly local adapter remains process-local.
+
 **Files:** `src/elspeth/web/middleware/rate_limit.py`, `src/elspeth/web/app.py`,
 Sessions models/protocol and owning authorities.
 **Tests:** `tests/unit/web/middleware/test_rate_limit.py`;
 create `tests/testcontainer/web/test_cross_process_rate_limit_postgres.py`.
 
-The current limiter explicitly uses per-process buckets. This affects the
-Composer, cheap-write and auth-IP instances; affinity does not provide one
-cluster-wide quota. Record the limitation even if implementation remains deferred.
+The original baseline used per-process buckets for Composer, cheap-write and
+auth-IP instances; affinity did not provide one cluster-wide quota. That
+external-PostgreSQL limitation is replaced by the shared adapter above.
 
 1. Define scope/subject keys and privacy-preserving digests for all three
    limiter uses; carry separate budgets for cheap writes and LLM/execution work.
@@ -201,12 +285,17 @@ and auth, write and Composer routes select the shared adapter consistently.
 
 ## F. Receipt evolution and deferred provider work
 
+**Status (2026-09-10): deferral adopted; receipt regression checks pending.**
+See [Final verification](#final-verification). No new provider or receipt v3 is implemented. Existing receipt
+envelopes, closed mechanism vocabulary and validators remain unchanged; old
+and current diagnostic reasons remain admissible without enabling a P4b pass.
+
 The v3 trigger in `_azure_container_apps_acceptance/README.md` includes
 **0.8.1 planning**, and this checkout is already on that release branch.
-Record an explicit disposition now: this ACA reconciliation **proposes deferring
-v3 implementation** because it changes neither the receipt envelope nor the
-provider set. This proposal does not erase the trigger or constitute operator
-ratification. Revisit it before a third provider or envelope/compatibility-field
+The instruction to execute this plan adopts its explicit disposition:
+**defer v3 implementation** because this work changes neither the receipt
+envelope nor the provider set. This does not erase the trigger. Revisit it
+before a third provider or envelope/compatibility-field
 change; implement the shared contract once, with both provider regression suites.
 
 For that work inspect `src/elspeth/web/_acceptance_common/`,
@@ -218,15 +307,15 @@ Keep Scenario B/C on ACA, `azure-otlp`, Entra PostgreSQL auth, Document
 Intelligence acceptance, Kubernetes/AKS and generated platform profiles out of
 this ACA completion scope. Their earlier inclusion/exclusion is not proof of
 implementation. A provider-profile project must distinguish the existing startup
-registry from a public profile schema. Recheck ADR-041 against the final runtime
-claim when promoting documentation; the recording ticket alone proves no amendment.
+registry from a public profile schema. The ADR-041 bounded runtime amendment
+records this scope; it does not promote the frozen state-engine catalog.
 
 ## Order and verification
 
-A can proceed independently. B needs a reviewed cross-database transition
-design before implementation. C and D share Sessions/auth boundaries; E can be
-developed separately but must coordinate schema and authority-gate changes.
-Finish C and D, then prove routing without affinity before relaxing the ACA
+The original execution order separated A from the runtime changes and required
+a reviewed cross-database transition design for B. C, D and E coordinated
+shared Sessions/auth, schema and authority-gate changes. Routing without
+affinity still requires separate qualification before relaxing the ACA
 configuration. None of B–F is silently made a new closure blocker for the
 already desktop-accepted ACA task.
 
@@ -261,5 +350,26 @@ Read the completed `summary.txt` and frozen-tree result. PostgreSQL tests
 require Docker and serial execution; default pytest is not PostgreSQL evidence.
 Compare the key-free lint corpus against the base and report the signing state
 separately. Bicep changes also require the compiled-ARM bundle tests and pinned
-CI compile job. These are future execution instructions, not checks claimed
-to have passed during this documentation reconciliation.
+CI compile job. Historical measurements below do not substitute for fresh
+results from the resolved release integration. The current repair checks and
+full default and serial PostgreSQL gates remain pending.
+
+## Final verification
+
+**Current release integration: verification pending.** Re-run the required
+gates after the release merge and review repairs, and record their completed
+exit codes and frozen-tree result before claiming integration verification.
+
+The earlier feature working tree based on `a086371f1`, with the B merge staged
+(frozen fingerprint `fb5231de4f42f6ea`), completed the default suite (**50,598 passed, 83 skipped, 2 xfailed**, exit 0)
+and serial PostgreSQL suite (**433 passed, 1 skipped**, exit 0), with `frozen=YES`
+in **/tmp/aca-corrected-final-runtime-gates/20260909T233507Z-aca-replica-residuals-2427810/summary.txt**. The separate final static run recorded
+Ruff, mypy and contracts exit 0; the key-free trust-tier lint stage exited 1 with
+1,923 findings (**/tmp/aca-corrected-final-static-gates/20260909T233154Z-aca-replica-residuals-2404264/summary.txt**). This is not an all-gates-green
+or operator-signature claim. These results precede the merge with
+`release/0.8.1` and the recovery/ticket review repairs; their frozen fingerprint
+does not certify the current integration. The earlier attempt with 74
+default-suite and 6 PostgreSQL failures is also historical. This evidence does not
+produce a live ACA receipt, qualify routing without affinity, promote a frozen
+state-engine catalog, or close the direct CLI runtime-fingerprint residual
+`elspeth-f321e3ff21`.

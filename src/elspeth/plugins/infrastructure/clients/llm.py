@@ -243,17 +243,27 @@ def _extract_usage_from_provider_response(usage: Any) -> TokenUsage:
         return TokenUsage.unknown()
 
     if isinstance(usage, Mapping):
-        usage_data = {
-            "prompt_tokens": usage.get("prompt_tokens"),
-            "completion_tokens": usage.get("completion_tokens"),
-            "total_tokens": usage.get("total_tokens"),
-        }
+        return TokenUsage.from_dict(usage)
     else:
         usage_data = {
             "prompt_tokens": getattr(usage, "prompt_tokens", None),
             "completion_tokens": getattr(usage, "completion_tokens", None),
             "total_tokens": getattr(usage, "total_tokens", None),
+            "cached_prompt_tokens": getattr(usage, "cached_prompt_tokens", None),
+            "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", None),
+            "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None),
+            "reasoning_tokens": getattr(usage, "reasoning_tokens", None),
         }
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        usage_data["prompt_tokens_details"] = (
+            prompt_details if isinstance(prompt_details, Mapping) else {"cached_tokens": getattr(prompt_details, "cached_tokens", None)}
+        )
+        usage_data["completion_tokens_details"] = (
+            completion_details
+            if isinstance(completion_details, Mapping)
+            else {"reasoning_tokens": getattr(completion_details, "reasoning_tokens", None)}
+        )
 
     return TokenUsage.from_dict(usage_data)
 
@@ -468,6 +478,7 @@ class AuditedLLMClient(AuditedClientBase):
             sdk_kwargs["max_tokens"] = max_tokens
 
         start = time.perf_counter()
+        usage = TokenUsage.unknown()
 
         try:
             response = self._client.chat.completions.create(**sdk_kwargs)
@@ -491,6 +502,7 @@ class AuditedLLMClient(AuditedClientBase):
                 ),
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=usage,
             )
 
             # Telemetry emitted AFTER successful Landscape recording (even for call errors)
@@ -539,7 +551,6 @@ class AuditedLLMClient(AuditedClientBase):
         # AttributeError here, so they share the guard. usage defaults to
         # unknown() so the error handler can still run if the usage read is what
         # failed (the LLM call happened — it must be recorded, not vanish).
-        usage = TokenUsage.unknown()
         try:
             usage = _extract_usage_from_provider_response(response.usage)
             raw_response = response.model_dump()
@@ -559,6 +570,7 @@ class AuditedLLMClient(AuditedClientBase):
                 ),
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=usage,
             )
             # Telemetry emitted AFTER successful Landscape recording — without
             # this, serialization failures undercount in dashboards relative to
@@ -596,6 +608,7 @@ class AuditedLLMClient(AuditedClientBase):
                 ),
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=usage,
             )
 
             response_data = response_payload.to_dict()
@@ -633,6 +646,7 @@ class AuditedLLMClient(AuditedClientBase):
                 ),
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=usage,
             )
             # Telemetry emitted AFTER successful Landscape recording — keeps
             # empty-choices failures counted alongside the other error branches
@@ -675,6 +689,7 @@ class AuditedLLMClient(AuditedClientBase):
                 ),
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=usage,
             )
             # Telemetry emitted AFTER successful Landscape recording -- keeps
             # content-extraction failures counted alongside the other error
@@ -715,6 +730,7 @@ class AuditedLLMClient(AuditedClientBase):
                     ),
                     latency_ms=latency_ms,
                     resolved_prompt_template_hash=resolved_prompt_template_hash,
+                    token_usage=usage,
                 )
                 # Telemetry emitted AFTER successful Landscape recording — keeps
                 # unsupported tool_calls failures counted alongside the other
@@ -754,6 +770,7 @@ class AuditedLLMClient(AuditedClientBase):
                 ),
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=usage,
             )
 
             # Telemetry emitted AFTER successful Landscape recording (even for null-content errors)
@@ -793,6 +810,7 @@ class AuditedLLMClient(AuditedClientBase):
                 ),
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=usage,
             )
             # Telemetry emitted AFTER successful Landscape recording — keeps
             # non-str content failures counted alongside the other error
@@ -825,6 +843,7 @@ class AuditedLLMClient(AuditedClientBase):
             response_data=response_dto,
             latency_ms=latency_ms,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=usage,
         )
 
         # Telemetry emitted AFTER successful Landscape recording

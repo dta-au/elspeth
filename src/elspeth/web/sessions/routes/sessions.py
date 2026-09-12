@@ -901,7 +901,7 @@ def register_session_routes(router: APIRouter) -> None:
             compose_lock_registry = _get_session_compose_lock_registry(request)
             await compose_lock_registry.cleanup_session_lock(session_key)
             progress_registry = _get_composer_progress_registry(request)
-            await progress_registry.clear(session_key)
+            await progress_registry.clear(session_key, user.user_id)
 
     @router.post(
         "/{session_id}/fork",

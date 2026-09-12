@@ -32,6 +32,7 @@ from elspeth.web.secrets.user_store import UserSecretStore, _derive_fernet_key
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import user_secrets_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 TEST_MASTER_KEY = "test-master-key-for-encryption"
 
@@ -45,6 +46,9 @@ def db_engine():
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        for identity_id in ("user-1", "u1", "alice", "bob"):
+            ensure_test_identity(conn, identity_id=identity_id)
     return engine
 
 
@@ -290,6 +294,8 @@ class TestUserSecretStore:
         db_path = tmp_path / "test_concurrent.db"
         engine = create_session_engine(f"sqlite:///{db_path}")
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="u1")
         store = UserSecretStore(engine=engine, master_key=TEST_MASTER_KEY)
         errors: list[Exception] = []
 

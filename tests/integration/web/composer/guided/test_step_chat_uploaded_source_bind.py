@@ -257,9 +257,8 @@ def test_rejected_uploaded_bind_degrades_to_a_not_applied_turn(
     ``_prepare_step_1_uploaded_source_bind`` answers the live Step-1 turn
     through the ordinary schema-8 transition machinery
     (``transition_source_plugin_selection`` / ``transition_source_schema_form``
-    and the authority builders behind them), so its rejection set is the same
-    closed four — ``PluginConfigError``, ``InvariantError``, ``TypeError``,
-    ``ValueError``. The route degrades to the not-applied 200 the sibling
+    and the authority builders behind them). An external response ValueError
+    degrades to the not-applied 200 the sibling
     transition arm produces, keeps the authoritative turn, and leaves the file
     uploaded.
     """
@@ -270,7 +269,7 @@ def test_rejected_uploaded_bind_degrades_to_a_not_applied_turn(
     initial_turn = _guided(client, session_id)["next_turn"]
 
     def reject_bind(**_kwargs: object) -> object:
-        raise InvariantError("injected uploaded-bind transition rejection")
+        raise ValueError("injected uploaded-bind response rejection")
 
     monkeypatch.setattr(guided_chat_atomic, "_prepare_step_1_uploaded_source_bind", reject_bind)
 
@@ -291,16 +290,18 @@ def test_rejected_uploaded_bind_degrades_to_a_not_applied_turn(
     assert [str(blob.id) for blob in blobs] == [blob_id]
 
 
+@pytest.mark.parametrize("error_type", [AuditIntegrityError, InvariantError])
 def test_uploaded_bind_integrity_failure_fails_the_operation_closed(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
 ) -> None:
     """The bind's own integrity checks are NOT part of the rejection set.
 
     ``_prepare_step_1_uploaded_source_bind`` raises ``AuditIntegrityError``
     when its custody or projection invariants break (escaped step, missing
     blob custody, no projected form, lost server-held plugin). That type is
-    outside the four-member transition rejection set, so it must fail the
+    outside the external-response rejection set, so it must fail the
     operation closed instead of settling as a token-consuming degraded turn.
     """
     client = composer_test_client
@@ -309,8 +310,10 @@ def test_uploaded_bind_integrity_failure_fails_the_operation_closed(
     _refuse_provider(monkeypatch)
     initial_turn = _guided(client, session_id)["next_turn"]
 
+    primary = error_type("injected uploaded-bind custody failure")
+
     def break_bind(**_kwargs: object) -> object:
-        raise AuditIntegrityError("injected uploaded-bind custody failure")
+        raise primary
 
     monkeypatch.setattr(guided_chat_atomic, "_prepare_step_1_uploaded_source_bind", break_bind)
 
@@ -318,9 +321,9 @@ def test_uploaded_bind_integrity_failure_fails_the_operation_closed(
         f"/api/sessions/{session_id}/guided/chat",
         json=_chat_body(initial_turn, _UPLOAD_SENTINEL.format(filename="inventory.csv")),
     )
-
-    assert response.status_code == 500, response.json()
+    assert response.status_code == 500
     assert response.json()["detail"]["failure_code"] == "integrity_error"
+    assert str(primary) not in response.text
     assert _guided(client, session_id)["composition_state"]["sources"] == {}
 
 

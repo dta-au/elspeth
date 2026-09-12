@@ -17,7 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from elspeth.contracts.advisory_locks import ELSPETH_AUDIT_EXPORT_LOCK_CLASSID
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
     AUDIT_EXPORT_DERIVATION_VERSION,
+    AuditExportAuthEventCoverageValidator,
     AuditExportContentDescriptor,
     AuditExportContentStoreResolver,
     AuditExportSnapshotCandidate,
@@ -70,6 +72,11 @@ def _verify_snapshot_graph(
     chain = hashlib.sha256()
     cumulative_records = 0
     cumulative_bytes = 0
+    coverage = (
+        AuditExportAuthEventCoverageValidator(_timestamp(snapshot.source_completed_at))
+        if snapshot.exporter_version == AUDIT_EXPORT_AUTH_EXPORTER_VERSION
+        else None
+    )
     for chunk in chunks:
         content = resolve_registered(chunk.content_ref)
         content_hash = H(content)
@@ -110,6 +117,11 @@ def _verify_snapshot_graph(
                 except Exception as exc:
                     raise AuditIntegrityError("audit-export snapshot record HMAC verification failed") from exc
                 chain.update(signature.encode("ascii"))
+            if coverage is not None:
+                try:
+                    coverage.observe(emitted)
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise AuditIntegrityError("audit-export snapshot auth event coverage is invalid") from exc
             record_count += 1
         _expect_graph_value(record_count, chunk.record_count, f"chunk {chunk.ordinal} record_count")
         cumulative_records += record_count
@@ -126,6 +138,13 @@ def _verify_snapshot_graph(
                 "size_bytes": len(content),
             }
         )
+
+    if coverage is not None:
+        try:
+            coverage.finish()
+        except ValueError as exc:
+            raise AuditIntegrityError("audit-export snapshot auth event coverage is invalid") from exc
+        _expect_graph_value(coverage.public_config_hash, snapshot.public_export_config_hash, "public_export_config_hash")
 
     public_key_payload: dict[str, ClosedAuditExportJSON] = {
         "export_format": snapshot.export_format.value,

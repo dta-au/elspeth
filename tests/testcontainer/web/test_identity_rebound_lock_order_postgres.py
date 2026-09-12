@@ -43,6 +43,7 @@ from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import DBAPIError
 
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
     IdentityAdminActor,
     RepositoryIdentityAuthority,
@@ -203,7 +204,7 @@ def test_an_admin_rebound_commits_through_the_retry_against_a_server_that_honour
     url = _fresh_database(external_deployment_postgres_url, "rebound_retry")
     engine = create_session_engine(url)
     initialize_session_schema(engine)
-    authority = RepositoryIdentityAuthority(engine)
+    authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
     root = authority.bootstrap_admin(
         claims=_claims("root", email="root@example.com"),
@@ -245,7 +246,7 @@ def test_a_rebound_login_and_a_concurrent_admin_disable_both_commit_without_dead
     url = _fresh_database(external_deployment_postgres_url, "rebound_deadlock")
     setup_engine = create_session_engine(url)
     initialize_session_schema(setup_engine)
-    setup = RepositoryIdentityAuthority(setup_engine)
+    setup = RepositoryIdentityAuthority(setup_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
     root = setup.bootstrap_admin(
         claims=_claims("root", email="root@example.com"),
@@ -265,8 +266,8 @@ def test_a_rebound_login_and_a_concurrent_admin_disable_both_commit_without_dead
 
     first_engine = create_session_engine(url)
     second_engine = create_session_engine(url)
-    first = RepositoryIdentityAuthority(first_engine)
-    second = RepositoryIdentityAuthority(second_engine)
+    first = RepositoryIdentityAuthority(first_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+    second = RepositoryIdentityAuthority(second_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
     for rebounder, target in subjects:
         _one_concurrent_round(
@@ -292,7 +293,7 @@ def test_two_replicas_rebounding_the_last_admin_leave_it_active(external_deploym
     url = _fresh_database(external_deployment_postgres_url, "rebound_last_admin")
     setup_engine = create_session_engine(url)
     initialize_session_schema(setup_engine)
-    setup = RepositoryIdentityAuthority(setup_engine)
+    setup = RepositoryIdentityAuthority(setup_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
     root = setup.bootstrap_admin(
         claims=_claims("root", email="root@old.example"),
@@ -304,8 +305,8 @@ def test_two_replicas_rebounding_the_last_admin_leave_it_active(external_deploym
     root_id = root.record.identity_id
     assert setup.count_active_human_admins() == 1
 
-    first = RepositoryIdentityAuthority(create_session_engine(url))
-    second = RepositoryIdentityAuthority(create_session_engine(url))
+    first = RepositoryIdentityAuthority(create_session_engine(url), lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+    second = RepositoryIdentityAuthority(create_session_engine(url), lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
     barrier = Barrier(2)
 
     def attempt(authority: RepositoryIdentityAuthority) -> bool:
@@ -338,7 +339,7 @@ def test_concurrent_dormant_admin_logins_preserve_one_active_human_admin(externa
     url = _fresh_database(external_deployment_postgres_url, "dormancy_race")
     engine = create_session_engine(url)
     initialize_session_schema(engine)
-    authority = RepositoryIdentityAuthority(engine)
+    authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
     root = authority.bootstrap_admin(
         claims=_claims("root", email="root@example.com"),
         note="setup",
@@ -363,7 +364,7 @@ def test_concurrent_dormant_admin_logins_preserve_one_active_human_admin(externa
     def login(subject: str):
         other_engine = create_session_engine(url, connect_args={"options": "-c lock_timeout=5000 -c statement_timeout=10000"})
         try:
-            other = RepositoryIdentityAuthority(other_engine)
+            other = RepositoryIdentityAuthority(other_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
             barrier.wait(timeout=10)
             return other.ensure_identity(
                 claims=_claims(subject, email=f"{subject}@example.com"),

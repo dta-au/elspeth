@@ -17,6 +17,7 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
 )
 from elspeth.web.sessions.protocol import GuidedOperationClaimed
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -145,6 +146,8 @@ def test_reconciliation_rejects_wrong_operation_kind(composer_test_client: TestC
 
 def test_reconciliation_is_session_owned_and_requires_authentication(composer_test_client: TestClient) -> None:
     alice_session = _create_session(composer_test_client)
+    with composer_test_client.app.state.session_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="bob")
     bob_session = asyncio.run(composer_test_client.app.state.session_service.create_session("bob", "Bob", "local"))
     operation_id = str(uuid4())
 

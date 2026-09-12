@@ -19,6 +19,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.errors import ContractViolation, TransformErrorReason
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
@@ -74,6 +75,7 @@ class PluginAuditWriterAdapter:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         return self._execution.record_call(
             state_id,
@@ -89,6 +91,7 @@ class PluginAuditWriterAdapter:
             request_ref=request_ref,
             response_ref=response_ref,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
 
     def record_operation_call(
@@ -106,6 +109,7 @@ class PluginAuditWriterAdapter:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         return self._execution.record_operation_call(
             operation_id,
@@ -120,6 +124,7 @@ class PluginAuditWriterAdapter:
             request_ref=request_ref,
             response_ref=response_ref,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
 
     def get_node_state(self, state_id: str) -> NodeState | None:

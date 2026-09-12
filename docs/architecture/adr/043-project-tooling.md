@@ -204,18 +204,15 @@ This explicitly includes the three tools retired on 2026-08-29 — **Wardline,
 Legis, and Warpline** — and any future tool that a sibling installer offers
 to add. It says nothing about what a contributor runs locally.
 
-Mechanism: `tests/unit/docs/test_project_agent_guidance.py` pins the
-*absence* of every installer-written surface for each excluded tool
-(`AGENTS.md` block markers, `mcp__<tool>__` mentions, `.mcp.json` server,
-hook commands, skill directories, pack files). A re-leak fails CI instead of
-becoming a standing instruction. Proposing a new tool means: write the
-superseding ADR with a measured case (what it answers that the approved
-tools and git do not), add its surfaces, and move its absence test to a
-presence test in the same change.
+Review installer-written changes as ordinary repository changes. Product tests
+do not pin developer tooling choices, installations, local hooks, skill copies
+or standing-instruction wording (operator ruling, 2026-09-10). Changes to the
+maintainer's tool choices remain recorded decisions; they do not require
+presence or absence tests.
 
 Retiring a tool is the reverse and, per [ADR-046](046-audit-grade-is-a-product-characteristic.md),
 gets ordinary hygiene rather than audit-grade ceremony: remove the surfaces,
-add the absence test, purge its local state and its footprint in sibling
+purge its local state and its footprint in sibling
 tools, record the measurement here.
 
 ## Retirements (evidence)
@@ -291,10 +288,25 @@ block, both `warpline-workflow` skill copies, the post-commit block,
 `.weft/warpline/`. Loomweave answers the caller question; git answers the
 rest; the full `pytest tests/` run before merge stays the rule.
 
+### prove-it — retired 2026-09-13
+
+Completion-claim verifier and Claude Stop hook. The Stop hook and the product
+tests that pinned this optional developer tool had already been removed by the
+2026-09-10 tooling amendment, but its skill, command implementation, pytest
+helper, hook implementation, Claude skill symlink, ignored verdict directory,
+and generated `.verify/` state remained in the project. The maintainer directed
+their removal. Lane-manager had imported the pytest helper from the prove-it
+skill; that helper now belongs to lane-manager under its own name and
+environment contract because structural red-run verification is an existing
+lane-manager behavior, independent of completion claims. Removed:
+`.agents/skills/prove-it/`, `.claude/skills/prove-it`, the `.verify/` ignore,
+and the local `.verify/` state. No replacement completion gate or project
+test was introduced.
+
 ## Consequences
 
-- The tool set agents act on is a recorded decision with a CI-enforced
-  boundary; installer drift cannot silently widen it.
+- The tool set agents act on is a recorded maintainer decision reviewed through
+  ordinary repository changes, without CI pins on developer installations.
 - New static analysis or gating goes into elspeth-lints as a rule, which
   `meta_no_new_bespoke_cicd_enforcer` already enforces; a third-party
   analyzer is only ever a candidate if it answers something elspeth-lints
@@ -350,12 +362,20 @@ Decision: split by layer.
   the maintainer's harness choice is recorded in the toolchain document.
 - The §"Everything else is ruled out" clause above is reworded: the project
   ships no tool integrations beyond the named ones, and contributors use
-  whatever tools they like. The CI mechanism is unchanged — the guidance
-  tests still pin the *absence* of retired-tool surfaces and the repository
-  invariants (hooks bound to `${CLAUDE_PROJECT_DIR}`, bounded timeouts, no
-  private home paths, no hook bypass) — but they no longer assert that the
-  docs name any external tool.
+  whatever tools they like. At this amendment, guidance tests still pinned
+  retired-tool absence and local hook conventions, while no longer requiring
+  docs to name an external tool. The 2026-09-10 amendment below removes those
+  remaining developer-tooling pins.
 
 The approved-tooling section and the retirement evidence above stand as
 written; this amendment changes where the instructions live and what the
 project asks of contributors, not which tools the maintainer's agents use.
+
+## Amendment 2026-09-10: product tests do not pin developer tooling
+
+The operator directed removal of tests that pin developer tooling rather than
+the project. Tests no longer require or forbid particular agent tools, skill
+installations, local hooks, maintainer instructions or tool versions. This
+does not remove tests for ELSPETH's runtime Composer skills, deployment
+artifacts, or first-party checks that protect code, releases and user data.
+No replacement tool or installation requirement is introduced.

@@ -21,10 +21,13 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.contexts import RateLimitRegistryProtocol
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import CallType as CallTypeEnum
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.node_state_context import AggregationBatchContext
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
@@ -48,11 +51,11 @@ logger = logging.getLogger(__name__)
     invariant=(
         "Missing or malformed usage is observed as unknown by TokenUsage.from_dict; "
         "returns None when no valid usage field exists, preserving partial known counts without inventing zero counts. "
-        "The caller records the original response independently; this helper only projects telemetry metadata."
+        "The caller records the original response independently; this helper projects audit and telemetry metadata."
     ),
 )
 def _observed_response_token_usage(response_data: Mapping[str, object]) -> TokenUsage | None:
-    """Project optional provider usage independently of audit recording."""
+    """Project optional provider usage without changing the raw response."""
     from elspeth.contracts.token_usage import TokenUsage
 
     usage = TokenUsage.from_dict(response_data.get("usage"))
@@ -166,7 +169,7 @@ class PluginContext:
     # Callback to emit telemetry events for external calls.
     # Always present - when telemetry is disabled, orchestrator sets this to a no-op.
     # Plugins ALWAYS call this after successful Landscape recording - no None checks.
-    telemetry_emit: Callable[[Any], None] = field(default=lambda event: None)
+    telemetry_emit: Callable[[TelemetryEvent], None] = field(default=lambda event: None)
 
     # Validation errors that must later be linked to a persisted quarantine row.
     # Entries are (match_key, error_id), where match_key hashes the raw row payload
@@ -189,7 +192,7 @@ class PluginContext:
         contract: SchemaContract | None = None,
         state_id: str | None = None,
         operation_id: str | None = None,
-        telemetry_emit: Callable[[Any], None] | None = None,
+        telemetry_emit: Callable[[TelemetryEvent], None] | None = None,
         coordination_token: CoordinationToken | None = None,
         member_token: WorkerMembershipToken | None = None,
         work_item: TokenWorkItem | None = None,
@@ -385,6 +388,7 @@ class PluginContext:
 
         if self.state_id is not None or self.operation_id is None:
             raise FrameworkBugError("PluginContext.record_call requires an operation parent; row clients own row-call recording")
+        token_usage = _observed_response_token_usage(response_data) if call_type == CallTypeEnum.LLM and response_data is not None else None
         recorded_call = self.landscape.record_operation_call(
             operation_id=self.operation_id,
             call_type=call_type,
@@ -394,13 +398,13 @@ class PluginContext:
             error=RawCallPayload(error) if error is not None else None,
             latency_ms=latency_ms,
             coordination_token=self.require_coordination_token(),
+            token_usage=token_usage if token_usage is not None else TokenUsage.unknown(),
         )
         parent_id = self.operation_id
 
         # Emit telemetry AFTER successful Landscape recording
         # Wrapped in try/except to prevent telemetry failures from affecting callers
         try:
-            from elspeth.contracts.enums import CallType as CallTypeEnum
             from elspeth.contracts.events import ExternalCallCompleted
 
             # Pass data directly to RawCallPayload. No defensive copy needed:
@@ -410,13 +414,6 @@ class PluginContext:
             # (Existing test: test_request_payload_snapshot_is_immutable_after_call)
             request_snapshot = request_data
             response_snapshot = response_data
-
-            # Extract token usage for LLM calls if available.
-            # Keep external metadata observation separate from the audit-writing
-            # method: the response remains untrusted even after recording it.
-            token_usage = None
-            if call_type == CallTypeEnum.LLM and response_snapshot is not None:
-                token_usage = _observed_response_token_usage(response_snapshot)
 
             # Wrap data in RawCallPayload for typed telemetry payload.
             # RawCallPayload.__init__ calls deep_freeze(), creating an independent

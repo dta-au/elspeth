@@ -30,6 +30,7 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch
@@ -37,6 +38,7 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.execution.envelope import RunExecutionInput
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
@@ -59,6 +61,14 @@ def _required_parameter(owner: type[Any] | Any, method_name: str, parameter_name
 @pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
 def test_guided_reservation_requires_the_exact_parent_session_context(owner: type[Any]) -> None:
     parameter = _required_parameter(owner, "reserve_guided_operation", "session_operation_context")
+    assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
+
+
+@pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
+@pytest.mark.parametrize("method_name", ["assess_run_start_admission", "issue_run_start_permit"])
+def test_run_admission_requires_the_exact_session_context(owner: type[Any], method_name: str) -> None:
+    parameter = _required_parameter(owner, method_name, "session_operation_context")
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
 
 
@@ -306,9 +316,26 @@ def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
 
 def _resolved_signature(member: Any) -> tuple[tuple[tuple[str, inspect._ParameterKind, Any], ...], Any]:
     signature = inspect.signature(member)
-    hints = typing.get_type_hints(member, include_extras=True)
+    hints = typing.get_type_hints(
+        member,
+        localns={"RunExecutionInput": RunExecutionInput}
+        if member
+        in {
+            sessions_protocol.SessionOperationRunMutations.create_pending_run,
+            coordination_repository._RepositoryRunMutations.create_pending_run,
+        }
+        else None,
+        include_extras=True,
+    )
     parameters = tuple(parameter for parameter in signature.parameters.values() if parameter.name != "self")
-    assert all(parameter.default is inspect.Parameter.empty for parameter in parameters)
+    for parameter in parameters:
+        if parameter.name == "execution_input" and member in {
+            sessions_protocol.SessionOperationRunMutations.create_pending_run,
+            coordination_repository._RepositoryRunMutations.create_pending_run,
+        }:
+            assert parameter.default is None
+        else:
+            assert parameter.default is inspect.Parameter.empty
     return (
         tuple((parameter.name, parameter.kind, hints[parameter.name]) for parameter in parameters),
         hints["return"],
@@ -323,7 +350,17 @@ def _top_level_types(annotation: Any) -> tuple[Any, ...]:
 
 
 def _assert_no_authority_escape(*, owner: type[Any], member_name: str, member: Any) -> None:
-    hints = typing.get_type_hints(member, include_extras=True)
+    hints = typing.get_type_hints(
+        member,
+        localns={"RunExecutionInput": RunExecutionInput}
+        if member
+        in {
+            sessions_protocol.SessionOperationRunMutations.create_pending_run,
+            coordination_repository._RepositoryRunMutations.create_pending_run,
+        }
+        else None,
+        include_extras=True,
+    )
     forbidden_names = {"conn", "connection", "cursor", "engine", "query", "sql", "statement", "transaction", "tx"}
     assert not forbidden_names.intersection(member_name.lower().split("_"))
     for name, annotation in hints.items():
@@ -380,6 +417,13 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         (
             (session_protocol, implementation_types[1]),
             {
+                "assess_chargeable_operation": (
+                    (
+                        ("policy", inspect.Parameter.KEYWORD_ONLY, ChargeableAdmissionPolicy),
+                        ("operation", inspect.Parameter.KEYWORD_ONLY, ChargeableOperation),
+                    ),
+                    ChargeableAdmissionDecision,
+                ),
                 "record_plugin_crash_breadcrumb": (
                     (),
                     type(None),
@@ -429,12 +473,59 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         (
             (run_protocol, implementation_types[2]),
             {
+                "assess_start_admission": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("policy", inspect.Parameter.KEYWORD_ONLY, ChargeableAdmissionPolicy),
+                    ),
+                    sessions_protocol.RunStartPermitRecord,
+                ),
+                "issue_start_permit": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("policy", inspect.Parameter.KEYWORD_ONLY, ChargeableAdmissionPolicy),
+                    ),
+                    sessions_protocol.RunStartPermitRecord,
+                ),
+                "observe_start_permit_for_cleanup": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    sessions_protocol.RunStartPermitRecord,
+                ),
+                "complete_admission_refusal": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    type(None),
+                ),
+                "rebind_run_ownership": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    sessions_protocol.RunSagaState,
+                ),
+                "mark_recovery_outputs_finalized": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    type(None),
+                ),
+                "mark_recovery_required": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("reason", inspect.Parameter.KEYWORD_ONLY, sessions_protocol.RecoveryRequiredReason),
+                    ),
+                    type(None),
+                ),
+                "append_terminal_run_event_once": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("timestamp", inspect.Parameter.KEYWORD_ONLY, datetime),
+                        ("event_type", inspect.Parameter.KEYWORD_ONLY, sessions_protocol.SessionRunEventType),
+                        ("data", inspect.Parameter.KEYWORD_ONLY, Mapping[str, Any]),
+                    ),
+                    RunEventRecord,
+                ),
                 "create_pending_run": (
                     (
                         ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
                         ("state_id", inspect.Parameter.KEYWORD_ONLY, UUID),
                         ("pipeline_yaml", inspect.Parameter.KEYWORD_ONLY, str | None),
                         ("started_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                        ("execution_input", inspect.Parameter.KEYWORD_ONLY, RunExecutionInput | None),
                     ),
                     sessions_protocol.RunRecord,
                 ),
@@ -763,6 +854,46 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                 _assert_no_authority_escape(owner=owner, member_name=name, member=member)
 
 
+def _assert_background_lease_transfer(source: str) -> None:
+    """Bind the submitted worker and its completion callback to the same lease."""
+    tree = ast.parse(textwrap.dedent(source))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    submissions = [node for node in calls if ast.unparse(node.func) == "self._executor.submit"]
+    callbacks = [node for node in calls if ast.unparse(node.func) == "future.add_done_callback"]
+    assert len(submissions) == len(callbacks) == 1
+    submission = submissions[0]
+    assert ast.unparse(submission.args[0]) == "self._run_pipeline"
+    assert [(item.arg, ast.unparse(item.value)) for item in submission.keywords if item.arg == "session_operation_lease"] == [
+        ("session_operation_lease", "session_operation_lease")
+    ]
+    callback = callbacks[0]
+    assert len(callback.args) == 1
+    bound_callback = callback.args[0]
+    assert isinstance(bound_callback, ast.Call)
+    assert ast.unparse(bound_callback.func) == "partial"
+    assert ast.unparse(bound_callback.args[0]) == "self._on_pipeline_done"
+    assert [(item.arg, ast.unparse(item.value)) for item in bound_callback.keywords if item.arg == "session_operation_lease"] == [
+        ("session_operation_lease", "session_operation_lease")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("self._run_pipeline,", "self._different_worker,"),
+        ("self._on_pipeline_done,", "self._different_completion,"),
+        ("session_operation_lease=session_operation_lease", "session_operation_lease=another_lease"),
+        ("future.add_done_callback", "future.ignore_callback"),
+    ],
+)
+def test_background_lease_transfer_rejects_changed_worker_callback_or_authority(before: str, after: str) -> None:
+    source = inspect.getsource(ExecutionServiceImpl.execute)
+    assert before in source
+    _assert_background_lease_transfer(source)
+    with pytest.raises(AssertionError):
+        _assert_background_lease_transfer(source.replace(before, after))
+
+
 def test_execute_transfers_one_renewable_lease_to_background_completion() -> None:
     lease = _required_parameter(ExecutionServiceImpl, "execute", "session_operation_lease")
     assert lease.annotation is SessionOperationLease or lease.annotation == "SessionOperationLease"
@@ -774,9 +905,7 @@ def test_execute_transfers_one_renewable_lease_to_background_completion() -> Non
 
     execute_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl.execute))
     assert "session_operation_context = session_operation_lease.context" in execute_source
-    assert "session_operation_lease=session_operation_lease" in execute_source
-    assert "_executor.submit" in execute_source
-    assert "future.add_done_callback" in execute_source
+    _assert_background_lease_transfer(execute_source)
     worker_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl._run_pipeline))
     assert "session_operation_context = session_operation_lease.context" in worker_source
     assert "session_operation_lease.guard_external_effect" in worker_source

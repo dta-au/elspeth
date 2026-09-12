@@ -19,6 +19,7 @@ from elspeth.web.secrets.service import WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +33,9 @@ def engine() -> sa.engine.Engine:
     """In-memory SQLite engine migrated to head."""
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        for identity_id in ("user-1", "u1"):
+            ensure_test_identity(conn, identity_id=identity_id)
     return eng
 
 

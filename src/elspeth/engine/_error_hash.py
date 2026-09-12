@@ -34,7 +34,7 @@ def compute_error_hash(message: str, *, exception_type: str | None = None) -> st
     ``exception_type`` when available — so empty-message errors remain
     distinguishable by type and cannot collide with an ordinary UTF-8 message.
     """
-    if not message:
+    if message == "":
         payload = _EMPTY_MESSAGE_DOMAIN + (exception_type or "").encode()
     else:
         payload = message.encode()

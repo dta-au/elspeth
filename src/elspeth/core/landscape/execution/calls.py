@@ -27,6 +27,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
@@ -432,6 +433,7 @@ class CallAuditRepository:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record an external call for a node state.
 
@@ -444,6 +446,10 @@ class CallAuditRepository:
             response_data: Response payload (CallPayload — serialized internally, optional for errors)
             error: Error payload if status is ERROR (CallPayload — serialized internally)
             latency_ms: Call duration in milliseconds
+            token_usage: Admitted provider usage. Unreported measures stay NULL,
+                including failed calls. Only prompt, completion, cached prompt,
+                and reasoning measures have durable columns; provider totals
+                and Anthropic cache measures remain in response_data evidence.
             request_ref: Optional payload store reference for request
             response_ref: Optional payload store reference for response
             resolved_prompt_template_hash: Cross-DB hash anchor (Phase 5b Task 9).
@@ -472,6 +478,8 @@ class CallAuditRepository:
         # raise. Checking here keeps the audit trail pristine (Tier 1): a bad
         # hash leaves zero rows (elspeth-a94e626a36).
         validate_resolved_prompt_template_hash(call_type, resolved_prompt_template_hash)
+        if not isinstance(token_usage, TokenUsage):
+            raise TypeError("token_usage must be TokenUsage")
 
         call_id = generate_id()
         timestamp = now()
@@ -495,6 +503,10 @@ class CallAuditRepository:
             "response_hash": prepared.response_hash,
             "response_ref": prepared.response_ref,
             "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "prompt_tokens": token_usage.prompt_tokens,
+            "completion_tokens": token_usage.completion_tokens,
+            "cached_prompt_tokens": token_usage.cached_prompt_tokens,
+            "reasoning_tokens": token_usage.reasoning_tokens,
             "error_json": prepared.error_json,
             "latency_ms": latency_ms,
             "created_at": timestamp,
@@ -564,6 +576,10 @@ class CallAuditRepository:
             error_json=prepared.error_json,
             latency_ms=latency_ms,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            prompt_tokens=token_usage.prompt_tokens,
+            completion_tokens=token_usage.completion_tokens,
+            cached_prompt_tokens=token_usage.cached_prompt_tokens,
+            reasoning_tokens=token_usage.reasoning_tokens,
         )
 
     def record_operation_call(
@@ -581,6 +597,7 @@ class CallAuditRepository:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record an external call made during an operation.
 
@@ -595,6 +612,9 @@ class CallAuditRepository:
             response_data: Response payload (CallPayload — serialized internally, optional for errors)
             error: Error details if status is ERROR (stored as JSON)
             latency_ms: Call duration in milliseconds
+            token_usage: Admitted provider usage with unknown measures stored
+                as NULL. Provider-specific additional measures remain in the
+                response payload, rather than being inferred or normalized.
             request_ref: Optional payload store reference for request
             response_ref: Optional payload store reference for response
 
@@ -606,6 +626,8 @@ class CallAuditRepository:
         # `calls` rows rather than commit and then raise from Call.__post_init__
         # (elspeth-a94e626a36).
         validate_resolved_prompt_template_hash(call_type, resolved_prompt_template_hash)
+        if not isinstance(token_usage, TokenUsage):
+            raise TypeError("token_usage must be TokenUsage")
 
         if call_index is None:
             call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
@@ -631,6 +653,10 @@ class CallAuditRepository:
             "response_hash": prepared.response_hash,
             "response_ref": prepared.response_ref,
             "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "prompt_tokens": token_usage.prompt_tokens,
+            "completion_tokens": token_usage.completion_tokens,
+            "cached_prompt_tokens": token_usage.cached_prompt_tokens,
+            "reasoning_tokens": token_usage.reasoning_tokens,
             "error_json": prepared.error_json,
             "latency_ms": latency_ms,
             "created_at": timestamp,
@@ -700,6 +726,10 @@ class CallAuditRepository:
             error_json=prepared.error_json,
             latency_ms=latency_ms,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            prompt_tokens=token_usage.prompt_tokens,
+            completion_tokens=token_usage.completion_tokens,
+            cached_prompt_tokens=token_usage.cached_prompt_tokens,
+            reasoning_tokens=token_usage.reasoning_tokens,
         )
 
     def get_operation_calls(self, operation_id: str) -> list[Call]:

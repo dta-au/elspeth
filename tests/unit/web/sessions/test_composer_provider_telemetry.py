@@ -22,6 +22,7 @@ from elspeth.web.sessions import service as service_module
 from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
@@ -49,6 +50,8 @@ def _call() -> ComposerLLMCall:
 
 
 def _service(engine) -> SessionServiceImpl:
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),

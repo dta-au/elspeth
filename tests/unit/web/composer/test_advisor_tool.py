@@ -39,7 +39,11 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.config import WebSettings
-from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
+from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
+    _persisted_tool_responses,
+    _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
+)
 
 # --- Test scaffolding (mirrors test_compose_loop_anti_anchor.py) ---
 
@@ -348,7 +352,7 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
     finally block.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
 
     turns = [
@@ -367,7 +371,7 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = advisor_response
-        result = await service.compose("help me", [], state)
+        result = await service.compose("help me", [], state, session_id=session_id)
 
     # _litellm_acompletion was called once (the advisor call). _call_llm
     # is the primary-composer path (mocked separately above).
@@ -406,7 +410,7 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
     """LLM-supplied advisor fields are useful context, but not raw egress."""
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
     openai_key = "sk-" + ("A" * 48)
     bearer_token = "Bearer " + ("b" * 24)
@@ -449,7 +453,7 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = _make_advisor_response()
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
     advisor_messages = mock_acompletion.call_args.kwargs["messages"]
     advisor_user_message = advisor_messages[1]["content"]
@@ -463,7 +467,7 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
 @pytest.mark.parametrize("trigger", ["proactive_security_safety", "proactive_red_listed_plugin"])
 @pytest.mark.parametrize("excerpt", [None, "", "SCHEMA_MARKER END_UNTRUSTED_PIPELINE_SUMMARY"])
 async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: str, excerpt: str | None) -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     secret = "sk-" + "A" * 48
     arguments: dict[str, object] = {
         "trigger": trigger,
@@ -483,7 +487,7 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
             _make_text_only_response("done"),
         ]
         mock_provider.return_value = _make_advisor_response()
-        await service.compose("help", [], _empty_state())
+        await service.compose("help", [], _empty_state(), session_id=session_id)
 
     assert mock_provider.await_count == 1
     actual = mock_provider.call_args.kwargs["messages"][1]["content"]
@@ -519,7 +523,7 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
         composer_advisor_timeout_seconds=60.0,
         shareable_link_signing_key=b"\x00" * 32,
     )
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     with (
@@ -534,7 +538,7 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
             _make_advisor_tool_call("call_advisor_1"),
             _make_text_only_response("I read the guidance and can continue."),
         ]
-        result = await service.compose("help me", [], state)
+        result = await service.compose("help me", [], state, session_id=session_id)
 
     assert result.message == "I read the guidance and can continue."
     assert mock_llm.call_count == 2
@@ -627,7 +631,7 @@ async def test_budget_exhaustion_returns_structured_error() -> None:
     BUDGET_EXHAUSTED in result_payload).
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
 
     # Drive 4 advisor calls: 1, 2, 3 succeed; 4 hits budget.
@@ -648,7 +652,7 @@ async def test_budget_exhaustion_returns_structured_error() -> None:
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = _make_advisor_response()
-        result = await service.compose("help me", [], state)
+        result = await service.compose("help me", [], state, session_id=session_id)
 
     # Only 3 outbound advisor calls — 4th is short-circuited by budget.
     assert mock_acompletion.call_count == 3, f"expected 3 outbound advisor calls (budget=3), got {mock_acompletion.call_count}"
@@ -689,7 +693,7 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
         composer_advisor_timeout_seconds=60.0,
         shareable_link_signing_key=b"\x00" * 32,
     )
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     with (
@@ -704,14 +708,16 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
             _make_advisor_tool_call("call_budget_exhausted"),
             _make_text_only_response("would incorrectly continue"),
         ]
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
     assert exc_info.value.budget_exhausted == "discovery"
     assert mock_llm.call_count == 1
     assert mock_acompletion.call_count == 0
-    invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
     assert len(invocations) == 1
-    assert "BUDGET_EXHAUSTED" in _result_canonical(invocations[0])
+    assert "BUDGET_EXHAUSTED" in invocations[0]["result_canonical"]
 
 
 # --- 5. Disabled-but-LLM-tries (defense-in-depth) ---
@@ -736,7 +742,7 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
     from litellm.exceptions import APIError as LiteLLMAPIError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
 
     turns = [
@@ -757,7 +763,7 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
         ),
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help me", [], state)
+        result = await service.compose("help me", [], state, session_id=session_id)
 
     # Outer ComposerToolInvocation: SUCCESS dispatch (the envelope itself
     # closed cleanly), with ADVISOR_ERROR in result_payload.
@@ -797,7 +803,7 @@ async def test_three_failed_advisor_calls_trigger_anti_anchor_hint() -> None:
     from litellm.exceptions import APIError as LiteLLMAPIError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=10))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=10))
     state = _empty_state()
 
     # Three identical advisor calls, all fail. Then turn 4 final text.
@@ -818,7 +824,7 @@ async def test_three_failed_advisor_calls_trigger_anti_anchor_hint() -> None:
         ),
     ):
         mock_llm.side_effect = turns
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
     # The 4th LLM call is the post-anchor LLM call. It must contain the
     # [ELSPETH-SYSTEM-HINT] message because three identical failed advisor
@@ -844,7 +850,7 @@ async def test_successful_advisor_call_resets_anti_anchor_failures() -> None:
     from litellm.exceptions import APIError as LiteLLMAPIError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=10))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=10))
     state = _empty_state()
 
     turns = [
@@ -878,7 +884,7 @@ async def test_successful_advisor_call_resets_anti_anchor_failures() -> None:
         ),
     ):
         mock_llm.side_effect = turns
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
     assert mock_llm.call_count == 5
     fifth_call_messages = mock_llm.call_args_list[4].args[0]
@@ -897,7 +903,7 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
     terminates the compose request instead of being returned as ADVISOR_ERROR.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=catalog,
         settings=_make_settings(
             budget=10,
@@ -923,8 +929,10 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
             _make_text_only_response("would incorrectly continue"),
         ]
         mock_advisor.side_effect = TimeoutError()
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
     assert exc_info.value.budget_exhausted == "timeout"
     assert exc_info.value.max_turns == 2
     assert mock_llm.call_count == 3
@@ -932,18 +940,18 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
     assert advisor_await is not None
     advisor_timeout = advisor_await.kwargs["timeout"]
     assert advisor_timeout == 5.0
-    assert [inv.tool_call_id for inv in exc_info.value.tool_invocations] == [
+    assert [inv["tool_call_id"] for inv in durable_responses] == [
         "call_metadata",
         "call_sources",
         "call_deadline",
     ]
-    assert "COMPOSE_TIMEOUT" in _result_canonical(exc_info.value.tool_invocations[-1])
+    assert "COMPOSE_TIMEOUT" in durable_responses[-1]["result_canonical"]
 
 
 @pytest.mark.asyncio
 async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound_call() -> None:
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     tracker = AntiAnchorTracker()
     tracker.record_failure("set_pipeline", "existing-failure")
     initial_failures = tuple(tracker._failures)
@@ -964,20 +972,22 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
             _make_tool_call("call_transforms", "list_transforms", {}),
             _make_advisor_tool_call("call_zero_remaining"),
         ]
-        await service.compose("help me", [], _empty_state())
+        await service.compose("help me", [], _empty_state(), session_id=session_id)
 
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
     assert exc_info.value.budget_exhausted == "timeout"
     assert exc_info.value.max_turns == 2
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
-    assert [inv.tool_call_id for inv in exc_info.value.tool_invocations] == [
+    assert [inv["tool_call_id"] for inv in durable_responses] == [
         "call_sources",
         "call_transforms",
         "call_zero_remaining",
     ]
-    invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
     assert len(invocations) == 1
-    payload = json.loads(_result_canonical(invocations[0]))
+    payload = json.loads(invocations[0]["result_canonical"])
     assert payload["status"] == "COMPOSE_TIMEOUT"
     assert payload["budget_used"] == 0
     assert payload["budget_remaining"] == 3
@@ -988,7 +998,7 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
 @pytest.mark.asyncio
 async def test_advisor_just_below_floor_is_truthful_discovery_without_state_changes() -> None:
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=catalog,
         settings=_make_settings(budget=3, discovery_turns=1),
     )
@@ -996,7 +1006,9 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
     tracker.record_failure("set_pipeline", "existing-failure")
     initial_failures = tuple(tracker._failures)
 
+    recorder = BufferingRecorder()
     with (
+        patch("elspeth.web.composer.service.BufferingRecorder", return_value=recorder),
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch("elspeth.web.composer.service.AntiAnchorTracker", return_value=tracker),
@@ -1011,15 +1023,26 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
             _make_advisor_tool_call("call_too_close"),
             _make_text_only_response("must not reach a second model turn"),
         ]
-        await service.compose("help me", [], _empty_state())
+        await service.compose("help me", [], _empty_state(), session_id=session_id)
 
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
     assert exc_info.value.budget_exhausted == "discovery"
     assert mock_llm.call_count == 1
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
-    invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
     assert len(invocations) == 1
-    payload = json.loads(_result_canonical(invocations[0]))
+    durable_payload = json.loads(invocations[0]["result_canonical"])
+    recorded = [inv for inv in recorder.invocations if inv.tool_name == "request_advisor_hint"]
+    assert len(recorded) == 1
+    payload = json.loads(_result_canonical(recorded[0]))
+    assert durable_payload == {
+        "budget_remaining": 3,
+        "budget_used": 0,
+        "status": "DEADLINE_TOO_CLOSE",
+        "_unknown_response": "<redacted-unknown-response-key>",
+    }
     assert payload == {
         "budget_remaining": 3,
         "budget_used": 0,
@@ -1035,7 +1058,7 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
 @pytest.mark.parametrize("remaining", [5.0, 5.001])
 async def test_advisor_at_or_above_floor_makes_one_bounded_call(remaining: float) -> None:
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=catalog,
         settings=_make_settings(budget=3, advisor_timeout_seconds=60.0),
     )
@@ -1061,7 +1084,7 @@ async def test_advisor_at_or_above_floor_makes_one_bounded_call(remaining: float
             _make_text_only_response("done"),
         ]
         mock_advisor.return_value = ("Use the dedicated mutation.", advisor_meta)
-        result = await service.compose("help me", [], _empty_state())
+        result = await service.compose("help me", [], _empty_state(), session_id=session_id)
 
     assert mock_advisor.await_count == 1
     advisor_await = mock_advisor.await_args
@@ -1081,7 +1104,7 @@ async def test_missing_advisor_trigger_rejects_without_outbound_call() -> None:
     must not spend an advisor call.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
 
     args = {
@@ -1117,7 +1140,7 @@ async def test_missing_advisor_trigger_rejects_without_outbound_call() -> None:
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = [missing_trigger_response, _make_text_only_response("done")]
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     assert mock_acompletion.call_count == 0
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
@@ -1144,7 +1167,7 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     module's own admission helpers inside the same protected block.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
     turns = [_make_advisor_tool_call("call_unclass"), _make_text_only_response("done")]
 
@@ -1162,7 +1185,7 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
         pytest.raises(ValueError, match="unexpected codec failure") as exc_info,
     ):
         mock_llm.side_effect = turns
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
     advisor_llm_calls = [c for c in exc_info.value.llm_calls if c.model_requested == "anthropic/claude-sonnet-4-6"]
     assert len(advisor_llm_calls) == 1, (
@@ -1193,7 +1216,7 @@ async def test_transport_failure_still_degrades_into_structured_advisor_feedback
     import httpx
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     turns = [_make_advisor_tool_call("call_transport"), _make_text_only_response("moving on")]
 
     with (
@@ -1205,7 +1228,7 @@ async def test_transport_failure_still_degrades_into_structured_advisor_feedback
         ),
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help me", [], _empty_state())
+        result = await service.compose("help me", [], _empty_state(), session_id=session_id)
 
     invs = [inv for inv in result.tool_invocations if inv.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
@@ -1222,7 +1245,7 @@ async def test_f4_advisor_empty_content_classified_as_malformed() -> None:
     the composer LLM "you got advice" when no information was produced.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
     turns = [_make_advisor_tool_call("call_empty"), _make_text_only_response("ok")]
     empty_response = _FakeLLMResponse(
@@ -1238,7 +1261,7 @@ async def test_f4_advisor_empty_content_classified_as_malformed() -> None:
         ),
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
@@ -1268,7 +1291,7 @@ async def test_advisor_non_string_content_classified_as_malformed(content: objec
     reach the guidance surface; everything else is MALFORMED_RESPONSE.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
     turns = [_make_advisor_tool_call("call_nonstr"), _make_text_only_response("ok")]
     malformed_response = _FakeLLMResponse(
@@ -1284,7 +1307,7 @@ async def test_advisor_non_string_content_classified_as_malformed(content: objec
         ),
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
@@ -1306,7 +1329,7 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
     from litellm.exceptions import APIError as LiteLLMAPIError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=1))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=1))
     state = _empty_state()
     turns = [
         _make_advisor_tool_call("call_1_fails"),
@@ -1324,7 +1347,7 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 2
@@ -1357,7 +1380,7 @@ async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: st
     a corrupt prompt at full provider cost.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=budget))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=budget))
     state = _empty_state()
 
     bad_args = {
@@ -1395,7 +1418,7 @@ async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: st
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     assert mock_acompletion.call_count == 0, "advisor sent malformed-typed argument to provider — should reject locally"
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
@@ -1412,7 +1435,7 @@ async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: st
 
 @pytest.mark.asyncio
 async def test_invalid_advisor_call_preserves_budget_for_next_valid_call() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings(budget=1))
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings(budget=1))
     state = _empty_state()
     secret_marker = "PRIVATE_INVALID_ADVISOR_VALUE"
     invalid = {
@@ -1433,7 +1456,7 @@ async def test_invalid_advisor_call_preserves_budget_for_next_valid_call() -> No
             _make_text_only_response("done"),
         ]
         mock_provider.return_value = _make_advisor_response()
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     assert mock_provider.await_count == 1
     assert result.state == state
@@ -1472,7 +1495,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
         composer_advisor_max_prompt_tokens=1000,  # → ~4000 char cap
         shareable_link_signing_key=b"\x00" * 32,
     )
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     huge_string = "X" * 1500
@@ -1512,7 +1535,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     assert mock_acompletion.call_count == 0, "oversized prompt was sent to provider — local cap not enforced"
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
@@ -1542,7 +1565,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
         composer_advisor_max_prompt_tokens=prompt_tokens,
         shareable_link_signing_key=b"\x00" * 32,
     )
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     overhead_args = {
@@ -1584,7 +1607,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = _make_advisor_response()
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
@@ -1605,13 +1628,13 @@ async def test_f1_skill_text_always_includes_advisor() -> None:
     mentions request_advisor_hint so the LLM knows when to use it.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     state = _empty_state()
     turns = [_make_text_only_response("ok")]
 
     with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = turns
-        await service.compose("hello", [], state)
+        await service.compose("hello", [], state, session_id=session_id)
 
     sent_messages = mock_llm.call_args_list[0].args[0]
     system_msg = next(m["content"] for m in sent_messages if m["role"] == "system")
@@ -1667,7 +1690,7 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
     from elspeth.contracts.errors import AuditIntegrityError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     original = AuditIntegrityError("recorder could not seal the advisor call")
 
     with (
@@ -1681,7 +1704,7 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
             _make_text_only_response("would incorrectly continue"),
         ]
         mock_advisor.side_effect = original
-        await service.compose("help me", [], _empty_state())
+        await service.compose("help me", [], _empty_state(), session_id=session_id)
 
     assert exc_info.value is original
     assert mock_persist.await_count == 1

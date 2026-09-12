@@ -47,12 +47,43 @@ Before a public release, the maintainer should confirm:
 
 ## Maintainer Continuity
 
-ELSPETH operates in single-maintainer mode, recorded in
-`docs/architecture/adr/024-delivery-governance-for-single-maintainer-mode.md`,
-and maintainer continuity is a material residual risk. This governance file
-does not remove that risk. It makes the release authority and decision record
-explicit so future maintainers and adopting organisations can see where
-decisions are meant to land.
+ELSPETH operates in **single-maintainer mode**, and maintainer continuity is a
+material residual risk. This governance file does not remove that risk. It
+makes the release authority and decision record explicit so future maintainers
+and adopting organisations can see where decisions are meant to land.
+
+Single-maintainer mode holds until a second maintainer regularly participates
+in release-critical delivery. A single-maintainer repository cannot honestly
+claim independent two-person review, and self-approval would add ceremony
+without improving safety, so the posture is deliberate rather than an
+accidental waiver of review discipline:
+
+- the required human approval count is zero while no independent maintainer is
+  routinely available; self-review cannot satisfy an approval requirement;
+- default-branch and release-critical merges are protected by mandatory
+  automated gates;
+- required evidence comes from CI, policy lints, CodeQL, redaction governance,
+  artifact provenance, signatures, and smoke tests;
+- release images are tied to commits that have passed the required CI gate;
+- advisory quality signals (for example mutation testing) are labelled
+  advisory and must not be presented as enforced thresholds.
+
+Two consequences follow and are accepted. Independent human review is
+unavailable within the mode, so review quality depends heavily on CI coverage,
+policy lints, and disciplined issue and ADR records. Platform-configured
+controls such as branch protection require periodic inspection before they can
+be claimed as enforced.
+
+When a second independent maintainer regularly participates in
+release-critical delivery, ELSPETH enters **two-maintainer mode** and enables
+one required approving review, stale-review dismissal on new commits,
+last-push approval protection, required conversation resolution, CODEOWNERS or
+an equivalent ownership map for security-sensitive paths, and review
+requirements for release tags or branches where the platform supports them.
+
+Delivery governance and project-control reporting beyond the above are set by
+the maintainer's organisation, not decided by this project; the control-report
+set is described in `docs/project-control/README.md`.
 
 ## Security Governance
 

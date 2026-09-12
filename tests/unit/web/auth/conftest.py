@@ -29,6 +29,7 @@ from elspeth.web.auth.session_token import (
     LOCAL_AUDIENCE,
     SessionTokenIssuer,
 )
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
     IdentityDormant,
     IdentityRebound,
@@ -179,7 +180,7 @@ def build_local_auth_provider(
         initialize_session_schema(engine)
 
     # The substrate is reached only through its authority, as in app.py.
-    authority = RepositoryIdentityAuthority(engine)
+    authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
     def _principal_is_active(identity_id: str) -> bool:
         record = authority.read_identity(identity_id=identity_id)

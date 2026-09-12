@@ -44,10 +44,11 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any, Final, Literal, TypedDict, cast, final, get_args
 
 from sqlalchemy import bindparam, delete, insert, or_, select, update
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.auth import (
@@ -58,7 +59,9 @@ from elspeth.contracts.auth import (
     RelationshipType,
 )
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.coordination.identity_lifecycle import IdentityAuthorityRevoked, IdentityLifecycleEffect
 from elspeth.web.coordination.membership_authority import _database_clock_value, _ensure_utc
+from elspeth.web.coordination.mutation_connection_registry import _register_mutation_connection, _unregister_mutation_connection
 from elspeth.web.sessions.identity_repository import (
     _IDENTITY_COLUMNS,
     EnsureIdentityOutcome,
@@ -177,7 +180,14 @@ class LastActiveAdminProtected(IdentityAuthorityRefusal):
 
 @final
 class AdminAlreadyBootstrapped(IdentityAuthorityRefusal):
-    _MESSAGE = "an active human administrator already exists; bootstrap is inert"
+    _MESSAGE = "administrator history or current authority makes this bootstrap mode inert"
+
+
+class AdminBootstrapMode(Enum):
+    """Configured seeding is one-shot; explicit operator recovery is separate."""
+
+    CONFIGURED_SEED = "configured_seed"
+    OPERATOR_RECOVERY = "operator_recovery"
 
 
 @final
@@ -785,6 +795,13 @@ _ADMIN_HOLDER_ROWS: Final = (
 # drops FOR UPDATE; there ``engine.begin()`` is BEGIN IMMEDIATE, so the whole
 # read-count-then-write already runs under the single writer lock.
 _ADMIN_HOLDER_ROWS_FOR_UPDATE: Final = _ADMIN_HOLDER_ROWS.with_for_update()
+# Retained grants and their RESTRICT owner FK preserve seed consumption.
+_HISTORICAL_HUMAN_ADMIN: Final = (
+    select(identity_roles_table.c.role_id)
+    .join(identities_table, identities_table.c.identity_id == identity_roles_table.c.identity_id)
+    .where(identity_roles_table.c.role == "admin", identity_roles_table.c.scope.is_(None), identities_table.c.kind == "human")
+    .limit(1)
+)
 # The lazy purge's candidates: pending rows that have NEVER been activated.
 #
 # ``activated_at IS NULL`` is not belt-and-braces, it is the predicate the
@@ -1204,13 +1221,21 @@ def _revoked_grant(grant: RoleGrant, *, now: datetime) -> RoleGrant:
 class RepositoryIdentityAuthority:
     """Own every write to the identity substrate without exposing its handle."""
 
-    __slots__ = ("_clock_sql", "_engine")
+    __slots__ = ("_clock_sql", "_engine", "_lifecycle_effect")
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, *, lifecycle_effect: IdentityLifecycleEffect) -> None:
         if engine.dialect.name not in _DATABASE_CLOCK_SQL:
             raise NotImplementedError(f"identity authority not implemented for {engine.dialect.name}")
         self._engine = engine
         self._clock_sql = _DATABASE_CLOCK_SQL[engine.dialect.name]
+        self._lifecycle_effect = lifecycle_effect
+
+    def _emit_authority_revoked(self, connection: Connection, event: IdentityAuthorityRevoked) -> None:
+        token = _register_mutation_connection(connection)
+        try:
+            self._lifecycle_effect(token, event)
+        finally:
+            _unregister_mutation_connection(token)
 
     # -- reads ---------------------------------------------------------------
 
@@ -1271,6 +1296,11 @@ class RepositoryIdentityAuthority:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
             rows = conn.execute(_ADMIN_HOLDER_ROWS).all()
         return _active_human_admin_count(rows, now)
+
+    def configured_admin_seed_consumed(self) -> bool:
+        """Retained human admin grants permanently consume configured seeding."""
+        with self._engine.connect() as conn:
+            return conn.execute(_HISTORICAL_HUMAN_ADMIN).first() is not None
 
     def list_roles(self, *, identity_id: str | None, include_revoked: bool, limit: int, offset: int) -> tuple[RoleGrant, ...]:
         _require_limit(limit, offset)
@@ -1678,6 +1708,17 @@ class RepositoryIdentityAuthority:
                     # Inside the transaction, like the admission pair and the
                     # rebound disable: a re-pend this trail cannot hold does
                     # not commit.
+                    self._emit_authority_revoked(
+                        conn,
+                        IdentityAuthorityRevoked(
+                            event_id=str(uuid.uuid4()),
+                            identity_id=bound.identity_id,
+                            occurred_at=now,
+                            actor_kind="system",
+                            actor_identity_id=None,
+                            reason=DORMANT_DISABLE_REASON,
+                        ),
+                    )
                     record_dormant(
                         IdentityDormant(
                             record=pended_record,
@@ -1854,6 +1895,17 @@ class RepositoryIdentityAuthority:
             # Inside the transaction, like the admission pair: a disable this
             # trail cannot hold does not commit.
             previous_email, current_email = rebound
+            self._emit_authority_revoked(
+                conn,
+                IdentityAuthorityRevoked(
+                    event_id=str(uuid.uuid4()),
+                    identity_id=bound.identity_id,
+                    occurred_at=now,
+                    actor_kind="system",
+                    actor_identity_id=None,
+                    reason=REBOUND_DISABLE_REASON,
+                ),
+            )
             record_rebound(
                 IdentityRebound(
                     record=disabled_record,
@@ -1924,6 +1976,17 @@ class RepositoryIdentityAuthority:
                 reason=reason,
                 retired_at=now,
             )
+            self._emit_authority_revoked(
+                conn,
+                IdentityAuthorityRevoked(
+                    event_id=str(uuid.uuid4()),
+                    identity_id=bound.identity_id,
+                    occurred_at=now,
+                    actor_kind="operator",
+                    actor_identity_id=None,
+                    reason=reason,
+                ),
+            )
             record(outcome)
             return outcome.record
 
@@ -1937,6 +2000,7 @@ class RepositoryIdentityAuthority:
         quota_tokens_per_day: int | None,
         quota_storage_bytes: int | None,
         record: Callable[[IdentityActivated], None],
+        mode: AdminBootstrapMode = AdminBootstrapMode.OPERATOR_RECOVERY,
     ) -> IdentityActivated:
         """The first administrator activates themselves, once (spec D20).
 
@@ -1945,8 +2009,9 @@ class RepositoryIdentityAuthority:
         workload role (R8), and given its D31 quota row.  The actor is the
         OPERATOR: ``activated_by_identity_id`` is NULL and the role is
         self-granted, because there is by definition no other admin to name.
-        Inert once an active human admin exists, so a listed subject never
-        becomes a standing grant and a config edit cannot recover a lockout.
+        Configured seeding is inert once ANY human deployment admin grant has
+        existed, including expired and revoked history. Explicit operator
+        recovery remains available when no active human administrator exists.
 
         Two replicas bootstrapping at once serialise on a PostgreSQL table
         lock taken before the count, so the loser counts the winner and is
@@ -1955,6 +2020,8 @@ class RepositoryIdentityAuthority:
         """
         claims = _require_claims(claims)
         _require_nonblank(note, "note")
+        if not isinstance(mode, AdminBootstrapMode):
+            raise TypeError("mode must be AdminBootstrapMode")
         with self._engine.begin() as conn:
             if conn.dialect.name == "postgresql":
                 # D20's population lock.  The population this method counts
@@ -1969,6 +2036,8 @@ class RepositoryIdentityAuthority:
                 # only the statement text it can see at the call.
                 conn.exec_driver_sql("LOCK TABLE identity_roles, identities IN SHARE ROW EXCLUSIVE MODE")
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            if mode is AdminBootstrapMode.CONFIGURED_SEED and conn.execute(_HISTORICAL_HUMAN_ADMIN).first() is not None:
+                raise AdminAlreadyBootstrapped()
             if _active_human_admin_count(conn.execute(_ADMIN_HOLDER_ROWS).all(), now) > 0:
                 raise AdminAlreadyBootstrapped()
             existing = conn.execute(
@@ -2430,8 +2499,8 @@ class RepositoryIdentityAuthority:
         Refused for the actor's own identity and for the last active human
         administrator (R5; a service identity is never protected, which is
         the container-sovereignty property that makes the console pattern
-        acceptable).  Approvals, queued runs and user secrets are other
-        authorities' rules and are not touched here.
+        acceptable). Consumer effects are injected by the composition root;
+        this authority publishes its own fact and owns no consumer SQL.
         """
         actor = _require_actor(actor)
         _require_nonblank(identity_id, "identity_id")
@@ -2486,6 +2555,17 @@ class RepositoryIdentityAuthority:
                 ),
                 on_behalf_of=actor.on_behalf_of,
                 console_request_id=actor.console_request_id,
+            )
+            self._emit_authority_revoked(
+                conn,
+                IdentityAuthorityRevoked(
+                    event_id=str(uuid.uuid4()),
+                    identity_id=identity_id,
+                    occurred_at=now,
+                    actor_kind="identity",
+                    actor_identity_id=verified.identity_id,
+                    reason=reason,
+                ),
             )
             record(outcome)
             return outcome

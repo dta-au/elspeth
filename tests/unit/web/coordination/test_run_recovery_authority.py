@@ -46,7 +46,7 @@ class _LostRaceConnection:
             return _Result(None)
         self._select_count += 1
         if self._select_count == 1:
-            return _Result(SimpleNamespace(id=self._session_id))
+            return _Result(SimpleNamespace(archived_at=None))
         if self._select_count == 2:
             return _Result(SimpleNamespace(released_at=self.now))
         if self._select_count == 3:

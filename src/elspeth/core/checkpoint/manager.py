@@ -11,7 +11,6 @@ from sqlalchemy import asc, delete, desc, select
 from elspeth.contracts import Checkpoint, CheckpointDraft
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.core.checkpoint.compatibility import IncompatibleCheckpointError as IncompatibleCheckpointError
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction

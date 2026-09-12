@@ -52,6 +52,7 @@ Invariant: Token outcomes only recorded after sink durability (crash recovery sa
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1151,28 +1152,6 @@ class TestTransformExecutor:
             ctx,
         )
 
-        assert error_sink == "discard"
-
-    def test_on_error_is_always_set_invariant(self) -> None:
-        """on_error is now required at config time — transforms always have it set.
-
-        Previously on_error=None would raise RuntimeError at execution time.
-        Now TransformSettings requires on_error, so the None case cannot occur
-        in production. This test documents the invariant.
-        """
-        # Every transform constructed via TransformSettings will have on_error set.
-        # Verify a transform with on_error="discard" works (the minimum valid value).
-        factory = _make_factory()
-        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
-        transform = _make_transform(on_error="discard")
-        transform.process.return_value = TransformResult.error(
-            reason={"reason": "test_error"},
-        )
-        token = _make_token()
-        ctx = make_context()
-        ctx.landscape = factory.execution
-
-        _, _, error_sink = executor.execute_transform(transform, token, ctx)
         assert error_sink == "discard"
 
     def test_error_path_records_failed_state(self) -> None:
@@ -3469,18 +3448,17 @@ class TestAggregationExecutor:
         with pytest.raises(OrchestrationInvariantError, match="No batch exists"):
             executor.execute_flush(nid, transform, ctx, TriggerType.COUNT)
 
-    def test_execute_flush_empty_buffer_raises_runtime_error(self) -> None:
-        """Flushing with empty buffer raises RuntimeError.
+    def test_execute_flush_empty_buffer_raises_before_execution(self) -> None:
+        """An opened batch cannot execute before any adopted row reaches its buffer."""
+        executor, factory, nid = self._make_agg_executor()
+        executor.open_batch_membership(nid, coordination_token=_AGGREGATION_LEADER)
+        transform = _make_aggregation_transform()
 
-        To reproduce this: buffer a row, flush successfully (which clears buffer),
-        then try to flush again - the batch_id is None so it hits 'No batch exists'.
-        Actually, getting empty buffer with a batch requires manual state manipulation.
-        We'll skip this edge case since the production code guards against it
-        (buffer_row creates batch, and batch is reset on flush).
-        """
-        # This state is hard to reach without direct manipulation.
-        # The guard exists for internal consistency checking.
-        pass
+        with pytest.raises(OrchestrationInvariantError, match="Cannot flush empty buffer for node agg_1"):
+            executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT)
+
+        factory.execution.update_batch_status.assert_not_called()
+        transform.process.assert_not_called()
 
     def test_execute_flush_success_completes_batch_and_state(self) -> None:
         """Successful flush commits node, batch, and result receipt in ONE atomic call.
@@ -4477,7 +4455,7 @@ class TestNodeStateGuard:
     @pytest.mark.parametrize("authority", ["leader", "member"])
     def test_repository_authority_refusal_keeps_open_state_and_original_exception(self, authority: str) -> None:
         from elspeth.contracts.errors import RunLeadershipLostError, RunMembershipLostError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         setup = make_recorder_with_run(source_node_id="source-0")
         register_test_node(setup.data_flow, setup.run_id, "transform-1")
@@ -4520,7 +4498,7 @@ class TestNodeStateGuard:
 
     def test_auto_fail_phase_is_required_at_construction(self) -> None:
         """Every caller must name its guarded scope; there is no safe fallback."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         with pytest.raises(TypeError, match="auto_fail_phase"):
@@ -4546,7 +4524,7 @@ class TestNodeStateGuard:
     )
     def test_auto_fail_phase_rejects_values_outside_closed_vocabulary(self, invalid_phase: Any) -> None:
         """Invalid phase attribution fails before opening or completing audit state."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         with pytest.raises(OrchestrationInvariantError, match="auto_fail_phase"):
@@ -4572,7 +4550,7 @@ class TestNodeStateGuard:
         2. Raises OrchestrationInvariantError (crash on our bug)
         """
         from elspeth.contracts.errors import OrchestrationInvariantError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4597,7 +4575,7 @@ class TestNodeStateGuard:
 
     def test_exception_auto_completes_as_failed(self) -> None:
         """Unhandled exception triggers auto-complete as FAILED."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4625,7 +4603,7 @@ class TestNodeStateGuard:
     def test_explicit_ownership_abandonment_preserves_open_state(self) -> None:
         """Ownership loss leaves the stale attempt OPEN and propagates."""
         from elspeth.contracts.errors import SchedulerLeaseLostError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4646,7 +4624,7 @@ class TestNodeStateGuard:
 
     def test_abandonment_rejects_non_ownership_exception(self) -> None:
         """Only scheduler ownership loss may preserve an OPEN attempt."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4673,7 +4651,7 @@ class TestNodeStateGuard:
         str(exc_val) BEFORE the complete_node_state write — a messageless
         exception left the node state permanently OPEN.
         """
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4696,7 +4674,7 @@ class TestNodeStateGuard:
 
     def test_whitespace_only_exception_message_still_records_failed(self) -> None:
         """Whitespace-only messages fall back to the exception type name."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4722,7 +4700,7 @@ class TestNodeStateGuard:
         The original exception re-raises; the audit record falls back to the
         exception type name for its message.
         """
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         class _HostileStr(RuntimeError):
             def __str__(self) -> str:
@@ -4750,7 +4728,7 @@ class TestNodeStateGuard:
     def test_incomplete_audit_evidence_instantiation_inside_guard_records_failed(self) -> None:
         """Construction-time abstract failures still preserve the guard's terminal-state invariant."""
         from elspeth.contracts.audit_evidence import AuditEvidenceBase
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         class _Incomplete(AuditEvidenceBase, RuntimeError):
             def __init__(self, message: str) -> None:
@@ -4780,7 +4758,7 @@ class TestNodeStateGuard:
 
     def test_explicit_complete_prevents_auto_fail(self) -> None:
         """If caller calls complete() before exception, guard is no-op."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4803,7 +4781,7 @@ class TestNodeStateGuard:
 
     def test_complete_rejects_pending_without_standing_guard_down(self) -> None:
         """PENDING is not terminal and cannot satisfy the guard invariant."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4828,7 +4806,7 @@ class TestNodeStateGuard:
 
     def test_state_id_accessible_inside_block(self) -> None:
         """guard.state_id is available after __enter__."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -4848,7 +4826,7 @@ class TestNodeStateGuard:
 
     def test_state_id_before_enter_raises(self) -> None:
         """Accessing state_id before __enter__ raises OrchestrationInvariantError."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         guard = NodeStateGuard(
             _make_factory().execution,
@@ -4872,7 +4850,7 @@ class TestNodeStateGuard:
         """
         from elspeth.contracts.errors import AuditIntegrityError
         from elspeth.core.landscape.errors import LandscapeRecordError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         factory.execution.complete_node_state.side_effect = LandscapeRecordError("DB is down")
@@ -4891,7 +4869,7 @@ class TestNodeStateGuard:
 
     def test_auto_fail_value_error_from_execution_repo_propagates_plainly(self) -> None:
         """Non-recorder bugs during auto-fail must keep their original type."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         factory.execution.complete_node_state.side_effect = ValueError("execution repo bug")
@@ -4909,7 +4887,7 @@ class TestNodeStateGuard:
 
     def test_attempt_passed_to_begin_node_state(self) -> None:
         """attempt parameter is forwarded to begin_node_state."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         with NodeStateGuard(
@@ -4938,7 +4916,7 @@ class TestNodeStateGuard:
         propagate directly — it's more critical than the "missing complete()" bug.
         """
         from elspeth.contracts.errors import FrameworkBugError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         factory.execution.complete_node_state.side_effect = FrameworkBugError("internal inconsistency")
@@ -4962,7 +4940,7 @@ class TestNodeStateGuard:
         the highest-priority failure signal.
         """
         from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         factory.execution.complete_node_state.side_effect = AuditIntegrityError("corrupt state table")
@@ -4988,7 +4966,7 @@ class TestNodeStateGuard:
         """
         from elspeth.contracts.errors import AuditIntegrityError
         from elspeth.core.landscape.errors import LandscapeRecordError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         factory.execution.complete_node_state.side_effect = LandscapeRecordError("DB connection lost")
@@ -5006,7 +4984,7 @@ class TestNodeStateGuard:
 
     def test_value_error_from_execution_repo_propagates_on_clean_exit(self) -> None:
         """Non-recorder bugs on clean exit must not be reclassified."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         factory.execution.complete_node_state.side_effect = ValueError("execution repo bug")
@@ -5032,7 +5010,7 @@ class TestNodeStateGuard:
         exception — system-level corruption outranks the triggering error.
         """
         from elspeth.contracts.errors import FrameworkBugError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         factory.execution.complete_node_state.side_effect = FrameworkBugError("broken invariant")
@@ -5055,7 +5033,7 @@ class TestNodeStateGuard:
         Same as above: audit corruption is always the highest-priority signal.
         """
         from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         factory.execution.complete_node_state.side_effect = AuditIntegrityError("state table corrupt")
@@ -5080,7 +5058,7 @@ class TestNodeStateGuard:
         COMPLETED with FAILED — corrupting the audit trail.
         """
         from elspeth.core.landscape.errors import LandscapePostCommitError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         call_count = [0]
@@ -5118,7 +5096,7 @@ class TestNodeStateGuard:
         """If complete() fails before persistence, __exit__ must still record FAILED."""
         import rfc8785
 
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         setup = make_recorder_with_run(source_node_id="source-0")
         register_test_node(setup.data_flow, setup.run_id, "transform-1")
@@ -5162,7 +5140,7 @@ class TestNodeStateGuard:
 
         from elspeth.contracts.audit_evidence import AuditEvidenceBase
         from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         class _BrokenEvidence(AuditEvidenceBase, RuntimeError):
             def to_audit_dict(self) -> Mapping[str, Any]:
@@ -5202,7 +5180,7 @@ class TestNodeStateGuard:
 
     def test_plugin_contract_violation_populates_execution_error_context(self) -> None:
         """ADR-008: PluginContractViolation.to_audit_dict() → ExecutionError.context."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -5246,7 +5224,7 @@ class TestNodeStateGuard:
 
     def test_non_plugin_contract_violation_leaves_context_none(self) -> None:
         """Regular exceptions do NOT populate ExecutionError.context."""
-        from elspeth.engine.executors import NodeStateGuard
+        from elspeth.engine.executors.state_guard import NodeStateGuard
 
         factory = _make_factory()
         guard = NodeStateGuard(
@@ -6231,6 +6209,8 @@ class TestTransformExecutorBatchPath:
 
     def test_register_called_before_accept(self) -> None:
         """register() is called before accept() for correct waiter ordering."""
+        from elspeth.contracts.plugin_context import PluginContext
+
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
         contract = _make_contract()
@@ -6244,18 +6224,31 @@ class TestTransformExecutorBatchPath:
         mock_adapter = _BatchAdapterDouble(mock_waiter)
         _install_batch_adapter(executor, mock_adapter)
 
+        invocation_order: list[str] = []
+
+        def register(token_id: str, state_id: str) -> _BatchWaiterDouble:
+            invocation_order.append("register")
+            return mock_waiter
+
+        def accept(row: PipelineRow, context: PluginContext) -> None:
+            invocation_order.append("accept")
+
+        def wait(*, timeout: float, shutdown_event: threading.Event | None) -> TransformResult:
+            invocation_order.append("wait")
+            return success_result
+
+        mock_adapter.register.side_effect = register
+        transform.accept.side_effect = accept
+        mock_waiter.wait.side_effect = wait
+
         token = _make_token(contract=contract)
         ctx = make_context()
 
         executor.execute_transform(transform, token, ctx)
 
-        # Verify ordering: register called with (token_id, state_id)
+        assert invocation_order == ["register", "accept", "wait"]
         mock_adapter.register.assert_called_once_with(token.token_id, "state_001")
         transform.accept.assert_called_once()
-
-        # Verify register was called before accept (via call_args_list order is not
-        # available across objects, so we verify both were called — the production code
-        # structurally guarantees register-before-accept by line order)
         mock_waiter.wait.assert_called_once_with(timeout=transform.batch_wait_timeout, shutdown_event=None)
 
     # --- Timeout and eviction ---

@@ -36,6 +36,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
@@ -73,6 +74,8 @@ async def test_create_composition_proposal_accepts_live_compose_context() -> Non
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -116,6 +119,8 @@ async def test_create_pipeline_proposal_accepts_live_compose_context() -> None:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -181,6 +186,8 @@ async def test_reject_composition_proposal_accepts_exact_live_proposal_context()
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -280,6 +287,8 @@ async def test_reject_composition_proposal_invalid_authority_writes_nothing(inva
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     first = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -372,6 +381,8 @@ async def test_stale_compose_predecessor_creates_no_proposal_rows_after_takeover
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     first = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -544,6 +555,8 @@ async def test_accept_ordinary_proposal_atomically_inserts_state_event_and_pendi
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -604,6 +617,8 @@ async def test_accept_ordinary_proposal_rolls_back_state_and_event_when_pending_
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -676,6 +691,8 @@ async def test_accept_ordinary_proposal_stale_predecessor_writes_nothing() -> No
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -738,6 +755,8 @@ async def test_accept_ordinary_proposal_requires_absent_base_to_match_locked_hea
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -801,6 +820,8 @@ async def test_accept_ordinary_proposal_rejects_tool_state_shape_mismatch(case: 
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -866,6 +887,8 @@ async def test_accept_blob_only_proposal_binds_existing_or_inserts_initial_snaps
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -931,6 +954,8 @@ async def test_accept_ordinary_proposal_invalid_authority_writes_nothing(invalid
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     first = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),

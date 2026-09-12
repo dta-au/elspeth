@@ -143,6 +143,19 @@ _OTLP_ATTRIBUTE_ALLOWLIST = frozenset(
         "request_hash",
         "response_hash",
         "token_usage",
+        # Typed per-invocation plugin statistics; no content-bearing fields.
+        "pages_fetched",
+        "rows_yielded",
+        "rows_rejected",
+        "load_state",
+        "total_queries",
+        "total_chunks",
+        "quarantine_count",
+        "score_count",
+        "score_mean",
+        "score_std",
+        "total_written",
+        "total_bytes",
     }
 )
 _MAX_OTLP_ATTRIBUTE_CHARS = 256

@@ -80,6 +80,15 @@ def test_direct_construction_requires_create_tables_policy() -> None:
         )
 
 
+def test_recorder_reuses_one_engine_between_events(tmp_path) -> None:
+    recorder = AuthAuditRecorder(landscape_url=f"sqlite:///{tmp_path / 'reuse.db'}", landscape_passphrase=None, create_tables=True)
+    with recorder._open_landscape(audit_module.AuthAuditOperation.LOGIN_FAILURE) as first:
+        first_engine = first.engine
+    with recorder._open_landscape(audit_module.AuthAuditOperation.LOGIN_FAILURE) as second:
+        assert second.engine is first_engine
+    recorder.close()
+
+
 def test_external_recorder_open_forwards_postgres_engine_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
     open_calls: list[tuple[str, dict[str, object]]] = []
 

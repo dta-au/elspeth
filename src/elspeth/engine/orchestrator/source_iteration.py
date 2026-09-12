@@ -162,8 +162,6 @@ class SourceIterationDriver:
         *,
         agg_transform_lookup: Mapping[str, AggNodeEntry],
         coalesce_node_map: Mapping[CoalesceName, NodeID],
-        source_id: NodeID,
-        source_operation_id: str,
     ) -> None:
         """Flush time-sensitive aggregation/coalesce state while no source row is ready."""
         ctx = self._idle_timeout_context(loop_ctx.ctx)
@@ -205,8 +203,6 @@ class SourceIterationDriver:
         *,
         agg_transform_lookup: Mapping[str, AggNodeEntry],
         coalesce_node_map: Mapping[CoalesceName, NodeID],
-        source_id: NodeID,
-        source_operation_id: str,
     ) -> IdleTimeoutPump:
         """Bind the idle-flush closure for this run/source into a pump.
 
@@ -220,8 +216,6 @@ class SourceIterationDriver:
                 loop_ctx,
                 agg_transform_lookup=agg_transform_lookup,
                 coalesce_node_map=coalesce_node_map,
-                source_id=source_id,
-                source_operation_id=source_operation_id,
             )
 
         return IdleTimeoutPump(
@@ -268,8 +262,6 @@ class SourceIterationDriver:
                 loop_ctx,
                 agg_transform_lookup=agg_transform_lookup,
                 coalesce_node_map=coalesce_node_map,
-                source_id=source_id,
-                source_operation_id=source_operation_id,
             )
             one_shot.start()
             try:
@@ -575,8 +567,6 @@ class SourceIterationDriver:
                     loop_ctx,
                     agg_transform_lookup=agg_transform_lookup,
                     coalesce_node_map=coalesce_node_map,
-                    source_id=source_id,
-                    source_operation_id=source_operation_id,
                 )
                 idle_pump.start()
             try:

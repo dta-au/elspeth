@@ -2428,7 +2428,7 @@ class RowProcessor:
             # Engine-classified transport signals (see PluginRetryableError's
             # contract): ConnectionError/TimeoutError are the Python runtime's
             # canonical transient network failures beneath provider SDKs, and
-            # CapacityError contract-declares retryable=True. Bare OSError is
+            # CapacityError is retryable by nominal classification. Bare OSError is
             # deliberately NOT here: it spans plugin bug-classes
             # (FileNotFoundError, PermissionError) that must crash, not retry.
             return isinstance(e, ConnectionError | TimeoutError | CapacityError)

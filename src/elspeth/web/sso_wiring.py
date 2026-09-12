@@ -35,7 +35,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
 
 import httpx
 from sqlalchemy import Engine
@@ -63,6 +62,7 @@ from elspeth.web.auth.sso import (
 from elspeth.web.config import WebSettings, configured_auth_settings
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
+    AdminBootstrapMode,
     IdentityActivated,
     IdentityAlreadyDisabled,
     IdentityDormancyExempted,
@@ -116,7 +116,7 @@ def build_sso_wiring(
     *,
     session_engine: Engine,
     identity_authority: RepositoryIdentityAuthority,
-    resolved_state_mode: Literal["sqlite-single", "external-postgresql"],
+    audit_recorder: AuthAuditRecorder,
 ) -> SsoWiring | None:
     """Assemble the network-free half, or ``None`` when the deployment is not wired.
 
@@ -134,7 +134,6 @@ def build_sso_wiring(
     assert settings.sso_transaction_secret is not None
     assert settings.public_base_url is not None
     issuer_url = profile.resolve_issuer(settings)
-    audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
     provider = settings.auth_provider
 
     def _principal_is_active(identity_id: str) -> bool:
@@ -215,11 +214,11 @@ def build_sso_wiring(
 
     def _upsert_identity(claims: IdentityClaims) -> AdmittedIdentity:
         # D20 bootstrap seed: a listed subject activates itself as the first
-        # admin ONLY while the container has zero active human admins. The
-        # count here is a pre-check that keeps the common path (every later
-        # login) off the population lock; bootstrap_admin re-counts under
-        # the lock and is the authority on the race.
-        if claims.subject in settings.sso_admin_subjects and identity_authority.count_active_human_admins() == 0:
+        # admin ONLY before any human deployment admin grant has existed.
+        # Retained grant history keeps the seed consumed after lockout. This
+        # advisory precheck avoids the population lock on later logins; the
+        # authority repeats it inside the locked transaction.
+        if claims.subject in settings.sso_admin_subjects and not identity_authority.configured_admin_seed_consumed():
             try:
                 return identity_authority.bootstrap_admin(
                     claims=claims,
@@ -227,6 +226,7 @@ def build_sso_wiring(
                     quota_tokens_per_day=settings.quota_default_tokens_per_day,
                     quota_storage_bytes=settings.quota_default_storage_bytes,
                     record=_record_bootstrap,
+                    mode=AdminBootstrapMode.CONFIGURED_SEED,
                 ).record
             except (AdminAlreadyBootstrapped, IdentityAlreadyDisabled, RoleForbiddenForIdentity):
                 # Lost the race to another replica, or the listed subject's
@@ -328,6 +328,7 @@ async def resolve_sso_runtime(
         settings.jwks_failure_retry_seconds,
         settings.jwks_max_stale_seconds,
         algorithms=wiring.profile.id_token_algorithms,
+        token_issuer_aliases=wiring.profile.token_issuer_aliases,
         jwks_uri=endpoints.jwks_uri,
         transport=transport,
     )

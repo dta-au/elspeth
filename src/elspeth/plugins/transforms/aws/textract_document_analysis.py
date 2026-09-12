@@ -33,6 +33,7 @@ from elspeth.contracts.errors import (
     TransformErrorCategory,
     TransformErrorReason,
 )
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust, WebConfigAuthority
@@ -308,7 +309,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:735d486db9b909c9"
+    source_file_hash: str | None = "sha256:eb0303eb99d0cb68"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -414,7 +415,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._recorder: PluginAuditWriter | None = None
         self._run_id = ""
         self._node_id = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._sdk_client: TextractSDKClient | None = None
         self._s3_sdk_client: S3HeadBucketSDKClient | None = None

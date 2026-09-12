@@ -15,7 +15,7 @@ Operational procedures for ELSPETH pipeline management.
 | [Database Maintenance](database-maintenance.md) | Audit DB growing large, need cleanup |
 | [Incident Response](incident-response.md) | Production issue needs investigation |
 | [Backup and Recovery](backup-and-recovery.md) | Backup audit trail, restore from backup |
-| [Deployment Platforms](../reference/deployment-platforms.md) | Choose a maintained Compose, AWS ECS, native Linux, or Azure Ubuntu VM path; Kubernetes is BYO and Azure Container Apps is deferred |
+| [Deployment Platforms](../reference/deployment-platforms.md) | Choose Compose, AWS ECS, native Linux, Azure Ubuntu VM, or Azure Container Apps; ACA has desktop acceptance for Single/sticky with local PostgreSQL runtime evidence; Kubernetes is BYO |
 | [Native Linux and Azure Ubuntu VM Deployment](ansible-ubuntu-deployment.md) | Install one systemd-managed web process on Ubuntu; Azure may use one VM behind Front Door |
 | [Caddy Development Install Refresh](caddy-development-refresh.md) | Rebuild the frontend and restart the repository-specific source-checkout service behind Caddy |
 | [AWS ECS Cold Install](aws-ecs-cold-install.md) | Create a complete disposable stack with the tracked Scenario A Terraform package, including Aurora, monitoring, and Bedrock |

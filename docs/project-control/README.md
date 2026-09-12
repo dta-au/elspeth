@@ -1,9 +1,17 @@
 # Project control
 
-This folder holds ELSPETH's project-control artefacts — the lean control set
-described in [ADR-024](../architecture/adr/024-delivery-governance-for-single-maintainer-mode.md).
+This folder holds ELSPETH's project-control artefacts. Delivery governance and
+project-control reporting for ELSPETH are set by the maintainer's
+organisation, not decided by this project; this README is the repository's
+pointer to them, and this folder is the only authority for what they are.
+(They were previously described in
+[ADR-024](../architecture/adr/024-delivery-governance-for-single-maintainer-mode.md),
+retired 2026-09-13 as not being an architecture decision. For the project's
+own single-maintainer assurance posture — approval counts, required gates,
+the two-maintainer step-up trigger — see
+[GOVERNANCE.md](../../GOVERNANCE.md) § Maintainer Continuity.)
 
-ADR-024 defines four living artefacts, each one to two pages:
+The reporting set is four living artefacts, each one to two pages:
 
 | Artefact | State |
 |---|---|
@@ -14,7 +22,7 @@ ADR-024 defines four living artefacts, each one to two pages:
 
 The folder also holds a program of outstanding work and a product requirements
 document. These support scope and onboarding decisions; they do not substitute
-for the three missing ADR-024 artefacts.
+for the three missing artefacts above.
 
 The current version of each document is the file with the latest date prefix.
 The current drafts use identifiers ELS-POW-1.0.0, ELS-PRD-1.0.0 and

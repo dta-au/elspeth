@@ -19,12 +19,15 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture
 def engine():
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="schema-test-user")
     return eng
 
 
@@ -45,7 +48,7 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_53(engine) -> None:
+def test_blob_inline_resolutions_schema_epoch_is_55(engine) -> None:
     # 51: the multi-replica session-operation substrate landed on top of
     # mainline's 50 (elspeth-4d6c0dd0f5).
     # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
@@ -53,9 +56,11 @@ def test_blob_inline_resolutions_schema_epoch_is_53(engine) -> None:
     # and workflow-governance tables, all in one cutover window.
     # 53: per-admission read records (session_read_admissions,
     # elspeth-f98e0ae8b2).
-    assert SESSION_SCHEMA_EPOCH == 53
+    # 54: durable Composer progress and inflight request records.
+    # 55: identity ownership and approval/admission provenance.
+    assert SESSION_SCHEMA_EPOCH == 55
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 53
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 55
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

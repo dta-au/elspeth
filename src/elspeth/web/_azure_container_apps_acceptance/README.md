@@ -18,6 +18,14 @@ package imports the other (`tests/unit/architecture/test_azure_container_apps_ac
 
 ## The v3 consolidation trigger (plan §6.4, recorded on 6b-9)
 
+**0.8.1 disposition (2026-09-10): explicitly defer v3 implementation.** The
+operator authorized execution of the ACA reconciliation plan, including this
+deferral. This reconciliation changes neither the receipt envelope nor the
+provider set. Revisit v3 before a third provider or an envelope/compatibility
+field change; implement the shared contract once with both provider regression
+suites. Preserve old evidence admission or document an explicit version
+transition. The triggers below remain in force.
+
 A provider-neutral receipt family (`elspeth.deployment-compatibility-receipt.v3`
 with a `provider` discriminator and a closed `deployment_subject`) was
 rejected for 0.8.0 because it would rename ECS fields and re-pin the ECS
@@ -52,8 +60,9 @@ carry the slippage budget.
 
 - Every kind's `details` is a closed field set with a `mechanism` from a closed
   enum; a receipt cannot claim more than the tree proves.
-- The replica kinds are re-admitted through the shared `ProbeResult`: P4b is
-  `owner_affine` and `cannot_pass` by construction; a P3 whose owner row read
+- The replica kinds are re-admitted through the shared `ProbeResult`: legacy
+  v2 P4b remains `owner_affine` and `cannot_pass` by construction. It does not
+  measure the new runtime capabilities below. A P3 whose owner row read
   `stopped`/`draining` is downgraded to `graceful_stop` and refused as a pass.
 - `verify-connection-budget` wraps the shared budget validator under
   `elspeth.postgres-flexible-connection-budget.v1`.
@@ -63,8 +72,29 @@ carry the slippage budget.
   the provisioned database target. `bundle_check` refuses
   the bundle unless exactly one passing run is on record.
 - No receipt kind claims that a live acceptance ran: the kinds are what a run
-  *would* record; the first live run is 6b-7's and needs an operator-owned
-  subscription.
+  *would* record. Task `elspeth-5ec3befc1a` closed on 2026-09-10 through desktop
+  acceptance. No live cloud acceptance is claimed; a future live run needs an
+  operator-owned subscription and must satisfy the existing receipt validators.
+  It is no longer a closure prerequisite.
+
+The implemented operating configuration remains `Single` revision mode with
+`sticky` session affinity and one web process per replica. External PostgreSQL
+provides single-use tickets and durable run-event replay on authorized peer
+reconnect, renewable Composer request leases with saved progress and current
+inflight accounting, and shared auth/write/Composer budgets. An interrupted
+provider request is not automatically resumed. P4a covers shared database state
+and files. Automatic run handoff is implemented for durable admission,
+permit-bound PREPARED initialization and eligible checkpoint resume, with
+fresh web and Landscape authority. Unsafe effects, incomplete sources and
+identity/compatibility failures remain `recovery_required`. Integrated
+verification is recorded in the
+[ACA plan](../../../../docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification);
+neither P2/P3 nor desktop acceptance measures those
+new transitions or promotes them into the legacy receipt contract.
+Verification of the new mechanisms is limited to local PostgreSQL mechanism
+and integration evidence. There is no cloud receipt or no-affinity deployment
+qualification. Receipt evolution remains deferred: runtime capabilities do
+not change the legacy P4b result or its validators.
 
 ## Not reproduced from ECS (plan §5)
 

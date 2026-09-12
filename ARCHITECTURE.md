@@ -1034,7 +1034,7 @@ ELSPETH uses ADRs to document significant architectural choices.
 | **ADR-021** | Sources and sinks uniformly boundary | Treat sources and sinks as architecture boundary components | Applies trust and contract enforcement consistently at ingress and egress |
 | **ADR-022** | Shareable reviews | Add signed share tokens and composer completion events | Freezes reviewable composition state with auditable completion gestures |
 | **ADR-023** | Custom Python CI analyzer | Maintain `elspeth-lints` for project-specific static invariants | Captures architecture and audit rules that general linters cannot express |
-| **ADR-024** | Delivery governance for single-maintainer mode | Govern release and CI/CD delivery for single-maintainer operation | Makes delivery controls explicit where team-size assumptions do not apply |
+| **ADR-024** (Retired) | Delivery governance for single-maintainer mode | Retired 2026-09-13 — governance is set by the maintainer's organisation, not decided here; the assurance posture moved to `GOVERNANCE.md` § Maintainer Continuity | An ADR should not claim authority over a posture the project does not control |
 | **ADR-025** | Multi-source ingestion | The pipeline source surface is plural by contract and by code; the singular `source` surface is deleted, not deprecated | Removes the special case rather than carrying two ingestion shapes |
 | **ADR-026** | Durable token scheduler | ELSPETH owns a durable token scheduler as a first-class engine primitive; the scheduler row is authoritative for resume, and in-memory work state is a cache that must never diverge from it | Resume replays from one durable authority instead of reconstructing work from memory |
 | **ADR-027** | Composer operator set sampling | Nullable `composer_temperature` / `composer_seed` on `WebSettings`, defaulting to `None` so the field is omitted from the provider request | Makes Composer LLM sampling explicit operator configuration instead of a hidden default |
@@ -1060,7 +1060,7 @@ ELSPETH uses ADRs to document significant architectural choices.
 
 ADR-034 and ADR-035 were renumbered in 0.7.2 from colliding `025-` and `026-`
 filenames; the record now runs 000–048, with 044 and 045 unused. ADR-048 is
-Proposed; every other record listed above is Accepted.
+Proposed and ADR-024 is Retired; every other record listed above is Accepted.
 
 ### Implicit Architectural Decisions
 

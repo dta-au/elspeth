@@ -93,6 +93,60 @@ class TestTheHappyPathIsActuallyReachable:
         assert payload.subject == "subject-1"
 
 
+@pytest.mark.parametrize("token_issuer", ["https://accounts.google.com", "accounts.google.com"])
+def test_google_accepts_both_documented_token_issuers(rsa_keypair, token_issuer: str) -> None:
+    from elspeth.web.auth.providers import get_profile
+
+    profile = get_profile("google")
+    validator = JWKSTokenValidator(
+        issuer="https://accounts.google.com",
+        audience=AUDIENCE,
+        algorithms=profile.id_token_algorithms,
+        jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
+        token_issuer_aliases=profile.token_issuer_aliases,
+    )
+    private_key, public_key = rsa_keypair
+    token = make_rsa_token(private_key, _claims(iss=token_issuer))
+    assert _decode(validator, token, build_rsa_jwk(public_key)).issuer == token_issuer
+
+
+@pytest.mark.parametrize("provider", ["entra", "oidc", "vanguard"])
+def test_other_profiles_do_not_accept_google_issuer_alias(rsa_keypair, provider: str) -> None:
+    from elspeth.web.auth.providers import get_profile
+
+    profile = get_profile(provider)
+    validator = JWKSTokenValidator(
+        issuer="https://accounts.google.com",
+        audience=AUDIENCE,
+        algorithms=profile.id_token_algorithms,
+        jwks_uri=JWKS_URI,
+        token_issuer_aliases=profile.token_issuer_aliases,
+    )
+    private_key, public_key = rsa_keypair
+    token = make_rsa_token(private_key, _claims(iss="accounts.google.com"))
+    with pytest.raises(AuthenticationError):
+        _decode(validator, token, build_rsa_jwk(public_key))
+
+
+@pytest.mark.parametrize(
+    "token_issuer", ["http://accounts.google.com", "https://accounts.google.com/", "accounts.google.com.attacker.example"]
+)
+def test_google_refuses_undocumented_token_issuers(rsa_keypair, token_issuer: str) -> None:
+    from elspeth.web.auth.providers import get_profile
+
+    validator = JWKSTokenValidator(
+        issuer="https://accounts.google.com",
+        audience=AUDIENCE,
+        algorithms=("RS256",),
+        jwks_uri=JWKS_URI,
+        token_issuer_aliases=get_profile("google").token_issuer_aliases,
+    )
+    private_key, public_key = rsa_keypair
+    token = make_rsa_token(private_key, _claims(iss=token_issuer))
+    with pytest.raises(AuthenticationError):
+        _decode(validator, token, build_rsa_jwk(public_key))
+
+
 class TestAlgorithmConfusion:
     """The algorithm comes from the PROFILE, never from the token header."""
 

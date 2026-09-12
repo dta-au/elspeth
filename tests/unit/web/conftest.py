@@ -54,6 +54,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -87,6 +88,7 @@ def _make_session(
     ``auth_provider_type`` values.
     """
     now = created_at or datetime.now(UTC)
+    ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
     conn.execute(
         insert(models.sessions_table).values(
             id=session_id,
@@ -117,6 +119,8 @@ def test_client(tmp_path: Path) -> TestClient:
     )
     app = FastAPI()
     identity = UserIdentity(user_id="alice", username="alice")
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
 
     async def mock_user() -> UserIdentity:
         return identity

@@ -61,6 +61,14 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import expire_lease, leader_coordination_token, make_factory, make_landscape_db, register_test_node
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 from tests.helpers.tree_gate import iter_gate_sources
+from tests.unit.web.execution.test_service import _execute_lease
+from tests.unit.web.execution.test_service import _live_execute_lease as _live_execute_lease
+from tests.unit.web.execution.test_service import broadcaster as broadcaster
+from tests.unit.web.execution.test_service import mock_loop as mock_loop
+from tests.unit.web.execution.test_service import mock_session_service as mock_session_service
+from tests.unit.web.execution.test_service import mock_settings as mock_settings
+from tests.unit.web.execution.test_service import real_loop as real_loop
+from tests.unit.web.execution.test_service import service as service
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 RUN_ID = "forbidden-path-run"
@@ -595,6 +603,85 @@ def test_f10_evicted_member_cannot_record_routing_event(harness: _Harness) -> No
     _assert_only_fence_refusal(harness, before, verb="record_routing_event", membership=True)
 
 
+@pytest.mark.parametrize("stale", [False, True])
+def test_stale_admission_refusal_leader_refuses_before_cleanup(request, tmp_path, monkeypatch, stale) -> None:
+    """A superseded reconciliation token cannot clean blobs or acknowledge Sessions."""
+    from contextlib import nullcontext
+    from unittest.mock import create_autospec
+    from uuid import UUID, uuid4
+
+    from sqlalchemy import select
+
+    from elspeth.contracts.blobs import BlobFinalizationResult
+    from elspeth.contracts.coordination import mint_worker_id
+    from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+    from elspeth.core.landscape.schema import metadata, run_coordination_events_table
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from tests.fixtures.landscape import leader_token_for
+
+    execution_service = request.getfixturevalue("service")
+    sessions = request.getfixturevalue("mock_session_service")
+    loop = request.getfixturevalue("real_loop")
+    execution_service._blob_service = create_autospec(BlobServiceImpl, instance=True)
+    execution_service._blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+    acquire = RunCoordinationRepository.acquire_reconciliation_leadership
+    before = {}
+    prior_event_seqs = set()
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path}/refusal.db") as db:
+        factory = RecorderFactory(db)
+        run = factory.run_lifecycle.begin_run({}, "v1", run_id=str(uuid4()))
+        owner = leader_token_for(db, run.run_id)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=owner)
+        factory.run_coordination.release_seat(token=owner)
+
+        def supersede_before_return(repository, **kwargs):
+            token = acquire(repository, **kwargs)
+            repository.release_seat(token=token)
+            acquire(
+                repository,
+                run_id=run.run_id,
+                worker_id=mint_worker_id(run.run_id),
+                window_seconds=30,
+                expected_status=RunStatus.FAILED,
+            )
+            with db.engine.connect() as connection:
+                for table in metadata.tables.values():
+                    if table is not run_coordination_events_table:
+                        before[table.name] = connection.execute(select(table)).all()
+                prior_event_seqs.update(connection.execute(select(run_coordination_events_table.c.seq)).scalars())
+            return token
+
+        if stale:
+            monkeypatch.setattr(RunCoordinationRepository, "acquire_reconciliation_leadership", supersede_before_return)
+        monkeypatch.setattr("elspeth.web.execution.service.open_landscape_db", lambda _settings: nullcontext(db))
+        if stale:
+            with pytest.raises(RunLeadershipLostError) as raised:
+                loop.run_until_complete(execution_service._settle_admission_refusal(UUID(run.run_id), _execute_lease()))
+            assert raised.value.verb == "web_admission_refusal_reconciliation"
+            with pytest.raises(RunLeadershipLostError):
+                loop.run_until_complete(_execute_lease().close())
+            assert _execute_lease().closed
+            with db.engine.connect() as connection:
+                for table in metadata.tables.values():
+                    if table is not run_coordination_events_table:
+                        assert connection.execute(select(table)).all() == before[table.name], table.name
+                additions = [
+                    row for row in connection.execute(select(run_coordination_events_table)).all() if row.seq not in prior_event_seqs
+                ]
+            assert len(additions) == 2
+            assert all(row.event_type == "fence_refusal" for row in additions)
+            assert {json.loads(row.context_json)["verb"] for row in additions} == {
+                "web_admission_refusal_reconciliation",
+                "release_seat",
+            }
+            execution_service._blob_service.finalize_run_output_blobs.assert_not_called()
+            sessions.session_operation_authority.mutate.assert_not_called()
+        else:
+            loop.run_until_complete(execution_service._settle_admission_refusal(UUID(run.run_id), _execute_lease()))
+            execution_service._blob_service.finalize_run_output_blobs.assert_awaited_once()
+            sessions.session_operation_authority.mutate.assert_called_once()
+
+
 def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None:
     """No new fenced mutation surface may escape the F-10 cohort.
 
@@ -699,6 +786,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "terminalize_pending_sinks_with_terminal_outcomes",
         "update_run_source_contract",
         "update_run_status",
+        "web_terminal_reconciliation",
+        "web_admission_refusal_reconciliation",
+        "run-start-reset-prepared",
+        "run-start-effects",
     }
     member_verbs = {
         "update_node_output_contract",
@@ -757,6 +848,22 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
     assert actual_items == item_verbs
 
     retained_tests = {
+        "web_admission_refusal_reconciliation": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_stale_admission_refusal_leader_refuses_before_cleanup",
+        ),
+        "web_terminal_reconciliation": (
+            "tests/unit/web/execution/test_recovery_coordinator.py",
+            "test_stale_reconciliation_leader_refuses_before_projection",
+        ),
+        "run-start-reset-prepared": (
+            "tests/unit/core/landscape/test_run_start_admission.py",
+            "test_stale_leader_cannot_change_start_admission_or_setup",
+        ),
+        "run-start-effects": (
+            "tests/unit/core/landscape/test_run_start_admission.py",
+            "test_stale_leader_cannot_change_start_admission_or_setup",
+        ),
         "allocate_call_index": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_item_cannot_allocate_or_record_calls"),
         "fork_token": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_reclaimed_item_refuses_without_payload_mutation"),
         "record_call": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_item_cannot_allocate_or_record_calls"),
@@ -1077,6 +1184,22 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
                 if call_name in local_functions:
                     pending.append(local_functions[call_name])
         source_entry_points = {
+            "web_admission_refusal_reconciliation": (
+                "src/elspeth/web/execution/service.py",
+                "_settle_admission_refusal",
+            ),
+            "web_terminal_reconciliation": (
+                "src/elspeth/web/execution/recovery.py",
+                "_reconcile_resumable_terminal",
+            ),
+            "run-start-reset-prepared": (
+                "src/elspeth/core/landscape/run_start_admission.py",
+                "reset_prepared_initialization",
+            ),
+            "run-start-effects": (
+                "src/elspeth/core/landscape/run_start_admission.py",
+                "mark_executing",
+            ),
             "_transition": ("src/elspeth/core/landscape/scheduler/dispositions.py", "mark_terminal"),
             "_transition_with_ready_children": (
                 "src/elspeth/core/landscape/scheduler/dispositions.py",

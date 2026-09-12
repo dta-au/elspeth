@@ -86,6 +86,7 @@ from elspeth.web.sessions.service import (
     _patch_llm_transform_prompt,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
@@ -125,6 +126,7 @@ def service(engine) -> SessionServiceImpl:
 
 
 def _insert_session(conn, session_id: str) -> None:
+    ensure_test_identity(conn, identity_id="alice")
     created_at = datetime.now(UTC)
     conn.execute(
         insert(sessions_table).values(

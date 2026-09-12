@@ -1,9 +1,9 @@
 """Purpose-separated key derivation from the single web ``secret_key``.
 
-One 32-byte operator secret feeds three unrelated cryptographic jobs: signing
+One 32-byte operator secret feeds four unrelated cryptographic jobs: signing
 session tokens, encrypting user secrets at rest, and tagging plugin-binding
-evidence. Handing the same raw string to all three means a weakness or a
-disclosure in any one of them is a weakness in all three, and the SSO delivery
+evidence and deriving private rate-limit subjects. Handing the same raw string
+to every consumer means a disclosure in any one compromises the others, and the SSO delivery
 adds traffic to the first of those without changing that.
 
 HKDF-SHA256 with a distinct ``info`` string per job fixes that: each consumer
@@ -20,7 +20,7 @@ derivation whenever the operator is already willing to manage a second secret.
 
 EPOCH BINDING
 -------------
-Two of the three derivations change a value that is compared against something
+Two derivations change a value that is compared against something
 already at rest, so both are bound to the epoch window where the stores are
 recreated. What an operator must do about that is
 "What the derived keys change across this boundary" in
@@ -52,6 +52,7 @@ _DERIVED_KEY_BYTES: Final = 32
 _SESSION_TOKEN_INFO: Final = b"elspeth-session-token-hs256-v1"
 _USER_SECRET_INFO: Final = b"elspeth-user-secret-encryption-v1"
 _BINDING_GENERATION_INFO: Final = b"elspeth-plugin-binding-generation-v1"
+_RATE_LIMIT_INFO: Final = b"elspeth-rate-limit-subject-v1"
 _SSO_TRANSACTION_INFO: Final = b"sso-transaction-v1"
 
 
@@ -78,6 +79,16 @@ def _derive(secret_key: str, *, info: bytes) -> bytes:
 def derive_session_token_key(secret_key: str) -> bytes:
     """Return the HMAC key that signs and verifies session tokens."""
     return _derive(secret_key, info=_SESSION_TOKEN_INFO)
+
+
+def derive_rate_limit_key(secret_key: str) -> bytes:
+    """Return the independent root key for scoped rate-limit subject digests.
+
+    Replicas sharing the web secret derive identical quotas. Rotating that
+    secret starts new buckets; old digest rows expire through bounded cleanup.
+    The separately managed shareable-link key remains exclusive to link signing.
+    """
+    return _derive(secret_key, info=_RATE_LIMIT_INFO)
 
 
 def derive_user_secret_master_key(secret_key: str) -> str:

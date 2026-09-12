@@ -617,6 +617,12 @@ from pydantic import ValidationError
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.contracts import Determinism
 from elspeth.contracts.audit import Run
+from elspeth.contracts.chargeable_admission import (
+    AdmissionPolicyEvidence,
+    ChargeableAdmissionDecision,
+    ChargeableOperation,
+    QuotaDisposition,
+)
 from elspeth.contracts.enums import CreationModality, RunStatus
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
@@ -624,7 +630,7 @@ from elspeth.contracts.secrets import (
     SecretInventoryItem,
     SecretUnavailabilityReason,
 )
-from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.config import (
     AggregationSettings,
     CoalesceSettings,
@@ -3729,6 +3735,21 @@ class _FakeSessionService:
     recorded_blob_inline_resolutions: list[dict[str, Any]] = field(default_factory=list)
     record_blob_inline_resolutions_hook: Any = None
     next_event_sequence: int = 0
+
+    async def assess_chargeable_operation(
+        self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision:
+        """Model the active, quota-free owner of this blob-custody fixture."""
+        assert session_operation_context.fence.session_id == str(self.run.session_id)
+        assert session_operation_context.operation_kind is SessionOperationKind.EXECUTE
+        assert operation is ChargeableOperation.RUN
+        return ChargeableAdmissionDecision(
+            refusal_reason=None,
+            evidence=AdmissionPolicyEvidence(
+                quota_disposition=QuotaDisposition.NOT_CONFIGURED,
+                secret_wiring_hash=stable_hash([]),
+            ),
+        )
 
     async def update_run_status(self, run_id: UUID, status: str, **kwargs: Any) -> None:
         self.run.status = status
@@ -7083,6 +7104,7 @@ class TestCsvBindGuaranteeRuntimeAgreement:
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import chat_messages_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
+        from tests.fixtures.identities import ensure_test_identity
         from tests.helpers.session_fences import fenced_operation_context
 
         engine = create_session_engine(
@@ -7093,6 +7115,7 @@ class TestCsvBindGuaranteeRuntimeAgreement:
         initialize_session_schema(engine)
         now = _datetime.now(UTC)
         with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="agreement-suite-user")
             conn.execute(
                 _insert(sessions_table).values(
                     id=_AGREEMENT_SESSION_ID,

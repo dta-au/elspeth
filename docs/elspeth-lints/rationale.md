@@ -19,10 +19,12 @@ actually statically decidable rather than value-dependent.
 
 For the repository governance posture that makes these analyzer results part of
 single-maintainer delivery evidence, read
-[ADR-024](../architecture/adr/024-delivery-governance-for-single-maintainer-mode.md).
-That ADR records why ELSPETH currently uses automated gates instead of
-non-meaningful self-approval, and how the project steps up to two-person review
-when a second maintainer is assigned.
+[GOVERNANCE.md](../../GOVERNANCE.md) § Maintainer Continuity. It records why
+ELSPETH currently uses automated gates instead of non-meaningful
+self-approval, and how the project steps up to two-person review when a second
+maintainer is assigned. (That posture was previously recorded in
+[ADR-024](../architecture/adr/024-delivery-governance-for-single-maintainer-mode.md),
+retired 2026-09-13 as not being an architecture decision.)
 
 ## Rule Taxonomy
 

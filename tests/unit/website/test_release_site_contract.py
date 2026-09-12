@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -11,6 +12,7 @@ from elspeth.web.composer.guided.state_machine import GUIDED_SESSION_SCHEMA_VERS
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 ROOT = Path(__file__).resolve().parents[3]
+CURRENT_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 WEBSITE = ROOT / "website"
 PAGES = {
     "index.html": "index.html",
@@ -48,12 +50,20 @@ def test_changelog_describes_release_boundaries_precisely() -> None:
     assert "sink-effect-v1" not in release
 
 
-def test_changelog_keeps_071_historical_and_assigns_current_epoch_to_080() -> None:
+def test_changelog_preserves_historical_epochs_and_assigns_live_epochs_to_current_release() -> None:
     changelog = _text(ROOT / "CHANGELOG.md")
-    release_080 = changelog.split("## 0.8.0", maxsplit=1)[1].split("## 0.7.1", maxsplit=1)[0]
-    release_071 = changelog.split("## 0.7.1", maxsplit=1)[1].split("## 0.7.0", maxsplit=1)[0]
+    current_heading = f"\n## {CURRENT_VERSION} - "
+    assert changelog.count(current_heading) == 1
+    current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
-    assert f"SESSION_SCHEMA_EPOCH` advances from 35\nto {SESSION_SCHEMA_EPOCH}" in release_080
+    assert f"SESSION_SCHEMA_EPOCH` advances from 53\nto {SESSION_SCHEMA_EPOCH}" in current_release
+    assert f"SQLITE_SCHEMA_EPOCH` advances from 38 to {SQLITE_SCHEMA_EPOCH}" in current_release
+    assert f"install {CURRENT_VERSION}" in " ".join(current_release.split())
+
+    assert "SESSION_SCHEMA_EPOCH` advances from 35\nto 53" in release_080
+    assert "SQLITE_SCHEMA_EPOCH` advances from 29 to 38" in release_080
     assert "retryable" in release_080 and "blob deletion" in release_080.lower()
     assert "install 0.8.0" in " ".join(release_080.split())
 
@@ -81,14 +91,14 @@ def test_every_page_has_description_favicon_and_current_navigation() -> None:
 def test_every_page_advertises_current_release() -> None:
     for name in PAGES:
         html = _text(WEBSITE / name)
-        assert "Changelog · v0.8.0" in html, name
-        assert "ELSPETH 0.8.0" in html, name
+        assert f"Changelog · v{CURRENT_VERSION}" in html, name
+        assert f"ELSPETH {CURRENT_VERSION}" in html, name
 
 
 def test_home_surfaces_current_and_predecessor_releases_without_invented_counts() -> None:
     html = _text(WEBSITE / "index.html")
 
-    assert "Current version: 0.8.0" in html
+    assert f"Current version: {CURRENT_VERSION}" in html
     assert "0.7.0" in html and "LLM-primary" in html
     assert "0.7.1" in html and "recoverable publication" in html.lower()
     assert "0.8.0" in html and "unified lineage" in html.lower()
@@ -149,12 +159,20 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "npm install" in html and "npm run build" in html
     assert "ELSPETH_WEB__SECRET_KEY" in html
     assert "elspeth composer users add" in html and "--password" in html
-    assert "SESSION_SCHEMA_EPOCH" in html and f"35 → {SESSION_SCHEMA_EPOCH}" in html
-    assert f"guided schema changes 10 → {GUIDED_SESSION_SCHEMA_VERSION}" in html
-    # Derived, like the session epoch above: hardcoding the Landscape half
-    # made a Landscape epoch bump fail here with no hint that the published
-    # page was the thing out of date.
-    assert "SQLITE_SCHEMA_EPOCH" in html and f"29 → {SQLITE_SCHEMA_EPOCH}" in html
+    soup = _soup("get-started.html")
+    current = soup.select(f'[data-release="{CURRENT_VERSION}"]')
+    assert len(current) == 1
+    current_text = current[0].get_text(" ", strip=True)
+    assert f"From 0.8.0 to {CURRENT_VERSION}" in current_text
+    assert "SESSION_SCHEMA_EPOCH" in current_text and f"53 → {SESSION_SCHEMA_EPOCH}" in current_text
+    assert f"guided schema remains at {GUIDED_SESSION_SCHEMA_VERSION}" in current_text
+    assert "SQLITE_SCHEMA_EPOCH" in current_text and f"38 → {SQLITE_SCHEMA_EPOCH}" in current_text
+    historical = soup.select('[data-release="0.8.0"]')
+    assert len(historical) == 1
+    historical_text = historical[0].get_text(" ", strip=True)
+    assert "from 0.7.1 to 0.8.0" in historical_text
+    assert "35 → 53" in historical_text and "29 → 38" in historical_text
+    assert f"before installing {CURRENT_VERSION}" in html
     assert "aws-ecs-deployment.md" in html
 
 

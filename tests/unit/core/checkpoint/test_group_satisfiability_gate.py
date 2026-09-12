@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import update
 
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.checkpoint.recovery import (
@@ -108,6 +109,7 @@ class TestForkGroups:
         assert member.kind is FrameKind.FORK
         # Exact-reason refusal (spec §9 row 5: "prefer exact-reason refusal").
         assert gate.check.reason is not None
+        assert gate.check.cause is ResumeRefusalCause.GROUP_UNSATISFIABLE
         for needle in ("merger", FORK_GROUP, "path_b", "group_losses"):
             assert needle in gate.check.reason
 

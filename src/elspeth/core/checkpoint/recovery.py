@@ -31,12 +31,13 @@ from elspeth.contracts import (
     TerminalPath,
 )
 from elspeth.contracts.barrier_scalars import BarrierScalars
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError
 from elspeth.contracts.freeze import deep_freeze, freeze_fields
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import NodeID
-from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator, IncompatibleCheckpointError
+from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager
 from elspeth.core.checkpoint.serialization import checkpoint_loads
 from elspeth.core.landscape.database import LandscapeDB
@@ -103,7 +104,7 @@ __all__ = [
 # (contrast the run-immutability guard's AuditIntegrityError in
 # RunLifecycleRepository.update_run_status).
 class NonResumableRunError(Exception):
-    """Raised by ``ResumeCoordinator.resume()`` when run status precludes resume.
+    """Operational refusal of resume or export admission with its observed cause.
 
     ``RecoveryManager.can_resume()`` is ADVISORY — callers may skip it — so
     ``resume()`` re-checks the run status at entry via the same shared
@@ -115,9 +116,10 @@ class NonResumableRunError(Exception):
     without parsing the exception text.
     """
 
-    def __init__(self, run_id: str, reason: str) -> None:
+    def __init__(self, run_id: str, reason: str, *, cause: ResumeRefusalCause) -> None:
         self.run_id = run_id
         self.reason = reason
+        self.cause = cause
         super().__init__(f"Cannot resume run {run_id!r}: {reason}")
 
 
@@ -146,7 +148,7 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
     """
     run = _fetch_run(db, run_id)
     if run is None:
-        return None, ResumeCheck(can_resume=False, reason=f"Run {run_id} not found")
+        return None, ResumeCheck(can_resume=False, reason=f"Run {run_id} not found", cause=ResumeRefusalCause.RUN_NOT_FOUND)
 
     try:
         run_status = RunStatus(run.status)
@@ -154,7 +156,7 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
         raise CheckpointCorruptionError(f"Run {run_id} has invalid status {run.status!r}; audit trail is corrupt") from exc
 
     if run_status == RunStatus.COMPLETED:
-        return run_status, ResumeCheck(can_resume=False, reason="Run already completed successfully")
+        return run_status, ResumeCheck(can_resume=False, reason="Run already completed successfully", cause=ResumeRefusalCause.RUN_TERMINAL)
 
     if run_status == RunStatus.RUNNING:
         # §B.3 + §H test #2(c) (epoch 21, ADR-030, slice 4 flip):
@@ -177,12 +179,14 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
                 f"(seat expires {leader.leader_heartbeat_expires_at.isoformat()}) — "
                 "use `elspeth join` to attach as a follower"
             )
-            return run_status, ResumeCheck(can_resume=False, reason=reason)
+            return run_status, ResumeCheck(can_resume=False, reason=reason, cause=ResumeRefusalCause.LEADER_LIVE)
         # Seat is absent or expired: dead-leader takeover path → resumable.
         return run_status, ResumeCheck(can_resume=True)
 
     if run_status not in _RESUMABLE_RUN_STATUSES:
-        return run_status, ResumeCheck(can_resume=False, reason=f"Run status {run_status.value!r} is not resumable")
+        return run_status, ResumeCheck(
+            can_resume=False, reason=f"Run status {run_status.value!r} is not resumable", cause=ResumeRefusalCause.RUN_TERMINAL
+        )
 
     return run_status, ResumeCheck(can_resume=True)
 
@@ -245,7 +249,7 @@ def check_source_lifecycle_resumable(db: LandscapeDB, run_id: str) -> SourceLife
         return SourceLifecycleResumeGate(
             lifecycle_by_source=lifecycle_by_source,
             incomplete_sources=incomplete_sources,
-            check=ResumeCheck(can_resume=False, reason=reason),
+            check=ResumeCheck(can_resume=False, reason=reason, cause=ResumeRefusalCause.SOURCE_NOT_EXHAUSTED),
         )
     return SourceLifecycleResumeGate(
         lifecycle_by_source=lifecycle_by_source,
@@ -522,7 +526,7 @@ def check_group_satisfiability_resumable(
         )
         return GroupSatisfiabilityResumeGate(
             unsatisfiable_members=tuple(unsatisfiable),
-            check=ResumeCheck(can_resume=False, reason=reason),
+            check=ResumeCheck(can_resume=False, reason=reason, cause=ResumeRefusalCause.GROUP_UNSATISFIABLE),
         )
     return GroupSatisfiabilityResumeGate(unsatisfiable_members=(), check=ResumeCheck(can_resume=True))
 
@@ -742,11 +746,7 @@ class RecoveryManager:
         if not status_check.can_resume:
             return status_check
 
-        try:
-            checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
-        except IncompatibleCheckpointError as e:
-            # Return ResumeCheck instead of propagating exception (API contract)
-            return ResumeCheck(can_resume=False, reason=str(e))
+        checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
         if checkpoint is None:
             # F1 Task 3.2: journal-flavoured refuse — the checkpoint row is the
             # run's resume BASELINE (scalars + topology anchor); buffered work
@@ -755,6 +755,7 @@ class RecoveryManager:
             return ResumeCheck(
                 can_resume=False,
                 reason="Run has no resume baseline (run predates run-start checkpointing or checkpointing was disabled)",
+                cause=ResumeRefusalCause.CHECKPOINT_MISSING,
             )
 
         # Validate topological compatibility
@@ -787,7 +788,7 @@ class RecoveryManager:
 
         return ResumeCheck(can_resume=True)
 
-    def get_resume_point(self, run_id: str, graph: ExecutionGraph) -> ResumePoint | None:
+    def get_resume_point(self, run_id: str, graph: ExecutionGraph) -> ResumePoint:
         """Get the resume point for a failed run.
 
         Returns all information needed to resume processing:
@@ -800,23 +801,28 @@ class RecoveryManager:
             graph: The current execution graph to validate against
 
         Returns:
-            ResumePoint if run can be resumed, None otherwise
+            ResumePoint if run can be resumed.
+
+        Raises:
+            NonResumableRunError: The observed admission check refused resume.
         """
         check = self.can_resume(run_id, graph)
         if not check.can_resume:
-            return None
+            assert check.reason is not None and check.cause is not None
+            raise NonResumableRunError(run_id, check.reason, cause=check.cause)
 
         # get_latest_checkpoint is a raw persistence read: it returns a
         # checkpoint or None and raises CheckpointCorruptionError on malformed
-        # data — it never raises IncompatibleCheckpointError (compatibility is
-        # the validator's job, below). No handler: corruption propagates.
+        # data. Compatibility is the validator's job, below.
+        # No handler: corruption propagates.
         checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
         if checkpoint is None:
-            return None
+            raise NonResumableRunError(run_id, "Run has no resume baseline", cause=ResumeRefusalCause.CHECKPOINT_MISSING)
 
         topology_check = CheckpointCompatibilityValidator().validate(checkpoint, graph)
         if not topology_check.can_resume:
-            return None
+            assert topology_check.reason is not None and topology_check.cause is not None
+            raise NonResumableRunError(run_id, topology_check.reason, cause=topology_check.cause)
 
         self.verify_contract_integrity(run_id)
         barrier_scalars = self._restore_barrier_scalars(checkpoint)
@@ -836,7 +842,8 @@ class RecoveryManager:
         format_check = CheckpointCompatibilityValidator().validate_format_version(checkpoint)
         if not format_check.can_resume:
             assert format_check.reason is not None
-            raise IncompatibleCheckpointError(format_check.reason)
+            assert format_check.cause is not None
+            raise NonResumableRunError(run_id, format_check.reason, cause=format_check.cause)
 
         return checkpoint
 

@@ -40,7 +40,9 @@ from sqlalchemy import create_engine, delete, event, insert, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipLost, WorkerMembershipToken, mint_worker_id
+from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     JoinRefusedError,
@@ -395,6 +397,7 @@ class TestAcquireRunLeadershipCAS:
 
         assert "run leadership is held by" in str(excinfo.value)
         assert leader_b in str(excinfo.value)
+        assert excinfo.value.cause is ResumeRefusalCause.LEADER_LIVE
         # Zero mutation: seat, registry, ledger, and runs row all untouched.
         seat = _seat_row(engine)
         assert seat["leader_worker_id"] == leader_b
@@ -450,6 +453,21 @@ class TestAcquireRunLeadershipCAS:
 class TestAcquireExportLeadership:
     """ADR-048 §4: re-driving a finalized run's audit export takes the seat first — a separate arm from the resume takeover."""
 
+    def test_reconciliation_status_race_refuses_without_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        _seed_run(engine, status="interrupted")
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+        repo.release_seat(token=token)
+        before = _coordination_image(engine)
+        with pytest.raises(NonResumableRunError) as exc_info:
+            repo.acquire_reconciliation_leadership(
+                run_id=RUN_ID,
+                worker_id=mint_worker_id(RUN_ID),
+                window_seconds=WINDOW,
+                expected_status=RunStatus.FAILED,
+            )
+        assert exc_info.value.cause is ResumeRefusalCause.TERMINAL_STATUS_CHANGED
+        assert _coordination_image(engine) == before
+
     @pytest.mark.parametrize("terminal_status", ["completed", "completed_with_failures", "empty", "failed", "interrupted"])
     def test_vacant_seat_on_terminal_run_is_taken_without_a_status_flip(
         self, engine: Tier1Engine, repo: RunCoordinationRepository, terminal_status: str
@@ -490,9 +508,10 @@ class TestAcquireExportLeadership:
         repo.release_seat(token=token_a)
         image_before = _coordination_image(engine)
 
-        with pytest.raises(NonResumableRunError, match="not terminal"):
+        with pytest.raises(NonResumableRunError, match="not terminal") as excinfo:
             repo.acquire_export_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
 
+        assert excinfo.value.cause is ResumeRefusalCause.RUN_NOT_FINALIZED
         assert _coordination_image(engine) == image_before
 
     def test_live_seat_is_refused_with_zero_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
@@ -506,6 +525,7 @@ class TestAcquireExportLeadership:
 
         assert "run leadership is held by" in str(excinfo.value)
         assert holder in str(excinfo.value)
+        assert excinfo.value.cause is ResumeRefusalCause.LEADER_LIVE
         assert _coordination_image(engine) == image_before
 
     def test_expired_dead_leader_is_evicted_by_the_export_seat(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:

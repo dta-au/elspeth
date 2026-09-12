@@ -21,6 +21,7 @@ from elspeth.web.sessions._persist_payload import StatePayload
 from elspeth.web.sessions.models import session_operation_fences_table
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.conftest import _make_session as _make_session_row
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -109,6 +110,8 @@ def service(engine, tmp_path) -> SessionServiceImpl:
     fixture — without it, the fixture's untyped parameters poison the
     return type to ``Any`` and helper-method calls return ``Any``.
     """
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     instance = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,

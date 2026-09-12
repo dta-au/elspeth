@@ -32,6 +32,7 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -256,7 +257,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4753a3d81bb7aace"
+    source_file_hash: str | None = "sha256:4faa7438003a3fae"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -352,7 +353,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._recorder: PluginAuditWriter | None = None
         self._run_id = ""
         self._node_id = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._payload_store: PayloadStore | None = None
         self._sdk_client: TextractSyncSDKClient | None = None

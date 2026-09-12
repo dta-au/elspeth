@@ -17,6 +17,21 @@ from elspeth.contracts.audit_export import (
 from elspeth.core.config import LandscapeExportSettings
 
 
+def test_auth_event_policy_is_closed_and_default_omission_is_explicit() -> None:
+    settings = LandscapeExportSettings(**_enabled_config())
+    assert settings.exporter_version == "landscape-exporter-auth-v1"
+    assert settings.auth_events == "omitted"
+    assert settings.public_snapshot_config()["auth_events"] == "omitted"
+    included = LandscapeExportSettings(**_enabled_config(auth_events="deployment_snapshot"))
+    assert included.public_snapshot_config()["auth_events"] == "deployment_snapshot"
+    with pytest.raises(ValidationError, match="auth_events"):
+        LandscapeExportSettings(**_enabled_config(auth_events="all"))
+    with pytest.raises(ValidationError, match="exporter_version"):
+        LandscapeExportSettings(**_enabled_config(exporter_version="landscape-exporter-v1"))
+    with pytest.raises(ValidationError, match="exporter_version"):
+        LandscapeExportSettings(**_enabled_config(exporter_version="landscape-exporter-v1", auth_events="deployment_snapshot"))
+
+
 def _enabled_config(**overrides: object) -> dict[str, object]:
     config: dict[str, object] = {
         "enabled": True,

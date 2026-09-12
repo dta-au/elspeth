@@ -35,6 +35,8 @@ from uuid import UUID
 from litellm.exceptions import APIError as LiteLLMAPIError
 from opentelemetry import metrics
 
+from elspeth.contracts.chargeable_admission import ChargeableOperation
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 from elspeth.web.validation import _redact_sensitive_content, reject_credential_shaped_content
@@ -73,6 +75,7 @@ _AUTO_TITLE_EXCERPT_CHAR_LIMIT = 800
 _AUTO_TITLE_EXCERPT_FENCE = "EXCERPT-8f2c"
 _AUTO_TITLE_FAILED_COUNTER = metrics.get_meter(__name__).create_counter("composer.auto_title.failed")
 _AUTO_TITLE_REJECTED_COUNTER = metrics.get_meter(__name__).create_counter("composer.auto_title.rejected")
+_AUTO_TITLE_ADMISSION_REFUSED_COUNTER = metrics.get_meter(__name__).create_counter("composer.auto_title.admission_refused")
 # Characters a title may contain besides Unicode letters/numbers (category
 # L/N) and U+0020. Deliberately excludes "." and ":" — they are what list
 # markers ("1. Title") and conversational preambles ("Here's a title: …")
@@ -286,6 +289,17 @@ async def maybe_auto_title_session(
     the exact same kwargs as before this affordance existed.
     """
     if not user_message.strip():
+        return
+    if session_operation_context.fence.session_id != str(session_id):
+        raise AuditIntegrityError("Auto-title session authority targets a different session")
+    decision = await service.assess_chargeable_operation(
+        session_operation_context=session_operation_context,
+        operation=ChargeableOperation.AUTO_TITLE,
+    )
+    if not decision.allowed:
+        if decision.refusal_reason is None:
+            raise AuditIntegrityError("Refused auto-title admission has no refusal reason")
+        _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": decision.refusal_reason.value})
         return
     kwargs: dict[str, object] = {
         "model": model,

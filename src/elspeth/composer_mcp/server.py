@@ -754,6 +754,7 @@ def create_server(
         # is recorded).
         error_payload_for_audit: dict[str, Any] | None = None
         clear_session_after_audit = False
+        checkout_refused = False
 
         def _argument_error_result(exc: Exception) -> CallToolResult:
             nonlocal status, error_class, error_message, error_payload_for_audit
@@ -839,6 +840,17 @@ def create_server(
                 )
             except ToolArgumentError as exc:
                 return _argument_error_result(exc)
+            except SessionCheckoutMismatchError as exc:
+                # Expected refusal: dispatch completed without changing state.
+                # Persist the same safe diagnostic the MCP client receives.
+                checkout_refused = True
+                result_dict = {
+                    "success": False,
+                    "error": str(exc),
+                    "code": "session_checkout_mismatch",
+                    "requested_session_id": exc.requested_session_id,
+                    "active_session_id": exc.active_session_id,
+                }
             except Exception as exc:
                 _capture_plugin_crash(exc)
                 raise
@@ -894,6 +906,8 @@ def create_server(
                 result_dict = None
                 raise
 
+            if checkout_refused:
+                return CallToolResult(content=[TextContent(type="text", text=response_text)], isError=True)
             return [TextContent(type="text", text=response_text)]
         finally:
             finished_at = datetime.now(UTC)

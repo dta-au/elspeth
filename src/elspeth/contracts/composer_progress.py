@@ -113,6 +113,7 @@ type ComposerProgressReason = Literal[
     "planner_repair_exhausted",
     # Generic ComposerServiceError — prompt prep / availability / catch-all.
     "service_setup_failed",
+    "admission_refused",
     # Client closed the HTTP connection or operator cancelled the request
     # before the composer returned. Distinct from convergence_wall_clock_timeout
     # (server budget exceeded) so dashboards and audit can tell apart "the

@@ -52,6 +52,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -69,6 +70,7 @@ def _make_session(
 ) -> None:
     """Insert a session row with every NOT NULL column populated."""
     now = created_at or datetime.now(UTC)
+    ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
     conn.execute(
         insert(models.sessions_table).values(
             id=session_id,
@@ -145,6 +147,8 @@ def composer_test_client(tmp_path: Path) -> TestClient:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session_service = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
@@ -449,6 +453,8 @@ def _seed_session_with_state(
     # paths inside the persisted CompositionState satisfy
     # web/paths.py's resolve_data_path() invariants.
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=settings.auth_provider)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness fixture",
@@ -487,6 +493,8 @@ def _seed_session_without_state(
     settings: WebSettings = client.app.state.settings
 
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=settings.auth_provider)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness empty fixture",
@@ -590,6 +598,8 @@ def _seed_session_with_mismatched_auth_provider(
     settings: WebSettings = client.app.state.settings
 
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness mismatched-provider fixture",

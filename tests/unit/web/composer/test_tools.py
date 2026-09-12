@@ -89,6 +89,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.state_envelope import envelope_state_column
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
 
 
@@ -649,6 +650,8 @@ def _session_engine_with_session() -> tuple[Any, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
@@ -4917,6 +4920,9 @@ class TestBlobTools:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
+            ensure_test_identity(conn, identity_id="other-user")
 
         self.session_id = str(uuid4())
         self.other_session_id = str(uuid4())
@@ -5606,6 +5612,8 @@ class TestDeleteBlobActiveRunGuard:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.data_dir = str(tmp_path)
@@ -6094,6 +6102,8 @@ class TestUpdateBlobQuota:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
@@ -6457,6 +6467,8 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
@@ -6677,6 +6689,8 @@ class TestUpdateBlobSessionLockSerialisation:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
@@ -6882,6 +6896,8 @@ class TestUpdateBlobQuotaRollbackDivergence:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
@@ -14736,6 +14752,8 @@ class TestCreateBlobTypeGuard:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.data_dir = tmp_path
@@ -14834,6 +14852,8 @@ class TestUpdateBlobTypeGuard:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.data_dir = tmp_path
@@ -14992,6 +15012,8 @@ class TestSetSourceFromBlobTypeGuard:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.data_dir = tmp_path
@@ -15110,6 +15132,8 @@ class TestGetBlobContentGuards:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.data_dir = tmp_path
         self.session_id = str(uuid4())
@@ -15622,6 +15646,8 @@ class TestUpdateBlobActiveRunGuard:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.data_dir = tmp_path
         self.session_id = str(uuid4())
@@ -16141,6 +16167,8 @@ class TestUpdateBlobAtomicWrite:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.data_dir = tmp_path
         self.session_id = str(uuid4())
@@ -16332,6 +16360,8 @@ class TestInspectSourceTool:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.data_dir = tmp_path
         self.session_id = str(uuid4())
@@ -16645,6 +16675,8 @@ class TestPreviewProofStep:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.data_dir = tmp_path
         self.session_id = str(uuid4())
@@ -19896,6 +19928,8 @@ class TestGetBlobContentReaderMixedVersion:
 
         engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         session_id = str(uuid4())
         blob_id = str(uuid4())
@@ -20051,6 +20085,8 @@ class TestBlobCrashStateReconciliation:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
@@ -20277,6 +20313,8 @@ class TestDeleteBlobDurableJournal:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
@@ -20409,6 +20447,8 @@ class TestUpdateBlobSidecarCommitFailure:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         session_id = str(uuid4())
         blob_id = str(uuid4())
@@ -20522,6 +20562,8 @@ class TestBlobCompositionReferenceGuards:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(self.engine)
+        with self.engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())

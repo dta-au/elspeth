@@ -15,6 +15,7 @@ from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
     LLMClientError,
@@ -141,6 +142,7 @@ class FakeCallRecorder:
         resolved_prompt_template_hash: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         call_kwargs = {
             "state_id": state_id,
@@ -177,6 +179,7 @@ class FakeCallRecorder:
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
         coordination_token: CoordinationToken,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         actual_call_index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
         call_kwargs = {

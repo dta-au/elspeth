@@ -25,6 +25,7 @@ from elspeth.web.sessions.protocol import SessionOperationMutationTransaction
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 
 
 def _die_during_replacement(database_url: str, storage_root: str, blob_id: UUID, context: SessionOperationContext, phase: str) -> None:
@@ -72,6 +73,8 @@ def test_process_death_keeps_exact_version_recoverable(tmp_path: Path, phase: st
     database_url = f"sqlite:///{tmp_path / 'sessions.db'}"
     engine = create_session_engine(database_url)
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="process-death")
     sessions = SessionServiceImpl(engine, tmp_path, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.process-death"))
     session = asyncio.run(sessions.create_session("process-death", "Replacement", "local"))
     authority = sessions.session_operation_authority

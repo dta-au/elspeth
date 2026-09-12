@@ -1543,6 +1543,7 @@ class ComposerService(Protocol):
         snapshot: Mapping[str, object],
         *,
         recorder: BufferingRecorder | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> str:
         """Explain a bounded run diagnostics snapshot without mutating state."""
         ...

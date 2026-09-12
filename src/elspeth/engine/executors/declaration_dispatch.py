@@ -85,12 +85,17 @@ def _serialize_plugin_name(plugin: Any) -> str:
     plugin's class name when the authoritative ``plugin.name`` is absent.
     """
     name = plugin.name
+    if not isinstance(name, str):
+        raise FrameworkBugError(
+            f"Aggregate declaration audit evidence requires plugin.name to be a string; "
+            f"got {type(name).__name__} on {type(plugin).__name__}"
+        )
     if not name:
         raise FrameworkBugError(
             f"Aggregate declaration audit evidence requires a non-empty plugin.name; "
             f"refusing to fabricate an identifier for {type(plugin).__name__} from empty plugin.name"
         )
-    return "".join((name,))
+    return name
 
 
 def _violation_message_label(violation: DeclarationContractViolation) -> str:

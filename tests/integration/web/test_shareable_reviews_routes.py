@@ -33,6 +33,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.shareable_reviews.signer import ShareTokenPayload
+from tests.fixtures.identities import ensure_test_identity
 
 from .conftest import (
     _TEST_AUTHED_USER_ID,
@@ -115,6 +116,8 @@ def _seed_session_with_blob_subtree_sink(client: TestClient, *, user_id: str) ->
     (settings.data_dir / "outputs").mkdir(parents=True, exist_ok=True)
 
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=settings.auth_provider)
         record = await session_service.create_session(
             user_id=user_id,
             title="blob-subtree sink fixture",
@@ -236,6 +239,8 @@ def _seed_session_with_described_state(client: TestClient, *, user_id: str) -> U
     settings = client.app.state.settings
 
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=settings.auth_provider)
         record = await session_service.create_session(
             user_id=user_id,
             title="described fixture",

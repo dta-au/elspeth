@@ -37,7 +37,7 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.landscape import expire_leader_seat, insert_crashed_leader_seat, leader_token_for
-from tests.fixtures.pipeline import build_linear_pipeline, build_production_graph
+from tests.fixtures.pipeline import build_production_graph
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -1077,6 +1077,7 @@ class TestInterruptAndResume:
         run_id: str,
         num_rows: int,
         processed_count: int,
+        config: PipelineConfig,
     ) -> Any:
         """Set up a failed run with some rows processed and others pending.
 
@@ -1091,6 +1092,7 @@ class TestInterruptAndResume:
             run_id: Run identifier
             num_rows: Total rows to create
             processed_count: Number of rows already processed (with terminal outcomes)
+            config: Exact plugin implementations the resumed execution will run
 
         Returns:
             ExecutionGraph for the run (with sink/transform ID maps already set)
@@ -1101,7 +1103,7 @@ class TestInterruptAndResume:
 
         from elspeth.contracts import NodeType
         from elspeth.contracts.contract_records import ContractAuditRecord
-        from elspeth.contracts.enums import Determinism, RoutingMode, TerminalOutcome, TerminalPath
+        from elspeth.contracts.enums import RoutingMode, TerminalOutcome, TerminalPath
         from elspeth.contracts.schema_contract import FieldContract, SchemaContract
         from elspeth.core.checkpoint import CheckpointManager
         from elspeth.core.landscape.schema import (
@@ -1113,14 +1115,14 @@ class TestInterruptAndResume:
             tokens_table,
         )
         from tests.fixtures.landscape import make_factory
-        from tests.fixtures.plugins import PassTransform
 
         now = datetime.now(UTC)
 
         # Build graph via production path — prevents BUG-LINEAGE-01
-        source_data = [{"value": i} for i in range(num_rows)]
-        transform = PassTransform()
-        _, _, _, graph = build_linear_pipeline(source_data, transforms=[as_transform(transform)])
+        graph = build_production_graph(config)
+        source = config.sources["primary"]
+        transform = config.transforms[0]
+        sink = config.sinks["default"]
 
         # Extract production-generated node IDs
         source_nid = graph.get_sources()[0]
@@ -1168,19 +1170,20 @@ class TestInterruptAndResume:
             # leader seat begin_run would have minted atomically with the run.
             insert_crashed_leader_seat(conn, run_id=run_id)
 
-            for node_id, plugin_name, node_type in [
-                (source_nid, "list_source", NodeType.SOURCE),
-                (xform_nid, "passthrough", NodeType.TRANSFORM),
-                (sink_nid, "collect_sink", NodeType.SINK),
+            for node_id, plugin, node_type in [
+                (source_nid, source, NodeType.SOURCE),
+                (xform_nid, transform, NodeType.TRANSFORM),
+                (sink_nid, sink, NodeType.SINK),
             ]:
                 conn.execute(
                     insert(nodes_table).values(
                         node_id=node_id,
                         run_id=run_id,
-                        plugin_name=plugin_name,
+                        plugin_name=plugin.name,
                         node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                        plugin_version=plugin.plugin_version,
+                        determinism=plugin.determinism,
+                        source_file_hash=plugin.source_file_hash,
                         config_hash="test",
                         config_json="{}",
                         registered_at=now,
@@ -1282,11 +1285,24 @@ class TestInterruptAndResume:
         from elspeth.core.config import CheckpointSettings
         from elspeth.core.landscape.schema import runs_table
         from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
-        from elspeth.plugins.sources.null_source import NullSource
 
         run_id = "resume-shutdown-test"
         total_rows = 10
         processed_count = 3
+
+        # Set up resume with shutdown event that fires after 2 rows
+        resume_shutdown = threading.Event()
+        resume_transform = InterruptAfterN(2, resume_shutdown)
+        resume_transform.on_success = "default"
+        resume_transform.on_error = "discard"
+        resume_sink = CollectSink()
+        resume_source = ListSource([{"value": i} for i in range(total_rows)])
+
+        resume_config = PipelineConfig(
+            sources={"primary": as_source(resume_source)},
+            transforms=[as_transform(resume_transform)],
+            sinks={"default": as_sink(resume_sink)},
+        )
 
         # Set up failed run: 10 rows, 3 processed, 7 remaining
         # Graph is built via production path; ID maps are already set.
@@ -1296,6 +1312,7 @@ class TestInterruptAndResume:
             run_id,
             num_rows=total_rows,
             processed_count=processed_count,
+            config=resume_config,
         )
 
         checkpoint_mgr = CheckpointManager(landscape_db)
@@ -1304,21 +1321,6 @@ class TestInterruptAndResume:
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
         resume_point = recovery.get_resume_point(run_id, graph)
         assert resume_point is not None
-
-        # Set up resume with shutdown event that fires after 2 rows
-        resume_shutdown = threading.Event()
-        resume_transform = InterruptAfterN(2, resume_shutdown)
-        resume_transform.on_success = "default"
-        resume_transform.on_error = "discard"
-        resume_sink = CollectSink()
-        null_source = NullSource({})
-        null_source.on_success = "default"
-
-        resume_config = PipelineConfig(
-            sources={"primary": as_source(null_source)},
-            transforms=[as_transform(resume_transform)],
-            sinks={"default": as_sink(resume_sink)},
-        )
 
         orchestrator = Orchestrator(
             db=landscape_db,
@@ -1457,7 +1459,6 @@ class TestInterruptAndResume:
         from elspeth.core.config import CheckpointSettings
         from elspeth.core.landscape.schema import runs_table
         from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
-        from elspeth.plugins.sources.null_source import NullSource
         from elspeth.plugins.transforms.passthrough import PassThrough
         from elspeth.telemetry import TelemetryManager
         from tests.fixtures.telemetry import MockTelemetryConfig, TelemetryTestExporter
@@ -1465,6 +1466,19 @@ class TestInterruptAndResume:
         run_id = "resume-no-shutdown-test"
         total_rows = 10
         processed_count = 5
+
+        # Set up resume WITHOUT shutdown event
+        passthrough = PassThrough({"schema": {"mode": "observed"}})
+        passthrough.on_success = "default"
+        passthrough.on_error = "discard"
+        resume_sink = CollectSink()
+        resume_source = ListSource([{"value": i} for i in range(total_rows)])
+
+        resume_config = PipelineConfig(
+            sources={"primary": as_source(resume_source)},
+            transforms=[as_transform(passthrough)],
+            sinks={"default": as_sink(resume_sink)},
+        )
 
         # Set up failed run: 10 rows, 5 processed, 5 remaining
         # Graph is built via production path; ID maps are already set.
@@ -1474,6 +1488,7 @@ class TestInterruptAndResume:
             run_id,
             num_rows=total_rows,
             processed_count=processed_count,
+            config=resume_config,
         )
 
         checkpoint_mgr = CheckpointManager(landscape_db)
@@ -1482,20 +1497,6 @@ class TestInterruptAndResume:
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
         resume_point = recovery.get_resume_point(run_id, graph)
         assert resume_point is not None
-
-        # Set up resume WITHOUT shutdown event
-        passthrough = PassThrough({"schema": {"mode": "observed"}})
-        passthrough.on_success = "default"
-        passthrough.on_error = "discard"
-        resume_sink = CollectSink()
-        null_source = NullSource({})
-        null_source.on_success = "default"
-
-        resume_config = PipelineConfig(
-            sources={"primary": as_source(null_source)},
-            transforms=[as_transform(passthrough)],
-            sinks={"default": as_sink(resume_sink)},
-        )
 
         telemetry_exporter = TelemetryTestExporter()
         telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[telemetry_exporter])

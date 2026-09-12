@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import Engine, select, update
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.session_fences import acquire_compose_context
 
@@ -59,6 +60,8 @@ def postgres_engine() -> Iterator[Engine]:
 
 @pytest.fixture
 def postgres_service(postgres_engine: Engine, tmp_path: Path) -> SessionServiceImpl:
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return SessionServiceImpl(
         postgres_engine,
         data_dir=tmp_path,

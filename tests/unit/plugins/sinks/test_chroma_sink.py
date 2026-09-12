@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import create_autospec, patch
@@ -11,7 +12,8 @@ import chromadb
 import pytest
 from chromadb.api import ClientAPI
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, TelemetryExporterError
+from elspeth.contracts.events import ChromaWriteStatistics, TelemetryEvent
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
@@ -31,8 +33,11 @@ from elspeth.engine.orchestrator.preflight import (
 )
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.sinks.chroma_sink import ChromaSink
+from elspeth.telemetry.exporters.console import ConsoleExporter
+from elspeth.telemetry.manager import TelemetryManager
 from tests.fixtures.base_classes import inject_write_failure
 from tests.fixtures.factories import make_context, make_operation_context
+from tests.fixtures.telemetry import MockTelemetryConfig
 
 
 def _make_config(**overrides: Any) -> dict[str, Any]:
@@ -56,7 +61,7 @@ def _make_config(**overrides: Any) -> dict[str, Any]:
     return config
 
 
-def _telemetry_emit(event: Any) -> None:
+def _telemetry_emit(event: TelemetryEvent) -> None:
     """Function spec for telemetry emit interactions."""
 
 
@@ -79,7 +84,7 @@ def _make_sink_with_collection(mock_collection: Any, **config_overrides: Any) ->
 
 def _make_lifecycle_ctx() -> Any:
     """Build a context suitable for on_start() / on_complete() lifecycle hooks."""
-    return make_context()
+    return make_context(node_id="chroma")
 
 
 def _make_sink_ctx() -> Any:
@@ -100,20 +105,42 @@ def _make_mock_audit_ctx() -> Any:
 class TestChromaSinkCompletionTelemetry:
     """elspeth-ee69831e4c: on_complete telemetry emit must be best-effort.
 
-    Telemetry fires AFTER successful writes and their audit record; an emit
-    failure must not fail completion. Tier-1/audit-integrity errors still
-    propagate (audit corruption outranks).
+    Telemetry fires AFTER successful writes and their audit record; expected
+    exporter failures must not fail completion. Programming errors and
+    Tier-1/audit-integrity errors still propagate.
     """
 
     def test_telemetry_failure_does_not_fail_completion(self) -> None:
         sink = ChromaSink(_make_config())
         sink._telemetry_emit = create_autospec(
             _telemetry_emit,
-            side_effect=RuntimeError("telemetry transport down"),
+            side_effect=TelemetryExporterError("console", "telemetry transport down"),
             spec_set=True,
         )
         sink.on_complete(_make_lifecycle_ctx())  # must not raise
         sink._telemetry_emit.assert_called_once()
+
+    @pytest.mark.parametrize("error", [RuntimeError("programming error"), AttributeError("bad event")])
+    def test_programming_error_propagates(self, error: Exception) -> None:
+        sink = ChromaSink(_make_config())
+        sink._telemetry_emit = create_autospec(_telemetry_emit, side_effect=error, spec_set=True)
+        with pytest.raises(type(error), match=str(error)):
+            sink.on_complete(_make_lifecycle_ctx())
+
+    def test_invalid_statistics_fail_before_transport(self) -> None:
+        sink = ChromaSink(_make_config())
+        sink._total_written = -1
+        sink._telemetry_emit = create_autospec(_telemetry_emit, spec_set=True)
+        with pytest.raises(ValueError):
+            sink.on_complete(_make_lifecycle_ctx())
+        sink._telemetry_emit.assert_not_called()
+
+    def test_completion_requires_node_identity(self) -> None:
+        sink = ChromaSink(_make_config())
+        sink._telemetry_emit = create_autospec(_telemetry_emit, spec_set=True)
+        with pytest.raises(FrameworkBugError, match="node_id"):
+            sink.on_complete(make_context())
+        sink._telemetry_emit.assert_not_called()
 
     def test_tier1_error_during_telemetry_propagates(self) -> None:
         sink = ChromaSink(_make_config())
@@ -124,6 +151,53 @@ class TestChromaSinkCompletionTelemetry:
         )
         with pytest.raises(AuditIntegrityError):
             sink.on_complete(_make_lifecycle_ctx())
+
+    def test_real_console_statistics_and_run_reset(self, capsys) -> None:
+        exporter = ConsoleExporter()
+        exporter.configure({"format": "json"})
+        manager = TelemetryManager(MockTelemetryConfig(), [exporter])
+        client = _make_chroma_client_double()
+        collection = _RecoverableChromaCollection()
+        client.get_or_create_collection.return_value = collection
+        sink = ChromaSink(_make_config())
+        capsys.readouterr()
+        row = {"doc_id": "private-id", "text": "private-document", "topic": "private-topic"}
+        try:
+            with patch("elspeth.plugins.sinks.chroma_sink.chromadb.PersistentClient", return_value=client):
+                for run_id in ("first-run", "second-run"):
+                    lifecycle = make_context(run_id=run_id, node_id="chroma")
+                    lifecycle.telemetry_emit = manager.handle_event
+                    sink.on_start(lifecycle)
+                    if run_id == "first-run":
+                        member = _chroma_effect_member(0, row)
+                        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
+                        ctx = _chroma_effect_context()
+                        inspection = sink.inspect_effect(
+                            SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx
+                        )
+                        plan = sink.prepare_effect(
+                            SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx
+                        )
+                        sink.commit_member_effect(plan, member, effect_input, ctx)
+                    sink.on_complete(lifecycle)
+                    manager.flush()
+                    output = capsys.readouterr().out
+                    payload = json.loads(output)
+                    assert payload["event_type"] == "ChromaWriteStatistics"
+                    assert payload["run_id"] == run_id
+                    assert payload["node_id"] == "chroma"
+                    assert payload["plugin_name"] == sink.name
+                    assert payload["total_written"] == (1 if run_id == "first-run" else 0)
+                    expected_bytes = len(
+                        canonical_json({"ids": [row["doc_id"]], "documents": [row["text"]], "metadatas": [{"topic": row["topic"]}]}).encode(
+                            "utf-8"
+                        )
+                    )
+                    assert payload["total_bytes"] == (expected_bytes if run_id == "first-run" else 0)
+                    assert "test-collection" not in output
+                    assert "private-" not in output
+        finally:
+            manager.close()
 
 
 class TestChromaSinkOnStart:
@@ -460,14 +534,11 @@ class TestChromaMemberEffects:
             )
             for row in rows
         )
-        assert events == [
-            {
-                "event": "chroma_sink_complete",
-                "collection": "test-collection",
-                "total_written": 2,
-                "total_bytes": expected_bytes,
-            }
-        ]
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, ChromaWriteStatistics)
+        assert event.total_written == 2
+        assert event.total_bytes == expected_bytes
 
     @pytest.mark.parametrize(
         ("row", "stored_metadata", "metadata_fields"),

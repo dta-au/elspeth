@@ -556,6 +556,11 @@ class Call:
     # ``interpretation_events.resolved_prompt_template_hash`` in the session
     # audit DB when non-None; inequality = Tier-1 audit anomaly.
     resolved_prompt_template_hash: str | None = None
+    # None means unreported, including failed calls. It is not zero usage.
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cached_prompt_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
     def __post_init__(self) -> None:
         """Validate enum fields and structural invariants — Tier 1 crash on invalid types."""
@@ -563,6 +568,10 @@ class Call:
         _validate_enum(self.call_type, CallType, "call_type")
         _validate_enum(self.status, CallStatus, "status")
         validate_resolved_prompt_template_hash(self.call_type, self.resolved_prompt_template_hash)
+        require_int(self.prompt_tokens, "prompt_tokens", optional=True, min_value=0)
+        require_int(self.completion_tokens, "completion_tokens", optional=True, min_value=0)
+        require_int(self.cached_prompt_tokens, "cached_prompt_tokens", optional=True, min_value=0)
+        require_int(self.reasoning_tokens, "reasoning_tokens", optional=True, min_value=0)
         # XOR: exactly one of state_id or operation_id must be set
         has_state = self.state_id is not None
         has_operation = self.operation_id is not None

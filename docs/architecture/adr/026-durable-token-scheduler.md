@@ -1,10 +1,11 @@
 # ADR-026: Durable Token Scheduler
 
 **Date:** 2026-05-23
-**Status:** Accepted with stated preconditions (see *RC6
-Preconditions*; the separate deployment-shape ADR required by
-Precondition #9 is now authored as ADR-030 — proposed at slice
-0 of its landing plan, → Accepted at slice 5)
+**Status:** Accepted. All RC6 preconditions are discharged
+(closed out 2026-09-13; see *RC6 Preconditions* for the
+per-item record). RC6 shipped as 0.6.0 on 2026-06-20 with
+N>1 workers via `elspeth join`, and the deployment-shape ADR
+required by Precondition #9 — ADR-030 — is Accepted.
 **Deciders:** ELSPETH maintainer
 **Tags:** scheduler, checkpoint, resume, leases, cas, audit-integrity,
           embedded-database, rc6, multi-source-token-scheduler
@@ -293,10 +294,11 @@ it.
 ### What this is NOT
 
 - **Not a message broker.** The scheduler is an embedded SQLite
-  table; ADR-024's single-maintainer governance and the embedded-
-  database discipline (uv-installable, no Redis/RabbitMQ/Kafka
-  runtime) are preserved. No external service is required to run
-  ELSPETH.
+  table. The **embedded-database discipline** — ELSPETH is
+  uv-installable and requires no Redis/RabbitMQ/Kafka runtime; one
+  SQLite file is the system — is preserved. No external service is
+  required to run ELSPETH. This ADR is the home of that discipline;
+  earlier revisions attributed it to ADR-024, which never stated it.
 - **Not a message broker for arbitrary cross-process queues.**
   The scheduler is the in-tree token-work queue for ELSPETH
   workers cooperating on the same run; it is not a general-purpose
@@ -422,12 +424,20 @@ it.
 
 ### RC6 Preconditions
 
+**All discharged (verified 2026-09-13).** RC6 shipped as
+0.6.0 on 2026-06-20 — `CHANGELOG.md` titles that release
+"cross-process multi-worker run coordination" — so list B
+below applied and was met rather than deferring to
+post-RC6 follow-ups. Every gate is annotated with the
+evidence that closed it; the per-item wording is preserved
+so the original reasoning stays readable.
+
 The scheduler primitive's design is final. The items below
-are the gates between the present `feat/multi-source-token-
-scheduler` branch and RC6 publish-readiness. They are split
-into two lists because conflating them inflates the apparent
-cost of multi-worker and hides that several gates are
-correctness requirements at *any* worker count.
+were the gates between the then-current `feat/multi-source-
+token-scheduler` branch and RC6 publish-readiness. They are
+split into two lists because conflating them inflates the
+apparent cost of multi-worker and hides that several gates
+are correctness requirements at *any* worker count.
 
 #### A. Scheduler-correctness preconditions (required at any N≥1)
 
@@ -454,11 +464,16 @@ this list.
    recovery at any N.
 
 3. **Per-source schema-contract resume (G2 /
-   elspeth-01942858c3). Pending.** Lands with the ADR-025
+   elspeth-01942858c3). Done.** Landed with the ADR-025
    structural fix; required so resume reconstructs the
    same `schema_contract` regardless of which source's
    row is consulted first. Multi-source correctness at any
-   worker count.
+   worker count. Resume now carries
+   `schema_contracts_by_source` — the plural-by-source
+   mapping of ADR-025 §3 — and raises when a token's
+   `source_node_id` is absent from it rather than falling
+   back to an arbitrary source
+   (`engine/orchestrator/resume.py`).
 
 4. **CAS race fix on `claim_ready` and `claim_pending_sink`
    (G27 / elspeth-4678a5aa73). Done.** The
@@ -476,12 +491,18 @@ this list.
    discipline on every scheduler/coordination write path.
 
 5. **PRAGMA discipline on scheduler-bearing connections
-   (G28 / elspeth-8536552dcb). Required.** Probe-and-
-   assert that every connection has `journal_mode=WAL`,
-   the agreed `busy_timeout`, and `foreign_keys=ON` —
-   crash if not (probe path elspeth-97f8509b35). At N=1
-   uniformity is needed across connections within the
-   process; at N>1 across processes too.
+   (G28 / elspeth-8536552dcb). Done.** Probe-and-assert
+   that every connection has `journal_mode=WAL`, the
+   agreed `busy_timeout`, and `foreign_keys=ON` — crash if
+   not (probe path elspeth-97f8509b35). At N=1 uniformity
+   is needed across connections within the process; at N>1
+   across processes too. `verify_sqlite_tier1_pragmas` in
+   `core/landscape/database.py` probes the live connection
+   and raises `AuditIntegrityError` on any violation; the
+   invariant tuple pins `journal_mode`, `synchronous`,
+   `foreign_keys` and `busy_timeout`, with
+   `journal_mode=memory` the one sanctioned deviation for
+   `:memory:` databases.
 
 6. **Scheduler state transitions in Landscape audit (G29 /
    elspeth-2b608abbd3). Implemented (2026-06).** Audit-primacy
@@ -497,34 +518,42 @@ this list.
    separately named legacy adapter.
 
 7. **Runbook for lease recovery (G19 /
-   elspeth-559bce3459). Authored for N=1; N>1 rewrite
-   pending.** First-operator-incident artifact: stuck
-   lease, over-aggressive expiry, crashed worker. Required
-   at N=1 (every "did the worker crash or is the LLM slow?"
-   question lands here). The runbook exists at
+   elspeth-559bce3459). Done.**
+   First-operator-incident artifact: stuck lease,
+   over-aggressive expiry, crashed worker. Required at N=1
+   (every "did the worker crash or is the LLM slow?"
+   question lands here). The runbook is at
    `docs/runbooks/scheduler-lease-recovery.md`. The N>1
-   incident surface is now fixed by ADR-030 (Precondition
-   #9); the runbook's N>1 rewrite (including the
-   kill-the-wedged-incumbent step) rides slice 6 of
-   ADR-030's landing plan and remains the RC6 publish gate.
+   incident surface was fixed by ADR-030 (Precondition
+   #9), and the runbook's N>1 rewrite landed with slice 6
+   of ADR-030's landing plan: it now covers the
+   multi-worker topology, two-level liveness, dead-leader
+   takeover, the wedged-incumbent SIGKILL step, and
+   follower lifecycle (`RunWorkerEvictedError` /
+   `FollowerSeatDeadError`).
 
 #### B. Multi-worker-specific preconditions (required only if N>1 ships)
 
-These gates exist only because RC6 might ship N>1
-workers. If a future session decides RC6 ships at N=1, the
-items here become post-RC6 follow-ups rather than RC6
-gates. Listing them honestly distinguishes scheduler
-correctness from multi-worker capability.
+These gates existed only because RC6 might ship N>1
+workers. RC6 did ship N>1, so they applied as RC6 gates
+rather than becoming post-RC6 follow-ups. Listing them
+separately still distinguishes scheduler correctness from
+multi-worker capability.
 
 8. **Multi-worker isolation tests (G25b /
    elspeth-6116873e3b) and chaos coverage (G25h /
-   elspeth-7bb7124e8f). Required if N>1.** CAS-loser,
-   lease-expiry, claim-ordering, and barrier-
-   terminalization paths exercised under N>1 with
-   ChaosLLM / ChaosWeb / ChaosEngine wired against the
-   scheduler. Without these the multi-worker claim is
-   unproved. At N=1 the same surfaces are covered by the
-   existing single-worker suite.
+   elspeth-7bb7124e8f). Done.** CAS-loser, lease-expiry,
+   claim-ordering, and barrier-terminalization paths
+   exercised under N>1 with ChaosLLM / ChaosWeb /
+   ChaosEngine wired against the scheduler. Without these
+   the multi-worker claim is unproved. At N=1 the same
+   surfaces are covered by the existing single-worker
+   suite. Coverage lives in
+   `tests/e2e/recovery/test_follower_coordination_chaos.py`,
+   `tests/e2e/recovery/test_multi_worker_leader_finalize.py`
+   and `tests/integration/engine/test_multi_source_chaos.py`,
+   against the `tests/fixtures/chaosllm.py` and
+   `tests/fixtures/chaosweb.py` harnesses.
 
 9. **Deployment-shape decision (worker process
    lifecycle). Required if N>1; satisfied by ADR-030
@@ -586,10 +615,10 @@ correctness from multi-worker capability.
     `lease_owner`), shutdown semantics, and the
     `pending_items` cross-worker question (per-process
     caches always backed by durable rows — unchanged
-    invariant). This precondition is discharged when
-    ADR-030 is accepted (slice 5 of its landing plan); no
-    invariant in this ADR changes as a result. RC6 still
-    cannot ship N>1 before that acceptance.
+    invariant). This precondition was to be discharged when
+    ADR-030 was accepted (slice 5 of its landing plan); no
+    invariant in this ADR changed as a result. **Done** —
+    ADR-030 is Accepted, and RC6 then shipped N>1 as 0.6.0.
 
 ## Alternatives Considered
 
@@ -622,9 +651,9 @@ message broker. The broker provides queue semantics, lease
 equivalents (visibility timeout), and multi-worker out of the
 box. ELSPETH gains free horizontal scaling.
 
-**Rejected because:** ADR-024 (delivery governance for single-
-maintainer mode) constrains the operational surface to
-mechanical, in-tree gates with uv-installable dependencies. A
+**Rejected because:** ELSPETH's operational surface is
+deliberately constrained to mechanical, in-tree gates with
+uv-installable dependencies (§*What this is NOT*). A
 broker is a separate runtime — operator must install, configure,
 secure, back up, and monitor it; the embedded-database
 discipline (one SQLite file is the system) is the present
@@ -965,6 +994,42 @@ for the move.
       yet filed" was stale), and the *Open questions* residue
       updated; *Related Decisions* gained the ADR-030 entry.
 
+- **2026-09-13** — RC6 precondition close-out. RC6 shipped as
+  0.6.0 on 2026-06-20 ("cross-process multi-worker run
+  coordination", `elspeth join`), three releases before the
+  current 0.8.1 line, but the Status field and four
+  precondition items still read as open gates. All six
+  tracker items are closed (`elspeth-01942858c3`,
+  `elspeth-8536552dcb`, `elspeth-97f8509b35`,
+  `elspeth-559bce3459`, `elspeth-6116873e3b`,
+  `elspeth-7bb7124e8f`), and each was re-verified against the
+  tree rather than taken from tracker status:
+    - *#3 (G2) Pending → Done.* `resume.py` carries
+      `schema_contracts_by_source` and raises on an unknown
+      `source_node_id` instead of falling back to an
+      arbitrary source.
+    - *#5 (G28) Required → Done.*
+      `verify_sqlite_tier1_pragmas` in
+      `core/landscape/database.py` probes the live connection
+      and raises `AuditIntegrityError`; the invariant tuple
+      pins `journal_mode`, `synchronous`, `foreign_keys` and
+      `busy_timeout`.
+    - *#7 (G19) N>1 rewrite pending → Done.* The runbook now
+      covers multi-worker topology, two-level liveness,
+      dead-leader takeover, the wedged-incumbent SIGKILL step
+      and follower lifecycle. The 2026-06-12 entry above
+      records the state at that time and is left as written.
+    - *#8 (G25b/G25h) Required if N>1 → Done.* Chaos and
+      multi-worker coverage exist under `tests/e2e/recovery/`
+      and `tests/integration/engine/`.
+    - *#9* already satisfied by ADR-030, now Accepted; the
+      conditional "RC6 still cannot ship N>1" tail is
+      resolved.
+  Status line changed from "Accepted with stated
+  preconditions" to "Accepted"; §B's framing changed from
+  conditional to historical. No invariant in this ADR
+  changes.
+
 ## Related Decisions
 
 - **ADR-001** (plugin-level concurrency) — **amended by
@@ -1002,10 +1067,14 @@ for the move.
   fingerprint rotation as scheduler-related code lands; the
   enforcement contract and `docs/judge-signature-handoff.md` workflow apply.
 - **ADR-024** (delivery governance for single-maintainer
-  mode) — preserved and load-bearing. The embedded-database
-  discipline, the no-external-broker discipline, and the
-  mechanical-gate discipline are the rationale for
-  Alternative 2 being rejected.
+  mode) — **Retired 2026-09-13**; governance is set by the
+  maintainer's organisation and the assurance posture now
+  lives in `GOVERNANCE.md` § Maintainer Continuity. The
+  embedded-database, no-external-broker and mechanical-gate
+  disciplines that reject Alternative 2 are **this ADR's own**
+  (§*What this is NOT*); earlier revisions mis-attributed them
+  to ADR-024, which never stated them. Retiring ADR-024
+  therefore changes nothing in this decision.
 - **ADR-025** (multi-source ingestion) — companion. ADR-025
   records *what* the source surface looks like and *why*
   it's plural; ADR-026 records *how* tokens produced by

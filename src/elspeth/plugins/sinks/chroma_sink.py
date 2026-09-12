@@ -10,6 +10,7 @@ import hashlib
 import math
 import urllib.parse
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import chromadb
@@ -24,7 +25,9 @@ from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.enums import CallType
 from elspeth.contracts.errors import (
     FrameworkBugError,
+    TelemetryExporterError,
 )
+from elspeth.contracts.events import ChromaWriteStatistics, TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -213,7 +216,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0a6b845505e56554"
+    source_file_hash: str | None = "sha256:53866f704b91068f"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -313,13 +316,15 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
 
         self._client: chromadb.api.ClientAPI | None = None
         self._collection: chromadb.Collection | None = None
-        self._telemetry_emit: Callable[[Any], None] | None = None
+        self._telemetry_emit: Callable[[TelemetryEvent], None] | None = None
         self._total_written = 0
         self._total_bytes = 0
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)
         self._telemetry_emit = ctx.telemetry_emit
+        self._total_written = 0
+        self._total_bytes = 0
 
         if self._config.mode == "persistent":
             # Validated by ChromaConnectionConfig: persist_directory is not None
@@ -689,30 +694,27 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         super().on_complete(ctx)
         if self._telemetry_emit is None:
             return
-        # Telemetry is best-effort operational visibility emitted AFTER the writes
-        # and their audit record have completed; an emit failure must not fail
-        # completion (elspeth-ee69831e4c). Tier-1/audit-integrity errors still
-        # propagate (audit corruption outranks) — same guard shape as
-        # plugins/sinks/dataverse.py's post-audit telemetry emission.
+        if ctx.node_id is None:
+            raise FrameworkBugError("Chroma completion requires a node_id")
+        event = ChromaWriteStatistics(
+            timestamp=datetime.now(UTC),
+            run_id=ctx.run_id,
+            node_id=ctx.node_id,
+            plugin_name=self.name,
+            total_written=self._total_written,
+            total_bytes=self._total_bytes,
+        )
+        # Expected exporter failure is best-effort after publication and audit. Event
+        # construction and programming errors must still fail completion.
         try:
-            self._telemetry_emit(
-                {
-                    "event": "chroma_sink_complete",
-                    "collection": self._config.collection,
-                    "total_written": self._total_written,
-                    "total_bytes": self._total_bytes,
-                }
-            )
+            self._telemetry_emit(event)
         except contract_errors.TIER_1_ERRORS:
             raise
-        except Exception as tel_err:
+        except TelemetryExporterError as tel_err:
             slog.warning(
                 "telemetry_emit_failed",
                 sink="chroma",
-                collection=self._config.collection,
-                error=str(tel_err),
                 error_type=type(tel_err).__name__,
-                exc_info=True,
             )
 
     def close(self) -> None:

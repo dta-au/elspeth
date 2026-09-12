@@ -22,6 +22,7 @@ from elspeth.contracts.audit_export import (
     IterableBoundAuditExportContentReader,
     RegisteredAuditExportContent,
 )
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
@@ -43,6 +44,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectState,
 )
 from elspeth.core.audit_export_content_store import FilesystemAuditExportContentStore
+from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.config import AuditExportContentStoreSettings, LandscapeExportSettings
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -215,7 +217,7 @@ def _config(**overrides: object) -> LandscapeExportSettings:
         format="json",
         signing_mode="unsigned",
         signer_key_id="UNSIGNED",
-        exporter_version="landscape-exporter-v1",
+        exporter_version="landscape-exporter-auth-v1",
         serialization_version="audit-export-v2",
         chunking_algorithm_version="record-framing-v1",
         total_record_limit=10_000,
@@ -604,9 +606,10 @@ def test_hmac_snapshot_streaming_derivation_and_production_verification(
             content_store=store,
         )
 
-        record = json.loads(next(snapshot.reader.iter_verified_chunks()))
+        records = [json.loads(line) for chunk in snapshot.reader.iter_verified_chunks() for line in chunk.splitlines()]
         manifest = json.loads(snapshot.reader.read_verified_signed_manifest())
-        assert isinstance(record["signature"], str) and len(record["signature"]) == 64
+        assert [record["record_type"] for record in records] == ["run", "audit_export_config", "auth_event_coverage"]
+        assert all(isinstance(record["signature"], str) and len(record["signature"]) == 64 for record in records)
         assert isinstance(manifest["signature"], str) and len(manifest["signature"]) == 64
     finally:
         db.close()
@@ -1395,8 +1398,9 @@ def test_resume_audit_export_refuses_ineligible_runs(
         )
 
     try:
-        with pytest.raises(ValueError, match="not found"):
+        with pytest.raises(NonResumableRunError, match="not found") as exc_info:
             attempt("run-missing")
+        assert exc_info.value.cause is ResumeRefusalCause.RUN_NOT_FOUND
 
         with db.engine.begin() as connection:
             connection.execute(
@@ -1412,13 +1416,15 @@ def test_resume_audit_export_refuses_ineligible_runs(
                     openrouter_catalog_source="bundled",
                 )
             )
-        with pytest.raises(ValueError, match="export-terminal"):
+        with pytest.raises(NonResumableRunError, match="export-terminal") as exc_info:
             attempt("run-running")
+        assert exc_info.value.cause is ResumeRefusalCause.RUN_NOT_FINALIZED
 
         _insert_terminal_run(db, "run-export-done")
         _set_export_status_row(db, "run-export-done", "completed")
-        with pytest.raises(ValueError, match="already completed"):
+        with pytest.raises(NonResumableRunError, match="already completed") as exc_info:
             attempt("run-export-done")
+        assert exc_info.value.cause is ResumeRefusalCause.EXPORT_ALREADY_COMPLETED
 
         assert store.put_count == 0, "refusals must precede any content-store write"
     finally:

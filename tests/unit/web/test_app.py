@@ -70,7 +70,6 @@ from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
 from elspeth.web.operator_telemetry import OperatorTelemetryFactories, OperatorTelemetryRuntime
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
 from elspeth.web.sessions.protocol import (
-    LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX,
     LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     CompositionStateData,
@@ -80,6 +79,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from elspeth.web.sso_wiring import SsoWiring
+from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import expire_leader_seat
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -421,6 +421,8 @@ class TestCreateApp:
         from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         async def _mock_user() -> UserIdentity:
             return UserIdentity(user_id="test-user", username="test-user")
@@ -1571,7 +1573,7 @@ class TestLifespanShutdown:
         async def _fail_sweep(**_kwargs: object) -> list[RunRecord]:
             raise OperationalError("UPDATE runs", {}, Exception("db unavailable"))
 
-        monkeypatch.setattr(app.state.session_service, "cancel_all_orphaned_run_records", _fail_sweep)
+        monkeypatch.setattr(app.state.session_service, "list_recoverable_run_records", _fail_sweep)
         with (
             patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
             pytest.raises(OperationalError),
@@ -1631,7 +1633,8 @@ class TestLifespanShutdown:
         assert called is False
 
     @pytest.mark.asyncio
-    async def test_lifespan_startup_orphan_cleanup_terminalizes_landscape_run(self, tmp_path) -> None:
+    @pytest.mark.parametrize("terminal", [False, True])
+    async def test_lifespan_recovers_terminal_truth_and_defers_live_landscape_leader(self, tmp_path, terminal) -> None:
         app = create_app(
             _settings(
                 tmp_path,
@@ -1640,9 +1643,10 @@ class TestLifespanShutdown:
             )
         )
         session_service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await session_service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(session_service, session.id)
-        landscape_run_id = "lscp-startup-orphan"
         authority = session_service.session_operation_authority
         execute_context = authority.acquire(
             session_id=session.id,
@@ -1656,6 +1660,7 @@ class TestLifespanShutdown:
                 state.id,
                 session_operation_context=execute_context,
             )
+            landscape_run_id = str(web_run.id)
             await session_service.update_run_status(
                 web_run.id,
                 "running",
@@ -1666,36 +1671,39 @@ class TestLifespanShutdown:
             authority.release(execute_context)
 
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
-            RecorderFactory(db).run_lifecycle.begin_run(
+            repositories = RecorderFactory(db)
+            repositories.run_lifecycle.begin_run(
                 config={},
                 canonical_version="v1",
                 run_id=landscape_run_id,
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
             )
-            # The dead leader's seat has lapsed: the orphan finaliser takes it
-            # through the takeover CAS before stamping INTERRUPTED (ADR-048 §4).
-            expire_leader_seat(db, landscape_run_id)
+            if terminal:
+                from tests.fixtures.landscape import leader_coordination_token
+
+                repositories.run_lifecycle.complete_run(
+                    RunStatus.EMPTY, coordination_token=leader_coordination_token(repositories, landscape_run_id)
+                )
 
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
                 pass
 
         updated_web_run = await session_service.get_run(web_run.id)
-        assert updated_web_run.status == "cancelled"
-        assert updated_web_run.finished_at is not None
-        assert updated_web_run.error is not None
-        assert updated_web_run.error.endswith(LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX)
+        assert updated_web_run.status == ("empty" if terminal else "running")
+        assert (updated_web_run.finished_at is not None) == terminal
+        assert updated_web_run.error is None
 
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
             landscape_run = RecorderFactory(db).run_lifecycle.get_run(landscape_run_id)
 
         assert landscape_run is not None
-        assert landscape_run.status == RunStatus.INTERRUPTED
-        assert landscape_run.completed_at is not None
+        assert landscape_run.status == (RunStatus.EMPTY if terminal else RunStatus.RUNNING)
+        assert (landscape_run.completed_at is not None) == terminal
 
     @pytest.mark.asyncio
-    async def test_lifespan_marks_missing_landscape_anchor_absent_and_emits_static_event(self, tmp_path) -> None:
+    async def test_lifespan_marks_legacy_missing_baseline_recovery_required(self, tmp_path) -> None:
         app = create_app(
             _settings(
                 tmp_path,
@@ -1704,6 +1712,8 @@ class TestLifespanShutdown:
             )
         )
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         authority = service.session_operation_authority
@@ -1733,22 +1743,15 @@ class TestLifespanShutdown:
                 pass
 
         updated = await service.get_run(web_run.id)
-        assert updated.error is not None
-        assert updated.error.endswith(LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX)
+        assert updated.status == "running"
+        assert updated.saga_state.value == "recovery_required"
+        assert updated.recovery_required_reason.value == "missing_baseline"
         events = [entry for entry in logs if entry.get("event") == "orphan_landscape_run_absent"]
-        assert events == [
-            {
-                "event": "orphan_landscape_run_absent",
-                "log_level": "error",
-                "outcome": "absent",
-                "count": 1,
-                "operator_action": "investigate audit-row absence",
-            }
-        ]
+        assert events == []
         assert "RAW_ABSENT_ANCHOR_SENTINEL" not in repr(events)
 
     @pytest.mark.asyncio
-    async def test_lifespan_null_anchor_receives_complete_marker_without_landscape_access(self, tmp_path, monkeypatch) -> None:
+    async def test_lifespan_legacy_pending_admission_requires_recovery_without_cancellation(self, tmp_path) -> None:
         app = create_app(
             _settings(
                 tmp_path,
@@ -1757,6 +1760,8 @@ class TestLifespanShutdown:
             )
         )
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         authority = service.session_operation_authority
@@ -1775,24 +1780,20 @@ class TestLifespanShutdown:
         finally:
             authority.release(execute_context)
 
-        real_finalize = app_module._finalize_orphaned_landscape_runs
-
-        def finalize(url: str, runs: list[RunRecord], *, create_tables: bool = True):
-            assert all(run.landscape_run_id is None for run in runs)
-            return real_finalize("sqlite:////definitely/not/accessed.db", runs, create_tables=create_tables)
-
-        monkeypatch.setattr(app_module, "_finalize_orphaned_landscape_runs", finalize)
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
                 pass
         updated = await service.get_run(web_run.id)
-        assert updated.error is not None
-        assert updated.error.endswith(LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX)
+        assert updated.status == "pending"
+        assert updated.saga_state.value == "recovery_required"
+        assert updated.recovery_required_reason.value == "missing_baseline"
 
     @pytest.mark.asyncio
     async def test_marker_failure_after_landscape_completion_retries_idempotently(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         landscape_run_id = "landscape-marker-retry"
@@ -2158,21 +2159,18 @@ class TestLifespanShutdown:
         periodic_calls: list[bool] = []
         periodic_started = asyncio.Event()
 
-        def finalize(
-            _url: str,
-            _runs: list[RunRecord],
-            *,
-            create_tables: bool,
-        ) -> tuple[frozenset[object], frozenset[object]]:
+        coordinator_type = app_module.RunRecoveryCoordinator
+
+        def coordinator(*args, create_tables: bool, **kwargs):
             one_shot_calls.append(create_tables)
-            return frozenset(), frozenset()
+            return coordinator_type(*args, create_tables=create_tables, **kwargs)
 
         async def periodic(*_args: object, create_tables: bool, **_kwargs: object) -> None:
             periodic_calls.append(create_tables)
             periodic_started.set()
             await asyncio.Event().wait()
 
-        monkeypatch.setattr(app_module, "_finalize_orphaned_landscape_runs", finalize)
+        monkeypatch.setattr(app_module, "RunRecoveryCoordinator", coordinator)
         monkeypatch.setattr(app_module, "_periodic_orphan_cleanup", periodic)
 
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
@@ -3014,6 +3012,8 @@ class TestValidationErrorRedaction:
         from elspeth.web.auth.models import UserIdentity
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
 
         identity = UserIdentity(user_id="test-user", username="test-user")
 
@@ -3142,9 +3142,12 @@ class TestValidationErrorRedaction:
     def test_sessions_message_route_redacts_input(self, tmp_path) -> None:
         """POST to a session message route with invalid body must not echo content."""
         client = self._authed_client(tmp_path)
+        created = client.post("/api/sessions", json={"title": "Validation redaction"})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
         # Send a message with state_id as a non-UUID string — triggers 422
         resp = client.post(
-            "/api/sessions/00000000-0000-0000-0000-000000000000/messages",
+            f"/api/sessions/{session_id}/messages",
             json={"content": "leaked-password-value", "state_id": "not-a-uuid"},
         )
         assert resp.status_code == 422
@@ -3176,6 +3179,8 @@ class TestSecretsExceptionHandlers:
         from elspeth.web.auth.models import UserIdentity
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
         identity = UserIdentity(user_id="test-user", username="test-user")
 
         async def _mock_user() -> UserIdentity:
@@ -3730,6 +3735,14 @@ class TestDeploymentStateModeStartup:
         monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         app = create_app(settings)
 
+        # The audit engine now starts before services. Model the externally
+        # provisioned Landscape alongside the provisioned Sessions stand-in;
+        # the recorder still validates it with create_tables=False.
+        audit_url = f"sqlite:///{tmp_path / 'external-audit.db'}"
+        with LandscapeDB.from_url(audit_url):
+            pass
+        monkeypatch.setattr(app.state.auth_audit_recorder, "landscape_url", audit_url)
+
         with (
             patch("elspeth.web.app.ExecutionServiceImpl", return_value=_RecordingExecutionService()),
             patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
@@ -4019,13 +4032,16 @@ class TestAwsEcsValidateOnlyStartup:
             )
         ]
         assert app.state.session_engine is engine
-        assert len(finalizers) == 2
+        assert len(finalizers) == 3
         assert finalizers[0][0] is app
         assert finalizers[0][1] is app_module._dispose_session_engine
         assert finalizers[0][2] == (engine,)
         assert finalizers[1][0] is app
-        assert finalizers[1][1] is app_module._close_readiness_runner
-        assert finalizers[1][2] == (app.state.readiness_probe_runner,)
+        assert finalizers[1][1] == app.state.auth_audit_recorder.close
+        assert finalizers[1][2] == ()
+        assert finalizers[2][0] is app
+        assert finalizers[2][1] is app_module._close_readiness_runner
+        assert finalizers[2][2] == (app.state.readiness_probe_runner,)
         assert settings.data_dir not in mkdir_calls
         assert settings.data_dir / "runs" not in mkdir_calls
         engine.dispose()

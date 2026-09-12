@@ -30,6 +30,7 @@ from uuid import uuid4
 import pytest
 import structlog
 from sqlalchemy import Engine, insert
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -98,7 +99,10 @@ async def test_postgres_lease_renew_is_not_blocked_by_an_in_flight_blob_persist(
     session_engine, blob_engine, sessions, shared = deployment
     _register_instance(session_engine, sessions.session_operation_owner_instance_id)
     blobs = BlobServiceImpl(blob_engine, shared)
-    session = await sessions.create_session(f"pg-custody-{uuid4()}", "Custody", "local")
+    owner_id = f"pg-custody-{uuid4()}"
+    with session_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = await sessions.create_session(owner_id, "Custody", "local")
     lease = await SessionOperationLease.acquire(
         sessions.session_operation_authority,
         session_id=session.id,

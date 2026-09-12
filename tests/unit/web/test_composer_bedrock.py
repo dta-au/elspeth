@@ -10,7 +10,9 @@ import pytest
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
-from tests.unit.web.composer._helpers import _empty_state, _make_llm_response, _make_settings, _mock_catalog
+from elspeth.web.config import WebSettings
+from tests.helpers.session_fences import fenced_operation_context
+from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_llm_response, _make_settings, _mock_catalog
 
 _BEDROCK_PRIMARY = "bedrock/global.anthropic.claude-sonnet-4-6"
 _BEDROCK_ADVISOR = "bedrock/global.anthropic.claude-opus-4-6-v1"
@@ -40,14 +42,17 @@ def _clear_static_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
-def _bedrock_service() -> ComposerServiceImpl:
-    settings = _make_settings(
+def _bedrock_settings() -> WebSettings:
+    return _make_settings(
         composer_model=_BEDROCK_PRIMARY,
         composer_advisor_model=_BEDROCK_ADVISOR,
         composer_temperature=None,
         composer_seed=None,
     )
-    return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
+
+
+def _bedrock_service() -> ComposerServiceImpl:
+    return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_bedrock_settings())
 
 
 @pytest.mark.asyncio
@@ -65,7 +70,7 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
         return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
     monkeypatch.setattr(service_module, "_litellm_acompletion", fake_acompletion)
-    service = _bedrock_service()
+    service, session_id = _composer_service_with_session(_mock_catalog(), _bedrock_settings())
     monkeypatch.setattr(service, "_run_advisor_checkpoint", clean_checkpoint)
 
     availability = service.get_availability()
@@ -73,7 +78,14 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     assert availability.provider == "bedrock"
     expected_tool_names = {tool["function"]["name"] for tool in service._get_litellm_tools()}
 
-    await service.compose("No pipeline changes are needed.", [], _empty_state())
+    engine = service._require_sessions_service()._engine
+    try:
+        with fenced_operation_context(engine, session_id) as context:
+            await service.compose(
+                "No pipeline changes are needed.", [], _empty_state(), session_id=session_id, session_operation_context=context
+            )
+    finally:
+        engine.dispose()
 
     assert len(captured) == 1
     request = captured[0]

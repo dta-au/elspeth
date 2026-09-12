@@ -121,6 +121,10 @@ def _pt_node() -> NodeSpec:
 
 
 async def _persist(sessions_service: SessionServiceImpl, state: CompositionState) -> tuple[UUID, UUID]:
+    from tests.fixtures.identities import ensure_test_identity
+
+    with sessions_service._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="u")
     session = await sessions_service.create_session("u", "surfacer test", "local")
     session_id = session.id
     record = await _save_state_for_session(sessions_service, session_id, state)

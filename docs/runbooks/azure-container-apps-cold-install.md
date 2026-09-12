@@ -10,10 +10,30 @@ PostgreSQL Flexible Server, an NFS 4.1 Azure Files share, Key Vault, Log
 Analytics, separate runtime and schema-owner managed identities and vaults,
 the web app and its Jobs.
 
-> **Status.** Skeleton prepared by Phase 6b before the first live run; steps
-> marked **LIVE** are completed from the 6b-7 acceptance. Until the sanitized
-> receipt at `docs/operator/evidence/azure-container-apps/0.8.0.json` exists,
-> this is not a support claim.
+> **Status.** The implemented ACA slice received desktop acceptance:
+> `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
+> acceptance is claimed. This is an executable operator procedure; steps marked
+> **LIVE** require measurements during execution. A future acceptance receipt at
+> `docs/operator/evidence/azure-container-apps/0.8.1.json` is no longer a tracker
+> closure or documentation-promotion condition.
+
+The supported configuration retains `Single` revision mode, `sticky` session
+affinity and 2–4 replicas with one web process per replica. External PostgreSQL
+provides single-use tickets and durable run-event replay on authorized peer
+reconnect, renewable Composer request leases with saved progress and current
+inflight accounting, and shared budgets for auth, writes and Composer/execution
+work. An interrupted provider request is not automatically resumed. Automatic
+run handoff covers durable admission, permit-bound PREPARED initialization and
+eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
+effects, incomplete sources and identity/compatibility failures remain
+`recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
+Integrated verification is recorded in the
+[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+Evidence remains limited to
+local PostgreSQL mechanism and integration evidence, with no cloud receipt or
+no-affinity deployment qualification. The legacy v2 P4b receipt remains
+conservative `cannot_pass`; it does not measure the new runtime capabilities.
+Receipt evolution is deferred.
 
 ## Choose the correct Azure procedure
 
@@ -55,7 +75,7 @@ A successful install has:
   `/api/health` and `/api/ready`;
 - both databases (`elspeth_sessions`, `elspeth_landscape`) on one Flexible
   Server behind a private endpoint, one schema-owner role and one runtime role,
-  session epoch 53 and Landscape epoch 38 initialized;
+  session epoch 55 and Landscape epoch 40 initialized;
 - one NFS 4.1 Azure Files share mounted at `/mnt/elspeth` on the app and every
   Job with `data`, `data/blobs` and `payloads` owned `1654:1654`. SMB Azure
   Files is not supported for this target; **Azure Files carries no database**

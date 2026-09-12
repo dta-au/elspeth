@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink_effects import AuditExportSignedManifestInput
 
 AUDIT_EXPORT_DERIVATION_VERSION: Final = "audit-export-derivation-v1"
+AUDIT_EXPORT_AUTH_EXPORTER_VERSION: Final = "landscape-exporter-auth-v1"
 AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v2"
 AUDIT_EXPORT_MANIFEST_SCHEMA: Final = "elspeth.audit-export-manifest.v2"
 AUDIT_EXPORT_MAX_CHUNKS: Final = 100_000
@@ -313,6 +314,11 @@ def _timestamp(value: object, path: str) -> str:
 
 
 def _validate_public_config(payload: object) -> None:
+    if type(payload) is not dict:
+        raise TypeError("public config must be an exact dict")
+    if "exporter_version" not in payload:
+        raise ValueError("public config is missing exporter_version")
+    is_auth_version = payload["exporter_version"] == AUDIT_EXPORT_AUTH_EXPORTER_VERSION
     fields = frozenset(
         {
             "chunking_algorithm_version",
@@ -326,7 +332,11 @@ def _validate_public_config(payload: object) -> None:
             "signing_mode",
         }
     )
+    if is_auth_version:
+        fields = fields | {"auth_events"}
     obj = _object(payload, fields=fields, path="public config")
+    if is_auth_version:
+        _string(obj["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
     _string(obj["chunking_algorithm_version"], "chunking_algorithm_version")
     _string(obj["export_format"], "export_format", allowed=frozenset({"json", "csv"}))
     _string(obj["exporter_version"], "exporter_version")
@@ -858,6 +868,7 @@ class AuditExportDerivationConfig:
     signing_mode: Literal["unsigned", "hmac_sha256"]
     signer_key_id: str
     signing_key: bytes | None
+    auth_events: Literal["omitted", "deployment_snapshot"] = "omitted"
 
     def __post_init__(self) -> None:
         _string(self.source_run_id, "source_run_id")
@@ -865,6 +876,9 @@ class AuditExportDerivationConfig:
         _timestamp(self.source_completed_at, "source_completed_at")
         _string(self.export_format, "export_format", allowed=frozenset({"json", "csv"}))
         _string(self.exporter_version, "exporter_version")
+        _string(self.auth_events, "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
+        if self.exporter_version != AUDIT_EXPORT_AUTH_EXPORTER_VERSION and self.auth_events != "omitted":
+            raise ValueError(f"auth_events deployment_snapshot requires {AUDIT_EXPORT_AUTH_EXPORTER_VERSION}")
         if self.serialization_version != AUDIT_EXPORT_SERIALIZATION_VERSION:
             raise ValueError(f"serialization_version must equal {AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
         _string(self.chunking_algorithm_version, "chunking_algorithm_version")
@@ -887,6 +901,23 @@ class AuditExportDerivationConfig:
     @property
     def exported_at(self) -> str:
         return self.source_completed_at
+
+    def public_snapshot_config(self) -> dict[str, ClosedAuditExportJSON]:
+        """Exact versioned config carried in the authenticated record stream."""
+        payload: dict[str, ClosedAuditExportJSON] = {
+            "chunking_algorithm_version": self.chunking_algorithm_version,
+            "export_format": self.export_format,
+            "exporter_version": self.exporter_version,
+            "include_raw_error_rows": self.include_raw_error_rows,
+            "per_chunk_byte_limit": self.per_chunk_byte_limit,
+            "per_chunk_record_limit": self.per_chunk_record_limit,
+            "serialization_version": self.serialization_version,
+            "signer_key_id": self.signer_key_id,
+            "signing_mode": self.signing_mode,
+        }
+        if self.exporter_version == AUDIT_EXPORT_AUTH_EXPORTER_VERSION:
+            payload["auth_events"] = self.auth_events
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -1022,6 +1053,102 @@ def _detached_record(record: Mapping[str, object]) -> dict[str, ClosedAuditExpor
     return value
 
 
+@dataclass(slots=True)
+class AuditExportAuthEventCoverageValidator:
+    """Bounded semantic validation shared by producer and registered-byte reader."""
+
+    source_completed_at: str
+    expected_policy: Literal["omitted", "deployment_snapshot"] | None = None
+    config_count: int = 0
+    public_config_hash: str | None = None
+    config_policy: str | None = None
+    coverage_count: int = 0
+    event_count: int = 0
+    selected_count: int | None = None
+    policy: str | None = None
+
+    def observe(self, record: Mapping[str, object]) -> None:
+        kind = record["record_type"]
+        if kind == "audit_export_config":
+            self.config_count += 1
+            config_record = _object(dict(record), fields=frozenset({"record_type", "public_config"}), path="audit export config")
+            public_config = config_record["public_config"]
+            _validate_public_config(public_config)
+            assert isinstance(public_config, dict)
+            if public_config["exporter_version"] != AUDIT_EXPORT_AUTH_EXPORTER_VERSION:
+                raise ValueError("auth event coverage requires current public config version")
+            self.config_policy = _string(public_config["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
+            self.public_config_hash = H(C("audit-export-public-config-v1", cast(ClosedAuditExportJSON, public_config)))
+        elif kind == "auth_event_coverage":
+            self.coverage_count += 1
+            coverage = _object(
+                dict(record),
+                fields=frozenset(
+                    {
+                        "record_type",
+                        "policy",
+                        "selection_cutoff",
+                        "selected_count",
+                        "reason",
+                        "selection_basis",
+                    }
+                ),
+                path="auth event coverage",
+            )
+            self.policy = _string(coverage["policy"], "coverage policy", allowed=frozenset({"omitted", "deployment_snapshot"}))
+            if self.expected_policy is not None and self.policy != self.expected_policy:
+                raise ValueError("auth event coverage policy differs from public config")
+            if self.policy == "omitted":
+                if (
+                    coverage["selection_cutoff"] is not None
+                    or coverage["selected_count"] is not None
+                    or coverage["selection_basis"] is not None
+                    or coverage["reason"] != "not_requested"
+                ):
+                    raise ValueError("omitted auth event coverage must disclose no selection")
+            else:
+                if (
+                    coverage["selection_cutoff"] != self.source_completed_at
+                    or coverage["selection_basis"] != "visible_rows_at_or_before_run_completion"
+                    or coverage["reason"] != "deployment_snapshot"
+                ):
+                    raise ValueError("auth event coverage selection scope is inconsistent")
+                self.selected_count = _integer(coverage["selected_count"], "coverage selected_count")
+        elif kind == "auth_event":
+            self.event_count += 1
+            if _timestamp(record["occurred_at"], "auth event occurred_at") > self.source_completed_at:
+                raise ValueError("auth event exceeds coverage selection cutoff")
+
+    def finish(self) -> None:
+        if self.config_count != 1:
+            raise ValueError("auth event coverage requires exactly one audit_export_config record")
+        if self.coverage_count != 1:
+            raise ValueError("auth event coverage must appear exactly once")
+        if self.policy != self.config_policy:
+            raise ValueError("auth event coverage policy differs from declared public config")
+        if self.policy == "omitted" and self.event_count:
+            raise ValueError("omitted auth event coverage forbids auth events")
+        if self.policy == "deployment_snapshot" and self.selected_count != self.event_count:
+            raise ValueError("auth event coverage selected_count differs from emitted auth events")
+
+
+def _coverage_checked_records(
+    records: Iterable[Mapping[str, object]],
+    config: AuditExportDerivationConfig,
+) -> Iterator[Mapping[str, object]]:
+    """Check signed coverage against the actual emitted stream in bounded memory."""
+    if config.exporter_version != AUDIT_EXPORT_AUTH_EXPORTER_VERSION:
+        yield from records
+        return
+    validator = AuditExportAuthEventCoverageValidator(config.source_completed_at, config.auth_events)
+    for record in records:
+        validator.observe(record)
+        yield record
+    validator.finish()
+    if validator.public_config_hash != H(C("audit-export-public-config-v1", config.public_snapshot_config())):
+        raise ValueError("auth event coverage declared public config differs from derivation config")
+
+
 def derive_audit_export_bundle(
     records: Iterable[Mapping[str, object]],
     config: AuditExportDerivationConfig,
@@ -1036,17 +1163,7 @@ def derive_audit_export_bundle(
         raise TypeError("config must be exact AuditExportDerivationConfig")
     from elspeth.contracts.sink_effects import AuditExportSignedManifestInput
 
-    public_config: dict[str, ClosedAuditExportJSON] = {
-        "chunking_algorithm_version": config.chunking_algorithm_version,
-        "export_format": config.export_format,
-        "exporter_version": config.exporter_version,
-        "include_raw_error_rows": config.include_raw_error_rows,
-        "per_chunk_byte_limit": config.per_chunk_byte_limit,
-        "per_chunk_record_limit": config.per_chunk_record_limit,
-        "serialization_version": config.serialization_version,
-        "signer_key_id": config.signer_key_id,
-        "signing_mode": config.signing_mode,
-    }
+    public_config = config.public_snapshot_config()
     public_export_config_bytes = C("audit-export-public-config-v1", public_config)
     public_export_config_hash = H(public_export_config_bytes)
     registry_key: dict[str, ClosedAuditExportJSON] = {
@@ -1065,7 +1182,7 @@ def derive_audit_export_bundle(
     unsigned_record_bytes: list[bytes] = []
     record_frames: list[bytes] = []
     chain = hashlib.sha256()
-    for raw in records:
+    for raw in _coverage_checked_records(records, config):
         unsigned = _detached_record(raw)
         unsigned_bytes = canonical_json(unsigned).encode("utf-8")
         emitted = dict(unsigned)
@@ -1386,17 +1503,7 @@ def _stream_audit_export_bundle_to_spool(
     """Generator body for :func:`stream_audit_export_bundle_to_spool`."""
     from elspeth.contracts.sink_effects import AuditExportSignedManifestInput, AuditExportSigningMode
 
-    public_config: dict[str, ClosedAuditExportJSON] = {
-        "chunking_algorithm_version": config.chunking_algorithm_version,
-        "export_format": config.export_format,
-        "exporter_version": config.exporter_version,
-        "include_raw_error_rows": config.include_raw_error_rows,
-        "per_chunk_byte_limit": config.per_chunk_byte_limit,
-        "per_chunk_record_limit": config.per_chunk_record_limit,
-        "serialization_version": config.serialization_version,
-        "signer_key_id": config.signer_key_id,
-        "signing_mode": config.signing_mode,
-    }
+    public_config = config.public_snapshot_config()
     public_export_config_bytes = C("audit-export-public-config-v1", public_config)
     public_export_config_hash = H(public_export_config_bytes)
     registry_key: dict[str, ClosedAuditExportJSON] = {
@@ -1441,7 +1548,7 @@ def _stream_audit_export_bundle_to_spool(
         current = bytearray()
         current_records = 0
 
-    for raw in records:
+    for raw in _coverage_checked_records(records, config):
         unsigned = _detached_record(raw)
         unsigned_bytes = canonical_json(unsigned).encode("utf-8")
         emitted = dict(unsigned)

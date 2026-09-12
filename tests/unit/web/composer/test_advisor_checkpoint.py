@@ -4394,6 +4394,10 @@ async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp
     from .conftest import build_test_sessions_service
 
     sessions = build_test_sessions_service(data_dir=tmp_path)
+    from tests.fixtures.identities import ensure_test_identity
+
+    with sessions._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="battery-user")
     session = await sessions.create_session("battery-user", "Withheld disclosure", "local")
     contradiction = "Remove the gate entirely but keep the guarantee that only amounts>100 reach big_amounts."
     await sessions.add_message(

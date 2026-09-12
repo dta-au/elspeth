@@ -128,10 +128,12 @@ def test_coordination_state_and_reason_enums_are_bounded() -> None:
         "pending",
         "start_permitted",
         "cancelled_before_permit",
+        "refused",
     }
     assert {item.value for item in RunSagaState} == {
         "draft",
         "start_intent",
+        "admission_refusal_pending",
         "start_permit_issued",
         "baseline_checkpointed",
         "running",

@@ -280,6 +280,10 @@ class TestRowsInARealSessionStore:
         from .conftest import build_test_sessions_service
 
         sessions = build_test_sessions_service(data_dir=tmp_path)
+        from tests.fixtures.identities import ensure_test_identity
+
+        with sessions._engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="audit-user")
         session = await sessions.create_session("audit-user", "Advisor audit rows", "local")
         record = _pass_record()
         publication = _publication()

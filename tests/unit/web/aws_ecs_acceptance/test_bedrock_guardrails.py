@@ -14,6 +14,8 @@ from types import SimpleNamespace
 import pytest
 
 from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.events import RunStarted
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -833,7 +835,7 @@ def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_sa
         acceptance.build_plugin_policy_acceptance(settings, env)
 
 
-@pytest.mark.parametrize("failure_mode", [None, "checker_failure", "claim_lost"])
+@pytest.mark.parametrize("failure_mode", [None, "checker_failure", "claim_lost", "wrong_telemetry"])
 def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_and_closes_resources(
     tmp_path: Path, failure_mode: str | None
 ) -> None:
@@ -879,6 +881,7 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
             return next(self.responses)
 
     provider_calls: list[dict[str, object]] = []
+    rejected_event_errors: list[str] = []
     sdks = iter(
         (
             SequencedSDK(response(), response(detected="PROMPT_ATTACK")),
@@ -898,6 +901,15 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
     def checker(**kwargs: object) -> object:
         if failure_mode == "checker_failure":
             raise RuntimeError("private checker failure")
+        if failure_mode == "wrong_telemetry":
+            telemetry_emit = kwargs["telemetry_emit"]
+            assert callable(telemetry_emit)
+            try:
+                telemetry_emit(RunStarted(timestamp=datetime.now(UTC), run_id="wrong-event-run", config_hash="abc", source_plugin="csv"))
+            except FrameworkBugError as error:
+                rejected_event_errors.append(str(error))
+                raise
+            pytest.fail("Guardrail callback accepted a non-call telemetry event")
         if failure_mode == "claim_lost":
             member = kwargs["member_token"]
             work_item = kwargs["work_item"]
@@ -947,12 +959,14 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
             run_acceptance()
         assert provider_calls == []
         assert manager.events == []
+        if failure_mode == "wrong_telemetry":
+            assert rejected_event_errors == ["Guardrail audit forwarding requires ExternalCallCompleted"]
         assert manager.closed is True
         with LandscapeDB.from_url(database_url, create_tables=False) as database:
             repositories = RecorderFactory.writable(database)
             run = repositories.run_lifecycle.list_runs()[0]
             outcomes = repositories.query.get_all_token_outcomes_for_run(run.run_id)
-        if failure_mode == "checker_failure":
+        if failure_mode in ("checker_failure", "wrong_telemetry"):
             assert run.status.value == "failed"
             assert len(outcomes) == 1
             assert outcomes[0].outcome.value == "failure"

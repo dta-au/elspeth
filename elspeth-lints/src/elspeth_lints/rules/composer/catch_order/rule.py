@@ -16,6 +16,7 @@ from elspeth_lints.rules.composer.catch_order.metadata import LEGACY_RULE_ID, RU
 # supertype does (elspeth-eb90341cdb).
 _BROAD_SUPERTYPES: frozenset[str] = frozenset({"Exception", "BaseException"})
 _SUBCLASS_TO_SUPERCLASSES: dict[str, frozenset[str]] = {
+    "ComposerAdmissionRefused": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerPluginCrashError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerConvergenceError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerRuntimePreflightError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,

@@ -81,7 +81,13 @@ from elspeth.plugins.llm.config_validation import (
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.multi_query import ResponseFormat, resolve_queries
-from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import (
+    LLMAuditParent,
+    LLMQueryResult,
+    ParsedFinishReason,
+    observe_http_token_usage,
+    parse_finish_reason,
+)
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
 if TYPE_CHECKING:
@@ -579,6 +585,7 @@ class GatewayLLMProvider:
 
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
+        observed_usage = TokenUsage.unknown()
         try:
             request_body: dict[str, Any] = {
                 "model": model,
@@ -591,6 +598,8 @@ class GatewayLLMProvider:
                 request_body["response_format"] = response_format
 
             response = self._post_chat_completion(http_client, request_body)
+            observed_usage = observe_http_token_usage(response.content)
+            self._validate_completion_status(response)
 
             data, content, usage, finish_reason, response_model = _validate_gateway_success_response(
                 response, usage_required=self._usage_required
@@ -619,6 +628,7 @@ class GatewayLLMProvider:
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 exc=exc,
+                usage=observed_usage,
             )
             raise
         except BaseException as exc:
@@ -645,7 +655,7 @@ class GatewayLLMProvider:
                     raise cleanup_error
 
     def _post_chat_completion(self, http_client: AuditedHTTPClient, request_body: dict[str, Any]) -> httpx.Response:
-        """POST one request, mapping transport and gateway-envelope failures.
+        """POST one request, mapping transport failures.
 
         ``httpx.TimeoutException`` is a subclass of ``httpx.RequestError`` —
         the timeout-specific except clause is listed first (mirroring the
@@ -664,6 +674,10 @@ class GatewayLLMProvider:
         except httpx.RequestError as e:
             raise NetworkError(_STATIC_GATEWAY_ERROR) from e
 
+        return response
+
+    def _validate_completion_status(self, response: httpx.Response) -> None:
+        """Reject gateway envelopes after execution has observed reported usage."""
         # Contract-header verification applies to every response — success
         # or error — before any status-code or body classification.
         _validate_contract_header(response, self._contract_major)
@@ -675,8 +689,6 @@ class GatewayLLMProvider:
             # HTTP status code itself (a buggy/malicious gateway could send
             # a misleading status alongside a correct code, or vice versa).
             raise _classify_gateway_http_error(e.response) from e
-
-        return response
 
     def _build_llm_request_payload(
         self,
@@ -724,6 +736,7 @@ class GatewayLLMProvider:
                 usage=usage,
                 raw_response=raw_response,
             ),
+            token_usage=usage,
             latency_ms=(time.perf_counter() - started_at) * 1000,
             resolved_prompt_template_hash=self._resolved_prompt_template_hash,
         )
@@ -735,6 +748,7 @@ class GatewayLLMProvider:
         started_at: float,
         request_payload: LLMCallRequest,
         exc: LLMClientError,
+        usage: TokenUsage,
     ) -> None:
         call_index = audit_parent.allocate_call_index(self._recorder)
         message = str(exc) or type(exc).__name__
@@ -743,6 +757,7 @@ class GatewayLLMProvider:
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.ERROR,
+            token_usage=usage,
             request_data=request_payload,
             error=LLMCallError(
                 type=type(exc).__name__,
@@ -824,6 +839,7 @@ class GatewayLLMProvider:
                 "max_tokens": 32,
             }
             response = self._post_chat_completion(http_client, request_body)
+            self._validate_completion_status(response)
             _validate_gateway_success_response(response, usage_required=self._usage_required)
         finally:
             http_client.close()

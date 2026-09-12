@@ -18,6 +18,7 @@ via their Audited*Client (D2 from architecture remediation).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -29,8 +30,26 @@ from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
-from elspeth.contracts.token_usage import TokenUsage
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+
+
+@observation_boundary(
+    tier=3,
+    source="HTTP LLM response body before strict completion validation",
+    source_param="body",
+    suppresses=("R1", "R5"),
+    invariant="Malformed JSON or absent usage remains unknown; valid counters are retained even when completion content is refused.",
+)
+def observe_http_token_usage(body: bytes) -> TokenUsage:
+    """Preserve consumed tokens independently of completion admissibility."""
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeError, RecursionError):
+        return UNKNOWN_TOKEN_USAGE
+    if not isinstance(data, dict):
+        return UNKNOWN_TOKEN_USAGE
+    return TokenUsage.from_dict(data.get("usage"))
 
 
 class _AuditClientKwargs(TypedDict):
@@ -140,6 +159,7 @@ class LLMAuditParent:
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record a semantic call under this validated parent."""
         if self.operation_id is not None:
@@ -154,6 +174,7 @@ class LLMAuditParent:
                 error=error,
                 latency_ms=latency_ms,
                 resolved_prompt_template_hash=resolved_prompt_template_hash,
+                token_usage=token_usage,
             )
         if self.state_id is None:
             raise RuntimeError("validated row parent lost state_id")
@@ -169,6 +190,7 @@ class LLMAuditParent:
             error=error,
             latency_ms=latency_ms,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
+            token_usage=token_usage,
         )
 
 

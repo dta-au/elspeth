@@ -42,6 +42,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
 )
 from elspeth.web.config import WebSettings
+from tests.unit.web.composer._helpers import _composer_service_with_session
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures required for all compose-loop tests in this file.
@@ -248,7 +249,7 @@ class TestUnknownToolNameComposeLoopAuditShape:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: LLM emits a hallucinated (unknown) tool name.
@@ -267,7 +268,7 @@ class TestUnknownToolNameComposeLoopAuditShape:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [unknown_tool_call, self_correction]
-            result = await service.compose("Build a pipeline", [], state)
+            result = await service.compose("Build a pipeline", [], state, session_id=session_id)
 
         # Assert 5: compose loop continued; turn 2 text is the result message.
         assert "apologise" in result.message or "sorry" in result.message.lower() or result.message
