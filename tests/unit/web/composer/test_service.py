@@ -3732,7 +3732,7 @@ class TestDiscoveryCache:
         from elspeth.contracts.composer_audit import ComposerToolStatus
         from elspeth.web.composer import tool_batch as tool_batch_module
 
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         state = _empty_state()
         malformed = ToolResult(
             success=True, updated_state=state, validation=state.validate(), affected_nodes=(), data={"unexpected": "producer bug"}
@@ -3745,15 +3745,30 @@ class TestDiscoveryCache:
             patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
             patch.object(tool_batch_module, "execute_tool", return_value=malformed),
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
+            patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
             pytest.raises(ComposerPluginCrashError) as caught,
         ):
-            await service.compose("Describe the pipeline language", [], state)
+            await service.compose("Describe the pipeline language", [], state, session_id=session_id)
 
         assert isinstance(caught.value.original_exc, FrameworkBugError)
         assert completion.call_count == 1
         cache_payload.assert_not_called()
-        assert len(caught.value.tool_invocations) == 1
-        assert caught.value.tool_invocations[0].status is ComposerToolStatus.PLUGIN_CRASH
+        assert [call.args[1].status for call in record.call_args_list] == [ComposerToolStatus.PLUGIN_CRASH]
+        # Session-backed compose persists this failed turn before raising;
+        # the exception must not ask the route to write the same audit twice.
+        assert caught.value.tool_invocations == ()
+        assert service._sessions_service is not None
+        stored_messages = await service._sessions_service.get_messages(UUID(session_id))
+        stored_tool_rows = [message for message in stored_messages if message.role == "tool"]
+        assert len(stored_tool_rows) == 1
+        assert stored_tool_rows[0].tool_call_id == "bad-response"
+        stored_failure = json.loads(stored_tool_rows[0].content)
+        assert stored_failure["_redaction_status"] == "plugin_crash"
+        assert "data" not in stored_failure
+        assert "producer bug" not in stored_tool_rows[0].content
+        stored_assistant_rows = [message for message in stored_messages if message.role == "assistant"]
+        assert len(stored_assistant_rows) == 1
+        assert stored_tool_rows[0].parent_assistant_id == stored_assistant_rows[0].id
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("tool_name", ["get_expression_grammar", "get_audit_info"])
@@ -3762,7 +3777,7 @@ class TestDiscoveryCache:
         from elspeth.contracts.composer_audit import ComposerToolStatus
         from elspeth.web.composer import tool_batch as tool_batch_module
 
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
             _make_llm_response(tool_calls=[{"id": call_id, "name": tool_name, "arguments": {"unexpected": 1}}])
             for call_id in ("invalid-1", "invalid-2")
@@ -3773,7 +3788,7 @@ class TestDiscoveryCache:
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
         ):
-            result = await service.compose("Describe the pipeline language", [], _empty_state())
+            result = await service.compose("Describe the pipeline language", [], _empty_state(), session_id=session_id)
 
         assert dispatch.call_count == 2
         cache_payload.assert_not_called()
@@ -3801,7 +3816,7 @@ class TestDiscoveryCache:
                 admitted = replace(cached.admitted_response, contract=replace(EXPRESSION_GRAMMAR_RESPONSE_CONTRACT))
             return replace(cached, admitted_response=admitted)
 
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
             _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
             for call_id in ("miss", "corrupt-hit")
@@ -3814,7 +3829,7 @@ class TestDiscoveryCache:
             patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
             pytest.raises(FrameworkBugError),
         ):
-            await service.compose("Describe the pipeline language", [], _empty_state())
+            await service.compose("Describe the pipeline language", [], _empty_state(), session_id=session_id)
 
         assert dispatch.call_count == 1
         assert cache_payload.call_count == 1
@@ -3831,7 +3846,7 @@ class TestDiscoveryCache:
         def fail_discovery(*args: Any, **kwargs: Any) -> ToolResult:
             return replace(_strict_execute_tool(*args, **kwargs), success=False, data=None)
 
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
             _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
             for call_id in ("failed-1", "failed-2")
@@ -3842,7 +3857,7 @@ class TestDiscoveryCache:
             patch.object(tool_batch_module, "execute_tool", side_effect=fail_discovery) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
         ):
-            await service.compose("Describe the pipeline language", [], _empty_state())
+            await service.compose("Describe the pipeline language", [], _empty_state(), session_id=session_id)
 
         assert dispatch.call_count == 2
         cache_payload.assert_not_called()
@@ -3860,7 +3875,7 @@ class TestDiscoveryCache:
         from elspeth.web.composer import tool_batch as tool_batch_module
         from elspeth.web.composer.discovery_cache import admitted_result_from_cached_discovery_payload
 
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
             _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
             for call_id in ("miss", "encoder-failure")
@@ -3881,7 +3896,7 @@ class TestDiscoveryCache:
                 patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
                 pytest.raises(FrameworkBugError, match="encoder bug"),
             ):
-                await service.compose("Describe the pipeline language", [], _empty_state())
+                await service.compose("Describe the pipeline language", [], _empty_state(), session_id=session_id)
 
         assert dispatch.call_count == 1
         assert completion.call_count == 2
