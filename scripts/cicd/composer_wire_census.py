@@ -7,8 +7,8 @@ validator. Unsupported validation/forwarding raises CensusError. A missing
 model is reported as absent, never supplied from the redaction manifest.
 
 No repository walk is needed: live callable identities select source files.
-The advisor interception has no registered callable and remains explicitly
-unresolved. This census makes no claim that validation runs on every branch.
+The advisor interception is bound by a source-checked adapter. READ records
+input-field extractions, not causal use or execution of every branch.
 """
 
 from __future__ import annotations
@@ -86,6 +86,45 @@ def _mentions_input(node: ast.AST, parameter: str) -> bool:
     return any(isinstance(part, ast.Name) and part.id == parameter for part in ast.walk(node))
 
 
+def _unwrap_forwarder(function: FunctionType) -> FunctionType:
+    """Only cross wrappers whose actual body forwards all input unchanged."""
+    visited: set[FunctionType] = set()
+    while "__wrapped__" in vars(function):
+        if function in visited:
+            raise CensusError(f"{function.__qualname__}: cyclic wrapper identity")
+        visited.add(function)
+        wrapped = vars(function)["__wrapped__"]
+        lines, _ = inspect.getsourcelines(function.__code__)
+        definition = ast.parse(textwrap.dedent("".join(lines))).body[0]
+        if not isinstance(definition, ast.FunctionDef):
+            raise CensusError(f"{function.__qualname__}: unsupported wrapper syntax")
+        arguments = definition.args
+        statement = definition.body[0] if len(definition.body) == 1 else None
+        call = statement.value if isinstance(statement, ast.Return) else None
+        if (
+            not isinstance(wrapped, FunctionType)
+            or arguments.args
+            or arguments.posonlyargs
+            or arguments.kwonlyargs
+            or arguments.vararg is None
+            or arguments.kwarg is None
+            or not isinstance(call, ast.Call)
+            or not isinstance(call.func, ast.Name)
+            or inspect.getclosurevars(function).nonlocals.get(call.func.id) is not wrapped
+            or len(call.args) != 1
+            or not isinstance(call.args[0], ast.Starred)
+            or not _input_expression(call.args[0].value, arguments.vararg.arg)
+            or len(call.keywords) != 1
+            or call.keywords[0].arg is not None
+            or not _input_expression(call.keywords[0].value, arguments.kwarg.arg)
+        ):
+            raise CensusError(f"{function.__qualname__}: unsupported wrapper forwarding identity")
+        if not isinstance(wrapped, FunctionType):
+            raise CensusError(f"{function.__qualname__}: unsupported wrapped callable identity")
+        function = wrapped
+    return function
+
+
 def _model_for_handler(handler: FunctionType, *, input_parameter: str | None = None) -> tuple[type[BaseModel] | None, tuple[str, ...]]:
     """Resolve one original-input model, refusing ambiguity and opaque shapes.
 
@@ -97,7 +136,7 @@ def _model_for_handler(handler: FunctionType, *, input_parameter: str | None = N
     visited: set[tuple[FunctionType, str]] = set()
 
     def scan(function: FunctionType, parameter: str) -> None:
-        function = inspect.unwrap(function)
+        function = _unwrap_forwarder(function)
         key = (function, parameter)
         if key in visited:
             raise CensusError(f"{function.__qualname__}: recursive argument forwarding")
@@ -108,6 +147,7 @@ def _model_for_handler(handler: FunctionType, *, input_parameter: str | None = N
         if not isinstance(definition, ast.FunctionDef | ast.AsyncFunctionDef):
             raise CensusError(f"{function.__qualname__}: unsupported handler syntax")
         nodes = _body_nodes(definition)
+        awaited_calls = {id(node.value) for node in nodes if isinstance(node, ast.Await)}
         nested_functions = {node.name: node for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
         local_names = {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
         local_names.update(node.name for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef))
@@ -231,6 +271,13 @@ def _model_for_handler(handler: FunctionType, *, input_parameter: str | None = N
                         raise CensusError(f"{site}: unsupported mutation validation construct")
                     receiver = call.args[0]
                 elif isinstance(target, FunctionType):
+                    target = _unwrap_forwarder(target)
+                    if (
+                        inspect.isgeneratorfunction(target)
+                        or inspect.isasyncgenfunction(target)
+                        or (inspect.iscoroutinefunction(target) and id(call) not in awaited_calls)
+                    ):
+                        raise CensusError(f"{site}: deferred helper body has no admission proof")
                     parameters = list(inspect.signature(target).parameters)
                     for index, _ in forwarded:
                         if index >= len(parameters):
@@ -247,6 +294,9 @@ def _model_for_handler(handler: FunctionType, *, input_parameter: str | None = N
             model = _resolve(receiver, function, local_names)
             if not isinstance(model, type) or not issubclass(model, BaseModel):
                 raise CensusError(f"{site}: validation receiver is not a BaseModel class")
+            validation_method = next(vars(base)["model_validate"] for base in model.__mro__ if "model_validate" in vars(base))
+            if validation_method is not vars(BaseModel)["model_validate"]:
+                raise CensusError(f"{site}: overridden model validation identity")
             if any(field.alias is not None or field.validation_alias is not None for field in model.model_fields.values()):
                 raise CensusError(f"{site}: validation aliases are unsupported")
             models.setdefault(model, set()).add(site)
@@ -265,7 +315,17 @@ def _model_for_handler(handler: FunctionType, *, input_parameter: str | None = N
     return model, tuple(sorted(sites))
 
 
-def census_model_wire() -> dict[str, ModelWireRow]:
+@dataclass(frozen=True)
+class _ToolInput:
+    name: str
+    shipped: frozenset[str]
+    handler: FunctionType | None
+    parameter: str | None
+    unresolved: str | None = None
+
+
+def _tool_inputs() -> tuple[_ToolInput, ...]:
+    """One live callable universe shared by MODEL and READ."""
     handlers: dict[str, object] = {declaration.name: declaration.handler for declaration in _REGISTERED_TOOLS}
     if len(handlers) != len(_REGISTERED_TOOLS) or handlers.keys() & _SESSION_AWARE_TOOL_HANDLERS.keys():
         raise CensusError("duplicate registered handler names")
@@ -280,7 +340,7 @@ def census_model_wire() -> dict[str, ModelWireRow]:
             f"shipped/handler universe mismatch: missing={sorted(expected - set(shipped_names))}, "
             f"unexpected={sorted(set(shipped_names) - expected)}"
         )
-    rows: dict[str, ModelWireRow] = {}
+    inputs: list[_ToolInput] = []
     handler: object
     for definition in definitions:
         name = definition["name"]
@@ -290,15 +350,26 @@ def census_model_wire() -> dict[str, ModelWireRow]:
             try:
                 handler = _advisor_admission_handler()
             except CensusError as exc:
-                rows[name] = ModelWireRow(name, shipped, None, frozenset(), f"unresolved:{exc}")
+                inputs.append(_ToolInput(name, shipped, None, None, str(exc)))
                 continue
             input_parameter = "arguments"
         else:
             handler = handlers[name]
         if not isinstance(handler, FunctionType):
             raise CensusError(f"{name}: registered handler is not a Python function")
+        inputs.append(_ToolInput(name, shipped, handler, input_parameter))
+    return tuple(inputs)
+
+
+def census_model_wire() -> dict[str, ModelWireRow]:
+    rows: dict[str, ModelWireRow] = {}
+    for tool in _tool_inputs():
+        name, shipped, handler = tool.name, tool.shipped, tool.handler
+        if handler is None:
+            rows[name] = ModelWireRow(name, shipped, None, frozenset(), f"unresolved:{tool.unresolved}")
+            continue
         try:
-            model, sites = _model_for_handler(handler, input_parameter=input_parameter)
+            model, sites = _model_for_handler(handler, input_parameter=tool.parameter)
         except CensusError as exc:
             rows[name] = ModelWireRow(name, shipped, None, frozenset(), f"unresolved:{exc}")
             continue
@@ -357,6 +428,401 @@ def census_redaction_models() -> dict[str, type[BaseModel] | None]:
 
 
 @dataclass(frozen=True)
+class ReadSite:
+    field: str
+    site: str
+    callers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReadWireRow:
+    tool: str
+    shipped: frozenset[str]
+    read: frozenset[str]
+    extractions: tuple[ReadSite, ...]
+    presence: tuple[ReadSite, ...]
+    unresolved: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ReadOrigin:
+    model: type[BaseModel] | None = None
+    fields: frozenset[str] | None = None
+
+
+def _reads_for_handler(
+    handler: FunctionType, *, input_parameter: str | None = None
+) -> tuple[tuple[ReadSite, ...], tuple[ReadSite, ...], tuple[str, ...]]:
+    """Observe original-input extraction, retaining unsupported provenance.
+
+    This is intentionally not use analysis. Once a field is extracted, its
+    subsequent transformation is outside this pass. Whole-input and admitted
+    instance forwarding remain provenance obligations; dumps confer no fields.
+    """
+    extractions: set[ReadSite] = set()
+    presence: set[ReadSite] = set()
+    unresolved: set[str] = set()
+    active: set[tuple[FunctionType, str, _ReadOrigin, str]] = set()
+
+    def scan(
+        function: FunctionType,
+        parameter: str,
+        origin: _ReadOrigin,
+        callers: tuple[str, ...],
+        *,
+        closure: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
+        captures: dict[str, _ReadOrigin] | None = None,
+        source_start: int | None = None,
+        enclosing_names: frozenset[str] = frozenset(),
+    ) -> _ReadOrigin | None:
+        try:
+            function = _unwrap_forwarder(function)
+        except CensusError as exc:
+            unresolved.add(str(exc))
+            return None
+        identity = f"{function.__module__}.{function.__qualname__}"
+        if closure is not None:
+            identity += f".<locals>.{closure.name}"
+        key = (function, parameter, origin, identity)
+        if key in active:
+            unresolved.add(f"{identity}: recursive input forwarding")
+            return None
+        active.add(key)
+        if closure is None:
+            lines, start = inspect.getsourcelines(function)
+            definition = ast.parse(textwrap.dedent("".join(lines))).body[0]
+        else:
+            assert source_start is not None
+            start = source_start
+            definition = closure
+        nodes = _body_nodes(definition)
+        awaited_calls = {id(node.value) for node in nodes if isinstance(node, ast.Await)}
+        stores: dict[str, int] = {}
+        for node in nodes:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                stores[node.id] = stores.get(node.id, 0) + 1
+        local_names = set(stores) | set(enclosing_names)
+        if closure is None:
+            local_names.update(inspect.signature(function).parameters)
+        nested = {node.name: node for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
+        nested_definitions = [node.name for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
+        lambdas = {
+            node.targets[0].id: node.value
+            for node in nodes
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Lambda)
+        }
+        declared_classes = {node.name for node in nodes if isinstance(node, ast.ClassDef)}
+        local_names.update(nested)
+        local_names.update(declared_classes)
+        imported_names: set[str] = set()
+        for node in nodes:
+            if isinstance(node, ast.Import):
+                imported_names.update(alias.asname or alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported_names.update(alias.asname or alias.name for alias in node.names)
+        local_names.update(imported_names)
+        mutated = {
+            node.value.id
+            for node in nodes
+            if isinstance(node, ast.Subscript | ast.Attribute)
+            and isinstance(node.ctx, ast.Store | ast.Del)
+            and isinstance(node.value, ast.Name)
+        }
+        mutated.update(
+            node.func.value.id
+            for node in nodes
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.attr in {"clear", "pop", "popitem", "update", "setdefault", "__setitem__", "__delitem__"}
+        )
+        bindings: dict[str, _ReadOrigin] = {parameter: origin} if captures is None else dict(captures)
+        local_names.update(bindings)
+        for name in tuple(bindings):
+            if name in stores or name in mutated or name in imported_names or name in nested or name in declared_classes:
+                unresolved.add(f"{identity}:{start}: original input rebound or mutated")
+                del bindings[name]
+        cache: dict[int, _ReadOrigin | None] = {}
+        call_chain = (*callers, identity)
+
+        def site(node: ast.expr | ast.stmt) -> str:
+            return f"{identity}:{start + node.lineno - 1}"
+
+        def resolve(node: ast.expr) -> object | None:
+            try:
+                return _resolve(node, function, local_names)
+            except CensusError:
+                return None
+
+        def record(field: ast.expr, node: ast.expr, *, membership: bool = False) -> None:
+            if not isinstance(field, ast.Constant) or not isinstance(field.value, str):
+                unresolved.add(f"{site(node)}: dynamic input key")
+                return
+            target = presence if membership else extractions
+            target.add(ReadSite(field.value, site(node), call_chain))
+
+        def admitted(model_node: ast.expr, value: _ReadOrigin | None, node: ast.Call) -> _ReadOrigin | None:
+            if value is None:
+                return None
+            model = resolve(model_node)
+            if value.model is not None or not isinstance(model, type) or not issubclass(model, BaseModel):
+                unresolved.add(f"{site(node)}: unsupported model admission identity")
+                return None
+            validation_method = next(vars(base)["model_validate"] for base in model.__mro__ if "model_validate" in vars(base))
+            if validation_method is not vars(BaseModel)["model_validate"]:
+                unresolved.add(f"{site(node)}: overridden model validation identity")
+                return None
+            if any(field.alias is not None or field.validation_alias is not None for field in model.model_fields.values()):
+                unresolved.add(f"{site(node)}: model validation aliases")
+                return None
+            return _ReadOrigin(model)
+
+        def expression(node: ast.expr) -> _ReadOrigin | None:
+            if id(node) in cache:
+                return cache[id(node)]
+            cache[id(node)] = None
+            result = evaluate(node)
+            cache[id(node)] = result
+            return result
+
+        def evaluate(node: ast.expr) -> _ReadOrigin | None:
+            if isinstance(node, ast.Name):
+                return bindings.get(node.id)
+            if isinstance(node, ast.Await):
+                return expression(node.value)
+            if isinstance(node, ast.Lambda):
+                return None
+            if isinstance(node, ast.Attribute):
+                receiver = expression(node.value)
+                if (
+                    receiver is not None
+                    and receiver.model is not None
+                    and node.attr in receiver.model.model_fields
+                    and (receiver.fields is None or node.attr in receiver.fields)
+                ):
+                    extractions.add(ReadSite(node.attr, site(node), call_chain))
+                return None
+            if isinstance(node, ast.Subscript):
+                receiver = expression(node.value)
+                if receiver is not None:
+                    if receiver.model is None and isinstance(node.ctx, ast.Load):
+                        record(node.slice, node)
+                    elif receiver.model is not None:
+                        unresolved.add(f"{site(node)}: subscript on admitted model")
+                expression(node.slice)
+                return None
+            if isinstance(node, ast.Compare):
+                operands = [node.left, *node.comparators]
+                for index, operator in enumerate(node.ops):
+                    if isinstance(operator, ast.In | ast.NotIn) and expression(operands[index + 1]) is not None:
+                        record(operands[index], node, membership=True)
+                for operand in operands:
+                    expression(operand)
+                return None
+            if not isinstance(node, ast.Call):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, ast.expr) and expression(child) is not None:
+                        unresolved.add(f"{site(node)}: unsupported whole-input construction")
+                return None
+
+            args = [expression(arg) for arg in node.args]
+            kwargs = {keyword.arg: expression(keyword.value) for keyword in node.keywords}
+            lambda_body = (
+                node.func if isinstance(node.func, ast.Lambda) else lambdas.get(node.func.id) if isinstance(node.func, ast.Name) else None
+            )
+            if lambda_body is not None and any(_mentions_input(lambda_body, name) for name in bindings):
+                unresolved.add(f"{site(node)}: unsupported invoked lambda closure")
+                return None
+            target = resolve(node.func)
+            if target is cast:
+                return args[1] if len(args) == 2 and not node.keywords else None
+            if target is _validate_mutation_arguments:
+                if len(args) == 3 and not node.keywords:
+                    return admitted(node.args[0], args[1], node)
+                unresolved.add(f"{site(node)}: unsupported mutation admission")
+                return None
+            if isinstance(node.func, ast.Attribute):
+                receiver = expression(node.func.value)
+                if node.func.attr.startswith("model_validate") and any(value is not None for value in args):
+                    if node.func.attr == "model_validate" and len(args) == 1 and not node.keywords:
+                        return admitted(node.func.value, args[0], node)
+                    unresolved.add(f"{site(node)}: unsupported model validation form")
+                    return None
+                if receiver is not None:
+                    if receiver.model is None and node.func.attr == "get":
+                        if node.args:
+                            record(node.args[0], node)
+                        else:
+                            unresolved.add(f"{site(node)}: missing literal input key")
+                        return None
+                    if node.func.attr == "model_dump":
+                        unresolved.add(f"{site(node)}: bulk model dump has no per-field extraction proof")
+                        return None
+                    if node.func.attr == "model_copy":
+                        copy_method = (
+                            next((vars(base)["model_copy"] for base in receiver.model.__mro__ if "model_copy" in vars(base)), None)
+                            if receiver.model is not None
+                            else None
+                        )
+                        if (
+                            receiver.model is not None
+                            and copy_method is BaseModel.model_copy
+                            and not node.args
+                            and len(node.keywords) == 1
+                            and node.keywords[0].arg == "update"
+                            and isinstance(node.keywords[0].value, ast.Dict)
+                        ):
+                            updates = node.keywords[0].value.keys
+                            if all(
+                                isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value in receiver.model.model_fields
+                                for key in updates
+                            ):
+                                replaced = frozenset(key.value for key in updates if isinstance(key, ast.Constant))
+                                available = frozenset(receiver.model.model_fields) if receiver.fields is None else receiver.fields
+                                return _ReadOrigin(receiver.model, available - replaced)
+                        unresolved.add(f"{site(node)}: unsupported admitted model copy")
+                        return None
+                    if receiver.model is None and node.func.attr in {"keys", "items", "values"}:
+                        return None
+                    method = None if receiver.model is None else vars(receiver.model).get(node.func.attr)
+                    if isinstance(method, FunctionType) and not node.args and not node.keywords:
+                        if deferred(method, node):
+                            return None
+                        return scan(method, next(iter(inspect.signature(method).parameters)), receiver, call_chain)
+                    unresolved.add(f"{site(node)}: unsupported input method {node.func.attr}")
+                    return None
+            if isinstance(node.func, ast.Name) and node.func.id in nested:
+                captures = any(_mentions_input(nested[node.func.id], name) for name in bindings)
+                if captures or any(value is not None for value in [*args, *kwargs.values()]):
+                    child = nested[node.func.id]
+                    if (
+                        node.args
+                        or node.keywords
+                        or child.decorator_list
+                        or isinstance(child, ast.AsyncFunctionDef)
+                        or any(isinstance(part, ast.Yield | ast.YieldFrom) for part in _body_nodes(child))
+                        or child.args.args
+                        or child.args.posonlyargs
+                        or child.args.kwonlyargs
+                        or child.args.vararg is not None
+                        or child.args.kwarg is not None
+                        or node.func.id in stores
+                        or node.func.id in imported_names
+                        or nested_definitions.count(node.func.id) != 1
+                        or child.lineno >= node.lineno
+                    ):
+                        unresolved.add(f"{site(node)}: unsupported invoked closure identity")
+                    else:
+                        return scan(
+                            function,
+                            parameter,
+                            origin,
+                            call_chain,
+                            closure=child,
+                            captures={name: value for name, value in bindings.items() if _mentions_input(child, name)},
+                            source_start=start,
+                            enclosing_names=frozenset(local_names),
+                        )
+                return None
+            forwarded = any(value is not None for value in [*args, *kwargs.values()])
+            if not forwarded:
+                return None
+            if target is dict and len(args) == 1 and not node.keywords:
+                if args[0] is not None and args[0].model is None:
+                    return args[0]
+                unresolved.add(f"{site(node)}: bulk model-to-dict transformation")
+                return None
+            if target in (isinstance, len, bool, str, type, set, frozenset, sorted):
+                return None
+            if not isinstance(target, FunctionType) or None in kwargs:
+                unresolved.add(f"{site(node)}: unsupported callable receiving input provenance")
+                return None
+            if deferred(target, node):
+                return None
+            # Unknown ** forwarding was refused above; bind only named keys.
+            named_kwargs = {name: value for name, value in kwargs.items() if name is not None}
+            try:
+                bound = inspect.signature(target).bind_partial(*args, **named_kwargs)
+            except TypeError:
+                unresolved.add(f"{site(node)}: unsupported helper argument binding")
+                return None
+            returned = []
+            for name, value in bound.arguments.items():
+                if isinstance(value, _ReadOrigin):
+                    returned.append(scan(target, name, value, call_chain))
+                elif isinstance(value, tuple | dict):
+                    unresolved.add(f"{site(node)}: variadic helper input forwarding")
+            return returned[0] if returned and all(value == returned[0] for value in returned) else None
+
+        def deferred(target: FunctionType, node: ast.Call) -> bool:
+            try:
+                target = _unwrap_forwarder(target)
+            except CensusError as exc:
+                unresolved.add(str(exc))
+                return True
+            if (
+                inspect.isgeneratorfunction(target)
+                or inspect.isasyncgenfunction(target)
+                or (inspect.iscoroutinefunction(target) and id(node) not in awaited_calls)
+            ):
+                unresolved.add(f"{site(node)}: deferred helper body has no extraction proof")
+                return True
+            return False
+
+        returns: list[_ReadOrigin | None] = []
+        for node in nodes:
+            if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+                if (
+                    isinstance(node.value, ast.Name)
+                    and node.value.id in nested
+                    and any(_mentions_input(nested[node.value.id], name) for name in bindings)
+                ):
+                    unresolved.add(f"{site(node)}: captured closure alias has unresolved provenance")
+                value = expression(node.value)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if value is not None:
+                    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                        unresolved.add(f"{site(node)}: unsupported input assignment")
+                    else:
+                        name = targets[0].id
+                        if stores[name] != 1 or name in mutated or name in imported_names or name in nested or name in declared_classes:
+                            unresolved.add(f"{site(node)}: input binding rebound or mutated: {name}")
+                        elif isinstance(node.value, ast.Name):
+                            unresolved.add(f"{site(node)}: input alias: {name}")
+                        else:
+                            bindings[name] = value
+            elif isinstance(node, ast.Return) and node.value is not None:
+                returns.append(expression(node.value))
+            elif isinstance(node, ast.expr):
+                expression(node)
+        active.remove(key)
+        return returns[0] if returns and all(value == returns[0] for value in returns) else None
+
+    parameter = input_parameter or next(iter(inspect.signature(handler).parameters))
+    scan(handler, parameter, _ReadOrigin(), ())
+
+    def sort_key(item: ReadSite) -> tuple[str, str, tuple[str, ...]]:
+        return item.field, item.site, item.callers
+
+    return tuple(sorted(extractions, key=sort_key)), tuple(sorted(presence, key=sort_key)), tuple(sorted(unresolved))
+
+
+def census_read_wire() -> dict[str, ReadWireRow]:
+    """Read the shared live catalog; unresolved rows retain partial fields."""
+    rows: dict[str, ReadWireRow] = {}
+    for tool in _tool_inputs():
+        if tool.handler is None:
+            rows[tool.name] = ReadWireRow(tool.name, tool.shipped, frozenset(), (), (), (str(tool.unresolved),))
+            continue
+        evidence, presence, unresolved = _reads_for_handler(tool.handler, input_parameter=tool.parameter)
+        rows[tool.name] = ReadWireRow(tool.name, tool.shipped, frozenset(item.field for item in evidence), evidence, presence, unresolved)
+    return rows
+
+
+@dataclass(frozen=True)
 class TaughtWireRow:
     tool: str
     shipped: frozenset[str]
@@ -387,6 +853,7 @@ def census_taught_wire() -> dict[str, TaughtWireRow]:
 if __name__ == "__main__":
     redaction_models = census_redaction_models()
     taught_rows = census_taught_wire()
+    read_rows = census_read_wire()
     print(
         json.dumps(
             [
@@ -403,6 +870,16 @@ if __name__ == "__main__":
                     "site": row.site,
                     "shipped_not_model": sorted(row.shipped - row.model_fields),
                     "model_not_shipped": sorted(row.model_fields - row.shipped),
+                    "read": sorted(read_rows[row.tool].read),
+                    "shipped_not_read": sorted(row.shipped - read_rows[row.tool].read),
+                    "read_not_shipped": sorted(read_rows[row.tool].read - row.shipped),
+                    "read_unresolved": list(read_rows[row.tool].unresolved),
+                    "read_sites": [
+                        {"field": item.field, "site": item.site, "callers": list(item.callers)} for item in read_rows[row.tool].extractions
+                    ],
+                    "presence_sites": [
+                        {"field": item.field, "site": item.site, "callers": list(item.callers)} for item in read_rows[row.tool].presence
+                    ],
                     "taught": sorted(taught_rows[row.tool].taught),
                     "untaught": sorted(row.shipped - taught_rows[row.tool].taught),
                     "stale_argument_declarations": sorted(taught_rows[row.tool].declared - row.shipped),

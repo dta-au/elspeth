@@ -1009,13 +1009,14 @@ def build_set_pipeline_candidate(
             # arguments (CEC1 channel discipline) — propagate to the
             # compose loop's ARG_ERROR branch rather than masking as
             # SUCCESS-with-success=False. The inline_blob contents are already
-            # type-validated by ``_InlineBlobModel``
-            # (str/str/str + extra=forbid), so the isinstance guards inside
-            # _prepare_blob_create are unreachable from this caller — see
-            # the cleanup that removes them.
+            # type-validated by ``_InlineBlobModel`` and forwarded directly
+            # through the helper's typed keyword parameters.
             provenance = _blob_creation_provenance(inline_blob.content, context)
             prepared_inline_blob = _prepare_blob_create(
-                inline_blob.model_dump(),
+                filename=inline_blob.filename,
+                mime_type=inline_blob.mime_type,
+                content=inline_blob.content,
+                description=inline_blob.description,
                 data_dir=data_dir,
                 session_id=session_id,
                 creation_modality=provenance.creation_modality,

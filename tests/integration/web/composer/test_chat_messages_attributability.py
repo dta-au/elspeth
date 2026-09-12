@@ -90,11 +90,9 @@ def _session_with_user_message_and_blob(tmp_path: Path) -> tuple[Any, str, str]:
         )
 
     prepared = _prepare_blob_create(
-        {
-            "filename": "ada.csv",
-            "mime_type": "text/csv",
-            "content": "name,score\nada,42\n",
-        },
+        filename="ada.csv",
+        mime_type="text/csv",
+        content="name,score\nada,42\n",
         data_dir=str(tmp_path),
         session_id=session_id,
         creation_modality=CreationModality.VERBATIM,

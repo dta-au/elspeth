@@ -1,200 +1,292 @@
-"""Every argument knob the planner is shown must reach the audit wire.
+"""Every live Composer tool has closed ADMITTED root argument names.
 
-WHAT THIS GUARDS, and why it is not covered elsewhere.
+SHIPPED comes from the actual registry. ADMITTED comes from the manifest's
+production closure policy or its argument model's accepted wire names. Empty
+policies remain in the relation; missing/duplicate endpoints cannot disappear
+through intersections or default values. Type-driven output is also exercised
+through the real redactor, including existing default materialization.
 
-A composer tool argument -- a "knob" the planner LLM can set -- is described in
-several places at once, and each description is a wire that must carry it:
-
-    SHIPPED    the json-schema property the model is shown, from the live
-               ``get_tool_definitions()`` registry
-    MODEL      the pydantic arguments model the handler validates against
-    ADMITTED   ``MANIFEST[tool].policy.known_argument_keys`` in redaction.py
-    READ       what the handler actually consumes
-    TAUGHT     exact property descriptions and own-tool prose, measured by
-               ``test_tool_knob_teaching_gate.py`` via the shared ownership reader
-
-``tools/schema_contract.py`` already pins SHIPPED against MODEL, directionally,
-for ``upsert_node`` and ``set_pipeline``. Nothing pinned SHIPPED against
-ADMITTED, for any tool. That gap was not theoretical: between 2026-08-15
-(80fa17fed added a ``description`` property to two tool schemas) and 2026-09-04,
-``upsert_node`` and ``set_output`` advertised a knob their allowlist did not
-admit, and because both run ``redact_unknown_argument_keys=True`` the audit
-trail replaced the key NAME with ``<redacted-unknown-argument-key>``. The row
-could not say which knob had been dropped. The schema prose meanwhile told the
-model the value was "shown to reviewers on the Spec tab".
-
-Both sides here are derived from live sources -- the registry and the manifest --
-so this gate cannot itself drift out of step with what it checks. That is the
-point: a gate needing a hand-edit alongside the thing it guards reproduces the
-defect it is meant to catch.
-
-SCOPE, MEASURED -- stated so a green run is not over-read. This pins the ADMITTED
-wire only, and only for tools with a nonempty declarative argument allowlist.
-Type-driven redaction, open declarative policies, and closed policies with an
-empty argument set are outside this comparison. A green run is silent about
-their admission behavior; omission here does not mean they run open.
-
-It is also silent about READ (a knob the handler ignores) and the TypeScript
-decoder. TAUGHT has its own live gate: nonempty exact property descriptions or
-quoted keys in owned tool context, with stale names derived only from explicit
-argument declarations, never from arbitrary quoted response keys or enum values.
-
-An earlier revision of this docstring claimed the gate covered "all 42 tools".
-It iterated 14. That overstatement is the same defect the file exists to catch,
-one level up, which is why the numbers above are measured rather than described.
+This is root-name admission and emission evidence. MODEL proves actual handler
+admission separately; READ, nested value redaction, TAUGHT and frontend projection
+have their own authorities. No whole-schema or semantic consumption claim is
+made here. Alias forms that the name-based sensitive walker cannot establish
+are refused explicitly instead of being treated as Python-field equality.
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
+from types import MappingProxyType
 from typing import Any
 
-from elspeth.web.composer.redaction import MANIFEST, policy_closes_unknown_arguments
+import pytest
+from jsonschema import Draft202012Validator
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
+
+from elspeth.web.composer import redaction
+from elspeth.web.composer.redaction import (
+    REDACTED_UNKNOWN_ARGUMENT_KEY,
+    REDACTED_UNKNOWN_ARGUMENTS_FIELD,
+    ToolRedaction,
+    policy_closes_unknown_arguments,
+    redact_tool_call_arguments,
+)
+from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
+
+_TYPE_DRIVEN_INPUTS: dict[str, dict[str, Any]] = {
+    "set_source": {
+        "plugin": "csv",
+        "on_success": "rows",
+        "on_validation_failure": "discard",
+        "options": {"nested": [None, False, 1]},
+    },
+    "create_blob": {"filename": "data.csv", "mime_type": "text/csv", "content": "x\n1\n"},
+    "update_blob": {"blob_id": "blob", "content": "x\n2\n"},
+    "set_source_from_blob": {"blob_id": "blob", "on_success": "rows"},
+    "set_source_from_blobs": {"blob_ids": ["blob"], "on_success": "rows"},
+    "set_pipeline": {"source": {"plugin": "csv", "on_success": "rows"}, "nodes": [], "edges": [], "outputs": []},
+    "patch_source_options": {"source_name": "source", "patch": {"nested": [None, False, 1]}},
+    "patch_node_options": {"node_id": "node", "patch": {"nested": [None, False, 1]}},
+    "patch_output_options": {"sink_name": "output", "patch": {"nested": [None, False, 1]}},
+    "get_blob_content": {"blob_id": "blob"},
+    "request_interpretation_review": {"affected_node_id": "node", "kind": "vague_term", "user_term": "draft term"},
+    "splice_transform": {
+        "predecessor_id": "source",
+        "successor_id": "output",
+        "node": {"id": "node", "plugin": "passthrough", "options": {}},
+    },
+}
+
+
+def test_emission_fixtures_cover_exact_live_type_driven_universe() -> None:
+    assert _TYPE_DRIVEN_INPUTS.keys() == {name for name, entry in redaction.MANIFEST.items() if entry.argument_model is not None}
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_emission_fixture_endpoint_drift_is_rejected(monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
+    if mutation == "missing":
+        monkeypatch.delitem(_TYPE_DRIVEN_INPUTS, "get_blob_content")
+    else:
+        monkeypatch.setitem(_TYPE_DRIVEN_INPUTS, "unregistered_tool", {})
+    with pytest.raises(AssertionError):
+        test_emission_fixtures_cover_exact_live_type_driven_universe()
 
 
 def _shipped_argument_keys() -> dict[str, frozenset[str]]:
-    """Advertised argument names per tool, read from the live tool registry."""
+    """Read the owned registry grammar without skipping or overwriting rows."""
     shipped: dict[str, frozenset[str]] = {}
     for definition in get_tool_definitions():
-        function: dict[str, Any] = definition.get("function", definition)
-        name = function.get("name")
-        if not isinstance(name, str):
-            continue
-        parameters = function.get("parameters") or {}
-        properties = parameters.get("properties") or {}
-        shipped[name] = frozenset(properties)
+        name = definition["name"]
+        assert name not in shipped, f"duplicate shipped definition: {name}"
+        shipped[name] = frozenset(definition["parameters"]["properties"])
+    assert shipped, "empty tool registry"
+    assert shipped.keys() == redaction.MANIFEST.keys(), (
+        f"registry/manifest mismatch: missing policies={sorted(shipped.keys() - redaction.MANIFEST.keys())}; "
+        f"missing definitions={sorted(redaction.MANIFEST.keys() - shipped.keys())}"
+    )
     return shipped
 
 
-def _argument_allowlists() -> dict[str, frozenset[str]]:
-    """Admitted argument names per tool, read from the live redaction manifest.
+def _model_argument_keys(tool: str, model: type[BaseModel]) -> frozenset[str]:
+    """Measure accepted root names; diagnose unsupported aliases explicitly."""
+    for name, field in model.model_fields.items():
+        assert field.alias in (None, name), f"{tool}.{name}: unsupported input alias"
+        assert field.validation_alias in (None, name), f"{tool}.{name}: unsupported validation alias"
+        assert field.serialization_alias in (None, name), f"{tool}.{name}: unsupported serialization alias"
+    assert model.model_config["extra"] == "forbid", f"{tool}: argument model must reject unknown root keys"
+    schema = model.model_json_schema(mode="validation", by_alias=True)
+    assert schema["type"] == "object", f"{tool}: unsupported argument root"
+    accepted = frozenset(schema["properties"])
+    assert accepted == frozenset(model.model_fields), f"{tool}: accepted schema/field names disagree"
+    return accepted
 
-    ``MANIFEST`` maps a tool name to a ``ToolRedaction`` wrapper; the allowlist
-    lives on its ``.policy``, which is ``None`` for tools carrying no policy.
-    Reading ``known_argument_keys`` off the wrapper returns ``None`` for every
-    tool -- a confidently wrong answer rather than an error.
-    """
+
+def _admitted_argument_keys() -> dict[str, frozenset[str]]:
+    """Keep every manifest entry, including closed policies with zero keys."""
     admitted: dict[str, frozenset[str]] = {}
-    for name, entry in MANIFEST.items():
-        policy = entry.policy
-        if policy is None:
-            continue
-        keys = policy.known_argument_keys
-        if keys:
-            admitted[name] = frozenset(keys)
+    for name, entry in redaction.MANIFEST.items():
+        model = entry.argument_model
+        if model is not None:
+            admitted[name] = _model_argument_keys(name, model)
+        else:
+            policy = entry.policy
+            assert policy is not None
+            assert policy_closes_unknown_arguments(policy), f"{name}: open argument policy"
+            admitted[name] = frozenset(policy.known_argument_keys)
     return admitted
 
 
-def _fail_closed_tools() -> frozenset[str]:
-    """Tools that redact argument keys they do not recognise.
-
-    The predicate is IMPORTED from production, not restated here. The first
-    version of this file restated it as ``redact_unknown_argument_keys`` alone;
-    production's rule is ``known_argument_keys or redact_unknown_argument_keys``,
-    so this gate silently skipped ``request_advisor_hint`` -- a tool whose
-    unadmitted keys production really does replace with the sentinel (verified by
-    sending it a bogus key). A guard that re-derives its own scope drifts from the
-    authority it guards while reading as though it covered what it skipped.
-    """
-    return frozenset(name for name, entry in MANIFEST.items() if entry.policy is not None and policy_closes_unknown_arguments(entry.policy))
-
-
-def test_every_advertised_knob_on_a_fail_closed_tool_is_admitted_by_its_allowlist() -> None:
-    """A knob the model is shown must survive the audit trail intact.
-
-    On a fail-closed tool an advertised-but-unadmitted argument is destroyed by
-    name, so the audit row records that *something* unknown was sent and cannot
-    say what. The model is told the knob exists; the record of it being used is
-    discarded.
-    """
+def _assert_admitted_wire() -> None:
     shipped = _shipped_argument_keys()
-    admitted = _argument_allowlists()
-    fail_closed = _fail_closed_tools()
-
-    # Non-vacuity. Every accessor above can return an empty mapping without
-    # raising -- `known_argument_keys` read off the ToolRedaction wrapper instead
-    # of its `.policy` yields None for all 42 tools, and this assertion would
-    # then iterate nothing and pass. A gate that measures nothing must fail, not
-    # report success.
-    assert shipped, "no tool definitions read from the live registry"
-    assert admitted, "no argument allowlists read from the live redaction manifest"
-    assert fail_closed, "no fail-closed tools found; the manifest accessor is reading the wrong attribute"
-
-    unadmitted: dict[str, list[str]] = {}
-    for tool in sorted(fail_closed & set(admitted)):
-        missing = shipped.get(tool, frozenset()) - admitted[tool]
-        if missing:
-            unadmitted[tool] = sorted(missing)
-
-    assert unadmitted == {}, (
-        "These tools advertise argument keys their allowlist does not admit, and they "
-        "close over unknown arguments, so the audit trail will replace each key NAME "
-        f"with the unknown-argument sentinel: {unadmitted}. Add the key to "
-        "known_argument_keys in redaction.py's MANIFEST, or stop advertising it."
-    )
+    admitted = _admitted_argument_keys()
+    assert admitted.keys() == shipped.keys(), "ADMITTED relation omitted a registered tool"
+    for name in shipped:
+        assert shipped[name] == admitted[name], (
+            f"{name}: SHIPPED/ADMITTED mismatch: "
+            f"unadmitted={sorted(shipped[name] - admitted[name])}; unadvertised={sorted(admitted[name] - shipped[name])}"
+        )
 
 
-def test_no_allowlist_admits_an_argument_the_tool_does_not_advertise() -> None:
-    """A dead allowlist entry is a knob that was renamed or removed elsewhere.
-
-    This is the reverse direction and it is a staleness check, not a safety one:
-    admitting a key nothing ships costs nothing at runtime, but it means the
-    tuple has stopped tracking the schema and the next reader cannot tell which
-    entries are load-bearing.
-    """
-    shipped = _shipped_argument_keys()
-    admitted = _argument_allowlists()
-
-    dead: dict[str, list[str]] = {}
-    for tool in sorted(admitted):
-        if tool not in shipped:
-            continue
-        orphaned = admitted[tool] - shipped[tool]
-        if orphaned:
-            dead[tool] = sorted(orphaned)
-
-    assert dead == {}, f"Allowlist entries with no matching advertised argument: {dead}"
+def _assert_emitted_argument_keys(tool: str, raw_arguments: dict[str, Any]) -> None:
+    model = redaction.MANIFEST[tool].argument_model
+    assert model is not None
+    accepted = _model_argument_keys(tool, model)
+    model.model_validate(raw_arguments)
+    result = redact_tool_call_arguments(tool, raw_arguments, telemetry=NoopRedactionTelemetry())
+    # The current argument redactor materializes model defaults. Sparse display
+    # is a separate campaign change and must intentionally update this contract.
+    assert frozenset(result) == accepted, f"{tool}: redacted emission lost or renamed an admitted root key"
 
 
-def test_every_tool_in_the_redaction_manifest_is_a_live_registered_tool() -> None:
-    """The manifest and the registry describe the same tool set.
-
-    A manifest entry for a tool that no longer exists is unreachable policy; a
-    registered tool with no manifest entry has no redaction policy at all.
-    """
-    shipped = _shipped_argument_keys()
-
-    assert sorted(set(MANIFEST) - set(shipped)) == [], "redaction manifest entries with no live registered tool"
-    assert sorted(set(shipped) - set(MANIFEST)) == [], "registered tools absent from the redaction manifest"
+def test_every_shipped_tool_has_complete_admitted_argument_names() -> None:
+    _assert_admitted_wire()
 
 
-def test_this_gates_fail_closed_filter_is_the_one_production_applies() -> None:
-    """The gate's scope must equal production's, not merely resemble it.
+def test_duplicate_shipped_definition_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    definitions = get_tool_definitions()
+    definitions.append(definitions[0])
+    monkeypatch.setitem(globals(), "get_tool_definitions", lambda: definitions)
+    with pytest.raises(AssertionError, match="duplicate"):
+        _shipped_argument_keys()
 
-    ``_fail_closed_tools`` calls ``policy_closes_unknown_arguments``, the same
-    predicate ``_redact_via_policy`` branches on. This test fails if a future
-    edit inlines the condition here again, because the two spellings that look
-    equivalent are not: filtering on ``redact_unknown_argument_keys`` alone drops
-    every tool that closes by declaring an allowlist without setting the flag.
 
-    Asserted against a locally recomputed truth rather than the imported helper,
-    so replacing the helper with a wrong one still fails this.
-    """
-    production_closed = {
-        name
-        for name, entry in MANIFEST.items()
-        if entry.policy is not None and (entry.policy.known_argument_keys or entry.policy.redact_unknown_argument_keys)
+@pytest.mark.parametrize("missing", ["definition", "policy"])
+def test_missing_relation_endpoint_is_rejected(monkeypatch: pytest.MonkeyPatch, missing: str) -> None:
+    if missing == "definition":
+        definitions = [definition for definition in get_tool_definitions() if definition["name"] != "list_blobs"]
+        monkeypatch.setitem(globals(), "get_tool_definitions", lambda: definitions)
+    else:
+        monkeypatch.setattr(
+            redaction, "MANIFEST", MappingProxyType({name: entry for name, entry in redaction.MANIFEST.items() if name != "list_blobs"})
+        )
+    with pytest.raises(AssertionError, match=r"registry/manifest mismatch.*list_blobs"):
+        _assert_admitted_wire()
+
+
+def test_closed_empty_policy_cannot_lose_an_advertised_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    definitions = get_tool_definitions()
+    definition = next(item for item in definitions if item["name"] == "list_blobs")
+    definition["parameters"]["properties"]["new_knob"] = {"type": "string"}
+    monkeypatch.setitem(globals(), "get_tool_definitions", lambda: definitions)
+    with pytest.raises(AssertionError, match=r"list_blobs.*new_knob"):
+        _assert_admitted_wire()
+
+
+def test_type_driven_model_cannot_lose_an_advertised_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    class EmptyArguments(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+    replacement = ToolRedaction(argument_model=EmptyArguments)
+    monkeypatch.setattr(redaction, "MANIFEST", MappingProxyType({**redaction.MANIFEST, "get_blob_content": replacement}))
+    with pytest.raises(AssertionError, match=r"get_blob_content.*blob_id"):
+        _assert_admitted_wire()
+
+
+def test_type_driven_model_cannot_add_an_unadvertised_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ExtendedArguments(BaseModel):
+        blob_id: str
+        hidden: str = "default"
+        model_config = ConfigDict(extra="forbid")
+
+    replacement = ToolRedaction(argument_model=ExtendedArguments)
+    monkeypatch.setattr(redaction, "MANIFEST", MappingProxyType({**redaction.MANIFEST, "get_blob_content": replacement}))
+    with pytest.raises(AssertionError, match=r"get_blob_content.*hidden"):
+        _assert_admitted_wire()
+
+
+@pytest.mark.parametrize("alias", ["wire_id", AliasChoices("wire_id", "alternate"), AliasPath("wrapped", "wire_id")])
+def test_unresolved_validation_alias_is_not_field_name_parity(alias: str | AliasChoices | AliasPath) -> None:
+    class AliasedArguments(BaseModel):
+        blob_id: str = Field(validation_alias=alias)
+        model_config = ConfigDict(extra="forbid")
+
+    raw = {"wrapped": {"wire_id": "blob"}} if isinstance(alias, AliasPath) else {"wire_id": "blob"}
+    assert AliasedArguments.model_validate(raw).blob_id == "blob"
+    with pytest.raises(AssertionError, match="unsupported validation alias"):
+        _model_argument_keys("probe", AliasedArguments)
+
+
+def test_input_alias_and_serialization_alias_are_distinct_relations() -> None:
+    class InputAlias(BaseModel):
+        blob_id: str = Field(alias="wire_id")
+        model_config = ConfigDict(extra="forbid")
+
+    class OutputAlias(BaseModel):
+        blob_id: str = Field(serialization_alias="emitted_id")
+        model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
+
+    assert InputAlias.model_validate({"wire_id": "blob"}).blob_id == "blob"
+    assert OutputAlias.model_validate({"blob_id": "blob"}).model_dump() == {"emitted_id": "blob"}
+    with pytest.raises(AssertionError, match="unsupported input alias"):
+        _model_argument_keys("probe", InputAlias)
+    with pytest.raises(AssertionError, match="unsupported serialization alias"):
+        _model_argument_keys("probe", OutputAlias)
+
+
+@pytest.mark.parametrize("tool", [name for name, entry in redaction.MANIFEST.items() if entry.argument_model is not None])
+def test_type_driven_admitted_keys_reach_actual_redacted_output(tool: str) -> None:
+    # Explicit JSON witnesses keep this root-name claim separate from the
+    # sensitive-value property generators in the existing completeness suite.
+    _assert_emitted_argument_keys(tool, deepcopy(_TYPE_DRIVEN_INPUTS[tool]))
+
+
+def test_emitted_key_loss_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = redact_tool_call_arguments
+
+    def drop_blob_id(tool: str, arguments: dict[str, Any], *, telemetry: NoopRedactionTelemetry) -> dict[str, Any]:
+        result = original(tool, arguments, telemetry=telemetry)
+        del result["blob_id"]
+        return result
+
+    _assert_emitted_argument_keys("get_blob_content", {"blob_id": "blob"})
+    monkeypatch.setitem(globals(), "redact_tool_call_arguments", drop_blob_id)
+    with pytest.raises(AssertionError, match="emission lost or renamed"):
+        _assert_emitted_argument_keys("get_blob_content", {"blob_id": "blob"})
+
+
+def test_all_declarative_policies_close_unknown_arguments() -> None:
+    for name, entry in redaction.MANIFEST.items():
+        if entry.policy is not None:
+            assert policy_closes_unknown_arguments(entry.policy), name
+
+
+@pytest.mark.parametrize("tool", [name for name, entry in redaction.MANIFEST.items() if entry.policy is not None])
+def test_actual_declarative_redactor_drops_unknown_name_and_value(tool: str) -> None:
+    # This is redaction admission, not a claim that a handler accepts missing
+    # required fields. Absent sensitive fields are the existing walker no-op.
+    arguments = {"unadvertised_private_key": "unadvertised-private-value"}
+    original = deepcopy(arguments)
+    result = redact_tool_call_arguments(tool, arguments, telemetry=NoopRedactionTelemetry())
+    assert result == {REDACTED_UNKNOWN_ARGUMENTS_FIELD: REDACTED_UNKNOWN_ARGUMENT_KEY}
+    assert arguments == original
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("get_plugin_schema", {"plugin_type": "source", "name": "csv"}),
+        ("get_plugin_assistance", {"plugin_type": "source", "plugin_name": "csv", "issue_code": None}),
+        ("explain_validation_error", {"error_text": "quarantine_unknown_output"}),
+        ("get_pipeline_state", {"component": "sources"}),
+        ("list_models", {"provider": "example/", "limit": 1}),
+    ],
+)
+def test_closed_discovery_preserves_supplied_values_and_omissions(tool: str, arguments: dict[str, Any]) -> None:
+    schema = next(definition["parameters"] for definition in get_tool_definitions() if definition["name"] == tool)
+    Draft202012Validator(schema).validate(arguments)
+    assert redact_tool_call_arguments(tool, arguments, telemetry=NoopRedactionTelemetry()) == arguments
+    assert redact_tool_call_arguments(tool, {}, telemetry=NoopRedactionTelemetry()) == {}
+
+
+def test_closure_uses_allowlist_even_without_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = redaction.MANIFEST["request_advisor_hint"].policy
+    assert policy is not None and policy.known_argument_keys and not policy.redact_unknown_argument_keys
+    assert policy_closes_unknown_arguments(policy)
+    assert "request_advisor_hint" in _admitted_argument_keys()
+    assert redact_tool_call_arguments("request_advisor_hint", {"unknown": "private"}, telemetry=NoopRedactionTelemetry()) == {
+        REDACTED_UNKNOWN_ARGUMENTS_FIELD: REDACTED_UNKNOWN_ARGUMENT_KEY
     }
-
-    assert _fail_closed_tools() == production_closed, (
-        "This gate's fail-closed set has diverged from the rule _redact_via_policy "
-        "applies. Tools it would skip: "
-        f"{sorted(production_closed - _fail_closed_tools())}"
-    )
-
-    flag_only = {name for name, entry in MANIFEST.items() if entry.policy is not None and entry.policy.redact_unknown_argument_keys}
-    assert production_closed - flag_only, (
-        "Expected at least one tool that closes by declaring known_argument_keys "
-        "without setting redact_unknown_argument_keys. If none remains, this test's "
-        "premise is gone and it should be retired rather than left passing vacuously."
-    )
+    monkeypatch.setitem(globals(), "policy_closes_unknown_arguments", lambda value: value.redact_unknown_argument_keys)
+    with pytest.raises(AssertionError, match="open argument policy"):
+        _admitted_argument_keys()

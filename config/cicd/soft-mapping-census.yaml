@@ -844,7 +844,7 @@ files:
   src/elspeth/web/composer/tools/_registry.py:
     Mapping[str, Any]: 2
   src/elspeth/web/composer/tools/blobs.py:
-    boundary: 3
+    boundary: 2
     dict[str, Any]: 12
   src/elspeth/web/composer/tools/declarations.py:
     Mapping[str, Any]: 4
@@ -1014,7 +1014,7 @@ totals:
   Mapping[str, Any]: 864
   Mapping[str, object]: 290
   MutableMapping[str, Any]: 13
-  boundary: 64
+  boundary: 63
   dict[str, Any]: 1138
   dict[str, object]: 399
   soft: 2704

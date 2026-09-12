@@ -993,18 +993,12 @@ def _check_blob_quota(
     return None
 
 
-@trust_boundary(
-    tier=3,
-    source="LLM-supplied create_blob-style tool arguments (filename / mime_type / content / optional description)",
-    source_param="arguments",
-    suppresses=("R1",),
-    invariant="raises ToolArgumentError on a disallowed MIME type, unsanitizable filename, or non-UTF-8-encodable content; never coerces malformed arguments",
-    test_ref="tests/integration/web/composer/test_inline_source_provenance.py::test_non_utf8_content_raises_tool_argument_error",
-    test_fingerprint="0ba34e12e1e4291965b7a438789c3b877f8a9f1a2add72e9c8d1fe51628f3ab3",
-)
 def _prepare_blob_create(
-    arguments: Mapping[str, Any],
     *,
+    filename: str,
+    mime_type: str,
+    content: str,
+    description: str | None = None,
     data_dir: str,
     session_id: str,
     creation_modality: CreationModality,
@@ -1015,28 +1009,13 @@ def _prepare_blob_create(
     creating_composer_skill_hash: str | None = None,
     creating_arguments_hash: str | None = None,
 ) -> _PreparedBlobCreate:
-    """Validate a create_blob-style payload and allocate its storage path.
+    """Prepare admitted blob fields and allocate their storage path.
 
     Type guarantees on entry
     ------------------------
-    Every reachable caller validates ``arguments`` via a Pydantic model
-    BEFORE invoking this helper:
-
-      * :func:`_execute_create_blob` — :class:`CreateBlobArgumentsModel`
-        (``filename: str``, ``mime_type: str``, ``content: str`` +
-        ``extra="forbid"``).
-      * :func:`_execute_set_pipeline` inline-blob path — passes
-        ``validated.source.inline_blob.model_dump()`` (via
-        :class:`_InlineBlobModel`; same string-typed required fields
-        + ``extra="forbid"``).
-
-    The three ``isinstance(..., str)`` guards that previously sat at the
-    top of this function are therefore unreachable — Pydantic rejects any
-    non-string value with a structured :class:`pydantic.ValidationError`
-    re-raised by the caller as :class:`ToolArgumentError` before this
-    helper is invoked.  They are removed in the same commit that promotes
-    ``set_pipeline`` so the dead-code surface does not linger past the
-    wave that makes it dead (CONTRIBUTING.md §Code Standards).
+    Production callers pass fields directly from CreateBlobArgumentsModel
+    or the set_pipeline source's _InlineBlobModel after Pydantic admission.
+    The explicit keyword parameters preserve that shared typed contract.
 
     Semantic checks below this point (MIME allowlist, filename
     sanitisation, UTF-8 encodability) ARE NOT type checks — they enforce
@@ -1053,10 +1032,6 @@ def _prepare_blob_create(
     — the constraint IS the validation, per the engine-patterns-reference
     skill §Offensive Programming Examples.
     """
-    filename = arguments["filename"]
-    mime_type = arguments["mime_type"]
-    content = arguments["content"]
-
     if is_llm_authored_creation_modality(creation_modality) and created_from_message_id is None:
         raise AuditIntegrityError(
             "LLM-authored blob creation_modality requires created_from_message_id so the audit trail can walk back to the triggering chat message"
@@ -1114,7 +1089,7 @@ def _prepare_blob_create(
         content_bytes=content_bytes,
         content_hash=file_hash,
         storage_path=_blob_storage_path(data_dir, session_id, blob_id, safe_filename),
-        description=arguments.get("description"),
+        description=description,
         creation_modality=creation_modality,
         created_from_message_id=created_from_message_id,
         creating_model_identifier=creating_model_identifier,
@@ -1217,7 +1192,7 @@ def _execute_create_blob(
     ARG_ERROR routing at ``service.py:2480`` receives the right
     exception class.
 
-    The validated ``model_dump()`` is then fed to ``_prepare_blob_create``
+    The validated fields are then passed to ``_prepare_blob_create``
     which still performs the MIME-type allowlist check and
     :func:`sanitize_filename` traversal-defence — those are semantic
     Tier-3 checks (value-based) that Pydantic's type validation cannot
@@ -1262,7 +1237,10 @@ def _execute_create_blob(
     # to ARG_ERROR (CEC1 channel discipline).
     provenance = _blob_creation_provenance(validated.content, context)
     prepared = _prepare_blob_create(
-        validated.model_dump(),
+        filename=validated.filename,
+        mime_type=validated.mime_type,
+        content=validated.content,
+        description=validated.description,
         data_dir=context.data_dir,
         session_id=session_id,
         creation_modality=provenance.creation_modality,

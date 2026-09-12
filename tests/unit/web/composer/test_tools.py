@@ -2113,6 +2113,7 @@ class TestUpsertNode:
         assert result2.success is True
         assert len(result2.updated_state.nodes) == 1
         assert result2.updated_state.nodes[0].input == "new_in"
+        assert deep_thaw(result2.updated_state.nodes[0].options) == {"schema": {"mode": "observed"}}
 
     def test_gate_node_no_plugin_validation(self) -> None:
         """Gates don't have plugins — should not validate against catalog."""
@@ -12037,6 +12038,41 @@ class TestExplainValidationCode:
 
 
 class TestListModels:
+    def test_mixed_catalog_provider_and_limit_select_exact_models(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.web.composer.tools import generation
+
+        matching = [f"example/model{i:02}" for i in range(52)]
+        models = ["other/foreign", "bare-model", *matching, "example-other/foreign"]
+        monkeypatch.setattr(generation, "read_litellm_model_list", lambda: models)
+
+        default = execute_tool("list_models", {"provider": "example/"}, _empty_state(), _mock_catalog())
+        limited = execute_tool("list_models", {"provider": "example/", "limit": 2}, _empty_state(), _mock_catalog())
+        complete = execute_tool("list_models", {"provider": "example/", "limit": 52}, _empty_state(), _mock_catalog())
+
+        assert default.success is True
+        assert deep_thaw(default.data) == {"models": matching[:50], "count": 52, "truncated": True}
+        assert limited.success is True
+        assert deep_thaw(limited.data) == {"models": matching[:2], "count": 52, "truncated": True}
+        assert complete.success is True
+        assert deep_thaw(complete.data) == {"models": matching, "count": 52, "truncated": False}
+
+    def test_mixed_catalog_omitted_and_empty_provider_take_distinct_branches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.web.composer.tools import generation
+
+        models = ["example/one", "bare-one", "other/two", "bare-two", "openrouter/stale"]
+        monkeypatch.setattr(generation, "read_litellm_model_list", lambda: models)
+        monkeypatch.setattr(generation, "get_catalog_values", lambda name: frozenset({"live/one", "live/two"}))
+
+        summary = execute_tool("list_models", {}, _empty_state(), _mock_catalog())
+        unprefixed = execute_tool("list_models", {"provider": ""}, _empty_state(), _mock_catalog())
+
+        assert summary.success is True
+        assert deep_thaw(summary.data["providers"]) == {"example": 1, "": 2, "other": 1, "openrouter": 2}
+        assert summary.data["total_models"] == 6
+        assert "models" not in summary.data
+        assert unprefixed.success is True
+        assert deep_thaw(unprefixed.data) == {"models": ["bare-one", "bare-two"], "count": 2, "truncated": False}
+
     def test_list_models_returns_provider_summary(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
@@ -14394,6 +14430,7 @@ class TestPrevalidatePluginOptions:
         assert node.id == "agg1"
         assert node.node_type == "aggregation"
         assert node.plugin == "batch_stats"
+        assert deep_thaw(node.options) == {"schema": {"mode": "observed"}, "value_field": "amount"}
 
     def test_patch_node_options_collector_routes_through_prevalidation(self) -> None:
         """patch_node_options with node_type='collector' pre-validates the patch.

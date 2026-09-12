@@ -244,26 +244,46 @@ field extraction, and prove operational consumption separately with behavioral
 tests. This corrects the stronger obsolete requirements copied into the initial
 resumption plan; it does not lower the accepted evidence standard.
 
-- [ ] Reuse the actual callable catalogue and source provenance utilities for
+**Implementation checkpoint — 2026-09-12.** The live CLI measures 42 tools with
+no missing, extra or unresolved READ fields. ADMITTED measures 30 closed
+declarative policies and 12 type-driven models, covering the same 42 tools and
+104 advertised knobs. These are extraction and root-name relations; separate
+behavior tests check selected results, persisted state and mocked advisor requests.
+The shared blob preparation helper now receives explicit typed fields, removing
+its bulk-mapping conversion without a census exemption. Unsupported wrappers,
+deferred bodies, overridden validation and captured-callable aliases fail visibly.
+
+A frozen combined Composer/MCP and touched blob-integration run recorded
+`exit=0; 9365 passed; 1 warning`. Subsequent census-only typing and deferred
+MODEL-admission refinements recorded `exit=0; 177 passed`, with five-file mypy
+and Ruff passing. Independent runtime controls reproduced the original false
+attribution cases and then passed against the repaired, unchanged source.
+ADMITTED's related selection recorded `exit=0; 468 passed; 1 warning`; its actual
+closure-policy mutation failed and the restored selection passed. The warning
+is the existing Hypothesis Strict-metadata limitation, not a new fixture warning.
+Fresh-worktree checkpoint proof remains recorded separately under `.verify/`;
+full repository, PostgreSQL, moving-release and live acceptance remain later work.
+
+- [x] Reuse the actual callable catalogue and source provenance utilities for
   READ. Bind instances to complete original-input admission, and collect direct
   declared field accesses and literal raw reads along supported owned helpers.
   Preserve extraction sites alongside unresolved provenance. Do not label these
   static extractions as operational consumption.
-- [ ] Add the derived READ relation and provenance controls: foreign/independent
+- [x] Add the derived READ relation and provenance controls: foreign/independent
   model instances, unused nested functions, ambiguous aliases/copies and whole
   model dumps cannot manufacture coverage. Unsupported paths remain explicit
   findings; a bulk dump never implies every field is extracted.
-- [ ] Add meaningful behavior probes showing representative field changes alter
+- [x] Add meaningful behavior probes showing representative field changes alter
   intended state, selected results, or the request at a mocked boundary. Cover
   optional branches and defaults. Dead-read/logging-only positives are not
   consumption evidence. No general semantic-use graph or shadow field reads.
-- [ ] Extend `test_tool_argument_wire_parity.py` to include closed-empty policies,
+- [x] Extend `test_tool_argument_wire_parity.py` to include closed-empty policies,
   type-driven models and actual accepted/emitted wire names. Check exact universe
   equality before per-field comparisons; do not intersect away missing endpoints.
-- [ ] Tighten internally chosen open policies under the existing ruling and
+- [x] Tighten internally chosen open policies under the existing ruling and
   prove existing sensitive-value handling. ADMITTED and MODEL remain different
   authorities; name preservation does not authorize value disclosure.
-- [ ] Run representative missing-endpoint, empty-allowlist, input-alias,
+- [x] Run representative missing-endpoint, empty-allowlist, input-alias,
   serialization-alias, removed-use and advisor-interception mutations.
 
 ### 3. Introduce direct diagnostic guidance and freeze legacy regex growth

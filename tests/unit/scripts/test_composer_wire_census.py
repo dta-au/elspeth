@@ -321,3 +321,441 @@ def test_mutated_original_input_is_refused(module_factory: Callable[[str, str], 
     )
     with pytest.raises(CensusError):
         _model_for_handler(handler(module))
+
+
+def test_read_tracks_admitted_instance_and_raw_helper(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_owned",
+        """
+class Model(BaseModel):
+    first: str
+    second: str
+def child(payload):
+    return payload.get('hidden')
+def arbitrary_name(arguments):
+    admitted = Model.model_validate(arguments)
+    independent = Model.model_validate({'first':'a', 'second':'b'})
+    def unused():
+        return admitted.second
+    return admitted.first, independent.second, child(arguments)
+""",
+    )
+    evidence, presence, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == {"first", "hidden"}
+    assert not presence
+    assert not unresolved
+    assert any("child" in item.site for item in evidence)
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("return Model.model_validate(arguments).first", {"first"}),
+        ("validated = Model.model_validate(arguments)\n    unused = validated.first", {"first"}),
+        ("validated = Model.model_validate(arguments)\n    print(validated.first)", {"first"}),
+        ("return arguments['raw']", {"raw"}),
+        ("return 'raw' in arguments", set()),
+    ],
+)
+def test_read_is_extraction_not_causal_use(module_factory: Callable[[str, str], ModuleType], body: str, expected: set[str]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_extraction", "class Model(BaseModel):\n    first: str\ndef arbitrary_name(arguments):\n    " + body + "\n"
+    )
+    evidence, presence, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == expected
+    assert {item.field for item in presence} == ({"raw"} if " in arguments" in body else set())
+    assert not unresolved
+
+
+@pytest.mark.parametrize(
+    "body,reason",
+    [
+        ("alias = arguments\n    return alias['hidden']", "alias"),
+        ("return arguments[key]", "dynamic"),
+        ("return arguments.get(key)", "dynamic"),
+        ("return Model.model_validate(arguments).model_dump()", "bulk"),
+        ("return Model.model_validate(arguments).model_copy(deep=True)", "copy"),
+        ("parsed = Model.model_validate(arguments)\n    parsed = Model(first='foreign')\n    return parsed.first", "rebound"),
+        ("def child():\n        return arguments['hidden']\n    child = lambda: None\n    return child()", "closure"),
+        ("return (lambda: arguments['hidden'])()", "closure"),
+        ("child = lambda: arguments['hidden']\n    return child()", "closure"),
+        ("return getattr(Model.model_validate(arguments), key)", "unsupported"),
+        ("return dict(Model.model_validate(arguments)).first", "bulk"),
+        ("copied = {**arguments}\n    return Model.model_validate(copied).first", "construction"),
+        ("copied = dict(arguments)\n    copied.clear()\n    return Model.model_validate(copied).first", "mutated"),
+    ],
+)
+def test_read_unresolved_provenance_is_not_silent(module_factory: Callable[[str, str], ModuleType], body: str, reason: str) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_unresolved", "class Model(BaseModel):\n    first: str\ndef arbitrary_name(arguments):\n    " + body + "\n"
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any(reason in item for item in unresolved), unresolved
+
+
+def test_read_keeps_partial_extractions_when_bulk_is_unresolved(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_partial",
+        "class Model(BaseModel):\n    first: str\n    second: str\ndef arbitrary_name(arguments):\n"
+        "    parsed = Model.model_validate(arguments)\n    print(parsed.first)\n    return parsed.model_dump()\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == {"first"}
+    assert any("bulk" in item for item in unresolved)
+
+
+def test_read_complete_raw_copy_and_renamed_model_forwarding(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_copy",
+        """
+from typing import cast as identity
+class Model(BaseModel):
+    first: str
+    second: str
+def child(other_name):
+    return other_name.first
+def arbitrary_name(arguments):
+    copied = dict(arguments)
+    parsed = identity(Model, Model.model_validate(copied))
+    return child(other_name=parsed)
+""",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == {"first"}
+    assert not unresolved
+
+
+def test_read_owned_method_projects_fields_but_foreign_method_does_not(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_method",
+        """
+class Model(BaseModel):
+    first: str
+    second: str
+    def projection(self):
+        return {'first': self.first}
+def arbitrary_name(arguments):
+    parsed = Model.model_validate(arguments)
+    foreign = Model(first='x',second='y')
+    return parsed.projection(), foreign.second
+""",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == {"first"}
+    assert not unresolved
+
+
+def test_read_helper_foreign_return_does_not_inherit_input_identity(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_foreign_return",
+        """
+class Model(BaseModel):
+    first: str
+def child(payload):
+    Model.model_validate(payload)
+    return Model(first='foreign')
+def arbitrary_name(arguments):
+    result = child(arguments)
+    return result.first
+""",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert not unresolved
+
+
+def test_read_live_catalog_and_empty_tool_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.cicd import composer_wire_census as census
+
+    definitions = census.get_tool_definitions()
+    rows = census.census_read_wire()
+    assert set(rows) == {definition["name"] for definition in definitions}
+    empty = next(definition for definition in definitions if not definition["parameters"]["properties"])
+    assert not rows[empty["name"]].read
+    empty["parameters"]["properties"]["injected"] = {"type": "string"}
+    monkeypatch.setattr(census, "get_tool_definitions", lambda: definitions)
+    changed = census.census_read_wire()[empty["name"]]
+    assert changed.shipped - changed.read == {"injected"}
+
+
+@pytest.mark.parametrize("update,expected", [("{}", {"first", "second"}), ("{'first':'server'}", {"second"})])
+def test_read_model_copy_drops_overwritten_slot_provenance(
+    module_factory: Callable[[str, str], ModuleType], update: str, expected: set[str]
+) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_model_copy",
+        "class Model(BaseModel):\n    first: str\n    second: str\n"
+        "def child(payload):\n    return payload.first, payload.second\n"
+        "def arbitrary_name(arguments):\n    parsed = Model.model_validate(arguments)\n"
+        f"    return child(parsed.model_copy(update={update}))\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == expected
+    assert not unresolved
+
+
+@pytest.mark.parametrize("update", ["updates", "{'unknown':'x'}", "{**updates}"])
+def test_read_unknown_model_copy_stays_unresolved(module_factory: Callable[[str, str], ModuleType], update: str) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_opaque_copy",
+        "class Model(BaseModel):\n    first: str\ndef arbitrary_name(arguments):\n"
+        f"    return Model.model_validate(arguments).model_copy(update={update}).first\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("copy" in finding for finding in unresolved)
+
+
+@pytest.mark.parametrize("invocation,expected", [("child()", {"first"}), ("None", set())])
+def test_read_only_invoked_unshadowed_closure_receives_provenance(
+    module_factory: Callable[[str, str], ModuleType], invocation: str, expected: set[str]
+) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_closure",
+        "class Model(BaseModel):\n    first: str\n    second: str\ndef arbitrary_name(arguments):\n"
+        "    parsed = Model.model_validate(arguments)\n    foreign = Model(first='a', second='b')\n"
+        "    def child():\n        return parsed.first, foreign.second\n"
+        f"    return {invocation}\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == expected
+    assert not unresolved
+
+
+def test_read_closure_mutated_capture_is_unresolved(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_mutated_capture",
+        "class Model(BaseModel):\n    first: str\ndef arbitrary_name(arguments):\n"
+        "    parsed = Model.model_validate(arguments)\n    def child():\n"
+        "        nonlocal parsed\n        parsed = Model(first='foreign')\n        return parsed.first\n"
+        "    return child()\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("rebound" in finding for finding in unresolved)
+
+
+def test_public_read_census_contract_covers_live_registry() -> None:
+    from scripts.cicd import composer_wire_census as census
+
+    assert "census_read_wire" in vars(census), "READ census API is missing"
+    assert callable(census.census_read_wire)
+    rows = census.census_read_wire()
+    definitions = census.get_tool_definitions()
+    assert set(rows) == {definition["name"] for definition in definitions}
+    for row in rows.values():
+        assert row.read == frozenset(item.field for item in row.extractions)
+        assert row.read == row.shipped, (row.tool, row.shipped - row.read, row.read - row.shipped)
+        assert not row.unresolved, (row.tool, row.unresolved)
+        assert all(item.site and item.callers for item in row.extractions)
+
+
+def test_read_overridden_model_copy_is_not_pydantic_copy(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_fake_model_copy",
+        "class Model(BaseModel):\n    first: str\n"
+        "    def model_copy(self, *, update):\n        return Model(first='foreign')\n"
+        "def arbitrary_name(arguments):\n    return Model.model_validate(arguments).model_copy(update={}).first\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("copy" in finding for finding in unresolved)
+
+
+def test_read_closure_import_shadow_does_not_borrow_capture(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_import_shadow",
+        "class Model(BaseModel):\n    first: str\ndef arbitrary_name(arguments):\n"
+        "    parsed = Model.model_validate(arguments)\n    def child():\n"
+        "        from elsewhere import parsed\n        return parsed.first\n    return child()\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("rebound" in finding for finding in unresolved)
+
+
+def test_read_decorated_closure_has_no_original_body_guarantee(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_decorated_closure",
+        "def replacement(function):\n    return lambda: None\n"
+        "def arbitrary_name(arguments):\n    @replacement\n    def child():\n"
+        "        return arguments['hidden']\n    return child()\n",
+    )
+    assert handler(module)({"hidden": "not read"}) is None
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("closure" in finding for finding in unresolved)
+
+
+def test_read_overridden_model_validation_cannot_create_origin(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_overridden_validation",
+        "class Model(BaseModel):\n    first: str\n    @classmethod\n"
+        "    def model_validate(cls, obj):\n        return cls(first='foreign')\n"
+        "def arbitrary_name(arguments):\n    return Model.model_validate(arguments).first\n",
+    )
+    assert handler(module)({"first": "input"}) == "foreign"
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("overridden" in finding for finding in unresolved)
+    with pytest.raises(CensusError, match="overridden"):
+        _model_for_handler(handler(module))
+
+
+@pytest.mark.parametrize(
+    "child,call",
+    [
+        ("async def child(payload):\n    return payload.first\n", "child(parsed)"),
+        ("def child(payload):\n    yield payload.first\n", "child(parsed)"),
+    ],
+)
+def test_read_dormant_helper_body_is_unresolved(module_factory: Callable[[str, str], ModuleType], child: str, call: str) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_dormant_helper",
+        "class Model(BaseModel):\n    first: str\n"
+        + child
+        + "def arbitrary_name(arguments):\n    parsed = Model.model_validate(arguments)\n"
+        + f"    return {call}\n",
+    )
+    dormant = handler(module)({"first": "unread"})
+    dormant.close()
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("deferred" in finding for finding in unresolved)
+
+
+def test_read_local_generator_body_is_unresolved(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_dormant_local",
+        "class Model(BaseModel):\n    first: str\ndef arbitrary_name(arguments):\n"
+        "    parsed = Model.model_validate(arguments)\n    def child():\n        yield parsed.first\n"
+        "    return child()\n",
+    )
+    dormant = handler(module)({"first": "unread"})
+    dormant.close()
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("closure" in finding for finding in unresolved)
+
+
+def test_read_awaited_helper_extracts_original_input(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_awaited_helper",
+        "class Model(BaseModel):\n    first: str\nasync def child(payload):\n    return payload.first\n"
+        "async def arbitrary_name(arguments):\n    return await child(Model.model_validate(arguments))\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == {"first"}
+    assert not unresolved
+
+
+@pytest.mark.parametrize("forward", [True, False])
+def test_wrapper_must_forward_actual_original_input(module_factory: Callable[[str, str], ModuleType], forward: bool) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    call = "function(*args, **kwargs)" if forward else "function({'first': 'foreign'})"
+    module = module_factory(
+        "read_wrapper",
+        "from functools import wraps\nclass Model(BaseModel):\n    first: str\n"
+        "def decorate(function):\n    @wraps(function)\n    def wrapper(*args, **kwargs):\n"
+        f"        return {call}\n    return wrapper\n"
+        "@decorate\ndef child(payload):\n    return Model.model_validate(payload).first\n"
+        "def arbitrary_name(arguments):\n    return child(arguments)\n",
+    )
+    assert handler(module)({"first": "original"}) == ("original" if forward else "foreign")
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    if forward:
+        assert {item.field for item in evidence} == {"first"}
+        assert not unresolved
+        assert _model_for_handler(handler(module))[0] is vars(module)["Model"]
+    else:
+        assert not evidence
+        assert any("wrapper" in finding for finding in unresolved)
+        with pytest.raises(CensusError, match="wrapper"):
+            _model_for_handler(handler(module))
+
+
+def test_read_captured_closure_alias_is_explicitly_unresolved(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_alias_closure",
+        "def arbitrary_name(arguments):\n    def child():\n        return arguments['hidden']\n    run = child\n    return run()\n",
+    )
+    assert handler(module)({"hidden": "original"}) == "original"
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any("closure alias" in finding for finding in unresolved)
+
+
+@pytest.mark.parametrize("kind", ["async", "generator", "awaited"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_admission_and_read_require_invoked_helper_body(module_factory: Callable[[str, str], ModuleType], kind: str, wrapped: bool) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    decoration = (
+        "from functools import wraps\ndef decorate(function):\n    @wraps(function)\n"
+        "    def wrapper(*args, **kwargs):\n        return function(*args, **kwargs)\n    return wrapper\n"
+    )
+    prefix = "async " if kind != "generator" else ""
+    operation = "yield" if kind == "generator" else "return"
+    module = module_factory(
+        "deferred_admission",
+        "class Model(BaseModel):\n    first: str\n"
+        + decoration
+        + ("@decorate\n" if wrapped else "")
+        + f"{prefix}def child(payload):\n    {operation} Model.model_validate(payload).first\n"
+        + ("async " if kind == "awaited" else "")
+        + "def arbitrary_name(arguments):\n    return "
+        + ("await " if kind == "awaited" else "")
+        + "child(arguments)\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    if kind == "awaited":
+        assert _model_for_handler(handler(module))[0] is vars(module)["Model"]
+        assert {item.field for item in evidence} == {"first"}
+        assert not unresolved
+    else:
+        dormant = handler(module)({"first": "unread"})
+        dormant.close()
+        with pytest.raises(CensusError, match="deferred"):
+            _model_for_handler(handler(module))
+        assert not evidence
+        assert any("deferred" in finding for finding in unresolved)

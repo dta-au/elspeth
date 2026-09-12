@@ -111,9 +111,8 @@ _TOOL_RESULT_ENVELOPE_KEYS: frozenset[str] = frozenset(TOOL_RESULT_REQUIRED_KEYS
 # Fixed sentinel for arguments that appear in the input but are not declared in
 # a manifest entry's optional known_argument_keys allowlist. Unknown key names
 # are removed too; they are LLM-controlled text and may themselves carry
-# sensitive payload. Most declarative tools still preserve historical
-# passthrough behavior; tools that persist untyped, LLM-supplied argument dicts
-# can opt into this fail-closed mode with redact_unknown_argument_keys=True.
+# sensitive payload. Every registered declarative tool closes its argument
+# names; redact_unknown_argument_keys=True also closes an empty argument set.
 REDACTED_UNKNOWN_ARGUMENT_KEY = "<redacted-unknown-argument-key>"
 REDACTED_UNKNOWN_ARGUMENTS_FIELD = "_unknown_arguments"
 
@@ -3621,72 +3620,84 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
         # _DISCOVERY_TOOLS, 12 declarative entries.
         "list_sources": ToolRedaction(
             policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_LIST_SOURCES_REASON,
             )
         ),
         "list_transforms": ToolRedaction(
             policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_LIST_TRANSFORMS_REASON,
             )
         ),
         "list_sinks": ToolRedaction(
             policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_LIST_SINKS_REASON,
             )
         ),
         "get_plugin_schema": ToolRedaction(
             policy=ToolRedactionPolicy(
+                known_argument_keys=("plugin_type", "name"),
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_GET_PLUGIN_SCHEMA_REASON,
             )
         ),
         "get_expression_grammar": ToolRedaction(
             policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_GET_EXPRESSION_GRAMMAR_REASON,
             )
         ),
         "explain_validation_error": ToolRedaction(
             policy=ToolRedactionPolicy(
+                known_argument_keys=("error_text",),
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_EXPLAIN_VALIDATION_ERROR_REASON,
             )
         ),
         "get_plugin_assistance": ToolRedaction(
             policy=ToolRedactionPolicy(
+                known_argument_keys=("plugin_type", "plugin_name", "issue_code"),
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_GET_PLUGIN_ASSISTANCE_REASON,
             )
         ),
         "list_models": ToolRedaction(
             policy=ToolRedactionPolicy(
+                known_argument_keys=("provider", "limit"),
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_LIST_MODELS_REASON,
             )
         ),
         "get_audit_info": ToolRedaction(
             policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_GET_AUDIT_INFO_REASON,
             )
         ),
         "get_pipeline_state": ToolRedaction(
             policy=ToolRedactionPolicy(
+                known_argument_keys=("component",),
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_GET_PIPELINE_STATE_REASON,
             )
         ),
         "preview_pipeline": ToolRedaction(
             policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_PREVIEW_PIPELINE_REASON,
             )
         ),
         "diff_pipeline": ToolRedaction(
             policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_DIFF_PIPELINE_REASON,
             )
