@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore } from "@/stores/sessionStore";
 import { clearAllGuidedRetries } from "@/stores/guidedOperationRetry";
 import fixture from "../../../../../../tests/fixtures/web/composer/composition_state_validation_errors.json";
+import emptyStateResponse from "../../../../../../tests/fixtures/web/composer/empty_composition_state_response.json";
 
 import { fetchCompositionState, fetchStateVersions, importCompositionYaml, revertToVersion } from "./client";
 import { decodeCompositionState } from "./guidedDecoder";
@@ -80,9 +81,29 @@ describe("composition state HTTP admission", () => {
     await expect(fetchStateVersions("session-1")).rejects.toThrow(/composition_states\[0\].validation_errors/);
   });
 
-  it("rejects null successful response roots", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(new Response("null"));
-    await expect(fetchCompositionState("session-1")).rejects.toThrow(/composition_state/);
+  it("preserves the actual empty-session HTTP producer's successful null response", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(emptyStateResponse.body), {
+      status: emptyStateResponse.status,
+    }));
+    expect(await fetchCompositionState("session-1")).toBeNull();
+  });
+
+  it.each([{}, [], false, "not a state"])("rejects malformed non-null fetched state %j", async (body) => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(body)));
+    await expect(fetchCompositionState("session-1")).rejects.toThrow();
+  });
+
+  it("rejects a missing successful response body", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(""));
+    await expect(fetchCompositionState("session-1")).rejects.toThrow();
+  });
+
+  it("does not widen the required-state decoder for other endpoints", async () => {
+    expect(() => decodeCompositionState(null)).toThrow(/composition_state/);
+    for (const operation of [operations[1][1], operations[2][1]]) {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response("null"));
+      await expect(operation()).rejects.toThrow(/composition_state/);
+    }
   });
 
   it("stores a decoded revert response and refuses a malformed replacement", async () => {

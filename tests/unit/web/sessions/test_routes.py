@@ -7315,6 +7315,8 @@ class TestStateRoutes:
         state_resp = client.get(f"/api/sessions/{session_id}/state")
         assert state_resp.status_code == 200
         assert state_resp.json() is None
+        fixture = Path(__file__).resolve().parents[3] / "fixtures/web/composer/empty_composition_state_response.json"
+        assert json.loads(fixture.read_text()) == {"status": state_resp.status_code, "body": state_resp.json()}
 
     def test_get_state_versions(self, tmp_path) -> None:
         app, _ = _make_app(tmp_path)

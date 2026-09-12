@@ -1115,7 +1115,8 @@ export async function fetchCompositionState(
   if (response.status === 404) {
     return null;
   }
-  return decodeCompositionState(await parseResponse<unknown>(response));
+  const body = await parseResponse<unknown>(response);
+  return body === null ? null : decodeCompositionState(body);
 }
 
 /** Get all composition state versions for a session. */
