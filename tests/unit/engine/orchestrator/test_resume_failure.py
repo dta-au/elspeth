@@ -174,6 +174,7 @@ def _insert_run_source(
         )
 
 
+@contextmanager
 def _admit_resume_point(orch: Orchestrator, resume_point: ResumePoint) -> Any:
     """Satisfy the resume() entry guard's read-only checkpoint checks.
 
@@ -190,10 +191,17 @@ def _admit_resume_point(orch: Orchestrator, resume_point: ResumePoint) -> Any:
     manager.get_latest_checkpoint.return_value = resume_point.checkpoint
     orch._checkpoint_manager = manager
     orch._resume_coordinator._checkpoint_manager = manager
-    return patch(
-        "elspeth.engine.orchestrator.resume.CheckpointCompatibilityValidator.validate",
-        return_value=ResumeCheck(can_resume=True),
-    )
+    with (
+        patch(
+            "elspeth.engine.orchestrator.resume.CheckpointCompatibilityValidator.validate",
+            return_value=ResumeCheck(can_resume=True),
+        ),
+        patch(
+            "elspeth.engine.orchestrator.resume.check_implementation_compatibility",
+            return_value=ResumeCheck(can_resume=True),
+        ),
+    ):
+        yield
 
 
 @pytest.mark.parametrize(
@@ -336,6 +344,9 @@ def test_real_payload_restore_failure_releases_reconstruction_seat(damage: str, 
     )
     orch = _make_orchestrator(db)
     recovery = RecoveryManager(db, MagicMock(spec=CheckpointManager))
+    manager = MagicMock(spec=CheckpointManager)
+    manager.get_latest_checkpoint.return_value = checkpoint
+    orch._resume_coordinator._checkpoint_manager = manager
     source_id = NodeID(setup.source_node_id)
     snapshot = _ResumeAuditSnapshot(
         factory=factory,
@@ -366,6 +377,77 @@ def test_real_payload_restore_failure_releases_reconstruction_seat(damage: str, 
     assert seat.leader_epoch == setup.coordination_token.leader_epoch + 1
     assert seat.leader_worker_id is None
     flush.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_cause"),
+    [
+        ("missing", ResumeRefusalCause.CHECKPOINT_MISSING),
+        ("format-missing", ResumeRefusalCause.CHECKPOINT_FORMAT_MISSING),
+        ("format-incompatible", ResumeRefusalCause.CHECKPOINT_FORMAT_INCOMPATIBLE),
+        ("topology", ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED),
+    ],
+)
+def test_checkpoint_race_refusal_preserves_cause_and_releases_seat(damage: str, expected_cause: ResumeRefusalCause) -> None:
+    from dataclasses import replace
+
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import run_coordination_table
+
+    store = MockPayloadStore()
+    setup = make_recorder_with_run(payload_store=store)
+    factory, db, run_id = setup.factory, setup.db, setup.run_id
+    factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=setup.coordination_token)
+    factory.run_coordination.release_seat(token=setup.coordination_token)
+    checkpoint = Checkpoint(
+        checkpoint_id="original-checkpoint",
+        run_id=run_id,
+        sequence_number=1,
+        created_at=datetime.now(UTC),
+        upstream_topology_hash="a" * 64,
+        format_version=Checkpoint.CURRENT_FORMAT_VERSION,
+    )
+    advanced = replace(checkpoint, checkpoint_id="advanced-checkpoint", sequence_number=2)
+    if damage == "missing":
+        latest = None
+    elif damage == "format-missing":
+        latest = replace(advanced, format_version=None)
+    elif damage == "format-incompatible":
+        latest = replace(advanced, format_version=Checkpoint.CURRENT_FORMAT_VERSION + 1)
+    else:
+        latest = replace(advanced, upstream_topology_hash="b" * 64)
+    orch = _make_orchestrator(db)
+    manager = MagicMock(spec=CheckpointManager)
+    manager.get_latest_checkpoint.return_value = latest
+    orch._resume_coordinator._checkpoint_manager = manager
+    recovery = RecoveryManager(db, manager)
+    snapshot = _ResumeAuditSnapshot(
+        factory=factory,
+        recovery=recovery,
+        run_id=run_id,
+        worker_id="checkpoint-race-worker",
+        schema_contracts_by_source={},
+        source_names_by_source={},
+        source_lifecycle_by_source={},
+        source_schema_classes={},
+    )
+    with (
+        patch.object(orch._resume_coordinator, "_load_resume_audit_snapshot", return_value=snapshot),
+        patch.object(recovery, "get_resume_workset") as workset,
+        patch.object(orch._ceremony, "safe_flush_telemetry"),
+        pytest.raises(NonResumableRunError) as exc_info,
+    ):
+        orch._resume_coordinator.reconstruct_resume_state(ResumePoint(checkpoint=checkpoint, sequence_number=1), store)
+    assert exc_info.value.cause is expected_cause
+    workset.assert_not_called()
+    run = factory.run_lifecycle.get_run(run_id)
+    assert run is not None
+    assert run.status is RunStatus.FAILED
+    with db.engine.connect() as conn:
+        seat = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == run_id)).one()
+    assert seat.leader_epoch == setup.coordination_token.leader_epoch + 1
+    assert seat.leader_worker_id is None
 
 
 # Protocol-specced plugin doubles. ``SourceProtocol``/``SinkProtocol``/
@@ -1890,6 +1972,7 @@ class TestResumeFinalizesAsFailed:
             checkpoint=checkpoint,
             sequence_number=checkpoint.sequence_number,
         )
+        orch._checkpoint_manager.get_latest_checkpoint.return_value = checkpoint
         orders_contract = MagicMock(spec=SchemaContract, name="orders-contract")
         refunds_contract = MagicMock(spec=SchemaContract, name="refunds-contract")
         mock_factory = MagicMock(spec=RecorderFactory)
@@ -1937,7 +2020,10 @@ class TestResumeFinalizesAsFailed:
         with (
             patch("elspeth.engine.orchestrator.resume.RecorderFactory", return_value=mock_factory),
             patch("elspeth.core.checkpoint.RecoveryManager", return_value=mock_recovery),
-            patch("elspeth.engine.orchestrator.resume.reconstruct_schema_from_json", side_effect=[orders_schema, refunds_schema]),
+            patch(
+                "elspeth.engine.orchestrator.resume.reconstruct_schema_from_json",
+                side_effect=[orders_schema, refunds_schema, orders_schema, refunds_schema],
+            ),
         ):
             state = orch._resume_coordinator.reconstruct_resume_state(resume_point, MockPayloadStore())
 
@@ -1990,6 +2076,7 @@ class TestResumeFinalizesAsFailed:
             checkpoint=checkpoint,
             sequence_number=checkpoint.sequence_number,
         )
+        orch._checkpoint_manager.get_latest_checkpoint.return_value = checkpoint
         source_contract = MagicMock(spec=SchemaContract, name="source-contract")
         mock_factory = MagicMock(spec=RecorderFactory)
         prepare_for_run()

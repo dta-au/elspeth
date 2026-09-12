@@ -11,6 +11,7 @@ from sqlalchemy import ColumnElement, Connection, Engine, select, update
 
 from elspeth.contracts.advisory_locks import ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.coordination.contracts import CancellationSource, RecoveryRequiredReason, RunSagaState
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock
 from elspeth.web.sessions.models import (
     runs_table,
@@ -64,6 +65,10 @@ def _run_record_from_row(row: Any) -> RunRecord:
         error=row.error,
         landscape_run_id=row.landscape_run_id,
         pipeline_yaml=row.pipeline_yaml,
+        cancel_requested_at=_ensure_utc(row.cancel_requested_at) if row.cancel_requested_at is not None else None,
+        cancellation_source=CancellationSource(row.cancellation_source) if row.cancellation_source is not None else None,
+        saga_state=RunSagaState(row.saga_state),
+        recovery_required_reason=RecoveryRequiredReason(row.recovery_required_reason) if row.recovery_required_reason is not None else None,
     )
 
 
@@ -100,8 +105,10 @@ class RepositoryGlobalRunRecoveryAuthority:
             raise TypeError("reason must be an exact string or None")
 
     def _session_allows_recovery(self, conn: Connection, *, session_id: str, database_now: datetime) -> bool:
-        session = conn.execute(select(sessions_table.c.id).where(sessions_table.c.id == session_id).with_for_update()).one_or_none()
-        if session is None:
+        session = conn.execute(
+            select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id).with_for_update()
+        ).one_or_none()
+        if session is None or session.archived_at is not None:
             return False
         fence = conn.execute(
             select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == session_id).with_for_update()
@@ -127,6 +134,33 @@ class RepositoryGlobalRunRecoveryAuthority:
         if type(owner.lease_expires_at) is not datetime:
             raise AuditIntegrityError("Web-instance membership has an invalid lease expiry")
         return _ensure_utc(owner.lease_expires_at) <= database_now
+
+    def list_recoverable_run_records(self) -> tuple[RunRecord, ...]:
+        """Discover candidates without cancelling or claiming them.
+
+        A caller must acquire fresh EXECUTE authority before projecting anything.
+        Every candidate is rechecked under the ordinary session lock.
+        """
+        with self._engine.connect() as conn:
+            candidates = conn.execute(
+                select(runs_table.c.id, runs_table.c.session_id).where(
+                    runs_table.c.status.in_(("pending", "running")) | runs_table.c.saga_state.in_(("running", "admission_refusal_pending")),
+                    runs_table.c.saga_state != "recovery_required",
+                )
+            ).all()
+        result: list[RunRecord] = []
+        for candidate in candidates:
+            with locked_session_transaction(self._engine, candidate.session_id) as conn:
+                if not self._session_allows_recovery(conn, session_id=candidate.session_id, database_now=_database_now(conn)):
+                    continue
+                row = conn.execute(select(runs_table).where(runs_table.c.id == candidate.id)).one_or_none()
+                if (
+                    row is not None
+                    and row.saga_state != "recovery_required"
+                    and (row.status in {"pending", "running"} or row.saga_state in {"running", "admission_refusal_pending"})
+                ):
+                    result.append(_run_record_from_row(row))
+        return tuple(result)
 
     def _cancel_candidate(
         self,

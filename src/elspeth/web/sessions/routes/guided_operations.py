@@ -117,6 +117,10 @@ _SAFE_FAILURES: dict[str, tuple[int, str]] = {
         "This pipeline is blocked by a deployment policy and cannot be built as configured. "
         "Change the highlighted component — retrying will fail the same way.",
     ),
+    "admission_refused": (
+        403,
+        "This request was refused by the admission policy. Ask an administrator to review your access and quota configuration.",
+    ),
     "stale_conflict": (409, "The guided state changed before settlement. Reload the authoritative state."),
     "integrity_error": (500, "The operation failed an integrity check."),
     "custody_error": (500, "The operation could not establish result custody."),

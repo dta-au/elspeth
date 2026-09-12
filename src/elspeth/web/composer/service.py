@@ -48,6 +48,7 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
+from elspeth.contracts.chargeable_admission import ChargeableOperation
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import (
@@ -2217,6 +2218,10 @@ async def _surface_pending_interpretation_reviews_under_writer(
             continue
 
 
+class ComposerAdmissionRefused(ComposerServiceError):
+    """A committed admission decision refused this provider operation."""
+
+
 class ComposerServiceImpl:
     """LLM-driven pipeline composer with dual-counter budget and discovery caching.
 
@@ -3611,11 +3616,32 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
         )
 
+    async def _require_chargeable_admission(
+        self,
+        session_operation_context: SessionOperationContext | None,
+    ) -> None:
+        """Authorize a request independently of its pipeline shape or caches."""
+        if self._sessions_service is None or session_operation_context is None:
+            raise ComposerAdmissionRefused("Composer admission requires session authority.")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("Composer admission requires COMPOSE session authority")
+        decision = await self._sessions_service.assess_chargeable_operation(
+            session_operation_context=session_operation_context,
+            operation=ChargeableOperation.COMPOSER,
+        )
+        if not decision.allowed:
+            if decision.refusal_reason is None:
+                raise AuditIntegrityError("Refused Composer admission has no refusal reason")
+            raise ComposerAdmissionRefused(f"Composer admission refused: {decision.refusal_reason.value}.")
+
     async def explain_run_diagnostics(
         self,
         snapshot: Mapping[str, object],
         *,
         recorder: BufferingRecorder | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> str:
         """Return a plain-language explanation of a bounded run snapshot.
 
@@ -3625,6 +3651,7 @@ class ComposerServiceImpl:
         if not self._availability.available:
             raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
 
+        await self._require_chargeable_admission(session_operation_context)
         try:
             messages = build_run_diagnostics_messages(snapshot, data_dir=self._data_dir)
         except OSError as exc:
@@ -3699,6 +3726,7 @@ class ComposerServiceImpl:
             if session_id is None or session_operation_context.fence.session_id != session_id:
                 raise AuditIntegrityError("Composer session authority targets a different session")
 
+        await self._require_chargeable_admission(session_operation_context)
         deadline = asyncio.get_event_loop().time() + self._timeout_seconds
         from litellm.exceptions import APIError as LiteLLMAPIError
 
@@ -3938,6 +3966,7 @@ class ComposerServiceImpl:
             session_operation_context,
             session_id=originating_message.session_id,
         )
+        await self._require_chargeable_admission(session_operation_context)
         if type(operation_fence) is not GuidedOperationFence:
             raise TypeError("operation_fence must be an exact GuidedOperationFence")
         if str(operation_fence.session_id) != originating_message.session_id:
@@ -4094,6 +4123,7 @@ class ComposerServiceImpl:
             session_id=originating_message.session_id,
         )
 
+        await self._require_chargeable_admission(session_operation_context)
         from elspeth.web.composer.guided.deferred_intents import evaluate_deferred_intent_coverage
         from elspeth.web.composer.guided.planning import (
             GuidedCorrectionTarget,
@@ -8200,6 +8230,9 @@ class ComposerServiceImpl:
         rendered inside the existing untrusted fence — never as a new
         unfenced channel and never used for any phase but ``"end"``.
         """
+        if session_operation_context is not None and session_id != session_operation_context.fence.session_id:
+            raise AuditIntegrityError("Composer signoff authority targets a different session")
+        await self._require_chargeable_admission(session_operation_context)
         return await self._run_advisor_checkpoint(
             phase="end",
             state=state,

@@ -506,7 +506,7 @@ async def get_composer_progress(
     """Return the latest provider-safe composer progress for a session."""
     session = await _verify_session_ownership(session_id, user, request)
     registry = _get_composer_progress_registry(request)
-    return await registry.get_latest(str(session.id))
+    return await registry.get_latest(str(session.id), user.user_id)
 
 
 @router.get(

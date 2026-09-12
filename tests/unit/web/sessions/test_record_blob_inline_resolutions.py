@@ -23,6 +23,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
@@ -39,6 +40,8 @@ def engine():
 
 @pytest.fixture
 def service(engine):
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="writer-test-user")
     return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -127,6 +130,8 @@ async def test_record_blob_inline_resolutions_raises_audit_integrity_error_on_db
         log=structlog.get_logger("test.record-blob-inline-resolutions"),
     )
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="writer-test-user")
     session = await service.create_session("writer-test-user", "Writer test", "local")
     run_id = uuid4()
     blob_id = uuid4()
@@ -174,6 +179,8 @@ async def test_record_blob_inline_resolutions_empty_batch_wraps_cas_database_fai
         log=structlog.get_logger("test.record-blob-inline-resolutions"),
     )
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="writer-test-user")
     session = await service.create_session("writer-test-user", "Empty batch database failure", "local")
     execute_context = service.session_operation_authority.acquire(
         session_id=session.id,

@@ -6,6 +6,7 @@ from dataclasses import replace as _replace_dataclass
 from elspeth.contracts.errors import GuidedCustodyIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
+from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.titles import is_default_session_title
 
@@ -21,7 +22,6 @@ from ._helpers import (
     ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerProgressEvent,
-    ComposerRateLimiter,
     ComposerRuntimePreflightError,
     ComposerService,
     ComposerServiceError,
@@ -39,6 +39,7 @@ from ._helpers import (
     SendMessageRequest,
     SessionServiceProtocol,
     UserIdentity,
+    WebRateLimiter,
     _BadRequestLLMError,
     _cancel_on_client_disconnect,
     _composer_chat_history,
@@ -110,7 +111,7 @@ def register_message_routes(router: APIRouter) -> None:
         body: SendMessageRequest,
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
         # In-flight compose tally for the SPA's post-abort settlement signal
         # (elspeth-06a23adfcc); decrements only after the route fully unwinds.
         _inflight_tally: None = Depends(_track_compose_inflight),
@@ -230,8 +231,9 @@ def register_message_routes(router: APIRouter) -> None:
                 session_operation_context=compose_operation_lease.context,
             )
             progress_registry = _get_composer_progress_registry(request)
-            progress_sink = _composer_progress_sink(
+            progress_sink = await _composer_progress_sink(
                 progress_registry,
+                request=request,
                 session_id=str(session.id),
                 request_id=str(user_msg.id),
                 user_id=str(user.user_id),
@@ -649,6 +651,21 @@ def register_message_routes(router: APIRouter) -> None:
                         session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
+                except ComposerAdmissionRefused as exc:
+                    await _publish_progress(
+                        progress_sink,
+                        event=ComposerProgressEvent(
+                            phase="failed",
+                            headline="This request was refused by the admission policy.",
+                            evidence=(str(exc),),
+                            likely_next="Ask an administrator to review your access and quota configuration.",
+                            reason="admission_refused",
+                        ),
+                    )
+                    raise HTTPException(
+                        status_code=403,
+                        detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
+                    ) from exc
                 except ComposerServiceError as exc:
                     await _publish_progress(
                         progress_sink,

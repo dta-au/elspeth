@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock, create_autospec
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -24,6 +24,7 @@ from elspeth.contracts import FrameworkBugError, RunStatus, TerminalOutcome, Ter
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -43,13 +44,14 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.transforms.passthrough import PassThrough
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.sessions.protocol import CompositionStateRecord, SessionServiceProtocol
+from elspeth.web.sessions.protocol import CompositionStateRecord
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.e2e.recovery.test_follower_join_and_drain import (
     _GUARD_LIVE_SEAT_WINDOW_SECONDS,
@@ -58,7 +60,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seed_real_follower_ready_item,
     _work_item,
 )
-from tests.helpers.session_fences import execute_lease
+from tests.helpers.web_cli_profile import create_profile_session
 
 if TYPE_CHECKING:
     from scripts.state_engine_profile_reporter import RuntimeProfileReporter
@@ -185,21 +187,6 @@ payload_store:
         composer_meta=None,
     )
 
-    session_service = create_autospec(SessionServiceProtocol, instance=True)
-    session_service.get_active_run.return_value = None
-    session_service.get_current_state.return_value = state_record
-    session_service.create_run.return_value = SimpleNamespace(id=run_uuid)
-    session_service.get_run.return_value = SimpleNamespace(status="running", session_id=session_id)
-    session_service.update_run_status.return_value = None
-    event_sequence = 0
-
-    async def append_run_event(**_kwargs: Any) -> SimpleNamespace:
-        nonlocal event_sequence
-        event_sequence += 1
-        return SimpleNamespace(sequence=event_sequence)
-
-    session_service.append_run_event.side_effect = append_run_event
-
     web_settings = SimpleNamespace(
         deployment_target="default",
         deployment_state_mode="sqlite-single",
@@ -214,6 +201,13 @@ payload_store:
     )
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    session_engine, session_service, session_id = await create_profile_session(
+        tmp_path,
+        state=state_record,
+        run_id=run_uuid,
+        snapshot=snapshot,
+        user_id="task10-web-user",
+    )
     web_policy = WebPluginPolicy(
         schema_version=1,
         required=snapshot.available,
@@ -342,14 +336,16 @@ payload_store:
 
     monkeypatch.setattr(service._executor, "submit", capture_submit)
 
-    # ``execute`` takes an exact EXECUTE lease and the run keeps reproving it
-    # from its worker threads until the leader's future resolves, so the lease
-    # is held on an exit stack and released with the service in the cleanup
-    # block below. The helper acquires through ``SessionOperationLease.acquire``
-    # over a recording authority; the session service here is an autospec and
-    # mints no authority of its own.
+    # The leader and session writes share the real durable EXECUTE authority.
     lease_stack = contextlib.AsyncExitStack()
-    session_operation_lease = await lease_stack.enter_async_context(execute_lease(session_id, lease_seconds=120))
+    session_operation_lease = await SessionOperationLease.acquire(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    lease_stack.push_async_callback(session_operation_lease.close)
     try:
         launched_run_id = await service.execute(
             session_id,
@@ -398,7 +394,7 @@ payload_store:
                     "join",
                     run_id,
                     "--settings",
-                    str(settings_path),
+                    str(session_service.profile_settings_path),
                     "--database",
                     str(tmp_path / "real-follower-audit.db"),
                     "--format",
@@ -585,22 +581,15 @@ payload_store:
         assert [json.loads(line) for line in output_a_path.read_text(encoding="utf-8").splitlines()] == [{"id": 1, "value": 10}]
         assert [json.loads(line) for line in output_b_path.read_text(encoding="utf-8").splitlines()] == [{"id": 1, "value": 10}]
 
-        status_calls = [call.kwargs for call in session_service.update_run_status.await_args_list]
-        assert [call["status"] for call in status_calls] == ["running", "completed"]
-        # Every status write is fenced by the exact context the EXECUTE lease
-        # minted at launch, so a run can never report completion under
-        # someone else's authority.
-        assert status_calls[-1] == {
-            "status": "completed",
-            "error": None,
-            "rows_processed": 1,
-            "rows_succeeded": 2,
-            "rows_failed": 0,
-            "rows_routed_success": 0,
-            "rows_routed_failure": 0,
-            "rows_quarantined": 0,
-            "session_operation_context": session_operation_lease.context,
-        }
+        persisted_run = await session_service.get_run(run_uuid)
+        assert persisted_run.status == "completed"
+        assert persisted_run.error is None
+        assert persisted_run.rows_processed == 1
+        assert persisted_run.rows_succeeded == 2
+        assert persisted_run.rows_failed == 0
+        assert persisted_run.rows_routed_success == 0
+        assert persisted_run.rows_routed_failure == 0
+        assert persisted_run.rows_quarantined == 0
 
         if request.config.pluginmanager.hasplugin("scripts.state_engine_profile_reporter"):
             reporter = cast("RuntimeProfileReporter", request.getfixturevalue("state_engine_profile"))
@@ -621,6 +610,7 @@ payload_store:
         await service.shutdown()
         db.close()
         await lease_stack.aclose()
+        session_engine.dispose()
 
 
 @pytest.mark.timeout(120)

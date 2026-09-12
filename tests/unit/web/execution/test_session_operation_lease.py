@@ -24,6 +24,8 @@ import operator
 import re
 import textwrap
 import threading
+from asyncio.tasks import run_coroutine_threadsafe
+from asyncio.threads import to_thread
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -59,6 +61,7 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionDerivedCustodyError, SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution import service as execution_service_module
+from elspeth.web.execution.envelope import restore_execution_envelope
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.execution.routes import create_execution_router
@@ -68,6 +71,7 @@ from elspeth.web.sessions.models import run_events_table
 from elspeth.web.sessions.protocol import CompositionStateData, SessionOperationAuthority, SessionServiceProtocol
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _USER_ID = "execution-lease-user"
@@ -646,7 +650,7 @@ async def test_submitted_worker_retains_exact_lease_until_every_terminal_outcome
     assert len(executor.submit_calls) == 1
     submitted = executor.submit_calls[0]
     assert submitted[0] == service._run_pipeline
-    assert submitted[2] == {"session_operation_lease": lease}
+    assert submitted[2] == {"session_operation_lease": lease, "durable_admission": True}
     assert all(argument is not lease.context for argument in submitted[1])
     submitted_authorities = (*submitted[1], *submitted[2].values())
     assert sum(argument is lease for argument in submitted_authorities) == 1
@@ -707,7 +711,6 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
     lease, authority = await _real_lease(
         _context(session_id),
         renew_interval_seconds=0.01,
-        renew_error=loss,
     )
     validation = ValidationResult(
         is_valid=True,
@@ -730,6 +733,8 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
     assert isinstance(worker_shutdown_event, threading.Event)
     assert not worker_shutdown_event.is_set()
     effect_counts_after_submit = _durable_effect_call_counts(session_service)
+    authority.renew_called.clear()
+    authority.renew_error = loss
 
     await asyncio.wait_for(asyncio.to_thread(authority.renew_called.wait, 2), timeout=2)
     assert authority.renew_called.is_set()
@@ -1300,6 +1305,166 @@ def _is_exact_worker_delegation_edge(call: ast.Call, callback: ast.AST) -> bool:
     )
 
 
+def _unique_local_callable(function: _FunctionNode, name: str, enclosing: dict[int, _FunctionNode]) -> _FunctionNode | None:
+    scope: _FunctionNode | None = function
+    while scope is not None:
+        nodes = _walk_function_body_without_nested_functions(scope)
+        bindings = _binding_nodes(scope, nodes, name=name)
+        definitions = [
+            node
+            for node in _reachable_function_nodes(scope)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+        ]
+        deletions = [node for node in nodes if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Del)]
+        if bindings or definitions or deletions:
+            if len(definitions) == 1 and not bindings and not deletions and not definitions[0].decorator_list:
+                return definitions[0]
+            return None
+        scope = enclosing.get(id(scope))
+    return None
+
+
+def _is_exact_asyncio_thread_edge(
+    call: ast.Call,
+    callback: ast.AST,
+    function: _FunctionNode,
+    enclosing: dict[int, _FunctionNode],
+    parent: dict[ast.AST, ast.AST],
+) -> bool:
+    """Admit a lexically bound local callable passed alone to stdlib to_thread."""
+    if not (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "asyncio"
+        and call.func.attr == "to_thread"
+        and len(call.args) == 1
+        and not call.keywords
+        and call.args[0] is callback
+        and isinstance(callback, ast.Name)
+    ):
+        return False
+    definition = _unique_local_callable(function, callback.id, enclosing)
+    if not isinstance(definition, ast.FunctionDef):
+        return False
+    consumer = parent.get(call)
+    if not isinstance(consumer, ast.Await):
+        if not (
+            isinstance(consumer, ast.Call)
+            and isinstance(consumer.func, ast.Attribute)
+            and isinstance(consumer.func.value, ast.Name)
+            and consumer.func.attr == "create_task"
+            and consumer.args == [call]
+            and all(keyword.arg == "name" for keyword in consumer.keywords)
+        ):
+            return False
+        lease_bindings = _binding_nodes(function, _walk_function_body_without_nested_functions(function), name=consumer.func.value.id)
+        if not (
+            len(lease_bindings) == 1
+            and isinstance(lease_bindings[0], ast.arg)
+            and ast.unparse(lease_bindings[0].annotation or ast.Constant(None)) == "SessionOperationLease"
+        ):
+            return False
+    scope: _FunctionNode | None = function
+    while scope is not None:
+        nodes = _walk_function_body_without_nested_functions(scope)
+        if _binding_nodes(scope, nodes, name="asyncio"):
+            return False
+        if any(
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "asyncio"
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            for node in nodes
+        ):
+            return False
+        scope = enclosing.get(id(scope))
+    return True
+
+
+def _is_scheduled_local_coroutine(
+    call: ast.Call, parent: dict[ast.AST, ast.AST], function: _FunctionNode, enclosing: dict[int, _FunctionNode]
+) -> bool:
+    if not isinstance(call.func, ast.Name) or not isinstance(
+        _unique_local_callable(function, call.func.id, enclosing), ast.AsyncFunctionDef
+    ):
+        return False
+    consumer = parent.get(call)
+    if isinstance(consumer, ast.Await):
+        return True
+    if isinstance(consumer, ast.GeneratorExp):
+        expansion = parent.get(consumer)
+        gather = parent.get(expansion) if isinstance(expansion, ast.Starred) else None
+        if (
+            isinstance(gather, ast.Call)
+            and isinstance(gather.func, ast.Attribute)
+            and isinstance(gather.func.value, ast.Name)
+            and gather.func.value.id == "asyncio"
+            and gather.func.attr == "gather"
+            and isinstance(parent.get(gather), ast.Await)
+        ):
+            return True
+    if (
+        isinstance(consumer, ast.Call)
+        and isinstance(consumer.func, ast.Attribute)
+        and isinstance(consumer.func.value, ast.Name)
+        and consumer.func.value.id == "self"
+        and consumer.func.attr == "_call_async"
+        and consumer.args == [call]
+        and not consumer.keywords
+    ):
+        return True
+    if not (
+        isinstance(consumer, ast.Call)
+        and isinstance(consumer.func, ast.Attribute)
+        and isinstance(consumer.func.value, ast.Name)
+        and consumer.func.value.id == "asyncio"
+        and consumer.func.attr == "run_coroutine_threadsafe"
+        and len(consumer.args) == 2
+        and consumer.args[0] is call
+        and not consumer.keywords
+    ):
+        return False
+    scope: _FunctionNode | None = function
+    while scope is not None:
+        nodes = _walk_function_body_without_nested_functions(scope)
+        if _binding_nodes(scope, nodes, name="asyncio") or any(
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "asyncio"
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            for node in nodes
+        ):
+            return False
+        scope = enclosing.get(id(scope))
+    return True
+
+
+def _is_exact_envelope_blob_verifier_edge(call: ast.Call, keyword: ast.keyword) -> bool:
+    """The trusted worker forwards this verifier to the trusted envelope restorer."""
+    expected_keywords = {
+        "current_snapshot",
+        "user_id",
+        "auth_provider_type",
+        "resolver",
+        "implementation_fingerprint",
+        "deployment_generation",
+        "blob_verifier",
+    }
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "run_sync_in_worker"
+        and len(call.args) == 2
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == "restore_execution_envelope"
+        and not isinstance(call.args[1], ast.Starred)
+        and len(call.keywords) == len(expected_keywords)
+        and {candidate.arg for candidate in call.keywords} == expected_keywords
+        and keyword.arg == "blob_verifier"
+        and any(candidate is keyword for candidate in call.keywords)
+        and isinstance(keyword.value, ast.Name)
+    )
+
+
 def _is_exact_blob_metadata_callback_edge(call: ast.Call, keyword: ast.keyword) -> bool:
     """``validate_pipeline(..., blob_get_metadata=<local def>)``: the validator's per-ref metadata lookup."""
     return (
@@ -1475,6 +1640,8 @@ class _ExecutionReachability:
 
 
 def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
+    enclosing = _enclosing_function_map(owner)
+    parent = {child: node for node in ast.walk(owner) for child in ast.iter_child_nodes(node)}
     members = {member.name: member for member in owner.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
     local_functions = {
         nested.name: nested
@@ -1502,6 +1669,7 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
             function, live_nodes, name="compute_proof_diagnostics", module=_PROOF_DIAGNOSTICS_MODULE
         )
         exact_worker_bound = _binding_nodes(function, live_nodes, name="run_sync_in_worker") == ()
+        exact_envelope_bound = _binding_nodes(function, live_nodes, name="restore_execution_envelope") == ()
         for call in (candidate for candidate in live_nodes if isinstance(candidate, ast.Call)):
             if (
                 isinstance(call.func, ast.Attribute)
@@ -1514,7 +1682,13 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
                 exact_consumer_calls.append(call)
             callable_edges: list[ast.expr] = []
             if isinstance(call.func, ast.Name):
-                callable_edges.append(call.func)
+                if isinstance(local_functions.get(call.func.id), ast.AsyncFunctionDef):
+                    if _is_scheduled_local_coroutine(call, parent, function, enclosing):
+                        definition = _unique_local_callable(function, call.func.id, enclosing)
+                        assert definition is not None
+                        pending.append(definition)
+                else:
+                    callable_edges.append(call.func)
             delegated_edges: list[ast.expr] = []
             delegated_edges.extend(
                 edge
@@ -1526,10 +1700,22 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
                 for edge in call.args
                 if exact_worker_bound and isinstance(edge, ast.Name) and _is_exact_worker_delegation_edge(call, edge)
             )
+            thread_edges = [edge for edge in call.args if _is_exact_asyncio_thread_edge(call, edge, function, enclosing, parent)]
+            for edge in thread_edges:
+                assert isinstance(edge, ast.Name)
+                definition = _unique_local_callable(function, edge.id, enclosing)
+                assert definition is not None
+                pending.append(definition)
+                admitted.add(id(edge))
             delegated_edges.extend(
                 keyword.value
                 for keyword in call.keywords
                 if exact_validator_bound and isinstance(keyword.value, ast.Name) and _is_exact_blob_metadata_callback_edge(call, keyword)
+            )
+            delegated_edges.extend(
+                keyword.value
+                for keyword in call.keywords
+                if exact_worker_bound and exact_envelope_bound and _is_exact_envelope_blob_verifier_edge(call, keyword)
             )
             admitted.update(id(edge) for edge in delegated_edges)
             callable_edges.extend(delegated_edges)
@@ -1595,6 +1781,120 @@ class _ExecutionEffectFindings:
     escaped_class_helpers: tuple[str, ...]
 
 
+def _caller_lease_escapes(member: _FunctionNode) -> bool:
+    """Keep the transferred lease within the reviewed execution consumers."""
+    parents = {child: node for node in ast.walk(member) for child in ast.iter_child_nodes(node)}
+    positional_consumers = {
+        "self._signal_shutdown_on_operation_loss": 0,
+        "self._settle_admission_refusal": 1,
+        "self._materialize_durable_cancellation": 1,
+        "self._record_recovery_refusal": 1,
+    }
+    keyword_consumers = {
+        "self._broadcast_progress_event",
+        "self._finalize_output_blobs",
+        "self._persist_and_broadcast_run_event",
+        "self._persist_failed_run_status",
+        "self._probe_run_already_terminal",
+    }
+    for node in ast.walk(member):
+        if not (isinstance(node, ast.Name) and node.id == "session_operation_lease" and isinstance(node.ctx, ast.Load)):
+            continue
+        consumer = parents[node]
+        if isinstance(consumer, ast.Attribute) and consumer.value is node and isinstance(consumer.ctx, ast.Load):
+            continue
+        if isinstance(consumer, ast.Call):
+            position = positional_consumers.get(ast.unparse(consumer.func))
+            if position is not None and len(consumer.args) > position and consumer.args[position] is node:
+                continue
+        if isinstance(consumer, ast.keyword) and consumer.arg == "session_operation_lease":
+            call = parents[consumer]
+            if isinstance(call, ast.Call):
+                target = ast.unparse(call.func)
+                if target in keyword_consumers:
+                    continue
+                if call.args and (
+                    (target == "partial" and ast.unparse(call.args[0]) == "self._on_pipeline_done")
+                    or (target == "self._executor.submit" and ast.unparse(call.args[0]) == "self._run_pipeline")
+                ):
+                    continue
+        return True
+    return False
+
+
+def _has_transferred_lease_context(
+    call: ast.Call, function: _FunctionNode, owner: ast.ClassDef, enclosing: dict[int, _FunctionNode]
+) -> bool:
+    """Prove a closure's lease.context comes from an unchanged transferred parameter."""
+    values = [keyword.value for keyword in call.keywords if keyword.arg == "session_operation_context"]
+    if len(values) != 1:
+        return False
+    value = values[0]
+    if not (isinstance(value, ast.Attribute) and value.attr == "context" and isinstance(value.value, ast.Name)):
+        return False
+    name = value.value.id
+    scope = function
+    while id(scope) in enclosing:
+        if _binding_nodes(scope, _walk_function_body_without_nested_functions(scope), name=name):
+            return False
+        scope = enclosing[id(scope)]
+    parameters = [*scope.args.posonlyargs, *scope.args.args]
+    matching = [parameter for parameter in parameters if parameter.arg == name]
+    if len(matching) != 1 or ast.unparse(matching[0].annotation or ast.Constant(None)) != "SessionOperationLease":
+        return False
+    if _binding_nodes(scope, _walk_function_body_without_nested_functions(scope), name=name) != (matching[0],):
+        return False
+    parents = {child: node for node in ast.walk(scope) for child in ast.iter_child_nodes(node)}
+    if any(
+        isinstance(node, ast.Name)
+        and node.id == name
+        and isinstance(node.ctx, ast.Load)
+        and not (
+            isinstance(parents.get(node), ast.Attribute)
+            and cast(ast.Attribute, parents[node]).value is node
+            and isinstance(cast(ast.Attribute, parents[node]).ctx, ast.Load)
+        )
+        for node in ast.walk(scope)
+    ):
+        return False
+    position = parameters.index(matching[0]) - 1  # self is supplied by attribute dispatch
+    callers = [
+        (member, candidate)
+        for member in owner.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for candidate in _reachable_function_nodes(member)
+        if isinstance(candidate, ast.Call)
+        and isinstance(candidate.func, ast.Attribute)
+        and isinstance(candidate.func.value, ast.Name)
+        and candidate.func.value.id == "self"
+        and candidate.func.attr == scope.name
+    ]
+    return bool(callers) and all(
+        position >= 0
+        and len(candidate.args) > position
+        and isinstance(candidate.args[position], ast.Name)
+        and candidate.args[position].id == "session_operation_lease"
+        and not any(keyword.arg == name for keyword in candidate.keywords)
+        and any(parameter.arg == "session_operation_lease" for parameter in (*member.args.args, *member.args.kwonlyargs))
+        and len(_binding_nodes(member, _walk_function_body_without_nested_functions(member), name="session_operation_lease")) == 1
+        and not _caller_lease_escapes(member)
+        and not any(
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "session_operation_lease"
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            for node in ast.walk(member)
+        )
+        and not any(
+            isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "session_operation_lease"
+            for node in ast.walk(member)
+        )
+        for member, candidate in callers
+    )
+
+
 def _execution_effect_findings(owner: ast.ClassDef) -> _ExecutionEffectFindings:
     reachability = _execution_reachability(owner)
     reachable = reachability.reachable
@@ -1642,7 +1942,16 @@ def _execution_effect_findings(owner: ast.ClassDef) -> _ExecutionEffectFindings:
             unresolved_receivers.append(
                 f"line {call.lineno}: {ast.unparse(call)} reaches the blob service through an unresolved receiver {receiver!r}"
             )
-    context_offenders = tuple(sorted({_call_name(call) or "" for call in calls if not _exact_context_keyword(call)}))
+    context_offenders = tuple(
+        sorted(
+            {
+                _call_name(call) or ""
+                for call in calls
+                if not _exact_context_keyword(call)
+                and not _has_transferred_lease_context(call, call_owner[id(call)], owner, enclosing_functions)
+            }
+        )
+    )
 
     parent = {child: node for function in reachable for node in ast.walk(function) for child in ast.iter_child_nodes(node)}
     escaped_effects = tuple(
@@ -1743,6 +2052,12 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
     ]
     assert execution_service_module.EventBus is EventBus, "execution callback bus constructor provenance changed"
     assert execution_service_module.run_sync_in_worker is run_sync_in_worker, "execution worker delegation provenance changed"
+    assert execution_service_module.asyncio is asyncio, "execution thread/coroutine scheduler module provenance changed"
+    assert execution_service_module.asyncio.to_thread is to_thread
+    assert execution_service_module.asyncio.run_coroutine_threadsafe is run_coroutine_threadsafe
+    assert execution_service_module.restore_execution_envelope is restore_execution_envelope, (
+        "execution envelope consumer provenance changed"
+    )
     assert [function.name for function in exact_event_bus_functions] == ["_run_pipeline"]
     assert findings.escaped_local_helpers == (), (
         f"local execution helper callable escapes direct analysis: {findings.escaped_local_helpers}"
@@ -2141,6 +2456,141 @@ def test_worker_delegation_edge_admits_only_the_sole_local_callable(case_id: str
     _assert_edge_control(case)
 
 
+@pytest.mark.parametrize(
+    ("handoff", "rebinding", "admitted"),
+    [
+        ("asyncio.to_thread(_preflight)", "", True),
+        ("asyncio.to_thread(_preflight, state)", "", False),
+        ("asyncio.to_thread(func=_preflight)", "", False),
+        ("other.to_thread(_preflight)", "", False),
+        ("asyncio.other(_preflight)", "", False),
+        ("asyncio.to_thread(_preflight)", "asyncio = self._runner", False),
+        ("asyncio.to_thread(_preflight)", "import other as asyncio", False),
+        ("asyncio.to_thread(_preflight)", "asyncio.to_thread = self._runner", False),
+        ("asyncio.to_thread(_preflight)", "_preflight = self._runner", False),
+    ],
+)
+def test_asyncio_thread_delegation_requires_exact_scheduler_and_callback(handoff: str, rebinding: str, admitted: bool) -> None:
+    _assert_edge_control(_worker_delegation_case(handoff=handoff, rebinding=rebinding, admitted=admitted))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "none",
+        "module",
+        "method",
+        "callback",
+        "dead",
+        "context",
+        "caller",
+        "rebind",
+        "unscheduled",
+        "decorated",
+        "coroutine_rebound",
+        "duplicate_callback",
+        "lease_attribute",
+        "lease_alias",
+        "caller_attribute",
+        "caller_alias",
+        "caller_mutator",
+        "caller_keyword_mutator",
+    ],
+)
+def test_admission_cleanup_scanner_controls(mutation: str) -> None:
+    owner = _class_node(ExecutionServiceImpl)
+    settlement = next(node for node in owner.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_settle_admission_refusal")
+    thread_call = next(node for node in ast.walk(settlement) if isinstance(node, ast.Call) and _call_name(node) == "to_thread")
+    if mutation == "callback":
+        thread_call.args = [ast.Name(id="unrelated_callback", ctx=ast.Load())]
+    elif mutation == "unscheduled":
+        for statement in settlement.body:
+            if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Call) and _call_name(statement.value) == "create_task":
+                statement.value = thread_call
+    elif mutation == "decorated":
+        callback = next(node for node in settlement.body if isinstance(node, ast.FunctionDef) and node.name == "reconcile_landscape")
+        callback.decorator_list = [ast.parse("lambda fn: lambda: None", mode="eval").body]
+    elif mutation == "coroutine_rebound":
+        settlement.body.append(ast.parse("finish_cleanup = lambda: asyncio.sleep(0)").body[0])
+    elif mutation == "duplicate_callback":
+        callback = next(node for node in settlement.body if isinstance(node, ast.FunctionDef) and node.name == "reconcile_landscape")
+        duplicate = ast.parse(ast.unparse(callback)).body[0]
+        callback.body = [ast.Pass()]
+        other = ast.parse("def unrelated(self): pass").body[0]
+        assert isinstance(other, ast.FunctionDef)
+        other.body = [duplicate]
+        owner.body.append(other)
+    elif mutation == "lease_attribute":
+        settlement.body.insert(0, ast.parse("lease._context = unrelated_context").body[0])
+    elif mutation == "lease_alias":
+        settlement.body.insert(0, ast.parse("lease_alias = lease").body[0])
+    elif mutation in {"caller_mutator", "caller_keyword_mutator"}:
+        caller = next(node for node in owner.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "recover_run")
+        injected = (
+            "setattr(session_operation_lease, '_context', unrelated_context)"
+            if mutation == "caller_mutator"
+            else "mutate_context(lease=session_operation_lease)"
+        )
+        caller.body[0:0] = ast.parse(injected).body
+    elif mutation in {"caller_attribute", "caller_alias"}:
+        caller = next(node for node in owner.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "recover_run")
+        injected = (
+            "session_operation_lease._context = unrelated_context"
+            if mutation == "caller_attribute"
+            else "lease_alias = session_operation_lease\nlease_alias._context = unrelated_context"
+        )
+        caller.body[0:0] = ast.parse(injected).body
+    elif mutation == "dead":
+        settlement.body.insert(0, ast.Return(value=None))
+    elif mutation in {"module", "method"}:
+        for node in ast.walk(settlement):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "run_coroutine_threadsafe":
+                if mutation == "module":
+                    node.func.value = ast.Name(id="unrelated_scheduler", ctx=ast.Load())
+                else:
+                    node.func.attr = "unrelated_method"
+    elif mutation == "context":
+        for node in ast.walk(settlement):
+            if isinstance(node, ast.keyword) and node.arg == "session_operation_context":
+                node.value = ast.Name(id="other_context", ctx=ast.Load())
+    elif mutation == "caller":
+        for node in ast.walk(owner):
+            if isinstance(node, ast.Call) and _call_name(node) == "_settle_admission_refusal":
+                node.args[1] = ast.Name(id="other_lease", ctx=ast.Load())
+    elif mutation == "rebind":
+        settlement.body.insert(0, ast.parse("lease = other_lease").body[0])
+    ast.fix_missing_locations(owner)
+    findings = _execution_effect_findings(owner)
+    decoys = [_call_name(call) for call in findings.unreachable_decoys]
+    if mutation in {
+        "module",
+        "method",
+        "callback",
+        "dead",
+        "unscheduled",
+        "decorated",
+        "coroutine_rebound",
+        "duplicate_callback",
+        "rebind",
+    }:
+        assert "finalize_run_output_blobs" in decoys
+    elif mutation in {
+        "context",
+        "caller",
+        "lease_attribute",
+        "lease_alias",
+        "caller_attribute",
+        "caller_alias",
+        "caller_mutator",
+        "caller_keyword_mutator",
+    }:
+        assert "finalize_run_output_blobs" in findings.context_offenders
+    else:
+        assert findings.unreachable_decoys == ()
+        assert findings.context_offenders == ()
+        assert findings.escaped_local_helpers == ()
+
+
 def test_worker_delegation_edge_does_not_admit_a_partial_over_a_class_member() -> None:
     """The withdrawn shape: ``run_sync_in_worker(partial(self.<member>, ...))`` hides the member from the walk."""
     body = """
@@ -2250,6 +2700,8 @@ def _real_session_service(
     engine: Engine,
     authority: SQLiteLocalSessionOperationAuthority,
 ) -> SessionServiceImpl:
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=_USER_ID)
     return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -2696,3 +3148,74 @@ def test_controllable_executor_and_lease_doubles_model_real_resource_seams() -> 
     assert executor.submit_calls == [(executor.submit_calls[0][0], (lease.context,), {})]
     assert not future.done()
     assert not lease.close_started.is_set()
+
+
+_ENVELOPE_BLOB_VERIFIER_EDGE = """
+    def _entry(self, state, *, session_id, session_operation_context):
+        {rebinding}
+
+        def verify_blob(blob_id):
+            return self._call_async({receiver}.get_blob(blob_id, session_operation_context={context}))
+
+        return {worker}({consumer}, state{extra_argument}, current_snapshot=state, user_id=None,
+            auth_provider_type=None, resolver=None, implementation_fingerprint="implementation",
+            deployment_generation="generation", {keyword}=verify_blob{extra_keyword})
+"""
+
+
+def _envelope_blob_verifier_case(
+    *,
+    worker: str = "run_sync_in_worker",
+    consumer: str = "restore_execution_envelope",
+    keyword: str = "blob_verifier",
+    rebinding: str = "",
+    extra_argument: str = "",
+    extra_keyword: str = "",
+    receiver: str = "self._blob_service",
+    context: str = "session_operation_context",
+    admitted: bool,
+    context_offenders: tuple[str, ...] = (),
+    unresolved_receiver_count: int = 0,
+) -> _EdgeControlCase:
+    return _EdgeControlCase(
+        body=_ENVELOPE_BLOB_VERIFIER_EDGE.format(
+            worker=worker,
+            consumer=consumer,
+            keyword=keyword,
+            rebinding=rebinding,
+            extra_argument=extra_argument,
+            extra_keyword=extra_keyword,
+            receiver=receiver,
+            context=context,
+        ),
+        closure="verify_blob",
+        admitted=admitted,
+        context_offenders=context_offenders,
+        unresolved_receiver_count=unresolved_receiver_count,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "case"),
+    [
+        ("exact-shape-admitted", _envelope_blob_verifier_case(admitted=True)),
+        ("other-worker-escapes", _envelope_blob_verifier_case(worker="other_worker", admitted=False)),
+        ("other-consumer-escapes", _envelope_blob_verifier_case(consumer="other_restore", admitted=False)),
+        ("other-keyword-escapes", _envelope_blob_verifier_case(keyword="verify_blob", admitted=False)),
+        ("extra-positional-escapes", _envelope_blob_verifier_case(extra_argument=", state", admitted=False)),
+        ("expanded-keywords-escape", _envelope_blob_verifier_case(extra_keyword=", **state", admitted=False)),
+        ("rebound-worker-escapes", _envelope_blob_verifier_case(rebinding="run_sync_in_worker = self._runner", admitted=False)),
+        ("rebound-consumer-escapes", _envelope_blob_verifier_case(rebinding="restore_execution_envelope = self._restore", admitted=False)),
+        (
+            "other-module-consumer-escapes",
+            _envelope_blob_verifier_case(
+                rebinding="from elspeth.web.execution.staging import restore_execution_envelope",
+                admitted=False,
+            ),
+        ),
+        ("wrong-context-flagged", _envelope_blob_verifier_case(admitted=True, context="other_context", context_offenders=("get_blob",))),
+        ("wrong-receiver-flagged", _envelope_blob_verifier_case(admitted=True, receiver="self._staging", unresolved_receiver_count=1)),
+    ],
+)
+def test_envelope_blob_verifier_callback_requires_exact_worker_and_restore_consumer(case_id: str, case: _EdgeControlCase) -> None:
+    _assert_edge_control(case)

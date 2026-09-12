@@ -58,6 +58,14 @@ from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 # ---------------------------------------------------------------------------
 
 
+class _Psycopg2Error(Exception):
+    """Model pgcode populated by a server response, not a bare constructor."""
+
+    def __init__(self, pgcode: str) -> None:
+        super().__init__("driver diagnostic")
+        self.pgcode = pgcode
+
+
 class _StubRepo:
     """Minimal stub of RunCoordinationRepository for heartbeat unit tests.
 
@@ -377,9 +385,8 @@ class TestBusyTolerated:
         assert not thread._coordination_lost_event.is_set()
         thread.check_and_raise()  # must not raise
 
-    @pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
-    def test_postgresql_lock_timeout_records_degradation(self, driver: str) -> None:
-        postgres = pytest.importorskip(driver)
+    def test_postgresql_lock_timeout_records_degradation(self) -> None:
+        postgres = pytest.importorskip("psycopg")
         failure = OperationalError(
             "SELECT run_coordination FOR UPDATE",
             None,
@@ -1188,3 +1195,27 @@ def test_stop_before_start_is_safe() -> None:
 def test_stop_timeout_requires_finite_positive_budget(timeout: float) -> None:
     with pytest.raises(ValueError, match="finite and positive"):
         RunHeartbeatThread(_StubRepo(), member_token=_TOKEN, stop_timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("sqlstate", ["55P03", "40P01", "57014"])
+@pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+def test_postgresql_sqlstate_distinguishes_contention_from_statement_cancellation(sqlstate: str, driver: str) -> None:
+    """Both driver fields classify by server SQLSTATE independently of text."""
+    from psycopg.errors import lookup
+
+    repo = _StubRepo()
+    origin = lookup(sqlstate)("driver diagnostic") if driver == "psycopg" else _Psycopg2Error(sqlstate)
+    failure = OperationalError("UPDATE run_workers", None, origin)
+    repo.side_effect = failure
+    thread = _make_thread(repo, degraded_threshold=1)
+    thread._step_beat()
+    if sqlstate in {"55P03", "40P01"}:
+        assert thread._consecutive_busy == 1
+        assert len(repo.record_heartbeat_degraded_calls) == 1
+        thread.check_and_raise()
+    else:
+        assert thread._consecutive_busy == 0
+        assert repo.record_heartbeat_degraded_calls == []
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure

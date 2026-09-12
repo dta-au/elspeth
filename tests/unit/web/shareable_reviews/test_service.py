@@ -70,6 +70,7 @@ from elspeth.web.shareable_reviews.service import (
     ShareableReviewService,
 )
 from elspeth.web.shareable_reviews.signer import InvalidToken, ShareTokenPayload, ShareTokenSigner
+from tests.fixtures.identities import ensure_test_identity
 
 _VALID_SIGNING_KEY = b"k" * 32
 
@@ -289,6 +290,8 @@ def session_engine_with_row(
     """Insert parent sessions + composition_states rows so FK constraints on
     composer_completion_events resolve.
     """
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=session_record.user_id)
     authority = SQLiteLocalSessionOperationAuthority(engine)
     monkeypatch.setattr(coordination_repository, "_new_session_id", lambda: session_record.id)
     created = authority.create_session_with_initial_fence(

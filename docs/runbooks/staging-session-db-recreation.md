@@ -2,9 +2,25 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.0 blob cleanup, guided decline, aggregation recovery, the identity substrate, and read admissions (session epoch 53 and Landscape epoch 38)
+## Current Cutover: 0.8.1 replica recovery and identity admission (session epoch 55 and Landscape epoch 40)
 
-0.8.0 advances `SESSION_SCHEMA_EPOCH` from 35 to 53. Epoch 36 ensures a committed
+0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 55 and Landscape
+`SQLITE_SCHEMA_EPOCH` from 38 to 40. Session epoch 54 adds durable Composer
+progress snapshots and exact request lifecycle leases. Landscape epoch 39
+adds immutable web run-start permit binding and recoverable pre-effect
+admission state. Session epoch 55 adds identity ownership foreign keys,
+approval revocation provenance and durable admission/refusal decisions.
+Landscape epoch 40 adds nullable call token measures and the persisted
+quota-policy/secret-wiring admission evidence. These intermediate definitions
+share one prepared 0.8.1 cutover; installing the intermediate ACA pair is not
+required. This procedure describes an operator action, not an already
+performed reset. Stop the service, archive/export required evidence, recreate
+both stale stores, and install 0.8.1 using the procedure below.
+
+The preceding 0.8.0 release advanced `SESSION_SCHEMA_EPOCH` from 35 to 53
+and Landscape `SQLITE_SCHEMA_EPOCH` from 29 to 38. Its historical changes
+and credential re-admission guidance remain relevant when recreating these
+stores. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
 after restart. Epoch 37 adds the completed `guided_plan` `declined`
 result kind and its state-only result locator. Epoch 38 additionally retains the
@@ -59,7 +75,7 @@ the session is archived or deleted. Landscape advances to epoch 38:
 authoritative replay order, and `event_id` becomes a non-unique content digest
 of the transition, because database-stamped events tie on `recorded_at`
 inside one SQLite second or one PostgreSQL transaction.
-An epoch-35 through epoch-52 database cannot represent
+An epoch-35 through epoch-53 database cannot represent
 the complete current contract and must be recreated. Only `sessions.db` is
 recreated — `data/auth.db` and the content-addressed payload store are never
 deleted by this procedure; recreating the session DB severs stale payload
@@ -115,8 +131,8 @@ Epoch 36 binds every coalesce effect to its non-null lineage group.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 37. Landscape epoch 38
-is the current release boundary, so a Landscape database left at epoch 37 or
+session epoch is a recreate boundary, including epoch 37. Landscape epoch 40
+is the current release boundary, so a Landscape database left at epoch 39 or
 below is stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
 
@@ -137,9 +153,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-53 release forward,
+unsupported: keep the service drained, repair the epoch-55 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-53/Landscape-epoch-38 record when binding candidate and rollback
+session-epoch-55/Landscape-epoch-40 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
@@ -160,93 +176,56 @@ awaiting administrator approval`. The account named by `dev_admin_user` is
 refused identically, and the dev-admin surface could not clear it even if it
 were reachable: it manages `auth.db` credentials, not identities.
 
-0.8.0 ships no activation route and no activation command — `elspeth composer
-users add` / `remove` write `auth.db`, and the bootstrap CLI the SSO design
-assumes for cohort re-admission belongs to a later phase. Until it lands, the
-operator clears the wall with direct SQL against the recreated session DB,
-inside the same window, before handing the deployment back. Do not reach for
-`registration_mode=open` as the shortcut: it admits every stranger who can
-reach the service for as long as it is set, which is the opposite of what a
-`closed` deployment is configured for.
-
-**Pre-provision the cohort before the users come back.** A pending row does
-not exist until an account's first login creates it, and only a *correct*
-credential gets that far — `_login_sync` refuses a bad password, and an
-unverified email, before reaching the admission wall. So the operator cannot
-activate a row that does not exist yet, and cannot make it exist without the
-user's password. Waiting for each person to hit a 401 first would mean handing
-the deployment back before the window can close.
-
-Insert the rows instead. `identities.pre_provisioned_at` exists for exactly
-this: an administrator may create an `active` row by `(provider, subject)`
-before anyone logs in, and that person's first login BINDS to it rather than
-creating a second identity. It needs only the usernames, which `auth.db`
-already has. Resolve `$DB_PATH` first — the assignment lives in the Procedure
-script below, so set it explicitly if you are running this section on its own:
+**Use the audited identity administration paths in 0.8.1.** `elspeth composer
+users add` and `remove` manage the surviving credential store; they do not
+activate identities. With the recreated stores initialized and the service
+still withheld from ordinary traffic, create or recover the first human
+administrator:
 
 ```bash
-DB_PATH="${ELSPETH_DATA_DIR:-data}/sessions.db"
-
-# The cohort to admit, read from the credential store that survived the reset.
-sqlite3 "${ELSPETH_DATA_DIR:-data}/auth.db" \
-  "SELECT user_id FROM users WHERE email_verified = 1 ORDER BY user_id;"
-
-# One statement per account. Repeat for each username from the list above.
-sqlite3 "$DB_PATH" "
-  INSERT INTO identities (identity_id, provider, kind, subject, username,
-                          first_seen_at, access_state, pre_provisioned_at, activated_at)
-  VALUES (lower(hex(randomblob(4))||'-'||hex(randomblob(2))||'-4'||substr(hex(randomblob(2)),2)
-          ||'-'||substr('89ab',abs(random())%4+1,1)||substr(hex(randomblob(2)),2)||'-'||hex(randomblob(6))),
-          'local', 'human', 'THE_USERNAME', 'THE_USERNAME',
-          datetime('now'), 'active', datetime('now'), datetime('now'));"
+elspeth composer users bootstrap-admin local THE_ADMIN_USERNAME \
+  --note "Re-admission after the 0.8.1 paired database recreation"
 ```
 
-For the local provider the `subject` **is** the username, so both columns take
-the same value. The `identity_id` expression generates a v4 UUID, matching what
-`ensure_identity` writes; the column has no format constraint, but a value
-shaped like every other id is what makes the table readable later.
-`datetime('now')` is UTC at second precision, which the typed columns read back
-unchanged.
+The command uses the configured Sessions and Landscape URLs or the
+data-directory defaults. Supply `--session-db-url` and `--landscape-url` if
+those environment settings are absent. It refuses when an active human
+administrator already exists and grants no workload role. Where this
+deployment issues quota policies, supply both `--quota-tokens-per-day` and
+`--quota-storage-bytes` with the operator-approved values. This command is
+administrator bootstrap/recovery, not a general policy backfill command.
 
-**Mop-up, for anyone missed.** Someone left off the list meets the 401 and
-creates their own `pending` row. Activate those by name once they appear:
+**Pre-provision the cohort before the users come back.** Log in as that
+administrator and use the authenticated identity administration API to admit
+the approved cohort. `POST /api/auth/admin/identities` pre-provisions an
+account before first login. For a local account use its username as `subject`,
+with `provider: "local"`, the intended `role`, and a nonempty operator `note`.
+The roles are `user`, `approver`, `reviewer`, or `none`.
 
-```bash
-sqlite3 "$DB_PATH" \
-  "SELECT username, access_state, first_seen_at FROM identities WHERE provider = 'local' ORDER BY first_seen_at;"
+For accounts that already have pending rows, obtain their identity IDs from
+`GET /api/auth/admin/identities?access_state=pending` and use
+`POST /api/auth/admin/identities/{identity_id}/activate` with `role` and `note`.
+Page the listing when needed. These paths preserve activation audit and
+create missing identity policy rows when both issuance defaults are
+configured. Do not widen registration to admit the cohort or bypass these
+paths with the historical SQL workaround.
 
-sqlite3 "$DB_PATH" \
-  "UPDATE identities SET access_state = 'active', activated_at = datetime('now')
-   WHERE provider = 'local' AND subject = 'THE_USERNAME' AND access_state = 'pending';"
-```
+**Token admission is already fail-closed.** A configured
+`quota_default_tokens_per_day` requires an active identity policy; a configured
+`quota_container_tokens_per_day` requires an active container policy. A
+missing required slot refuses chargeable work with `quota_policy_missing`.
+An applicable active identity or container policy otherwise refuses with
+`token_accounting_unavailable`, including policies authored independently of
+boot defaults, because complete accounting is not implemented. Adding policy
+rows does not make chargeable work available in this release. Only an active
+identity with no configured token-policy requirements and no applicable
+active policies receives the explicit no-quota allowance. Keep the
+deployment's intended policy posture; do not remove policies as a recovery
+shortcut.
 
-Both predicates on that UPDATE are load-bearing. Without `access_state =
-'pending'` a recovery sweep resurrects any identity an administrator
-deliberately `disabled`; without the `subject` predicate the sweep admits
-everyone holding a pending row, which under `email_verified` includes anyone
-who self-registered and verified an address since the reset — exactly the
-population that mode exists to gate.
-
-Two consequences of activating this way, both of which the deploy record must
-carry because the audit trail cannot:
-
-- **No `identity_activated` event is written.** That event and its `quota_set`
-  partner are emitted by the admission callback inside `ensure_identity`, and
-  that callback runs only when `ensure_identity` CREATES an activated row. It
-  is unreachable for any row that already exists, whatever its state — a later
-  login on a still-`pending` row does not emit it either. The Landscape trail will
-  show these identities acting as admitted principals with no activating
-  actor — an admission with no activation event, which is precisely the shape
-  the normal path is built to make impossible. Record the operator, the window,
-  and the activated usernames in the deploy record.
-- **No `quota_policies` row is written.** Activation normally writes one from
-  the container defaults, but only when both `quota_default_tokens_per_day` and
-  `quota_default_storage_bytes` are configured. If this deployment configures
-  them, the identities activated by SQL will need those rows backfilled when
-  quota enforcement lands; nothing reads them in this phase.
-
-Verify by having one activated account log in again: the same credential now
-returns a token instead of the 401.
+Verify that an admitted account can log in again, and separately verify the
+expected chargeable-admission result before reopening ordinary traffic.
+Successful login does not prove token-accounting availability.
 
 ### What the derived keys change across this boundary
 
@@ -752,8 +731,8 @@ sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
 resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 53 (== SESSION_SCHEMA_EPOCH)
-sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 38 (== SQLITE_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 55 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 40 (== SQLITE_SCHEMA_EPOCH)
 ```
 
 Any predecessor session or Landscape epoch is not repairable in place: keep the

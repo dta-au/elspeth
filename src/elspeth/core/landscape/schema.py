@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from sqlalchemy import (
     DDL,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -375,7 +376,22 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        (ix_scheduler_events_run_token_time is replaced by
 #        ix_scheduler_events_run_token_seq). Pre-1.0 delete-and-recreate
 #        boundary; no migration, rollback_permitted: false.
-SQLITE_SCHEMA_EPOCH = 38
+#   39 → immutable web run-start permit binding and recoverable pre-effect
+#        admission state. Pre-1.0 delete-and-recreate boundary; no migration.
+#   40 → VANguard residual schema batch (elspeth-255ae1a544,
+#        elspeth-ff89d2bea0): nullable prompt_tokens, completion_tokens,
+#        cached_prompt_tokens and reasoning_tokens on calls preserve reported
+#        usage, including measured zero, without inventing usage when unknown.
+#        Run policy evidence gains the assessed quota-policy identities and
+#        canonical secret-wiring hash bound to the durable admission decision.
+#        These items missed the epoch-38 window; their named trigger is this
+#        prepared residual batch after ACA epoch 39, not a future incidental
+#        bump. Deploy together with Sessions epoch 55 in ONE service-stop
+#        window. Definitions and admission checks prepare that window; they
+#        do not perform a deployed cutover or assert complete token accounting.
+#        Pre-1.0 delete-and-recreate boundary; no migration,
+#        rollback_permitted: false. Preserve/export evidence before cutover.
+SQLITE_SCHEMA_EPOCH = 40
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -488,6 +504,21 @@ runs_table = Table(
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
 
+run_start_admissions_table = Table(
+    "run_start_admissions",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("permit_id", String, nullable=False, unique=True),
+    Column("permit_epoch", Integer, nullable=False),
+    Column("subject_hash", String(64), nullable=False),
+    Column("state", String(16), nullable=False),
+    CheckConstraint("permit_epoch > 0", name="ck_run_start_admissions_epoch"),
+    CheckConstraint("length(trim(permit_id)) > 0", name="ck_run_start_admissions_permit").ddl_if(dialect="sqlite"),
+    CheckConstraint("length(btrim(permit_id)) > 0", name="ck_run_start_admissions_permit").ddl_if(dialect="postgresql"),
+    CheckConstraint(_LowerHex64Check("subject_hash"), name="ck_run_start_admissions_hash"),
+    CheckConstraint("state IN ('prepared', 'executing')", name="ck_run_start_admissions_state"),
+)
+
 run_attributions_table = Table(
     "run_attributions",
     metadata,
@@ -517,6 +548,13 @@ run_web_plugin_policy_table = Table(
     Column("plugin_code_identities_json", Text, nullable=False),
     Column("binding_generation_fingerprint", String(64), nullable=False),
     Column("decision_codes_json", Text, nullable=False),
+    Column("admission_decision_json", Text, nullable=True),
+    Column("admission_decision_hash", String(64), nullable=True),
+    CheckConstraint(
+        "(admission_decision_json IS NULL AND admission_decision_hash IS NULL) OR "
+        "(admission_decision_json IS NOT NULL AND admission_decision_hash IS NOT NULL)",
+        name="ck_run_web_plugin_policy_admission_pair",
+    ),
     CheckConstraint("schema_version >= 1", name="ck_run_web_plugin_policy_schema_version"),
 )
 
@@ -2087,6 +2125,16 @@ calls_table = Table(
     # the session service (write at resolve time) and the runtime plugin (write
     # at execution time), so the hashes are comparable byte-for-byte.
     Column("resolved_prompt_template_hash", String(64), nullable=True),
+    # Missing provider usage is unknown, never zero. Provider-specific totals
+    # and Anthropic cache measures remain in the retained response payload.
+    Column("prompt_tokens", BigInteger, nullable=True),
+    Column("completion_tokens", BigInteger, nullable=True),
+    Column("cached_prompt_tokens", BigInteger, nullable=True),
+    Column("reasoning_tokens", BigInteger, nullable=True),
+    CheckConstraint("prompt_tokens >= 0", name="calls_prompt_tokens_nonnegative"),
+    CheckConstraint("completion_tokens >= 0", name="calls_completion_tokens_nonnegative"),
+    CheckConstraint("cached_prompt_tokens >= 0", name="calls_cached_prompt_tokens_nonnegative"),
+    CheckConstraint("reasoning_tokens >= 0", name="calls_reasoning_tokens_nonnegative"),
     Column("error_json", Text),
     Column("latency_ms", Float),
     Column("created_at", DateTime(timezone=True), nullable=False),

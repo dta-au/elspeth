@@ -373,6 +373,7 @@ export type ComposerProgressReason =
   // retryable — deliberately not part of the provider_* family.
   | "planner_repair_exhausted"
   | "service_setup_failed"
+  | "admission_refused"
   // Required when phase === "cancelled" — distinguishes a client disconnect
   // from a future operator-initiated cancel without parsing the headline.
   | "client_cancelled"
@@ -801,6 +802,7 @@ export interface Run {
  * - "failed" -- terminal. Pipeline aborted due to an unrecoverable error.
  */
 export interface RunEvent {
+  event_sequence?: number;
   run_id: string;
   timestamp: string;
   event_type: "progress" | "error" | "completed" | "cancelled" | "failed";

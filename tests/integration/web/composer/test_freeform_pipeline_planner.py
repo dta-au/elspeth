@@ -40,6 +40,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
@@ -193,6 +194,8 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
@@ -320,6 +323,8 @@ async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
@@ -467,6 +472,8 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     """Cancelled auto mode terminalises; explicit review stays crash-resumable."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
@@ -707,6 +714,8 @@ async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
@@ -765,6 +774,8 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
@@ -837,6 +848,8 @@ async def _recipe_composer_context(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(

@@ -110,7 +110,7 @@ def _derivation_config(*, signed: bool = False) -> AuditExportDerivationConfig:
         source_status="completed",
         source_completed_at=COMPLETED_AT_TEXT,
         export_format="json",
-        exporter_version="landscape-exporter-v2",
+        exporter_version="landscape-exporter-v1",
         serialization_version="audit-export-v2",
         chunking_algorithm_version="complete-frame-v1",
         include_raw_error_rows=False,
@@ -144,8 +144,9 @@ def _candidate(
     *,
     records: list[dict[str, object]] | None = None,
     signed: bool = False,
+    config: AuditExportDerivationConfig | None = None,
 ) -> AuditExportSnapshotCandidate:
-    bundle = derive_audit_export_bundle(records or [{"record_type": "run"}], _derivation_config(signed=signed))
+    bundle = derive_audit_export_bundle(records or [{"record_type": "run"}], config or _derivation_config(signed=signed))
     for chunk in bundle.chunks:
         assert (
             store.put_immutable(
@@ -213,6 +214,67 @@ def _candidate(
         for chunk in bundle.chunks
     )
     return AuditExportSnapshotCandidate(snapshot=snapshot, chunks=chunks)
+
+
+def test_reader_rejects_resigned_false_auth_event_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _MemoryContentStore()
+    config = replace(_derivation_config(signed=True), exporter_version="landscape-exporter-auth-v1", auth_events="deployment_snapshot")
+    records = [
+        {"record_type": "run"},
+        {
+            "record_type": "auth_event_coverage",
+            "policy": "deployment_snapshot",
+            "selection_cutoff": COMPLETED_AT_TEXT,
+            "selected_count": 1,
+            "reason": "deployment_snapshot",
+            "selection_basis": "visible_rows_at_or_before_run_completion",
+        },
+    ]
+    # Model a signer bypassing producer admission: every cryptographic binding
+    # is recomputed honestly around a semantically false coverage declaration.
+    with monkeypatch.context() as producer:
+        producer.setattr("elspeth.contracts.audit_export._coverage_checked_records", lambda records, config: iter(records))
+        config_record = {"record_type": "audit_export_config", "public_config": config.public_snapshot_config()}
+        false_candidate = _candidate(store, records=[*records, config_record], signed=True, config=config)
+        true_records = [records[0], {**records[1], "selected_count": 0}]
+        true_candidate = _candidate(store, records=[*true_records, config_record], signed=True, config=config)
+        false_config_candidate = _candidate(
+            store,
+            records=[
+                *true_records,
+                {
+                    "record_type": "audit_export_config",
+                    "public_config": {**config.public_snapshot_config(), "include_raw_error_rows": True},
+                },
+            ],
+            signed=True,
+            config=config,
+        )
+    from elspeth.core.landscape.execution.audit_export_snapshots import _verify_snapshot_graph
+
+    _verify_snapshot_graph(
+        true_candidate.snapshot,
+        true_candidate.chunks,
+        resolve_registered=store.content.__getitem__,
+        signed_manifest_verifier=_signed_manifest_verifier,
+        record_signature_verifier=_record_signature_verifier,
+    )
+    with pytest.raises(AuditIntegrityError, match="coverage"):
+        _verify_snapshot_graph(
+            false_candidate.snapshot,
+            false_candidate.chunks,
+            resolve_registered=store.content.__getitem__,
+            signed_manifest_verifier=_signed_manifest_verifier,
+            record_signature_verifier=_record_signature_verifier,
+        )
+    with pytest.raises(AuditIntegrityError, match="public_export_config_hash"):
+        _verify_snapshot_graph(
+            false_config_candidate.snapshot,
+            false_config_candidate.chunks,
+            resolve_registered=store.content.__getitem__,
+            signed_manifest_verifier=_signed_manifest_verifier,
+            record_signature_verifier=_record_signature_verifier,
+        )
 
 
 def _repository(db: LandscapeDB) -> AuditExportSnapshotRepository:

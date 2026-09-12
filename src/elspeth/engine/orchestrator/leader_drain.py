@@ -110,6 +110,7 @@ class LeaderDrainCoordinator:
         shutdown_event: threading.Event | None = None,
         coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
+        before_plugin_effects: Callable[[], None] | None = None,
         register_graph_nodes_and_edges: RegisterGraphNodesAndEdges,
     ) -> RunResult:
         """Execute the run using the execution graph.
@@ -148,6 +149,8 @@ class LeaderDrainCoordinator:
         artifacts = register_graph_nodes_and_edges(factory, run_id, config, graph, coordination_token)
 
         # 2. Initialize context + processor
+        if before_plugin_effects is not None:
+            before_plugin_effects()
         run_ctx = self._context_factory.initialize_run_context(
             factory,
             run_id,

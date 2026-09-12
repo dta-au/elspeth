@@ -50,6 +50,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import create_blob_under_fence, get_blob_under_fence, read_blob_content_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -256,6 +257,8 @@ def engine():
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return eng
 
 
@@ -2025,6 +2028,8 @@ def _make_fork_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -2921,6 +2926,8 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         # Create a session as "bob" directly in the service (bypassing auth)
+        with service._engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="bob")
         bob_session = await service.create_session("bob", "Bob's Session", "local")
         msg = await service.add_message(bob_session.id, "user", "Hello", writer_principal="route_user_message")
 
@@ -3284,6 +3291,8 @@ class TestForkEndpoint:
             poolclass=StaticPool,
         )
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session_service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),

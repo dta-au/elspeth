@@ -51,6 +51,10 @@ class _Proposal:
 async def proposal(tmp_path: Path) -> AsyncIterator[_Proposal]:
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}", connect_args={"check_same_thread": False})
     initialize_session_schema(engine)
+    from tests.fixtures.identities import ensure_test_identity
+
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     service = SessionServiceImpl(
         engine, data_dir=tmp_path, telemetry=build_sessions_telemetry(), log=structlog.get_logger("proposal-authority")
     )

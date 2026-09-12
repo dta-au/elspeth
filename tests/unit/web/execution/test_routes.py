@@ -25,6 +25,7 @@ from httpx import ASGITransport, AsyncClient
 from starlette.requests import Request
 from starlette.routing import Route
 
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.execution.accounting import RunAccountingBatch
@@ -1337,7 +1338,15 @@ class TestRunDiagnosticsEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
 
         class ExplodingComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 raise AssertionError("LLM evaluation must not run when the audit store is unavailable")
 
         app = _create_test_app(execution_service=svc)
@@ -1401,7 +1410,15 @@ class TestRunDiagnosticsEndpoint:
         captured: dict[str, Any] = {}
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 captured.update(snapshot)
                 return (
                     '{"headline":"The run is processing data",'
@@ -1476,7 +1493,15 @@ class TestRunDiagnosticsEndpoint:
         calls = 0
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 nonlocal calls
                 calls += 1
                 return "provider must not be reached"
@@ -1582,7 +1607,10 @@ class TestRunDiagnosticsEndpoint:
                 snapshot: dict[str, object],
                 *,
                 recorder: BufferingRecorder | None = None,
+                session_operation_context: SessionOperationContext | None = None,
             ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -1726,7 +1754,10 @@ class TestRunDiagnosticsEndpoint:
                 snapshot: dict[str, object],
                 *,
                 recorder: BufferingRecorder | None = None,
+                session_operation_context: SessionOperationContext | None = None,
             ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -1832,7 +1863,10 @@ class TestRunDiagnosticsEndpoint:
                 snapshot: dict[str, object],
                 *,
                 recorder: BufferingRecorder | None = None,
+                session_operation_context: SessionOperationContext | None = None,
             ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -2007,7 +2041,15 @@ class TestRunDiagnosticsEndpoint:
         captured: dict[str, Any] = {}
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 captured.update(snapshot)
                 return (
                     '{"headline":"The run failed",'
@@ -2082,7 +2124,15 @@ class TestRunDiagnosticsEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 return "The run is still working through the data."
 
         app = _create_test_app(execution_service=svc)
@@ -2156,7 +2206,15 @@ class TestRunDiagnosticsEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 raise _BadRequestLLMError(
                     "LLM request rejected (BadRequestError)",
                     provider_detail="Model `gpt-foo` does not exist",
@@ -2238,7 +2296,15 @@ class TestRunDiagnosticsEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 raise _BadRequestLLMError(
                     "LLM request rejected (BadRequestError)",
                     provider_detail="Model `gpt-foo` does not exist",

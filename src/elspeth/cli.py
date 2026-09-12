@@ -37,7 +37,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.types import AggregationName
 from elspeth.core.checkpoint.recovery import NonResumableRunError
-from elspeth.core.config import ElspethSettings, SourceSettings, resolve_config
+from elspeth.core.config import ElspethSettings, resolve_config
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
 from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
@@ -45,7 +45,7 @@ from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
-    from elspeth.contracts import SinkProtocol, SourceProtocol
+    from elspeth.contracts import SinkProtocol
     from elspeth.contracts.coordination import WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_context import PluginContext
@@ -1997,7 +1997,7 @@ def _composer_auth_audit_recorder(landscape_url: str) -> AuthAuditRecorder:
     )
 
 
-def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetired], None]:
+def _composer_retirement_recorder(recorder: AuthAuditRecorder) -> Callable[[IdentityRetired], None]:
     """The CLI's audit sink for a retirement: the SAME Landscape row app.py writes.
 
     A credential deletion disables the identity and retires its binding, and
@@ -2008,7 +2008,6 @@ def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetir
     allows; it writes ``identity_disabled`` with ``cause=credential_deleted``
     through the same recorder, resolved from the same URL rule.
     """
-    recorder = _composer_auth_audit_recorder(landscape_url)
 
     def record(outcome: IdentityRetired) -> None:
         recorder.record_identity_retired(
@@ -2041,12 +2040,17 @@ def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> Retir
     user to. So ``add`` binds the real authority, with the real audit sink,
     behind a first-call open.
     """
+    from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
 
     def retire(username: str) -> None:
         engine = _composer_session_engine(session_db_url)
         try:
-            local_identity_retirer(RepositoryIdentityAuthority(engine), _composer_retirement_recorder(landscape_url))(username)
+            with _composer_auth_audit_recorder(landscape_url) as recorder:
+                local_identity_retirer(
+                    RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
+                    _composer_retirement_recorder(recorder),
+                )(username)
         finally:
             engine.dispose()
 
@@ -2157,6 +2161,7 @@ def composer_users_remove(
     ),
 ) -> None:
     """Remove a local Composer web user and retire the identity it was bound to."""
+    from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
     from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 
@@ -2169,32 +2174,33 @@ def composer_users_remove(
         raise typer.Exit(1)
     resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
     session_engine = _composer_session_engine(resolved_session_db_url)
-    provider = _composer_auth_provider(
-        db_path,
-        retire_identity=local_identity_retirer(
-            RepositoryIdentityAuthority(session_engine),
-            _composer_retirement_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url)),
-        ),
-    )
     # The store must carry the current schema BEFORE the credential goes:
     # a deletion whose retirement then fails is the inheritance defect with
     # extra steps. Same create-or-validate rule the web app applies to this
     # URL at boot -- an empty store is initialised, a stale one is refused
     # unaltered, and the credential is untouched either way until this
     # returns.
-    if session_engine.dialect.name == "sqlite":
-        sqlite_store = session_engine.url.database
-        if sqlite_store is not None and sqlite_store != ":memory:":
-            Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
     try:
-        initialize_session_schema(session_engine)
-    except SessionSchemaError as exc:
-        typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    try:
-        if not provider.delete_user(username):
-            typer.echo(f"Error: composer user not found: {username}", err=True)
-            raise typer.Exit(1)
+        if session_engine.dialect.name == "sqlite":
+            sqlite_store = session_engine.url.database
+            if sqlite_store is not None and sqlite_store != ":memory:":
+                Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            initialize_session_schema(session_engine)
+        except SessionSchemaError as exc:
+            typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        with _composer_auth_audit_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url)) as recorder:
+            provider = _composer_auth_provider(
+                db_path,
+                retire_identity=local_identity_retirer(
+                    RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
+                    _composer_retirement_recorder(recorder),
+                ),
+            )
+            if not provider.delete_user(username):
+                typer.echo(f"Error: composer user not found: {username}", err=True)
+                raise typer.Exit(1)
     finally:
         session_engine.dispose()
     typer.echo(f"Removed composer user {username} from {db_path}")
@@ -2287,6 +2293,7 @@ def composer_users_bootstrap_admin(
         )
 
     try:
+        recorder.start()
         if session_engine.dialect.name == "sqlite":
             sqlite_store = session_engine.url.database
             if sqlite_store is not None and sqlite_store != ":memory:":
@@ -2297,7 +2304,11 @@ def composer_users_bootstrap_admin(
             typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
             raise typer.Exit(1) from exc
         try:
-            activated = RepositoryIdentityAuthority(session_engine).bootstrap_admin(
+            from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+
+            activated = RepositoryIdentityAuthority(
+                session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply
+            ).bootstrap_admin(
                 claims=claims,
                 note=note,
                 quota_tokens_per_day=quota_tokens_per_day,
@@ -2314,7 +2325,10 @@ def composer_users_bootstrap_admin(
             typer.echo(f"Error: the identity for {provider}:{subject} is a service identity; admin is a human role", err=True)
             raise typer.Exit(1) from exc
     finally:
-        session_engine.dispose()
+        try:
+            recorder.close()
+        finally:
+            session_engine.dispose()
     typer.echo(f"Bootstrapped admin {activated.record.username} ({activated.record.identity_id}) for {provider}:{subject}")
 
 
@@ -2545,7 +2559,7 @@ def _execute_resume_with_instances(
     Args:
         config: Validated ElspethSettings
         graph: Validated ExecutionGraph
-        plugins: Pre-instantiated plugins (with NullSource)
+        plugins: Pre-instantiated original plugins for compatibility validation
         resume_point: Resume point information
         payload_store: Payload store for retrieving row data
         db: LandscapeDB connection (caller owns close lifecycle)
@@ -2586,9 +2600,8 @@ def _build_resume_graphs(
     Returns:
         Tuple of (validation_graph, execution_graph):
         - validation_graph: Uses original source for topology hash matching
-        - execution_graph: Uses the same original topology/source IDs; runtime
-          plugin instances are swapped to NullSource later because resume data
-          comes from stored payloads
+        - execution_graph: Uses the same original topology/source IDs and
+          plugin identities; resume reads row data from stored payloads
     """
     gate_settings = list(settings_config.gates)
     coalesce_settings = list(settings_config.coalesce) if settings_config.coalesce else None
@@ -2597,8 +2610,8 @@ def _build_resume_graphs(
 
     # Both resume graphs use the ORIGINAL source topology to match the topology
     # hash and source node IDs computed during the original run. The runtime
-    # PluginBundle is swapped to NullSource separately before execution; graph
-    # identity must not change just because resume does not reopen sources.
+    # Source instances also remain original for implementation compatibility;
+    # the resume lifecycle does not reopen or invoke those sources.
     execution_sinks = _execution_sinks_for_graph(settings_config, plugins.sinks)
     validation_graph = ExecutionGraph.from_plugin_instances(
         sources=plugins.sources,
@@ -3156,8 +3169,6 @@ def resume(
         # _configure_execution_sinks_for_resume BEFORE admission was issued,
         # so the admission receipt binds the live post-resume mode
         # (elspeth-fc9906e398).
-        from elspeth.plugins.sources.null_source import NullSource
-
         resume_sinks = {}
 
         for sink_name, sink in execution_sinks.items():
@@ -3210,28 +3221,18 @@ def resume(
 
             resume_sinks[sink_name] = sink
 
-        # Override sources with NullSource for resume (data comes from payloads).
-        # Per ADR-025 §2 each named source becomes its own NullSource so the
-        # execution graph mirrors the original source-name set.
+        # Keep original source implementations for the enforcing resume
+        # compatibility check. Resume skips source start/load/cleanup and
+        # obtains rows from persisted payloads, so substitution is unnecessary
+        # and would compare the original audit evidence against another plugin.
         from dataclasses import replace
 
-        from elspeth.core.config import SourceSettings as _SourceSettings
-
-        null_resume_sources: dict[str, SourceProtocol] = {}
-        null_resume_settings: dict[str, SourceSettings] = {}
-        for source_name, original_source in plugins.sources.items():
-            null_source = NullSource({})
-            null_source.on_success = original_source.on_success
-            null_resume_sources[source_name] = null_source
-            null_resume_settings[source_name] = _SourceSettings(plugin="null", on_success=original_source.on_success)
         resume_plugins = replace(
             plugins,
-            sources=null_resume_sources,
-            source_settings_map=null_resume_settings,
             sinks=resume_sinks,  # Use append-mode sinks
         )
 
-        # Execute resume with execution graph (NullSource)
+        # Execute resume from persisted rows with the original plugin evidence.
         try:
             result = _execute_resume_with_instances(
                 config=settings_config,

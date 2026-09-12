@@ -50,6 +50,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -78,6 +79,8 @@ def _make_app_with_telemetry(tmp_path: Path) -> tuple[FastAPI, SessionServiceImp
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     telemetry = build_sessions_telemetry()
     service = DualFencedSessionServiceHarness(
         engine,

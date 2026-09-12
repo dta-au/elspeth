@@ -64,9 +64,11 @@ class _FakeExecutionService:
 
     def __init__(self) -> None:
         self.cancelled: list[UUID] = []
+        self.cancelling_users: list[UserIdentity] = []
 
-    async def cancel(self, run_id: UUID) -> None:
+    async def cancel(self, run_id: UUID, *, user: UserIdentity) -> None:
         self.cancelled.append(run_id)
+        self.cancelling_users.append(user)
 
 
 def _app(tmp_path: Path) -> FastAPI:
@@ -267,6 +269,7 @@ def test_post_cancel_with_active_run_cancels_via_run_cancel_machinery(tmp_path: 
     # The session's active run was cancelled through the EXISTING run-cancel
     # machinery (ExecutionService.cancel keyed by run_id), not a tutorial fork.
     assert app.state.execution_service.cancelled == [run.id]
+    assert app.state.execution_service.cancelling_users == [UserIdentity(user_id="alice", username="alice")]
 
 
 def test_post_cancel_without_active_run_is_idempotent(tmp_path: Path) -> None:

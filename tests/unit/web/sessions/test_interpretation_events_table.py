@@ -33,6 +33,7 @@ from elspeth.web.sessions.models import (
     skill_markdown_history_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture
@@ -44,6 +45,7 @@ def engine():
 
 
 def _insert_session(conn, session_id: str) -> None:
+    ensure_test_identity(conn, identity_id="alice")
     conn.execute(
         insert(sessions_table).values(
             id=session_id,
@@ -196,7 +198,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_52() -> None:
+def test_current_session_schema_epoch_is_55() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -220,7 +222,10 @@ def test_current_session_schema_epoch_is_52() -> None:
     # 53: per-admission read records (session_read_admissions,
     # elspeth-f98e0ae8b2) so a released or expired BLOB_READ context is
     # refused on its next proof.
-    assert SESSION_SCHEMA_EPOCH == 53
+    # 54: durable Composer progress and inflight request records.
+    # 55: ownership FKs, revocation provenance and permit admission evidence;
+    # paired with Landscape40 in the identity residual schema window.
+    assert SESSION_SCHEMA_EPOCH == 55
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

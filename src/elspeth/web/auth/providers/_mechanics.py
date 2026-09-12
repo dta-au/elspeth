@@ -121,11 +121,14 @@ def check_entra_tenant(claims: IdTokenClaims, settings: WebSettings) -> None:
 def check_google_hosted_domain(claims: IdTokenClaims, settings: WebSettings) -> None:
     """Verified email plus the configured Workspace domain, both required.
 
-    ``hd`` is emitted for Workspace accounts ONLY and is absent from Google's
-    published ``claims_supported``, so a personal account produces a token
-    with no ``hd`` at all. Treating absence as "no restriction" would make
+    ``hd`` identifies a Google Workspace or Cloud organisation and is absent
+    from Google's published ``claims_supported``. A personal account has
+    no ``hd`` at all. Treating absence as "no restriction" would make
     every Google account on earth a valid login, which is why this fails
     closed on a missing claim rather than skipping the check.
+
+    Source: https://developers.google.com/identity/openid-connect/openid-connect
+    The request's ``hd`` is only a UI hint; this checks the signed token claim.
     """
     assert settings.google_hosted_domain is not None, "required_settings guarantees google_hosted_domain"
     if not claims.email_verified:

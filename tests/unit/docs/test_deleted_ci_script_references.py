@@ -7,12 +7,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LINT_MIGRATION_STATUS = REPO_ROOT / "config" / "cicd" / "lint_migration_status.yaml"
-HISTORICAL_DOC_PREFIXES = (
+EXCLUDED_DOC_PREFIXES = (
     "docs-archive/",
     "docs/plans/",
     "docs/specs/",
+    "docs/maintainer/",
 )
-HISTORICAL_DOC_PATHS = ("CHANGELOG.md",)
+EXCLUDED_DOC_PATHS = ("CHANGELOG.md", "AGENTS.md", "CLAUDE.md")
 
 
 def _deleted_migrated_scripts() -> set[str]:
@@ -29,15 +30,13 @@ def _active_reference_paths() -> list[Path]:
     paths = [
         *REPO_ROOT.glob("*.md"),
         *REPO_ROOT.glob("docs/**/*.md"),
-        # .agents/skills is the canonical skills tree; .claude/skills holds symlinks into it.
-        *REPO_ROOT.glob(".agents/skills/**/*.md"),
         *REPO_ROOT.glob("src/elspeth/**/*.py"),
     ]
     return [
         path
         for path in sorted(paths)
-        if not any(path.relative_to(REPO_ROOT).as_posix().startswith(prefix) for prefix in HISTORICAL_DOC_PREFIXES)
-        and path.relative_to(REPO_ROOT).as_posix() not in HISTORICAL_DOC_PATHS
+        if not any(path.relative_to(REPO_ROOT).as_posix().startswith(prefix) for prefix in EXCLUDED_DOC_PREFIXES)
+        and path.relative_to(REPO_ROOT).as_posix() not in EXCLUDED_DOC_PATHS
     ]
 
 

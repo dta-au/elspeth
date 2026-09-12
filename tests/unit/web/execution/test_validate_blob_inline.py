@@ -32,6 +32,7 @@ from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 
 VALID_HASH = "a" * 64
 BLOB_ID = UUID("5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b")
@@ -175,6 +176,8 @@ async def _acquire_blob_read_lease() -> tuple[UUID, SessionOperationLease, Engin
     )
     try:
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="user-1")
         authority = SQLiteLocalSessionOperationAuthority(engine)
         session = authority.create_session_with_initial_fence(
             user_id="user-1",

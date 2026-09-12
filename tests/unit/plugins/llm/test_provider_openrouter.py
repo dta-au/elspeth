@@ -553,14 +553,16 @@ class TestExecuteQuery:
                     ),
                 )
 
-    def test_empty_string_content_raises_content_policy_error(self, provider: OpenRouterLLMProvider) -> None:
+    def test_empty_string_content_raises_content_policy_error(
+        self, provider: OpenRouterLLMProvider, audit_recorder: FakeAuditRecorder
+    ) -> None:
         """Empty string content (not null) must raise ContentPolicyError,
         not ValueError from LLMQueryResult invariant."""
         body = json.dumps(
             {
                 "choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}],
+                "usage": {"completion_tokens_details": {"reasoning_tokens": 4}},
                 "model": "gpt-4o",
-                "usage": {"prompt_tokens": 10, "completion_tokens": 0},
             }
         )
         resp = httpx.Response(
@@ -583,6 +585,9 @@ class TestExecuteQuery:
                     token_id="tok-1",
                 ),
             )
+
+        assert audit_recorder.calls[-1]["token_usage"].reasoning_tokens == 4
+        assert audit_recorder.calls[-1]["token_usage"].prompt_tokens is None
 
     def test_whitespace_only_content_raises_content_policy_error(self, provider: OpenRouterLLMProvider) -> None:
         """Whitespace-only content must raise ContentPolicyError."""

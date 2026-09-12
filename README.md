@@ -33,6 +33,7 @@ inputs into one compiled artifact that the executor runs directly.
 
 - [Why ELSPETH exists](#why-elspeth-exists)
 - [Architecture at a glance](#architecture-at-a-glance)
+- [What changed in 0.8.1](#what-changed-in-081)
 - [What changed in 0.8.0](#what-changed-in-080)
 - [Getting started](#getting-started)
   - [YAML operator path](#yaml-operator-path)
@@ -157,8 +158,31 @@ runtime check that holds a plugin to its own declaration; see
 
 ## What changed in 0.8.1
 
-0.8.1 is a correctness and hardening release on top of 0.8.0, with no schema
-cutover: the session store stays at epoch 53 and Landscape at epoch 38.
+0.8.1 extends the PostgreSQL replica runtime with durable run admission,
+Composer progress, single-use tickets and shared budgets. The bounded runtime
+contract and remaining acceptance limits are documented in
+[Deployment Platforms](docs/reference/deployment-platforms.md); live ACA
+acceptance is not claimed.
+
+**Operational:** 0.8.1 is a pre-1.0 database cutover from session epoch 53
+to 55 and Landscape epoch 38 to 40; guided schema remains at 11. Archive or
+export required evidence, stop the old service, recreate both stale databases
+in the same service-stop window, and install 0.8.1.
+Preserve `data/auth.db` and follow the
+[session DB reset runbook](docs/runbooks/staging-session-db-recreation.md),
+including account re-admission. Do not roll older code back over recreated
+databases.
+
+- **Identity and admission evidence.** Session owners are constrained to real
+  identities, withdrawn identity authority revokes awaiting approvals, and
+  run admission retains the quota-policy and secret-wiring decision. Reported
+  LLM token usage is queryable in the audit trail; unknown usage remains
+  unknown. Token-quota deployments refuse chargeable work until complete
+  accounting is available.
+- **Signed authentication exports.** Operator exports can include a bounded
+  authentication-event snapshot and explicitly distinguish omitted events
+  from an included empty set. Web run exports cannot include deployment-wide
+  authentication history.
 
 - **Coordination deadlines come from fresh post-lock database time.** Lease
   deadlines are issued after locked admission instead of from a clock read
@@ -187,9 +211,11 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   Docker Compose/PostgreSQL and native Linux systemd bundles, retains the AWS
   ECS acceptance controller, and packages the Web Composer in a pinned,
   non-root container image. The Azure Container Apps Bicep bundle ships in
-  `deploy/azure-container-apps/` with its receipts, replica-count probes and
-  runbooks; its replica > 1 live acceptance is an operator-run step on dev
-  hardware, and the support claim waits for that receipt.
+  `deploy/azure-container-apps/` with receipt validators, replica-count probes
+  and runbooks. Its Single/sticky configuration received desktop acceptance
+  on 2026-09-10; live cloud acceptance is not claimed. PostgreSQL supplies
+  the coordination substrate; the durable progress, single-use tickets and
+  shared budgets described above are 0.8.1 extensions.
 - **Committed blob deletion is recoverable.** Durable cleanup state remains
   until both the staged unlink and parent-directory fsync succeed, so restart
   recovery does not retain unaccounted files.
@@ -233,7 +259,7 @@ from epoch 35 to 53; guided schema moves to 11, and Landscape moves from epoch
 | 48 | Adds the session-operation coordination tables (retained per-session fences, guided-operation leases, and fork/blob-effect receipts) that ground the multi-replica fencing work |
 
 Archive or export evidence as required, stop the old service, recreate
-a stale session store and a Landscape store left at epoch 29, and install 0.8.1.
+a stale session store and a Landscape store left at epoch 29, and install 0.8.0.
 Do not roll older code back over the recreated databases.
 `data/auth.db` remains separate; recreating the session store does not remove
 local user accounts.
@@ -621,10 +647,18 @@ Current 0.8.0 behaviour:
 - A run can be driven by a single process or by a leader plus claim-only
   followers across multiple processes on one host (`elspeth join`), backed by
   one write-ahead logging (WAL) SQLite audit database.
-- Maintained web deployment profiles run one process or replica. Cross-instance
-  web coordination remains deferred; production Compose, AWS ECS, Azure VM, and
-  Kubernetes BYO deployments use external PostgreSQL where the deployment
-  contract requires it.
+- Maintained web deployment profiles run one process per replica. ACA uses
+  Single/sticky routing with PostgreSQL membership and session fencing;
+  durable run-event replay, renewable Composer inflight accounting and shared
+  budgets work across replicas. Interrupted provider requests are not
+  automatically resumed. Durable run admission, PREPARED restart and eligible
+  checkpoint handoff are implemented with fresh web and Landscape authority;
+  integrated verification is recorded in the
+  [ACA plan](docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification). See the
+  [handoff limits](docs/reference/deployment-platforms.md#durable-run-handoff).
+  Other maintained targets retain one replica and
+  stop-before-start replacement. Production deployments use external PostgreSQL
+  where the deployment contract requires it.
 - Each web process serves all blocking work from one shared 16-thread worker
   pool with bounded, fail-fast admission; the pool is not yet partitioned by
   purpose (see [Web worker pool capacity](#web-worker-pool-capacity)).
@@ -1170,7 +1204,7 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 **Development setup:**
 
 ```bash
-uv sync --frozen --extra dev --extra azure
+uv sync --frozen --all-extras
 source .venv/bin/activate
 
 # Install the git hook dispatchers (pre-commit + commit-msg policy gates)

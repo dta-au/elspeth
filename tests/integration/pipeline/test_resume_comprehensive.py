@@ -103,6 +103,7 @@ def _build_two_source_failed_run(
     checkpoint_mgr: Any,
     *,
     run_id: str,
+    config: PipelineConfig,
 ) -> tuple[ExecutionGraph, str, str, dict[str, Any]]:
     """Insert a 2-source FAILED run wired for resume through the PUBLIC API.
 
@@ -170,19 +171,20 @@ def _build_two_source_failed_run(
         # Epoch 21 (ADR-030): the crashed-run image includes the expired
         # leader seat begin_run would have minted atomically with the run.
         insert_crashed_leader_seat(conn, run_id=run_id)
-        for node_id, plugin_name, node_type in [
-            ("source-orders", "null", NodeType.SOURCE),
-            ("source-refunds", "null", NodeType.SOURCE),
-            ("sink", "json", NodeType.SINK),
+        for node_id, plugin, node_type in [
+            ("source-orders", config.sources["orders"], NodeType.SOURCE),
+            ("source-refunds", config.sources["refunds"], NodeType.SOURCE),
+            ("sink", config.sinks["default"], NodeType.SINK),
         ]:
             conn.execute(
                 nodes_table.insert().values(
                     node_id=node_id,
                     run_id=run_id,
-                    plugin_name=plugin_name,
+                    plugin_name=plugin.name,
                     node_type=node_type,
-                    plugin_version="1.0.0",
-                    determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                    plugin_version=plugin.plugin_version,
+                    determinism=plugin.determinism,
+                    source_file_hash=plugin.source_file_hash,
                     config_hash="test",
                     config_json="{}",
                     registered_at=now,
@@ -361,6 +363,7 @@ class TestResumeComprehensive:
         run_id: str,
         num_rows: int,
         checkpoint_at: int,
+        config: PipelineConfig,
     ) -> tuple[str, ExecutionGraph]:
         """Set up a failed run with rows and a checkpoint.
 
@@ -370,6 +373,7 @@ class TestResumeComprehensive:
             run_id: Run identifier
             num_rows: Total number of rows to create
             checkpoint_at: Row index where checkpoint was created
+            config: Exact plugin instances whose implementation evidence is seeded
 
         Returns:
             Tuple of (run_id, graph)
@@ -440,19 +444,20 @@ class TestResumeComprehensive:
             insert_crashed_leader_seat(conn, run_id=run_id)
 
             # Create nodes
-            for node_id, plugin_name, node_type in [
-                ("src", "null", NodeType.SOURCE),
-                ("xform", "passthrough", NodeType.TRANSFORM),
-                ("sink", "csv", NodeType.SINK),
+            for node_id, plugin, node_type in [
+                ("src", config.sources["source"], NodeType.SOURCE),
+                ("xform", config.transforms[0], NodeType.TRANSFORM),
+                ("sink", config.sinks["default"], NodeType.SINK),
             ]:
                 conn.execute(
                     nodes_table.insert().values(
                         node_id=node_id,
                         run_id=run_id,
-                        plugin_name=plugin_name,
+                        plugin_name=plugin.name,
                         node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                        plugin_version=plugin.plugin_version,
+                        determinism=plugin.determinism,
+                        source_file_hash=plugin.source_file_hash,
                         config_hash="test",
                         config_json="{}",
                         registered_at=now,
@@ -491,7 +496,7 @@ class TestResumeComprehensive:
                 run_sources_table.insert().values(
                     run_id=run_id,
                     source_node_id="src",
-                    source_name="src",
+                    source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
                     config_hash="test",
@@ -556,7 +561,16 @@ class TestResumeComprehensive:
         # Set up failed run
         run_id = "resume-normal-test"
         output_path = tmp_path / "normal_output.csv"
-        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=5, checkpoint_at=2)
+        strict_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
+        passthrough = PassThrough({"schema": strict_schema})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": strict_schema, "mode": "append"}))},
+        )
+
+        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=5, checkpoint_at=2, config=config)
 
         # Simulate partial output (rows 0-2 already written)
         with open(output_path, "w") as f:
@@ -598,15 +612,6 @@ class TestResumeComprehensive:
         orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
 
         # Use CSVSink with strict schema matching the data: {"id": int, "value": str}
-        strict_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
-        passthrough = PassThrough({"schema": strict_schema})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": strict_schema, "mode": "append"}))},
-        )
-
         # Build graph manually
         resume_graph = ExecutionGraph()
         schema_config = {
@@ -664,7 +669,16 @@ class TestResumeComprehensive:
 
         run_id = "resume-real-scheduler-work-test"
         output_path = tmp_path / "scheduler_resume_output.csv"
-        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=1, checkpoint_at=0)
+        strict_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
+        passthrough = PassThrough({"schema": strict_schema})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": strict_schema, "mode": "append"}))},
+        )
+
+        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=1, checkpoint_at=0, config=config)
 
         create_checkpoint(
             checkpoint_mgr,
@@ -698,14 +712,6 @@ class TestResumeComprehensive:
         assert resume_point is not None
 
         orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        strict_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
-        passthrough = PassThrough({"schema": strict_schema})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": strict_schema, "mode": "append"}))},
-        )
         resume_graph = ExecutionGraph()
         schema_config = {
             "schema": {"mode": "observed"}
@@ -761,8 +767,10 @@ class TestResumeComprehensive:
         tmp_path = resume_test_env["tmp_path"]
 
         run_id = "resume-multi-source-schema-test"
-        graph, _orders_hash, _refunds_hash, _payloads = _build_two_source_failed_run(db, payload_store, checkpoint_mgr, run_id=run_id)
         config, output_path = _two_source_resume_pipeline(tmp_path, "multi_source_schema_output")
+        graph, _orders_hash, _refunds_hash, _payloads = _build_two_source_failed_run(
+            db, payload_store, checkpoint_mgr, run_id=run_id, config=config
+        )
 
         assert recovery_mgr.can_resume(run_id, graph).can_resume
         resume_point = recovery_mgr.get_resume_point(run_id, graph)
@@ -814,7 +822,16 @@ class TestResumeComprehensive:
         # Set up failed run
         run_id = "resume-early-exit-test"
         output_path = tmp_path / "early_exit_output.csv"
-        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=3, checkpoint_at=2)
+        strict_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
+        passthrough = PassThrough({"schema": strict_schema})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": strict_schema, "mode": "append"}))},
+        )
+
+        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=3, checkpoint_at=2, config=config)
 
         # Simulate ALL rows already written
         with open(output_path, "w") as f:
@@ -856,15 +873,6 @@ class TestResumeComprehensive:
         orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
 
         # Use CSVSink with strict schema matching the data: {"id": int, "value": str}
-        strict_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
-        passthrough = PassThrough({"schema": strict_schema})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": strict_schema, "mode": "append"}))},
-        )
-
         resume_graph = ExecutionGraph()
         schema_config = {
             "schema": {"mode": "observed"}
@@ -966,6 +974,23 @@ class TestResumeComprehensive:
         graph.add_edge("src", "xform", label="continue")
         graph.add_edge("xform", "sink", label="continue")
 
+        resume_schema = {"mode": "observed", "guaranteed_fields": ["id", "timestamp"], "required_fields": ["id", "timestamp"]}
+
+        class DatetimeAssertingPassThrough(PassThrough):
+            determinism = Determinism.DETERMINISTIC
+
+            def process(self, row: Any, ctx: Any) -> Any:
+                assert isinstance(row["timestamp"], datetime)
+                return super().process(row, ctx)
+
+        passthrough = DatetimeAssertingPassThrough({"schema": resume_schema})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": resume_schema, "mode": "append"}))},
+        )
+
         with db.engine.begin() as conn:
             # Create run with datetime schema
             conn.execute(
@@ -987,19 +1012,20 @@ class TestResumeComprehensive:
             insert_crashed_leader_seat(conn, run_id=run_id)
 
             # Create nodes
-            for node_id, plugin_name, node_type in [
-                ("src", "null", NodeType.SOURCE),
-                ("xform", "passthrough", NodeType.TRANSFORM),
-                ("sink", "csv", NodeType.SINK),
+            for node_id, plugin, node_type in [
+                ("src", config.sources["source"], NodeType.SOURCE),
+                ("xform", config.transforms[0], NodeType.TRANSFORM),
+                ("sink", config.sinks["default"], NodeType.SINK),
             ]:
                 conn.execute(
                     nodes_table.insert().values(
                         node_id=node_id,
                         run_id=run_id,
-                        plugin_name=plugin_name,
+                        plugin_name=plugin.name,
                         node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                        plugin_version=plugin.plugin_version,
+                        determinism=plugin.determinism,
+                        source_file_hash=plugin.source_file_hash,
                         config_hash="test",
                         config_json="{}",
                         registered_at=now,
@@ -1028,7 +1054,7 @@ class TestResumeComprehensive:
                 run_sources_table.insert().values(
                     run_id=run_id,
                     source_node_id="src",
-                    source_name="src",
+                    source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
                     config_hash="test",
@@ -1100,23 +1126,6 @@ class TestResumeComprehensive:
         # deserializes datetime objects from format: "date-time", not strings.
         # Schema field specs don't support datetime directly, so use observed
         # mode with explicit field guarantees instead of declaring a fake type.
-        resume_schema = {"mode": "observed", "guaranteed_fields": ["id", "timestamp"], "required_fields": ["id", "timestamp"]}
-
-        class DatetimeAssertingPassThrough(PassThrough):
-            determinism = Determinism.DETERMINISTIC
-
-            def process(self, row: Any, ctx: Any) -> Any:
-                assert isinstance(row["timestamp"], datetime)
-                return super().process(row, ctx)
-
-        passthrough = DatetimeAssertingPassThrough({"schema": resume_schema})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": resume_schema, "mode": "append"}))},
-        )
-
         resume_graph = ExecutionGraph()
         resume_schema_config: dict[str, Any] = {
             "schema": {"mode": "observed"}
@@ -1215,6 +1224,15 @@ class TestResumeComprehensive:
         graph.add_edge("src", "xform", label="continue")
         graph.add_edge("xform", "sink", label="continue")
 
+        resume_schema = {"mode": "fixed", "fields": ["id: int", "amount: float"]}
+        passthrough = PassThrough({"schema": resume_schema})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": resume_schema, "mode": "append"}))},
+        )
+
         with db.engine.begin() as conn:
             # Create run with Decimal schema
             conn.execute(
@@ -1236,19 +1254,20 @@ class TestResumeComprehensive:
             insert_crashed_leader_seat(conn, run_id=run_id)
 
             # Create nodes
-            for node_id, plugin_name, node_type in [
-                ("src", "null", NodeType.SOURCE),
-                ("xform", "passthrough", NodeType.TRANSFORM),
-                ("sink", "csv", NodeType.SINK),
+            for node_id, plugin, node_type in [
+                ("src", config.sources["source"], NodeType.SOURCE),
+                ("xform", config.transforms[0], NodeType.TRANSFORM),
+                ("sink", config.sinks["default"], NodeType.SINK),
             ]:
                 conn.execute(
                     nodes_table.insert().values(
                         node_id=node_id,
                         run_id=run_id,
-                        plugin_name=plugin_name,
+                        plugin_name=plugin.name,
                         node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                        plugin_version=plugin.plugin_version,
+                        determinism=plugin.determinism,
+                        source_file_hash=plugin.source_file_hash,
                         config_hash="test",
                         config_json="{}",
                         registered_at=now,
@@ -1277,7 +1296,7 @@ class TestResumeComprehensive:
                 run_sources_table.insert().values(
                     run_id=run_id,
                     source_node_id="src",
-                    source_name="src",
+                    source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
                     config_hash="test",
@@ -1347,15 +1366,6 @@ class TestResumeComprehensive:
 
         # Resume schema matches recovery output types: the recovery system
         # coerces Decimal to float per the schema contract.
-        resume_schema = {"mode": "fixed", "fields": ["id: int", "amount: float"]}
-        passthrough = PassThrough({"schema": resume_schema})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={"default": inject_write_failure(CSVSink({"path": str(output_path), "schema": resume_schema, "mode": "append"}))},
-        )
-
         resume_graph = ExecutionGraph()
         resume_schema_config: dict[str, Any] = {
             "schema": {"mode": "observed"}
@@ -1445,9 +1455,23 @@ class TestResumeComprehensive:
         schema_config = {"schema": {"mode": "observed"}}
         graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="null", config={**schema_config, "source_name": "source"})
         graph.add_node("xform", node_type=NodeType.TRANSFORM, plugin_name="passthrough", config=schema_config)
-        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", config=schema_config)
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json", config=schema_config)
         graph.add_edge("src", "xform", label="continue")
         graph.add_edge("xform", "sink", label="continue")
+
+        passthrough = PassThrough({"schema": {"mode": "observed"}})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={
+                "default": inject_write_failure(
+                    JSONSink(
+                        {"path": str(output_path.with_suffix(".json")), "schema": {"mode": "observed"}, "mode": "append", "format": "jsonl"}
+                    )
+                )
+            },
+        )
 
         with db.engine.begin() as conn:
             # Create run with array schema
@@ -1470,19 +1494,20 @@ class TestResumeComprehensive:
             insert_crashed_leader_seat(conn, run_id=run_id)
 
             # Create nodes
-            for node_id, plugin_name, node_type in [
-                ("src", "null", NodeType.SOURCE),
-                ("xform", "passthrough", NodeType.TRANSFORM),
-                ("sink", "csv", NodeType.SINK),
+            for node_id, plugin, node_type in [
+                ("src", config.sources["source"], NodeType.SOURCE),
+                ("xform", config.transforms[0], NodeType.TRANSFORM),
+                ("sink", config.sinks["default"], NodeType.SINK),
             ]:
                 conn.execute(
                     nodes_table.insert().values(
                         node_id=node_id,
                         run_id=run_id,
-                        plugin_name=plugin_name,
+                        plugin_name=plugin.name,
                         node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                        plugin_version=plugin.plugin_version,
+                        determinism=plugin.determinism,
+                        source_file_hash=plugin.source_file_hash,
                         config_hash="test",
                         config_json="{}",
                         registered_at=now,
@@ -1511,7 +1536,7 @@ class TestResumeComprehensive:
                 run_sources_table.insert().values(
                     run_id=run_id,
                     source_node_id="src",
-                    source_name="src",
+                    source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
                     config_hash="test",
@@ -1579,25 +1604,11 @@ class TestResumeComprehensive:
 
         orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
 
-        passthrough = PassThrough({"schema": {"mode": "observed"}})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={
-                "default": inject_write_failure(
-                    JSONSink(
-                        {"path": str(output_path.with_suffix(".json")), "schema": {"mode": "observed"}, "mode": "append", "format": "jsonl"}
-                    )
-                )
-            },
-        )
-
         resume_graph = ExecutionGraph()
         schema_config = {"schema": {"mode": "observed"}}
         resume_graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="null", config={**schema_config, "source_name": "source"})
         resume_graph.add_node("xform", node_type=NodeType.TRANSFORM, plugin_name="passthrough", config=schema_config)
-        resume_graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", config=schema_config)
+        resume_graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json", config=schema_config)
         resume_graph.add_edge("src", "xform", label="continue")
         resume_graph.add_edge("xform", "sink", label="continue")
         resume_graph.set_sink_id_map({SinkName("default"): NodeID("sink")})
@@ -1677,9 +1688,23 @@ class TestResumeComprehensive:
         schema_config = {"schema": {"mode": "observed"}}
         graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="null", config={**schema_config, "source_name": "source"})
         graph.add_node("xform", node_type=NodeType.TRANSFORM, plugin_name="passthrough", config=schema_config)
-        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", config=schema_config)
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json", config=schema_config)
         graph.add_edge("src", "xform", label="continue")
         graph.add_edge("xform", "sink", label="continue")
+
+        passthrough = PassThrough({"schema": {"mode": "observed"}})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={
+                "default": inject_write_failure(
+                    JSONSink(
+                        {"path": str(output_path.with_suffix(".json")), "schema": {"mode": "observed"}, "mode": "append", "format": "jsonl"}
+                    )
+                )
+            },
+        )
 
         with db.engine.begin() as conn:
             # Create run with object schema
@@ -1702,19 +1727,20 @@ class TestResumeComprehensive:
             insert_crashed_leader_seat(conn, run_id=run_id)
 
             # Create nodes
-            for node_id, plugin_name, node_type in [
-                ("src", "null", NodeType.SOURCE),
-                ("xform", "passthrough", NodeType.TRANSFORM),
-                ("sink", "csv", NodeType.SINK),
+            for node_id, plugin, node_type in [
+                ("src", config.sources["source"], NodeType.SOURCE),
+                ("xform", config.transforms[0], NodeType.TRANSFORM),
+                ("sink", config.sinks["default"], NodeType.SINK),
             ]:
                 conn.execute(
                     nodes_table.insert().values(
                         node_id=node_id,
                         run_id=run_id,
-                        plugin_name=plugin_name,
+                        plugin_name=plugin.name,
                         node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                        plugin_version=plugin.plugin_version,
+                        determinism=plugin.determinism,
+                        source_file_hash=plugin.source_file_hash,
                         config_hash="test",
                         config_json="{}",
                         registered_at=now,
@@ -1743,7 +1769,7 @@ class TestResumeComprehensive:
                 run_sources_table.insert().values(
                     run_id=run_id,
                     source_node_id="src",
-                    source_name="src",
+                    source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
                     config_hash="test",
@@ -1811,25 +1837,11 @@ class TestResumeComprehensive:
 
         orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
 
-        passthrough = PassThrough({"schema": {"mode": "observed"}})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={
-                "default": inject_write_failure(
-                    JSONSink(
-                        {"path": str(output_path.with_suffix(".json")), "schema": {"mode": "observed"}, "mode": "append", "format": "jsonl"}
-                    )
-                )
-            },
-        )
-
         resume_graph = ExecutionGraph()
         schema_config = {"schema": {"mode": "observed"}}
         resume_graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="null", config={**schema_config, "source_name": "source"})
         resume_graph.add_node("xform", node_type=NodeType.TRANSFORM, plugin_name="passthrough", config=schema_config)
-        resume_graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", config=schema_config)
+        resume_graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json", config=schema_config)
         resume_graph.add_edge("src", "xform", label="continue")
         resume_graph.add_edge("xform", "sink", label="continue")
         resume_graph.set_sink_id_map({SinkName("default"): NodeID("sink")})
@@ -1899,12 +1911,24 @@ class TestResumeComprehensive:
         schema_config = {"schema": {"mode": "observed"}}
         graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="null", config={**schema_config, "source_name": "source"})
         graph.add_node("xform", node_type=NodeType.TRANSFORM, plugin_name="passthrough", config=schema_config)
-        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", config=schema_config)
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json", config=schema_config)
         graph.add_edge("src", "xform", label="continue")
         graph.add_edge("xform", "sink", label="continue")
 
         # Create a minimal schema contract for the run record
         schema_contract_json, schema_contract_hash = self._create_schema_contract([("id", int), ("location", str)])
+
+        passthrough = PassThrough({"schema": {"mode": "observed"}})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={
+                "default": inject_write_failure(
+                    JSONSink({"path": "/tmp/dummy.json", "schema": {"mode": "observed"}, "mode": "write", "format": "jsonl"})
+                )
+            },
+        )
 
         with db.engine.begin() as conn:
             # Create run with unsupported schema
@@ -1927,19 +1951,20 @@ class TestResumeComprehensive:
             insert_crashed_leader_seat(conn, run_id=run_id)
 
             # Create nodes
-            for node_id, plugin_name, node_type in [
-                ("src", "null", NodeType.SOURCE),
-                ("xform", "passthrough", NodeType.TRANSFORM),
-                ("sink", "csv", NodeType.SINK),
+            for node_id, plugin, node_type in [
+                ("src", config.sources["source"], NodeType.SOURCE),
+                ("xform", config.transforms[0], NodeType.TRANSFORM),
+                ("sink", config.sinks["default"], NodeType.SINK),
             ]:
                 conn.execute(
                     nodes_table.insert().values(
                         node_id=node_id,
                         run_id=run_id,
-                        plugin_name=plugin_name,
+                        plugin_name=plugin.name,
                         node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                        plugin_version=plugin.plugin_version,
+                        determinism=plugin.determinism,
+                        source_file_hash=plugin.source_file_hash,
                         config_hash="test",
                         config_json="{}",
                         registered_at=now,
@@ -1968,7 +1993,7 @@ class TestResumeComprehensive:
                 run_sources_table.insert().values(
                     run_id=run_id,
                     source_node_id="src",
-                    source_name="src",
+                    source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
                     config_hash="test",
@@ -2021,23 +2046,11 @@ class TestResumeComprehensive:
 
         orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
 
-        passthrough = PassThrough({"schema": {"mode": "observed"}})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={
-                "default": inject_write_failure(
-                    JSONSink({"path": "/tmp/dummy.json", "schema": {"mode": "observed"}, "mode": "write", "format": "jsonl"})
-                )
-            },
-        )
-
         resume_graph = ExecutionGraph()
         schema_config = {"schema": {"mode": "observed"}}
         resume_graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="null", config={**schema_config, "source_name": "source"})
         resume_graph.add_node("xform", node_type=NodeType.TRANSFORM, plugin_name="passthrough", config=schema_config)
-        resume_graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", config=schema_config)
+        resume_graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json", config=schema_config)
         resume_graph.add_edge("src", "xform", label="continue")
         resume_graph.add_edge("xform", "sink", label="continue")
         resume_graph.set_sink_id_map({SinkName("default"): NodeID("sink")})
@@ -2100,7 +2113,26 @@ class TestResumeComprehensive:
 
         run_id = "resume-gate-routed-test"
         output_path = tmp_path / "gate_routed_output.csv"
-        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=5, checkpoint_at=4)
+        resume_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
+        passthrough = PassThrough({"schema": resume_schema})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={
+                "default": inject_write_failure(
+                    CSVSink(
+                        {
+                            "path": str(output_path),
+                            "schema": resume_schema,
+                            "mode": "append",
+                        }
+                    )
+                )
+            },
+        )
+
+        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=5, checkpoint_at=4, config=config)
 
         # Mark every row as gate-routed (SUCCESS/GATE_ROUTED, sink_name set,
         # error_hash NULL — the canonical pre-split-fix shape for
@@ -2143,24 +2175,6 @@ class TestResumeComprehensive:
         # xform -> sink), even though every persisted outcome is ROUTED.
         # The predicate's behaviour, not the topology, is the unit under
         # test here.
-        resume_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
-        passthrough = PassThrough({"schema": resume_schema})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={
-                "default": inject_write_failure(
-                    CSVSink(
-                        {
-                            "path": str(output_path),
-                            "schema": resume_schema,
-                            "mode": "append",
-                        }
-                    )
-                )
-            },
-        )
         resume_graph = ExecutionGraph()
         resume_schema_config: dict[str, Any] = {
             "schema": {"mode": "observed"}
@@ -2288,7 +2302,26 @@ class TestResumeComprehensive:
 
         run_id = "resume-routed-on-error-test"
         output_path = tmp_path / "routed_on_error_output.csv"
-        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=5, checkpoint_at=4)
+        resume_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
+        passthrough = PassThrough({"schema": resume_schema})
+        passthrough.on_error = "discard"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[passthrough],
+            sinks={
+                "default": inject_write_failure(
+                    CSVSink(
+                        {
+                            "path": str(output_path),
+                            "schema": resume_schema,
+                            "mode": "append",
+                        }
+                    )
+                )
+            },
+        )
+
+        run_id, graph = self._setup_failed_run(db, payload_store, run_id, num_rows=5, checkpoint_at=4, config=config)
 
         # Mark every row as on_error DIVERT (FAILURE/ON_ERROR_ROUTED).
         # Contract requires sink_name AND error_hash for this outcome
@@ -2329,24 +2362,6 @@ class TestResumeComprehensive:
             checkpoint_config=checkpoint_config,
         )
 
-        resume_schema = {"mode": "fixed", "fields": ["id: int", "value: str"]}
-        passthrough = PassThrough({"schema": resume_schema})
-        passthrough.on_error = "discard"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[passthrough],
-            sinks={
-                "default": inject_write_failure(
-                    CSVSink(
-                        {
-                            "path": str(output_path),
-                            "schema": resume_schema,
-                            "mode": "append",
-                        }
-                    )
-                )
-            },
-        )
         resume_graph = ExecutionGraph()
         resume_schema_config: dict[str, Any] = {
             "schema": {"mode": "observed"}
@@ -2497,9 +2512,11 @@ class TestMultiSourceResumeContractDispatch:
         tmp_path = resume_test_env["tmp_path"]
 
         run_id = "resume-multi-source-per-row-contract"
-        graph, orders_hash, refunds_hash, _payloads = _build_two_source_failed_run(db, payload_store, checkpoint_mgr, run_id=run_id)
-        assert orders_hash != refunds_hash, "test setup error: contracts must differ"
         config, output_path = _two_source_resume_pipeline(tmp_path, "per_row_contract_output")
+        graph, orders_hash, refunds_hash, _payloads = _build_two_source_failed_run(
+            db, payload_store, checkpoint_mgr, run_id=run_id, config=config
+        )
+        assert orders_hash != refunds_hash, "test setup error: contracts must differ"
 
         assert recovery_mgr.can_resume(run_id, graph).can_resume
         resume_point = recovery_mgr.get_resume_point(run_id, graph)
@@ -2683,6 +2700,15 @@ class TestMultiSourceResumeContractDispatch:
 
         source_schema_json = json.dumps({"properties": {"id": {"type": "integer"}}, "required": ["id"]})
 
+        output_path = tmp_path / "single_source_round_trip.jsonl"
+        config = PipelineConfig(
+            sources={"source": _null_source("default")},
+            transforms=[],
+            sinks={
+                "default": inject_write_failure(JSONSink({"path": str(output_path), "schema": {"mode": "observed"}, "format": "jsonl"}))
+            },
+        )
+
         with db.engine.begin() as conn:
             conn.execute(
                 runs_table.insert().values(
@@ -2701,18 +2727,19 @@ class TestMultiSourceResumeContractDispatch:
             # Epoch 21 (ADR-030): the crashed-run image includes the expired
             # leader seat begin_run would have minted atomically with the run.
             insert_crashed_leader_seat(conn, run_id=run_id)
-            for node_id, plugin_name, node_type in [
-                ("source-only", "null", NodeType.SOURCE),
-                ("sink", "json", NodeType.SINK),
+            for node_id, plugin, node_type in [
+                ("source-only", config.sources["source"], NodeType.SOURCE),
+                ("sink", config.sinks["default"], NodeType.SINK),
             ]:
                 conn.execute(
                     nodes_table.insert().values(
                         node_id=node_id,
                         run_id=run_id,
-                        plugin_name=plugin_name,
+                        plugin_name=plugin.name,
                         node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
+                        plugin_version=plugin.plugin_version,
+                        determinism=plugin.determinism,
+                        source_file_hash=plugin.source_file_hash,
                         config_hash="test",
                         config_json="{}",
                         registered_at=now,
@@ -2773,15 +2800,6 @@ class TestMultiSourceResumeContractDispatch:
             sequence_number=1,
             barrier_scalars=None,
             graph=graph,
-        )
-
-        output_path = tmp_path / "single_source_round_trip.jsonl"
-        config = PipelineConfig(
-            sources={"source": _null_source("default")},
-            transforms=[],
-            sinks={
-                "default": inject_write_failure(JSONSink({"path": str(output_path), "schema": {"mode": "observed"}, "format": "jsonl"}))
-            },
         )
 
         assert recovery_mgr.can_resume(run_id, graph).can_resume

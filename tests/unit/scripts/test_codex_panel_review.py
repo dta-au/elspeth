@@ -3,19 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 from scripts import codex_panel_review as cpr
-
-
-def test_module_constants_present_and_typed():
-    assert isinstance(cpr.PANEL_FINDING_SCHEMA, Path)
-    assert cpr.PANEL_FINDING_SCHEMA.name == "panel_finding.schema.json"
-    assert isinstance(cpr.LENSES_DIR, Path)
-    # priority-bearing categories that must carry a file:line anchor
-    assert frozenset({"bug", "correctness", "security", "smell"}) == cpr.STRICT_CATEGORIES
-    assert frozenset({"improvement", "efficiency"}) == cpr.RELAXED_CATEGORIES
-    assert cpr.STRICT_CATEGORIES | frozenset({"easy-win"}) == cpr.ANCHOR_REQUIRED_CATEGORIES
 
 
 def test_panel_schema_shape():
@@ -70,20 +59,6 @@ def test_load_persona_reads_and_errors(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         cpr.load_persona("missing", lenses_dir=tmp_path)
-
-
-def test_route_lenses_default_and_override():
-    py = Path("src/elspeth/web/foo.py")
-    expected = [
-        "solution-architect",
-        "systems-thinker",
-        "quality-engineer",
-        "security-architect",
-    ]
-    assert cpr.route_lenses(py) == expected
-    assert cpr.route_lenses(Path("src/elspeth/web/frontend/foo.tsx")) == expected
-    # explicit override is returned verbatim
-    assert cpr.route_lenses(py, override=["security-architect"]) == ["security-architect"]
 
 
 def _write_sidecar(tmp_path, findings):

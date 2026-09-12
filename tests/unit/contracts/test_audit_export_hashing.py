@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from io import BytesIO
@@ -24,6 +25,96 @@ from elspeth.contracts.audit_export import (
     hash_final_manifest_identity_payload,
 )
 from elspeth.contracts.sink_effects import AuditExportSignedManifestInput, AuditExportSigningMode
+from elspeth.core.config import LandscapeExportSettings
+
+
+@pytest.mark.parametrize("spooled", [False, True])
+@pytest.mark.parametrize("signed", [False, True])
+def test_auth_event_coverage_count_and_policy_are_enforced(spooled: bool, signed: bool) -> None:
+    base = (
+        _golden_config(signing_mode="hmac_sha256", signer_key_id="test-key", signing_key=b"coverage-test") if signed else _golden_config()
+    )
+    config = replace(base, exporter_version="landscape-exporter-auth-v1", auth_events="deployment_snapshot")
+    coverage = {
+        "record_type": "auth_event_coverage",
+        "policy": "deployment_snapshot",
+        "selection_cutoff": config.source_completed_at,
+        "selected_count": 1,
+        "reason": "deployment_snapshot",
+        "selection_basis": "visible_rows_at_or_before_run_completion",
+    }
+    config_record = {
+        "record_type": "audit_export_config",
+        "public_config": {
+            **PUBLIC_CONFIG,
+            "exporter_version": config.exporter_version,
+            "auth_events": config.auth_events,
+            "signing_mode": config.signing_mode,
+            "signer_key_id": config.signer_key_id,
+        },
+    }
+    records = [_golden_record(), config_record, {"record_type": "auth_event", "occurred_at": config.source_completed_at}, coverage]
+
+    def derive(items: list[dict[str, object]]):
+        if spooled:
+            return derive_audit_export_bundle_to_spool(
+                items, config, BytesIO(), max_total_records=100, max_total_bytes=100000, max_chunks=10
+            )
+        return derive_audit_export_bundle(items, config)
+
+    bundle = derive(records)
+    assert b'"auth_events":"deployment_snapshot"' in bundle.public_export_config_bytes
+    for invalid in [
+        records[:-1],
+        [*records, coverage],
+        [*records[:-1], {**coverage, "selected_count": 0}],
+        [*records, config_record],
+        [records[0], *records[2:]],
+    ]:
+        with pytest.raises(ValueError, match="coverage"):
+            derive(invalid)
+
+
+@pytest.mark.parametrize("spooled", [False, True])
+def test_omission_disclosure_is_not_a_claim_that_no_events_exist(spooled: bool) -> None:
+    config = replace(_golden_config(), exporter_version="landscape-exporter-auth-v1")
+    coverage = {
+        "record_type": "auth_event_coverage",
+        "policy": "omitted",
+        "selection_cutoff": None,
+        "selected_count": None,
+        "reason": "not_requested",
+        "selection_basis": None,
+    }
+
+    def derive(items: list[dict[str, object]]):
+        if spooled:
+            return derive_audit_export_bundle_to_spool(
+                items, config, BytesIO(), max_total_records=100, max_total_bytes=100000, max_chunks=10
+            )
+        return derive_audit_export_bundle(items, config)
+
+    settings = LandscapeExportSettings(format="json", per_chunk_record_limit=1000, per_chunk_byte_limit=1048576)
+    config_record = {"record_type": "audit_export_config", "public_config": settings.public_snapshot_config()}
+    bundle = derive([_golden_record(), config_record, coverage])
+    assert bundle.public_export_config_hash == derive_public_export_config_hash(settings.public_snapshot_config())
+    with pytest.raises(ValueError, match="coverage"):
+        derive([_golden_record(), config_record, {**coverage, "selected_count": 0}])
+    with pytest.raises(ValueError, match="coverage"):
+        derive([_golden_record(), config_record, coverage, {"record_type": "auth_event", "occurred_at": config.source_completed_at}])
+
+
+def test_auth_events_policy_changes_identity_without_reinterpreting_legacy_bytes() -> None:
+    legacy = _golden_config()
+    assert derive_audit_export_bundle([_golden_record()], legacy).public_export_config_bytes == PUBLIC_CONFIG_BYTES
+    with pytest.raises(ValueError, match="auth_events"):
+        replace(legacy, auth_events="deployment_snapshot")
+    omitted = {**PUBLIC_CONFIG, "exporter_version": "landscape-exporter-auth-v1", "auth_events": "omitted"}
+    included = {**omitted, "auth_events": "deployment_snapshot"}
+    assert derive_public_export_config_hash(omitted) != derive_public_export_config_hash(included)
+    with pytest.raises(ValueError, match="auth_events"):
+        derive_public_export_config_hash({**omitted, "auth_events": "all"})
+
 
 PUBLIC_CONFIG = {
     "chunking_algorithm_version": "record-framing-v1",

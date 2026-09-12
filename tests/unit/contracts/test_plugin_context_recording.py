@@ -17,6 +17,7 @@ from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipTo
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.plugin_context import PluginContext, TransformErrorToken, ValidationErrorToken
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from tests.fixtures.factories import make_source_context
 from tests.fixtures.mock_audit import mock_audit_authority
 
@@ -38,6 +39,7 @@ class _FakePluginAuditWriter:
         response_data: RawCallPayload | None = None,
         error: RawCallPayload | None = None,
         latency_ms: float | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         if self.failure is not None:
             raise self.failure
@@ -51,6 +53,7 @@ class _FakePluginAuditWriter:
                 "response_data": response_data,
                 "error": error,
                 "latency_ms": latency_ms,
+                "token_usage": token_usage,
             }
         )
         return Call(
@@ -330,6 +333,7 @@ class TestRecordCallHappyPath:
         ctx.record_call(CallType.LLM, CallStatus.SUCCESS, {}, response_data=response)
 
         assert writer.operation_calls[0]["response_data"].to_dict() == response
+        assert writer.operation_calls[0]["token_usage"] == TokenUsage.from_dict(response.get("usage"))
         assert len(events) == 1
         assert events[0].response_payload is not None
         assert events[0].response_payload.to_dict() == response

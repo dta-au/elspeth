@@ -44,6 +44,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
 
 EXPECTED_REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
@@ -191,6 +192,9 @@ def blob_env(tmp_path: Path) -> Iterator[dict[str, Any]]:
 
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
+        ensure_test_identity(conn, identity_id="other-user")
 
     session_id = str(uuid4())
     other_session_id = str(uuid4())

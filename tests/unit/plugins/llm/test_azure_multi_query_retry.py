@@ -19,6 +19,7 @@ import pytest
 from elspeth.contracts import Call, CallStatus, CallType, TransformResult
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.engine.batch_adapter import ExceptionResult
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.transforms.llm.transform import LLMTransform
@@ -69,6 +70,7 @@ class _ExecutionRepositoryDouble:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         call_kwargs = {
             "state_id": state_id,
@@ -82,6 +84,7 @@ class _ExecutionRepositoryDouble:
             "request_ref": request_ref,
             "response_ref": response_ref,
             "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "token_usage": token_usage,
         }
         self.recorded_calls.append(call_kwargs)
         return self._recorded_call(call_kwargs)
@@ -101,6 +104,7 @@ class _ExecutionRepositoryDouble:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         actual_call_index = (
             call_index
@@ -119,6 +123,7 @@ class _ExecutionRepositoryDouble:
             "request_ref": request_ref,
             "response_ref": response_ref,
             "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "token_usage": token_usage,
         }
         self.recorded_calls.append(call_kwargs)
         return self._recorded_call(call_kwargs)
@@ -136,6 +141,10 @@ class _ExecutionRepositoryDouble:
             operation_id=call_kwargs.get("operation_id"),
             latency_ms=call_kwargs["latency_ms"],
             resolved_prompt_template_hash=call_kwargs["resolved_prompt_template_hash"],
+            prompt_tokens=call_kwargs["token_usage"].prompt_tokens,
+            completion_tokens=call_kwargs["token_usage"].completion_tokens,
+            cached_prompt_tokens=call_kwargs["token_usage"].cached_prompt_tokens,
+            reasoning_tokens=call_kwargs["token_usage"].reasoning_tokens,
         )
 
 
@@ -317,6 +326,9 @@ class TestRetryBehavior:
             )
             # More calls than 4 queries proves retries happened
             assert call_count[0] > 4
+            failed_calls = [call for call in mock_recorder.recorded_calls if call["status"] is CallStatus.ERROR]
+            assert len(failed_calls) == 2
+            assert all(call["token_usage"] == UNKNOWN_TOKEN_USAGE for call in failed_calls)
 
     def test_capacity_retry_timeout(
         self,

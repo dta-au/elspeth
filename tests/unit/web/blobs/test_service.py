@@ -71,6 +71,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -97,6 +98,7 @@ def session_id(db_engine) -> UUID:
     sid = str(uuid4())
     now = datetime.now(UTC)
     with db_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
         conn.execute(
             sessions_table.insert().values(
                 id=sid,
@@ -456,6 +458,7 @@ class TestListBlobs:
                 (str(s1_id), "user-a", "Session 1"),
                 (str(s2_id), "user-b", "Session 2"),
             ]:
+                ensure_test_identity(conn, identity_id=uid)
                 conn.execute(
                     sessions_table.insert().values(
                         id=sid,
@@ -2921,6 +2924,7 @@ class TestInlineCustody:
         shared_session_id = uuid4()
         now = datetime.now(UTC)
         with first_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
             conn.execute(
                 sessions_table.insert().values(
                     id=str(shared_session_id),
@@ -2957,6 +2961,7 @@ class TestInlineCustody:
         try:
             initialize_session_schema(engine)
             with engine.begin() as conn:
+                ensure_test_identity(conn, identity_id="sqlite-custody-test")
                 conn.execute(
                     sessions_table.insert().values(
                         id=str(shared_session_id),
@@ -3353,6 +3358,7 @@ class TestCopyBlobsForFork:
         session_id = uuid4()
         now = datetime.now(UTC)
         with db_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
             conn.execute(
                 sessions_table.insert().values(
                     id=str(session_id),
@@ -6033,6 +6039,7 @@ class TestLinkBlobToRunSessionGuard:
         session_b = UUID(str(uuid4()))
         now = datetime.now(UTC)
         with db_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user-b")
             conn.execute(
                 sessions_table.insert().values(
                     id=str(session_b),
@@ -6284,6 +6291,7 @@ class TestReadBlobContentCustodyLock:
         storage_path = storage_dir / f"{blob_id}_data.csv"
         storage_path.write_bytes(content)
         with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
             conn.execute(
                 sessions_table.insert().values(
                     id=sid,

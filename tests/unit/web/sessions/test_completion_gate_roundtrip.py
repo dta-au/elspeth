@@ -49,6 +49,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _BLOCKED_DETAIL = "The advisor sign-off could not be obtained; the pipeline cannot complete."
@@ -62,6 +63,8 @@ def service():
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),

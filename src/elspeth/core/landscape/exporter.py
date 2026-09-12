@@ -16,8 +16,8 @@ from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import copy
-from datetime import UTC
-from typing import Any, BinaryIO, Protocol, cast
+from datetime import UTC, datetime
+from typing import Any, BinaryIO, Literal, Protocol, cast
 
 from elspeth.contracts import (
     BatchMember,
@@ -30,6 +30,7 @@ from elspeth.contracts import (
     TokenParent,
 )
 from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
     AUDIT_EXPORT_MAX_CHUNKS,
     AUDIT_EXPORT_MAX_TOTAL_BYTES,
     AUDIT_EXPORT_MAX_TOTAL_RECORDS,
@@ -42,6 +43,9 @@ from elspeth.contracts.audit_export import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.export_records import (
+    AuditExportConfigRecord,
+    AuthEventCoverageExportRecord,
+    AuthEventExportRecord,
     BatchExportRecord,
     BatchMemberExportRecord,
     CallExportRecord,
@@ -83,6 +87,8 @@ class ExportReadModel(Protocol):
     """Read-only repository surface needed by ``LandscapeExporter``."""
 
     def get_run(self, run_id: str) -> Any | None: ...
+
+    def iter_auth_events(self, cutoff: datetime, *, batch_size: int) -> Iterator[AuthEventExportRecord]: ...
 
     def get_run_attribution(self, run_id: str) -> tuple[str, str] | None: ...
 
@@ -147,6 +153,9 @@ class RecorderFactoryExportReadModel:
 
     def get_run(self, run_id: str) -> Any | None:
         return self._factory.run_lifecycle.get_run(run_id)
+
+    def iter_auth_events(self, cutoff: datetime, *, batch_size: int) -> Iterator[AuthEventExportRecord]:
+        raise AuditIntegrityError("Deployment auth export requires a snapshot-bound export read model")
 
     def get_run_attribution(self, run_id: str) -> tuple[str, str] | None:
         return self._factory.run_lifecycle.get_run_attribution(run_id)
@@ -311,11 +320,12 @@ class LandscapeExporter:
         signing_key: bytes | None = None,
         *,
         include_raw_error_rows: bool = False,
+        auth_events: Literal["omitted", "deployment_snapshot"] = "omitted",
         row_batch_size: int = 500,
         read_model: ExportReadModel | None = None,
         signer_key_id: str | None = None,
         export_format: str = "json",
-        exporter_version: str = "landscape-exporter-v1",
+        exporter_version: str = AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
         serialization_version: str = AUDIT_EXPORT_SERIALIZATION_VERSION,
         chunking_algorithm_version: str = "record-framing-v1",
         per_chunk_byte_limit: int = 64 * 1024 * 1024,
@@ -355,6 +365,11 @@ class LandscapeExporter:
         self._read_model_is_caller_owned = read_model is not None
         self._signing_key = signing_key
         self._include_raw_error_rows = include_raw_error_rows
+        if auth_events not in ("omitted", "deployment_snapshot"):
+            raise ValueError("auth_events must be omitted or deployment_snapshot")
+        if exporter_version != AUDIT_EXPORT_AUTH_EXPORTER_VERSION and auth_events != "omitted":
+            raise ValueError("Legacy exporter cannot include deployment auth events")
+        self._auth_events = auth_events
         self._row_batch_size = row_batch_size
         self._signer_key_id = signer_key_id
         self._export_format = export_format
@@ -466,7 +481,7 @@ class LandscapeExporter:
                 terminal_witness=terminal_witness,
             )
             stream = stream_audit_export_bundle_to_spool(
-                exporter._iter_records(run_id),
+                exporter._configured_records(run_id, derivation_config),
                 derivation_config,
                 cast(BinaryIO, _DiscardSpool()),
                 max_total_records=AUDIT_EXPORT_MAX_TOTAL_RECORDS,
@@ -499,7 +514,21 @@ class LandscapeExporter:
                 derivation_config=derivation_config,
                 terminal_witness=terminal_witness,
             )
-            return derive_audit_export_bundle(exporter._iter_records(run_id), derivation_config)
+            return derive_audit_export_bundle(exporter._configured_records(run_id, derivation_config), derivation_config)
+
+    def _configured_records(self, run_id: str, config: AuditExportDerivationConfig) -> Iterator[ExportRecord]:
+        scoped = copy(self)
+        scoped._auth_events = config.auth_events
+        scoped._exporter_version = config.exporter_version
+        scoped._include_raw_error_rows = config.include_raw_error_rows
+        scoped._signing_key = config.signing_key
+        scoped._signer_key_id = config.signer_key_id
+        scoped._export_format = config.export_format
+        scoped._serialization_version = config.serialization_version
+        scoped._chunking_algorithm_version = config.chunking_algorithm_version
+        scoped._per_chunk_byte_limit = config.per_chunk_byte_limit
+        scoped._per_chunk_record_limit = config.per_chunk_record_limit
+        yield from scoped._iter_records(run_id)
 
     def _resolve_derivation_config(
         self,
@@ -551,6 +580,7 @@ class LandscapeExporter:
                 serialization_version=self._serialization_version,
                 chunking_algorithm_version=self._chunking_algorithm_version,
                 include_raw_error_rows=self._include_raw_error_rows,
+                auth_events=self._auth_events,
                 per_chunk_byte_limit=self._per_chunk_byte_limit,
                 per_chunk_record_limit=self._per_chunk_record_limit,
                 signing_mode=signing_mode,  # type: ignore[arg-type]
@@ -642,6 +672,50 @@ class LandscapeExporter:
         }
         yield run_record
 
+        if self._exporter_version == AUDIT_EXPORT_AUTH_EXPORTER_VERSION:
+            if self._signing_key is not None and self._signer_key_id is None:
+                raise ValueError("Signed export requires an explicit signer_key_id")
+            public_config: AuditExportConfigRecord = {
+                "record_type": "audit_export_config",
+                "public_config": {
+                    "auth_events": self._auth_events,
+                    "chunking_algorithm_version": self._chunking_algorithm_version,
+                    "export_format": self._export_format,
+                    "exporter_version": self._exporter_version,
+                    "include_raw_error_rows": self._include_raw_error_rows,
+                    "per_chunk_byte_limit": self._per_chunk_byte_limit,
+                    "per_chunk_record_limit": self._per_chunk_record_limit,
+                    "serialization_version": self._serialization_version,
+                    "signer_key_id": self._signer_key_id
+                    if self._signer_key_id is not None and self._signing_key is not None
+                    else "UNSIGNED",
+                    "signing_mode": "hmac_sha256" if self._signing_key is not None else "unsigned",
+                },
+            }
+            yield public_config
+            selected_count = 0
+            cutoff = run.completed_at
+            if cutoff is None and self._auth_events == "deployment_snapshot":
+                raise AuditIntegrityError("Auth coverage requires completed run timestamp")
+            if cutoff is not None and cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=UTC)
+            if self._auth_events == "deployment_snapshot":
+                assert cutoff is not None
+                for auth_event in self._read_model.iter_auth_events(cutoff, batch_size=self._row_batch_size):
+                    selected_count += 1
+                    yield auth_event
+            coverage: AuthEventCoverageExportRecord = {
+                "record_type": "auth_event_coverage",
+                "policy": self._auth_events,
+                "selection_cutoff": cutoff.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                if self._auth_events == "deployment_snapshot" and cutoff is not None
+                else None,
+                "selection_basis": "visible_rows_at_or_before_run_completion" if self._auth_events == "deployment_snapshot" else None,
+                "selected_count": selected_count if self._auth_events == "deployment_snapshot" else None,
+                "reason": "deployment_snapshot" if self._auth_events == "deployment_snapshot" else "not_requested",
+            }
+            yield coverage
+
         policy_evidence = self._read_model.get_web_plugin_policy_evidence(run_id)
         if policy_evidence is not None:
             policy_record: WebPluginPolicyExportRecord = {
@@ -658,6 +732,12 @@ class LandscapeExporter:
                 "plugin_code_identities": [list(item) for item in policy_evidence.plugin_code_identities],
                 "binding_generation_fingerprint": policy_evidence.binding_generation_fingerprint,
                 "decision_codes": list(policy_evidence.decision_codes),
+                "admission_decision_json": (
+                    policy_evidence.admission_decision.model_dump_json() if policy_evidence.admission_decision is not None else None
+                ),
+                "admission_decision_hash": (
+                    policy_evidence.admission_decision.canonical_hash if policy_evidence.admission_decision is not None else None
+                ),
             }
             yield policy_record
 
@@ -763,6 +843,10 @@ class LandscapeExporter:
                     "request_hash": call.request_hash,
                     "response_hash": call.response_hash,
                     "resolved_prompt_template_hash": call.resolved_prompt_template_hash,
+                    "prompt_tokens": call.prompt_tokens,
+                    "completion_tokens": call.completion_tokens,
+                    "cached_prompt_tokens": call.cached_prompt_tokens,
+                    "reasoning_tokens": call.reasoning_tokens,
                     "latency_ms": call.latency_ms,
                     "request_ref": call.request_ref,
                     "response_ref": call.response_ref,
@@ -1081,6 +1165,10 @@ class LandscapeExporter:
                             "request_hash": call.request_hash,
                             "response_hash": call.response_hash,
                             "resolved_prompt_template_hash": call.resolved_prompt_template_hash,
+                            "prompt_tokens": call.prompt_tokens,
+                            "completion_tokens": call.completion_tokens,
+                            "cached_prompt_tokens": call.cached_prompt_tokens,
+                            "reasoning_tokens": call.reasoning_tokens,
                             "latency_ms": call.latency_ms,
                             "request_ref": call.request_ref,
                             "response_ref": call.response_ref,

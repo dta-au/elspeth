@@ -9,7 +9,7 @@ Install Python 3.12 or newer, `uv`, Node.js 24, and npm 11. The repository's
 
 ```bash
 git clone https://github.com/dta-au/elspeth.git && cd elspeth
-uv sync --frozen --extra dev --extra azure
+uv sync --frozen --all-extras
 source .venv/bin/activate
 
 # Azure Blob integration tests require the Azurite emulator

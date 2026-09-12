@@ -431,6 +431,34 @@ def test_every_kind_accepts_its_valid_details_and_round_trips_through_the_envelo
     assert receipt.kind == kind and receipt.subject_sha256 == BINDING.sha256
 
 
+@pytest.mark.parametrize("kind", ["replica-progress", "single-revision-progress"])
+@pytest.mark.parametrize(
+    "reason",
+    ["progress_stream_and_websocket_ticket_are_process_local", "legacy_p4b_contract_does_not_measure_durable_progress"],
+)
+def test_legacy_p4b_reasons_preserve_envelope_and_stored_admission(kind: str, reason: str) -> None:
+    details = VALID[kind]()
+    affine = cast(dict[str, object], details["owner_affine"])
+    affine["reasons"] = [reason]
+    line = encode_exec_receipt(kind, cast(contracts.CheckDetails, details), candidate_sha=CANDIDATE, binding=BINDING, scenario_id="A")
+    extracted = extract_exec_receipt(
+        line, expected_candidate_sha=CANDIDATE, expected_binding=BINDING, expected_scenario_id="A", expected_check=kind
+    )
+    document = json.loads(extracted.canonical_json)
+    admitted = validate_stored_receipt(document, kind=kind, scenario_id="A", subject_sha256=BINDING.sha256, candidate_sha=CANDIDATE)
+    assert json.loads(admitted.canonical_json) == document
+    assert document["details"]["owner_affine"] == {
+        "probe": "P4b",
+        "outcome": "cannot_pass",
+        "mechanism": "owner_affine",
+        "reasons": [reason],
+        "evidence": {"mitigation": "single_revision_sticky_sessions"},
+    }
+    affine.update({"outcome": "pass", "reasons": []})
+    with pytest.raises(AcceptanceCheckError, match="exec_receipt_schema"):
+        _validate(kind, details)
+
+
 def _scalar_paths(value: object, prefix: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
     if isinstance(value, dict):
         return [path for key, child in value.items() for path in _scalar_paths(child, (*prefix, key))]

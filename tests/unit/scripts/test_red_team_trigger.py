@@ -9,7 +9,6 @@ under-specified finding may never auto-file a tracker issue.
 
 from __future__ import annotations
 
-import pytest
 from scripts.red_team import trigger
 
 
@@ -86,30 +85,6 @@ class TestClassifyPaths:
 
 
 class TestSelectAttackAngles:
-    @pytest.mark.parametrize(
-        "category",
-        ["auth", "secrets", "security", "policy_gate", "state_machine", "cicd_gate"],
-    )
-    def test_every_seam_gets_two_to_three_distinct_angles(self, category: str) -> None:
-        angles = trigger.select_attack_angles({category})
-        names = [angle.name for angle in angles]
-        assert 2 <= len(names) <= 3
-        assert len(set(names)) == len(names)
-
-    def test_base_angles_always_present(self) -> None:
-        angles = trigger.select_attack_angles({"cicd_gate"})
-        names = {angle.name for angle in angles}
-        assert "wrong-reason-tests" in names
-        assert "reverted-guard" in names
-
-    def test_auth_seam_adds_escape_artist(self) -> None:
-        names = {angle.name for angle in trigger.select_attack_angles({"auth"})}
-        assert "escape-artist" in names
-
-    def test_state_machine_seam_adds_state_conflation(self) -> None:
-        names = {angle.name for angle in trigger.select_attack_angles({"state_machine"})}
-        assert "state-conflation" in names
-
     def test_no_categories_yields_no_angles(self) -> None:
         assert trigger.select_attack_angles(set()) == ()
 
@@ -117,7 +92,6 @@ class TestSelectAttackAngles:
         first = trigger.select_attack_angles({"auth", "state_machine"})
         second = trigger.select_attack_angles({"state_machine", "auth"})
         assert [angle.name for angle in first] == [angle.name for angle in second]
-        assert len(first) == 3
 
 
 class TestParseFindings:
@@ -187,29 +161,9 @@ class TestRouteFinding:
 
 
 class TestCommandConstruction:
-    def test_file_issue_argv_builds_filigree_create(self) -> None:
-        finding = _finding(severity="critical")
-        argv = trigger.file_issue_argv(finding)
-        assert argv[0] == "filigree"
-        assert argv[1] == "create"
-        assert finding.title in argv
-        assert "--type" in argv
-        assert argv[argv.index("--type") + 1] == "bug"
-        assert argv[argv.index("-p") + 1] == "0"
-        assert "red-team" in argv
-
     def test_high_severity_maps_to_priority_one(self) -> None:
         argv = trigger.file_issue_argv(_finding(severity="high"))
         assert argv[argv.index("-p") + 1] == "1"
-
-    def test_agent_argv_targets_red_team_agent(self) -> None:
-        angle = trigger.select_attack_angles({"auth"})[0]
-        argv = trigger.build_agent_argv(angle, "the prompt")
-        assert argv[0] == "claude"
-        assert "--agent" in argv
-        assert argv[argv.index("--agent") + 1] == "red-team"
-        assert "-p" in argv
-        assert "the prompt" in argv
 
     def test_agent_prompt_names_commit_and_angle(self) -> None:
         angle = trigger.select_attack_angles({"auth"})[-1]

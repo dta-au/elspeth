@@ -27,7 +27,8 @@ communicates through :class:`threading.Event` flags:
 Design invariants enforced here:
 
 - **BUSY = liveness-unknown** — a heartbeat ``OperationalError`` whose DBAPI
-  message is SQLite or PostgreSQL lock contention (``_is_lock_contention``), or a
+  evidence is SQLite write-lock contention or PostgreSQL lock/deadlock
+  SQLSTATE (``_is_lock_contention``), or a
   rolled-back lease deadline rejection (``LeaseDeadlineExpiredError``), is
   logged at DEBUG and counted toward the ``heartbeat_degraded`` threshold
   ``k``; the thread never sets the latch on either. An ``OperationalError``
@@ -90,7 +91,13 @@ _DEFAULT_DEGRADED_THRESHOLD: int = 3
 
 
 def _is_lock_contention(exc: OperationalError) -> bool:
-    """True only for SQLite or PostgreSQL lock contention.
+    """Recognize SQLite busy/locked and PostgreSQL lock/deadlock contention.
+
+    PostgreSQL's DBAPI SQLSTATE is authoritative independently of diagnostic
+    text. Lock-not-available and deadlock-victim errors roll back the tick;
+    query cancellation (57014) proves no lock contention and remains fatal.
+    The optional psycopg drivers expose different foreign exception fields,
+    admitted here without requiring either driver on SQLite installations.
 
     ``begin_write`` takes the WAL write lock at BEGIN IMMEDIATE and raises
     ``OperationalError("database is locked")`` after the 5000 ms busy_timeout
@@ -105,8 +112,8 @@ def _is_lock_contention(exc: OperationalError) -> bool:
     about contention and is reported as non-contention — this predicate gates
     a fatal latch, so its unknown case must fail closed.
 
-    PostgreSQL's shorter lock timeout fires before its statement timeout. Only
-    the lock-timeout primary message is contention; statement timeouts and
+    PostgreSQL's shorter lock timeout fires before its statement timeout so
+    the server reports the specific lock SQLSTATE. Statement timeouts and
     explicit query cancellation remain fatal database failures.
 
     Every other ``OperationalError`` — unable to open the database file, disk
@@ -116,8 +123,12 @@ def _is_lock_contention(exc: OperationalError) -> bool:
     origin = exc.orig
     if origin is None:
         return False
-    message = str(origin).lower()
-    return "is locked" in message or message.split("\n", 1)[0] == "canceling statement due to lock timeout"
+    sqlstate = getattr(origin, "sqlstate", None)
+    if sqlstate is None:
+        sqlstate = getattr(origin, "pgcode", None)
+    if sqlstate is not None:
+        return type(sqlstate) is str and sqlstate in {"55P03", "40P01"}
+    return "is locked" in str(origin).lower()
 
 
 class _HeartbeatRepository(Protocol):

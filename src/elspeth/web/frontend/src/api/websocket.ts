@@ -86,13 +86,14 @@ export function connectToRun(
 ): WebSocketConnection {
   let socket: WebSocket | null = null;
   let closed = false;
+  let lastSequence = 0;
   let reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   function buildWsUrl(ticket: string): string {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    return `${protocol}//${host}/ws/runs/${runId}?ticket=${encodeURIComponent(ticket)}`;
+    return `${protocol}//${host}/ws/runs/${runId}?ticket=${encodeURIComponent(ticket)}&after_sequence=${lastSequence}`;
   }
 
   function errorStatus(error: unknown): number | null {
@@ -163,7 +164,12 @@ export function connectToRun(
 
     socket.onmessage = (messageEvent: MessageEvent): void => {
       const event: RunEvent = JSON.parse(messageEvent.data as string);
+      if (event.event_sequence != null) {
+        if (!Number.isSafeInteger(event.event_sequence) || event.event_sequence < 1) return;
+        if (event.event_sequence <= lastSequence) return;
+      }
       dispatchEvent(event);
+      if (event.event_sequence != null) lastSequence = event.event_sequence;
 
       // Terminal events: stop reconnecting. The server will close
       // the connection with code 1000 after sending a terminal event.

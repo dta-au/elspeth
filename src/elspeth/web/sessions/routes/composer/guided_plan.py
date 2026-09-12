@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import replace
+from typing import Annotated, cast
 from uuid import UUID, uuid4
 
 import elspeth.contracts.errors as contract_errors
@@ -20,11 +22,12 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PipelinePlannerError, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
-from elspeth.web.composer.progress import client_cancelled_progress_event
+from elspeth.web.composer.progress import ComposerRequestLease, client_cancelled_progress_event
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.guided_replay import project_composition_proposal, project_guided_full_decline
@@ -46,13 +49,14 @@ from elspeth.web.sessions.schemas import CompositionProposalResponse, GuidedPlan
 
 from .._helpers import (
     APIRouter,
-    ComposerRateLimiter,
     Depends,
     HTTPException,
     Request,
     SessionServiceProtocol,
     UserIdentity,
+    WebRateLimiter,
     _cancel_on_client_disconnect,
+    _composer_progress_sink,
     _failure_log_request_id,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
@@ -61,6 +65,7 @@ from .._helpers import (
     _request_plugin_policy_context,
     _safe_frame_strings,
     _state_from_record,
+    _track_compose_inflight,
     _verify_session_ownership,
     get_current_user,
     get_rate_limiter,
@@ -70,6 +75,7 @@ from .._helpers import (
 from ..guided_operations import (
     GuidedOperationExpired,
     GuidedOperationLease,
+    guided_operation_lease_guard,
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
@@ -130,6 +136,14 @@ def _guided_full_complete_outcome_unreadable_progress_event() -> ComposerProgres
 
 
 def _guided_full_failed_progress_event(failure_code: GuidedOperationFailureCode) -> ComposerProgressEvent:
+    if failure_code == "admission_refused":
+        return ComposerProgressEvent(
+            phase="failed",
+            headline="This request was refused by the admission policy.",
+            evidence=("The guided operation was refused before provider work.",),
+            likely_next="Ask an administrator to review your access and quota configuration.",
+            reason="admission_refused",
+        )
     if failure_code == "planner_repair_exhausted":
         # Planner-owned non-convergence (elspeth-5904b1683a): honest about WHO
         # failed (the planner loop, not the provider) and honest that a retry
@@ -259,6 +273,8 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
         return "quota_exceeded"
     if isinstance(exc, BlobError):
         return "custody_error"
+    if isinstance(exc, ComposerAdmissionRefused):
+        return "admission_refused"
     if isinstance(exc, ComposerServiceError):
         return "provider_unavailable"
     if isinstance(exc, PipelinePlannerError):
@@ -307,8 +323,9 @@ async def post_guided_plan(
     session_id: UUID,
     body: GuidedPlanRequest,
     request: Request,
+    _inflight_tally: Annotated[None, Depends(_track_compose_inflight)],
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
-    rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+    rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
 ) -> CompositionProposalResponse | GuidedPlanDeclinedResponse:
     """Plan and atomically stage one full guided proposal.
 
@@ -398,6 +415,7 @@ async def post_guided_plan(
         raise AuditIntegrityError("guided-full operation was not reserved")
     if not isinstance(reserved, GuidedOperationLease):
         await _get_composer_progress_registry(request).publish_replay_if_unclaimed(
+            lease=cast(ComposerRequestLease, request.state.composer_request_lease),
             session_id=str(session_id),
             request_id=body.operation_id,
             user_id=user.user_id,
@@ -408,11 +426,20 @@ async def post_guided_plan(
         return reserved
 
     recorder = BufferingRecorder()
-    progress = _get_composer_progress_registry(request).bind_request(
-        session_id=str(session_id),
-        request_id=body.operation_id,
-        user_id=user.user_id,
-    )
+    # Claiming progress is fallible and cancellable after acquiring session
+    # authority. The shared guard owns terminal disposition and lease cleanup
+    # until the claim succeeds; then the route's audited settlement/finally
+    # below takes ownership synchronously, before any further await.
+    async with AsyncExitStack() as claim_cleanup:
+        await claim_cleanup.enter_async_context(guided_operation_lease_guard(service=service, lease=reserved))
+        progress = await _composer_progress_sink(
+            _get_composer_progress_registry(request),
+            request,
+            session_id=str(session_id),
+            request_id=body.operation_id,
+            user_id=user.user_id,
+        )
+        claim_cleanup.pop_all()
     # Set the moment this worker observes that its guided authority is gone
     # (a takeover or lapse). From then on the lease's own close reporting the
     # same loss is expected and must never replace the outcome the route

@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import delete, event, func, insert, select, text, update
 from sqlalchemy.engine import Connection, Engine, Transaction
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
@@ -47,6 +48,13 @@ from elspeth.web.sessions.protocol import (
     SessionForkParentAuthority,
     SessionGuidedOperationInProgressError,
 )
+
+
+@pytest.fixture(autouse=True)
+def session_owner(engine: Engine) -> None:
+    """Seed the owner before testing session-operation authority and rollback."""
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
 
 
 def _created(authority: SQLiteLocalSessionOperationAuthority):
@@ -150,6 +158,8 @@ def test_sqlite_process_and_file_lock_allow_exactly_one_claimant(tmp_path) -> No
     database_url = f"sqlite:///{tmp_path / 'authority.db'}"
     first_engine = create_session_engine(database_url)
     initialize_session_schema(first_engine)
+    with first_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     second_engine = create_session_engine(database_url)
     first_authority = SQLiteLocalSessionOperationAuthority(first_engine)
     second_authority = SQLiteLocalSessionOperationAuthority(second_engine)

@@ -55,6 +55,7 @@ import pytest
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from tests.unit.web.composer._helpers import (
     FakeChoice,
+    _composer_service_with_session,
     _empty_state,
     _make_llm_response,
     _make_settings,
@@ -189,14 +190,14 @@ async def _run_envelope(script: Sequence[ScriptedTurn], *, user_message: str = "
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     responses = [_build_scripted_response(turn) for turn in script]
 
     with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = responses
-        result = await service.compose(user_message, [], state)
+        result = await service.compose(user_message, [], state, session_id=session_id)
 
     sizes: list[int] = []
     for invocation in mock_llm.call_args_list:

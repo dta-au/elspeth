@@ -56,6 +56,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -115,6 +116,8 @@ def composer_freeform_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
 
     session_service = DualFencedSessionServiceHarness(
         engine,

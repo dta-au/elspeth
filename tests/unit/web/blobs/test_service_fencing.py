@@ -33,6 +33,7 @@ from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blob_run_links_table, blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
 from tests.unit.web.blobs.test_service import _seed_active_run, reserve_output_blob
 
@@ -52,6 +53,7 @@ def _insert_session(db_engine) -> UUID:
     sid = str(uuid4())
     now = datetime.now(UTC)
     with db_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
         conn.execute(
             sessions_table.insert().values(
                 id=sid,

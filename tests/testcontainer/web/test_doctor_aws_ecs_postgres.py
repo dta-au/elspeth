@@ -241,7 +241,7 @@ def test_concurrent_doctor_init_schema_cli_runs_are_safe(
             completed.append((process.returncode, stdout, stderr))
 
         for returncode, stdout, stderr in completed:
-            assert returncode == 0, stderr or stdout
+            assert returncode == 0, f"stdout:\n{stdout}\nstderr:\n{stderr}"
             report = _assert_all_green_report(stdout)
             _assert_trust_and_transport_green(report)
             _assert_private_database_values_absent(stdout + stderr, database_pair, environment)

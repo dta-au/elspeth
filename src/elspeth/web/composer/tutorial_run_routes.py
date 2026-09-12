@@ -14,7 +14,7 @@ from elspeth.web.composer.tutorial_models import (
     TutorialRunResponse,
 )
 from elspeth.web.composer.tutorial_service import cancel_tutorial_run, cleanup_tutorial_orphans, run_tutorial_pipeline
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
+from elspeth.web.middleware.rate_limit import WebRateLimiter, get_rate_limiter
 
 
 def create_tutorial_run_router() -> APIRouter:
@@ -26,7 +26,7 @@ def create_tutorial_run_router() -> APIRouter:
         body: TutorialRunRequest,
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
     ) -> TutorialRunResponse:
         await rate_limiter.check(user.user_id)
         return await run_tutorial_pipeline(

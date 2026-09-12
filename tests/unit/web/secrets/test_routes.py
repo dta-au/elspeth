@@ -23,6 +23,7 @@ from elspeth.web.secrets.service import WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -61,6 +62,8 @@ def _make_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
 
     user_store = UserSecretStore(engine, _TEST_MASTER_KEY)
     server_store = ServerSecretStore(server_allowlist)
@@ -409,6 +412,9 @@ class TestCrossUserIsolation:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            for identity_id in ("alice", "bob"):
+                ensure_test_identity(conn, identity_id=identity_id)
 
         user_store = UserSecretStore(engine, _TEST_MASTER_KEY)
         server_store = ServerSecretStore(())

@@ -29,7 +29,10 @@ from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
     supports_anthropic_prompt_cache_markers,
 )
-from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
+from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
+    _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
+)
 
 
 class TestSupportsAnthropicPromptCacheMarkers:
@@ -307,7 +310,6 @@ class TestCacheMarkersWiredAtCallSite:
 
         from elspeth.web.composer.service import (
             ComposerAvailability,
-            ComposerServiceImpl,
         )
         from tests.unit.web.composer._helpers import (
             FakeChoice,
@@ -326,7 +328,7 @@ class TestCacheMarkersWiredAtCallSite:
 
         catalog = _mock_catalog()
         settings = _make_settings(composer_model="anthropic/claude-sonnet-4.5")
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         # Bypass availability check (no real Anthropic API key needed).
         service._availability = ComposerAvailability(available=True, model=service._model, provider="test")
         state = _empty_state()
@@ -343,7 +345,7 @@ class TestCacheMarkersWiredAtCallSite:
             "elspeth.web.composer.service._litellm_acompletion",
             new=fake_acompletion,
         ):
-            result = await service.compose("Build a CSV pipeline.", [], state)
+            result = await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
 
         # The stable system prompt MUST carry cache_control after the transform.
         sent_messages = captured["messages"]
@@ -393,7 +395,6 @@ class TestCacheMarkersWiredAtCallSite:
 
         from elspeth.web.composer.service import (
             ComposerAvailability,
-            ComposerServiceImpl,
         )
         from tests.unit.web.composer._helpers import (
             FakeChoice,
@@ -413,7 +414,7 @@ class TestCacheMarkersWiredAtCallSite:
         catalog = _mock_catalog()
         # Default _make_settings model is gpt-5.5 (OpenAI-shape).
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         service._availability = ComposerAvailability(available=True, model=service._model, provider="test")
         state = _empty_state()
         captured: dict[str, Any] = {}
@@ -429,7 +430,7 @@ class TestCacheMarkersWiredAtCallSite:
             "elspeth.web.composer.service._litellm_acompletion",
             new=fake_acompletion,
         ):
-            await service.compose("Build a CSV pipeline.", [], state)
+            await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
 
         sent_messages = captured["messages"]
         system_messages = [m for m in sent_messages if m.get("role") == "system"]

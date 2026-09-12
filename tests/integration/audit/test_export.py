@@ -141,6 +141,30 @@ class TestLandscapeExport:
         assert "run" in record_types, "Missing run record"
         assert "row" in record_types, "Missing row records"
 
+    def test_cli_signed_export_includes_deployment_auth_history(
+        self, export_settings_yaml: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from elspeth.cli import app
+        from elspeth.core.landscape.database import LandscapeDB
+        from tests.unit.core.landscape.test_auth_event_export import _event
+
+        config = yaml.safe_load(export_settings_yaml.read_text())
+        config["landscape"]["export"] = _audit_export_config(signed=True)
+        config["landscape"]["export"]["auth_events"] = "deployment_snapshot"
+        export_settings_yaml.write_text(yaml.safe_dump(config))
+        monkeypatch.setenv("ELSPETH_SIGNING_KEY", "controlled-export-test-signing-key")
+        with LandscapeDB.from_url(config["landscape"]["url"]) as db:
+            _event(db, "prior-role-grant")
+        result = runner.invoke(app, ["run", "-s", str(export_settings_yaml), "--execute"])
+        assert result.exit_code == 0, result.output
+        records = _read_audit_records(tmp_path / "audit_export.json")
+        events = [record for record in records if record["record_type"] == "auth_event"]
+        assert [record["event_id"] for record in events] == ["prior-role-grant"]
+        coverage = next(record for record in records if record["record_type"] == "auth_event_coverage")
+        assert coverage["policy"] == "deployment_snapshot"
+        assert coverage["selected_count"] == 1
+        assert all("signature" in record for record in records)
+
     def test_export_contains_all_record_types(self, export_settings_yaml: Path, tmp_path: Path) -> None:
         """Export should contain run, node, row, token, and node_state records."""
         from elspeth.cli import app

@@ -38,6 +38,7 @@ from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
@@ -190,6 +191,8 @@ async def test_failed_commit_reconciliation_preserves_a_committed_inline_stage(t
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("test-user", "Ambiguous inline commit", "local")
     message = await sessions.add_message(
@@ -239,6 +242,8 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("test-user", "Blocked inline custody", "local")
     message = await sessions.add_message(
@@ -342,6 +347,8 @@ async def test_failed_commit_reconciliation_removes_stage_when_committed_row_was
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("test-user", "Deleted inline commit", "local")
     message = await sessions.add_message(

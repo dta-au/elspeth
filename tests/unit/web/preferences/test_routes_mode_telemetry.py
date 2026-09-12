@@ -41,6 +41,7 @@ from elspeth.web.preferences.service import PreferencesService
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -65,6 +66,8 @@ def _make_app(user_id: str | None = "alice") -> FastAPI:
     app.state.sessions_telemetry = build_sessions_telemetry()
 
     if user_id is not None:
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id)
         identity = UserIdentity(user_id=user_id, username=user_id)
 
         async def _mock_user() -> UserIdentity:

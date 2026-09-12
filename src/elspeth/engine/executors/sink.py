@@ -1360,6 +1360,11 @@ class SinkExecutor:
         """
         if not tokens:
             return None, DiversionCounts()
+        # Refuse a replaced caller before opening sink node states or
+        # reserving an effect. The adapter-level guard still rechecks before
+        # publication, but that later check cannot undo admission audit writes.
+        if self._check_coordination_latch is not None:
+            self._check_coordination_latch()
         if effect_mode is None:
             raise OrchestrationInvariantError(
                 f"Sink '{sink_name}' reached execution without a validated effect mode; legacy publication is forbidden"

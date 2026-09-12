@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import Engine, select
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.web.coordination.contracts import InstanceState, SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.membership_authority import (
@@ -94,8 +95,11 @@ def _fence_row(engine: Engine, session_id: UUID) -> Any:
         ).one()
 
 
-async def _create_running_run(service: SessionServiceImpl) -> tuple[RunRecord, SessionOperationContext]:
-    session = await service.create_session(str(uuid4()), "Pipeline", "local")
+async def _create_running_run(service: SessionServiceImpl, engine: Engine) -> tuple[RunRecord, SessionOperationContext]:
+    owner_id = str(uuid4())
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = await service.create_session(owner_id, "Pipeline", "local")
     compose_context = await service._run_sync(
         lambda: service.session_operation_authority.acquire(
             session_id=session.id,
@@ -143,7 +147,7 @@ async def test_partitioned_owner_is_taken_over_only_after_both_leases_expire(dep
     RepositoryWebInstanceMembershipAuthority(second_engine).register(
         _identity(second.session_operation_owner_instance_id), lease_seconds=300
     )
-    run, _context = await _create_running_run(first)
+    run, _context = await _create_running_run(first, first_engine)
 
     # Before expiry: the fence is live, so both the survivor's acquire and its
     # recovery sweep refuse.
@@ -183,7 +187,7 @@ async def test_heartbeating_owner_is_unstealable_until_it_stops(deployment) -> N
     )
     await membership.start()
     try:
-        run, _context = await _create_running_run(first)
+        run, _context = await _create_running_run(first, first_engine)
 
         # The fence lease lapses (the owner is busy, not dead); the membership
         # lease is renewed every second, so the survivor must keep refusing.

@@ -69,6 +69,7 @@ from elspeth.web.sessions.routes._helpers import _state_from_record
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 
 # Re-register the guided suite's restart-capable HTTP fixture for this package so
 # the deferred-intent negatives in ``test_repair_and_deferral.py`` can request it
@@ -760,6 +761,8 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     """Build the shared real production stack with the two false-green bypasses."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     sessions = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),

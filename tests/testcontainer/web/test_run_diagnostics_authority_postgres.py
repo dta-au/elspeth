@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import Engine, event, func, select
+from tests.fixtures.identities import ensure_test_identity
 
 import elspeth.web.coordination.run_diagnostics_authority as run_diagnostics_authority_module
 from elspeth.web.coordination.contracts import SessionOperationKind
@@ -55,8 +56,11 @@ def deployment(
         archive_engine.dispose()
 
 
-async def _create_pending_run(service: SessionServiceImpl) -> RunRecord:
-    session = await service.create_session(str(uuid4()), "Pipeline", "local")
+async def _create_pending_run(service: SessionServiceImpl, engine: Engine) -> RunRecord:
+    owner_id = str(uuid4())
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = await service.create_session(owner_id, "Pipeline", "local")
     compose_context = await service._run_sync(
         lambda: service.session_operation_authority.acquire(
             session_id=session.id,
@@ -104,7 +108,7 @@ def _message_count(engine: Engine, session_id: UUID) -> int:
 @pytest.mark.asyncio
 async def test_archive_winning_advisory_lock_forces_diagnostics_recheck_and_refusal(deployment) -> None:
     diagnostics_engine, archive_engine, diagnostics, archive = deployment
-    run = await _create_pending_run(diagnostics)
+    run = await _create_pending_run(diagnostics, diagnostics_engine)
     authority = RunDiagnosticsAuditAuthority(
         run_id=run.id,
         session_id=run.session_id,
@@ -154,7 +158,7 @@ async def test_archive_winning_advisory_lock_forces_diagnostics_recheck_and_refu
 @pytest.mark.asyncio
 async def test_diagnostics_winning_advisory_lock_commits_before_archive(deployment) -> None:
     diagnostics_engine, archive_engine, diagnostics, archive = deployment
-    run = await _create_pending_run(diagnostics)
+    run = await _create_pending_run(diagnostics, diagnostics_engine)
     authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=run.session_id, state_id=run.state_id)
     diagnostics_has_lock = threading.Event()
     allow_diagnostics_commit = threading.Event()
@@ -205,7 +209,7 @@ async def test_diagnostics_winning_advisory_lock_commits_before_archive(deployme
 @pytest.mark.asyncio
 async def test_lock_order_also_orders_diagnostics_timestamps(deployment, monkeypatch: pytest.MonkeyPatch) -> None:
     diagnostics_engine, _peer_engine, diagnostics, peer = deployment
-    run = await _create_pending_run(diagnostics)
+    run = await _create_pending_run(diagnostics, diagnostics_engine)
     authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=run.session_id, state_id=run.state_id)
     earlier = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
     later = earlier + timedelta(seconds=1)

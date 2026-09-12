@@ -1427,8 +1427,9 @@ async def post_guided_chat_schema8(
             progress_started = False
             progress_registry = _get_composer_progress_registry(request)
             try:
-                progress_sink = _composer_progress_sink(
+                progress_sink = await _composer_progress_sink(
                     progress_registry,
+                    request=request,
                     session_id=str(session_id),
                     request_id=body.operation_id,
                     user_id=str(user.user_id),
@@ -1997,7 +1998,7 @@ async def post_guided_chat_schema8(
                                 payload_store=payload_store,
                                 new_stable_id=uuid4(),
                             )
-                        except (PluginConfigError, InvariantError, TypeError, ValueError):
+                        except (PluginConfigError, ValueError):
                             # Same degradation as a rejected chat transition: the
                             # upload stays uploaded and the authoritative turn is
                             # unchanged, so the wizard remains usable.
@@ -2063,7 +2064,7 @@ async def post_guided_chat_schema8(
                             )
                             next_turn = current_turn
                             prepared_next = planned_current
-                        except (PluginConfigError, InvariantError, TypeError, ValueError):
+                        except (PluginConfigError, ValueError):
                             chat_result = _with_pair_disposition(
                                 StepChatResult(
                                     assistant_message=(
@@ -2516,10 +2517,16 @@ async def post_guided_chat_schema8(
                         ),
                         session_operation_context=reserved.session_operation_context,
                     )
-                except GuidedOperationFenceLostError:
+                except GuidedOperationFenceLostError as settlement_exc:
+                    if failure_code == "integrity_error":
+                        raise exc from settlement_exc
                     rejoin_after_lock = True
+                except Exception as settlement_exc:
+                    if failure_code == "integrity_error":
+                        raise exc from settlement_exc
+                    raise
                 else:
-                    raise guided_operation_failure_error(failed)
+                    raise guided_operation_failure_error(failed) from exc
             finally:
                 await lease_guard.finish_active_exception()
         if rejoin_after_lock:

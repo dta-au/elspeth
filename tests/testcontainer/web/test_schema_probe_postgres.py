@@ -18,6 +18,7 @@ from sqlalchemy import Connection, Engine, create_engine, event, inspect, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
+from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.core.test_schema_shape import _static_check_issues
@@ -310,6 +311,8 @@ async def test_postgres_guided_operation_takeover_fences_late_worker(postgres_en
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-operation-postgres-b"),
     )
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session_id = (await service_a.create_session("alice", "PostgreSQL guided operation", "local")).id
     compose_context = await service_a._run_sync(
         lambda: service_a.session_operation_authority.acquire(
@@ -454,6 +457,8 @@ async def test_postgres_concurrent_expired_reserve_has_one_takeover_winner(postg
         )
         for index in range(3)
     ]
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session_id = (await services[0].create_session("alice", "Contended PostgreSQL operation", "local")).id
     operation_id = "postgres-contended-takeover"
     request_hash = "c" * 64
@@ -548,6 +553,8 @@ async def test_postgres_concurrent_takeover_contenders_are_decided_at_the_sessio
         )
         for index in range(3)
     ]
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session_id = (await services[0].create_session("alice", "Contended PostgreSQL operation", "local")).id
     operation_id = "postgres-contended-takeover"
     request_hash = "c" * 64
@@ -631,6 +638,7 @@ async def test_postgres_concurrent_takeover_contenders_are_decided_at_the_sessio
 
 def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, include_completion: bool) -> None:
     with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="trigger-user")
         conn.execute(
             text(
                 """
@@ -1056,6 +1064,8 @@ def test_preferences_upsert_round_trips_on_postgres(postgres_engine: Engine) -> 
     """The account preferences write path must use PostgreSQL's upsert builder."""
     init_session_schema(postgres_engine)
     service = PreferencesService(postgres_engine)
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="postgres-preferences-user")
 
     transition = asyncio.run(
         service.update_composer_preferences(

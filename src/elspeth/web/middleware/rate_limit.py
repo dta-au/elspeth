@@ -1,9 +1,7 @@
-"""In-memory sliding window rate limiter for composer messages.
+"""Explicit local and PostgreSQL shared sliding-window rate limit adapters.
 
-Per-user rate limiting via FastAPI Depends(). Not thread-safe across
-multiple uvicorn workers -- each worker has its own counter. Multi-worker
-deployments need Redis or equivalent shared store for accurate
-cross-process rate limiting.
+Local SQLite deployments use the process-local adapter. PostgreSQL deployments
+use a repository authority so replicas consume one shared budget.
 
 Layer: L3 (application).
 """
@@ -14,6 +12,10 @@ import asyncio
 import time
 
 from fastapi import HTTPException, Request
+from sqlalchemy.exc import SQLAlchemyError
+
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_sync_in_worker
+from elspeth.web.coordination.rate_limit_authority import RateLimitScope, RepositoryRateLimitAuthority
 
 
 class ComposerRateLimiter:
@@ -30,10 +32,8 @@ class ComposerRateLimiter:
     _locks_lock (held for microseconds -- dict lookup only) serializes
     creation/fetch of per-user locks.
 
-    Rate limiting is per-process. Deployments with multiple uvicorn
-    workers have an effective rate limit of N * limit across the
-    cluster. Multi-worker deployments require Redis or an equivalent
-    shared store for accurate cross-process rate limiting.
+    Rate limiting is per-process. App construction selects this adapter only
+    for local deployments; PostgreSQL deployments use SharedRateLimiter.
     """
 
     _WINDOW_SECONDS: float = 60.0
@@ -139,20 +139,52 @@ class ComposerRateLimiter:
             bucket.append(now)
 
 
-async def get_rate_limiter(request: Request) -> ComposerRateLimiter:
+class SharedRateLimiter:
+    """Async route adapter for the nominal repository quota authority."""
+
+    def __init__(self, limit: int, *, authority: RepositoryRateLimitAuthority, scope: RateLimitScope) -> None:
+        if not isinstance(authority, RepositoryRateLimitAuthority):
+            raise TypeError("Shared rate limiting requires RepositoryRateLimitAuthority")
+        self._limit = limit
+        self._authority = authority
+        self._scope = scope
+
+    async def check(self, user_id: str) -> None:
+        """Refuse database errors without exposing SQL diagnostics or subjects."""
+        try:
+            decision = await run_sync_in_worker(self._authority.admit, scope=self._scope, subject=user_id, limit=self._limit)
+        except (SQLAlchemyError, AsyncWorkerAdmissionTimeoutError):
+            raise HTTPException(status_code=503, detail="Rate limit service unavailable") from None
+        if not decision.allowed:
+            retry_after = decision.retry_after
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error_type": "rate_limited",
+                    "detail": f"Rate limit exceeded. Try again in {retry_after} seconds.",
+                    "retry_after": retry_after,
+                },
+                headers={"Retry-After": str(retry_after)},
+            )
+
+
+WebRateLimiter = ComposerRateLimiter | SharedRateLimiter
+
+
+async def get_rate_limiter(request: Request) -> WebRateLimiter:
     """FastAPI dependency that extracts the rate limiter from app state."""
-    limiter: ComposerRateLimiter = request.app.state.rate_limiter
+    limiter: WebRateLimiter = request.app.state.rate_limiter
     return limiter
 
 
-async def get_write_rate_limiter(request: Request) -> ComposerRateLimiter:
+async def get_write_rate_limiter(request: Request) -> WebRateLimiter:
     """FastAPI dependency for the cheap-DB-write bucket.
 
     Distinct from get_rate_limiter (the LLM/execution bucket) so bursty
     but cheap writes — tutorial stage persistence above all — cannot
     starve LLM-endpoint budget or vice versa.
     """
-    limiter: ComposerRateLimiter = request.app.state.write_rate_limiter
+    limiter: WebRateLimiter = request.app.state.write_rate_limiter
     return limiter
 
 
@@ -166,6 +198,6 @@ async def check_auth_rate_limit(request: Request) -> None:
     proxy with --proxy-headers enabled, Starlette populates this from
     X-Forwarded-For automatically.
     """
-    limiter: ComposerRateLimiter = request.app.state.auth_rate_limiter
+    limiter: WebRateLimiter = request.app.state.auth_rate_limiter
     client_ip = request.client.host if request.client else "unknown"
     await limiter.check(client_ip)

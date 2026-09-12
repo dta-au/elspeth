@@ -42,10 +42,16 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Session epoch 53 (elspeth-f98e0ae8b2) adds the per-admission read
     # records on the session side only. Landscape epoch 38 (elspeth-2d436dd6e8,
     # elspeth-5d66fc5ed1) adds the scheduler_events ``seq`` replay key on the
-    # Landscape side only, so the pair is (53, 38) and both stores still name
-    # the same release.
-    assert SESSION_SCHEMA_EPOCH == 53
-    assert SQLITE_SCHEMA_EPOCH == 38
+    # Landscape side only, giving the previous pair (53, 38).
+    # Session epoch 54 adds durable Composer progress snapshots and exact
+    # request lifecycle leases. Landscape epoch 39 adds immutable web
+    # run-start permit binding and recoverable pre-effect admission state.
+    # Session epoch 55 adds identity-owner foreign keys, durable admission
+    # policy evidence and approval revocation provenance. Landscape epoch 40
+    # adds nullable call token measures and immutable run policy evidence.
+    # These VANguard changes deploy together as the pair (55, 40).
+    assert SESSION_SCHEMA_EPOCH == 55
+    assert SQLITE_SCHEMA_EPOCH == 40
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:

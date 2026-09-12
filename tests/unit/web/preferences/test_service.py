@@ -34,6 +34,7 @@ from elspeth.web.preferences.service import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import metadata, user_preferences_table
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture(scope="module")
@@ -49,6 +50,52 @@ def engine():
         poolclass=StaticPool,
     )
     metadata.create_all(eng)
+    # Each scenario has an authenticated identity, initially without preferences.
+    with eng.begin() as conn:
+        for identity_id in (
+            "alice-get-default",
+            "alice-real-updated-at",
+            "alice-update-persist",
+            "alice-tutorial-set",
+            "alice-tutorial-final",
+            "alice-tutorial-preserve",
+            "alice-tutorial-retake",
+            "alice-tutorial-discriminate",
+            "alice-tutorial-corrupt",
+            "alice-tutorial-counter",
+            "alice-no-tutorial-counter",
+            "alice-tutorial-first-time-counter",
+            "alice-tutorial-skip-counter",
+            "alice-tutorial-retake-counter",
+            "alice-tutorial-repeat-counter",
+            "alice-tutorial-exit-counter",
+            "alice-tutorial-exit-mode-counter",
+            "alice-tutorial-exit-clears-progress",
+            "alice-tutorial-mode-only-counter",
+            "alice-banner-reshow",
+            "alice-banner-discriminate",
+            "alice-partial",
+            "alice-empty-patch-no-row",
+            "alice-empty-patch-existing",
+            "alice-isolated",
+            "bob-isolated",
+            "alice-corrupt-public",
+            "alice-finding-7",
+            "alice-corrupt-prior-blocks-patch",
+            "alice-partial-corrupt",
+            "alice-tutorial-progress-roundtrip",
+            "alice-tutorial-progress-advance",
+            "alice-tutorial-progress-preserve",
+            "alice-tutorial-progress-complete",
+            "alice-tutorial-progress-reset",
+            "alice-tutorial-progress-not-empty",
+            "alice-tutorial-progress-clear",
+            "alice-tutorial-stage-corrupt",
+            "alice-tutorial-progress-counter",
+            "alice-show-advanced",
+            "alice-flag-derivation",
+        ):
+            ensure_test_identity(conn, identity_id=identity_id)
     yield eng
     eng.dispose()
 
@@ -783,6 +830,8 @@ def test_concurrent_partial_patches_return_serialized_current_state(tmp_path):
     metadata.create_all(engine)
     service = PreferencesService(engine)
     user = "alice-concurrent-partial-return"
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user)
     stamp = datetime(2026, 5, 16, 12, 30, tzinfo=UTC)
 
     mode_writer_ready = threading.Event()
@@ -1147,6 +1196,8 @@ def test_prior_read_runs_under_begin_immediate_on_sqlite(tmp_path):
     metadata.create_all(engine)
     service = PreferencesService(engine)
     user = "alice-begin-immediate"
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user)
     asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(default_mode="freeform")))
 
     trace = _attach_trace(engine)

@@ -24,6 +24,7 @@ from elspeth.web.auth.identity_admin_routes import create_identity_admin_router
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.routes import create_auth_router
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.sessions.engine import create_session_engine
@@ -120,7 +121,7 @@ def _build(tmp_path: Path) -> _Harness:
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
-    authority = RepositoryIdentityAuthority(engine)
+    authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
     provider = build_local_auth_provider(tmp_path / "auth.db", session_engine=engine, registration_open=True)
     for username in ("root", "alice", "bob", "carol"):
         provider.create_user(username, "password123", display_name=username.title())

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import final
+from typing import final, get_args
 from uuid import uuid4
 
 from sqlalchemy import Connection, Engine, insert, select
@@ -62,7 +62,7 @@ class RepositoryAuditAccessLogAuthority:
         if type(requesting_principal) is not str or not requesting_principal:
             raise TypeError("requesting_principal must be a non-empty exact string")
         auth_provider_candidate: object = auth_provider_type
-        if type(auth_provider_candidate) is not str or auth_provider_candidate not in {"local", "oidc", "entra"}:
+        if type(auth_provider_candidate) is not str or auth_provider_candidate not in get_args(AuthProviderType):
             raise ValueError("auth_provider_type must be a supported exact provider")
         if type(request_path) is not str or not request_path:
             raise TypeError("request_path must be a non-empty exact string")

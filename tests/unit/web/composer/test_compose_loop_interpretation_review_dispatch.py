@@ -253,6 +253,10 @@ def engine():
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
+    from tests.fixtures.identities import ensure_test_identity
+
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return eng
 
 
@@ -600,6 +604,9 @@ async def _seed_session_and_state(
     """
     session_id = uuid4()
     with service._engine.begin() as conn:
+        from tests.fixtures.identities import ensure_test_identity
+
+        ensure_test_identity(conn, identity_id=user_id)
         conn.execute(
             insert(sessions_table).values(
                 id=str(session_id),

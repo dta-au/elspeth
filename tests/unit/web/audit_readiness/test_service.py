@@ -40,6 +40,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 _TEST_SESSION_ID = UUID("11111111-1111-1111-1111-111111111111")
 _session_operation_context: SessionOperationContext | None = None
@@ -61,6 +62,8 @@ def _live_blob_read_context(monkeypatch: pytest.MonkeyPatch):
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     authority = SQLiteLocalSessionOperationAuthority(engine)
     monkeypatch.setattr(coordination_repository, "_new_session_id", lambda: _TEST_SESSION_ID)
     created = authority.create_session_with_initial_fence(

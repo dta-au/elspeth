@@ -392,6 +392,13 @@ def _assert_export_relationships_are_closed(grouped: dict[str, list[dict[str, An
     batch_ids = _exported_ids(grouped, "batch", "batch_id")
 
     for record_type, records in grouped.items():
+        if record_type == "audit_export_config":
+            assert records[0]["public_config"]["auth_events"] == "omitted"
+            continue
+        if record_type == "auth_event_coverage":
+            assert records[0]["policy"] == "omitted"
+            assert records[0]["selected_count"] is None
+            continue
         for record in records:
             assert record["run_id"] == grouped["run"][0]["run_id"], f"{record_type} has sibling run_id: {record}"
 

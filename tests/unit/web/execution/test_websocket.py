@@ -49,6 +49,11 @@ class FakeWebSocket:
         self.sent_json: list[dict[str, Any]] = []
         self.close_code: int | None = None
         self.close_reason: str | None = None
+        self.disconnected = asyncio.Event()
+
+    async def receive(self) -> dict[str, str]:
+        await self.disconnected.wait()
+        return {"type": "websocket.disconnect"}
 
     async def accept(self) -> None:
         self.accepted = True
@@ -220,9 +225,127 @@ def _create_ws_test_app(
     app.state.session_service = FakeSessionService()
     app.state.settings = FakeSettings()
     app.state.websocket_ticket_store = WebSocketTicketStore()
+    app.state.run_progress_reader = None
 
     app.include_router(create_execution_router())
     return app
+
+
+@pytest.mark.asyncio
+async def test_negative_reconnect_cursor_is_rejected() -> None:
+    app = _create_ws_test_app()
+    run_id = str(uuid4())
+    websocket = FakeWebSocket(app)
+    await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id), after_sequence=-1)
+    assert websocket.close_code == 4004
+
+
+@pytest.mark.asyncio
+async def test_durable_stream_polls_again_without_local_broadcast_and_reauthorizes() -> None:
+    from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
+
+    app = _create_ws_test_app()
+    run_id = str(uuid4())
+    reader = RepositoryRunProgressReader(cast(Any, None))
+    app.state.run_progress_reader = reader
+    app.state.execution_service.statuses = [
+        RunStatusResponse(
+            run_id=run_id, status="running", started_at=datetime.now(tz=UTC), finished_at=None, error=None, landscape_run_id=None
+        )
+    ]
+    with patch.object(RepositoryRunProgressReader, "read_after", side_effect=[(), None]) as read:
+        websocket = await _call_websocket(app, run_id, ticket=_issue_ws_ticket(app, run_id))
+    assert read.call_count == 2
+    assert websocket.close_code == 4004
+    assert app.state.broadcaster.subscribe_calls == []
+
+
+@pytest.mark.asyncio
+async def test_durable_stream_passes_reconnect_cursor_and_advances_each_page() -> None:
+    from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
+
+    app = _create_ws_test_app()
+    run_id = uuid4()
+    app.state.run_progress_reader = RepositoryRunProgressReader(cast(Any, None))
+    event = RunEventRecord(
+        id=uuid4(),
+        run_id=run_id,
+        sequence=4,
+        timestamp=datetime.now(tz=UTC),
+        event_type="error",
+        data={"message": "row failed", "node_id": None, "row_id": None},
+    )
+    websocket = FakeWebSocket(app)
+    with patch.object(RepositoryRunProgressReader, "read_after", side_effect=[(event,), None]) as read:
+        await _websocket_endpoint(app)(websocket, str(run_id), ticket=_issue_ws_ticket(app, str(run_id)), after_sequence=3)
+    assert [call.kwargs["after_sequence"] for call in read.call_args_list] == [3, 4]
+    assert len(websocket.sent_json) == 1
+    assert websocket.sent_json[0]["event_sequence"] == 4
+
+
+@pytest.mark.asyncio
+async def test_durable_stream_integrity_failure_closes_1011_and_propagates() -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
+
+    app = _create_ws_test_app()
+    run_id = str(uuid4())
+    app.state.run_progress_reader = RepositoryRunProgressReader(cast(Any, None))
+    websocket = FakeWebSocket(app)
+    with (
+        patch.object(RepositoryRunProgressReader, "read_after", side_effect=AuditIntegrityError("sequence gap")),
+        pytest.raises(AuditIntegrityError, match="sequence gap"),
+    ):
+        await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+    assert websocket.close_code == 1011
+
+
+@pytest.mark.asyncio
+async def test_durable_terminal_event_closes_without_local_status_projection() -> None:
+    from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
+
+    app = _create_ws_test_app()
+    run_id = uuid4()
+    app.state.run_progress_reader = RepositoryRunProgressReader(cast(Any, None))
+    event = RunEventRecord(
+        id=uuid4(),
+        run_id=run_id,
+        sequence=1,
+        timestamp=datetime.now(tz=UTC),
+        event_type="failed",
+        data={"status": "failed", "detail": "Owner failed", "node_id": None},
+    )
+    with patch.object(RepositoryRunProgressReader, "read_after", return_value=(event,)) as read:
+        websocket = await _call_websocket(app, str(run_id), ticket=_issue_ws_ticket(app, str(run_id)))
+    assert websocket.close_code == 1000
+    assert websocket.sent_json[0]["event_sequence"] == 1
+    assert websocket.sent_json[0]["event_type"] == "failed"
+    assert read.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_client_disconnect_joins_durable_database_poller() -> None:
+    from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
+
+    app = _create_ws_test_app()
+    run_id = str(uuid4())
+    app.state.run_progress_reader = RepositoryRunProgressReader(cast(Any, None))
+    app.state.execution_service.statuses = [
+        RunStatusResponse(
+            run_id=run_id, status="running", started_at=datetime.now(tz=UTC), finished_at=None, error=None, landscape_run_id=None
+        )
+    ]
+    websocket = FakeWebSocket(app)
+    loop = asyncio.get_running_loop()
+
+    def read_and_disconnect(**kwargs: object) -> tuple[RunEventRecord, ...]:
+        loop.call_soon_threadsafe(websocket.disconnected.set)
+        return ()
+
+    with patch.object(RepositoryRunProgressReader, "read_after", side_effect=read_and_disconnect) as read:
+        await asyncio.wait_for(_websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id)), timeout=2)
+        await asyncio.sleep(0.3)
+        assert read.call_count == 1
 
 
 def _accounting(
@@ -617,6 +740,7 @@ class TestWebSocketTimeoutRecovery:
 
         assert websocket.sent_json == [
             {
+                "event_sequence": 1,
                 "run_id": str(run_id),
                 "timestamp": websocket.sent_json[0]["timestamp"],
                 "event_type": "error",

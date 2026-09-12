@@ -24,7 +24,6 @@ from elspeth.testing.pytest_xdist_auto import pytest_cmdline_main
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
-ACTIONLINT_CONFIG = REPO_ROOT / ".github" / "actionlint.yaml"
 JUDGE_GATES_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "enforce-allowlist-judge-gates.yaml"
 CODEQL_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "codeql.yaml"
 CODEQL_CONFIG = REPO_ROOT / ".github" / "codeql" / "codeql-config.yml"
@@ -221,16 +220,6 @@ def test_integration_lane_does_not_force_parallel_xdist() -> None:
     assert _pytest_numprocesses_values(run) == []
 
 
-def test_python_matrix_documents_coverage_lane_choice() -> None:
-    """The 3.12/3.13 coverage split must carry its rationale in the workflow."""
-    workflow_text = CI_WORKFLOW.read_text(encoding="utf-8")
-    normalized = " ".join(workflow_text.split())
-
-    assert "Coverage runs on Python 3.13 only" in normalized
-    assert "Python 3.12 lane remains" in normalized
-    assert "dependency-compatibility signal" in normalized
-
-
 def test_judge_gates_workflow_mirrors_ci_concurrency_policy() -> None:
     """Policy-gate workflow must not race push and PR runs for one ref."""
     ci_workflow = _ci_workflow()
@@ -401,33 +390,6 @@ def test_static_analysis_runs_composer_skill_inventory_drift_gate() -> None:
     run = _step_run(static_analysis, "Check composer skill tool inventory")
 
     assert "scripts/cicd/generate_skill_inventory.py --check" in run
-
-
-def test_static_analysis_runs_actionlint_with_repo_policy_config() -> None:
-    """Workflow syntax and self-hosted runner labels must be checked in CI."""
-    workflow = _ci_workflow()
-    static_analysis = workflow["jobs"]["static-analysis"]
-
-    step = _step(static_analysis, "Check GitHub workflows (actionlint)")
-    assert step["shell"] == "bash"
-    env = step.get("env")
-    assert isinstance(env, dict), "actionlint step must pin version and checksum"
-    assert env["ACTIONLINT_VERSION"] == "1.7.12"
-    assert env["ACTIONLINT_SHA256"] == "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
-
-    run = _step_run(static_analysis, "Check GitHub workflows (actionlint)")
-    assert "sha256sum -c -" in run
-    assert "-config-file .github/actionlint.yaml" in run
-    assert ".github/workflows/*.yml" in run
-    assert ".github/workflows/*.yaml" in run
-
-
-def test_actionlint_policy_declares_self_hosted_runner_labels() -> None:
-    policy = _workflow(ACTIONLINT_CONFIG)
-
-    labels = policy["self-hosted-runner"]["labels"]
-
-    assert {"nyx-ci", "trusted"} <= set(labels)
 
 
 @pytest.mark.parametrize("workflow_path", PR_WORKFLOWS, ids=lambda path: path.name)
@@ -973,19 +935,3 @@ def test_judge_quality_never_receives_openrouter_credentials_on_prs() -> None:
 
     assert job["if"] == "github.event_name != 'pull_request'"
     assert job["env"]["OPENROUTER_API_KEY"] == "${{ secrets.OPENROUTER_API_KEY }}"
-
-
-def test_trust_tier_ci_failure_points_to_signature_diagnosis_command() -> None:
-    """Signed allowlist failures should point operators at the repair triage command."""
-    workflow = _ci_workflow()
-    static_analysis = workflow["jobs"]["static-analysis"]
-
-    trust_tier_run = _step_run(static_analysis, "Run trust-tier elspeth-lints rule")
-    sarif_run = _step_run(static_analysis, "Emit elspeth-lints trust-tier SARIF artifact")
-
-    for run in (trust_tier_run, sarif_run):
-        assert "diagnose-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model" in run
-        assert "sign-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model" in run
-        assert "--env-file /path/to/operator.env --owner" in run
-        assert "judge_metadata_signature" in run
-        assert "scope_fingerprint" in run

@@ -187,6 +187,7 @@ export type GuidedOperationFailureCode =
   /** Permanent by construction: a deployment policy refused this pipeline.
    *  Retry affordances must not invite a retry — only a revision can clear it. */
   | "policy_blocked"
+  | "admission_refused"
   | "stale_conflict"
   | "integrity_error"
   | "custody_error"

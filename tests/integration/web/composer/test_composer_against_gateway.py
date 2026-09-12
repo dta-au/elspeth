@@ -88,6 +88,7 @@ import uvicorn
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # --- sys.path shim ------------------------------------------------------
@@ -326,6 +327,7 @@ def _insert_session_row(sessions_service: SessionServiceImpl, session_id: str) -
 
     now = datetime.now(UTC)
     with sessions_service._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="gateway-e2e-user")
         conn.execute(
             sessions_table.insert().values(
                 id=session_id,

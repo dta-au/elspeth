@@ -9,7 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import insert, update
 from tests.fixtures.landscape import landscape_database_now, leader_coordination_token, leader_token_for, member_token_for
 from tests.helpers.state_engine import (
     EXCLUDED_STATE_ENGINE_TABLES,
@@ -23,7 +23,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import metadata, token_work_items_table
+from elspeth.core.landscape.schema import metadata, run_start_admissions_table, token_work_items_table
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 _CATALOG_SHA256 = "0" * 64
@@ -130,7 +130,7 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
 
 def test_state_engine_table_inventory_covers_every_run_owned_table() -> None:
     assert set(STATE_ENGINE_TABLES) == set(metadata.tables) - set(EXCLUDED_STATE_ENGINE_TABLES)
-    assert len(STATE_ENGINE_TABLES) == 43
+    assert len(STATE_ENGINE_TABLES) == 44
 
 
 def test_canonicalize_state_value_normalizes_temporal_enum_and_binary_values() -> None:
@@ -194,6 +194,27 @@ def test_capture_excludes_rows_owned_by_another_run(seeded_run: _SeededRun) -> N
         leader_worker_id="worker:foreign:leader",
     )
 
+    with seeded_run.db.engine.begin() as connection:
+        connection.execute(
+            insert(run_start_admissions_table),
+            [
+                {"run_id": run_id, "permit_id": f"permit:{run_id}", "permit_epoch": 1, "subject_hash": "a" * 64, "state": "prepared"}
+                for run_id in (seeded_run.run_id, "run-foreign")
+            ],
+        )
     image = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
 
     assert [row["run_id"] for row in image.tables["runs"]] == [seeded_run.run_id]
+    assert [row["run_id"] for row in image.tables["run_start_admissions"]] == [seeded_run.run_id]
+    with seeded_run.db.engine.begin() as connection:
+        connection.execute(
+            update(run_start_admissions_table).where(run_start_admissions_table.c.run_id == "run-foreign").values(state="executing")
+        )
+    assert capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id) == image
+    with seeded_run.db.engine.begin() as connection:
+        connection.execute(
+            update(run_start_admissions_table).where(run_start_admissions_table.c.run_id == seeded_run.run_id).values(state="executing")
+        )
+    changed = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
+    assert changed.tables["run_start_admissions"][0]["state"] == "executing"
+    assert image.diff(changed).changed_columns == {"run_start_admissions": {"state"}}

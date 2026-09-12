@@ -778,34 +778,39 @@ class TestResumeIdempotence:
             )
             conn.commit()
 
-        # Register nodes
+        # Register the actual admitted implementation evidence. Resume must
+        # compare the fresh plugins against the versions and determinism
+        # used by the uninterrupted run, not placeholder metadata.
         factory.data_flow.register_node(
             plugin_name="list_source",
             node_type=NodeType.SOURCE,
-            plugin_version="1.0",
+            plugin_version=source_a.plugin_version,
             config={},
             node_id="source",
-            determinism=Determinism.DETERMINISTIC,
+            determinism=source_a.determinism,
+            source_file_hash=source_a.source_file_hash,
             schema_config=SchemaConfig(mode="observed", fields=None),
             coordination_token=leader_token_for(factory._db, run_id),
         )
         factory.data_flow.register_node(
             plugin_name="doubler",
             node_type=NodeType.TRANSFORM,
-            plugin_version="1.0",
+            plugin_version=transform_a.plugin_version,
             config={},
             node_id="transform_0",
-            determinism=Determinism.DETERMINISTIC,
+            determinism=transform_a.determinism,
+            source_file_hash=transform_a.source_file_hash,
             schema_config=SchemaConfig(mode="observed", fields=None),
             coordination_token=leader_token_for(factory._db, run_id),
         )
         factory.data_flow.register_node(
             plugin_name="collect_sink",
             node_type=NodeType.SINK,
-            plugin_version="1.0",
+            plugin_version=sink_a.plugin_version,
             config={},
             node_id="sink_default",
-            determinism=Determinism.IO_WRITE,
+            determinism=sink_a.determinism,
+            source_file_hash=sink_a.source_file_hash,
             schema_config=SchemaConfig(mode="observed", fields=None),
             coordination_token=leader_token_for(factory._db, run_id),
         )

@@ -678,7 +678,12 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # Frozen semantic oracles and behavioral expectations are unchanged.
 # JSON source provenance refresh: update its one exact audit-record hash pin
 # after the plugin hash repair; behavioral and frozen semantic oracles stay fixed.
-EXPECTED_CASE_REGISTRY_SHA256 = "25d4bc8d7ee2d22151653d05c5c0c44df849e77d0d5407bb647aad84148a851c"
+# VANguard's current auth exporter adds one public configuration record and
+# one explicit omitted-auth coverage record to each exported run. Existing
+# runtime counts and the separate frozen semantic snapshots remain unchanged.
+# Full audit projections also bind the changed exporter settings and manifest
+# record count; a controlled reversal reproduces every former material/hash.
+EXPECTED_CASE_REGISTRY_SHA256 = "0388f63e24167d1f01f09d8e766f8104285f1fe07af4743ec7241d7f15428c04"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
