@@ -780,7 +780,32 @@ def assert_upsert_node_schema_compatible(*, advertised_schema: Mapping[str, Any]
     )
 
 
+def assert_model_wire_compatible(tool: str, *, shipped: frozenset[str], model_fields: frozenset[str], fenced: frozenset[str]) -> None:
+    """Raise unless every shipped knob is a model field and every model field is shipped, fences excepted.
+
+    Membership only, and in BOTH directions, for any tool: a json-schema
+    property with no field is a knob the planner is invited to set that the
+    handler's model silently drops, and a field with no property is a knob the
+    planner is never told about. Types, requiredness and defaults are the
+    directional walk `assert_set_pipeline_schema_compatible` and
+    `assert_upsert_node_schema_compatible` do for the two tools that have it.
+
+    Both sides are supplied by the caller because both are derived: SHIPPED
+    from the live registry, MODEL from the manifest's `argument_model` or the
+    handler's validator call by AST. `fenced` is the adjudicated exemption set
+    for this tool, and the gate that supplies it also fails when a fenced key
+    stops being a gap, so an exemption cannot outlive its reason.
+    """
+    shipped_not_model = shipped - model_fields - fenced
+    model_not_shipped = model_fields - shipped - fenced
+    if shipped_not_model or model_not_shipped:
+        raise RuntimeError(
+            f"{tool}: advertised but not validated {sorted(shipped_not_model)}; validated but never advertised {sorted(model_not_shipped)}"
+        )
+
+
 __all__ = [
+    "assert_model_wire_compatible",
     "assert_set_pipeline_schema_compatible",
     "assert_upsert_node_schema_compatible",
     "canonical_set_pipeline_schema",
