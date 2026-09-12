@@ -3,7 +3,8 @@
 Handles raw HTTP transport with full Tier 3 boundary validation:
 - JSON parsing with NaN/Infinity rejection
 - Content extraction from choices[0].message.content
-- Null content → ContentPolicyError
+- Missing content with explicit refusal or filtering → ContentPolicyError
+- Malformed, unexplained missing, or budget-exhausted output → LLMClientError
 - Non-finite usage values → LLMClientError
 - HTTP status code → typed exception mapping
 
@@ -357,8 +358,10 @@ class OpenRouterLLMProvider:
             RateLimitError: HTTP 429 (retryable)
             ServerError: HTTP 5xx (retryable)
             NetworkError: Connection/timeout failures (retryable)
-            ContentPolicyError: Null content from provider (not retryable)
-            LLMClientError: Other failures (not retryable)
+            ContentPolicyError: Missing content with explicit provider refusal
+                or filtering (not retryable)
+            LLMClientError: Malformed, unexplained missing, budget-exhausted
+                output, or other failures (not retryable)
         """
         cache_key = audit_parent.cache_key
         llm_request_payload = self._build_llm_request_payload(
