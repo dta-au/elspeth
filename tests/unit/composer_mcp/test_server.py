@@ -477,8 +477,9 @@ class TestDispatchTool:
             scratch_dir,
         )
         assert result["success"] is False
-        assert "Path violation (S2)" in result["data"]["error"]
-        assert "data_dir" in result["data"]["error"]
+        assert "Path violation (S2)" in result["validation"]["errors"][0]["message"]
+        assert "data_dir" in result["validation"]["errors"][0]["message"]
+        assert "data" not in result
 
     def test_set_output_requires_explicit_collision_policy(self, scratch_dir: Path) -> None:
         result = _dispatch_tool(

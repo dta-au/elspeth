@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Annotated, Any, Final, cast
+from typing import Annotated, Any, Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
@@ -14,6 +14,9 @@ from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchNodeOptionsArgumentsModel,
     SpliceTransformArgumentsModel,
+    _JsonInteger,
+    _NodeTriggerModel,
+    _OmittableString,
     _StrictTimeoutSeconds,
 )
 from elspeth.web.composer.state import (
@@ -35,6 +38,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import (
     _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _STEP_DESCRIPTION_DESCRIPTION,
+    EmptyToolArgumentsModel,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -91,14 +95,14 @@ class _UpsertNodeArgumentsModel(BaseModel):
     branches: list[str] | dict[str, str] | None = None
     policy: str | None = None
     merge: str | None = None
-    trigger: dict[str, Any] | None = None
-    output_mode: str | None = None
-    expected_output_count: int | None = None
+    trigger: _NodeTriggerModel | None = None
+    output_mode: Literal["passthrough", "transform"] | None = None
+    expected_output_count: _JsonInteger | None = None
     timeout_seconds: _StrictTimeoutSeconds | None = None
     description: str | None = None
     scope_name: str | None = None
     scope_opener: str | None = None
-    scope_policy: str | None = None
+    scope_policy: Literal["require_all", "best_effort"] | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -120,8 +124,8 @@ class _RemoveByIdArgumentsModel(BaseModel):
 
 
 class _SetMetadataPatchModel(BaseModel):
-    name: str | None = None
-    description: str | None = None
+    name: _OmittableString = None
+    description: _OmittableString = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -137,6 +141,7 @@ def _handle_list_transforms(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_transforms arguments")
     return _discovery_result(
         state,
         {
@@ -170,6 +175,7 @@ def _handle_list_sinks(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_sinks arguments")
     return _discovery_result(
         state,
         {
@@ -205,6 +211,12 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "node_type": {
             "type": "string",
             "enum": ["transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"],
+            "description": (
+                "Node kind. Choose transform for a per-row plugin, aggregation for a batch-aware plugin with optional triggers, "
+                "collector for a batch-aware plugin closing a declared EXPAND scope, gate for conditional routing or fan-out, "
+                "queue for explicit fan-in, coalesce to merge branch fields, or row_union to release original branch rows "
+                "without merging. Supply only fields supported by the chosen kind."
+            ),
         },
         "plugin": {
             "type": ["string", "null"],
@@ -214,16 +226,18 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "Connection-name string this node CONSUMES: must equal an upstream's on_success "
-                "(or routes value, or on_error), NOT the upstream node's id — connections match "
-                "by string, not by graph topology."
+                "(or routes value or fork_to connection), NOT the upstream node's id — connections match "
+                "by string, not by graph topology. For queue use its shared connection name; for coalesce "
+                "and row_union use the first branch connection as the required placeholder, while branches "
+                "provide the actual consuming bindings."
             ),
         },
         "on_success": {
             "type": ["string", "null"],
             "description": (
                 "Output connection, consumed by a downstream input/sink_name (matched by string). "
-                "Required for transform/aggregation/row_union; null for gates (they route via "
-                "condition/routes). A row_union MUST publish to a processing connection, never "
+                "Required for transform/collector/row_union. Aggregation may omit it to publish under its own node id. "
+                "Gates use routes/fork_to; queues omit it. A row_union MUST publish to a processing connection, never "
                 "directly to a sink. A coalesce normally publishes under its own node id; its "
                 "optional on_success may name only a sink."
             ),
@@ -240,7 +254,8 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "options": {
             "type": "object",
             "description": (
-                "Plugin-specific config (transform/aggregation only). The schema: block declares what "
+                "Plugin-specific config for transform, aggregation, and collector nodes; a queue permits only its optional "
+                "description. Other structural kinds do not take plugin configuration. The schema: block declares what "
                 "ARRIVES at the node, never its transformed result; declare arriving types on the "
                 "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
             ),
@@ -248,6 +263,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "condition": {"type": ["string", "null"], "description": "Boolean expression (gate only). Evaluated per row."},
         "routes": {
             "type": ["object", "null"],
+            "additionalProperties": {"type": "string"},
             "description": (
                 "Gate route mapping {true: ..., false: ...}; each value is a sink, a connection, or "
                 "'discard' for an audited gate_discarded terminal drop. Mutually exclusive with fork_to."
@@ -427,6 +443,13 @@ _UPSERT_EDGE_DECLARATION = ToolDeclaration(
             "edge_type": {
                 "type": "string",
                 "enum": ["on_success", "on_error", "route_true", "route_false", "fork"],
+                "description": (
+                    "Connection kind. Use on_success for a direct success relationship; on_error only from a transform or "
+                    "aggregation to a sink; route_true or route_false for gate routes; fork for a gate fan-out relationship. "
+                    "Gate expression errors use the gate node's on_error field instead. Edges targeting sinks also update "
+                    "the producer's corresponding runtime routing field; other edges are display relationships and do not "
+                    "replace node connection fields."
+                ),
             },
             "label": {"type": ["string", "null"], "description": "Display label."},
         },
@@ -512,6 +535,7 @@ _SET_METADATA_DECLARATION = ToolDeclaration(
             "patch": {
                 "type": "object",
                 "description": "Partial metadata update. Only included fields are changed.",
+                "additionalProperties": False,
                 "properties": {
                     "name": {"type": "string"},
                     "description": {"type": "string"},
@@ -561,7 +585,7 @@ def _execute_upsert_queue_node(
         branches=branches,
         policy=validated.policy,
         merge=validated.merge,
-        trigger=validated.trigger,
+        trigger=validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
@@ -586,7 +610,7 @@ def _execute_upsert_node(
     context: ToolContext,
 ) -> ToolResult:
     """Add or update a pipeline node."""
-    validated = cast(_UpsertNodeArgumentsModel, _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments"))
+    validated = _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments")
     node_id = validated.id
     node_type = validated.node_type
     plugin = validated.plugin
@@ -699,7 +723,9 @@ def _execute_upsert_node(
         if parity_error is not None:
             return _failure_result(state, f"Node '{node_id}': {parity_error}", error_code="gate_route_labels_mismatch")
     if node_type == "aggregation":
-        trigger_error = _validate_aggregation_trigger(validated.trigger)
+        trigger_error = _validate_aggregation_trigger(
+            validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None
+        )
         if trigger_error is not None:
             return _failure_result(state, f"Node '{node_id}': {trigger_error}")
 
@@ -725,7 +751,7 @@ def _execute_upsert_node(
         branches=branches,
         policy=validated.policy,
         merge=validated.merge,
-        trigger=validated.trigger,
+        trigger=validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
@@ -1075,10 +1101,7 @@ def _execute_splice_transform(
     context: ToolContext,
 ) -> ToolResult:
     """Atomically insert one transform on an existing direct linear path."""
-    validated = cast(
-        SpliceTransformArgumentsModel,
-        _validate_mutation_arguments(SpliceTransformArgumentsModel, args, "splice_transform arguments"),
-    )
+    validated = _validate_mutation_arguments(SpliceTransformArgumentsModel, args, "splice_transform arguments")
     predecessor_id = validated.predecessor_id
     successor_id = validated.successor_id
     node_args = validated.node
@@ -1271,7 +1294,7 @@ def _execute_upsert_edge(
     working pipeline.  Edges to non-output nodes are visual only.
     """
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(_UpsertEdgeArgumentsModel, _validate_mutation_arguments(_UpsertEdgeArgumentsModel, args, "upsert_edge arguments"))
+    validated = _validate_mutation_arguments(_UpsertEdgeArgumentsModel, args, "upsert_edge arguments")
     from_node = validated.from_node
     to_node = validated.to_node
     edge_type = validated.edge_type
@@ -1346,7 +1369,7 @@ def _execute_remove_node(
 ) -> ToolResult:
     """Remove a node and its edges."""
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(_RemoveByIdArgumentsModel, _validate_mutation_arguments(_RemoveByIdArgumentsModel, args, "remove_node arguments"))
+    validated = _validate_mutation_arguments(_RemoveByIdArgumentsModel, args, "remove_node arguments")
     node_id = validated.id
 
     # Collect affected nodes before removal (edges that reference this node)
@@ -1370,7 +1393,7 @@ def _execute_remove_edge(
 ) -> ToolResult:
     """Remove an edge."""
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(_RemoveByIdArgumentsModel, _validate_mutation_arguments(_RemoveByIdArgumentsModel, args, "remove_edge arguments"))
+    validated = _validate_mutation_arguments(_RemoveByIdArgumentsModel, args, "remove_edge arguments")
     edge_id = validated.id
 
     # Find the edge to get affected nodes
@@ -1395,7 +1418,7 @@ def _execute_set_metadata(
 ) -> ToolResult:
     """Update pipeline metadata."""
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(_SetMetadataArgumentsModel, _validate_mutation_arguments(_SetMetadataArgumentsModel, args, "set_metadata arguments"))
+    validated = _validate_mutation_arguments(_SetMetadataArgumentsModel, args, "set_metadata arguments")
     patch = validated.patch.model_dump(exclude_none=True)
 
     new_state = state.with_metadata(patch)
@@ -1808,6 +1831,8 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Insert one transform between a predecessor and successor on an existing direct linear on_success path. "
+        "Requires exactly one direct visual on_success edge between the endpoints, no routed error branches on either "
+        "endpoint, and no other consumers or visual branches on that path. "
         "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs. "
         "Returns `inserted_node_id`, `predecessor_id`, `successor_id`, `derived_connection` (the on_success carried "
         "over), `replaced_edge_id`, and `new_edge_id`; repeating an identical splice returns `already_applied`: true "
@@ -1826,6 +1851,11 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
             },
             "node": {
                 "type": "object",
+                "description": (
+                    "The single transform to insert: provide id, plugin, and options; optionally on_error and description. "
+                    "Do not supply node_type, input, or on_success: the tool authors the transform kind and derives routing "
+                    "from the insertion point."
+                ),
                 "properties": {
                     "id": {
                         **TypeAdapter(RuntimeNodeName).json_schema(),

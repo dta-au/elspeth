@@ -611,7 +611,7 @@ class TestSourceCustodyExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"inline custody exemplar rejected: {rejection}"
 
     def test_existing_blob_exemplar_validates_with_a_real_session_blob(self, tmp_path: Path) -> None:
@@ -642,7 +642,7 @@ class TestSourceCustodyExemplar:
                 ),
             )
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"existing-blob exemplar rejected: {rejection}"
         # Single-source contract: only the binding differs between the two
         # variants the prompt shows; everything downstream is byte-identical.
@@ -734,7 +734,7 @@ class TestForkCoalesceExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"fork/coalesce exemplar rejected: {rejection}"
         state = candidate.result.updated_state
         coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
@@ -808,7 +808,7 @@ class TestForkCoalesceExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"control-required fork exemplar rejected: {rejection}"
 
     def test_selected_controls_are_wired_into_the_forked_llm_exemplar(self, tmp_path: Path) -> None:
@@ -870,7 +870,7 @@ class TestForkCoalesceExemplar:
         context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
-        assert candidate.acceptable is True, (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, candidate.result.validation.errors[0].message
 
         result = view.validate_authored_state(candidate.result.updated_state)
         coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
@@ -939,7 +939,7 @@ class TestForkRowUnionExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"fork/row_union exemplar rejected: {rejection}"
         nodes = {node["id"]: node for node in args["nodes"]}
         gate = next(node for node in nodes.values() if node["node_type"] == "gate")
@@ -1011,7 +1011,7 @@ class TestForkRowUnionExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"alias-less control exemplar rejected: {rejection}"
 
     def test_recommended_alias_less_controls_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
@@ -1070,7 +1070,7 @@ class TestForkRowUnionExemplar:
         content = args["source"]["inline_blob"]["content"]
         context = _custody_context(tmp_path, content)
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"topology exemplar rejected: {rejection}"
 
     def test_trained_posture_payload_carries_the_topology_exemplar(self) -> None:

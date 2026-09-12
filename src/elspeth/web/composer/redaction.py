@@ -21,7 +21,18 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StrictFloat,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic.json_schema import SkipJsonSchema
 
 from elspeth.contracts.blobs import BLOB_CREATORS, AllowedMimeType
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -30,7 +41,6 @@ from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrity
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
-from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.guided.state_machine import TerminalState
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
@@ -1368,75 +1378,36 @@ def _summarize_set_source_options(options: object) -> str:
     )
 
 
-@observation_boundary(
-    tier=3,
-    source="LLM-authored free-form object tool-call argument (options/patch) before pydantic validation",
-    source_param="value",
-    suppresses=("R5",),
-    invariant=(
-        "never raises; only a str that bounded_json_loads decodes to a dict is replaced by that dict — "
-        "a non-str, undecodable text, an over-deep/over-long text (JsonBoundaryError is a ValueError), "
-        "or a non-object decode is returned untouched for the field's own validation to reject"
-    ),
-)
-def _coerce_stringified_json_object(value: Any) -> Any:
-    """Tier-3 boundary deserialisation for LLM-supplied object arguments.
-
-    Some models — notably ``openrouter/openai/gpt-5.4-mini``, the deployed
-    composer model — intermittently serialise a nested-object tool-call
-    parameter as a JSON *string* (``options="{}"``,
-    ``patch="{\\"column\\":\\"url\\"}"``) instead of emitting a JSON object
-    (``options={}``). This was proven from the staging audit trail (sessions
-    ``fd551d98`` / ``71d57b4f``): every free-form ``options`` / ``patch`` field
-    arrived as a string while typed sibling fields (``blob_id``, ``nodes``)
-    arrived correctly, so the build failed wholesale on a ``dict[str, Any]``
-    ``ValidationError`` whenever the model stringified.
-
-    A JSON string is an equivalent wire encoding of the object it encodes;
-    parsing it back is *meaning-preserving coercion*, not fabrication
-    (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model —
-    a Tier-3 boundary, the ``"42" -> 42`` class), and is therefore exempt from
-    the defensive-programming ban as a documented trust-boundary
-    deserialisation. The raw stringified form is recorded in the
-    per-dispatch audit envelope (``service.py`` ``begin_dispatch_or_arg_error``,
-    opened from the pre-coercion ``json.loads`` result) BEFORE this validator
-    runs, so the audit trail still records exactly what the model emitted.
-
-    The coercion is deliberately narrow: only a string that decodes to a JSON
-    *object* is coerced. A non-string, a string that is not valid JSON, or a
-    string that decodes to a non-object (list, scalar, ``null``) is returned
-    untouched so the field's ``dict[str, Any]`` validation still rejects
-    genuinely malformed input (fails closed).
-
-    Decoding runs through the shared bounded adapter: the outer tool-call
-    argument text was depth-bounded as JSON, but a stringified object hides
-    its nesting inside a JSON string, so an unbounded ``json.loads`` here
-    could still exhaust the C decoder and escape as a raw ``RecursionError``
-    (elspeth-b944d2324a, forensic audit G13). A ``JsonBoundaryError`` is a
-    ``ValueError`` and takes the same fail-closed arm as malformed text.
-    """
-    if not isinstance(value, str):
-        return value
-    try:
-        decoded = bounded_json_loads(value, label="stringified tool-argument object")
-    except (json.JSONDecodeError, ValueError):
-        return value
-    return decoded if type(decoded) is dict else value
-
-
-# Reusable annotation for every LLM-supplied free-form object argument
-# (``options`` on the source/node/output binding tools; ``patch`` on the
-# patch_* tools). Combines the existing ``Sensitive`` redaction marker with the
-# stringified-object coercion above. The redaction walker selects the
-# ``_SensitiveMarker`` by ``isinstance`` (``_has_sensitive`` /
-# ``_count_sensitive``), so the extra ``BeforeValidator`` metadata entry is
-# transparent to the adequacy guard; pydantic's ``BeforeValidator`` is a frozen
-# dataclass, so it does not introduce mutable metadata.
+# Earlier provider output sometimes stringified nested objects. Those values
+# violate the advertised object grammar and now reject at admission. The outer
+# tool-call JSON decoder remains bounded; plugin/data keys remain dynamic.
 _LlmJsonObject = Annotated[
     dict[str, Any],
     Sensitive(summarizer=_summarize_set_source_options),
-    BeforeValidator(_coerce_stringified_json_object),
 ]
+
+
+def _reject_supplied_null(value: Any) -> Any:
+    """Omission may use an internal None default; an authored null may not."""
+    if value is None:
+        raise ValueError("omit this optional field instead of supplying null")
+    return value
+
+
+_OmittableString = Annotated[
+    str | SkipJsonSchema[None],
+    BeforeValidator(_reject_supplied_null),
+]
+
+
+def _reject_coerced_integer(value: Any) -> Any:
+    """JSON Schema integers include integral numbers, but not booleans/text."""
+    if type(value) not in (int, float):
+        raise ValueError("expected a JSON integer")
+    return value
+
+
+_JsonInteger = Annotated[int, BeforeValidator(_reject_coerced_integer)]
 
 
 class SetSourceArgumentsModel(BaseModel):
@@ -1586,8 +1557,8 @@ class SetSourceFromBlobArgumentsModel(BaseModel):
     blob_id: str
     on_success: str
     source_name: str = "source"
-    plugin: str | None = None
-    on_validation_failure: str | None = None
+    plugin: _OmittableString = None
+    on_validation_failure: _OmittableString = None
     options: _LlmJsonObject = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
@@ -1607,7 +1578,7 @@ class SetSourceFromBlobsArgumentsModel(BaseModel):
     blob_ids: list[str] = Field(min_length=1, max_length=1000)
     on_success: str
     source_name: str = "source"
-    on_validation_failure: str | None = None
+    on_validation_failure: _OmittableString = None
     options: _LlmJsonObject = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
@@ -1698,7 +1669,7 @@ class CreateBlobArgumentsModel(BaseModel):
     filename: str
     mime_type: AllowedMimeType
     content: Annotated[str, Sensitive(summarizer=_summarize_inline_blob_content)]
-    description: str | None = None
+    description: _OmittableString = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1877,8 +1848,8 @@ class _NodeTriggerModel(BaseModel):
     boundary.
     """
 
-    count: int | None = None
-    timeout_seconds: float | None = None
+    count: _JsonInteger | None = None
+    timeout_seconds: StrictFloat | None = None
     condition: str | None = None
 
     model_config = ConfigDict(extra="forbid")
@@ -1959,7 +1930,7 @@ class _PipelineNodeModel(BaseModel):
     merge: str | None = None
     trigger: _NodeTriggerModel | None = None
     output_mode: str | None = None
-    expected_output_count: int | None = None
+    expected_output_count: _JsonInteger | None = None
     timeout_seconds: _StrictTimeoutSeconds | None = None
     # One-sentence composer-authored prose for the Spec tab. Free-text scalar
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
@@ -3347,20 +3318,12 @@ class GetBlobContentDataModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class GetBlobContentFailureDataModel(BaseModel):
-    """Recoverable ``get_blob_content`` failure payload."""
-
-    error: str
-
-    model_config = ConfigDict(extra="forbid")
-
-
 class GetBlobContentResponseModel(BaseModel):
     """Redaction-bearing ``ToolResult`` envelope for ``get_blob_content``.
 
     The handler returns a normal composer ``ToolResult`` envelope. Its success
-    branch stores sensitive blob bytes under ``data.content``; failure branches
-    store only ``data.error``. Keep both shapes closed so audit persistence
+    branch stores sensitive blob bytes under ``data.content``; rejection details
+    reside in ``validation.errors`` and need no data payload. Keep shapes closed so audit persistence
     redacts content without crashing on recoverable failures.
     """
 
@@ -3368,9 +3331,15 @@ class GetBlobContentResponseModel(BaseModel):
     validation: GetBlobContentValidationModel
     affected_nodes: list[str]
     version: int
-    data: GetBlobContentDataModel | GetBlobContentFailureDataModel
+    data: GetBlobContentDataModel | None = Field(default=None, exclude_if=lambda data: data is None)
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def require_success_data(self) -> GetBlobContentResponseModel:
+        if self.success and self.data is None:
+            raise ValueError("Successful get_blob_content response requires data")
+        return self
 
 
 class _ToolResultResponseModel(BaseModel):
@@ -3446,7 +3415,7 @@ _WIRE_BLOB_INLINE_REF_REASON = HandlesNoSensitiveDataReason(
     ),
     why_arguments_safe=(
         "wire_blob_inline_ref arguments are scalar metadata: field_path, blob_id, "
-        "optional encoding, and an optional sha256_override used only as a guardrail. "
+        "optional encoding. The stored content hash is authoritative. "
         "The tool never accepts content bytes; it reads the authoritative hash from "
         "the blobs table and rejects disagreement."
     ),
@@ -3762,8 +3731,8 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                 # Shared ToolResult.to_dict() envelope plus the data key emitted
                 # by failure branches reachable from _execute_upsert_node:
                 # _mutation_result → always emits success/validation/affected_nodes/version;
-                # _failure_result → adds data={"error": ...};
-                # _credential_wiring_contract_failure → adds data={error, credential_fields,
+                # _failure_result → rejection details in validation.errors;
+                # _credential_wiring_contract_failure → adds data={credential_fields,
                 #   components, repair}.
                 known_response_keys=_tool_result_response_keys(data=True),
             )
@@ -3847,8 +3816,8 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                 # Shared ToolResult.to_dict() envelope plus the data key emitted
                 # by failure branches reachable from _execute_set_output:
                 # _mutation_result → success/validation/affected_nodes/version;
-                # _failure_result → adds data={"error": ...};
-                # _credential_wiring_contract_failure → adds data={error, credential_fields,
+                # _failure_result → rejection details in validation.errors;
+                # _credential_wiring_contract_failure → adds data={credential_fields,
                 #   components, repair}.
                 known_response_keys=_tool_result_response_keys(data=True),
             )

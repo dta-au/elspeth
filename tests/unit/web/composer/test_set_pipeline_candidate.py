@@ -175,7 +175,7 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
     result = candidate.result
 
     assert candidate.acceptable is False
-    assert result.data["error_code"] == "plugin_options_invalid"
+    assert result.validation.errors[0].error_code == "plugin_options_invalid"
     assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
     assert [entry.error_code for entry in result.validation.errors] == ["plugin_options_invalid"]
 
@@ -312,7 +312,7 @@ def test_no_source_internal_defense_uses_prior_source_shape_for_repair_guidance(
         _trained_context(),
     )
 
-    error = candidate.result.data["error"]
+    error = candidate.result.validation.errors[0].message
     assert expected_container in error
     assert ("blob_id" in error) is expects_blob_advice
     assert ("inline_blob" in error) is expects_blob_advice
@@ -908,8 +908,8 @@ def test_reviewed_source_rehydrates_trusted_options_and_runs_b_before_plugin_val
     )
 
     assert candidate.acceptable is False
-    assert candidate.result.data["error_code"] == "interpretation_requirements_invalid"
-    assert "sk-sensitive-reviewed-source" not in candidate.result.data["error"]
+    assert candidate.result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "sk-sensitive-reviewed-source" not in candidate.result.validation.errors[0].message
 
 
 @pytest.mark.parametrize("mutation", ["name", "plugin", "options", "failure_policy"])
@@ -2094,8 +2094,6 @@ def test_current_executor_semantic_failures_are_atomic(tmp_path: Path, case_inde
     assert result.affected_nodes == ()
     assert result.validation.is_valid is False
     assert result.validation.errors[0].component == "rejected_mutation"
-    assert result.data["error"] == expected_error
-    assert result.data.get("error_code") == expected_error_code
     assert result.validation.errors[0].message == expected_error
     assert result.validation.errors[0].error_code == expected_error_code
     assert result.to_dict()["version"] == state.version
@@ -2329,8 +2327,8 @@ def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Pat
     blob_files = tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file())
     assert result.success is False
     assert result.updated_state is state
-    assert result.data["error_code"] == "interpretation_requirements_invalid"
-    assert "sk-sensitive-inline-review" not in result.data["error"]
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "sk-sensitive-inline-review" not in result.validation.errors[0].message
     assert blob_rows == 0
     assert blob_files == ()
 
@@ -2732,7 +2730,7 @@ def test_profile_lowered_llm_multi_query_candidate_is_acceptable(tmp_path: Path)
 
     candidate = build_set_pipeline_candidate(_ab_multi_query_args(tmp_path), state, context)
 
-    rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+    rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
     assert candidate.acceptable is True, f"canonical A/B shape rejected: {rejection}"
     assert candidate.result.success is True
 
@@ -2751,7 +2749,7 @@ def test_bare_relative_sink_path_canonicalizes_to_outputs_pool(tmp_path: Path) -
 
     candidate = build_set_pipeline_candidate(args, state, context)
 
-    rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+    rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
     assert candidate.acceptable is True, f"bare relative sink path rejected: {rejection}"
     committed = candidate.result.updated_state.outputs[0].options["path"]
     assert committed == "outputs/colour_ab.json"
@@ -2766,7 +2764,7 @@ def test_parent_traversal_sink_path_still_rejected(tmp_path: Path) -> None:
     candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
     assert candidate.acceptable is False
-    assert ".." in ((candidate.result.data or {}).get("error") or "")
+    assert ".." in (candidate.result.validation.errors[0].message or "")
 
 
 @pytest.mark.parametrize("path", [".", "./"])
@@ -2780,8 +2778,8 @@ def test_current_directory_sink_path_returns_validation_failure(tmp_path: Path, 
 
     assert candidate.acceptable is False
     assert candidate.result.success is False
-    assert (candidate.result.data or {}).get("error_code") == "plugin_options_invalid"
-    assert "current directory" in ((candidate.result.data or {}).get("error") or "")
+    assert candidate.result.validation.errors[0].error_code == "plugin_options_invalid"
+    assert "current directory" in (candidate.result.validation.errors[0].message or "")
 
 
 def _scrape_cleanup_args(tmp_path: Path) -> dict[str, Any]:
@@ -3202,9 +3200,6 @@ def test_multi_component_rejection_keeps_the_first_failure_first(tmp_path: Path)
     assert "bogus_source_option" in messages[0] or "Invalid options for source" in messages[0]
     assert messages[1].startswith("Node 'copy':")
     assert messages[2].startswith("Output 'main':")
-    # The leading rejection's own envelope is untouched, so a single-defect
-    # candidate and a multi-defect candidate agree on the `error` payload.
-    assert candidate.result.data["error"] == messages[0]
 
 
 def test_one_defective_component_is_reported_exactly_once(tmp_path: Path) -> None:
@@ -3220,7 +3215,7 @@ def test_one_defective_component_is_reported_exactly_once(tmp_path: Path) -> Non
     assert entries[0].message.startswith("Node 'copy':")
     # Exactly one rejection means the envelope is byte-identical to the
     # pre-collection single-rejection shape: no withheld counter rides along.
-    assert "components_withheld" not in candidate.result.data
+    assert candidate.result.data is None
 
 
 def test_component_rejections_are_bounded_and_report_what_they_withheld(tmp_path: Path) -> None:

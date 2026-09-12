@@ -128,8 +128,8 @@ def _assert_rejected_forged_review(result: Any, original_state: CompositionState
     assert result.success is False
     assert result.updated_state is original_state
     assert result.updated_state.version == original_state.version
-    assert result.data is not None
-    error = result.data["error"]
+    assert result.data is None
+    error = result.validation.errors[0].message
     assert INTERPRETATION_REQUIREMENTS_KEY in error
     assert "request_interpretation_review" in error
     assert "resolve_interpretation_event" not in error
@@ -393,5 +393,5 @@ def test_public_dispatch_rejects_every_server_owned_root_on_every_source_writer(
 
     assert result.success is False
     assert result.updated_state is state
-    assert result.data is not None
-    assert field_name in result.data["error"]
+    assert result.data is None
+    assert field_name in result.validation.errors[0].message

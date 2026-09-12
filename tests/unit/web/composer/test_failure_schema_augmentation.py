@@ -380,7 +380,7 @@ class TestFailureSchemaAugmentationSetPipeline:
         assert "Invalid options for sink 'json'" in leading["message"], leading
         assert payload["plugin_schemas"] == {"sink/json": catalog.get_schema("sink", "json").model_dump(mode="json")}
         assert leading["error_code"] == "plugin_options_invalid", leading
-        assert payload["data"]["error_code"] == "plugin_options_invalid", payload["data"]
+        assert "data" not in payload
         # The code is only worth stamping because a consumer resolves it: the
         # guidance the planner's redacted repair turn gets is keyed BY code, so
         # a codeless entry left this rejection with an empty ``codes`` map and
@@ -723,7 +723,7 @@ class TestFailureSchemaAugmentationFailsClosed:
         leading = payload["validation"]["errors"][0]
         assert leading["message"].startswith("Invalid secret_ref placement for source 'csv'"), leading
         assert leading["error_code"] == "plugin_options_invalid"
-        assert payload["data"]["error_code"] == "plugin_options_invalid"
+        assert "data" not in payload
         assert payload["plugin_schemas"] == {"source/csv": _csv_schema().model_dump(mode="json")}
 
 
@@ -832,7 +832,7 @@ def _assert_state_held_plugin_rejected_cleanly(result: Any, state: CompositionSt
     leading = payload["validation"]["errors"][0]
     assert leading["component"] == "rejected_mutation", leading
     assert leading["error_code"] == reason.value, leading
-    assert payload["data"]["error_code"] == reason.value, payload["data"]
+    assert "data" not in payload
     assert "Invalid options for" not in leading["message"], leading
     assert "plugin_schemas" not in payload, sorted(payload["plugin_schemas"])
 
@@ -958,15 +958,15 @@ def _assert_option_failure_augmented_exactly(
 ) -> None:
     """The wire parity every option-shape rejection must hold (elspeth-e405ad7cd2 R8).
 
-    The leading rejection carries the ``plugin_options_invalid`` code (twinned
-    onto ``data.error_code``), and ``plugin_schemas`` holds EXACTLY the one
+    The leading rejection carries the ``plugin_options_invalid`` code,
+    and ``plugin_schemas`` holds EXACTLY the one
     stamped plugin, byte-identical to a discrete ``get_plugin_schema`` call.
     Equality on the whole mapping is deliberate: a second key would mean a
     second identity was harvested from somewhere other than the carrier.
     """
     assert payload["validation"]["errors"][0]["component"] == "rejected_mutation", payload["validation"]["errors"][0]
     assert payload["validation"]["errors"][0]["error_code"] == "plugin_options_invalid", payload["validation"]["errors"][0]
-    assert payload["data"]["error_code"] == "plugin_options_invalid", payload["data"]
+    assert "data" not in payload
     # ``to_dict`` is the JSON projection (tuples become lists), so the
     # discrete-call comparison is against the schema's JSON dump.
     assert payload["plugin_schemas"] == {f"{kind}/{plugin}": catalog.get_schema(kind, plugin).model_dump(mode="json")}

@@ -474,5 +474,5 @@ def test_run_admitted_first_is_observed_by_blob_delete_and_update(
             ),
         )
     assert result.success is False, result.to_dict()
-    assert result.data["error"] == str(BlobActiveRunError(str(blob.id), run_id=str(run.id)))
+    assert result.validation.errors[0].message == str(BlobActiveRunError(str(blob.id), run_id=str(run.id)))
     assert Path(blob.storage_path).read_bytes() == _BLOB_CONTENT

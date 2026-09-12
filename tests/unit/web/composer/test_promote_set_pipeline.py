@@ -539,7 +539,7 @@ class TestPromoteSetPipelineArgErrorRouting:
 
         assert result.success is False
         assert "source" not in result.updated_state.sources
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message
 
     def test_csv_fixed_schema_accepts_advertised_field_definition_shape(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """CSV prevalidation accepts the field shape exposed by plugin JSON Schema."""
@@ -772,8 +772,8 @@ class TestPromoteSetPipelineArgErrorRouting:
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
         assert result.success is False
-        assert "drop_raw_html_fields" in result.data["error"]
-        assert "pipeline_decision" in result.data["error"]
+        assert "drop_raw_html_fields" in result.validation.errors[0].message
+        assert "pipeline_decision" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_cleanup_named_mapper_that_preserves_web_scrape_raw_fields(self) -> None:
         """A node named as cleanup cannot preserve the exact raw fields it claims to drop."""
@@ -828,8 +828,8 @@ class TestPromoteSetPipelineArgErrorRouting:
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
         assert result.success is False
-        assert "preserves web-scrape raw field" in result.data["error"]
-        assert "content" in result.data["error"]
+        assert "preserves web-scrape raw field" in result.validation.errors[0].message
+        assert "content" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_malformed_interpretation_requirements_without_crashing(self) -> None:
         """Malformed review metadata is Tier-3 tool input and must be a clean rejection."""
@@ -888,7 +888,7 @@ class TestPromoteSetPipelineArgErrorRouting:
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
         assert result.success is False
-        assert "interpretation_requirements must be a list" in result.data["error"]
+        assert "interpretation_requirements must be a list" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_raw_cleanup_review_on_llm_node(self) -> None:
         """A raw-cleanup review must be attached to the field_mapper doing the cleanup."""
@@ -963,8 +963,8 @@ class TestPromoteSetPipelineArgErrorRouting:
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
         assert result.success is False
-        assert "identify_primary_colours" in result.data["error"]
-        assert "must be implemented by a field_mapper" in result.data["error"]
+        assert "identify_primary_colours" in result.validation.errors[0].message
+        assert "must be implemented by a field_mapper" in result.validation.errors[0].message
 
     def test_existing_llm_blob_url_source_records_url_list_review_requirement(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """source.blob_id preserves the same source-review gate as inline_blob."""
@@ -1764,7 +1764,7 @@ class TestSetPipelineRowUnion:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
-        assert "timeout_seconds" in result.data["error"]
+        assert "timeout_seconds" in result.validation.errors[0].message
 
     @pytest.mark.parametrize(
         "override",
@@ -1915,7 +1915,7 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message
 
     def test_tampered_requirement_row_still_rejects(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """A row claiming resolver-owned resolution the server never wrote
@@ -1937,7 +1937,7 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert "resolved" in result.data["error"]
+        assert "resolved" in result.validation.errors[0].message
 
     def test_forged_block_without_a_stored_counterpart_still_rejects(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """No stored source at all: nothing can match, so the reserved-key
@@ -1951,4 +1951,4 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message

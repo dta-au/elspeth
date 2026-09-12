@@ -139,7 +139,8 @@ from elspeth.web.composer.tools import (
     normalize_tool_result_validation,
 )
 from elspeth.web.composer.tools._common import _failure_result
-from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools._registry import resolve_tool_effects
+from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
@@ -186,8 +187,8 @@ class _ProposalPayload(TypedDict):
 class _PrevalidationRejectedStatus(TypedDict):
     """The status fields merged onto a PREVALIDATION_REJECTED payload, in wire order.
 
-    The payload itself is the candidate's own ``data`` (its ``error`` /
-    ``error_code``) plus these; they are merged through a TypedDict constructor
+    The payload retains any independent candidate ``data`` plus these fields;
+    rejection details remain in ``validation.errors``. Fields merge through a TypedDict constructor
     rather than a bare dict literal so mypy refuses an extra key at the merge —
     a ``"success": True`` added here is the F1 twin returning eleven lines from
     the payload that pins it out, and nothing in the tree killed that mutant
@@ -350,8 +351,8 @@ def _prevalidation_feedback_seed(candidate_data: Any) -> Mapping[str, Any]:
     ``isinstance(x, dict)`` are False — only ``isinstance(x, Mapping)`` is
     True. The membership test MUST stay ABC-shaped: an exact-dict form makes
     the first arm unreachable, sends every rejection to the fallback, and stops
-    the composer model seeing the candidate's own ``error``/``error_code`` keys
-    at the top level of the feedback it is asked to repair from. Tracing the
+    the composer model seeing independent candidate data, such as credential
+    repair metadata, at the top level of the feedback. Tracing the
     producers does not establish otherwise — the container freezes the field
     after they built it.
 
@@ -1638,11 +1639,49 @@ async def run_tool_batch(
         # LLM call is recorded separately via _call_advisor_with_audit
         # firing a ComposerLLMCall record.
         if tool_name == "request_advisor_hint":
+            if resolve_tool_effects(tool_name, arguments).domains:
+                raise AssertionError("Advisor dispatch must not author composition domains.")
             # Successful advisor guidance is governed solely by the
             # advisor budget so the composer can read it. Advisor
             # policy/error feedback with no usable guidance is still
             # a non-mutating correction turn, so it consumes discovery
             # budget before the loop asks the primary model again.
+            # F3: validate argument types and total prompt size at the
+            # Tier-3 trust boundary. _TOOL_REQUIRED_PATHS only checks
+            # key presence, not value shape. Without this check the
+            # LLM could send a non-list (silently iterated char-by-
+            # char) or a megabyte-scale value (unbounded provider
+            # cost). ARG_ERRORs do NOT consume advisor budget — no
+            # outbound call is made — but anti-anchor counts them
+            # so repeated identical bad-arg calls trigger the §7.7
+            # structural hint.
+            advisor_arg_error = ctx.service._validate_advisor_arguments(arguments)
+            if not isinstance(advisor_arg_error, RequestAdvisorHintArgumentsModel):
+                recorder.record(
+                    finish_arg_error(
+                        audit,
+                        error_class=str(advisor_arg_error["error_class"]),
+                        error_message=str(advisor_arg_error["error"]),
+                        error_payload=advisor_arg_error,
+                    )
+                )
+                _append_tool_outcome(
+                    response=None,
+                    error_class=str(advisor_arg_error["error_class"]),
+                    error_message=str(advisor_arg_error["error"]),
+                    post_version=state.version,
+                )
+                anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                llm_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(advisor_arg_error),
+                    }
+                )
+                turn_has_discovery = True
+                continue
+
             budget = ctx.service._settings.composer_advisor_max_calls_per_compose
             if advisor_calls_used >= budget:
                 budget_payload = {
@@ -1679,42 +1718,6 @@ async def run_tool_batch(
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": json.dumps(budget_payload),
-                    }
-                )
-                turn_has_discovery = True
-                continue
-
-            # F3: validate argument types and total prompt size at the
-            # Tier-3 trust boundary. _TOOL_REQUIRED_PATHS only checks
-            # key presence, not value shape. Without this check the
-            # LLM could send a non-list (silently iterated char-by-
-            # char) or a megabyte-scale value (unbounded provider
-            # cost). ARG_ERRORs do NOT consume advisor budget — no
-            # outbound call is made — but anti-anchor counts them
-            # so repeated identical bad-arg calls trigger the §7.7
-            # structural hint.
-            advisor_arg_error = ctx.service._validate_advisor_arguments(arguments)
-            if advisor_arg_error is not None:
-                recorder.record(
-                    finish_arg_error(
-                        audit,
-                        error_class=str(advisor_arg_error["error_class"]),
-                        error_message=str(advisor_arg_error["error"]),
-                        error_payload=advisor_arg_error,
-                    )
-                )
-                _append_tool_outcome(
-                    response=None,
-                    error_class=str(advisor_arg_error["error_class"]),
-                    error_message=str(advisor_arg_error["error"]),
-                    post_version=state.version,
-                )
-                anti_anchor.record_failure(tool_name, audit.arguments_hash)
-                llm_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_arg_error),
                     }
                 )
                 turn_has_discovery = True
@@ -1791,7 +1794,7 @@ async def run_tool_batch(
 
             try:
                 advisor_outcome = await ctx.service._call_advisor_for_tool(
-                    arguments,
+                    advisor_arg_error,
                     recorder=recorder,
                     timeout=effective_advisor_timeout,
                 )
@@ -2512,8 +2515,8 @@ async def run_tool_batch(
             post_version=state.version,
         )
 
-        # Cache cacheable discovery results
-        if is_cacheable_discovery_tool(tool_name):
+        # Cached payloads omit rejection entries; only successful discovery is reusable.
+        if is_cacheable_discovery_tool(tool_name) and result.success:
             cache_key = _make_cache_key(tool_name, arguments)
             discovery_cache[cache_key] = _cached_discovery_payload(result)
 

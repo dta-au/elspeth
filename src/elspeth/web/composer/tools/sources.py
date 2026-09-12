@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Final, TypedDict
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine, select
 
@@ -50,6 +50,7 @@ from elspeth.web.composer.tools._common import (
     _SOURCE_BLOBS_OPTION_KEY,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
+    EmptyToolArgumentsModel,
     PendingCustodyBlobView,
     ToolContext,
     ToolResult,
@@ -70,6 +71,7 @@ from elspeth.web.composer.tools._common import (
     _prohibited_section,
     _resolver_owned_interpretation_requirement_error,
     _source_review_requirement_id,
+    _validate_mutation_arguments,
     _validate_plugin_name,
     _validate_source_path,
     _vf_destination_note,
@@ -154,11 +156,18 @@ class InspectSourceArgumentsModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ClearSourceArgumentsModel(BaseModel):
+    source_name: str = Field(default="source", min_length=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 def _handle_list_sources(
     arguments: dict[str, Any],
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_sources arguments")
     return _discovery_result(
         state,
         {
@@ -1832,7 +1841,7 @@ _INSPECT_SOURCE_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
         "Return bounded structural facts about a blob-backed source: `source_kind`, "
-        "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
+        "`observed_headers`, `sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
         "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
         "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
         "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
@@ -2102,20 +2111,8 @@ def _execute_clear_source(
 ) -> ToolResult:
     """Remove the pipeline source."""
     del context  # unused; signature uniformity with the other handlers.
-    extra_keys = set(args) - {"source_name"}
-    if extra_keys:
-        raise ToolArgumentError(
-            argument="clear_source arguments",
-            expected="only the optional 'source_name' key",
-            actual_type="unexpected extra keys",
-        )
-    source_name = args["source_name"] if "source_name" in args else "source"
-    if type(source_name) is not str or not source_name:
-        raise ToolArgumentError(
-            argument="source_name",
-            expected="a non-empty string",
-            actual_type=type(source_name).__name__,
-        )
+    validated = _validate_mutation_arguments(ClearSourceArgumentsModel, args, "clear_source arguments")
+    source_name = validated.source_name
     new_state = state.without_named_source(source_name)
     if new_state is None:
         return _failure_result(state, f"No source named '{source_name}' configured to clear.")
@@ -2141,6 +2138,8 @@ _CLEAR_SOURCE_DECLARATION = ToolDeclaration(
             "source_name": {
                 "type": "string",
                 "description": "Source root name to clear. Defaults to 'source'.",
+                "minLength": 1,
+                "default": "source",
             },
         },
         "required": [],

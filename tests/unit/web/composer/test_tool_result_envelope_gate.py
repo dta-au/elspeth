@@ -12,10 +12,11 @@ hand-listed:
              the ``data=`` payload at every tool's result-constructor site
   admitted — ``tool_result_envelope`` (the registry) versus the live redaction
              manifest objects and the planner's closed discovery twin
-  taught   — the rendered system prompt (both skills) plus every
+  taught   — owned passages of the rendered system prompt (both skills) plus own
              ``ToolDeclaration.description``, in house-style quoted form
 
-The only curated inputs are the attribution maps (which owned payload type a
+The curated inputs are precise source teaching scopes (validated against the
+live surface/tool/path census), the attribution maps (which owned payload type a
 ``data=`` helper or local carries — an unattributed one is a walker REFUSAL,
 never a silent skip) and the fence fixture (``tool_result_envelope_fence.json``):
 keys deliberately left untaught, each with a reason a reviewer can check. A
@@ -51,6 +52,7 @@ from tests.helpers.tree_gate import ParsedPythonFile, iter_gate_sources
 from tests.unit.web.composer._teaching_gate_support import (
     REPO_ROOT,
     WEB_SRC,
+    TeachingBlock,
     _call_name,
     _display,
     _enclosing_function,
@@ -59,6 +61,9 @@ from tests.unit.web.composer._teaching_gate_support import (
     _typed_keys,
     is_quoted_leaf,
     leaf_of,
+    owned_teaching_text,
+    teaching_blocks,
+    validate_teaching_scopes,
 )
 
 FENCE_PATH = Path(__file__).with_name("tool_result_envelope_fence.json")
@@ -82,7 +87,6 @@ _RESULT_CONSTRUCTORS = frozenset({"_discovery_result", "_mutation_result", "Tool
 _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
     ("_common.py", "_discovery_result"): "generic constructor: ships the payload its caller passed, counted at that call",
     ("_common.py", "_mutation_result"): "generic constructor: ships the payload its caller passed, counted at that call",
-    ("_common.py", "_failure_result"): "_FAILURE_DATA_HELPERS row: its ``data`` local is walked there",
     ("_common.py", "_credential_wiring_contract_failure"): "_FAILURE_DATA_HELPERS row: inline data={...}",
     ("_common.py", "_merged_component_rejection_result"): (
         "merges two already-censused payloads; the one key the merge adds is yielded explicitly by _failure_data_sites"
@@ -94,7 +98,7 @@ _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
     ),
 }
 # Sites on a surface this gate's taught side does not cover. The taught text is the COMPOSER skill
-# plus the composer tool descriptions (``taught_text``); the planner reads pipeline_capabilities.md
+# plus the composer tool descriptions (``_teaching_blocks``); the planner reads pipeline_capabilities.md
 # and its own briefs, so admitting planner payloads here would ask the composer skill to teach a
 # wire no composer model ever sees. Their shapes are closed by owned types and pinned in
 # test_pipeline_planner.py instead.
@@ -121,6 +125,12 @@ class FenceEntry(NamedTuple):
 # --- attribution maps (the census fills these; an unattributed site is a refusal) -----------------
 
 
+class _ListPayload(NamedTuple):
+    """A helper returning a list whose elements have one owned closed type."""
+
+    element: type
+
+
 class _Literal(NamedTuple):
     """Attribute a helper by READING the dict literal(s) it returns, for helpers that build plain dicts."""
 
@@ -129,10 +139,10 @@ class _Literal(NamedTuple):
 
 
 # helper called as ``data=<helper>(...)`` -> the owned TypedDict / pydantic model it returns, a
-# ``_Literal`` pointing at the function whose return literal to read, or ``None`` for a helper
+# ``_ListPayload`` of an owned element type, a ``_Literal`` pointing at the return literal, or ``None`` for a helper
 # that returns scalars only (nothing to teach). Every helper reached from a ``data=`` site MUST
 # appear here; the walker refuses an unattributed one.
-_DATA_HELPER_PAYLOADS: dict[str, type | _Literal | None] = {
+_DATA_HELPER_PAYLOADS: dict[str, type | _ListPayload | _Literal | None] = {
     "_blob_create_payload": blobs.BlobCreatePayload,
     "_serialize_full_pipeline_state": common._FullPipelineStatePayload,
     "_serialize_set_pipeline_arguments": _Literal(COMMON, "_serialize_set_pipeline_arguments"),
@@ -140,7 +150,7 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _Literal | None] = {
     "get_schema": PluginSchemaInfo,  # context.catalog.get_schema returns the pydantic model instance
     "get_expression_grammar": None,  # a str
     "_sync_list_blobs": _Literal(TOOLS_DIR / "blobs.py", "_sync_list_blobs"),
-    "_sync_list_ready_blob_inline_descriptors": _Literal(TOOLS_DIR / "blobs.py", "_sync_list_ready_blob_inline_descriptors"),
+    "_sync_list_ready_blob_inline_descriptors": _ListPayload(blobs.BlobInlineDescriptor),
     "facts_to_dict": _Literal(COMPOSER / "source_inspection.py", "facts_to_dict"),
     "diff_states": _Literal(COMMON, "diff_states"),
     "_vf_destination_note": _Literal(COMMON, "_vf_destination_note"),
@@ -151,6 +161,7 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _Literal | None] = {
     "_serialize_edge": _Literal(COMMON, "_serialize_edge"),
     "_serialize_output": _Literal(COMMON, "_serialize_output"),
     "_serialize_set_pipeline_node": common._SetPipelineNodePayload,
+    "_serialize_node": common._SetPipelineNodePayload,
     "_serialize_plugin_assistance_example": _Literal(TOOLS_DIR / "generation.py", "_serialize_plugin_assistance_example"),
 }
 
@@ -260,8 +271,7 @@ def _module_str_constants(tree: ast.Module, path: Path | None = None) -> dict[st
     """Module-level ``NAME = "literal"`` / ``NAME: Final[str] = "literal"`` bindings, plus — when
     ``path`` is given — every ``from m import NAME`` whose live value in that module is a str.
 
-    A census file may key a shipped dict on a constant it imports (``generation.py`` keyed a
-    payload on ``_DATA_ERROR_KEY`` from ``_common`` until d20f58783); the import branch reads
+    A census file may key a shipped dict on a constant it imports; the import branch reads
     such a key as the constant's value instead of refusing it. No census file does so today, so
     the branch is pinned by ``test_walker_resolves_import_bound_str_constants``, not by the
     census.
@@ -324,7 +334,17 @@ def _is_own_data(node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and _is_cast(node) and len(node.args) == 2 and _is_own_data(node.args[1])
 
 
-def _casts_to(fn: ast.AST, type_name: str) -> list[int]:
+def _is_list_of(node: ast.AST | None, type_name: str) -> bool:
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "list"
+        and isinstance(node.slice, ast.Name)
+        and node.slice.id == type_name
+    )
+
+
+def _casts_to(fn: ast.AST, type_name: str, *, include_list: bool = False) -> list[int]:
     """Linenos inside ``fn`` of every ``cast(<type_name>, ...)``: the shape asserted rather than derived."""
     return sorted(
         node.lineno
@@ -332,8 +352,9 @@ def _casts_to(fn: ast.AST, type_name: str) -> list[int]:
         if isinstance(node, ast.Call)
         and _is_cast(node)
         and node.args
-        and isinstance(node.args[0], ast.Name)
-        and node.args[0].id == type_name
+        and (
+            (isinstance(node.args[0], ast.Name) and node.args[0].id == type_name) or (include_list and _is_list_of(node.args[0], type_name))
+        )
     )
 
 
@@ -350,6 +371,9 @@ def _attributed_call_keys(call: ast.Call, *, prefix: str, site: str, depth: int,
     helper = _call_name(call)
     assert helper in _DATA_HELPER_PAYLOADS, f"{site}: {where} built by unattributed helper {helper!r} — add it to _DATA_HELPER_PAYLOADS"
     attribution = _DATA_HELPER_PAYLOADS[helper]
+    if isinstance(attribution, _ListPayload):
+        yield from _payload_keys(attribution.element, prefix.rstrip(".") + "[].")
+        return
     if isinstance(attribution, _Literal):
         yield from _helper_return_keys(attribution, prefix=prefix, site=site, depth=depth + 1)
         return
@@ -389,6 +413,7 @@ def _nested_value_keys(
     resolve_name: _NameResolver | None = None,
     *,
     element_of: str | None = None,
+    dict_forwarded: bool = False,
 ) -> Iterator[str]:
     """Keys nested INSIDE a value already reported at ``path``. Every shape is ENUMERATED; silence is not an arm.
 
@@ -426,22 +451,33 @@ def _nested_value_keys(
     a refusal, resolved by attributing the element or restructuring the
     producer — never by letting it pass.
     """
+    if dict_forwarded:
+        assert not _is_cast(value), f"{site}: cast inside dict wrapper hides the value's shape"
     if isinstance(value, ast.Dict):
-        yield from _dict_literal_keys(value, path + ".", site, constants, resolve_name)
+        yield from _dict_literal_keys(value, path + ".", site, constants, resolve_name, dict_forwarded=dict_forwarded)
         return
     element = _container_element(value)
     if element is not None:
-        yield from _nested_value_keys(element, path + "[]", site, constants, resolve_name, element_of=path)
+        yield from _nested_value_keys(element, path + "[]", site, constants, resolve_name, element_of=path, dict_forwarded=dict_forwarded)
         return
     if isinstance(value, (ast.List, ast.Tuple)):
         for item in value.elts:
-            yield from _nested_value_keys(item, path + "[]", site, constants, resolve_name, element_of=path)
+            yield from _nested_value_keys(item, path + "[]", site, constants, resolve_name, element_of=path, dict_forwarded=dict_forwarded)
         return
     if isinstance(value, ast.IfExp):
-        yield from _nested_value_keys(value.body, path, site, constants, resolve_name, element_of=element_of)
-        yield from _nested_value_keys(value.orelse, path, site, constants, resolve_name, element_of=element_of)
+        yield from _nested_value_keys(value.body, path, site, constants, resolve_name, element_of=element_of, dict_forwarded=dict_forwarded)
+        yield from _nested_value_keys(
+            value.orelse, path, site, constants, resolve_name, element_of=element_of, dict_forwarded=dict_forwarded
+        )
         return
     if isinstance(value, (ast.Constant, ast.JoinedStr)):
+        return
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "dict":
+        assert len(value.args) == 1 and not value.keywords, f"{site}: dict wrapper must have exactly one argument and no keywords"
+        yield from _nested_value_keys(value.args[0], path, site, constants, resolve_name, element_of=element_of, dict_forwarded=True)
+        return
+    if isinstance(value, ast.Call) and _call_name(value) in _DATA_HELPER_PAYLOADS:
+        yield from _attributed_call_keys(value, prefix=path + ".", site=site, depth=0, where="nested value")
         return
     if element_of is None:
         assert isinstance(value, _OPAQUE_REFERENCES), (
@@ -468,6 +504,8 @@ def _dict_literal_keys(
     site: str,
     constants: dict[str, str],
     resolve_name: _NameResolver | None = None,
+    *,
+    dict_forwarded: bool = False,
 ) -> Iterator[str]:
     """Dotted keys of a dict literal, recursing through nested dict literals and list/tuple-of-dict literals.
 
@@ -485,7 +523,7 @@ def _dict_literal_keys(
         assert not _is_cast(value), f"{site}: cast(...) hides the shape of {prefix}{key}"
         path = f"{prefix}{key}"
         yield path
-        yield from _nested_value_keys(value, path, site, constants, resolve_name)
+        yield from _nested_value_keys(value, path, site, constants, resolve_name, dict_forwarded=dict_forwarded)
 
 
 def _merged_mapping_keys(
@@ -1037,7 +1075,7 @@ def f(rows):
 
 _PROBE_IMPORTED_KEY = """
 def f():
-    return {_DATA_ERROR_KEY: "boom", "other": 1}
+    return {_SOURCE_BLOB_REF_OPTION_KEY: "boom", "other": 1}
 """
 
 # Annotated ``data=`` locals, one per arm of ``_owned_payload_type``. The RHS keys are
@@ -1061,7 +1099,7 @@ def plain_class_annotated():
 
 
 def non_type_annotated():
-    payload: _DATA_ERROR_KEY = {"rhs_only": 1}
+    payload: _SOURCE_BLOB_REF_OPTION_KEY = {"rhs_only": 1}
     return ToolResult(success=True, data=payload)
 """
 
@@ -1514,22 +1552,22 @@ def test_walker_resolves_import_bound_str_constants() -> None:
     No census file keys a shipped dict on an imported constant today (``generation.py``
     stopped at d20f58783), so the census cannot notice the branch resolving nothing
     (GATE-refute1 F1: ``value = None`` survived the whole gate). This probe is its
-    consumer: ``tools/__init__.py`` imports ``_DATA_ERROR_KEY`` from ``_common``; the
+    consumer: ``tools/sources.py`` imports ``_SOURCE_BLOB_REF_OPTION_KEY`` from ``_common``; the
     lookup must resolve it to the literal ``_common`` binds so a dict keyed on it reads
     as that key, must NOT admit an import whose live value is not a str, and without
     the branch the same key must be a refusal rather than a silent drop.
     """
-    path = TOOLS_DIR / "__init__.py"
+    path = TOOLS_DIR / "sources.py"
     tree = _parse(path)
     imported = {alias.asname or alias.name for stmt in tree.body if isinstance(stmt, ast.ImportFrom) for alias in stmt.names}
-    assert {"_DATA_ERROR_KEY", "ToolResult"} <= imported, "probe premise: tools/__init__.py imports both names"
+    assert {"_SOURCE_BLOB_REF_OPTION_KEY", "ToolResult"} <= imported, "probe premise: tools/sources.py imports both names"
     constants = _module_str_constants(tree, path)
-    assert constants["_DATA_ERROR_KEY"] == common._DATA_ERROR_KEY
+    assert constants["_SOURCE_BLOB_REF_OPTION_KEY"] == common._SOURCE_BLOB_REF_OPTION_KEY
     assert "ToolResult" not in constants
     fn = _function(ast.parse(_PROBE_IMPORTED_KEY), "f")
     ret = next(n for n in ast.walk(fn) if isinstance(n, ast.Return))
     assert ret.value is not None
-    assert list(_dict_literal_keys(ret.value, "data.", "probe", constants)) == [f"data.{common._DATA_ERROR_KEY}", "data.other"]
+    assert list(_dict_literal_keys(ret.value, "data.", "probe", constants)) == [f"data.{common._SOURCE_BLOB_REF_OPTION_KEY}", "data.other"]
     with pytest.raises(AssertionError, match="non-literal key"):
         list(_dict_literal_keys(ret.value, "data.", "probe", _module_str_constants(tree)))
 
@@ -1689,7 +1727,7 @@ def test_an_annotated_data_local_resolves_only_through_an_owned_payload_type() -
 
     * ``_FullPipelineStatePayload`` (TypedDict) and ``PluginSchemaInfo`` (pydantic model) are
       admitted, so the payload's OWN fields ship and the RHS literal is never read;
-    * ``ToolResult`` is a class that is neither, and ``_DATA_ERROR_KEY`` is a ``str`` and so
+    * ``ToolResult`` is a class that is neither, and ``_SOURCE_BLOB_REF_OPTION_KEY`` is a ``str`` and so
       not a class at all — both fall through to the RHS, one per conjunct of the nominal
       test. That is ADR-032 in this walker: a payload type by what it IS, never by carrying
       something that looks like ``model_fields``.
@@ -1708,7 +1746,7 @@ def test_local_payload_attribution_is_keyed_on_the_enclosing_function(monkeypatc
     locals stay distinct.
 
     Unlike ``test_walker_resolves_import_bound_str_constants``, whose branch has a live input
-    (``tools/__init__.py`` really does import ``_DATA_ERROR_KEY``), this map is ``{}`` in the
+    (``tools/sources.py`` really does import ``_SOURCE_BLOB_REF_OPTION_KEY``), this map is ``{}`` in the
     live tree: the resolver follows every ``data=`` local unaided today, so the enclosing
     function's name is genuinely inert and the probe supplies its ONLY consumer. That is why
     the entry is injected for the duration of this test rather than parked in the map — an
@@ -1818,7 +1856,6 @@ def _plugin_schema_sites() -> Iterator[ShippedKey]:
 # ``None`` means the payload is passed inline at ``data=`` — as a dict literal, or as a call to
 # an owned TypedDict, which is the form that leaves no local for a later store to travel through.
 _FAILURE_DATA_HELPERS: tuple[tuple[Path, str, str | None], ...] = (
-    (COMMON, "_failure_result", "data"),
     (COMMON, "_credential_wiring_contract_failure", None),  # passed inline as data={...}
     (TOOL_BATCH, "run_tool_batch", None),  # passed inline as data=_ProposalPayload(...)
     (TOOL_BATCH, "run_tool_batch", "feedback_data"),
@@ -2269,16 +2306,20 @@ def _authoring_vocabulary() -> frozenset[str]:
     return frozenset(names)
 
 
-def taught_text(tool: str) -> str:
-    skill = build_system_prompt(None)
+def _teaching_blocks() -> list[TeachingBlock]:
     descriptions = _all_descriptions()
-    if tool == SHARED:
-        return skill + "\n" + "\n".join(descriptions.values())
-    return skill + "\n" + descriptions.get(tool, "")
+    tools = frozenset(descriptions)
+    blocks = teaching_blocks(build_system_prompt(None), tools, site="system-prompt")
+    for tool, description in descriptions.items():
+        blocks.extend(teaching_blocks(description, tools, site=f"description:{tool}", description_owner=tool))
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+    return blocks
 
 
-def is_taught(shipped: ShippedKey) -> bool:
-    if is_quoted_leaf(shipped.key, taught_text(shipped.tool)):
+def is_taught(shipped: ShippedKey, blocks: list[TeachingBlock] | None = None) -> bool:
+    if blocks is None:
+        blocks = _teaching_blocks()
+    if is_quoted_leaf(shipped.key, owned_teaching_text(blocks, shipped.surface, shipped.tool, shipped.key)):
         return True
     # The echo and the state read restate the authoring payload the model itself wrote via
     # set_pipeline, so its property names are taught by the argument schema. No other surface
@@ -2291,8 +2332,9 @@ def is_taught(shipped: ShippedKey) -> bool:
 
 def untaught_keys() -> dict[tuple[str, str, str], list[str]]:
     out: dict[tuple[str, str, str], list[str]] = {}
+    blocks = _teaching_blocks()
     for shipped in shipped_keys():
-        if is_taught(shipped):
+        if is_taught(shipped, blocks):
             continue
         out.setdefault((shipped.surface, shipped.tool, shipped.key), []).append(shipped.site)
     return out
@@ -2306,6 +2348,7 @@ def load_fence(path: Path = FENCE_PATH) -> list[FenceEntry]:
 def matrix_rows() -> list[dict[str, object]]:
     """One row per shipped key: the census artefact for the ticket."""
     admitted = admitted_keys()
+    blocks = _teaching_blocks()
     rows: list[dict[str, object]] = []
     for shipped in shipped_keys():
         top = shipped.key.split(".")[0]
@@ -2320,7 +2363,7 @@ def matrix_rows() -> list[dict[str, object]]:
                 "tool": shipped.tool,
                 "key": shipped.key,
                 "site": shipped.site,
-                "taught": is_taught(shipped),
+                "taught": is_taught(shipped, blocks),
                 "admitted_on": admitted_on,
             }
         )
@@ -2344,8 +2387,8 @@ def test_every_shipped_envelope_key_is_taught_or_fenced() -> None:
 def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
     """No key nested under an envelope field may have one of the ENVELOPE's own key names as its leaf.
 
-    ``is_taught`` matches a quoted leaf ANYWHERE in the taught corpus, and the
-    corpus quotes every envelope key by construction, so a payload key named
+    Before the ownership reader, ``is_taught`` matched a quoted leaf ANYWHERE
+    in the taught corpus, which quotes every envelope key, so a payload key named
     after one is "taught" by the sentence describing a different field. Not
     hypothetical: ``data["success"] = "false"`` added to
     ``_common._failure_result`` — the shared recoverable-rejection builder, 261
@@ -2356,8 +2399,8 @@ def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
     payload, for every envelope key, and takes the forbidden names from the
     registry rather than from a list of the four that happen to be quoted today.
 
-    Depth-blind, and not scoped to ``data.``, on purpose: the mechanism is a
-    quoted leaf matching anywhere, and it cares neither how deep the key sits
+    This structural backstop remains depth-blind, not scoped to ``data.``:
+    the historical mechanism cared neither how deep the key sat
     nor which surface carries it. The dotted test is what separates a nested
     key from the envelope's own eleven rows, which are the only dotless ones
     (measured). Measured before landing, so the rule costs no churn — zero of
@@ -2490,6 +2533,37 @@ def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:
         assert not missing, f"{tool}: can ship {sorted(missing)} but the audit row does not admit them"
 
 
+def _assert_unique_container_producers() -> None:
+    """Witness registry ownership through the actual census walker, including deferred elements."""
+    observed: dict[str, set[tuple[str, int, int]]] = {}
+    walk = _nested_value_keys
+
+    def witnessing_walk(
+        value: ast.AST,
+        path: str,
+        site: str,
+        constants: dict[str, str],
+        resolve_name: _NameResolver | None = None,
+        *,
+        element_of: str | None = None,
+        dict_forwarded: bool = False,
+    ) -> Iterator[str]:
+        if element_of in _CONTAINER_ELEMENT_PAYLOADS:
+            assert isinstance(value, ast.expr)
+            observed.setdefault(element_of, set()).add((site, value.lineno, value.col_offset))
+        yield from walk(value, path, site, constants, resolve_name, element_of=element_of, dict_forwarded=dict_forwarded)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(importlib.import_module(__name__), "_nested_value_keys", witnessing_walk)
+        shipped_keys()
+    assert set(observed) == set(_CONTAINER_ELEMENT_PAYLOADS), "container registry has absent or stale producer witnesses"
+    assert all(len(producers) == 1 for producers in observed.values()), f"container registry has multiple producers: {observed}"
+
+
+def test_every_registered_container_path_has_one_witnessed_producer() -> None:
+    _assert_unique_container_producers()
+
+
 def test_every_deferred_container_element_is_censused_by_its_named_derivation() -> None:
     """An ``_Elsewhere`` deferral is CHECKED against the derivation it names, never taken on trust.
 
@@ -2615,7 +2689,7 @@ def test_a_type_attribution_is_derived_from_its_helper_and_never_asserted_over_i
     by construction: the first is read FROM the helper's own return literal,
     the second names a helper that ships no keys at all.
     """
-    typed = {name: payload for name, payload in _DATA_HELPER_PAYLOADS.items() if isinstance(payload, type)}
+    typed = {name: payload for name, payload in _DATA_HELPER_PAYLOADS.items() if isinstance(payload, (type, _ListPayload))}
     unresolved = set(typed) - set(_ATTRIBUTIONS_DEFINED_OUTSIDE_THE_COMPOSER)
     findings: list[str] = []
     for parsed in _composer_sources():
@@ -2624,14 +2698,26 @@ def test_a_type_attribution_is_derived_from_its_helper_and_never_asserted_over_i
                 continue
             where = f"{_display(parsed.path)}:{node.lineno} {node.name}"
             unresolved.discard(node.name)
-            expected = typed[node.name].__name__
+            payload = typed[node.name]
+            element_type = payload.element if isinstance(payload, _ListPayload) else payload
+            expected = element_type.__name__
+            if isinstance(payload, _ListPayload):
+                assert typing.is_typeddict(element_type) or issubclass(element_type, BaseModel), (
+                    f"{where}: list attribution needs an owned closed element type"
+                )
             annotation = node.returns
-            if not (isinstance(annotation, ast.Name) and annotation.id == expected):
+            matches = (
+                _is_list_of(annotation, expected)
+                if isinstance(payload, _ListPayload)
+                else isinstance(annotation, ast.Name) and annotation.id == expected
+            )
+            if not matches:
                 rendered = "none" if annotation is None else ast.unparse(annotation)
-                findings.append(f"{where}: returns {rendered}, but the census attributes it {expected}")
+                attributed = f"list[{expected}]" if isinstance(payload, _ListPayload) else expected
+                findings.append(f"{where}: returns {rendered}, but the census attributes it {attributed}")
             findings.extend(
                 f"{where}:{lineno}: casts to its own attributed type {expected} instead of deriving it"
-                for lineno in _casts_to(node, expected)
+                for lineno in _casts_to(node, expected, include_list=isinstance(payload, _ListPayload))
             )
     assert not findings, "type attributions that are asserted rather than derived:\n" + "\n".join(findings)
     assert not unresolved, (
@@ -2652,6 +2738,195 @@ def test_casts_to_reports_only_a_cast_asserting_the_named_type() -> None:
     assert _casts_to(_function(tree, "launders"), "_ProbePayload") == [3]
     assert _casts_to(_function(tree, "casts_something_else"), "_ProbePayload") == []
     assert _casts_to(_function(tree, "derives"), "_ProbePayload") == []
+
+
+@pytest.mark.parametrize(
+    ("expression", "prefix", "expected"),
+    [
+        (
+            "_blob_create_payload(input_only=1)",
+            "data.inline_blob",
+            {"blob_id", "content_hash", "filename", "mime_type", "originated_in", "size_bytes"},
+        ),
+        ("_serialize_output(input_only=1)", "data.output", {"description", "on_write_failure", "options", "plugin", "sink_name"}),
+        ("get_expression_grammar()", "data.grammar", set()),
+        ("unregistered()", "data.opaque", set()),
+        (
+            "dict(_blob_create_payload())",
+            "data.inline_blob",
+            {"blob_id", "content_hash", "filename", "mime_type", "originated_in", "size_bytes"},
+        ),
+    ],
+)
+def test_plain_registered_helper_descendants(expression: str, prefix: str, expected: set[str]) -> None:
+    value = ast.parse(expression, mode="eval").body
+    assert set(_nested_value_keys(value, prefix, "probe", {})) == {f"{prefix}.{key}" for key in expected}
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_plain_list_helper_keeps_element_paths(wrapped: bool) -> None:
+    expression = "_sync_list_ready_blob_inline_descriptors()"
+    if wrapped:
+        expression = f"dict({expression})"
+    value = ast.parse(expression, mode="eval").body
+    assert set(_nested_value_keys(value, "data.blobs", "probe", {})) == {
+        f"data.blobs[].{key}" for key in typing.get_type_hints(blobs.BlobInlineDescriptor)
+    }
+
+
+def test_nested_dict_wrapper_does_not_treat_helper_input_cast_as_payload_cast() -> None:
+    value = ast.parse("dict(_blob_create_payload(cast(Input, raw), input_only=cast(Input, raw)))", mode="eval").body
+    assert set(_nested_value_keys(value, "data.blob", "probe", {})) == {
+        f"data.blob.{key}" for key in typing.get_type_hints(blobs.BlobCreatePayload)
+    }
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "dict(cast(BlobCreatePayload, raw) if flag else _blob_create_payload())",
+        "dict(_blob_create_payload() if flag else cast(BlobCreatePayload, raw))",
+        "dict(dict(cast(BlobCreatePayload, raw)) if flag else _blob_create_payload())",
+        "dict({'blob': cast(BlobCreatePayload, raw) if flag else _blob_create_payload()})",
+        "dict([cast(BlobCreatePayload, raw) if flag else _blob_create_payload()])",
+        "dict((cast(BlobCreatePayload, raw) if flag else _blob_create_payload(),))",
+        "dict({i: cast(BlobCreatePayload, raw) if flag else _blob_create_payload() for i in rows})",
+    ],
+)
+def test_dict_forwarding_refuses_casts_in_readable_values(expression: str) -> None:
+    with pytest.raises(AssertionError, match="cast"):
+        list(_nested_value_keys(ast.parse(expression, mode="eval").body, "data.blob", "probe", {}))
+
+
+def test_dict_forwarding_condition_and_helper_inputs_are_not_payload_values() -> None:
+    value = ast.parse(
+        "dict(_blob_create_payload(cast(Input, raw)) if cast(bool, flag) else _blob_create_payload(input_only=cast(Input, raw)))",
+        mode="eval",
+    ).body
+    assert set(_nested_value_keys(value, "data.blob", "probe", {})) == {
+        f"data.blob.{key}" for key in typing.get_type_hints(blobs.BlobCreatePayload)
+    }
+
+
+def test_receiver_dict_call_is_not_the_bare_dict_wrapper() -> None:
+    value = ast.parse("receiver.dict(_blob_create_payload())", mode="eval").body
+    assert list(_nested_value_keys(value, "data.blob", "probe", {})) == []
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "dict(_blob_create_payload(), other())",
+        "dict(_blob_create_payload(), extra=1)",
+        "dict(**_blob_create_payload())",
+        "dict()",
+        "dict(cast(BlobCreatePayload, _blob_create_payload()))",
+        "dict(dict(cast(BlobCreatePayload, _blob_create_payload())))",
+    ],
+)
+def test_nested_dict_wrapper_refuses_shape_changes(expression: str) -> None:
+    with pytest.raises(AssertionError, match="dict wrapper"):
+        list(_nested_value_keys(ast.parse(expression, mode="eval").body, "data.blob", "probe", {}))
+
+
+@pytest.mark.parametrize(
+    ("annotation", "body", "element", "refusal"),
+    [
+        ("list[BlobInlineDescriptor]", "return []", blobs.BlobInlineDescriptor, None),
+        ("list[dict[str, Any]]", "return []", blobs.BlobInlineDescriptor, "returns"),
+        ("list[BlobCreatePayload]", "return []", blobs.BlobInlineDescriptor, "returns"),
+        (None, "return []", blobs.BlobInlineDescriptor, "returns"),
+        ("BlobInlineDescriptor", "return {}", blobs.BlobInlineDescriptor, "returns"),
+        ("list[str]", "return []", str, "owned closed element"),
+        ("list[BlobInlineDescriptor]", "return cast(list[BlobInlineDescriptor], untyped())", blobs.BlobInlineDescriptor, "casts"),
+        ("list[BlobInlineDescriptor]", "return [cast(BlobInlineDescriptor, untyped())]", blobs.BlobInlineDescriptor, "casts"),
+        ("list[BlobInlineDescriptor]", "other = cast(list[BlobCreatePayload], untyped())\n    return []", blobs.BlobInlineDescriptor, None),
+    ],
+)
+def test_list_attribution_proves_annotation_and_rejects_casts(
+    monkeypatch: pytest.MonkeyPatch, annotation: str | None, body: str, element: type, refusal: str | None
+) -> None:
+    suffix = "" if annotation is None else f" -> {annotation}"
+    source = f"def structural_probe(){suffix}:\n    {body}\n"
+    parsed = ParsedPythonFile(COMPOSER / "structural_probe.py", source, ast.parse(source))
+    monkeypatch.setattr(importlib.import_module(__name__), "_composer_sources", lambda: [parsed])
+    monkeypatch.setattr(importlib.import_module(__name__), "_DATA_HELPER_PAYLOADS", {"structural_probe": _ListPayload(element)})
+    if refusal is None:
+        test_a_type_attribution_is_derived_from_its_helper_and_never_asserted_over_it()
+    else:
+        with pytest.raises(AssertionError, match=refusal):
+            test_a_type_attribution_is_derived_from_its_helper_and_never_asserted_over_it()
+
+
+def test_unresolved_list_attribution_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(importlib.import_module(__name__), "_composer_sources", lambda: [])
+    monkeypatch.setattr(
+        importlib.import_module(__name__), "_DATA_HELPER_PAYLOADS", {"structural_probe": _ListPayload(blobs.BlobInlineDescriptor)}
+    )
+    with pytest.raises(AssertionError, match="no definition"):
+        test_a_type_attribution_is_derived_from_its_helper_and_never_asserted_over_it()
+
+
+@pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    census = shipped_keys
+
+    def with_second_producer() -> list[ShippedKey]:
+        rows = census()
+        list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+        return rows
+
+    monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+    test_every_deferred_container_element_is_censused_by_its_named_derivation()
+    with pytest.raises(AssertionError, match="multiple producers"):
+        _assert_unique_container_producers()
+
+
+@pytest.mark.parametrize("missing", [None, *sorted(_CONTAINER_ELEMENT_PAYLOADS)])
+def test_container_ownership_requires_every_live_witness(monkeypatch: pytest.MonkeyPatch, missing: str | None) -> None:
+    def incomplete_census() -> list[ShippedKey]:
+        if missing is not None:
+            for path in _CONTAINER_ELEMENT_PAYLOADS:
+                if path != missing:
+                    list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "probe", {}, element_of=path))
+        return []
+
+    monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", incomplete_census)
+    with pytest.raises(AssertionError, match="absent or stale"):
+        _assert_unique_container_producers()
+
+
+@pytest.mark.parametrize("different_line", [False, True])
+def test_container_owner_identity_is_site_and_element_line(monkeypatch: pytest.MonkeyPatch, different_line: bool) -> None:
+    def repeated_census() -> list[ShippedKey]:
+        for path in _CONTAINER_ELEMENT_PAYLOADS:
+            for source in ("item.to_dict()", "\nitem.to_dict()" if different_line else "item.to_dict()"):
+                list(_nested_value_keys(ast.parse(source, mode="eval").body, path + "[]", "same-carrier", {}, element_of=path))
+        return []
+
+    monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", repeated_census)
+    if different_line:
+        with pytest.raises(AssertionError, match="multiple producers"):
+            _assert_unique_container_producers()
+    else:
+        _assert_unique_container_producers()
+
+
+def test_container_owners_on_the_same_line_remain_distinct(monkeypatch: pytest.MonkeyPatch) -> None:
+    expressions = ast.parse("[first.to_dict(), second.to_dict()]", mode="eval").body
+    assert isinstance(expressions, ast.List)
+    first, second = expressions.elts
+    assert first.lineno == second.lineno and first.col_offset != second.col_offset
+
+    def same_line_census() -> list[ShippedKey]:
+        for path in _CONTAINER_ELEMENT_PAYLOADS:
+            for value in expressions.elts:
+                list(_nested_value_keys(value, path + "[]", "same-carrier", {}, element_of=path))
+        return []
+
+    monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", same_line_census)
+    with pytest.raises(AssertionError, match="multiple producers"):
+        _assert_unique_container_producers()
 
 
 def test_every_result_constructor_site_is_attributed() -> None:
@@ -2796,10 +3071,10 @@ _PROPOSAL_PAYLOAD_KEYS: tuple[str, ...] = ("status", "proposal_id", "tool_name",
 def test_approval_required_proposal_payload_ships_exactly_its_keys() -> None:
     """Exact-key pin on the proposal payload (red-team R5, mutation RM5; GATE-refute1-2 F-1; verify-gate VG-F1).
 
-    The teaching gate cannot catch ``"success": True`` creeping back into this
+    The old teaching reader could not catch ``"success": True`` creeping back into this
     payload: the leaf ``success`` is quoted everywhere the envelope is taught,
-    so ``data.success`` would count as taught. Only an exact pin on the site the
-    walker reads can refuse it.
+    so ``data.success`` counted as taught. This exact structural pin remains
+    independent of the ownership reader's refusal.
 
     The shape is closed STRUCTURALLY rather than by a walker chasing syntax. The
     payload is built inline as the ``data=`` argument of one result constructor,
@@ -2871,9 +3146,9 @@ def test_prevalidation_rejected_payload_ships_exactly_its_status_keys() -> None:
     The proposal payload eleven lines below was pinned; this one was not, and
     ``"success": True`` added to its merge SURVIVED the envelope gate and a wide
     kill search of 8665 tests. The census does enumerate the key — but
-    ``is_taught`` matches a quoted leaf anywhere in the skill, and the skill
-    quotes the ENVELOPE's ``success``, so the teaching gate reads the homonym as
-    taught. Only an exact pin on the site refuses it.
+    the old ``is_taught`` matched a quoted leaf anywhere in the skill, and the
+    skill quotes the ENVELOPE's ``success``, so it read the homonym as taught.
+    This exact pin remains independent of the ownership reader's refusal.
 
     Closed the same way as the proposal payload: the merge argument is a call to
     an owned TypedDict, so mypy refuses an extra, missing or mistyped key at the

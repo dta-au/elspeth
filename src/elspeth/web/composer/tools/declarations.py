@@ -38,7 +38,7 @@ This module is a **pure-data leaf**: it defines ``ToolKind`` and
 ``ToolDeclaration`` plus stateless derivation helpers that take an
 ``Iterable[ToolDeclaration]`` parameter. It imports nothing from plane modules.
 Plane modules import this module to construct their declarations and expose
-``TOOLS_IN_MODULE`` tuples; ``_dispatch.py`` (which already imports every
+``TOOLS_IN_MODULE`` tuples; ``_registry.py`` (which imports every
 plane) is the single aggregation site that concatenates those tuples and feeds
 them to the derivation helpers. This breaks the import cycle — Python's
 partial-module-load window cannot leave a derivation function seeing an empty
@@ -48,7 +48,7 @@ every plane has finished loading.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
@@ -91,12 +91,38 @@ class ToolKind(Enum):
     SECRET_MUTATION = "secret_mutation"
 
 
+class EffectDomain(Enum):
+    """Owned domains a successful tool attempt intends to change."""
+
+    GRAPH = "graph"
+    VALIDATION = "validation"
+    YAML = "yaml"
+    BLOB_STORE = "blob_store"
+    INTERPRETATION = "interpretation"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolEffects:
+    """Prospective successful effects, not evidence that a write occurred."""
+
+    domains: tuple[EffectDomain, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.domains) is not tuple or any(not isinstance(domain, EffectDomain) for domain in self.domains):
+            raise TypeError("ToolEffects requires a tuple of EffectDomain members.")
+        if len(set(self.domains)) != len(self.domains):
+            raise ValueError("ToolEffects domains must be unique.")
+
+
+GRAPH_EFFECTS = ToolEffects((EffectDomain.GRAPH, EffectDomain.VALIDATION, EffectDomain.YAML))
+
+
 @dataclass(frozen=True, slots=True)
 class ToolDeclaration:
     """One composer tool, declared at one site, co-located with its handler.
 
     Every declared tool is registered by being placed in a plane module's
-    ``TOOLS_IN_MODULE`` tuple. ``_dispatch.py`` aggregates every plane's tuple
+    ``TOOLS_IN_MODULE`` tuple. ``_registry.py`` aggregates every plane's tuple
     into a single registered set; pure-function derivation helpers below
     project that set to the surfaces the dispatcher consumes.
 
@@ -104,11 +130,9 @@ class ToolDeclaration:
         name: The tool name as the LLM sees it. Must equal the dict key the
             tool is dispatched under and the name in the corresponding
             ``discovery.py`` name-set.
-        handler: The ``ToolHandler`` callable
-            ``(arguments, state, context) -> ToolResult``. ``SESSION_AWARE``
-            tools carry an async coroutine handler instead; the dispatcher
-            distinguishes by ``kind``.
-        kind: One of the seven ``ToolKind`` categories. Determines the
+        handler: The synchronous ``ToolHandler`` callable
+            ``(arguments, state, context) -> ToolResult``.
+        kind: A ``ToolKind`` category. Determines the
             dispatch path and the name-set the tool's name must appear in.
         description: The LLM-facing description prose. This is the
             single source of truth for tool description text used by both
@@ -129,9 +153,12 @@ class ToolDeclaration:
             import-time subset check (Python-engineer M3 review finding,
             2026-05-23).
         blob_store_only: True if the tool writes only to blob storage and
-            never advances ``CompositionState`` (excluded from the
-            ``trust_mode == "explicit_approve"`` proposal-interception gate).
+            never advances ``CompositionState``. Approval policy separately
+            admits creation immediately and intercepts destructive writes.
             Only meaningful for ``BLOB_MUTATION``.
+        argument_effects: Optional pure resolver for argument-dependent
+            prospective effects, co-located with the declaration. It must
+            never execute handlers or prepare external writes.
         augments_on_failure: True if a failure result from this tool should be
             decorated with inline plugin schemas via
             ``build_plugin_schemas_for_failure``. Set on mutation tools that
@@ -154,6 +181,20 @@ class ToolDeclaration:
     cacheable: bool = False
     blob_store_only: bool = False
     augments_on_failure: bool = False
+    argument_effects: Callable[[Mapping[str, Any]], ToolEffects] | None = None
+
+    def resolve_effects(self, arguments: Mapping[str, Any]) -> ToolEffects:
+        """Resolve effects purely from declaration metadata and argument shape."""
+        if self.argument_effects is not None:
+            return self.argument_effects(arguments)
+        match self.kind:
+            case ToolKind.DISCOVERY | ToolKind.BLOB_DISCOVERY | ToolKind.SECRET_DISCOVERY:
+                return ToolEffects()
+            case ToolKind.MUTATION | ToolKind.SECRET_MUTATION:
+                return GRAPH_EFFECTS
+            case ToolKind.BLOB_MUTATION:
+                return ToolEffects((EffectDomain.BLOB_STORE,)) if self.blob_store_only else GRAPH_EFFECTS
+        raise AssertionError("Unsupported tool kind for effect resolution.")
 
     def __post_init__(self) -> None:
         if not self.name:

@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -24,7 +24,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -40,6 +40,7 @@ from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResol
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.pipeline_planner import PipelineCandidatePolicyRejection, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
+from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
     ComposerConvergenceError,
@@ -67,6 +68,7 @@ from elspeth.web.composer.state import (
     ValidationSummary,
 )
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools import _registry as tool_registry
 from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
@@ -838,6 +840,37 @@ def _blob_content_for_test(engine: Any, blob_id: str) -> str | None:
     return Path(row.storage_path).read_text(encoding="utf-8")
 
 
+def test_effect_resolution_and_summaries_never_write_seeded_blob_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    engine, session_id = _session_engine_with_session()
+    blob_id = _create_session_blob_for_test(engine=engine, session_id=session_id, data_dir=tmp_path)
+    with engine.connect() as conn:
+        rows_before = conn.execute(select(blobs_table)).all()
+    files_before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    declarations = dict(tool_registry._DECLARATIONS_BY_NAME)
+    spies = []
+    for name in ("create_blob", "update_blob", "delete_blob", "set_pipeline"):
+        declaration = declarations[name]
+        spy = create_autospec(declaration.handler, side_effect=AssertionError("effect resolution invoked mutation handler"))
+        spies.append(spy)
+        declarations[name] = replace(declaration, handler=spy, json_schema=deep_thaw(declaration.json_schema))
+    monkeypatch.setattr(tool_registry, "_DECLARATIONS_BY_NAME", declarations)
+    for name, arguments in (
+        ("create_blob", {"filename": "SECRET_SENTINEL_RAW", "content": "SECRET_SENTINEL_RAW"}),
+        ("update_blob", {"blob_id": blob_id, "content": "SECRET_SENTINEL_RAW"}),
+        ("delete_blob", {"blob_id": blob_id}),
+        ("set_pipeline", {"source": {"inline_blob": {"content": "SECRET_SENTINEL_RAW"}}}),
+    ):
+        owned = deep_freeze(arguments)
+        assert tool_registry.resolve_tool_effects(name, owned).domains
+        summary = build_tool_proposal_summary(tool_name=name, arguments=owned, redacted_arguments={"blob_id": "safe-file"})
+        assert "SECRET_SENTINEL_RAW" not in repr(summary)
+    for spy in spies:
+        spy.assert_not_called()
+    with engine.connect() as conn:
+        assert conn.execute(select(blobs_table)).all() == rows_before
+    assert {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == files_before
+
+
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep service tests focused on compose behavior, not local API keys."""
@@ -1398,6 +1431,8 @@ class TestComposerSingleToolCall:
             data_dir=tmp_path,
             content="original content",
         )
+        with engine.connect() as conn:
+            blob_before = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
         await sessions_service.update_composer_preferences(
             session_uuid,
             trust_mode="explicit_approve",
@@ -1428,6 +1463,10 @@ class TestComposerSingleToolCall:
         proposals = await sessions_service.list_composition_proposals(session_uuid)
         assert [proposal.tool_name for proposal in proposals] == ["update_blob"]
         assert proposals[0].status == "pending"
+        assert proposals[0].affects == ("blob_store",)
+        assert proposals[0].summary.startswith("Overwrite session file")
+        with engine.connect() as conn:
+            assert conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one() == blob_before
         assert _blob_content_for_test(engine, blob_id) == "original content"
 
     @pytest.mark.asyncio
@@ -1451,6 +1490,8 @@ class TestComposerSingleToolCall:
             data_dir=tmp_path,
             content="original content",
         )
+        with engine.connect() as conn:
+            blob_before = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
         await sessions_service.update_composer_preferences(
             session_uuid,
             trust_mode="explicit_approve",
@@ -1481,6 +1522,10 @@ class TestComposerSingleToolCall:
         proposals = await sessions_service.list_composition_proposals(session_uuid)
         assert [proposal.tool_name for proposal in proposals] == ["delete_blob"]
         assert proposals[0].status == "pending"
+        assert proposals[0].affects == ("blob_store",)
+        assert proposals[0].summary.startswith("Delete session file")
+        with engine.connect() as conn:
+            assert conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one() == blob_before
         assert _blob_content_for_test(engine, blob_id) == "original content"
 
     @pytest.mark.asyncio
@@ -3480,6 +3525,8 @@ class TestDiscoveryCache:
     async def test_cacheable_tool_returns_cached_result(self) -> None:
         """Repeated cacheable discovery calls return cached results
         without incrementing any budget counter."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+
         catalog = _mock_catalog()
         settings = _make_settings(composer_max_discovery_turns=2)
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
@@ -3496,12 +3543,16 @@ class TestDiscoveryCache:
         )
         text = _make_llm_response(content="Found sources.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
+        ):
             mock_llm.side_effect = [disc1, disc2, text]
             result = await service.compose("List sources", [], state)
 
         # Should NOT have raised — second list_sources was a cache hit
         assert result.message == "Found sources."
+        assert dispatch.call_count == 1
         # Catalog list_sources is called once by snapshot construction
         # (before any PolicyCatalogView exists) and once more by the
         # PolicyCatalogView itself, which memoizes its unrestricted listing
@@ -3512,6 +3563,75 @@ class TestDiscoveryCache:
         # The second discovery call is a composer tool-cache hit — no catalog call.
         # Total: 2, not 4.
         assert catalog.list_sources.call_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("change_state", [False, True])
+    async def test_failed_cacheable_discovery_preserves_rejection_on_each_call(self, change_state: bool) -> None:
+        """A failed schema lookup must execute twice and retain its rejection code."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+        from elspeth.web.composer.discovery_cache import cached_discovery_payload
+
+        catalog = _mock_catalog()
+        service, session_id = _composer_service_with_session(catalog, _make_settings())
+        arguments = {"plugin_type": "source", "name": "missing_plugin"}
+        responses = [
+            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_plugin_schema", "arguments": arguments}])
+            for call_id in ("c1", "c2")
+        ]
+        if change_state:
+            responses.insert(
+                1,
+                _make_llm_response(
+                    tool_calls=[
+                        {
+                            "id": "mutation",
+                            "name": "set_source",
+                            "arguments": {
+                                "plugin": "csv",
+                                "on_success": "out",
+                                "options": {"path": f"/data/blobs/{session_id}/input.csv", "schema": {"mode": "observed"}},
+                                "on_validation_failure": "quarantine",
+                            },
+                        }
+                    ]
+                ),
+            )
+        responses.append(_make_llm_response(content="That plugin is unavailable."))
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
+            patch.object(tool_batch_module, "_cached_discovery_payload", wraps=cached_discovery_payload) as cache_payload,
+            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+        ):
+            result = await service.compose("Describe the missing plugin", [], _empty_state(), session_id=session_id)
+
+        assert dispatch.call_count == 2 + int(change_state)
+        cache_payload.assert_not_called()
+        tool_messages = [
+            message
+            for message in completion.call_args_list[-1][0][0]
+            if message["role"] == "tool" and message["tool_call_id"] in ("c1", "c2")
+        ]
+        assert len(tool_messages) == 2
+        entries = []
+        for message in tool_messages:
+            payload = json.loads(message["content"])
+            assert payload["success"] is False
+            assert "data" not in payload
+            entry = payload["validation"]["errors"][0]
+            assert entry["component"] == "rejected_mutation"
+            assert entry["error_code"] == "plugin_not_installed"
+            assert entry["message"] == (
+                "source plugin selection is unavailable (plugin_not_installed): no plugin with this name is installed in this deployment"
+            )
+            entries.append(entry)
+        assert entries[0] == entries[1]
+        first_payload, second_payload = [json.loads(message["content"]) for message in tool_messages]
+        assert first_payload["version"] == 1
+        assert second_payload["version"] == result.state.version == 1 + int(change_state)
+        if change_state:
+            assert any(entry.get("error_code") == "no_source_configured" for entry in first_payload["validation"]["errors"])
+            assert all(entry.get("error_code") != "no_source_configured" for entry in second_payload["validation"]["errors"])
 
     @pytest.mark.asyncio
     async def test_cache_hit_rebuilds_result_envelope_from_current_state(self) -> None:

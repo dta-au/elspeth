@@ -1,3 +1,5 @@
+import { isEmptyRedactedOptions } from "./ChatPanel";
+import { redactedArguments } from "@/test/redactedArgumentFixture";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -8209,24 +8211,10 @@ describe("isAmbiguousInlineProposal", () => {
       summary,
       rationale: "",
       affects: ["source"],
+      // Synthetic metadata absence isolates the classifier. Current set_pipeline
+      // redaction fills metadata defaults; live reachability awaits seam 4.4.
       arguments_redacted_json: {
-        source: {
-          plugin: "csv",
-          on_success: "csv_rows",
-          blob_id: null,
-          options: "{}",
-          on_validation_failure: null,
-          inline_blob: {
-            filename: "chat.csv",
-            mime_type: "text/csv",
-            content: "<inline-blob:42-bytes>",
-            description: null,
-          },
-        },
-        sources: null,
-        nodes: [],
-        edges: [],
-        outputs: [],
+        ...structuredClone(redactedArguments("set_pipeline_ambiguous_inline_empty_options")),
         metadata: null,
       },
       base_state_id: null,
@@ -8237,6 +8225,28 @@ describe("isAmbiguousInlineProposal", () => {
       ...overrides,
     };
   }
+
+  it("keeps the current full producer payload on standard approval pending sparse metadata", () => {
+    const proposal = makeInlineProposal("I read your message as 3 rows.");
+    proposal.arguments_redacted_json = redactedArguments("set_pipeline_ambiguous_inline_empty_options");
+    expect(proposal.arguments_redacted_json.metadata).toBe("<metadata-patch:description,name>");
+    expect(isAmbiguousInlineProposal(proposal)).toBe(false);
+  });
+
+  it.each(["<metadata-patch:invalid>", "<metadata-patch:name>", "not a summary", {}])(
+    "rejects metadata that does not prove an empty write: %j",
+    (metadata) => {
+      const proposal = makeInlineProposal("I read your message as 3 rows.");
+      proposal.arguments_redacted_json.metadata = metadata;
+      expect(isAmbiguousInlineProposal(proposal)).toBe(false);
+    },
+  );
+
+  it("rejects a source description that the compact approval cannot expose", () => {
+    const proposal = makeInlineProposal("I read your message as 3 rows.");
+    (proposal.arguments_redacted_json.source as Record<string, unknown>).description = "Additional authored description";
+    expect(isAmbiguousInlineProposal(proposal)).toBe(false);
+  });
 
   it("returns true when summary contains 'I read'", () => {
     expect(
@@ -8712,24 +8722,10 @@ describe("ChatPanel inline-source disambiguation routing", () => {
       summary: "I read your message as 3 separate URLs.",
       rationale: "",
       affects: ["source"],
+      // Synthetic metadata absence isolates widget routing. The full producer
+      // still emits a key-bearing metadata summary until seam 4.4.
       arguments_redacted_json: {
-        source: {
-          plugin: "csv",
-          on_success: "csv_rows",
-          blob_id: null,
-          options: "{}",
-          on_validation_failure: null,
-          inline_blob: {
-            filename: "chat.csv",
-            mime_type: "text/csv",
-            content: "<inline-blob:42-bytes>",
-            description: null,
-          },
-        },
-        sources: null,
-        nodes: [],
-        edges: [],
-        outputs: [],
+        ...structuredClone(redactedArguments("set_pipeline_ambiguous_inline_empty_options")),
         metadata: null,
       },
       base_state_id: null,
@@ -8771,6 +8767,28 @@ describe("ChatPanel inline-source disambiguation routing", () => {
       screen.getByRole("region", { name: /row count/i }),
     ).toBeInTheDocument();
   });
+
+  it.each(["nonempty", "malformed"])(
+    "does not render disambiguation for %s redacted options",
+    (kind) => {
+      const { proposal, userMessage, assistantMessage } = makeAmbiguousProposalAndMessages();
+      const payload = structuredClone(redactedArguments("set_pipeline_ambiguous_inline_nonempty_options"));
+      // Isolate options from the independent metadata-defaulting blocker.
+      payload.metadata = null;
+      if (kind === "malformed") {
+        (payload.source as Record<string, unknown>).options = "{}";
+      }
+      proposal.arguments_redacted_json = payload;
+      useSessionStore.setState({
+        activeSessionId: sessionFixture.id,
+        sessions: [sessionFixture],
+        messages: [userMessage, assistantMessage],
+        compositionProposals: [proposal],
+      });
+      render(<ChatPanel />);
+      expect(screen.queryByRole("region", { name: /row count/i })).not.toBeInTheDocument();
+    },
+  );
 
   it("excludes the ambiguous proposal from the standard PendingProposalsBanner", () => {
     const { proposal, userMessage, assistantMessage } =
@@ -10913,4 +10931,19 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
     const indicator = panel!.querySelector(".composing-indicator");
     if (indicator !== null) expect(dock!.contains(indicator)).toBe(true);
   });
+});
+
+describe("isEmptyRedactedOptions producer contract", () => {
+  it.each([["empty", true], ["nonempty", false]] as const)(
+    "decodes actual %s set_pipeline options",
+    (kind, expected) => {
+      const source = redactedArguments(`set_pipeline_ambiguous_inline_${kind}_options`).source as Record<string, unknown>;
+      expect(isEmptyRedactedOptions(source.options)).toBe(expected);
+    },
+  );
+
+  it.each([null, undefined, {}, "{}", "invalid", "<invalid-options>"])(
+    "rejects malformed or absent present-field values: %j",
+    (value) => expect(isEmptyRedactedOptions(value)).toBe(false),
+  );
 });

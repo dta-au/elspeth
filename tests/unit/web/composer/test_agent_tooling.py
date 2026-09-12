@@ -300,7 +300,7 @@ class TestCreateBlob:
             catalog,
         )
         assert result.success is False
-        assert "session context" in result.data["error"]
+        assert "session context" in result.validation.errors[0].message
 
     def test_writes_file_to_disk(self, blob_env: dict[str, Any]) -> None:
         state = _empty_state()
@@ -377,7 +377,7 @@ class TestUpdateBlob:
         # update_blob validates blob_id as a canonical UUID at the Tier-3
         # boundary before the row lookup, so a non-UUID literal surfaces the
         # more specific "not a valid UUID" repair hint rather than "not found".
-        assert "is not a valid UUID" in result.data["error"]
+        assert "is not a valid UUID" in result.validation.errors[0].message
 
 
 class TestDeleteBlob:
@@ -725,10 +725,9 @@ class TestDiffPipelineTool:
         catalog = _mock_catalog()
         result = execute_tool("diff_pipeline", {}, state, catalog)
         assert result.success is False
-        assert "No baseline" in result.data["error"]
-        assert result.data["error_code"] == "diff_baseline_unavailable"
-        assert "current_version" not in result.data
+        assert "No baseline" in result.validation.errors[0].message
         assert result.validation.errors[0].error_code == "diff_baseline_unavailable"
+        assert result.data is None
 
     def test_returns_changes_with_baseline(self) -> None:
         s1 = _empty_state()
@@ -968,7 +967,7 @@ class TestCrossSessionIsolation:
             session_operation_authority=blob_env["authority"],
         )
         assert result.success is False
-        assert "not found" in result.data["error"]
+        assert "not found" in result.validation.errors[0].message
 
     def test_delete_scoped_to_session(self, blob_env: dict[str, Any]) -> None:
         state = _empty_state()

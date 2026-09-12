@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import type { CompositionProposal } from "@/types/api";
 import { Button } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { proposalEffectLabel } from "./proposalEffectLabel";
 
 interface PendingProposalsBannerProps {
   proposals: CompositionProposal[];
@@ -145,7 +146,7 @@ export function PendingProposalsBanner({
                 </p>
                 {proposal.affects.length > 0 && (
                   <p className="pending-proposals-banner-affects">
-                    Affects: {proposal.affects.join(", ")}
+                    Affects: {proposal.affects.map(proposalEffectLabel).join(", ")}
                   </p>
                 )}
               </div>

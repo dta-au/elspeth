@@ -301,11 +301,10 @@ class TestUnknownToolNameComposeLoopAuditShape:
         assert payload["success"] is False, (
             f"Expected payload['success'] to be False (semantic failure recorded in the payload), got {payload['success']!r}."
         )
-        assert "data" in payload, f"Expected 'data' key in result_canonical payload, got keys: {list(payload.keys())}."
-        assert "error" in payload["data"], f"Expected 'error' key in payload['data'], got keys: {list(payload['data'].keys())}."
-        assert "Unknown tool: this_tool_does_not_exist" in payload["data"]["error"], (
-            f"Expected 'Unknown tool: this_tool_does_not_exist' in payload['data']['error'], got: {payload['data']['error']!r}."
-        )
+        assert "data" not in payload
+        rejection = payload["validation"]["errors"][0]
+        assert rejection["component"] == "rejected_mutation"
+        assert "Unknown tool: this_tool_does_not_exist" in rejection["message"]
 
 
 # ---------------------------------------------------------------------------

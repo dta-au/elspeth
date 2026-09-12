@@ -244,12 +244,12 @@ def _assert_aws_s3_endpoint_url_rejected(
     assert result.success is False
     assert result.updated_state is original_state
     assert result.updated_state.version == original_state.version
-    assert result.data is not None
+    assert result.data is None
     # A set_pipeline component rejection names its subject both structurally
     # and as the minted message prefix; an incremental tool's rejection is
     # about the component it was called with and carries neither.
     expected_prefix = "" if rejected_component is None else rejected_component_prefix(rejected_component)
-    assert result.data["error"] == f"{expected_prefix}{AWS_S3_ENDPOINT_URL_POLICY_ERROR}"
+    assert result.validation.errors[0].message == f"{expected_prefix}{AWS_S3_ENDPOINT_URL_POLICY_ERROR}"
     assert result.validation.errors[0].rejected_component == rejected_component
     assert forbidden_value not in repr(result.data)
     assert forbidden_value not in repr(result.validation)
@@ -525,7 +525,7 @@ def test_direct_upsert_cannot_name_hidden_registered_plugin() -> None:
     )
 
     assert result.success is False
-    assert result.data["error_code"] == "plugin_not_enabled"
+    assert result.validation.errors[0].error_code == "plugin_not_enabled"
     assert result.updated_state.version == 1
 
 
@@ -546,7 +546,7 @@ def test_direct_upsert_cannot_name_hidden_registered_plugin() -> None:
                 "input": "rows",
                 "on_success": "main",
                 "options": {},
-                "trigger": {"records": 10},
+                "trigger": {"count": 10},
             },
             PluginId("transform", "batch_stats"),
         ),
@@ -583,7 +583,7 @@ def test_canonical_mutations_reject_hidden_registered_plugins(
     result = execute_tool(tool_name, arguments, _empty_state(), view, plugin_snapshot=snapshot)
 
     assert result.success is False
-    assert result.data["error_code"] == "plugin_not_enabled"
+    assert result.validation.errors[0].error_code == "plugin_not_enabled"
     catalog.post_call_hints.assert_not_called()
 
 
@@ -787,7 +787,7 @@ def test_execute_create_blob_honors_configured_session_quota(tmp_path: Path) -> 
         )
 
     assert result.success is False
-    assert "3 byte limit" in result.data["error"]
+    assert "3 byte limit" in result.validation.errors[0].message
     assert list((tmp_path / "blobs" / session_id).glob("*")) == []
 
 
@@ -881,45 +881,19 @@ class TestFailureResult:
         assert "source" in components
         assert "pipeline" in components
 
-    def test_data_error_mirrors_leading_validation_message(self) -> None:
-        """data.error and validation.errors[0].message must match.
-
-        The two channels exist for backward compatibility with
-        consumers that read either field. They must stay in sync so a
-        consumer reading one cannot disagree with a consumer reading
-        the other.
-        """
-        state = _empty_state()
-        result = _failure_result(state, "rejection text")
-        assert result.data["error"] == result.validation.errors[0].message
-
-    def test_data_error_code_mirrors_leading_validation_error_code(self) -> None:
-        """data.error_code and validation.errors[0].error_code must match.
-
-        Same two-channel contract as the message twin above, for the coded
-        channel. One ``error_code`` parameter currently fans into both
-        writes, so this reads as near-tautological today; it exists to fail
-        loudly if a refactor ever splits them, because no server code reads
-        ``data["error_code"]`` — only the serialized envelope's readers (the
-        planner LLM on the freeform/MCP surfaces, and the frontend) would
-        see the disagreement, and they would see two conflicting codes in
-        one payload with nothing to arbitrate.
-
-        Pinned at the constructor, not through a tool. The predecessor test
-        vehicled this through ``apply_pipeline_recipe`` and died with it
-        (e7a85bf8e) even though ``_plugin_policy_failure`` still emits the
-        same shape from five surviving tools.
-        """
-        state = _empty_state()
-        result = _failure_result(state, "rejection text", error_code="profile_unavailable")
-        assert result.data["error_code"] == result.validation.errors[0].error_code
-
-    def test_absent_error_code_is_absent_on_both_channels(self) -> None:
-        """Neither channel invents a code when the caller supplies none."""
-        state = _empty_state()
-        result = _failure_result(state, "rejection text")
-        assert "error_code" not in result.data
-        assert result.validation.errors[0].error_code is None
+    @pytest.mark.parametrize("code", [None, "profile_unavailable"])
+    def test_rejection_details_have_one_serialized_authority(self, code: str | None) -> None:
+        result = _failure_result(_empty_state(), "rejection text", error_code=code)
+        wire = result.to_dict()
+        assert result.data is None
+        assert "data" not in wire
+        entry = wire["validation"]["errors"][0]
+        assert entry["component"] == "rejected_mutation"
+        assert entry["message"] == "rejection text"
+        if code is None:
+            assert "error_code" not in entry
+        else:
+            assert entry["error_code"] == code
 
     def test_preserves_warnings_and_semantic_contracts(self) -> None:
         """Non-error fields on the input ValidationSummary survive prepending."""
@@ -1215,16 +1189,12 @@ class TestAwsS3SourceComposerPolicy:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
-        assert result.data is not None
-        assert "operator profile" in result.data["error"]
-        assert result.data["error_code"] == "profile_unavailable"
-        # The ENTRY-level code, not just the envelope. This is the field the
-        # planner actually reads: _rejection_entries ->
-        # _allowlisted_candidate_feedback -> rejection_codes. Envelope
-        # error_code has no server consumer at all, so a suite that pins only
-        # data["error_code"] leaves the planner-facing contract unpinned.
-        assert result.validation.errors[0].component == "rejected_mutation"
+        assert result.data is None
+        assert "operator profile" in result.validation.errors[0].message
         assert result.validation.errors[0].error_code == "profile_unavailable"
+        # The planner reads this entry through _rejection_entries and
+        # _allowlisted_candidate_feedback to derive rejection_codes.
+        assert result.validation.errors[0].component == "rejected_mutation"
 
     def test_set_source_allows_aws_s3_for_trained_operator_session(self) -> None:
         """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
@@ -1292,10 +1262,10 @@ class TestAwsS3SourceComposerPolicy:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
-        assert result.data is not None
-        assert "Source 'archive':" in result.data["error"]
-        assert "operator profile" in result.data["error"]
-        assert result.data["error_code"] == "profile_unavailable"
+        assert result.data is None
+        assert "Source 'archive':" in result.validation.errors[0].message
+        assert "operator profile" in result.validation.errors[0].message
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
     def test_set_pipeline_rejects_aws_s3_legacy_source_for_web_authored_session_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -1314,9 +1284,9 @@ class TestAwsS3SourceComposerPolicy:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
-        assert result.data is not None
-        assert "operator profile" in result.data["error"]
-        assert result.data["error_code"] == "profile_unavailable"
+        assert result.data is None
+        assert "operator profile" in result.validation.errors[0].message
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
     def test_set_pipeline_allows_aws_s3_legacy_source_for_trained_operator_session(self) -> None:
         """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
@@ -1409,9 +1379,9 @@ class TestAwsS3SourceComposerPolicy:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
-        assert result.data is not None
-        assert "operator profile" in result.data["error"]
-        assert result.data["error_code"] == "profile_unavailable"
+        assert result.data is None
+        assert "operator profile" in result.validation.errors[0].message
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
     def test_set_source_from_blob_allows_aws_s3_for_trained_operator_session(self) -> None:
         """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
@@ -1481,8 +1451,8 @@ class TestAwsS3SourceComposerPolicy:
         )
 
         assert result.success is False
-        assert result.data["error_code"] == "plugin_not_allowed_on_web"
-        assert "prohibited on the web authoring surface" in result.data["error"]
+        assert result.validation.errors[0].error_code == "plugin_not_allowed_on_web"
+        assert "prohibited on the web authoring surface" in result.validation.errors[0].message
 
     def test_prohibited_sink_selection_is_unaffected(self) -> None:
         """Only the SOURCE is prohibited; S3 writes stay authorable."""
@@ -1673,8 +1643,8 @@ class TestSetSource:
         assert result.success is False
         assert _default_source(result.updated_state) is None  # unchanged
         assert result.updated_state.version == 1
-        assert result.data is not None
-        assert result.data["error_code"] == "plugin_not_installed"
+        assert result.data is None
+        assert result.validation.errors[0].error_code == "plugin_not_installed"
 
     def test_set_source_rejects_manual_blob_ref_in_options(self) -> None:
         """Reject manual blob_ref injection through set_source.
@@ -1716,7 +1686,7 @@ class TestSetSource:
         )
         assert result.success is False
         assert _default_source(result.updated_state) is None
-        assert "set_source_from_blob" in result.data["error"]
+        assert "set_source_from_blob" in result.validation.errors[0].message
 
     def test_set_source_rejects_manual_blobs_list_in_options(self) -> None:
         """The plural blob_rows binding is resolver-owned (elspeth-0c6a343921
@@ -1750,7 +1720,7 @@ class TestSetSource:
         )
         assert result.success is False
         assert _default_source(result.updated_state) is None
-        assert "set_source_from_blobs" in result.data["error"]
+        assert "set_source_from_blobs" in result.validation.errors[0].message
 
     def test_patch_source_options_rejects_manual_blobs_list(self) -> None:
         """Patching the authoritative blobs list directly would let the LLM
@@ -1778,7 +1748,7 @@ class TestSetSource:
             catalog,
         )
         assert result.success is False
-        assert "set_source_from_blobs" in result.data["error"]
+        assert "set_source_from_blobs" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_manual_blobs_list_in_source_options(self) -> None:
         state = _empty_state()
@@ -1803,7 +1773,7 @@ class TestSetSource:
             catalog,
         )
         assert result.success is False
-        assert "set_source_from_blobs" in result.data["error"]
+        assert "set_source_from_blobs" in result.validation.errors[0].message
 
     def test_set_source_rejects_manual_source_authoring_in_options(self) -> None:
         """Caller-supplied source_authoring must not bypass blob provenance stamping."""
@@ -1832,7 +1802,7 @@ class TestSetSource:
 
         assert result.success is False
         assert "source" not in result.updated_state.sources
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message
 
     def test_set_source_rejects_literal_credential_value_without_mutating_state(self) -> None:
         """set_source rejects a literal credential *before* it is persisted.
@@ -2036,10 +2006,10 @@ class TestUpsertNode:
         result = execute_tool("upsert_node", arguments, state, _mock_catalog())
 
         assert result.success is False
-        assert result.data is not None
-        assert result.data["error_code"] == "structural_node_plugin_forbidden"
-        assert "plugin=null" in result.data["error"]
-        assert "authored_plugin_token" not in result.data["error"], "the authored plugin token is not echoed"
+        assert result.data is None
+        assert result.validation.errors[0].error_code == "structural_node_plugin_forbidden"
+        assert "plugin=null" in result.validation.errors[0].message
+        assert "authored_plugin_token" not in result.validation.errors[0].message, "the authored plugin token is not echoed"
         assert state.nodes == ()
         assert result.updated_state.nodes == ()
 
@@ -2245,7 +2215,7 @@ class TestUpsertNode:
             catalog,
         )
         assert result.success is False
-        assert "Forbidden construct" in result.data["error"]
+        assert "Forbidden construct" in result.validation.errors[0].message
         assert result.updated_state.version == 1  # unchanged
 
     def test_gate_malformed_condition_rejected(self) -> None:
@@ -2268,7 +2238,7 @@ class TestUpsertNode:
             catalog,
         )
         assert result.success is False
-        assert "Invalid gate condition syntax" in result.data["error"]
+        assert "Invalid gate condition syntax" in result.validation.errors[0].message
         assert result.updated_state.version == 1
 
     def test_gate_boolean_condition_custom_labels_rejected(self) -> None:
@@ -2296,7 +2266,7 @@ class TestUpsertNode:
             catalog,
         )
         assert result.success is False
-        assert "boolean condition" in result.data["error"]
+        assert "boolean condition" in result.validation.errors[0].message
         assert result.updated_state.version == 1
 
     def test_gate_numeric_condition_rejected(self) -> None:
@@ -2322,7 +2292,7 @@ class TestUpsertNode:
             catalog,
         )
         assert result.success is False
-        assert "numeric value" in result.data["error"]
+        assert "numeric value" in result.validation.errors[0].message
         assert result.updated_state.version == 1
 
     def test_gate_eval_call_rejected(self) -> None:
@@ -2345,7 +2315,7 @@ class TestUpsertNode:
             catalog,
         )
         assert result.success is False
-        assert "Forbidden construct" in result.data["error"]
+        assert "Forbidden construct" in result.validation.errors[0].message
 
     def test_gate_valid_condition_accepted(self) -> None:
         """upsert_node accepts gate with well-formed condition."""
@@ -2389,7 +2359,7 @@ class TestUpsertNode:
         )
 
         assert result.success is False
-        assert "end_of_source" in result.data["error"]
+        assert "end_of_source" in result.validation.errors[0].message
         assert result.updated_state.version == 1
 
     def test_gate_none_condition_not_validated(self) -> None:
@@ -2604,10 +2574,10 @@ class TestUpsertEdge:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.nodes[0].on_error is None
-        assert "upsert_node" in result.data["error"]
-        assert "on_error" in result.data["error"]
-        assert "route_true" not in result.data["error"]
-        assert "fork" not in result.data["error"]
+        assert "upsert_node" in result.validation.errors[0].message
+        assert "on_error" in result.validation.errors[0].message
+        assert "route_true" not in result.validation.errors[0].message
+        assert "fork" not in result.validation.errors[0].message
 
     def test_gate_on_error_edge_to_processing_node_is_also_rejected_atomically(self) -> None:
         gate = NodeSpec(
@@ -2657,8 +2627,8 @@ class TestUpsertEdge:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.edges == state.edges
-        assert "upsert_node" in result.data["error"]
-        assert "on_error" in result.data["error"]
+        assert "upsert_node" in result.validation.errors[0].message
+        assert "on_error" in result.validation.errors[0].message
 
     def test_upsert_edge_adds_llm_failure_sink_on_error_without_rebuilding_pipeline(self) -> None:
         """An existing LLM node can be routed to a failure sink via upsert_edge."""
@@ -2850,7 +2820,7 @@ class TestUpsertEdge:
         )
 
         assert result.success is False
-        assert "gate" in result.data["error"].lower()
+        assert "gate" in result.validation.errors[0].message.lower()
 
     def test_edge_to_output_syncs_source_on_success(self) -> None:
         """Edge from source to output updates source's on_success.
@@ -3351,8 +3321,8 @@ class TestSetOutput:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+        assert result.data is None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.validation.errors[0].message
 
     def test_data_dir_file_sink_requires_collision_policy(self) -> None:
         """Runnable web-composer file sinks must make output collision behavior explicit."""
@@ -3372,7 +3342,7 @@ class TestSetOutput:
         )
 
         assert result.success is False
-        assert "collision_policy" in result.data["error"]
+        assert "collision_policy" in result.validation.errors[0].message
 
     def test_data_dir_file_sink_accepts_explicit_collision_policy(self) -> None:
         """The composer accepts file sinks once the LLM chooses the collision policy."""
@@ -3491,10 +3461,10 @@ class TestSetOutput:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "csv" in result.data["error"]
-        assert "path" in result.data["error"]
-        assert "ANY_SECRET" in result.data["error"]
-        assert "only credential-bearing fields" in result.data["error"]
+        assert "csv" in result.validation.errors[0].message
+        assert "path" in result.validation.errors[0].message
+        assert "ANY_SECRET" in result.validation.errors[0].message
+        assert "only credential-bearing fields" in result.validation.errors[0].message
 
     def test_set_output_rejects_literal_database_url_credentials(self) -> None:
         state = _empty_state()
@@ -3522,7 +3492,7 @@ class TestSetOutput:
         assert result.data is not None
         assert "main:url" in result.data["credential_fields"]
         assert literal_url not in repr(result.to_dict())
-        assert "secret_ref" in result.data["error"]
+        assert "secret_ref" in result.validation.errors[0].message
 
 
 class TestRemoveOutput:
@@ -3588,7 +3558,7 @@ class TestSetSourcePathSecurity:
             data_dir="/data",
         )
         assert result.success is False
-        assert "path" in result.data["error"].lower()
+        assert "path" in result.validation.errors[0].message.lower()
 
     def test_traversal_attack_fails(self) -> None:
         state = _empty_state()
@@ -3666,9 +3636,9 @@ class TestSetSourcePathSecurity:
         # Pydantic catches the missing required 'path' field
         assert result.success is False
         # Error is from pre-validation (path required), not S2 (traversal / allowed dir)
-        assert "path" in result.data["error"]
-        assert "traversal" not in result.data["error"].lower()
-        assert "allowed" not in result.data["error"].lower()
+        assert "path" in result.validation.errors[0].message
+        assert "traversal" not in result.validation.errors[0].message.lower()
+        assert "allowed" not in result.validation.errors[0].message.lower()
 
     def test_relative_path_resolves_against_data_dir(self) -> None:
         """blobs/input.csv should resolve under {data_dir}/blobs/."""
@@ -3726,7 +3696,7 @@ class TestSetSourcePathSecurity:
         )
 
         assert result.success is False
-        assert "path" in result.data["error"].lower()
+        assert "path" in result.validation.errors[0].message.lower()
 
     def test_symlink_from_own_blob_subtree_to_other_session_fails(self, tmp_path: Path) -> None:
         own_root = tmp_path / "blobs" / "attacker-session"
@@ -3835,9 +3805,9 @@ class TestDiscoveryTools:
         )
 
         assert result.success is False
-        assert result.data["error_code"] == "credential_unavailable"
-        assert "azure_prompt_shield" not in result.data["error"]
-        assert "composer_hints" not in result.data
+        assert result.validation.errors[0].error_code == "credential_unavailable"
+        assert "azure_prompt_shield" not in result.validation.errors[0].message
+        assert result.data is None
 
     def test_get_plugin_assistance_rejects_snapshot_unavailable_plugin(self) -> None:
         catalog = _mock_catalog()
@@ -3856,9 +3826,9 @@ class TestDiscoveryTools:
         )
 
         assert result.success is False
-        assert result.data["error_code"] == "credential_unavailable"
-        assert "azure_prompt_shield" not in result.data["error"]
-        assert "composer_hints" not in result.data
+        assert result.validation.errors[0].error_code == "credential_unavailable"
+        assert "azure_prompt_shield" not in result.validation.errors[0].message
+        assert result.data is None
 
     def test_get_expression_grammar_is_static(self) -> None:
         grammar = get_expression_grammar()
@@ -5070,8 +5040,8 @@ class TestBlobTools:
         )
 
         assert result.success is False
-        assert "not a valid UUID" in result.data["error"]
-        assert sentinel not in result.data["error"]
+        assert "not a valid UUID" in result.validation.errors[0].message
+        assert sentinel not in result.validation.errors[0].message
 
     def test_get_blob_metadata_not_found_does_not_echo_blob_id(self) -> None:
         from uuid import uuid4
@@ -5088,8 +5058,8 @@ class TestBlobTools:
         )
 
         assert result.success is False
-        assert "not found" in result.data["error"].lower()
-        assert missing_blob_id not in result.data["error"]
+        assert "not found" in result.validation.errors[0].message.lower()
+        assert missing_blob_id not in result.validation.errors[0].message
 
     def test_get_blob_metadata_wrong_session_returns_failure(self) -> None:
         """IDOR at tool layer: blob belongs to session A, caller is session B."""
@@ -5378,8 +5348,8 @@ class TestBlobTools:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "blob_ref" in result.data["error"]
-        assert "set_source_from_blob" in result.data["error"]
+        assert "blob_ref" in result.validation.errors[0].message
+        assert "set_source_from_blob" in result.validation.errors[0].message
 
     def test_set_source_from_blob_gets_prior_validation(self) -> None:
         """Blob mutation tools must populate prior_validation for validation delta."""
@@ -5837,8 +5807,8 @@ class TestDeleteBlobActiveRunGuard:
             )
 
             assert result.success is False
-            assert operation_id in result.data["error"]
-            assert "session fork" in result.data["error"].lower()
+            assert operation_id in result.validation.errors[0].message
+            assert "session fork" in result.validation.errors[0].message.lower()
             assert self.storage_path.read_bytes() == b"a,b\n1,2"
 
     @pytest.mark.parametrize("fork_status", ["completed", "failed"])
@@ -5885,7 +5855,7 @@ class TestDeleteBlobActiveRunGuard:
                 session_operation_context=blob_operation_context,
             )
             assert result.success is False
-            assert "active run" in result.data["error"].lower()
+            assert "active run" in result.validation.errors[0].message.lower()
             assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_rejected_when_running_run_exists_without_link(self) -> None:
@@ -5906,7 +5876,7 @@ class TestDeleteBlobActiveRunGuard:
                 session_operation_context=blob_operation_context,
             )
             assert result.success is False
-            assert "active run" in result.data["error"].lower()
+            assert "active run" in result.validation.errors[0].message.lower()
             assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_succeeds_when_active_run_uses_different_source(self) -> None:
@@ -5963,7 +5933,7 @@ class TestDeleteBlobActiveRunGuard:
                 session_operation_context=blob_operation_context,
             )
             assert result.success is False
-            assert "active run" in result.data["error"].lower()
+            assert "active run" in result.validation.errors[0].message.lower()
             assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_succeeds_when_completed_run_exists_without_link(self) -> None:
@@ -6003,7 +5973,7 @@ class TestDeleteBlobActiveRunGuard:
                 session_operation_context=blob_operation_context,
             )
             assert result.success is False
-            assert "active run" in result.data["error"].lower()
+            assert "active run" in result.validation.errors[0].message.lower()
             assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_rejected_when_running_run_linked(self) -> None:
@@ -6265,7 +6235,7 @@ class TestUpdateBlobQuota:
                     **blob_provenance,
                 )
             assert result.success is False
-            assert "quota" in result.data["error"].lower()
+            assert "quota" in result.validation.errors[0].message.lower()
 
     def test_update_exceeding_quota_preserves_old_content(self) -> None:
         from unittest.mock import patch
@@ -6583,7 +6553,7 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
             with patch.object(BlobReplacementCoordinator, "_remove", side_effect=OSError("cleanup-fault")) as cleanup:
                 result = self._update(authority, context, provenance, quota=1 if rejection == "quota" else 1000)
             assert result.success is False
-            assert ("quota" if rejection == "quota" else "fork") in result.data["error"]
+            assert ("quota" if rejection == "quota" else "fork") in result.validation.errors[0].message
             cleanup.assert_not_called()
             self._assert_settled(self.original_content)
 
@@ -7001,7 +6971,9 @@ class TestUpdateBlobQuotaRollbackDivergence:
 
             # Clean failure result — no exception, no divergence.
             assert result.success is False, f"Expected quota failure result, got {result!r}"
-            assert "quota" in result.data["error"].lower(), f"Quota failure message missing from error: {result.data['error']!r}"
+            assert "quota" in result.validation.errors[0].message.lower(), (
+                f"Quota failure message missing from error: {result.validation.errors[0].message!r}"
+            )
             # Tripwire must not have fired — no write to storage_path.
             assert tripwire_hits == [], f"Pre-replace write to storage_path detected (atomic-rename regression): {tripwire_hits}"
             # Storage unchanged.
@@ -7041,7 +7013,7 @@ class TestUpdateBlobQuotaRollbackDivergence:
                 )
 
             assert result.success is False, "Quota-exceeded must return failure, not success"
-            assert "quota" in result.data["error"].lower()
+            assert "quota" in result.validation.errors[0].message.lower()
             # File must be restored to original content.
             assert self.storage_path.read_bytes() == self.original_content, (
                 "File was not rolled back after quota-exceeded with successful rollback"
@@ -7312,10 +7284,10 @@ class TestSecretTools:
 
         assert result.success is False
         assert result.updated_state is r1.updated_state
-        assert "csv" in result.data["error"]
-        assert "path" in result.data["error"]
-        assert "OPENROUTER_API_KEY" in result.data["error"]
-        assert "only credential-bearing fields" in result.data["error"]
+        assert "csv" in result.validation.errors[0].message
+        assert "path" in result.validation.errors[0].message
+        assert "OPENROUTER_API_KEY" in result.validation.errors[0].message
+        assert "only credential-bearing fields" in result.validation.errors[0].message
 
     def test_wire_secret_ref_rejects_node_non_credential_field(self) -> None:
         """wire_secret_ref must enforce placement policy for node options."""
@@ -7356,10 +7328,10 @@ class TestSecretTools:
 
         assert result.success is False
         assert result.updated_state is r1.updated_state
-        assert "llm" in result.data["error"]
-        assert "template" in result.data["error"]
-        assert "OPENROUTER_API_KEY" in result.data["error"]
-        assert "only credential-bearing fields" in result.data["error"]
+        assert "llm" in result.validation.errors[0].message
+        assert "template" in result.validation.errors[0].message
+        assert "OPENROUTER_API_KEY" in result.validation.errors[0].message
+        assert "only credential-bearing fields" in result.validation.errors[0].message
 
     def test_wire_secret_ref_rejects_output_non_credential_field(self) -> None:
         """wire_secret_ref must enforce placement policy for output options."""
@@ -7397,10 +7369,10 @@ class TestSecretTools:
 
         assert result.success is False
         assert result.updated_state is r1.updated_state
-        assert "csv" in result.data["error"]
-        assert "path" in result.data["error"]
-        assert "OPENROUTER_API_KEY" in result.data["error"]
-        assert "only credential-bearing fields" in result.data["error"]
+        assert "csv" in result.validation.errors[0].message
+        assert "path" in result.validation.errors[0].message
+        assert "OPENROUTER_API_KEY" in result.validation.errors[0].message
+        assert "only credential-bearing fields" in result.validation.errors[0].message
 
     def test_wire_secret_ref_without_service_returns_failure(self) -> None:
         state = _empty_state()
@@ -7607,8 +7579,8 @@ class TestSecretWiringAuthorization:
         )
         assert result.success is False
         assert result.updated_state is state
-        assert "OPENROUTER_API_KEY" in result.data["error"]
-        assert "secret_wiring_allowlist" in result.data["error"]
+        assert "OPENROUTER_API_KEY" in result.validation.errors[0].message
+        assert "secret_wiring_allowlist" in result.validation.errors[0].message
         opts = deep_thaw(_default_source(result.updated_state).options)
         assert "api_key" not in opts
 
@@ -7733,8 +7705,8 @@ class TestSecretWiringAuthorization:
         )
         assert result.success is False
         # The denial is the authorization denial, not the placement denial.
-        assert "secret_wiring_allowlist" in result.data["error"]
-        assert "only credential-bearing fields" not in result.data["error"]
+        assert "secret_wiring_allowlist" in result.validation.errors[0].message
+        assert "only credential-bearing fields" not in result.validation.errors[0].message
 
 
 class TestSecretToolsArgumentValidation:
@@ -7770,9 +7742,9 @@ class TestSecretToolsArgumentValidation:
             validate_arguments=True,
         )
         assert result.success is False
-        assert "Invalid arguments for tool 'validate_secret_ref'" in result.data["error"]
-        assert "type" in result.data["error"]
-        assert "42" not in result.data["error"]
+        assert "Invalid arguments for tool 'validate_secret_ref'" in result.validation.errors[0].message
+        assert "type" in result.validation.errors[0].message
+        assert "42" not in result.validation.errors[0].message
 
     def test_validate_secret_ref_rejects_extra_field(self) -> None:
         state = _empty_state()
@@ -7788,10 +7760,10 @@ class TestSecretToolsArgumentValidation:
             validate_arguments=True,
         )
         assert result.success is False
-        assert "Invalid arguments for tool 'validate_secret_ref'" in result.data["error"]
-        assert "unsupported" in result.data["error"]
-        assert "OPENROUTER_API_KEY" not in result.data["error"]
-        assert "value" not in result.data["error"]
+        assert "Invalid arguments for tool 'validate_secret_ref'" in result.validation.errors[0].message
+        assert "unsupported" in result.validation.errors[0].message
+        assert "OPENROUTER_API_KEY" not in result.validation.errors[0].message
+        assert "value" not in result.validation.errors[0].message
 
     def test_wire_secret_ref_wrong_type_for_name(self) -> None:
         state = _empty_state()
@@ -7807,9 +7779,9 @@ class TestSecretToolsArgumentValidation:
             validate_arguments=True,
         )
         assert result.success is False
-        assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]
-        assert "type" in result.data["error"]
-        assert "42" not in result.data["error"]
+        assert "Invalid arguments for tool 'wire_secret_ref'" in result.validation.errors[0].message
+        assert "type" in result.validation.errors[0].message
+        assert "42" not in result.validation.errors[0].message
 
     def test_wire_secret_ref_unknown_target_enum(self) -> None:
         state = _empty_state()
@@ -7825,9 +7797,9 @@ class TestSecretToolsArgumentValidation:
             validate_arguments=True,
         )
         assert result.success is False
-        assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]
-        assert "declared values" in result.data["error"]
-        assert "global" not in result.data["error"]
+        assert "Invalid arguments for tool 'wire_secret_ref'" in result.validation.errors[0].message
+        assert "declared values" in result.validation.errors[0].message
+        assert "global" not in result.validation.errors[0].message
 
     def test_wire_secret_ref_rejects_extra_field(self) -> None:
         state = _empty_state()
@@ -7848,10 +7820,10 @@ class TestSecretToolsArgumentValidation:
             validate_arguments=True,
         )
         assert result.success is False
-        assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]
-        assert "unsupported" in result.data["error"]
-        assert "OPENROUTER_API_KEY" not in result.data["error"]
-        assert "value" not in result.data["error"]
+        assert "Invalid arguments for tool 'wire_secret_ref'" in result.validation.errors[0].message
+        assert "unsupported" in result.validation.errors[0].message
+        assert "OPENROUTER_API_KEY" not in result.validation.errors[0].message
+        assert "value" not in result.validation.errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -7997,7 +7969,7 @@ class TestPatchSourceOptions:
             catalog,
         )
         assert result.success is False
-        assert "No source" in result.data["error"]
+        assert "No source" in result.validation.errors[0].message
         assert result.updated_state.version == 1
 
     def _blob_backed_state(self) -> CompositionState:
@@ -8055,7 +8027,7 @@ class TestPatchSourceOptions:
             catalog,
         )
         assert result.success is False
-        assert "blob-backed source" in result.data["error"]
+        assert "blob-backed source" in result.validation.errors[0].message
 
     def test_patch_source_options_rejects_blob_ref_patch_on_plain_source(self) -> None:
         """Manual blob identity injection is rejected even before a source is blob-backed."""
@@ -8068,7 +8040,7 @@ class TestPatchSourceOptions:
             catalog,
         )
         assert result.success is False
-        assert "Cannot patch 'blob_ref'" in result.data["error"]
+        assert "Cannot patch 'blob_ref'" in result.validation.errors[0].message
         assert _default_source(result.updated_state) is not None
         opts = deep_thaw(_default_source(result.updated_state).options)
         assert "blob_ref" not in opts
@@ -8091,7 +8063,7 @@ class TestPatchSourceOptions:
             catalog,
         )
         assert result.success is False
-        assert "Cannot patch 'blob_ref'" in result.data["error"]
+        assert "Cannot patch 'blob_ref'" in result.validation.errors[0].message
 
     def test_patch_source_options_allows_unrelated_keys_on_blob_backed_source(self) -> None:
         """Allow unrelated option patches on a blob-backed source.
@@ -8159,8 +8131,8 @@ class TestPatchSourceOptions:
             catalog,
         )
         assert result.success is False
-        assert "guaranteed_fields" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
+        assert "guaranteed_fields" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
         assert _default_source(result.updated_state) is not None
         opts = deep_thaw(_default_source(result.updated_state).options)
         assert "guaranteed_fields" not in opts["schema"]
@@ -8177,7 +8149,7 @@ class TestPatchSourceOptions:
             catalog,
         )
         assert result.success is False
-        assert "guaranteed_fields" in result.data["error"]
+        assert "guaranteed_fields" in result.validation.errors[0].message
 
     def test_patch_source_options_allows_echoed_guarantee_stamp(self) -> None:
         """A patch echoing the stored stamp verbatim asserts nothing new
@@ -8206,7 +8178,7 @@ class TestPatchSourceOptions:
             catalog,
         )
         assert result.success is False
-        assert "guaranteed_fields" in result.data["error"]
+        assert "guaranteed_fields" in result.validation.errors[0].message
         opts = deep_thaw(_default_source(result.updated_state).options)
         assert opts["schema"]["guaranteed_fields"] == ["colour"]
 
@@ -8342,10 +8314,10 @@ class TestPatchNodeOptions:
         assert result.success is False
         assert result.updated_state is with_node.updated_state
         assert result.updated_state.nodes[0].on_error == "discard"
-        assert "on_error is a node-level routing field" in result.data["error"]
-        assert "upsert_edge" in result.data["error"]
-        assert "edge_type='on_error'" in result.data["error"]
-        assert "Extra inputs are not permitted" not in result.data["error"]
+        assert "on_error is a node-level routing field" in result.validation.errors[0].message
+        assert "upsert_edge" in result.validation.errors[0].message
+        assert "edge_type='on_error'" in result.validation.errors[0].message
+        assert "Extra inputs are not permitted" not in result.validation.errors[0].message
 
     def test_patch_gate_options_rejects_on_error_with_node_level_guidance(self) -> None:
         state = _empty_state().with_node(
@@ -8375,8 +8347,8 @@ class TestPatchNodeOptions:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "upsert_node" in result.data["error"]
-        assert "upsert_edge" not in result.data["error"]
+        assert "upsert_node" in result.validation.errors[0].message
+        assert "upsert_edge" not in result.validation.errors[0].message
 
     def test_patch_node_options_unknown_node_fails(self) -> None:
         state = _empty_state()
@@ -8388,7 +8360,7 @@ class TestPatchNodeOptions:
             catalog,
         )
         assert result.success is False
-        assert "nonexistent" in result.data["error"]
+        assert "nonexistent" in result.validation.errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -8441,8 +8413,8 @@ class TestPatchOutputOptions:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+        assert result.data is None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.validation.errors[0].message
 
     def test_patch_output_options_rejects_literal_credential_value_without_mutating_state(self) -> None:
         state = self._state_with_output({"path": "/old.csv"})
@@ -8473,7 +8445,7 @@ class TestPatchOutputOptions:
             catalog,
         )
         assert result.success is False
-        assert "nonexistent" in result.data["error"]
+        assert "nonexistent" in result.validation.errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -8517,7 +8489,7 @@ class TestPatchOutputPathSecurity:
             data_dir="/data",
         )
         assert result.success is False
-        assert "path" in result.data["error"].lower()
+        assert "path" in result.validation.errors[0].message.lower()
 
     def test_traversal_attack_rejected(self) -> None:
         state = self._state_with_output({"path": "/data/outputs/test-session/ok.csv"})
@@ -8597,7 +8569,7 @@ class TestPatchOutputPathSecurity:
         )
 
         assert result.success is False
-        assert "path" in result.data["error"].lower()
+        assert "path" in result.validation.errors[0].message.lower()
 
     def test_sink_symlink_to_other_session_output_rejected(self, tmp_path: Path) -> None:
         from elspeth.web.composer.tools._common import _validate_sink_path
@@ -8841,7 +8813,7 @@ class TestTransformProviderConfigPathSecurity:
             data_dir="/data",
         )
         assert result.success is False
-        assert "managed identity" in result.data["error"].lower()
+        assert "managed identity" in result.validation.errors[0].message.lower()
 
     def test_patch_node_options_rejects_azure_search_managed_identity(self) -> None:
         state = _empty_state()
@@ -8882,7 +8854,7 @@ class TestTransformProviderConfigPathSecurity:
         )
 
         assert result.success is False
-        assert "managed identity" in result.data["error"].lower()
+        assert "managed identity" in result.validation.errors[0].message.lower()
 
     def test_set_pipeline_rejects_azure_search_managed_identity(self) -> None:
         state = _empty_state()
@@ -8921,7 +8893,7 @@ class TestTransformProviderConfigPathSecurity:
         }
         result = execute_tool("set_pipeline", args, state, catalog, data_dir="/data")
         assert result.success is False
-        assert "managed identity" in result.data["error"].lower()
+        assert "managed identity" in result.validation.errors[0].message.lower()
 
     def test_helper_allows_azure_search_api_key(self) -> None:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_policy
@@ -8953,7 +8925,7 @@ class TestTransformProviderConfigPathSecurity:
             data_dir="/data",
         )
         assert result.success is False
-        assert "persist_directory" in result.data["error"]
+        assert "persist_directory" in result.validation.errors[0].message
 
     def test_upsert_node_accepts_persist_directory_under_outputs(self) -> None:
         state = _empty_state()
@@ -9005,7 +8977,7 @@ class TestTransformProviderConfigPathSecurity:
             data_dir="/data",
         )
         assert result.success is False
-        assert "persist_directory" in result.data["error"]
+        assert "persist_directory" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_persist_directory_outside_allowed(self) -> None:
         """Parity: a bulk set_pipeline must reject an escaping transform path,
@@ -9042,7 +9014,7 @@ class TestTransformProviderConfigPathSecurity:
         }
         result = execute_tool("set_pipeline", args, state, catalog, data_dir="/data")
         assert result.success is False
-        assert "persist_directory" in result.data["error"]
+        assert "persist_directory" in result.validation.errors[0].message
 
 
 class TestTransformLlmRetryBudgetPolicy:
@@ -9135,7 +9107,7 @@ class TestTransformLlmRetryBudgetPolicy:
             data_dir="/data",
         )
         assert result.success is False
-        assert "sequential multi-query llm" in result.data["error"].lower()
+        assert "sequential multi-query llm" in result.validation.errors[0].message.lower()
 
     def test_patch_node_options_rejects_oversized_sequential_multi_query_retry_budget(self) -> None:
         catalog = self._catalog_with_llm()
@@ -9167,7 +9139,7 @@ class TestTransformLlmRetryBudgetPolicy:
             data_dir="/data",
         )
         assert result.success is False
-        assert "sequential multi-query llm" in result.data["error"].lower()
+        assert "sequential multi-query llm" in result.validation.errors[0].message.lower()
 
     def test_set_pipeline_rejects_default_sequential_multi_query_retry_budget(self) -> None:
         args = {
@@ -9204,7 +9176,7 @@ class TestTransformLlmRetryBudgetPolicy:
         }
         result = execute_tool("set_pipeline", args, _empty_state(), self._catalog_with_llm(), data_dir="/data")
         assert result.success is False
-        assert "sequential multi-query llm" in result.data["error"].lower()
+        assert "sequential multi-query llm" in result.validation.errors[0].message.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -9314,7 +9286,7 @@ def _assert_secret_wiring_contract_failure(
     assert result.updated_state.version == original_state.version
     assert result.data is not None
     assert field in result.data["credential_fields"]
-    assert "list_secret_refs -> validate_secret_ref -> wire_secret_ref" in result.data["error"]
+    assert "list_secret_refs -> validate_secret_ref -> wire_secret_ref" in result.validation.errors[0].message
     assert literal_value not in repr(result.to_dict())
 
 
@@ -9347,7 +9319,7 @@ class TestCredentialRejectionAdvertisesInlineForm:
         )
         assert result is not None
         assert result.success is False
-        error = result.data["error"]
+        error = result.validation.errors[0].message
         # Inline form must appear (and appear before the post-hoc form).
         assert "secret_ref" in error
         assert "{secret_ref: NAME}" in error or "{secret_ref:" in error
@@ -9371,6 +9343,8 @@ class TestCredentialRejectionAdvertisesInlineForm:
         )
         assert result is not None
         repair = result.data["repair"]
+        assert set(result.to_dict()["data"]) == {"credential_fields", "components", "repair"}
+        assert result.validation.errors[0].component == "rejected_mutation"
         # Old key must be gone — no compatibility shim (CONTRIBUTING.md §Code Standards).
         assert "required_tool_sequence" not in repair
         # New shape: two separately-keyed forms.
@@ -9403,7 +9377,7 @@ class TestCredentialRejectionAdvertisesInlineForm:
             options={"api_key": "literal-secret"},
         )
         assert result is not None
-        assert "list_secret_refs -> validate_secret_ref -> wire_secret_ref" in result.data["error"]
+        assert "list_secret_refs -> validate_secret_ref -> wire_secret_ref" in result.validation.errors[0].message
 
     def test_multiple_fields_listed_with_single_inline_example_form(self) -> None:
         """When multiple credential fields are violated, the example_options
@@ -9564,8 +9538,8 @@ class TestSetPipeline:
         result = execute_tool("set_pipeline", args, state, _mock_catalog())
 
         assert result.success is False
-        assert result.data is not None
-        assert result.data["error_code"] == "structural_node_plugin_forbidden"
+        assert result.data is None
+        assert result.validation.errors[0].error_code == "structural_node_plugin_forbidden"
         assert state.nodes == ()
         assert result.updated_state.nodes == ()
 
@@ -9686,7 +9660,7 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        error = result.data["error"]
+        error = result.validation.errors[0].message
         assert error.startswith("Output 'main': Missing options")
         assert '"sink_name": "main"' in error
         assert '"plugin": "json"' in error
@@ -9706,7 +9680,7 @@ class TestSetPipeline:
         result = execute_tool("set_pipeline", args, state, catalog, data_dir="/data")
 
         assert result.success is False
-        error = result.data["error"]
+        error = result.validation.errors[0].message
         assert '"plugin": "text"' in error
         assert '"path": "outputs/main.txt"' in error
         assert '"field": "line_text"' in error
@@ -9798,9 +9772,7 @@ class TestSetPipeline:
         assert first.component == "rejected_mutation"
         assert first.severity == "high"
         assert "missing options" in first.message.lower()
-        # data.error mirrors the leading entry's message verbatim so the
-        # two channels stay in sync.
-        assert first.message == result.data["error"]
+        assert result.data is None
         # The rejection entry is the WHOLE envelope: the unchanged state's
         # errors are withheld, not merely demoted.
         assert [e.component for e in result.validation.errors] == ["rejected_mutation"]
@@ -9896,8 +9868,8 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        error = result.data["error"]
+        assert result.data is None
+        error = result.validation.errors[0].message
         assert "Output 'main'" in error
         assert "table" in error
         assert "placeholder" in error
@@ -9983,9 +9955,9 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        assert "resolved_prompt_template_hash" in result.data["error"]
-        assert "runtime-owned" in result.data["error"]
+        assert result.data is None
+        assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+        assert "runtime-owned" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_output_interpretation_requirements_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -9996,8 +9968,8 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+        assert result.data is None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.validation.errors[0].message
 
     def test_upsert_node_rejects_user_supplied_llm_runtime_hash_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -10020,9 +9992,9 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        assert "resolved_prompt_template_hash" in result.data["error"]
-        assert "runtime-owned" in result.data["error"]
+        assert result.data is None
+        assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+        assert "runtime-owned" in result.validation.errors[0].message
 
     def test_patch_node_options_rejects_user_supplied_llm_runtime_hash_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -10056,9 +10028,9 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is created.updated_state
-        assert result.data is not None
-        assert "resolved_prompt_template_hash" in result.data["error"]
-        assert "runtime-owned" in result.data["error"]
+        assert result.data is None
+        assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+        assert "runtime-owned" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_user_supplied_resolved_llm_reviews_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -10079,10 +10051,10 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert result.data is None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_upsert_node_rejects_user_supplied_resolved_llm_reviews_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -10105,10 +10077,10 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert result.data is None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_patch_node_options_rejects_user_supplied_resolved_llm_reviews_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -10142,10 +10114,10 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is created.updated_state
-        assert result.data is not None
-        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert result.data is None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_patch_node_options_preserves_existing_resolved_llm_reviews_on_unrelated_patch(self) -> None:
         state = _empty_state()
@@ -10209,11 +10181,11 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "web_scrape" in result.data["error"]
-        assert "http.abuse_contact" in result.data["error"]
-        assert "ANY_SECRET" in result.data["error"]
-        assert "only credential-bearing fields" in result.data["error"]
-        assert "api_key" in result.data["error"]
+        assert "web_scrape" in result.validation.errors[0].message
+        assert "http.abuse_contact" in result.validation.errors[0].message
+        assert "ANY_SECRET" in result.validation.errors[0].message
+        assert "only credential-bearing fields" in result.validation.errors[0].message
+        assert "api_key" in result.validation.errors[0].message
 
     def test_upsert_node_rejects_secret_ref_in_non_credential_field(self) -> None:
         state = _empty_state()
@@ -10243,10 +10215,10 @@ class TestSetPipeline:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "web_scrape" in result.data["error"]
-        assert "http.scraping_reason" in result.data["error"]
-        assert "ANY_SECRET" in result.data["error"]
-        assert "only credential-bearing fields" in result.data["error"]
+        assert "web_scrape" in result.validation.errors[0].message
+        assert "http.scraping_reason" in result.validation.errors[0].message
+        assert "ANY_SECRET" in result.validation.errors[0].message
+        assert "only credential-bearing fields" in result.validation.errors[0].message
 
     def test_upsert_node_rejects_literal_credential_value_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -10338,8 +10310,8 @@ class TestSetPipeline:
         assert result.success is False
         assert _default_source(result.updated_state) is None
         assert result.updated_state.version == 1
-        assert "set_source_from_blob" in result.data["error"]
-        assert "source.inline_blob" in result.data["error"]
+        assert "set_source_from_blob" in result.validation.errors[0].message
+        assert "source.inline_blob" in result.validation.errors[0].message
 
     def test_set_pipeline_binds_existing_blob_instead_of_header_only_sibling(self, tmp_path: Path) -> None:
         """Complete-pipeline writes must preserve the user-selected uploaded blob."""
@@ -10492,8 +10464,8 @@ class TestSetPipeline:
 
         assert result.success is False
         assert _default_source(result.updated_state) is None
-        assert "header-only inline CSV" in result.data["error"]
-        assert uploaded_id in result.data["error"]
+        assert "header-only inline CSV" in result.validation.errors[0].message
+        assert uploaded_id in result.validation.errors[0].message
 
     def test_set_pipeline_header_only_inline_csv_check_does_not_read_full_candidate(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -10567,8 +10539,8 @@ class TestSetPipeline:
             )
 
         assert result.success is False
-        assert "header-only inline CSV" in result.data["error"]
-        assert uploaded_id in result.data["error"]
+        assert "header-only inline CSV" in result.validation.errors[0].message
+        assert uploaded_id in result.validation.errors[0].message
 
     def test_set_pipeline_header_only_inline_csv_decode_failure_escalates(self, tmp_path: Path) -> None:
         """Non-UTF-8 ready CSV candidates should raise audit integrity, not UnicodeDecodeError."""
@@ -10673,8 +10645,10 @@ class TestSetPipeline:
             )
 
         assert result.success is False
-        assert result.data["error"] == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
-        assert "x" * 32 not in result.data["error"]
+        assert (
+            result.validation.errors[0].message == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
+        )
+        assert "x" * 32 not in result.validation.errors[0].message
 
     @pytest.mark.parametrize(
         "unsafe_content",
@@ -10735,8 +10709,10 @@ class TestSetPipeline:
             )
 
         assert result.success is False
-        assert result.data["error"] == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
-        assert malformed_content not in result.data["error"]
+        assert (
+            result.validation.errors[0].message == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
+        )
+        assert malformed_content not in result.validation.errors[0].message
 
     def test_set_pipeline_candidate_csv_parser_error_escalates_as_integrity_failure(self, tmp_path: Path) -> None:
         from datetime import UTC, datetime
@@ -11104,7 +11080,7 @@ class TestSetPipeline:
             )
 
         assert result.success is False
-        assert expected_error in result.data["error"]
+        assert expected_error in result.validation.errors[0].message
         assert reads == expected_reads
 
     def test_set_pipeline_unknown_source_plugin_fails(self) -> None:
@@ -11115,7 +11091,7 @@ class TestSetPipeline:
         args["source"]["plugin"] = "nonexistent"
         result = execute_tool("set_pipeline", args, state, catalog)
         assert result.success is False
-        assert "source" in result.data["error"].lower()
+        assert "source" in result.validation.errors[0].message.lower()
 
     def test_set_pipeline_unknown_node_plugin_fails(self) -> None:
         state = _empty_state()
@@ -11139,7 +11115,7 @@ class TestSetPipeline:
         args["nodes"][0]["plugin"] = "badplugin"
         result = execute_tool("set_pipeline", args, state, catalog)
         assert result.success is False
-        assert "transform" in result.data["error"].lower()
+        assert "transform" in result.validation.errors[0].message.lower()
 
     def test_set_pipeline_unknown_sink_plugin_fails(self) -> None:
         state = _empty_state()
@@ -11163,7 +11139,7 @@ class TestSetPipeline:
         args["outputs"][0]["plugin"] = "badsink"
         result = execute_tool("set_pipeline", args, state, catalog)
         assert result.success is False
-        assert "sink" in result.data["error"].lower()
+        assert "sink" in result.validation.errors[0].message.lower()
 
     def test_set_pipeline_missing_required_field_fails(self) -> None:
         """Missing required field is now a Tier-3 ToolArgumentError.
@@ -11175,7 +11151,7 @@ class TestSetPipeline:
         :class:`ToolArgumentError` BEFORE any handler-side spec
         construction.  Previously the omission fell through to the
         ``try: SourceSpec(...)``/``except KeyError`` branch and was
-        reported via ``"Invalid pipeline spec"`` in ``result.data["error"]``;
+        reported via ``"Invalid pipeline spec"`` in ``result.validation.errors[0].message``;
         that branch was removed in Task 14 because Pydantic now catches
         the type errors upstream.
 
@@ -11382,7 +11358,7 @@ class TestSetPipeline:
         )
         result = execute_tool("set_pipeline", args, state, catalog)
         assert result.success is False
-        assert "Forbidden construct" in result.data["error"]
+        assert "Forbidden construct" in result.validation.errors[0].message
         assert result.updated_state.version == 1
 
     def test_set_pipeline_gate_malformed_condition_rejected(self) -> None:
@@ -11405,7 +11381,7 @@ class TestSetPipeline:
         )
         result = execute_tool("set_pipeline", args, state, catalog)
         assert result.success is False
-        assert "Invalid gate condition syntax" in result.data["error"]
+        assert "Invalid gate condition syntax" in result.validation.errors[0].message
 
     def test_value_transform_bad_expression_error_code_parity(self) -> None:
         """Both authoring routes code the same prevalidation failure (A6).
@@ -11460,8 +11436,8 @@ class TestSetPipeline:
         pipeline_result = execute_tool("set_pipeline", args, _empty_state(), catalog)
         assert pipeline_result.success is False
 
-        assert pipeline_result.data["error_code"] == "plugin_options_invalid"
-        assert node_result.data.get("error_code") == pipeline_result.data["error_code"]
+        assert pipeline_result.validation.errors[0].error_code == "plugin_options_invalid"
+        assert node_result.validation.errors[0].error_code == pipeline_result.validation.errors[0].error_code
 
     def test_set_pipeline_gate_valid_condition_accepted(self) -> None:
         """set_pipeline accepts gate nodes with valid conditions."""
@@ -11697,7 +11673,7 @@ class TestClearSource:
         catalog = _mock_catalog()
         result = execute_tool("clear_source", {}, state, catalog)
         assert result.success is False
-        assert "No source" in result.data["error"]
+        assert "No source" in result.validation.errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -12375,23 +12351,24 @@ class TestGetPluginAssistance:
             catalog,
         )
         assert result.success is False
-        assert result.data["error_code"] == "plugin_not_installed"
+        assert result.validation.errors[0].error_code == "plugin_not_installed"
 
     def test_invalid_plugin_type_returns_failure(self) -> None:
         """plugin_type is validated up-front; mistyped value surfaces as failure."""
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "get_plugin_assistance",
-            {
-                "plugin_type": "transformer",  # typo
-                "plugin_name": "web_scrape",
-            },
-            state,
-            catalog,
-        )
-        assert result.success is False
-        assert "transformer" in result.data["error"]
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        with pytest.raises(ToolArgumentError):
+            execute_tool(
+                "get_plugin_assistance",
+                {
+                    "plugin_type": "transformer",  # typo
+                    "plugin_name": "web_scrape",
+                },
+                state,
+                catalog,
+            )
 
     def test_dispatches_to_source_family(self) -> None:
         """plugin_type='source' looks up the plugin via get_source_by_name."""
@@ -14553,8 +14530,8 @@ class TestPrevalidatePluginOptions:
         )
 
         assert result.success is False
-        assert result.data is not None
-        messages = result.data["error"]
+        assert result.data is None
+        messages = result.validation.errors[0].message
         assert "required_input_fields" in messages
         assert "batch-aware" in messages
 
@@ -14593,8 +14570,8 @@ class TestPrevalidatePluginOptions:
         )
 
         assert result.success is False
-        assert result.data is not None
-        messages = result.data["error"]
+        assert result.data is None
+        messages = result.validation.errors[0].message
         assert "batch_replicate" in messages
         assert "aggregation" in messages
         assert "output_mode: transform" in messages
@@ -15170,7 +15147,7 @@ class TestGetBlobContentGuards:
                 session_operation_context=blob_operation_context,
             )
         assert result.success is False
-        assert "pending" in result.data["error"].lower() or "not readable" in result.data["error"].lower()
+        assert "pending" in result.validation.errors[0].message.lower() or "not readable" in result.validation.errors[0].message.lower()
 
     def test_error_blob_refused(self) -> None:
         """Status guard — error blobs belong to failed runs and are not trustworthy."""
@@ -15192,7 +15169,7 @@ class TestGetBlobContentGuards:
                 session_operation_context=blob_operation_context,
             )
         assert result.success is False
-        assert "error" in result.data["error"].lower() or "not readable" in result.data["error"].lower()
+        assert "error" in result.validation.errors[0].message.lower() or "not readable" in result.validation.errors[0].message.lower()
 
     def test_hash_mismatch_raises_blob_integrity_error(self) -> None:
         """Integrity guard — corruption/tampering must ESCALATE, not return failure.
@@ -15314,7 +15291,7 @@ class TestGetBlobContentGuards:
                 session_operation_context=blob_operation_context,
             )
         assert result.success is False
-        assert "utf-8" in result.data["error"].lower()
+        assert "utf-8" in result.validation.errors[0].message.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -15792,8 +15769,8 @@ class TestUpdateBlobActiveRunGuard:
             )
 
         assert result.success is False
-        assert operation_id in result.data["error"]
-        assert "session fork" in result.data["error"].lower()
+        assert operation_id in result.validation.errors[0].message
+        assert "session fork" in result.validation.errors[0].message.lower()
         assert self.storage_path.read_bytes() == self.original_content
 
     @pytest.mark.parametrize("fork_status", ["completed", "failed"])
@@ -15882,7 +15859,7 @@ class TestUpdateBlobActiveRunGuard:
             )
 
         assert result.success is False
-        assert "referenced by the current composition" in result.data["error"]
+        assert "referenced by the current composition" in result.validation.errors[0].message
         assert self.storage_path.read_bytes() == self.original_content
         with self.engine.begin() as conn:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
@@ -15950,7 +15927,7 @@ class TestUpdateBlobActiveRunGuard:
                 **blob_provenance,
             )
         assert result.success is False
-        assert "active run" in result.data["error"].lower()
+        assert "active run" in result.validation.errors[0].message.lower()
         assert self.storage_path.read_bytes() == self.original_content, "File must not change when the active-run guard blocks the update"
 
     def test_update_rejected_when_running_run_linked(self) -> None:
@@ -15972,7 +15949,7 @@ class TestUpdateBlobActiveRunGuard:
                 **blob_provenance,
             )
         assert result.success is False
-        assert "active run" in result.data["error"].lower()
+        assert "active run" in result.validation.errors[0].message.lower()
         assert self.storage_path.read_bytes() == self.original_content
 
     def test_update_succeeds_when_completed_run_linked(self) -> None:
@@ -16017,7 +15994,7 @@ class TestUpdateBlobActiveRunGuard:
                 **blob_provenance,
             )
         assert result.success is False
-        assert "active run" in result.data["error"].lower()
+        assert "active run" in result.validation.errors[0].message.lower()
         assert self.storage_path.read_bytes() == self.original_content
 
     def test_update_rejected_pre_link_window_path_source(self) -> None:
@@ -16043,7 +16020,7 @@ class TestUpdateBlobActiveRunGuard:
                 **blob_provenance,
             )
         assert result.success is False
-        assert "active run" in result.data["error"].lower()
+        assert "active run" in result.validation.errors[0].message.lower()
         assert self.storage_path.read_bytes() == self.original_content
 
     def test_update_succeeds_when_active_run_references_different_source(self) -> None:
@@ -16448,8 +16425,8 @@ class TestInspectSourceTool:
                 session_operation_context=blob_operation_context,
             )
         assert result.success is False
-        # Failure messages live in result.data["error"] (set by _failure_result).
-        assert "pending" in result.data["error"].lower()
+        # Failure messages live in result.validation.errors[0].message (set by _failure_result).
+        assert "pending" in result.validation.errors[0].message.lower()
 
     def test_missing_blob_returns_failure(self) -> None:
         from uuid import uuid4
@@ -16467,7 +16444,7 @@ class TestInspectSourceTool:
                 session_operation_context=blob_operation_context,
             )
         assert result.success is False
-        assert "not found" in result.data["error"].lower()
+        assert "not found" in result.validation.errors[0].message.lower()
 
     def test_without_session_context_returns_failure(self) -> None:
         result = execute_tool(
@@ -16579,10 +16556,10 @@ class TestInspectSourceTool:
             )
 
         assert result.success is False
-        assert "not a valid UUID" in result.data["error"]
-        assert "upload" in result.data["error"]
-        assert "list_blobs" in result.data["error"]
-        assert "not found" not in result.data["error"].lower()
+        assert "not a valid UUID" in result.validation.errors[0].message
+        assert "upload" in result.validation.errors[0].message
+        assert "list_blobs" in result.validation.errors[0].message
+        assert "not found" not in result.validation.errors[0].message.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -19252,7 +19229,7 @@ class TestUpsertNodeRowUnion:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
-        assert "timeout_seconds" in result.data["error"]
+        assert "timeout_seconds" in result.validation.errors[0].message
 
     def test_patch_node_options_cannot_add_options_to_row_union(self) -> None:
         state = _empty_state().with_node(_row_union_node_spec())
@@ -19548,9 +19525,9 @@ class TestStructuralBarrierTimeoutBoundary:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data is not None
-        assert result.data["error_code"] == "coalesce_config_invalid"
-        assert "options" in result.data["error"]
+        assert result.data is None
+        assert result.validation.errors[0].error_code == "coalesce_config_invalid"
+        assert "options" in result.validation.errors[0].message
         assert state.nodes == ()
 
     @pytest.mark.parametrize("invalid_timeout", [0, -1, float("nan"), float("inf")])
@@ -19775,7 +19752,7 @@ class TestStructuralNodeTypeProbedAsPlugin:
         )
 
         assert result.success is False
-        message = result.data["error"]
+        message = result.validation.errors[0].message
         assert "not a plugin" in message
         for fragment in expected_fragments:
             assert fragment in message, f"teaching message for {name!r} must mention {fragment!r}: {message}"
@@ -19784,16 +19761,16 @@ class TestStructuralNodeTypeProbedAsPlugin:
     def test_get_plugin_schema_rejects_unhashable_name(self, name: object) -> None:
         policy_catalog, snapshot = self._trained_pair()
 
-        result = execute_tool(
-            "get_plugin_schema",
-            {"plugin_type": "transform", "name": name},
-            _empty_state(),
-            policy_catalog,
-            plugin_snapshot=snapshot,
-        )
+        from elspeth.web.composer.protocol import ToolArgumentError
 
-        assert result.success is False
-        assert result.data["error_code"] == "plugin_not_installed"
+        with pytest.raises(ToolArgumentError):
+            execute_tool(
+                "get_plugin_schema",
+                {"plugin_type": "transform", "name": name},
+                _empty_state(),
+                policy_catalog,
+                plugin_snapshot=snapshot,
+            )
 
 
 class TestExplainGateRouteLabels:

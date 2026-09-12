@@ -936,16 +936,19 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
     """Map caller prose to an operator-owned, bounded expectation."""
     if type(value) is not str or not value or len(value) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS:
         return "a valid value"
-    if value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
-        return value
-
     lowered = value.casefold()
     if "object conforming to" in lowered:
-        return (
+        schema_expectation = (
             _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS[argument]
             if argument in _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS
             else "an object conforming to the declared argument schema"
         )
+        return (
+            f"{schema_expectation}. Match the tool's declared JSON types. "
+            "Supply object and array fields as actual JSON objects and arrays, not strings containing JSON."
+        )
+    if value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
+        return value
     if "per session per utc day" in lowered:
         return "within the per session per UTC day interpretation request limit"
     if "per term" in lowered and ("at most" in lowered or "limit" in lowered):

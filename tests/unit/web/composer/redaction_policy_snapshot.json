@@ -30,7 +30,7 @@
     "shape": "declarative"
   },
   "get_blob_content": {
-    "hash": "3201042b22ad5460705cc1bffc4539829138576a4f82971e8c32670b9f0f74bb",
+    "hash": "57f71f697c55cd53cb54e1d4302dd587ae79ca9b269cf9963186e958f81f5441",
     "sensitive_path_count": 2,
     "shape": "type_driven"
   },

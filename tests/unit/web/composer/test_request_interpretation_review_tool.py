@@ -46,7 +46,7 @@ from elspeth.contracts.composer_interpretation import (
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.proposals import build_tool_proposal_summary
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import REQUEST_INTERPRETATION_REVIEW_KIND_VALUES, ToolArgumentError
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -2155,20 +2155,21 @@ async def test_12_llm_draft_metacharacters_raise_no_db_write(service: SessionSer
 # --------------------------------------------------------------------------- #
 
 
-def test_07_proposal_summary_text() -> None:
+@pytest.mark.parametrize("kind", REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)
+def test_07_proposal_summary_text(kind: str) -> None:
     """Spec test 7: build_tool_proposal_summary returns the expected text
     and ``affects=('interpretation',)``."""
     summary = build_tool_proposal_summary(
         tool_name="request_interpretation_review",
         arguments={
             "affected_node_id": "rate_node",
-            "kind": "vague_term",
+            "kind": kind,
             "user_term": "cool",
             "llm_draft": "Visually appealing.",
         },
         redacted_arguments={
             "affected_node_id": "rate_node",
-            "kind": "vague_term",
+            "kind": kind,
             "user_term": "cool",
             "llm_draft": "Visually appealing.",
         },
@@ -2176,7 +2177,10 @@ def test_07_proposal_summary_text() -> None:
     assert summary.summary == "Surface an interpretation draft for user review."
     assert "cool" not in summary.summary
     assert summary.affects == ("interpretation",)
-    assert "subjective" in summary.rationale.lower() or "underspecified" in summary.rationale.lower()
+    assert "interpretation or assumption" in summary.rationale
+    assert "accepted into the pipeline" in summary.rationale
+    assert "subjective" not in summary.rationale
+    assert "prompt template" not in summary.rationale
 
 
 # --------------------------------------------------------------------------- #

@@ -251,10 +251,10 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
         )
 
         assert result.success is False
-        assert "not a valid UUID" in result.data["error"]
-        assert "upload" in result.data["error"]
-        assert "list_blobs" in result.data["error"]
-        assert "not found" not in result.data["error"].lower()
+        assert "not a valid UUID" in result.validation.errors[0].message
+        assert "upload" in result.validation.errors[0].message
+        assert "list_blobs" in result.validation.errors[0].message
+        assert "not found" not in result.validation.errors[0].message.lower()
 
     def test_valid_arguments_dispatch_normally(self, tmp_path: Path) -> None:
         """Functional smoke: a valid call wires the blob as the source.
@@ -444,7 +444,7 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
             ctx,
         )
         assert forged_authoring_patch.success is False
-        assert SOURCE_AUTHORING_KEY in forged_authoring_patch.data["error"]
+        assert SOURCE_AUTHORING_KEY in forged_authoring_patch.validation.errors[0].message
 
         patch_result = _execute_patch_source_options(
             {"patch": {"path": str(tmp_path / "other.txt")}},
@@ -452,7 +452,7 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
             ctx,
         )
         assert patch_result.success is False
-        assert "Cannot patch" in patch_result.data["error"]
+        assert "Cannot patch" in patch_result.validation.errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -1100,7 +1100,7 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert "resolved" in result.data["error"]
+        assert "resolved" in result.validation.errors[0].message
 
     def test_rebind_echoing_stored_source_authoring_is_accepted_with_note(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         ctx, state, options = self._bound_source(tmp_path, operation_scopes)
@@ -1137,4 +1137,4 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message

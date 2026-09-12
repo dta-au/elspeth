@@ -814,7 +814,7 @@ files:
     Mapping[str, Any]: 1
     boundary: 2
   src/elspeth/web/composer/service.py:
-    Mapping[str, Any]: 23
+    Mapping[str, Any]: 22
     Mapping[str, object]: 1
     boundary: 1
     dict[str, Any]: 39
@@ -842,12 +842,12 @@ files:
     Mapping[str, Any]: 6
     dict[str, Any]: 6
   src/elspeth/web/composer/tools/_registry.py:
-    Mapping[str, Any]: 1
+    Mapping[str, Any]: 2
   src/elspeth/web/composer/tools/blobs.py:
     boundary: 3
-    dict[str, Any]: 14
+    dict[str, Any]: 12
   src/elspeth/web/composer/tools/declarations.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 4
   src/elspeth/web/composer/tools/generation.py:
     Mapping[str, Any]: 19
     boundary: 4
@@ -861,7 +861,7 @@ files:
   src/elspeth/web/composer/tools/secrets.py:
     dict[str, Any]: 3
   src/elspeth/web/composer/tools/sessions.py:
-    Mapping[str, Any]: 12
+    Mapping[str, Any]: 13
     boundary: 1
     dict[str, Any]: 6
   src/elspeth/web/composer/tools/sources.py:
@@ -869,7 +869,7 @@ files:
     dict[str, Any]: 13
   src/elspeth/web/composer/tools/transforms.py:
     Mapping[str, Any]: 7
-    dict[str, Any]: 20
+    dict[str, Any]: 19
   src/elspeth/web/composer/turn_audit.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 1
@@ -1011,10 +1011,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 861
+  Mapping[str, Any]: 864
   Mapping[str, object]: 290
   MutableMapping[str, Any]: 13
   boundary: 64
-  dict[str, Any]: 1141
+  dict[str, Any]: 1138
   dict[str, object]: 399
   soft: 2704

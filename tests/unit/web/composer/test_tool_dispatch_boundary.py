@@ -73,9 +73,9 @@ def test_execute_tool_rejects_extra_top_level_arguments_before_handler() -> None
     )
 
     assert result.success is False
-    assert "Invalid arguments for tool 'get_pipeline_state'" in result.data["error"]
-    assert "unsupported" in result.data["error"]
-    assert "sk-test-secret" not in result.data["error"]
+    assert "Invalid arguments for tool 'get_pipeline_state'" in result.validation.errors[0].message
+    assert "unsupported" in result.validation.errors[0].message
+    assert "sk-test-secret" not in result.validation.errors[0].message
 
 
 def test_execute_tool_rejects_extra_arguments_without_audit_hash_before_handler(
@@ -104,8 +104,8 @@ def test_execute_tool_rejects_extra_arguments_without_audit_hash_before_handler(
     )
 
     assert result.success is False
-    assert "Invalid arguments for tool 'get_pipeline_state'" in result.data["error"]
-    assert "sk-test-secret" not in result.data["error"]
+    assert "Invalid arguments for tool 'get_pipeline_state'" in result.validation.errors[0].message
+    assert "sk-test-secret" not in result.validation.errors[0].message
 
 
 @pytest.mark.parametrize(
@@ -170,7 +170,7 @@ def test_execute_tool_rejects_invalid_set_pipeline_source_selection_before_handl
     )
 
     assert result.success is False
-    assert "Invalid arguments for tool 'set_pipeline'" in result.data["error"]
+    assert "Invalid arguments for tool 'set_pipeline'" in result.validation.errors[0].message
 
 
 def test_execute_tool_rejects_wrong_argument_types_before_handler() -> None:
@@ -184,9 +184,9 @@ def test_execute_tool_rejects_wrong_argument_types_before_handler() -> None:
     )
 
     assert result.success is False
-    assert "Invalid arguments for tool 'get_pipeline_state'" in result.data["error"]
-    assert "type" in result.data["error"]
-    assert "sk-test-secret" not in result.data["error"]
+    assert "Invalid arguments for tool 'get_pipeline_state'" in result.validation.errors[0].message
+    assert "type" in result.validation.errors[0].message
+    assert "sk-test-secret" not in result.validation.errors[0].message
 
 
 def test_source_path_arguments_require_data_dir_for_s2_confinement() -> None:
@@ -205,8 +205,8 @@ def test_source_path_arguments_require_data_dir_for_s2_confinement() -> None:
     )
 
     assert result.success is False
-    assert "Path violation (S2)" in result.data["error"]
-    assert "data_dir" in result.data["error"]
+    assert "Path violation (S2)" in result.validation.errors[0].message
+    assert "data_dir" in result.validation.errors[0].message
 
 
 def test_source_path_arguments_require_data_dir_without_audit_hash() -> None:
@@ -224,8 +224,8 @@ def test_source_path_arguments_require_data_dir_without_audit_hash() -> None:
     )
 
     assert result.success is False
-    assert "Path violation (S2)" in result.data["error"]
-    assert "data_dir" in result.data["error"]
+    assert "Path violation (S2)" in result.validation.errors[0].message
+    assert "data_dir" in result.validation.errors[0].message
 
 
 def test_secret_tool_missing_context_fails_before_handler(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -242,4 +242,4 @@ def test_secret_tool_missing_context_fails_before_handler(monkeypatch: pytest.Mo
     result = execute_tool("list_secret_refs", {}, _empty_state(), _catalog())
 
     assert result.success is False
-    assert "Secret tools require secret service context" in result.data["error"]
+    assert "Secret tools require secret service context" in result.validation.errors[0].message

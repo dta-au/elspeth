@@ -39,7 +39,6 @@ any ``__all__`` entry becomes dead.
 """
 
 from elspeth.web.composer.tools._common import (
-    _DATA_ERROR_KEY,
     RuntimePreflight,
     ToolContext,
     ToolResult,
@@ -134,7 +133,6 @@ __all__ = [
     "_BLOB_MUTATION_TOOLS",
     "_BLOCKING_DIAGNOSTIC_CODES",
     "_CACHEABLE_DISCOVERY_TOOL_NAMES",
-    "_DATA_ERROR_KEY",
     "_DISCOVERY_TOOLS",
     "_MUTATION_TOOLS",
     "_SECRET_DISCOVERY_TOOLS",

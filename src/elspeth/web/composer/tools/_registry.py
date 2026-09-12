@@ -47,6 +47,7 @@ ticket.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Final
 
 from elspeth.web.composer.tools._common import ToolHandler
@@ -54,7 +55,9 @@ from elspeth.web.composer.tools.blobs import (
     TOOLS_IN_MODULE as _BLOBS_TOOLS_IN_MODULE,
 )
 from elspeth.web.composer.tools.declarations import (
+    EffectDomain,
     ToolDeclaration,
+    ToolEffects,
     ToolKind,
     assert_unique_names,
     derive_augments_on_failure_names,
@@ -97,6 +100,26 @@ _REGISTERED_TOOLS: Final[tuple[ToolDeclaration, ...]] = (
     *_SECRETS_TOOLS_IN_MODULE,
 )
 assert_unique_names(_REGISTERED_TOOLS)
+
+_DECLARATIONS_BY_NAME: Final = MappingProxyType({decl.name: decl for decl in _REGISTERED_TOOLS})
+
+# Async tools have no synchronous declaration. These are authored-domain
+# effects only; advisor calls still perform network, budget and audit work.
+ASYNC_TOOL_EFFECTS: Final = MappingProxyType(
+    {
+        "request_interpretation_review": ToolEffects((EffectDomain.INTERPRETATION,)),
+        "request_advisor_hint": ToolEffects(),
+    }
+)
+
+
+def resolve_tool_effects(tool_name: str, arguments: Mapping[str, Any]) -> ToolEffects:
+    """Resolve a known tool's prospective effects without invoking its handler."""
+    if tool_name in ASYNC_TOOL_EFFECTS:
+        return ASYNC_TOOL_EFFECTS[tool_name]
+    if tool_name not in _DECLARATIONS_BY_NAME:
+        raise AssertionError("Unknown composer tool for effect resolution.")
+    return _DECLARATIONS_BY_NAME[tool_name].resolve_effects(arguments)
 
 
 # ---------------------------------------------------------------------------
@@ -157,9 +180,8 @@ _CACHEABLE_DISCOVERY_TOOL_NAMES: Final[frozenset[str]] = derive_cacheable_names(
 _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES: Final[frozenset[str]] = _DISCOVERY_TOOL_NAMES - _CACHEABLE_DISCOVERY_TOOL_NAMES
 
 # Blob-store side-effect tools that never advance ``CompositionState``.
-# Excluded from the ``trust_mode == "explicit_approve"`` proposal-interception
-# gate because they have no state delta to approve — the audit trail still
-# records the blob write but the composition itself is unchanged.
+# Creation is immediate; destructive updates/deletes still require approval
+# in explicit-approve mode even though the composition itself is unchanged.
 _BLOB_STORE_ONLY_MUTATION_TOOL_NAMES: Final[frozenset[str]] = derive_blob_store_only_names(_REGISTERED_TOOLS)
 
 # Mutation tools whose failure results carry inline plugin schemas. Derived

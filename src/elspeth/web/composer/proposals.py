@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.web.composer.tools._registry import resolve_tool_effects
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +37,7 @@ def _string_argument(arguments: Mapping[str, Any], key: str) -> str | None:
     if key not in arguments:
         return None
     value = arguments[key]
-    return value if type(value) is str and value else None
+    return value if type(value) is str and value and not value.startswith("<redacted") else None
 
 
 def build_tool_proposal_summary(
@@ -46,19 +47,17 @@ def build_tool_proposal_summary(
     redacted_arguments: Mapping[str, Any],
 ) -> ToolProposalSummary:
     rationale = "Requested by the current composer turn."
-    affects = ("graph", "validation", "yaml")
+    affects = tuple(domain.value for domain in resolve_tool_effects(tool_name, arguments).domains)
 
     if tool_name == "set_pipeline":
-        source = arguments["source"] if "source" in arguments else None
-        source_plugin = "new"
-        if type(source) is dict and "plugin" in source and type(source["plugin"]) is str:
-            source_plugin = source["plugin"]
+        sources = arguments["sources"] if "sources" in arguments else None
+        source_count = len(sources) if isinstance(sources, Mapping) else int("source" in arguments and arguments["source"] is not None)
         node_count = _count_items(arguments["nodes"] if "nodes" in arguments else ())
         output_count = _count_items(arguments["outputs"] if "outputs" in arguments else ())
         return ToolProposalSummary(
             summary=(
-                f"Replace the pipeline with {source_plugin} input, "
-                f"{_plural(node_count, 'transform')}, and {_plural(output_count, 'output')}."
+                f"Replace the pipeline with {_plural(source_count, 'input')}, "
+                f"{_plural(node_count, 'processing node')}, and {_plural(output_count, 'output')}."
             ),
             rationale=rationale,
             affects=affects,
@@ -66,7 +65,7 @@ def build_tool_proposal_summary(
         )
 
     if tool_name == "set_source":
-        label = _string_argument(arguments, "plugin") or "source"
+        label = _string_argument(redacted_arguments, "plugin") or "source"
         return ToolProposalSummary(
             summary=f"Set the pipeline source to {label}.",
             rationale=rationale,
@@ -75,9 +74,9 @@ def build_tool_proposal_summary(
         )
 
     if tool_name == "patch_node_options":
-        label = _string_argument(arguments, "node_id") or "selected transform"
+        label = _string_argument(redacted_arguments, "node_id") or "selected node"
         return ToolProposalSummary(
-            summary=f'Update options for transform "{label}".',
+            summary=f'Update options for node "{label}".',
             rationale=rationale,
             affects=affects,
             arguments_redacted_json=redacted_arguments,
@@ -92,7 +91,7 @@ def build_tool_proposal_summary(
         )
 
     if tool_name == "patch_output_options":
-        label = _string_argument(arguments, "sink_name") or "selected output"
+        label = _string_argument(redacted_arguments, "sink_name") or "selected output"
         return ToolProposalSummary(
             summary=f'Update options for output "{label}".',
             rationale=rationale,
@@ -111,17 +110,24 @@ def build_tool_proposal_summary(
         # is intentionally open — no closed literal to extend.
         return ToolProposalSummary(
             summary="Surface an interpretation draft for user review.",
-            rationale=(
-                "The term is subjective or underspecified; the user should "
-                "review the LLM's draft interpretation before the prompt "
-                "template is finalised."
-            ),
-            affects=("interpretation",),
+            rationale="Review the planner's proposed interpretation or assumption before it is accepted into the pipeline.",
+            affects=affects,
             arguments_redacted_json=redacted_arguments,
         )
 
+    if tool_name in {"create_blob", "update_blob", "delete_blob"}:
+        verb = {"create_blob": "Create", "update_blob": "Overwrite", "delete_blob": "Delete"}[tool_name]
+        blob_id = _string_argument(redacted_arguments, "blob_id")
+        target = f'session file "{blob_id}"' if blob_id else "a session file"
+        summary = f"{verb} {target}."
+    elif tool_name == "request_advisor_hint":
+        summary = "Request advisor guidance."
+    elif not affects:
+        summary = "Inspect composer information."
+    else:
+        summary = f"Apply composer tool {tool_name}."
     return ToolProposalSummary(
-        summary=f"Apply composer tool {tool_name}.",
+        summary=summary,
         rationale=rationale,
         affects=affects,
         arguments_redacted_json=redacted_arguments,

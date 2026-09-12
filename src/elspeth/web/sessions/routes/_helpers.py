@@ -130,7 +130,7 @@ from elspeth.web.composer.telemetry_phase8 import (
     record_session_completed,
     record_session_switched,
 )
-from elspeth.web.composer.tools import _DATA_ERROR_KEY, ToolResult, execute_tool
+from elspeth.web.composer.tools import ToolResult, execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import (
@@ -263,14 +263,14 @@ _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL = (
 @trust_boundary(
     tier=3,
     source=(
-        "ToolResult.data payload from the guided source-commit tool path — plugin/tool-produced "
-        "content whose nested shape no first-party contract promotes before this egress sanitizer"
+        "ToolResult validation messages from the guided source-commit tool path — "
+        "plugin/tool-produced text screened before this egress sanitizer emits a closed detail"
     ),
     source_param="tool_result",
     suppresses=("R1", "R5"),
     invariant=(
         "raises TypeError when the carrier is not an exact ToolResult; any unrecognized "
-        "ToolResult.data shape yields the closed generic detail string, never a raw repr "
+        "validation message yields the closed generic detail string, never a raw repr "
         "(the raw tool_result repr can dump CompositionState with Tier-3 row data and must "
         "not reach the HTTP body)"
     ),
@@ -282,10 +282,13 @@ _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL = (
 def _guided_source_commit_failure_detail(tool_result: object) -> str:
     if type(tool_result) is not ToolResult:
         raise TypeError(f"guided source commit failure detail requires ToolResult, got {type(tool_result).__name__}")
-    raw_data = tool_result.data
-    if isinstance(raw_data, Mapping):
-        error = raw_data.get(_DATA_ERROR_KEY)
-        if isinstance(error, str) and error.startswith("Path violation (S2):") and "Source file paths" in error:
+    if not tool_result.success and tool_result.validation.errors:
+        entry = tool_result.validation.errors[0]
+        if (
+            entry.component == "rejected_mutation"
+            and entry.message.startswith("Path violation (S2):")
+            and "Source file paths" in entry.message
+        ):
             return _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL
     return "Step 1 source commit failed"
 
@@ -3427,7 +3430,6 @@ __all__ = [
     "_COMPOSER_REQUEST_TERMINAL_COUNTER",
     "_COMPOSER_RUNTIME_PREFLIGHT_COUNTER",
     "_COMPOSER_TIER1_VIOLATION_COUNTER",
-    "_DATA_ERROR_KEY",
     "_MAX_PROVIDER_DETAIL_CHARS",
     "_OTHER_COMPOSER_EXCEPTION_CLASS",
     "_PROVIDER_DETAIL_REDACTED",

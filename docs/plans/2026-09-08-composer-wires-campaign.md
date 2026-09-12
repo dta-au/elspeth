@@ -1,354 +1,449 @@
 # Composer Wires Campaign Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every seam below is one run of the `explore-and-pin` skill (`.claude/skills/explore-and-pin/SKILL.md`); this plan says which seam, in what order, against which measured baseline.
+**Custody and consolidation update — 2026-09-12.** Resume this existing campaign
+on branch `composer-wires-consolidated`, in
+`.claude/worktrees/composer-wires-consolidated`, with custodian
+`codex-composer-wires-custodian`. The fixed release input is `release/0.8.1` at
+`cb772071b23cfd94757094f4f71643744542eeab`. The predecessor checkpoint
+`a1ab1b25ef3ec0397b6bb96df8f9a19723c4ec75` preserves the older worktree's five
+changed paths before the newer campaign overlay. This identifies the recovery
+inputs; it does not certify campaign acceptance or a merge into the release.
 
-**Goal:** Every knob the planner can set on any of the 42 composer tools is provably connected to every wire that carries it, with a whole-tree gate per wire deriving both sides from source, so the composer has the best chance of succeeding on the first turn.
+The current request is **consolidation and a plan to finish**, not execution of
+all remaining milestones. Consolidation commits are authorized by that request,
+superseding the September 8 commit ban for this scope. Keep the September 10
+[pause checkpoint](2026-09-10-composer-wires-campaign-checkpoint.md) as historical
+evidence. Its interrupted implementation, prior reviews and exact test results
+remain useful; its paused-work, original checkout and commit instructions no
+longer control this consolidation. Historical no-model alternatives and pending
+contract decisions below have been replaced by the accepted rulings in this plan.
 
-**Architecture:** The campaign walks the six wires (SHIPPED, MODEL, READ, ADMITTED, TAUGHT, FRONTEND) one wire at a time across all 42 tools, the way the three landed runs went, rather than one tool at a time. Two wires already have whole-tree gates (SHIPPED against ADMITTED for arguments; the whole response envelope). Each remaining wire gets a census by AST, a ratified matrix, a derived gate that extends the existing authority (`tools/schema_contract.py`, `test_tool_argument_wire_parity.py`) rather than a parallel one, and a structural close where a type can carry the invariant. The campaign ends with a per-tool scorecard derived from the gates and a live battery trial.
+## Outcome and scope
 
-**Tech Stack:** Python 3.12 `ast`, pydantic v2 `model_fields`, the live registry `tools/_dispatch.get_tool_definitions()` and `redaction.MANIFEST`, pytest whole-tree gates via `tests/helpers/tree_gate.iter_gate_sources`, vitest for the TypeScript wire, `scripts/check_contracts.py` for the soft-mapping census, `elspeth-lints check --rules all` in shape-only verify mode.
+Every planner argument must be accounted for across six wires: advertised schema
+(SHIPPED), actual owned argument admission (MODEL), consumption (READ), redaction
+admission (ADMITTED), planner teaching (TAUGHT), and operator projection
+(FRONTEND). Close internally chosen response shapes and the response/evaluation
+residue already included in the campaign. Finish with derived per-tool accounting,
+integrated gates and the planned live acceptance evidence.
 
-**Spec:** `.claude/skills/explore-and-pin/SKILL.md` (the technique) and epic `elspeth-54bd0b84cd` (the six-wire criterion and its founding instance). Long-form record: `docs/agents/explore-and-pin-methodology.md`.
+The historical 42 tools and 104 knobs are dated measurements, not fixed totals.
+Derive the universe from `get_tool_definitions()`. Extend the existing
+`composer_wire_census.py`, `tools/schema_contract.py` and owning tests;
+do not add a parallel registry or reporting framework.
 
-## Global Constraints
+The scope authority remains this plan and epic `elspeth-54bd0b84cd`. Use
+[the existing explore-and-pin methodology](../agents/explore-and-pin-methodology.md)
+for bounded census, verdict, structural repair, behavioral probes and review.
+When implementation resumes, use the repository's existing execution skills,
+read CONTRIBUTING's whole-tree gates before code edits, and retain one
+implementation owner across overlapping Composer/session files. Independent
+read-only preparation and reviews can run in parallel.
 
-- **No commits until the signing campaign lands** (John, 2026-09-08). Every "Commit" step below is suspended: leave the work uncommitted in the worktree, record the file set and the measurement on the ticket instead. The ban lifts only when John says so.
-- **Not a lane.** No metacontroller file-set declarations, no seats-as-agents, no merge protocol. Ordinary commit hygiene once commits are allowed. Reviewer charters (adversarial / LLM / systems) are subagents or separate passes per the skill §8.
-- **Workspace:** `.claude/worktrees/soft-type-burndown`, branch `composer-wires`, == `release/0.8.0` @ `3ab58f336` at campaign start. Every command: `cd "$(git rev-parse --show-toplevel)/.claude/worktrees/soft-type-burndown" && PYTHONPATH=$PWD/src:$PWD/elspeth-lints/src ...` with `-o "pythonpath=$PWD/src $PWD/elspeth-lints/src"` on pytest; verify `elspeth.__file__` resolves into the worktree before trusting a number.
-- **Census by AST or live import, never grep.** A grep number is orientation and is labelled so. Counts on tickets carry the commit they were measured on and say which "distinct" they mean.
-- **Gates derive, never enumerate.** The only admitted hand-maintained input is `PROJECTED_TOOLS` (a TypeScript switch Python cannot read), and Seam 4 converts it to a derivation.
-- **Extend the existing authority.** SHIPPED-side gates extend `src/elspeth/web/composer/tools/schema_contract.py` and `tests/unit/web/composer/test_tool_argument_wire_parity.py`; do not add a second module that checks one pair of wires.
-- **Evidence bar** (skill §10): suite failing SET diffed against the baseline set below, lint corpus diffed against the baseline count with positions masked, `check_contracts` census delta, mypy on touched packages, mutation ledger with reconciled selections, live trial counts.
-- **Composer invariants** (AGENTS.md): nothing here authors pipeline structure server-side; nothing is tutorial-special. Enabling a suppressed widget on the rootless entry path (Seam 4, `134b9a9a65`) gets per-transition provider-call scrutiny.
-- **Sibling suites** run on this box from Codex sandboxes; cap pytest at `-n 6` while any are running (`pgrep -af pytest` first).
+## Accepted decisions to preserve
 
----
+- Every shipped tool, including empty-input tools and advisor interception,
+  validates complete original public input into an owned model. A manifest model
+  is redaction evidence, not proof of handler admission. Missing models,
+  unresolved provenance, selected-key reconstruction and duplicate/missing
+  catalogue entries must remain visible failures. Do not import the older
+  provisional `model_wire_fence.json` as an approved exception.
+- Close internally chosen roots and fixed nested records. Preserve only
+  evidence-backed dynamic leaves with explicit value grammars. Malformed
+  provider output does not require hidden object-string coercion; genuine outer
+  transport JSON decoding and legitimate string content remain supported.
+- Follow JSON Schema numeric semantics: finite integral numbers such as `1.0`
+  are integers; reject booleans, numeric strings, nonintegral/nonfinite numbers
+  and invalid ranges. `list_models.limit` has minimum 1 and omitted default 50,
+  with no new upper bound. Preserve omission versus supplied null as advertised.
+- Structurally malformed arguments use the safe `ARG_ERROR` evidence summary.
+  Structurally valid but inapplicable mode/count pairs use an ordinary failed
+  ToolResult, preserving permitted redacted attempted values. Reject that
+  applicability defect before source/blob preparation; historical state stays
+  readable and repairable.
+- Seam 4.4 option (a) is approved: after validation and redaction, retain
+  recursively supplied fields, including explicit nonsensitive null, and omit
+  absent fields. Replacement cards always disclose that omitted settings may
+  reset, even when supplied-argument comparisons are empty. Do not ask for this
+  choice again or simulate effective defaults in the frontend.
+- Preserve exact published display and private invocation authority. The existing
+  inline-blob null equivalence belongs only to semantic redacted dispatch
+  comparison, including its persisted constructor and all five service sites.
+  Sparse presence and structured persisted errors share one session epoch cutover;
+  re-read both current epoch pins rather than hard-coding the historical 53→54.
+- Response contracts do not grant disclosure permission. Preserve D4 preview
+  audit withholding, restricted context projection, preview refusal and schema
+  budget checks. Unknown external key names remain opaque; no raw-name or
+  key-hash substitute for positional labels is approved.
+- New diagnostic guidance uses direct machine-code records. Freeze expanded
+  legacy regex membership and surviving order while retaining required prose
+  compatibility. Earlier 139-row/118-code figures were invalid AST counts;
+  neither those nor the later mixed-source experiment define the freeze.
+- Prioritize correctness and useful teaching before performance optimization.
+  No provider bypass, tutorial-special path, new broad fence, global signature
+  clearance or weakened admission/disclosure is authorized by this plan.
 
-## Baseline (measured 2026-09-08 on `composer-wires` @ `3ab58f336`)
+## State at the interrupted checkpoint
 
-| Instrument | Value |
-|---|---|
-| Live registry (`get_tool_definitions()`) | 42 tools, 104 knobs (sum of `parameters.properties`) |
-| Zero-knob tools | 10: `list_blobs`, `list_composer_blobs`, `list_sources`, `get_expression_grammar`, `get_audit_info`, `preview_pipeline`, `diff_pipeline`, `list_transforms`, `list_sinks`, `list_secret_refs` |
-| Redaction `MANIFEST` | 42 entries, all `ToolRedaction(argument_model, policy, response_model)`; registry and manifest name sets are equal |
-| Type-driven entries (`argument_model` and `response_model` set, `policy` None) | 12: `create_blob`, `get_blob_content`, `patch_node_options`, `patch_output_options`, `patch_source_options`, `request_interpretation_review`, `set_pipeline`, `set_source`, `set_source_from_blob`, `set_source_from_blobs`, `splice_transform`, `update_blob` |
-| Declarative entries with `known_argument_keys` | 15: `clear_source`, `delete_blob`, `get_blob_metadata`, `inspect_source`, `remove_edge`, `remove_node`, `remove_output`, `request_advisor_hint`, `set_metadata`, `set_output`, `upsert_edge`, `upsert_node`, `validate_secret_ref`, `wire_blob_inline_ref`, `wire_secret_ref` |
-| Entries with neither model nor allowlist | 15: the 10 zero-knob tools plus **`explain_validation_error` (1 knob), `get_pipeline_state` (1), `get_plugin_schema` (2), `get_plugin_assistance` (3), `list_models` (2)** — 9 knobs with no ADMITTED wire at all; Seam 1 census must say what happens to them |
-| Handler-side models | orientation grep: 6 handlers call `_validate_mutation_arguments(<Model>, args, ...)`; 32 `_execute_*` handlers in total. Seam 1 replaces this with an AST census |
-| Existing whole-tree gates | `test_tool_result_envelope_gate.py` (response envelope, all keys), `test_tool_argument_wire_parity.py` (SHIPPED vs ADMITTED, argument knobs), `test_planner_teaching_gate.py` (repair-feedback facts), `schema_contract.py` (SHIPPED vs MODEL, `upsert_node` and `set_pipeline` only), `test_proposal_diff_redaction_fixture.py` (frontend fixture, values and key order) |
-| Frontend projection | `ProposalDiff.tsx` switch: 13 arms; `PROJECTED_TOOLS` frozenset: the same 13 names, hand-maintained |
-| Soft-mapping census (`check_contracts.py`) | exit 0; 2693 soft occurrences across 382 files, 63 boundary-parsed |
-| Trust-tier lint corpus (shape-only verify mode) | exit 1 (deliberate fail-closed state), 1977 finding rows |
-| Full suite `pytest tests/ -n 6` | measured 2026-09-08 on 3ab58f336 in the `soft-type-burndown` worktree (PYTHONPATH exported + `-o pythonpath`): exit 1, **1 failed / 48792 passed / 79 skipped / 6 xfailed** in 25m12s. The one red is INHERITED from the tip commit itself: `tests/unit/core/landscape/test_database_clock_authority.py::test_clock_authority_definition_inventory_is_closed_and_stable` (3ab58f336 added three clock-boundary functions in `src/elspeth/engine/orchestrator/abandon.py` — `inspect_leaderless_run`, `abandon_leaderless_run`, `_resume_verdict` — without re-pinning the inventory; additive pin, re-pin by UNION). Not this campaign's to fix; every gate in this plan is scored as NEW = failing set minus this one id. The release memory's "8 failed" was measured on ad5421518 (origin), 31 unpushed commits earlier; 56e7ccaca re-pinned three of those and the rest cleared along the way |
+These are **September 10 historical results**, not fresh verification of the
+consolidated tree. Subsequent MODEL changes overlapped earlier reviewed files.
 
-Open epic children slotted by wire (all `elspeth-` ids): Seam 1 — none yet (the founding instance `2cdf71397b` is closed). Seam 3 — `657f603fcd` (cross-tool quotation admits a leaf). Seam 4 — `7cda5664b0`, `d6147d73ed`, `134b9a9a65`, `f491fca94e`. Seam 5 — `7980efe197`, `8fe09316ab`, `72ce6749ac`, `e12dce8ed6`, `9fcf465c41`, `5e81b50f2e`, `d83095ee87`, `c00e6d9795`, `6aa477c78e`, `9e76d9436b`. Outside this campaign (design decisions, not wires): `10f818998e` deep_thaw, `6089bfa8fa` byte ledger, `91133e850b` / `e25f8f7530` TS mirrors, `1eca86caa9` operator tier-model worklist, `8b0b6e5bb9`, `f4c71c3e8e`, `919cd29876`, the four Wave-1 residues (`4ddaee2202`, `c8f8318203`, `caae752e11`, `6bcc0e7ee9`).
+| Component | Historical state | What remains |
+|---|---|---|
+| Initial MODEL census | Reviewed bounded census; unfinished admission later extended it | Finish MODEL behavior, typing, mutation proofs and fresh review |
+| Frontend projection registry | Reviewed; source-derived dispatch guard rejects joint fixture/export omission | Integrated frontend/Python fixture regression |
+| Shared option decoder | Implemented | Sparse presence plus rootless widget acceptance |
+| Prospective approval effects | Reviewed declaration-derived implementation and card wording | Integrated behavior and text regression |
+| Response-envelope measurement | Reviewed structural repair | Preserve derived coverage through remaining response work |
+| Teaching ownership | Reviewed own-context lexical gate | Semantic teaching review and final integration |
+| Error-twin retirement | Reviewed; validation entries authoritative, independent repair data retained, failed discoveries uncached | Regression after MODEL and later contracts; unresolved shutdown warning remains evidence |
+| Universal MODEL admission | Unfinished; latest protocol repair had not been retested | Milestone 1 |
+| READ, complete ADMITTED, restricted responses, sparse presence, structured errors, remaining residue, scorecard/live trial | Unfinished | Milestones 2–8 |
 
----
+The controller's September 12 consolidation checks reproduce the immediate
+feedback gap: `exit=1; 103 passed; 4 failed`, with the four
+`test_structural_feedback_teaches_actual_json_types` cases expecting
+`caught.value.expected` to include `actual JSON objects and arrays` but receiving
+`a valid value`. The final historical protocol change therefore did not clear
+this selection. The fresh 18-file typing selection found 13 findings: the ten
+known cast/unreachable findings plus three AST-narrowing findings in the census
+script. Subsequent bounded five-file housekeeping removed redundant casts,
+duplicate model-enforced encoding validation and AST narrowing defects. Its
+focused evidence is `exit=0; 97 passed`, followed by the identical parent mypy
+rerun: `exit=0; Success: no issues found in 18 source files`. This is checkpoint
+typing hygiene, not semantic MODEL acceptance.
 
-## Seam 1 — MODEL: what the handler validates against, for all 42 tools
+The controller also recorded `exit=1; 1 failed; 6 passed` for mock discipline
+plus session attribute contracts. The failure is
+`test_no_unspecced_direct_mock_constructors`, identifying bare `MagicMock()` in
+`tests/unit/web/composer/test_tool_model_wire_parity.py:43`; the six session
+contract tests passed. Fix the mock to its real collaborator during MODEL work.
+No integrated campaign acceptance follows from these focused checks.
 
-Producer: SHIPPED json-schema properties per tool. Consumer: the pydantic model the tool's arguments actually pass through — the manifest's `argument_model` for the 12 type-driven tools, and the handler-side `_*ArgumentsModel` passed to `_validate_mutation_arguments` for the rest. Taught: the schema prose on each property. Trust boundary: the planner's arguments cross into the handler. Live consequence: a property the schema advertises that the model silently drops (a knob that does nothing) or a model field the schema never shows (a hidden knob).
+Focused frontend ProposalDiff/ToolCallCard/projected-tool tests then recorded
+`exit=0; 75 passed`. The first launch's two subprocess `EPERM` failures were
+sandbox limitations; the successful repeat ran outside that sandbox.
 
-### Task 1.1: Census — derive MODEL per tool from source
+Normal checkpoint hooks also exposed four exception-channel violations. The
+rejection-feeder and prospective-effect authorities operate on owned, already
+admitted values; their invariant failures now raise `AssertionError` rather than
+the planner-argument `ValueError` channel. Six expected-exception cases failed
+against the previous code, then the focused proposal/rejection suites passed:
+`exit=0; 84 passed`. Composer incremental checks, Ruff and scoped mypy passed.
+Two synthetic user-home paths in redaction tests were replaced with neutral
+server paths for commit hygiene; that file's tests passed `exit=0; 88 passed`.
 
-**Files:**
-- Create: `scripts/cicd/composer_wire_census.py` (the census, reusable by later seams)
-- Test: `tests/unit/scripts/test_composer_wire_census.py`
+An expanded proposal/rejection/declaration selection reported
+`exit=1; 163 passed; 14 failed`. All fourteen failures are in
+`tests/unit/web/composer/test_tool_declarations.py`, comparing declaration
+definitions/descriptions. They cover create/update/delete blob, list_models,
+preview_pipeline, clear_source, set_metadata, list_blobs, get_blob_metadata,
+get_blob_content, inspect_source, list_secret_refs, validate_secret_ref and the
+definition-map round trip. Their baseline attribution has not been measured.
+Reconcile these expectations against the accepted schemas and teaching during
+MODEL acceptance; do not blindly refresh expected output to turn the test green.
 
-**Interfaces:**
-- Produces: `census_model_wire() -> dict[str, ModelWireRow]` where `ModelWireRow` is a frozen dataclass `(tool: str, shipped: frozenset[str], model_class: str | None, model_fields: frozenset[str], site: str)`; `site` is `manifest` / `handler:<module>.<function>` / `none`.
+The historical baseline at `1278c5c21` had frontend 4,581 passing tests; backend
+50,562 passes and two timing failures; PostgreSQL 388 passes and one reproducible
+heartbeat timeout-classification failure (`elspeth-6feb133948`). Exact backend
+serial reruns passed but did not make that broad run green. The error-retirement
+selection also recorded an unresolved executor-shutdown warning. Re-measure the
+fixed release input and consolidated candidate where needed; none of these
+historical exceptions is a permanent waiver on the moving release.
 
-- [ ] **Step 1: Write the failing test that the census sees both loci**
+## Remaining execution order
 
-```python
-# tests/unit/scripts/test_composer_wire_census.py
-from scripts.cicd.composer_wire_census import census_model_wire
+Each milestone ends with a frozen, named source state, proportionate tests,
+reconciled baseline/mutant/restored evidence and fresh review. Historical reviewed
+work is retained and regression-tested rather than automatically rewritten.
 
-def test_type_driven_tools_take_their_model_from_the_manifest() -> None:
-    rows = census_model_wire()
-    assert rows["set_pipeline"].site == "manifest"
-    assert "nodes" in rows["set_pipeline"].model_fields
+### 1. Finish and accept universal MODEL admission
 
-def test_declarative_tools_take_their_model_from_the_handler() -> None:
-    rows = census_model_wire()
-    assert rows["upsert_node"].site.startswith("handler:")
-    assert rows["upsert_node"].model_class == "_UpsertNodeArgumentsModel"
+Use the [MODEL implementation charter](composer-wires/model-admission-implementation-charter.md)
+and [ruling amendment](composer-wires/argument-model-ruling-amendment.md).
+The [original field/boundary table](composer-wires/argument-model-handoff.md) and
+[whole-model strictness fixtures](composer-wires/existing-model-strictness.md)
+are supporting historical evidence; their pending choices are superseded.
 
-def test_every_registry_tool_has_a_row() -> None:
-    from elspeth.web.composer.tools._dispatch import get_tool_definitions
-    assert set(census_model_wire()) == {d["name"] for d in get_tool_definitions()}
-```
+- [x] Complete checkpoint typing housekeeping: remove the redundant validator
+  casts and duplicate model-enforced encoding checks, and narrow the census AST
+  values. The identical 18-file mypy rerun passed; actual MODEL acceptance remains
+  open in the steps below. Preserve every real admission boundary.
+- [ ] Run the exact preparation selection below after the final protocol feedback
+  repair. The September 12 rerun still has four feedback failures; diagnose the
+  actual exception-to-planner authority rather than assume wording placement
+  fixed it. Test actual planner-visible canonicalization, idempotence, bounds and
+  secret/unknown-key/cause withholding, not just caller-level text.
+- [ ] Finish advisor state/version/budget/accounting controls, valid exhausted
+  budget behavior, typed formatter equivalence/scrubbing/size checks and remaining
+  schema/nullability/requiredness cases. Complete original input must reach owned
+  public admission before budget or provider effects.
+- [ ] Repeat a consistent typing scope including `protocol.py`, Ruff/format and
+  contracts. Compare the identical target list with an explicitly named baseline;
+  the historical before/after 18-versus-17-file mismatch cannot prove parity.
+- [ ] Replace the known unspecced mock with a spec for its real collaborator and
+  rerun the mock-discipline gate alongside affected MODEL tests.
+- [ ] Resolve the fourteen measured declaration-definition expectations in
+  `tests/unit/web/composer/test_tool_declarations.py`, checking behavior and
+  teaching against the approved contract and comparing the named release base.
+- [ ] Freeze and run the broad owned Composer selection, representative charter
+  mutations, and fresh spec/quality, LLM-feedback and systems reviews. Evaluate
+  avoidable repeated validation only after correct public paths are proved.
 
-- [ ] **Step 2: Run it to verify it fails**
+### 2. Finish READ and complete ADMITTED parity
 
-Run: `pytest tests/unit/scripts/test_composer_wire_census.py -n 0 -v`
-Expected: FAIL with `ModuleNotFoundError: scripts.cicd.composer_wire_census`
+Use the [READ handoff](composer-wires/read-wire-handoff.md) and
+[ADMITTED handoff](composer-wires/admitted-scorecard-handoff.md), corrected by the
+accepted closure ruling above.
 
-- [ ] **Step 3: Write the census**
+- [ ] Reuse the actual callable catalogue and source provenance utilities for
+  READ. Attribute fields to non-diagnostic use with bounded helper inspection;
+  dead locals, logging, presence tests and whole-model serialization do not prove
+  consumption. Preserve proven fields alongside unresolved reasons.
+- [ ] Add the derived READ relation and its controlled probes. Unsupported
+  aliases, copied/transformed roots, invoked closures, cycles and opaque helpers
+  fail honestly until specifically supported. No generic CFG/SSA engine or
+  blanket forwarding fence is needed.
+- [ ] Extend `test_tool_argument_wire_parity.py` to include closed-empty policies,
+  type-driven models and actual accepted/emitted wire names. Check exact universe
+  equality before per-field comparisons; do not intersect away missing endpoints.
+- [ ] Tighten internally chosen open policies under the existing ruling and
+  prove existing sensitive-value handling. ADMITTED and MODEL remain different
+  authorities; name preservation does not authorize value disclosure.
+- [ ] Run representative missing-endpoint, empty-allowlist, input-alias,
+  serialization-alias, removed-use and advisor-interception mutations.
 
-```python
-# scripts/cicd/composer_wire_census.py
-"""Composer wire census: derive, per tool, what each wire carries.
+### 3. Introduce direct diagnostic guidance and freeze legacy regex growth
 
-Every side is read from the live registry, the live manifest, or the AST of the
-handler modules. Nothing here is a regex over source text (AGENTS.md).
-"""
-from __future__ import annotations
+Use the [diagnostic catalogue charter](composer-wires/diagnostic-catalogue-implementation-charter.md).
 
-import ast
-import importlib
-from dataclasses import dataclass
+- [ ] Capture the dependency-complete expanded legacy records, code order and
+  first-match relationships from the accepted post-MODEL snapshot. Refuse
+  unresolved generator expansion; record ordered occurrences, not a set/count.
+- [ ] Add direct immutable code-guidance records and derive exact lookup,
+  fuzzy/help vocabulary and producer coverage without a second code inventory.
+- [ ] Preserve required legacy prose behavior, Expected hints and terminal
+  guidance. Reject new/replaced/reordered regex rows, duplicate direct codes and
+  accidental authority collisions. Do not delete fallback before a separate
+  complete uncoded-producer census justifies it.
+- [ ] Point teaching/terminal consumers at the unified record authority and run
+  behavioral baseline/mutant/restored lookup and ordering checks.
+
+### 4. Enforce aggregation count applicability across authoring/runtime surfaces
+
+Use the [count charter](composer-wires/count-applicability-implementation-charter.md)
+and [audit-ordering constraints](composer-wires/expected-output-count-audit-ordering.md).
+
+- [ ] Add the smallest pure authority to the existing `OutputMode`, rejecting
+  passthrough plus non-null count. Preserve omitted/null Composer transform
+  defaults and runtime's existing null-mode restriction.
+- [ ] Apply it after structural admission in upsert and full set_pipeline,
+  before source/blob resolution/preparation. Collect bounded diagnostics in input
+  order, preserve state/version and permitted redacted attempted values.
+- [ ] Apply the same rule in runtime settings, state validation, YAML import and
+  public export/lowering; keep historical hydration readable. Register new
+  guidance through milestone 3 without growing legacy regexes.
+- [ ] Test actual audit serialization, pre-custody call boundaries, import/export
+  round trips and unchanged transform/passthrough executor behavior.
+
+### 5. Close producer-owned restricted discovery responses
+
+Use the [response implementation charter](composer-wires/restricted-response-implementation-charter.md).
+
+- [ ] Reconcile the historical producer table against the live discovery registry.
+  Select contracts from declarations, owned beside producers; admit real
+  successful variants and permitted absence/failure families only.
+- [ ] Close fixed roots and nested records while preserving legitimate dynamic
+  leaf grammar, nominal ownership, list roots, insertion order and omission.
+  No arbitrary object/Any/BaseModel/JSON root fallback or giant trial union.
+- [ ] Preserve independent error authority and exact disclosure/projection
+  precedence, cache eligibility and current state/schema budget on reuse. Build
+  the final restricted envelope once without later ambient mapping mutation.
+- [ ] Exercise real producer variants, corruption, current-surface cache reuse,
+  restricted/full-state selectors, preview refusal and schema budget boundaries.
+  Prove actual wrong-field/wrong-type mutations fail for intended reasons.
+- [ ] After correctness freezes, use the [local performance checks](composer-wires/contract-performance-checks.md)
+  for adapter construction/traversal costs. No performance target weakens admission.
+
+### 6. Implement sparse presence and structured persisted errors together
+
+Use the [combined charter](composer-wires/combined-presence-errors-charter.md),
+with the [detailed presence fixtures](composer-wires/frontend-presence-handoff.md).
+
+- [ ] Re-read both session schema epoch pins at the incorporated release state;
+  advance them together for these two persisted changes. Test fresh and stale
+  temporary SQLite/PostgreSQL stores. No actual session store reset, backfill,
+  legacy reader or historical rewriting is part of implementation.
+- [ ] Preserve sparse argument display through sensitive summarization,
+  publication, row/event restoration and frontend comparison. Responses retain
+  existing default-inclusive redaction. Replacement caveats are unconditional.
+- [ ] Share the narrowly scoped semantic-redacted hash helper between the
+  persisted dispatch-binding constructor and all five service comparisons.
+  Exact display, draft, audit-payload and private invocation hashes remain exact.
+- [ ] Carry frozen required-key `{message, error_code, component}` records through
+  composition-state persistence, strict decoder/HTTP projection, guided replay,
+  frontend and RGR scoring. Code remains `str | None`; preserve null/empty
+  semantics, message-only pending digest authority and guided disclosure.
+- [ ] Prove explicit inline_blob:null and omission through first durable guided
+  dispatch, settlement, rejection, retry and recovery, with non-normalized-field
+  tampering controls. Run frontend fixture/decoder/humanizer/component checks
+  and PostgreSQL persistence/epoch proofs.
+
+### 7. Close the remaining response and evaluation residue
+
+Use the [residue handoff](composer-wires/remaining-residue-handoff.md) and
+[hidden-label disposition](composer-wires/hidden-label-disposition.md).
+
+- [ ] `elspeth-5e81b50f2e`: remove the redundant destination data.note; retain the
+  existing `quarantine_unknown_output` error once, with direct guidance and
+  independent server-owned metadata notes preserved.
+- [ ] `elspeth-72ce6749ac`: keep legitimate dynamic keys private; document and
+  test mapping-local input-order labels through real redaction/audit persistence.
+  Approved fixed vocabulary may retain names; unknown external names/hashes may not.
+- [ ] `elspeth-c00e6d9795`: finish immutable restricted construction in milestone 5.
+- [ ] `elspeth-6aa477c78e`: make battery approval observability explicit; redacted
+  status is not evidence approval was absent or a mutation definitely applied.
+  If a minimal status carrier is needed, identify its actual producer/capture
+  seam and prove current disclosure policy permits it. Full canonical payload
+  capture would require a separate disclosure decision.
+- [ ] `elspeth-9e76d9436b`: consume actual structured HTTP state from milestone 6
+  with producer-backed fixtures; preserve correct mocked-harness behavior.
+- [ ] Reconcile already reviewed error-twin, envelope-census and teaching repairs
+  with their owning tests. Do not redo historical fixes or silently drop their
+  independent repair/failure/cache contracts.
+
+### 8. Derive the scorecard and complete integration/live acceptance
+
+Use the [scorecard charter](composer-wires/scorecard-integration-charter.md).
+
+- [ ] Extend `composer_wire_census.py --scorecard` using each gate's actual census
+  authority. Join every wire onto the live registered universe after exact-set
+  and duplicate checks. Missing/unresolved cells fail honestly, not as N/A.
+- [ ] Distinguish root/schema relation, static attribution, value redaction,
+  lexical teaching, generated frontend membership and executed behavioral proof.
+  The Python fixture consumer remains independent of Node; Vitest proves the
+  runtime dispatch relation. A table is not a test execution receipt.
+- [ ] At the frozen integrated candidate, run backend default and serial
+  PostgreSQL suites, full frontend tests/typecheck/lint, Ruff/mypy/contracts and
+  key-free lint-corpus comparison. Account for each new failure or binding delta.
+- [ ] Prepare the existing [standard battery](../../evals/composer-standard-battery/battery.md)
+  plus one scenario per repaired seam, including silently dropped knobs and
+  explicit-approval cards. Reuse the existing Composer harnesses. Prepare exact
+  baseline/candidate commands, model/settings and bounded inputs before seeking
+  any still-required provider-egress approval.
+- [ ] After authorized trials, record repair turns, calls per transition,
+  unknown-key placeholders and approval-card rows. Rootless/widget acceptance
+  requires per-transition provider-call scrutiny; the old single baseline
+  transition did not exercise that path.
+- [ ] Close campaign scope only when current gate results and live evidence
+  account for every tool and each residue item. Reverify tracker/HEAD status
+  before reporting completion; no inferred fence or incomplete scorer counts.
+
+## Commands and evidence discipline
+
+These are future execution commands. Start in the primary checkout for worktree
+selection; use its explicit resolved path thereafter. Use existing `.venv`
+dependencies; do not rebuild or install into the shared environment.
+
+```bash
+campaign_root="$(git rev-parse --show-toplevel)/.claude/worktrees/composer-wires-consolidated"
+cd "$campaign_root" && export PYTHONPATH="$campaign_root/src:$campaign_root/elspeth-lints/src"
+export LITELLM_MODE=PRODUCTION
+export LITELLM_LOCAL_MODEL_COST_MAP=True
+campaign_logs="$(mktemp -d /tmp/composer-wires-resume.XXXXXX)"
+cd "$campaign_root" && .venv/bin/python - <<'PY'
 from pathlib import Path
-
-from elspeth.web.composer import redaction
-from elspeth.web.composer.tools._dispatch import get_tool_definitions
-
-TOOLS_ROOT = Path(__file__).resolve().parents[2] / "src" / "elspeth" / "web" / "composer" / "tools"
-VALIDATOR_NAMES = frozenset({"_validate_mutation_arguments", "_validate_arguments"})
-
-
-@dataclass(frozen=True)
-class ModelWireRow:
-    tool: str
-    shipped: frozenset[str]
-    model_class: str | None
-    model_fields: frozenset[str]
-    site: str
-
-
-def _shipped() -> dict[str, frozenset[str]]:
-    return {d["name"]: frozenset((d.get("parameters") or {}).get("properties", {})) for d in get_tool_definitions()}
-
-
-def _handler_models() -> dict[str, tuple[str, str]]:
-    """tool -> (model class name, 'handler:<module>.<function>') from the AST.
-
-    A handler is `def _execute_<tool>(args, state, context)`. Its model is the
-    Name passed first to a validator call. A validator called with anything
-    other than a bare Name is a finding, not a row: raise so the census cannot
-    quietly skip it.
-    """
-    found: dict[str, tuple[str, str]] = {}
-    for path in sorted(TOOLS_ROOT.glob("*.py")):
-        module = ast.parse(path.read_text(), filename=str(path))
-        for node in module.body:
-            if not isinstance(node, ast.FunctionDef) or not node.name.startswith("_execute_"):
-                continue
-            tool = node.name.removeprefix("_execute_")
-            for call in ast.walk(node):
-                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
-                    continue
-                if call.func.id not in VALIDATOR_NAMES:
-                    continue
-                if not call.args or not isinstance(call.args[0], ast.Name):
-                    raise RuntimeError(f"{path.name}:{call.lineno}: {call.func.id} called without a bare model Name")
-                found[tool] = (call.args[0].id, f"handler:{path.stem}.{node.name}")
-    return found
-
-
-def census_model_wire() -> dict[str, ModelWireRow]:
-    shipped = _shipped()
-    handler_models = _handler_models()
-    rows: dict[str, ModelWireRow] = {}
-    for tool, props in shipped.items():
-        entry = redaction.MANIFEST[tool]
-        if entry.argument_model is not None:
-            model = entry.argument_model
-            rows[tool] = ModelWireRow(tool, props, model.__name__, frozenset(model.model_fields), "manifest")
-            continue
-        if tool in handler_models:
-            class_name, site = handler_models[tool]
-            module_name = site.removeprefix("handler:").rsplit(".", 1)[0]
-            model = getattr(importlib.import_module(f"elspeth.web.composer.tools.{module_name}"), class_name)
-            rows[tool] = ModelWireRow(tool, props, class_name, frozenset(model.model_fields), site)
-            continue
-        rows[tool] = ModelWireRow(tool, props, None, frozenset(), "none")
-    return rows
-
-
-if __name__ == "__main__":
-    for row in sorted(census_model_wire().values(), key=lambda r: r.tool):
-        gap_out = sorted(row.shipped - row.model_fields)
-        gap_in = sorted(row.model_fields - row.shipped)
-        print(f"{row.tool:32} {row.site:48} shipped-not-model={gap_out} model-not-shipped={gap_in}")
+import elspeth
+import elspeth_lints
+root = Path.cwd()
+for module, relative in ((elspeth, 'src'), (elspeth_lints, 'elspeth-lints/src')):
+    origin = Path(module.__file__).resolve()
+    print(f'{module.__name__}: {origin}')
+    assert origin.is_relative_to(root / relative)
+PY
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+Stop if provenance fails. Run the preserved immediate MODEL selection, capturing
+its exit separately. Read the complete log before making a result claim.
 
-Run: `pytest tests/unit/scripts/test_composer_wire_census.py -n 0 -v`
-Expected: PASS ×3. If `_handler_models` raises on a non-Name validator argument, that site is the first finding of the seam: record it on the ticket and decide (fix the handler to pass a bare Name, or teach the census the construct) before continuing.
-
-- [ ] **Step 5: Run the census and record the matrix on the ticket**
-
-Run: `PYTHONPATH=$PWD/src:$PWD/elspeth-lints/src .venv/bin/python scripts/cicd/composer_wire_census.py`
-Record: the full table, the count of rows with `site == "none"` (expected to include the 10 zero-knob tools and the 5 knob-bearing no-policy tools), and every non-empty `shipped-not-model` / `model-not-shipped` set, on a new task ticket under `elspeth-54bd0b84cd` titled "Seam 1 MODEL wire census @<sha>".
-
-- [ ] **Step 6: Commit — SUSPENDED** (leave uncommitted; note the two files on the ticket)
-
-### Task 1.2: Verdicts and ratification
-
-- [ ] **Step 1: One verdict per gap row** — for each tool with a non-empty gap, one of: `fix the producer` (schema property with no model field: delete the property or add the field), `fix the consumer` (model field the schema never shows: add the property or drop the field), `fence` (a model field deliberately internal, with the reason), `retire`.
-- [ ] **Step 2: LLM charter** — load `yzmir-llm-specialist:using-llm-specialist`; hand it the census table and three real planner tool calls from a session DB (`tool_calls` rows for `upsert_node`, `set_output`, `set_pipeline`); ask whether any `shipped-not-model` knob is one the model has been observed to set.
-- [ ] **Step 3: Systems charter** — load `yzmir-systems-thinking:using-systems-thinking`; ask for the shape ledger: every other place a json-schema and a pydantic model describe one payload with no cross-check (start from `guided/` and `mcp/` tool definitions).
-- [ ] **Step 4: Walk John through the table**, fences and producer fixes first; record each ruling on the ticket with the date.
-
-### Task 1.3: Pin — extend `schema_contract.py` to every tool
-
-**Files:**
-- Modify: `src/elspeth/web/composer/tools/schema_contract.py` (add a general assertion beside the two existing ones)
-- Test: `tests/unit/web/composer/test_tool_model_wire_parity.py`
-
-**Interfaces:**
-- Produces: `assert_model_wire_compatible(tool: str, *, shipped: frozenset[str], model_fields: frozenset[str], fenced: frozenset[str]) -> None`, raising `RuntimeError` (the module's existing convention: every `assert_*` there raises `RuntimeError` with the path and the reason) naming the tool, the direction, and the keys.
-
-- [ ] **Step 1: Write the failing gate**
-
-```python
-# tests/unit/web/composer/test_tool_model_wire_parity.py
-"""Every argument knob the planner is shown is a field of the model the handler validates against, and vice versa.
-
-SHIPPED comes from the live registry; MODEL comes from the manifest's argument_model or the
-handler's validator call, by AST (scripts/cicd/composer_wire_census.py). Neither side is
-hand-listed. Fences live in model_wire_fence.json with a reason each and are themselves gated.
-"""
-import json
-from pathlib import Path
-
-import pytest
-
-from elspeth.web.composer.tools.schema_contract import assert_model_wire_compatible
-from scripts.cicd.composer_wire_census import census_model_wire
-
-FENCE = json.loads((Path(__file__).parent / "model_wire_fence.json").read_text())
-ROWS = census_model_wire()
-
-
-@pytest.mark.parametrize("tool", sorted(ROWS))
-def test_shipped_and_model_agree(tool: str) -> None:
-    row = ROWS[tool]
-    if row.site == "none":
-        pytest.skip("no model on this wire; covered by the READ seam")
-    assert_model_wire_compatible(
-        tool, shipped=row.shipped, model_fields=row.model_fields, fenced=frozenset(FENCE.get(tool, {}))
-    )
-
-
-def test_every_fence_row_still_earns_its_place() -> None:
-    for tool, keys in FENCE.items():
-        row = ROWS[tool]
-        for key, reason in keys.items():
-            assert reason, f"{tool}.{key}: a fence without a reason"
-            assert key in (row.shipped ^ row.model_fields), f"{tool}.{key}: fenced but no longer a gap — retire the fence"
-
-
-def test_gate_is_not_vacuous() -> None:
-    assert sum(1 for r in ROWS.values() if r.site != "none") >= 12
+```bash
+cd "$campaign_root" && .venv/bin/python -m pytest \
+  -o "pythonpath=$campaign_root/src $campaign_root/elspeth-lints/src" -n 0 \
+  tests/unit/web/composer/test_tool_model_wire_parity.py \
+  tests/unit/web/composer/test_coerce_stringified_json_object_args.py \
+  tests/unit/web/composer/test_advisor_tool.py::test_f3a_advisor_rejects_non_list_recent_errors \
+  tests/unit/web/composer/test_blob_inline_tools.py::TestWireBlobInlineRef::test_authors_marker_with_authoritative_pinned_hash \
+  tests/unit/scripts/test_composer_wire_census.py \
+  > "$campaign_logs/model-preparation.log" 2>&1
+result=$?
+printf '%s\n' "$result" > "$campaign_logs/model-preparation.exit"
+cat "$campaign_logs/model-preparation.exit"
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+Add the actual owning protocol/error-closure tests after reading their current
+names. For final broad gates use the canonical wrapper; its detached launcher
+exit is not the suite result. Poll its printed `.done` path, then read
+`summary.txt` and the corresponding logs. A `frozen=NO` run is not evidence.
 
-Run: `pytest tests/unit/web/composer/test_tool_model_wire_parity.py -n 0 -v`
-Expected: FAIL with `ImportError: cannot import name 'assert_model_wire_compatible'`
-
-- [ ] **Step 3: Implement the assertion**
-
-```python
-# in src/elspeth/web/composer/tools/schema_contract.py, beside assert_upsert_node_schema_compatible
-def assert_model_wire_compatible(
-    tool: str, *, shipped: frozenset[str], model_fields: frozenset[str], fenced: frozenset[str]
-) -> None:
-    """Raise unless every shipped knob is a model field and every model field is shipped, fences excepted."""
-    shipped_not_model = shipped - model_fields - fenced
-    model_not_shipped = model_fields - shipped - fenced
-    if shipped_not_model or model_not_shipped:
-        raise RuntimeError(
-            f"{tool}: advertised but not validated {sorted(shipped_not_model)}; "
-            f"validated but never advertised {sorted(model_not_shipped)}"
-        )
+```bash
+cd "$campaign_root" && scripts/full-suite-gate.sh --execute --detach \
+  --root "$campaign_root" --log-dir "$campaign_logs/integrated" \
+  --stages ruff,mypy,contracts,lints,pytest,testcontainer
 ```
 
-- [ ] **Step 4: Run the gate; every red row is a Task 1.2 verdict** — fix the producer or consumer per the ratified table, or add the fence row `{"<tool>": {"<key>": "<reason>"}}` to `model_wire_fence.json`. Re-run until green with the fence count recorded on the ticket.
+Frontend commands use existing package scripts and record separate exits.
 
-- [ ] **Step 5: Mutation ledger** — (a) remove one fence row: gate must fail on that tool; (b) in the census, make `_handler_models` skip validator calls whose first arg is not a Name instead of raising: `test_gate_is_not_vacuous` or a parity row must fail — if neither does, the escape is unguarded and needs a probe site; (c) add a property to one tool's schema in a cp-roundtripped copy: its row must fail. Restore by copying back; reconcile failed + passed against the unmutated total each time.
+```bash
+for campaign_stage in typecheck lint test; do
+  cd "$campaign_root/src/elspeth/web/frontend" && npm run "$campaign_stage" \
+    > "$campaign_logs/frontend-$campaign_stage.log" 2>&1
+  result=$?
+  printf '%s\n' "$result" > "$campaign_logs/frontend-$campaign_stage.exit"
+done
+```
 
-- [ ] **Step 6: Commit — SUSPENDED**
+Use `-n 0` for single tests and PostgreSQL; respect sibling suite capacity.
+Each gate mutation records identical baseline/mutant/restored test identities,
+applied change, intended behavioral failure, explicit exits and restored source.
+Collection/import crashes are not semantic kills. Control new instruments with
+known-positive/negative examples and mutate the thing a gate claims to protect.
 
-### Task 1.4: Review to zero, evidence, close
+Compare failures against the same named comparison revision with identical test
+selection. Serial passes for timing-sensitive failures remain separate evidence.
+Compare key-free trust-tier findings with positions masked and binding changes
+explained; do not compare to zero, hand-edit signatures, hold signing keys or
+launch global restaging. Preserve necessary contract census changes honestly.
 
-- [ ] Adversarial charter (`red-team` agent) on the gate file and the census; LLM and systems charters at close-out per skill §8; three written verdicts on one named tree state.
-- [ ] Evidence: `pytest tests/unit/web/composer tests/unit/scripts -n 6`, then the full suite set-diffed against the baseline set; lint corpus row count vs 1977 with positions masked; `check_contracts.py` census vs 2693/382/63; mypy on `src/elspeth/web/composer/tools` and `scripts/cicd`.
-- [ ] Close the seam ticket with the numbers; deliberate residue on its own ticket with a measurement.
+## Release integration cadence and completion boundary
 
----
+ACA/multi-replica enhancements continue on `release/0.8.1`. Work against the fixed
+incorporated revision while completing a bounded milestone; avoid rebasing under
+an active writer or frozen test run. At milestone checkpoints and before final
+acceptance, measure upstream commits and exact changed paths, incorporate the
+chosen release revision deliberately, and rerun affected proofs.
 
-## Seam 2 — READ: what the handler actually consumes
+During consolidation the local release advanced to
+`d1b473c8f846f9ed7dc1da1d6c2dd6641abfed8a`. Git measured six newly reachable
+commits and 40 changed paths since the fixed input, with no direct overlap with
+the captured campaign paths plus `tools/outputs.py` housekeeping. Those release
+changes are not incorporated here. This is a dated path comparison, not proof
+that dependencies cannot interact; refresh it before the next integration.
 
-Producer: SHIPPED. Consumer: for tools with a model, `validated.<field>` attribute reads inside the handler; for tools without one (`site == "none"` rows from Seam 1 that have knobs — measured: `explain_validation_error`, `get_pipeline_state`, `get_plugin_schema`, `get_plugin_assistance`, `list_models`, plus any declarative handler that reads `args[...]` directly), the literal-key subscripts and `.get` calls. Live consequence: a shipped knob nothing reads (SHIPPED not READ — the worst symptom, no error signal).
+Deployment-only changes may be separate, but session service, schema epoch,
+durable dispatch/recovery, guided replay and PostgreSQL contention are real
+possible overlaps. Re-read their current contracts after integration, especially
+before milestone 6. Preserve unrelated release work and do not switch the shared
+checkout or clean older worktrees merely because committed ancestry is merged.
 
-### Task 2.1: Census — extend `composer_wire_census.py` with `census_read_wire()`
+The earlier provider approval covered one exact synthetic baseline command.
+When execution resumes, prepare reversible implementation/tests and concrete
+live commands or operational cutover before any final approval actually needed.
 
-- [ ] **Step 1: Failing test**: `test_read_wire_refuses_dynamic_reads` — a handler that reads `args[key]` with a non-literal key must raise from the census, not be skipped; `test_read_wire_sees_validated_attribute_reads` — `upsert_node`'s row contains `id`, `node_type`, `plugin`, `options`.
-- [ ] **Step 2: Implement**: walk each `_execute_<tool>` body; collect `ast.Subscript` on the `args` parameter with `ast.Constant` slices and `args.get("k")` calls (literal first argument), plus `ast.Attribute` reads on the name bound from the validator call (`validated = _validate_mutation_arguments(...)` → the target Name). Any subscript or `.get` on `args` whose key is not an `ast.Constant` raises with the site. Produce `ReadWireRow(tool, shipped, read: frozenset[str], site)`.
-- [ ] **Step 3: Matrix on the ticket**: `shipped - read` per tool is the finding list. Verdict per row: `fix the producer` (drop the knob), `fix the consumer` (read it), or `fence` (a knob consumed by a sub-call the AST cannot attribute — name the callee; keep this count near zero).
-- [ ] **Step 4: Gate** `tests/unit/web/composer/test_tool_read_wire_parity.py`, same shape as Seam 1's, with `read_wire_fence.json`. Probe sites: a module-level probe handler in the test file exercising the subscript, `.get`, and attribute-read branches, plus one dynamic-key probe asserted to raise.
-- [ ] **Step 5: Structural close**: for any handler still reading `args[...]` directly, the ratified fix is a pydantic arguments model registered where Seam 1's census sees it, so the READ wire collapses onto MODEL. Record how many handlers converted.
-- [ ] Review, mutation ledger, evidence, close — as Seam 1.
-
----
-
-## Seam 3 — TAUGHT: every knob is explained to the planner, or fenced
-
-Producer: SHIPPED knobs (104). Taught: the property's own `description` in the json-schema, the tool `description`, and `src/elspeth/web/composer/skills/pipeline_composer.md` / `pipeline_capabilities.md`. Consumer for the same rows: ADMITTED — the 9 knobs on the 5 no-policy tools have no allowlist at all, so this seam also settles what redaction does with them. Live consequence: TAUGHT-not-SHIPPED burns a repair turn against a budget of 2; SHIPPED-not-TAUGHT is a knob the model cannot use on purpose.
-
-### Task 3.1: Census `census_taught_wire()`
-
-- [ ] **Step 1: Failing test**: a knob whose json-schema property has a non-empty `description` counts as taught at the schema; a knob named in backticks in the skill prose counts as taught in the skill; a knob quoted only in ANOTHER tool's description does not count (this is `elspeth-657f603fcd`'s mechanism one wire over — refuse it from the start).
-- [ ] **Step 2: Implement**: taught-at-schema from `parameters.properties[k].description`; taught-in-skill by scanning the markdown for `` `k` `` inside the paragraph or table row that names the tool (own-tool context only; reuse `_teaching_gate_support.py`'s quoted-leaf reader for the tokenising, and add the context restriction there so the envelope gate can adopt it — that closes `657f603fcd`).
-- [ ] **Step 3: Matrix**: untaught knobs, stale knobs (taught, unshipped), and the 9 no-policy knobs with their ADMITTED disposition.
-- [ ] **Step 4: LLM charter FIRST** (skill §4): give it the real tool definitions as the model sees them and the untaught list; it decides which are teach vs fence, and whether each existing description lets the model set the knob correctly from the wire.
-- [ ] **Step 5: Gate** `tests/unit/web/composer/test_tool_knob_teaching_gate.py` + `knob_teaching_fence.json`, deriving both sides; the fence is gated. Extend `test_tool_argument_wire_parity.py`'s docstring to name TAUGHT as covered here, so the wire enumeration is complete in one place.
-- [ ] **Step 6: ADMITTED for the 5 no-policy tools**: ratified verdict per tool — add a declarative `known_argument_keys` entry (the gate from `test_tool_argument_wire_parity.py` then covers them) or record on the manifest why a discovery tool's arguments are never persisted, with a probe proving they are not.
-- [ ] Review, mutation ledger, evidence, close.
-
----
-
-## Seam 4 — FRONTEND: what the operator is shown
-
-Producer: the redacted argument payload (`redact_tool_call_arguments`, already fixtured in `frontend/src/test/fixtures/redacted-tool-arguments.json`). Consumer: `ProposalDiff.tsx`, `ChatPanel.tsx`, `proposals.py` (the approval card). Live consequence: an operator who opted into explicit approval is shown an empty diff, a false "Changed", a false blast radius, or never sees a widget.
-
-The four open tickets are this seam's matrix; each is an explore-and-pin in miniature.
-
-- [ ] **4.1 `f491fca94e`** — convert `PROJECTED_TOOLS` from transcription to derivation: export `PROJECTED_TOOL_NAMES` from `ProposalDiff.tsx` as the array the switch is built from; a vitest asserts switch-vs-constant parity; `scripts/cicd/bootstrap_proposal_diff_fixture.py` emits that list into the fixture JSON under `projected_tools`, and the Python guard reads it. Mutant: drop a tool from both the TS constant and the fixture → the vitest parity test fails.
-- [ ] **4.2 `134b9a9a65`** — route `isEmptyRedactedOptions` through `decodeRedactedOptionSummary(value)?.entryCount === 0`; replace the ChatPanel test's stale third-grammar fixture with a real one from the fixture file. This ENABLES a suppressed widget on the rootless path: per-transition provider-call scrutiny before it lands (AGENTS.md standing trigger), and the LLM charter confirms the widget's behaviour once it can render.
-- [ ] **4.3 `7cda5664b0`** — derive `affects` in `proposals.py` from what the handler returns (`_discovery_result` affects nothing in the graph; a blob-store mutation affects the blob store, a value the vocabulary must gain) instead of the constant default; the generic summary gains a blob-store arm naming the blob and the verb. Gate: a parametrised test over every tool asserting the card's `affects` equals the derived set; no per-tool hand branch.
-- [ ] **4.4 `d6147d73ed`** — design call for John, not a patch: (a) redact from the raw argument dict so absent keys stay absent; (b) record the provided key set beside the payload; (c) stop comparing nullable optional keys. Present the three with the fixture case `set_pipeline_replaying_current_state` as the driver; implement the ruled option; pin it from the fixture.
-- [ ] Review (adversarial + LLM on the card text), mutation ledger, vitest + pytest evidence, close.
-
----
-
-## Seam 5 — response-side residue from the envelope run
-
-Ten open children of the epic are envelope-side findings the second run recorded rather than fixed. Each is a verdict-and-fix under the existing envelope gate; none needs a new census.
-
-- [ ] `7980efe197` `_failure_result` ships `data.error` / `data.error_code` as a twin of `validation.errors[0]` at ~261 producers — one authority; systems charter names which.
-- [ ] `8fe09316ab` `validation_errors` stringified while warnings keep structure — close the type.
-- [ ] `72ce6749ac` `_redacted_response_field_N` positional identity — key on the field name.
-- [ ] `e12dce8ed6`, `9fcf465c41` envelope census gaps (dotted-path keying; attributed helper in dict-literal position) — fix the census, add the probes.
-- [ ] `657f603fcd` — closed by Seam 3's own-tool-context reader.
-- [ ] `5e81b50f2e`, `d83095ee87`, `c00e6d9795`, `6aa477c78e`, `9e76d9436b` — verdict each against the envelope matrix; fix in place or fence with a reason.
-
----
-
-## Seam 6 — scorecard and live trial
-
-- [ ] **Scorecard**: `scripts/cicd/composer_wire_census.py --scorecard` prints one row per tool with a column per wire (SHIPPED count, MODEL site, READ coverage, ADMITTED source, TAUGHT coverage, FRONTEND projected) — every cell derived from the gates' own census functions, no hand entry. A pytest pins that no cell reads "unknown".
-- [ ] **Live trial** (skill §10): the composer standard battery (`evals/composer-standard-battery/battery.md`) plus one scenario per seam designed to hit it (a knob previously silently dropped; an approval card under `explicit_approve`), driven through the API detached with a done marker. Count repair turns, tool calls per transition, unknown-key placeholders reaching the model, and approval-card rows. Compare against the peer baseline transcript; a reproduced failure is data.
-- [ ] Record the scorecard and trial counts on `elspeth-54bd0b84cd`; close the epic when every tool's row is fully wired or explicitly fenced.
-
----
-
-## Self-review
-
-- Spec coverage: the six wires each have a seam (SHIPPED is the producer side of every seam; ADMITTED is the landed gate plus Seam 3 step 6 for the 5 uncovered tools; MODEL 1; READ 2; TAUGHT 3; FRONTEND 4); the epic's open children are all slotted or explicitly excluded with a reason.
-- Placeholders: Seams 2–6 give instruments, file names, test names and mutation shapes but not full code; that is deliberate because their census does not exist yet and the skill forbids writing a claim ahead of the census. Seam 1 is fully specified and is the template the others repeat.
-- Type consistency: `census_model_wire()` / `ModelWireRow` (1.1) are what 1.3 imports; `assert_model_wire_compatible` (1.3) matches its test; it raises `RuntimeError` like every other assertion in `schema_contract.py` (verified 2026-09-08: the module defines no error class of its own).
+Campaign exclusions remain the previously separated design work: deep_thaw
+`elspeth-10f818998e`, byte ledger `elspeth-6089bfa8fa`, TS mirrors
+`elspeth-91133e850b` / `elspeth-e25f8f7530`, operator tier-model worklist
+`elspeth-1eca86caa9`, `elspeth-8b0b6e5bb9`, `elspeth-f4c71c3e8e`,
+`elspeth-919cd29876`, and Wave-1 residues `elspeth-4ddaee2202`,
+`elspeth-c8f8318203`, `elspeth-caae752e11`, `elspeth-6bcc0e7ee9`.
+New evidence that one is a necessary dependency must be explained explicitly;
+filing follow-ups is not a substitute for the campaign's actual deliverable.

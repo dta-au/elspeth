@@ -4,6 +4,7 @@ import type { CompositionProposal, CompositionState, ToolCall } from "@/types/ap
 import { Button } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { ArgumentFields, buildProposalDiff, ProposalChanges } from "./ProposalDiff";
+import { proposalEffectLabel } from "./proposalEffectLabel";
 import {
   TOOL_CALL_DESCRIPTIONS,
   describeToolCall,
@@ -173,7 +174,7 @@ export function ToolCallCard({
       </p>
       {proposal.affects.length > 0 && (
         <p className="tool-call-affects">
-          <strong>Affects:</strong> {proposal.affects.join(", ")}
+          <strong>Affects:</strong> {proposal.affects.map(proposalEffectLabel).join(", ")}
         </p>
       )}
       {/* Primary change surface (elspeth-10f76f9250): a before/after diff of

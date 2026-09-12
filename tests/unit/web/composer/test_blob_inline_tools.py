@@ -384,7 +384,7 @@ class TestWireBlobInlineRef:
         assert result.updated_state is state
         assert result.updated_state.version == state.version
         assert result.updated_state.nodes[0].options == {}
-        assert result.data["error"] == (
+        assert result.validation.errors[0].message == (
             "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options."
         )
 
@@ -448,8 +448,8 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data["error_code"] == "interpretation_requirements_invalid"
-        assert "sk-sensitive-wire-review" not in result.data["error"]
+        assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+        assert "sk-sensitive-wire-review" not in result.validation.errors[0].message
 
     @pytest.mark.parametrize("field_path", ["source.options.endpoint_url", "output:main.options.endpoint_url"])
     def test_aws_s3_endpoint_url_field_is_rejected_without_mutating_state(
@@ -478,8 +478,8 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == 5
-        assert result.data["error"] == AWS_S3_ENDPOINT_URL_POLICY_ERROR
-        assert blob.data["blob_id"] not in result.data["error"]
+        assert result.validation.errors[0].message == AWS_S3_ENDPOINT_URL_POLICY_ERROR
+        assert blob.to_dict()["data"]["blob_id"] not in result.validation.errors[0].message
 
     def test_authors_marker_with_authoritative_pinned_hash(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="Pinned prompt")
@@ -597,29 +597,28 @@ class TestWireBlobInlineRef:
         )
 
         assert result.success is False
-        assert "not ready" in result.data["error"] or "status" in result.data["error"]
+        assert "not ready" in result.validation.errors[0].message or "status" in result.validation.errors[0].message
 
     def test_rejects_llm_typed_disagreeing_hash(self, blob_env: dict[str, Any]) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
         blob = _create_blob(blob_env, content="hash source")
-
-        result = execute_tool(
-            "wire_blob_inline_ref",
-            {
-                "field_path": "node:classify.options.prompt_template",
-                "blob_id": blob.data["blob_id"],
-                "sha256_override": "b" * 64,
-            },
-            _inline_ref_state(),
-            _catalog(),
-            data_dir=blob_env["data_dir"],
-            session_engine=blob_env["engine"],
-            session_id=blob_env["session_id"],
-            session_operation_context=blob_env["operation"],
-            session_operation_authority=blob_env["authority"],
-        )
-
-        assert result.success is False
-        assert "sha256" in result.data["error"]
+        with pytest.raises(ToolArgumentError):
+            execute_tool(
+                "wire_blob_inline_ref",
+                {
+                    "field_path": "node:classify.options.prompt_template",
+                    "blob_id": blob.data["blob_id"],
+                    "sha256_override": "b" * 64,
+                },
+                _inline_ref_state(),
+                _catalog(),
+                data_dir=blob_env["data_dir"],
+                session_engine=blob_env["engine"],
+                session_id=blob_env["session_id"],
+                session_operation_context=blob_env["operation"],
+                session_operation_authority=blob_env["authority"],
+            )
 
     def test_rejects_llm_runtime_hash_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged prompt hash")
@@ -642,12 +641,12 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "resolved_prompt_template_hash" in result.data["error"]
-        assert "runtime-owned" in result.data["error"]
-        assert "field_path" in result.data["error"]
-        assert "patch_node_options" in result.data["error"]
-        assert "upsert_node" in result.data["error"]
-        assert "retry wire_blob_inline_ref" not in result.data["error"]
+        assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+        assert "runtime-owned" in result.validation.errors[0].message
+        assert "field_path" in result.validation.errors[0].message
+        assert "patch_node_options" in result.validation.errors[0].message
+        assert "upsert_node" in result.validation.errors[0].message
+        assert "retry wire_blob_inline_ref" not in result.validation.errors[0].message
 
     def test_rejects_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -670,9 +669,9 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert "interpretation_requirements" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_rejects_non_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -701,9 +700,9 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert "interpretation_requirements" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_rejects_source_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -726,9 +725,9 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert "interpretation_requirements" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     @pytest.mark.parametrize("field_name", sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
     def test_rejects_source_server_owned_root_field_path(
@@ -756,8 +755,8 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert field_name in result.data["error"]
-        assert "set_source_from_blob" in result.data["error"]
+        assert field_name in result.validation.errors[0].message
+        assert "set_source_from_blob" in result.validation.errors[0].message
 
     def test_rejects_output_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -780,9 +779,9 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert "interpretation_requirements" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_unrelated_wire_rejects_preexisting_output_interpretation_requirements(
         self,
@@ -825,8 +824,8 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data["error_code"] == "interpretation_requirements_invalid"
-        assert "sk-sensitive-output-review" not in result.data["error"]
+        assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+        assert "sk-sensitive-output-review" not in result.validation.errors[0].message
 
     def test_rejects_invalid_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="prompt")
@@ -847,29 +846,29 @@ class TestWireBlobInlineRef:
         )
 
         assert result.success is False
-        assert "field_path" in result.data["error"]
+        assert "field_path" in result.validation.errors[0].message
 
     def test_rejects_unknown_encoding(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="prompt")
 
-        result = execute_tool(
-            "wire_blob_inline_ref",
-            {
-                "field_path": "node:classify.options.prompt_template",
-                "blob_id": blob.data["blob_id"],
-                "encoding": "ascii",
-            },
-            _inline_ref_state(),
-            _catalog(),
-            data_dir=blob_env["data_dir"],
-            session_engine=blob_env["engine"],
-            session_id=blob_env["session_id"],
-            session_operation_context=blob_env["operation"],
-            session_operation_authority=blob_env["authority"],
-        )
+        from elspeth.web.composer.protocol import ToolArgumentError
 
-        assert result.success is False
-        assert "encoding" in result.data["error"]
+        with pytest.raises(ToolArgumentError):
+            execute_tool(
+                "wire_blob_inline_ref",
+                {
+                    "field_path": "node:classify.options.prompt_template",
+                    "blob_id": blob.data["blob_id"],
+                    "encoding": "ascii",
+                },
+                _inline_ref_state(),
+                _catalog(),
+                data_dir=blob_env["data_dir"],
+                session_engine=blob_env["engine"],
+                session_id=blob_env["session_id"],
+                session_operation_context=blob_env["operation"],
+                session_operation_authority=blob_env["authority"],
+            )
 
 
 class TestSetSourceFromBlobMode:
@@ -977,8 +976,8 @@ class TestSetSourceFromBlobMode:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements_invalid" in result.data["error"]
-        assert "sk-sensitive-source-review" not in result.data["error"]
+        assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+        assert "sk-sensitive-source-review" not in result.validation.errors[0].message
 
     def test_set_source_from_blob_emits_explicit_bind_source_mode(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, filename="input.csv", mime_type="text/csv", content="name\nAda")

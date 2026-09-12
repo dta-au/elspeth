@@ -251,7 +251,7 @@ def test_postgres_content_reader_waits_for_live_deletion_before_reconciliation(
                     result = read_future.result(timeout=10)
                     assert isinstance(result, ToolResult)
                     assert not result.success
-                    assert "not found" in result.data["error"].lower()
+                    assert "not found" in result.validation.errors[0].message.lower()
                 assert not storage.exists()
                 assert list(storage.parent.glob(f".{blob.id}.delete-*")) == []
         finally:

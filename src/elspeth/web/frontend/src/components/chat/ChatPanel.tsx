@@ -1,3 +1,4 @@
+import { decodeRedactedOptionSummary } from "@/utils/redactedArguments";
 // src/components/chat/ChatPanel.tsx
 import {
   Fragment,
@@ -136,11 +137,8 @@ function isAbsentOrNull(value: Record<string, unknown>, key: string): boolean {
   return !hasOwn(value, key) || value[key] === null;
 }
 
-function isEmptyRedactedOptions(value: unknown): boolean {
-  if (value === null || value === undefined) return true;
-  if (typeof value === "string") return value.trim() === "{}";
-  if (isRecord(value)) return Object.keys(value).length === 0;
-  return false;
+export function isEmptyRedactedOptions(value: unknown): boolean {
+  return decodeRedactedOptionSummary(value)?.entryCount === 0;
 }
 
 const DEFAULT_PIPELINE_METADATA_NAME = "Untitled Pipeline";
@@ -393,6 +391,7 @@ export function isAmbiguousInlineProposal(
         "blob_id",
         "options",
         "on_validation_failure",
+        "description",
         "inline_blob",
       ]),
     )
@@ -400,6 +399,7 @@ export function isAmbiguousInlineProposal(
     return false;
   }
   if (
+    !isAbsentOrNull(sourceRecord, "description") ||
     !isAbsentOrNull(sourceRecord, "blob_id") ||
     !isAbsentOrNull(sourceRecord, "on_validation_failure") ||
     (hasOwn(sourceRecord, "options") &&

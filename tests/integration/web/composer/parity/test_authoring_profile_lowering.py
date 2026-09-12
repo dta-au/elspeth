@@ -194,7 +194,7 @@ def test_splice_transform_clears_retry_budget_gate_for_profiled_multi_query(pari
         },
     }
     result = _run(parity_env, "splice_transform", args, _splice_base_state())
-    error = "" if result.success else str(result.data.get("error", "")).lower()
+    error = "" if result.success else str(result.validation.errors[0].message).lower()
     assert _RETRY_BUDGET_MARKER not in error, result.data
 
 
@@ -246,7 +246,7 @@ def _egress_rejection_error(result: Any) -> str:
     ``profile_unavailable`` mechanism.
     """
     assert result.success is False, result.data
-    return str(result.data.get("error", "")).lower()
+    return str(result.validation.errors[0].message).lower()
 
 
 @pytest.mark.parametrize("field,value", _SMUGGLED_EGRESS_FIELDS)

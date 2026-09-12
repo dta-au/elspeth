@@ -28,7 +28,7 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Final, NotRequired, TypedDict, cast
 
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 
@@ -122,9 +122,15 @@ from elspeth.web.validation import (
     INTERPRETATION_PLACEHOLDER_RE,
 )
 
+
+class EmptyToolArgumentsModel(BaseModel):
+    """Complete public admission for tools with no advertised arguments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 _FULL_STATE_COMPONENT_ALIASES: Final[tuple[str, ...]] = ("", "full", "all", "pipeline")
 _FULL_STATE_COMPONENT_ALIAS_SET: Final[frozenset[str]] = frozenset(_FULL_STATE_COMPONENT_ALIASES)
-_DATA_ERROR_KEY: Final[str] = "error"
 _RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"resolved_prompt_template_hash"})
 _SOURCE_BLOB_REF_OPTION_KEY: Final[str] = "blob_ref"
 _SOURCE_BLOBS_OPTION_KEY: Final[str] = "blobs"
@@ -1186,7 +1192,7 @@ def diff_states(
     return changes
 
 
-def _validate_mutation_arguments(model: type[BaseModel], arguments: object, argument_name: str) -> BaseModel:
+def _validate_mutation_arguments[ModelT: BaseModel](model: type[ModelT], arguments: object, argument_name: str) -> ModelT:
     try:
         return model.model_validate(arguments)
     except PydanticValidationError as exc:
@@ -1231,7 +1237,7 @@ def _attach_post_call_hints(
 
 
 def _discovery_result(state: CompositionState, data: Any) -> ToolResult:
-    """Build a ToolResult for a discovery (read-only) tool."""
+    """Build a result with unchanged composition state, including blob-only writes."""
     validation = state.validate()
     return ToolResult(
         success=True,
@@ -1290,15 +1296,11 @@ def _failure_result(
             plugin_identity=plugin_identity,
             rejected_component=rejected_component,
         )
-    data = {_DATA_ERROR_KEY: error_msg}
-    if error_code is not None:
-        data["error_code"] = error_code
     return ToolResult(
         success=False,
         updated_state=state,
         validation=validation,
         affected_nodes=(),
-        data=data,
         _state_validation_withheld=not with_state_validation,
     )
 
@@ -1523,19 +1525,17 @@ def _merged_component_rejection_result(
     The FIRST failing component's envelope is the base — its ``data`` payload
     (including the credential-rejection repair block) and its leading entry
     stay exactly what a single-component rejection would have produced, so
-    ordering is stable and no response shape moves. This is also the one
-    place where ``data["error_code"]`` agreeing with ``errors[0].error_code``
-    is NOT structural: ``data`` comes from ``results[0]`` while ``errors``
-    concatenates every result's entries. Agreement therefore rests on an
-    unstated precondition — ``results[0]`` must carry a leading
-    ``rejected_mutation`` entry. Every current feeder satisfies it because
-    all of them construct through ``_failure_result`` /
-    ``_plugin_policy_failure``; a future feeder that does not would publish
-    two disagreeing codes in one envelope. Later components
+    ordering is stable. Each feeder must be failed and lead with a
+    ``rejected_mutation`` entry. Later components
     contribute their rejection entries only. ``components_withheld`` records
     the components the caller's reporting cap dropped; truncation is never
     silent.
     """
+    if not results:
+        raise AssertionError("Component rejection merge requires at least one result")
+    for result in results:
+        if result.success or not result.validation.errors or result.validation.errors[0].component != "rejected_mutation":
+            raise AssertionError("Component rejection feeder must fail with a leading rejected_mutation entry")
     base = results[0]
     entries = tuple(entry for result in results for entry in result.validation.errors if entry.component == "rejected_mutation")
     data = base.data
@@ -1545,7 +1545,7 @@ def _merged_component_rejection_result(
         # `freeze_fields(self, "data")`, so `base.data` is a MappingProxyType,
         # never an exact dict. Converging this on the house `type(x) is dict`
         # scalar idiom makes the test permanently False, sends every merge to
-        # the else branch, and drops `error_code` and every detail from the
+        # the else branch, and drops independent repair details from the
         # rejection envelope the model receives. Pinned by
         # tests/unit/web/composer/test_frozen_state_nominal_type_guards.py::
         # test_merged_component_rejection_keeps_the_whole_data_payload_of_a_frozen_result
@@ -1890,7 +1890,6 @@ def _credential_wiring_contract_failure(
         affected_nodes=(),
         _state_validation_withheld=not with_state_validation,
         data={
-            _DATA_ERROR_KEY: error_msg,
             "credential_fields": credential_fields,
             "components": (
                 {

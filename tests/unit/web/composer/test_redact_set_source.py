@@ -25,7 +25,6 @@ from elspeth.web.composer.redaction import (
     REDACTED_BLOB_SOURCE_PATH,
     Sensitive,
     SetSourceArgumentsModel,
-    _coerce_stringified_json_object,
     _redact_via_schema,
     _summarize_set_source_options,
     normalize_set_pipeline_redacted_arguments,
@@ -230,7 +229,7 @@ def test_redact_guided_snapshot_masks_both_channels() -> None:
     source-keyed redaction misses it. The co-located schema-8 reviewed source retained
     blob_ref; the helper uses it (no DB lookup) to mask BOTH the committed source
     path (channel 2) and the reviewed snapshot path (channel 3)."""
-    real_path = "/home/u/elspeth/data/blobs/sess/abc_data.csv"
+    real_path = "/srv/elspeth/data/blobs/sess/abc_data.csv"
     sources = {"source": {"plugin": "csv", "options": {"path": real_path, "schema": {"mode": "observed"}}}}
     composer_meta = {
         "guided_session": {
@@ -529,7 +528,7 @@ def test_redact_guided_snapshot_requires_exact_pending_intent_options() -> None:
 
 
 def test_redact_guided_snapshot_rejects_malformed_source_when_blob_redaction_active() -> None:
-    real_path = "/home/u/elspeth/data/blobs/sess/abc_data.csv"
+    real_path = "/srv/elspeth/data/blobs/sess/abc_data.csv"
     sources = {"source": {"options": "not-options"}}
     composer_meta = {
         "guided_session": {
@@ -1022,19 +1021,14 @@ def test_redact_source_storage_path_none_options_and_missing_blob_ref_pass_throu
         assert redact_source_storage_path(state) == state
 
 
-def test_coerce_stringified_json_object_never_raises_on_hostile_text() -> None:
-    """``_coerce_stringified_json_object`` is an observation boundary: it never raises.
+def test_hostile_nested_object_text_is_rejected_without_decoding() -> None:
+    from pydantic import ValidationError
 
-    Depth is bounded by ``bounded_json_loads`` (``RecursionError`` becomes a
-    ``JsonBoundaryError``, a ``ValueError``), so the previously documented
-    unbounded-recursion exposure is closed and every non-object outcome is
-    returned untouched for pydantic to reject.
-    """
-    deep = "[" * 20_000
-    assert _coerce_stringified_json_object(deep) is deep
-    for untouched in ("not json", "[1, 2]", "null", '"str"', "42", 7, None, ["x"], {"already": "dict"}):
-        assert _coerce_stringified_json_object(untouched) is untouched
-    assert _coerce_stringified_json_object('{"k": 1}') == {"k": 1}
+    from elspeth.web.composer.redaction import SetSourceFromBlobArgumentsModel
+
+    for text in ("[" * 20000, "not json", '{"k": 1}'):
+        with pytest.raises(ValidationError):
+            SetSourceFromBlobArgumentsModel.model_validate({"blob_id": "b", "on_success": "rows", "options": text})
 
 
 def test_normalize_set_pipeline_redacted_arguments_membership_shapes() -> None:

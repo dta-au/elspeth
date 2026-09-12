@@ -1186,6 +1186,58 @@ def test_accept_schema_stale_proposal_returns_422_and_rejects(tmp_path) -> None:
     assert asyncio.run(service.get_current_state(session_id)) is None
 
 
+@pytest.mark.parametrize("rejection_kind", ["helper", "standing", "empty", "empty_message"])
+def test_accept_failed_proposal_uses_only_the_rejection_detail(tmp_path, monkeypatch, rejection_kind: str) -> None:
+    from elspeth.web.composer.tools import _failure_result
+    from elspeth.web.sessions.routes.composer import proposals as proposal_routes
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app, raise_server_exceptions=False)
+    session_id = uuid.UUID(client.post("/api/sessions", json={"title": "Rejected proposal"}).json()["id"])
+    arguments = {"patch": {"name": "new name"}}
+    proposal = asyncio.run(
+        _create_test_composition_proposal(
+            service,
+            session_id=session_id,
+            tool_call_id="call_rejected_metadata",
+            tool_name="set_metadata",
+            summary="Update pipeline metadata.",
+            rationale="Requested update.",
+            affects=("metadata",),
+            arguments_json=arguments,
+            arguments_redacted_json=arguments,
+            base_state_id=None,
+            actor="composer-web:user:alice",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash=stable_hash(arguments),
+        )
+    )
+    failure = _failure_result(
+        _EMPTY_STATE, "" if rejection_kind == "empty_message" else "rejected metadata update", with_state_validation=False
+    )
+    if rejection_kind in {"standing", "empty"}:
+        validation = _EMPTY_STATE.validate() if rejection_kind == "standing" else ValidationSummary(is_valid=True, errors=())
+        failure = replace(failure, validation=validation)
+    monkeypatch.setattr(proposal_routes, "execute_tool", lambda *args, **kwargs: failure)
+
+    response = client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept")
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    expected = "rejected metadata update" if rejection_kind == "helper" else "Composer proposal failed validation."
+    assert detail["detail"] == (
+        f"The composer's proposed change could not be applied: {expected} "
+        "The proposal has been automatically rejected. Ask the composer to revise and resubmit."
+    )
+    persisted = asyncio.run(
+        service.get_authoritative_composition_proposal(session_id=session_id, proposal_id=proposal.id, reviewed_facts=None)
+    ).row
+    assert persisted.status == "rejected"
+
+
 async def _create_canonical_pipeline_route_proposal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

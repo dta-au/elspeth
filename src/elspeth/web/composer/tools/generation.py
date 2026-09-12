@@ -15,6 +15,7 @@ from typing import Any, Final, Literal, TypedDict, final
 from uuid import UUID
 
 from opentelemetry import metrics
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Engine
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -38,6 +39,7 @@ from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
+from elspeth.web.composer.redaction import _JsonInteger, _OmittableString
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     derive_extra_column_risk,
@@ -65,11 +67,13 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tool_result_envelope import ValidationCodeGuidance, ValidationGuidance
 from elspeth.web.composer.tools._common import (
     _PLUGIN_UNAVAILABLE_EXPLANATIONS,
+    EmptyToolArgumentsModel,
     ToolContext,
     ToolResult,
     _discovery_result,
     _failure_result,
     _plugin_policy_failure,
+    _validate_mutation_arguments,
     _validate_plugin_name,
     diff_states,
 )
@@ -246,13 +250,42 @@ def get_expression_grammar() -> str:
     return _EXPRESSION_GRAMMAR
 
 
+class GetPluginSchemaArgumentsModel(BaseModel):
+    plugin_type: PluginKind
+    name: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExplainValidationErrorArgumentsModel(BaseModel):
+    error_text: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GetPluginAssistanceArgumentsModel(BaseModel):
+    plugin_type: PluginKind
+    plugin_name: str
+    issue_code: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ListModelsArgumentsModel(BaseModel):
+    provider: _OmittableString = None
+    limit: _JsonInteger = Field(default=50, ge=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 def _handle_get_plugin_schema(
     arguments: dict[str, Any],
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    plugin_type = arguments["plugin_type"]
-    name = arguments["name"]
+    validated = _validate_mutation_arguments(GetPluginSchemaArgumentsModel, arguments, "get_plugin_schema arguments")
+    plugin_type = validated.plugin_type
+    name = validated.name
     policy_error = _validate_plugin_name(context, plugin_type, name)
     if policy_error is not None:
         return _plugin_policy_failure(state, policy_error)
@@ -301,6 +334,7 @@ def _handle_get_expression_grammar(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "get_expression_grammar arguments")
     del context  # unused; signature uniformity with the other handlers.
     # A closed one-key payload, not the bare reference string: ``ToolResult``
     # admits only mapping / sequence / model payloads (elspeth-e405ad7cd2,
@@ -1816,9 +1850,10 @@ def _execute_explain_validation_error(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    validated = _validate_mutation_arguments(ExplainValidationErrorArgumentsModel, args, "explain_validation_error arguments")
     """Explain a validation error with human-readable diagnosis and fix."""
     validation = context.catalog.validate_composition_state(state).validation
-    error_text = args["error_text"]
+    error_text = validated.error_text
     for pattern, explanation, fix in _VALIDATION_ERROR_PATTERNS:
         if re.search(pattern, error_text):
             return ToolResult(
@@ -1945,14 +1980,15 @@ def _execute_get_plugin_assistance(
     Unknown plugin name or invalid plugin_type surfaces here as a tool
     failure with the original message so the agent can correct the call.
     """
-    plugin_type_raw = args["plugin_type"]
-    plugin_name = args["plugin_name"]
+    validated = _validate_mutation_arguments(GetPluginAssistanceArgumentsModel, args, "get_plugin_assistance arguments")
+    plugin_type_raw = validated.plugin_type
+    plugin_name = validated.plugin_name
     # ``args`` is LLM tool-call arguments (Tier 3). ``plugin_type``/``plugin_name``
     # are required (json_schema ``required``) so direct subscript lets a KeyError
     # surface an LLM contract violation; ``issue_code`` is optional (discovery vs
     # failure mode), so its absence is recorded honestly as ``None`` via the
     # membership form rather than a defensive ``.get``.
-    issue_code = args["issue_code"] if "issue_code" in args else None
+    issue_code = validated.issue_code
 
     if plugin_type_raw not in ("source", "transform", "sink"):
         return _failure_result(
@@ -2059,6 +2095,7 @@ def _execute_get_audit_info(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, args, "get_audit_info arguments")
     """Return constant facts about the Landscape audit trail.
 
     Audit is mandatory (`LandscapeSettings` rejects `enabled=false` at
@@ -2157,10 +2194,9 @@ def _execute_list_models(
     # description states "default 50") — a meaning-preserving substitution, not
     # fabrication. The scalar type checks use ``type() is`` so a bool ``limit``
     # (``isinstance(True, int)`` is True) is correctly rejected at the boundary.
-    provider = args["provider"] if "provider" in args else None
-    limit = args["limit"] if "limit" in args else 50
-    if type(limit) is not int or limit < 1:
-        limit = 50
+    validated = _validate_mutation_arguments(ListModelsArgumentsModel, args, "list_models arguments")
+    provider = validated.provider
+    limit = validated.limit
 
     if provider is not None and type(provider) is str:
         normalised = provider.rstrip("/")
@@ -2245,6 +2281,8 @@ _LIST_MODELS_DECLARATION = ToolDeclaration(
             },
             "limit": {
                 "type": "integer",
+                "minimum": 1,
+                "default": 50,
                 "description": "Max models to return (default 50).",
             },
         },
@@ -3850,6 +3888,7 @@ def _execute_preview_pipeline(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, args, "preview_pipeline arguments")
     """Preview pipeline configuration — dry-run validation with source summary.
 
     Three checks, each on its own surface: the authoring check rides on the
@@ -3978,7 +4017,8 @@ _PREVIEW_PIPELINE_DECLARATION = ToolDeclaration(
     "`structural_preview` when present (an advisory re-check whose "
     "`is_valid` is not the verdict), and a read-only overview: `sources` "
     "(keyed by source name, each with `plugin`, `on_success` and "
-    "`has_schema_config`), `nodes`, `outputs`, `node_count`, "
+    "`has_schema_config`), `nodes` (each with `id`, `node_type`, `plugin`), "
+    "`outputs` (each with `name`, `plugin`), `node_count`, "
     "`output_count`.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,
@@ -3990,6 +4030,7 @@ def _execute_diff_pipeline(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, args, "diff_pipeline arguments")
     """Compute a diff/change summary against a baseline state.
 
     The baseline is passed explicitly by the MCP server or web composer

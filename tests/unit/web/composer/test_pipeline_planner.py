@@ -2836,7 +2836,6 @@ async def test_redacted_planner_preserves_canonical_failed_state_read(
     tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
     payload = json.loads(tool_message["content"])
     assert payload["success"] is False
-    assert payload["data"].get("error_code") != "surface_projection_unavailable"
     if "unexpected" in arguments:
         # The argument rejection rides under ``data`` as ``argument_error``,
         # never as a second ``success`` / ``validation`` beside the envelope's
@@ -2844,10 +2843,9 @@ async def test_redacted_planner_preserves_canonical_failed_state_read(
         assert set(payload["data"]) == {"argument_error"}
         assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
     else:
-        assert payload["data"]["error"] == (
-            "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
-            "or a full-state alias ('full', 'all', 'pipeline', or empty string)."
-        )
+        assert "data" not in payload
+        assert payload["validation"]["errors"][0]["component"] == "pipeline"
+        assert "message" not in payload["validation"]["errors"][0]
 
 
 @pytest.mark.asyncio
@@ -2907,10 +2905,8 @@ async def test_pipeline_state_disclosure_projects_the_whole_restricted_envelope(
         ):
             assert all(set(entry) <= {"component", "severity", "error_code"} for entry in entries)
         if failed:
-            assert payload["data"]["error"] == (
-                "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
-                "or a full-state alias ('full', 'all', 'pipeline', or empty string)."
-            )
+            assert "data" not in payload
+            assert payload["validation"]["errors"][0]["component"] == "pipeline"
     else:
         assert _VALIDATION_MESSAGE_CANARY in tool_message["content"]
 
@@ -6084,12 +6080,12 @@ async def test_pending_custody_view_resolves_only_its_exact_blob_id(
     foreign["source"]["blob_id"] = str(uuid4())
     mismatched = build_set_pipeline_candidate(foreign, _empty_state(), context)
     assert not mismatched.acceptable
-    assert "not found" in mismatched.result.data["error"]
+    assert "not found" in mismatched.result.validation.errors[0].message
 
     wrong_session = dc_replace(context, _pending_custody=dc_replace(view, session_id=str(uuid4())))
     rejected = build_set_pipeline_candidate(safe_pipeline, _empty_state(), wrong_session)
     assert not rejected.acceptable
-    assert "not found" in rejected.result.data["error"]
+    assert "not found" in rejected.result.validation.errors[0].message
 
 
 @pytest.mark.asyncio

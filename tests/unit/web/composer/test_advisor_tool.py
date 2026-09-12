@@ -37,6 +37,7 @@ from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
+from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.config import WebSettings
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
@@ -268,7 +269,7 @@ def test_advisor_argument_validation_rejects_unknown_keys() -> None:
     assert payload is not None
     assert payload["status"] == "ARG_ERROR"
     assert payload["error_class"] == "ValueError"
-    assert "unknown argument" in payload["error"]
+    assert "extra keys" in payload["error"]
     assert "full_context" not in payload["error"]
     assert raw_extra_context not in payload["error"]
 
@@ -289,7 +290,7 @@ def test_reactive_trigger_is_retired() -> None:
     )
     assert payload is not None  # ARG_ERROR
     assert payload["status"] == "ARG_ERROR"
-    assert "must be one of" in payload["error"]
+    assert "published schema" in payload["error"]
     assert "reactive_validation_loop" not in payload["error"]
 
 
@@ -305,7 +306,7 @@ def test_proactive_triggers_still_valid() -> None:
                 "attempted_actions": [],
             }
         )
-        assert payload is None  # valid
+        assert isinstance(payload, RequestAdvisorHintArgumentsModel)
 
 
 # --- 2. CLI MCP allowlist excludes the advisor by design ---
@@ -1296,7 +1297,12 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_f3a_advisor_rejects_non_list_recent_errors() -> None:
+@pytest.mark.parametrize("budget", [0, 3])
+@pytest.mark.parametrize(
+    "field,value",
+    [("recent_errors", "single error string not list"), ("schema_excerpt", None), ("user_message", "secret backend-only value")],
+)
+async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: str, value: object) -> None:
     """F3a: recent_errors must be list[str]. _TOOL_REQUIRED_PATHS only
     checks key presence, so a non-list value (LLM bug, prompt injection)
     slips through schema validation. Without local type-check, the
@@ -1304,15 +1310,16 @@ async def test_f3a_advisor_rejects_non_list_recent_errors() -> None:
     a corrupt prompt at full provider cost.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=budget))
     state = _empty_state()
 
     bad_args = {
         "trigger": "proactive_security_safety",
         "problem_summary": "stuck",
-        "recent_errors": "single error string not list",  # WRONG TYPE
+        "recent_errors": [],
         "attempted_actions": ["x"],
     }
+    bad_args[field] = value
     bad_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(

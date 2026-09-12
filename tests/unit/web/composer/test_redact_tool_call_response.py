@@ -357,7 +357,6 @@ def test_existing_response_models_scrub_free_form_failure_and_diagnostic_text() 
         },
         "affected_nodes": [_EXTERNAL_SCALAR_CANARY],
         "version": 3,
-        "data": {"error": _EXTERNAL_SCALAR_CANARY},
     }
     review_response = {
         "success": True,
@@ -704,14 +703,13 @@ def test_get_blob_content_redacts_tool_result_failure_envelope() -> None:
         },
         "affected_nodes": [],
         "version": 2,
-        "data": {"error": "Blob 'blob-1' not found."},
     }
 
     result = redact_tool_call_response("get_blob_content", response, telemetry=NoopRedactionTelemetry())
 
     assert result["success"] is False
     assert result["version"] == 2
-    assert result["data"]["error"] == "<redacted-response-text>"
+    assert "data" not in result
     assert "blob-1" not in json.dumps(result, sort_keys=True)
 
 

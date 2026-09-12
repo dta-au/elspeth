@@ -160,7 +160,7 @@ def test_merged_component_rejection_keeps_the_whole_data_payload_of_a_frozen_res
     Converting that guard to the house `type(data) is dict` scalar idiom would
     make it permanently False and send every merge to the else branch, so the
     rejection envelope the model receives would carry ONLY
-    `components_withheld` — `error_code` and every detail silently dropped.
+    `components_withheld` — independent repair details silently dropped.
     This is a data-loss trap, not a lint-shape preference: do not convert it.
     """
     from elspeth.web.composer.tools._common import _merged_component_rejection_result
@@ -181,7 +181,7 @@ def test_merged_component_rejection_keeps_the_whole_data_payload_of_a_frozen_res
                 ),
             ),
             affected_nodes=(),
-            data={"error_code": "rejected_mutation", "detail": {"component": component}},
+            data={"credential_fields": ["api_key"], "detail": {"component": component}},
         )
 
     base = _result("first")
@@ -189,7 +189,7 @@ def test_merged_component_rejection_keeps_the_whole_data_payload_of_a_frozen_res
 
     merged = _merged_component_rejection_result([base, _result("second")], components_withheld=1)
 
-    assert merged.data["error_code"] == "rejected_mutation"
+    assert merged.data["credential_fields"] == ("api_key",)
     assert merged.data["detail"]["component"] == "first"
     assert merged.data["components_withheld"] == 1
 

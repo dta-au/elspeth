@@ -10,6 +10,8 @@ several places at once, and each description is a wire that must carry it:
     MODEL      the pydantic arguments model the handler validates against
     ADMITTED   ``MANIFEST[tool].policy.known_argument_keys`` in redaction.py
     READ       what the handler actually consumes
+    TAUGHT     exact property descriptions and own-tool prose, measured by
+               ``test_tool_knob_teaching_gate.py`` via the shared ownership reader
 
 ``tools/schema_contract.py`` already pins SHIPPED against MODEL, directionally,
 for ``upsert_node`` and ``set_pipeline``. Nothing pinned SHIPPED against
@@ -27,14 +29,15 @@ point: a gate needing a hand-edit alongside the thing it guards reproduces the
 defect it is meant to catch.
 
 SCOPE, MEASURED -- stated so a green run is not over-read. This pins the ADMITTED
-wire only, and only for tools that HAVE an argument allowlist: 15 of 42 tools and
-52 of 104 advertised knobs at 2026-09-04. The other 27 tools declare no allowlist
-and run open, so there is nothing to compare and they are unguarded here BY
-CONSTRUCTION, not by passing. A green run is silent about them.
+wire only, and only for tools with a nonempty declarative argument allowlist.
+Type-driven redaction, open declarative policies, and closed policies with an
+empty argument set are outside this comparison. A green run is silent about
+their admission behavior; omission here does not mean they run open.
 
-It is also silent about READ (a knob the handler ignores), TAUGHT (skill text
-naming a knob that does not exist), and the TypeScript decoder -- pytest cannot
-see the frontend in this repository.
+It is also silent about READ (a knob the handler ignores) and the TypeScript
+decoder. TAUGHT has its own live gate: nonempty exact property descriptions or
+quoted keys in owned tool context, with stale names derived only from explicit
+argument declarations, never from arbitrary quoted response keys or enum values.
 
 An earlier revision of this docstring claimed the gate covered "all 42 tools".
 It iterated 14. That overstatement is the same defect the file exists to catch,

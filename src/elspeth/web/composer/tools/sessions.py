@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Final, cast
+from typing import Annotated, Any, Final, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
@@ -38,6 +38,7 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.redaction import (
     SetPipelineArgumentsModel,
+    _OmittableString,
     redact_source_storage_path,
 )
 from elspeth.web.composer.source_demand import (
@@ -115,7 +116,10 @@ from elspeth.web.composer.tools.blobs import (
     _PreparedBlobCreate,
 )
 from elspeth.web.composer.tools.declarations import (
+    GRAPH_EFFECTS,
+    EffectDomain,
     ToolDeclaration,
+    ToolEffects,
     ToolKind,
 )
 from elspeth.web.composer.tools.sources import (
@@ -192,6 +196,44 @@ _tool_plugin_policy_failure = _plugin_policy_failure
 _MAX_REPORTED_COMPONENT_REJECTIONS: Final[int] = 8
 
 
+class _AdvisorHintRequest(TypedDict):
+    trigger: Literal["proactive_security_safety", "proactive_red_listed_plugin"]
+    problem_summary: str
+    recent_errors: list[str]
+    attempted_actions: list[str]
+    schema_excerpt: NotRequired[str]
+
+
+class RequestAdvisorHintArgumentsModel(BaseModel):
+    """Public advisor input; backend checkpoint fields are not authorable."""
+
+    trigger: Literal["proactive_security_safety", "proactive_red_listed_plugin"]
+    problem_summary: str = Field(max_length=2000)
+    recent_errors: list[Annotated[str, Field(max_length=2000)]] = Field(max_length=5)
+    attempted_actions: list[Annotated[str, Field(max_length=2000)]] = Field(max_length=8)
+    schema_excerpt: _OmittableString = Field(default=None, max_length=8000)
+
+    model_config = ConfigDict(extra="forbid")
+
+    def to_internal_request(self) -> _AdvisorHintRequest:
+        """Project typed public fields into the shared checkpoint formatter."""
+        request: _AdvisorHintRequest = {
+            "trigger": self.trigger,
+            "problem_summary": self.problem_summary,
+            "recent_errors": self.recent_errors,
+            "attempted_actions": self.attempted_actions,
+        }
+        if self.schema_excerpt is not None:
+            request["schema_excerpt"] = self.schema_excerpt
+        return request
+
+
+class GetPipelineStateArgumentsModel(BaseModel):
+    component: _OmittableString = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class _RequestInterpretationReviewArgumentsModel(BaseModel):
     """Tier-3 trust-boundary model for the ``request_interpretation_review`` tool.
 
@@ -221,7 +263,7 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
     affected_node_id: str = Field(min_length=1, max_length=256)
     kind: InterpretationKind = Field(json_schema_extra={"enum": list(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)})
     user_term: str = Field(min_length=1, max_length=8192)
-    llm_draft: str | None = Field(default=None, min_length=1, max_length=8192)
+    llm_draft: _OmittableString = Field(default=None, min_length=1, max_length=8192)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1850,9 +1892,18 @@ def _handle_set_pipeline(
     return _execute_set_pipeline(arguments, state, context)
 
 
+def _set_pipeline_effects(arguments: Mapping[str, Any]) -> ToolEffects:
+    """Classify prospective inline custody without preparing or writing bytes."""
+    source = arguments["source"] if "source" in arguments else None
+    if isinstance(source, Mapping) and "inline_blob" in source and source["inline_blob"] is not None:
+        return ToolEffects((*GRAPH_EFFECTS.domains, EffectDomain.BLOB_STORE))
+    return GRAPH_EFFECTS
+
+
 _SET_PIPELINE_DECLARATION = ToolDeclaration(
     name="set_pipeline",
     handler=_handle_set_pipeline,
+    argument_effects=_set_pipeline_effects,
     kind=ToolKind.MUTATION,
     description=(
         "Atomically create or fully rebuild a pipeline. For a narrow edit to an existing pipeline, name the "
@@ -1864,6 +1915,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
         "properties": {
             "source": {
                 "type": "object",
+                "additionalProperties": False,
                 "description": (
                     "Source configuration. Use blob_id to bind an already uploaded session blob, or "
                     "inline_blob to materialize user-provided literal data atomically with the pipeline. "
@@ -1900,6 +1952,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "inline_blob": {
                         "type": ["object", "null"],
+                        "additionalProperties": False,
                         "description": "Inline source content to create as a session blob before binding. Fields mirror create_blob.",
                         "properties": {
                             "filename": {"type": "string"},
@@ -1924,6 +1977,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 ),
                 "additionalProperties": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "plugin": {"type": "string"},
                         "options": {
@@ -1984,6 +2038,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "condition": {"type": ["string", "null"]},
                         "routes": {
                             "type": ["object", "null"],
+                            "additionalProperties": {"type": "string"},
                             "description": (
                                 "Gate route mapping to sink names, downstream connection names, 'fork', or "
                                 "'discard' for an audited terminal drop."
@@ -2039,6 +2094,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                     },
                     "required": ["id", "node_type", "input"],
+                    "additionalProperties": False,
                 },
                 "description": (
                     "Node specs. A queue node is a structural fan-in point: node_type='queue', id == input == the "
@@ -2067,6 +2123,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "label": {"type": ["string", "null"]},
                     },
                     "required": ["id", "from_node", "to_node", "edge_type"],
+                    "additionalProperties": False,
                 },
                 "description": (
                     "Edge specs. edge_type='on_error' is supported for transform/aggregation sink wiring only; "
@@ -2100,6 +2157,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                     },
                     "required": ["sink_name", "plugin"],
+                    "additionalProperties": False,
                     "examples": [
                         {
                             "sink_name": "results",
@@ -2122,6 +2180,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
             },
             "metadata": {
                 "type": ["object", "null"],
+                "additionalProperties": False,
                 "description": "Pipeline metadata: {name?, description?}",
                 "properties": {
                     "name": {"type": ["string", "null"]},
@@ -2171,7 +2230,8 @@ def _execute_get_pipeline_state(
     outputs with options, edges, and metadata.
     """
     del context  # unused; signature uniformity with the other handlers.
-    component = args.get("component")
+    validated = _validate_mutation_arguments(GetPipelineStateArgumentsModel, args, "get_pipeline_state arguments")
+    component = validated.component
     data: Any
 
     if component == "set_pipeline_arguments":
@@ -2873,13 +2933,10 @@ async def _handle_request_interpretation_review(
     :data:`_MUTATION_TOOLS` registry — see the dual-registry invariant
     documented at the registry block above).
     """
-    parsed = cast(
+    parsed = _validate_mutation_arguments(
         _RequestInterpretationReviewArgumentsModel,
-        _validate_mutation_arguments(
-            _RequestInterpretationReviewArgumentsModel,
-            arguments,
-            "request_interpretation_review arguments",
-        ),
+        arguments,
+        "request_interpretation_review arguments",
     )
     # F-34 credential prefilter: Tier-3 boundary check before any DB write.
     # ``reject_credential_shaped_content`` raises ``ValueError``; we wrap

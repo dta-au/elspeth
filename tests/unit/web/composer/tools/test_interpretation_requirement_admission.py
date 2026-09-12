@@ -645,7 +645,7 @@ def test_every_source_writer_rejects_malformed_or_resolver_owned_requirements(
 
     assert result.success is False, (writer, result.to_dict())
     assert result.updated_state is state
-    assert "interpretation_requirements" in result.data["error"]
+    assert "interpretation_requirements" in result.validation.errors[0].message
 
 
 @pytest.mark.parametrize(
@@ -677,7 +677,7 @@ def test_every_node_writer_rejects_for_llm_and_non_llm_plugins(
 
     assert result.success is False, (writer, plugin_name, result.to_dict())
     assert result.updated_state is state
-    assert "interpretation_requirements" in result.data["error"]
+    assert "interpretation_requirements" in result.validation.errors[0].message
 
 
 _COLLIDING_REQUIREMENT_LISTS: Final[tuple[list[dict[str, str]], ...]] = (
@@ -861,9 +861,9 @@ def test_every_node_writer_rejects_unregistered_pipeline_decision_before_publica
 
     assert result.success is False, (writer, result.to_dict())
     assert result.updated_state is state
-    assert "pipeline_decision user_term is not registered" in result.data["error"]
-    assert "closest registered term: 'drop_raw_html_fields'" in result.data["error"]
-    assert "required_control_auto_wired" not in result.data["error"]
+    assert "pipeline_decision user_term is not registered" in result.validation.errors[0].message
+    assert "closest registered term: 'drop_raw_html_fields'" in result.validation.errors[0].message
+    assert "required_control_auto_wired" not in result.validation.errors[0].message
     assert state.nodes == result.updated_state.nodes
 
 
@@ -892,8 +892,8 @@ def test_every_source_writer_rejects_identity_collisions_before_round_trip_poiso
 
     assert result.success is False, (writer, result.to_dict())
     assert result.updated_state is state
-    assert _IDENTITY_COLLISION_ERROR in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert _IDENTITY_COLLISION_ERROR in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
     _payload, round_trip_error = _serialize_set_pipeline_arguments(result.updated_state)
     assert round_trip_error is None
 
@@ -924,8 +924,8 @@ def test_every_node_writer_rejects_identity_collisions_before_round_trip_poisoni
 
     assert result.success is False, (writer, plugin_name, result.to_dict())
     assert result.updated_state is state
-    assert _IDENTITY_COLLISION_ERROR in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert _IDENTITY_COLLISION_ERROR in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
     _payload, round_trip_error = _serialize_set_pipeline_arguments(result.updated_state)
     assert round_trip_error is None
 
@@ -1166,18 +1166,20 @@ def test_public_composition_mutations_reject_preexisting_output_review_metadata(
 
     assert result.success is False
     assert result.updated_state is state
-    assert result.data["error_code"] == "interpretation_requirements_invalid"
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_composition_gate_registry_covers_every_public_state_mutation() -> None:
-    from elspeth.web.composer.tools._dispatch import _COMPOSITION_STATE_MUTATION_TOOL_NAMES
     from elspeth.web.composer.tools._registry import (
         _MUTATION_TOOL_NAMES,
+        _REGISTERED_TOOLS,
         _SECRET_MUTATION_TOOL_NAMES,
+        resolve_tool_effects,
     )
+    from elspeth.web.composer.tools.declarations import EffectDomain
 
-    covered = _COMPOSITION_STATE_MUTATION_TOOL_NAMES
+    covered = frozenset(decl.name for decl in _REGISTERED_TOOLS if EffectDomain.GRAPH in resolve_tool_effects(decl.name, {}).domains)
 
     assert covered == (
         _MUTATION_TOOL_NAMES
@@ -1225,8 +1227,8 @@ def test_node_writers_enforce_canonical_identity_after_automatic_review_staging(
 
     assert result.success is False
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 @pytest.mark.parametrize(
@@ -1277,8 +1279,8 @@ def test_patch_without_requirements_rejects_auto_stager_collision_with_trusted_r
 
     assert result.success is False, result.to_dict()
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
     _payload, round_trip_error = _serialize_set_pipeline_arguments(result.updated_state)
     assert round_trip_error is None
 
@@ -1315,8 +1317,8 @@ def test_patch_source_without_requirements_enforces_b_after_merge() -> None:
 
     assert result.success is False
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_splice_enforces_b_again_after_final_reconciliation() -> None:
@@ -1362,8 +1364,8 @@ def test_splice_enforces_b_again_after_final_reconciliation() -> None:
 
     assert result.success is False
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_internal_revalidation_skips_raw_admission_but_never_canonical_invariant() -> None:
@@ -1404,8 +1406,8 @@ def test_internal_revalidation_skips_raw_admission_but_never_canonical_invariant
 
     assert result.success is False
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_internal_revalidation_normalizes_trusted_legacy_pending_row_once() -> None:
@@ -1548,8 +1550,8 @@ def test_queue_upsert_reaches_plugin_agnostic_review_admission_without_leaking(
 
     assert result.success is False
     assert result.updated_state is state
-    assert expected_error in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert expected_error in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_queue_upsert_preserves_canonical_unknown_option_error_after_review_admission() -> None:
@@ -1572,4 +1574,4 @@ def test_queue_upsert_preserves_canonical_unknown_option_error_after_review_admi
 
     assert result.success is False
     assert result.updated_state is state
-    assert "unknown option" in result.data["error"]
+    assert "unknown option" in result.validation.errors[0].message

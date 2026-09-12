@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,46 @@ REGENERATE_COMMAND = ".venv/bin/python scripts/cicd/bootstrap_proposal_diff_fixt
 # (ProposalDiff.test.tsx ``makeState``). The arguments below are authored to
 # line up with it: same source name, node id, sink name, and option keys.
 CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
+    (
+        "set_pipeline_ambiguous_inline_empty_options",
+        "set_pipeline",
+        {
+            "source": {
+                "plugin": "csv",
+                "on_success": "csv_rows",
+                "options": {},
+                "inline_blob": {
+                    "filename": "chat.csv",
+                    "mime_type": "text/csv",
+                    "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n",
+                },
+            },
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+            "metadata": {},
+        },
+    ),
+    (
+        "set_pipeline_ambiguous_inline_nonempty_options",
+        "set_pipeline",
+        {
+            "source": {
+                "plugin": "csv",
+                "on_success": "csv_rows",
+                "options": {"delimiter": ","},
+                "inline_blob": {
+                    "filename": "chat.csv",
+                    "mime_type": "text/csv",
+                    "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n",
+                },
+            },
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+            "metadata": {},
+        },
+    ),
     # --- patch_*_options: the three tools whose `patch` is summarized -------
     (
         "patch_source_options_two_scalars",
@@ -233,6 +274,16 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
 )
 
 
+def projected_tool_names() -> list[str]:
+    """Read the frontend dispatch registry using its installed TypeScript parser."""
+    bridge = PROJECT_ROOT / "src/elspeth/web/frontend/scripts/projected-tool-names.mjs"
+    result = subprocess.run(["node", str(bridge)], check=True, capture_output=True, text=True)
+    names = json.loads(result.stdout)
+    if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
+        raise ValueError("Frontend projector bridge must return a nonempty string list")
+    return names
+
+
 def build_fixture() -> dict[str, Any]:
     """Redact every case through the live producer and assemble the fixture."""
     # Imported lazily so ``--help`` works without the package importable.
@@ -256,6 +307,7 @@ def build_fixture() -> dict[str, Any]:
             "two languages cannot drift (elspeth-b1c14dd3c2)."
         ),
         "_regenerate": REGENERATE_COMMAND,
+        "projected_tools": projected_tool_names(),
         "cases": cases,
     }
 

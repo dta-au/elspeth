@@ -21,6 +21,19 @@ from elspeth.core.config import (
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 
 
+def assert_tool_model_key_parity(*, tool_name: str, shipped: frozenset[str], model_fields: frozenset[str]) -> None:
+    """Compare names symmetrically after the caller proves actual admission.
+
+    Empty field sets are valid owned models. This checks names only; scalar,
+    requiredness, nullability and nested contracts need behavioral probes.
+    """
+    if shipped != model_fields:
+        raise RuntimeError(
+            f"{tool_name}: MODEL key mismatch: shipped_not_model={sorted(shipped - model_fields)}, "
+            f"model_not_shipped={sorted(model_fields - shipped)}"
+        )
+
+
 def _registered_tool_schema(tool_name: str) -> Mapping[str, Any]:
     for definition in get_tool_definitions():
         if definition["name"] == tool_name:
@@ -149,6 +162,8 @@ def _branch_compatibility_failure(
         return f"{path}: runtime type {runtime_type!r} is not advertised as {advertised_type!r}"
 
     runtime_values: frozenset[object] | None = None
+    if runtime_type == "null":
+        runtime_values = frozenset({None})
     if "enum" in runtime:
         runtime_values = frozenset(_schema_sequence(runtime["enum"], path=f"{path}.enum"))
     advertised_values: frozenset[object] | None = None
@@ -541,59 +556,10 @@ def canonical_set_pipeline_schema() -> dict[str, Any]:
 # schema following — which a per-kind membership assertion never caught.        #
 # --------------------------------------------------------------------------- #
 
-# `upsert_node`'s advertised schema is deliberately STRICTER than
-# `_UpsertNodeArgumentsModel` on these properties. The model types them
-# loosely on purpose so a bad value reaches a purpose-built validator with a
-# repair message instead of being bounced by a bare schema rejection, while
-# the wire schema still teaches the planner the closed vocabulary up front.
-# Each entry earns its place ONLY because the advertised vocabulary equals
-# what the named site enforces ON THE AUTHORING PATH — a rule the author would
-# hit anyway, disclosed earlier. A vocabulary enforced somewhere else (at
-# settings_load, say) does NOT qualify: advertising it here would reject an
-# authoring call the composer itself accepts, which is this ticket's defect
-# wearing an allowlist. Each comment names the call path so the next reader can
-# re-verify the claim without redoing the trace.
-#
-# Note the asymmetry the relaxation creates: once a property is disclosed, the
-# directional walker no longer sees its vocabulary at all (the advertised enum
-# is stripped, a closed object is reopened), so a downstream vocabulary that
-# GROWS cannot fail this contract. What holds each pairing is a named test in
-# tests/unit/web/composer/test_tool_schema_contract.py, one per entry below,
-# asserting the advertised vocabulary against the enforcing type AND that the
-# enforcer refuses a value outside it. Add an entry here and you owe both there.
-_UPSERT_NODE_ADVERTISED_DISCLOSURES: Mapping[str, str] = {
-    # Advertised {count, timeout_seconds, condition} under
-    # additionalProperties:False == `TriggerConfig`'s fields under
-    # extra="forbid". Authoring path, and the strictest of the three — it
-    # REJECTS THE MUTATION rather than reporting an entry:
-    #   transforms.py `_execute_upsert_node` (node_type == "aggregation")
-    #     -> `_common._validate_aggregation_trigger`
-    #     -> `TriggerConfig.model_validate` -> "Invalid aggregation trigger:
-    #        Extra inputs are not permitted"
-    # (the splice path calls the same validator; state.py runs the same model
-    # again on read-back as `aggregation_trigger_invalid`).
-    "trigger": "core/config.py TriggerConfig, via _common._validate_aggregation_trigger",
-    # Advertised ["passthrough", "transform"] == `OutputMode`'s members.
-    # Authoring path, but WEAKER than trigger: the mutation still succeeds and
-    # the bad value lands in state. The code is not in
-    # `_common._MUTATION_BLOCKING_INVARIANT_CODES`, so what the author gets is a
-    # high-severity entry on the validation summary every upsert_node result
-    # carries — the pipeline cannot pass validation, but the call is not
-    # rejected:
-    #   state.py `CompositionState.validate` -> `aggregation_output_mode_invalid`
-    # That enforcer derives its membership test from `OutputMode` directly, so
-    # this pairing binds two vocabularies rather than three. It used to restate
-    # the pair by hand, which would have made a grown enum look like a wire
-    # defect and invited the enum entry to be widened instead (review F1).
-    "output_mode": "web/composer/state.py CompositionState.validate, aggregation_output_mode_invalid",
-    # Advertised ["require_all", "best_effort"] == `_SCOPE_POLICY_VOCABULARY`
-    # (derived from `ScopeSettings.policy`). Authoring path, same weaker shape
-    # as output_mode — a summary entry, not a rejected mutation:
-    #   state.py `CompositionState.validate`
-    #     -> `_collector_intrinsic_errors` -> `collector_scope_policy_invalid`
-    #   "Collector '<id>' scope_policy '<value>' is not a valid policy."
-    "scope_policy": "web/composer/state.py _collector_intrinsic_errors, collector_scope_policy_invalid",
-}
+# All current upsert_node vocabularies and owned records are admitted by its
+# argument model. Keep the existing guarded extension point empty: a future
+# disclosure requires a concrete authoring-path enforcer and dedicated proof.
+_UPSERT_NODE_ADVERTISED_DISCLOSURES: Mapping[str, str] = {}
 
 
 # JSON-Schema composition keywords this traversal does not descend into. A
@@ -780,32 +746,7 @@ def assert_upsert_node_schema_compatible(*, advertised_schema: Mapping[str, Any]
     )
 
 
-def assert_model_wire_compatible(tool: str, *, shipped: frozenset[str], model_fields: frozenset[str], fenced: frozenset[str]) -> None:
-    """Raise unless every shipped knob is a model field and every model field is shipped, fences excepted.
-
-    Membership only, and in BOTH directions, for any tool: a json-schema
-    property with no field is a knob the planner is invited to set that the
-    handler's model silently drops, and a field with no property is a knob the
-    planner is never told about. Types, requiredness and defaults are the
-    directional walk `assert_set_pipeline_schema_compatible` and
-    `assert_upsert_node_schema_compatible` do for the two tools that have it.
-
-    Both sides are supplied by the caller because both are derived: SHIPPED
-    from the live registry, MODEL from the manifest's `argument_model` or the
-    handler's validator call by AST. `fenced` is the adjudicated exemption set
-    for this tool, and the gate that supplies it also fails when a fenced key
-    stops being a gap, so an exemption cannot outlive its reason.
-    """
-    shipped_not_model = shipped - model_fields - fenced
-    model_not_shipped = model_fields - shipped - fenced
-    if shipped_not_model or model_not_shipped:
-        raise RuntimeError(
-            f"{tool}: advertised but not validated {sorted(shipped_not_model)}; validated but never advertised {sorted(model_not_shipped)}"
-        )
-
-
 __all__ = [
-    "assert_model_wire_compatible",
     "assert_set_pipeline_schema_compatible",
     "assert_upsert_node_schema_compatible",
     "canonical_set_pipeline_schema",

@@ -251,7 +251,7 @@ def test_named_blob_source_reports_round_trip_unavailable() -> None:
     result = _exact_arguments(state)
 
     assert not result.success
-    assert result.data["error_code"] == "round_trip_unavailable"
+    assert result.validation.errors[0].error_code == "round_trip_unavailable"
     assert result.updated_state is state
 
 
@@ -278,7 +278,7 @@ def test_unsafe_blob_identity_reports_round_trip_unavailable(source_options: dic
     result = _exact_arguments(state)
 
     assert not result.success
-    assert result.data["error_code"] == "round_trip_unavailable"
+    assert result.validation.errors[0].error_code == "round_trip_unavailable"
     assert result.updated_state is state
 
 
@@ -307,8 +307,8 @@ def test_legacy_resolved_vague_term_without_parts_reports_round_trip_unavailable
     result = _exact_arguments(state)
 
     assert not result.success
-    assert result.data["error_code"] == "round_trip_unavailable"
-    assert "warm" not in result.data["error"]
+    assert result.validation.errors[0].error_code == "round_trip_unavailable"
+    assert "warm" not in result.validation.errors[0].message
     assert result.updated_state is state
 
 
@@ -587,8 +587,8 @@ def test_planner_widening_of_acknowledged_guarantee_is_rejected() -> None:
     result = _execute_set_pipeline(proposal, previous, _trained_context())
 
     assert result.success is False
-    assert "guaranteed_fields" in result.data["error"]
-    assert "request_interpretation_review" in result.data["error"]
+    assert "guaranteed_fields" in result.validation.errors[0].message
+    assert "request_interpretation_review" in result.validation.errors[0].message
 
 
 def test_deleting_resolved_source_contract_guarantee_reopens_review() -> None:
@@ -632,7 +632,7 @@ def test_exact_round_trip_rejects_incoherent_stored_source_contract_evidence() -
 
     assert not result.success
     assert result.updated_state is forged
-    assert result.data["error_code"] == "review_reconciliation_failed"
+    assert result.validation.errors[0].error_code == "review_reconciliation_failed"
 
 
 def test_exact_round_trip_refuses_unsupported_source_contract() -> None:
@@ -677,8 +677,8 @@ def test_public_set_pipeline_cannot_forge_resolved_source_contract_artifact() ->
 
     assert not result.success
     assert result.updated_state is previous
-    assert result.data["error_code"] == "interpretation_requirements_invalid"
-    assert "resolver-owned status 'resolved'" in result.data["error"]
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "resolver-owned status 'resolved'" in result.validation.errors[0].message
 
 
 def test_stale_source_contract_round_trip_remains_blocked_for_review() -> None:
@@ -1145,8 +1145,8 @@ def test_unknown_pipeline_decision_user_term_fails_closed() -> None:
     assert not result.success
     assert result.updated_state is previous
     assert result.updated_state.version == previous.version
-    assert result.data["error_code"] == "interpretation_requirements_invalid"
-    assert "unknown-decision" not in result.data["error"]
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "unknown-decision" not in result.validation.errors[0].message
 
 
 def _reconciler_stale_hash_state() -> CompositionState:
@@ -1204,9 +1204,9 @@ def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
     assert not result.success
     assert result.updated_state is previous
     assert result.updated_state.version == previous.version
-    assert result.data["error_code"] == "review_reconciliation_failed"
+    assert result.validation.errors[0].error_code == "review_reconciliation_failed"
     # The specific invariant, not just the generic retry instruction.
-    assert "hash drifted" in result.data["error"], result.data["error"]
+    assert "hash drifted" in result.validation.errors[0].message, result.validation.errors[0].message
     # ...and WHICH requirement drifted. This asserts a server-owned requirement
     # id reaching the planner, which is deliberate and redaction-safe: the id is
     # a pipeline identifier derived from kind + node id, not row content, and
@@ -1214,7 +1214,7 @@ def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
     # plugin prevalidation (the ``_prevalidate_plugin_options`` messages). Without
     # the id, a pipeline carrying several resolved reviews still leaves the
     # planner guessing which one to re-send.
-    assert "model_choice_review:enrich" in result.data["error"], result.data["error"]
+    assert "model_choice_review:enrich" in result.validation.errors[0].message, result.validation.errors[0].message
 
 
 def _unwired_vague_term_state() -> CompositionState:
@@ -1273,12 +1273,12 @@ def test_set_pipeline_rejects_unwired_pending_vague_term() -> None:
 
     assert not result.success
     assert result.updated_state is previous
-    assert result.data["error_code"] == "vague_term_unwired"
+    assert result.validation.errors[0].error_code == "vague_term_unwired"
     # The rejection must name the node and the term so the planner can repair.
-    assert "score_lead" in result.data["error"], result.data["error"]
-    assert "lead quality" in result.data["error"], result.data["error"]
+    assert "score_lead" in result.validation.errors[0].message, result.validation.errors[0].message
+    assert "lead quality" in result.validation.errors[0].message, result.validation.errors[0].message
     # ...and the repair itself: wire a prompt_template_parts interpretation_ref.
-    assert "prompt_template_parts" in result.data["error"], result.data["error"]
+    assert "prompt_template_parts" in result.validation.errors[0].message, result.validation.errors[0].message
 
 
 def test_set_pipeline_accepts_wired_pending_vague_term() -> None:

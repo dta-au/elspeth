@@ -1119,7 +1119,7 @@ def test_scenario_3_get_pipeline_state_preserves_redacted_patched_blob_path_that
         data_dir=str(data_dir),
     )
     assert rejected.success is False
-    assert "blob-backed source" in rejected.data["error"]
+    assert "blob-backed source" in rejected.validation.errors[0].message
 
     # The redaction contract still holds for canonical-path blob sources
     # (the shape set_source_from_blob produces).

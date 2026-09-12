@@ -160,9 +160,9 @@ def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() 
 
     assert result.success is False
     assert result.updated_state is state
-    assert result.data is not None
-    assert "resolved_prompt_template_hash" in result.data["error"]
-    assert "retry splice_transform" in result.data["error"]
+    assert result.data is None
+    assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+    assert "retry splice_transform" in result.validation.errors[0].message
 
 
 def test_splice_transform_public_dispatch_rejects_resolver_owned_review_atomically() -> None:
@@ -198,11 +198,11 @@ def test_splice_transform_public_dispatch_rejects_resolver_owned_review_atomical
 
     assert result.success is False
     assert result.updated_state is state
-    assert result.data is not None
-    assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
-    assert "retry splice_transform" in result.data["error"]
-    assert "request_interpretation_review" in result.data["error"]
-    assert "resolve_interpretation_event" not in result.data["error"]
+    assert result.data is None
+    assert INTERPRETATION_REQUIREMENTS_KEY in result.validation.errors[0].message
+    assert "retry splice_transform" in result.validation.errors[0].message
+    assert "request_interpretation_review" in result.validation.errors[0].message
+    assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
 
 def test_splice_transform_manifest_is_type_driven() -> None:
@@ -441,7 +441,7 @@ def test_splice_transform_identical_replay_rejects_noncanonical_retained_require
     replay = _execute_splice_transform(arguments, retained, _context())
 
     assert not replay.success
-    assert replay.data["error_code"] == "interpretation_requirements_invalid"
+    assert replay.validation.errors[0].error_code == "interpretation_requirements_invalid"
     assert replay.updated_state is retained
     assert replay.updated_state.version == retained.version
 
@@ -729,7 +729,7 @@ def test_splice_transform_rejects_connection_name_exhaustion_atomically() -> Non
 
     assert not result.success
     assert result.updated_state is state
-    assert "collision-free" in result.data["error"]
+    assert "collision-free" in result.validation.errors[0].message
 
 
 def test_splice_transform_node_options_redaction_omits_values() -> None:

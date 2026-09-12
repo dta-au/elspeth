@@ -491,8 +491,8 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
                 if plugin_id in case.extra_authorized
                 else PluginUnavailableReason.NOT_AUTHORIZED.value
             )
-            assert schema_result.data["error_code"] == expected_code
-            assert assistance_result.data["error_code"] == expected_code
+            assert schema_result.validation.errors[0].error_code == expected_code
+            assert assistance_result.validation.errors[0].error_code == expected_code
 
     for plugin_id in _ALL_CONTROLS:
         probe = _control_probe_state(plugin_id)
@@ -552,7 +552,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
             assert [finding.error_code for finding in validation.findings_for("plugin_enablement")] == [expected_code]
             assert [finding.error_code for finding in imported_validation.findings_for("plugin_enablement")] == [expected_code]
             assert direct_tool.success is False
-            assert direct_tool.data["error_code"] == expected_code
+            assert direct_tool.validation.errors[0].error_code == expected_code
             with pytest.raises(ValueError, match="not available"):
                 require_settings_plugins_available(runtime_settings, snapshot)
 
@@ -1141,7 +1141,7 @@ def test_auto_wired_required_controls_clear_the_execution_required_control_gate(
     def _validate(candidate: dict[str, Any]) -> Any:
         context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
         built = build_set_pipeline_candidate(candidate, _empty_state(), context)
-        rejection = None if built.acceptable else (built.result.data or {}).get("error")
+        rejection = None if built.acceptable else built.result.validation.errors[0].message
         assert built.acceptable is True, f"candidate rejected: {rejection}"
         return validation_module.validate_pipeline(
             built.result.updated_state,

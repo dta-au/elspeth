@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 import structlog
 from jinja2 import TemplateSyntaxError
 from opentelemetry import metrics
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -203,7 +204,6 @@ from elspeth.web.composer.tools import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
     ADVISOR_TRIGGER_DETERMINISTIC_END,
-    ADVISOR_TRIGGER_VALUES,
     RATE_CAP_CODE_TO_TELEMETRY_CAP_TYPE,
     RuntimePreflight,
     ToolResult,
@@ -212,6 +212,9 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     normalize_tool_result_validation,
 )
+from elspeth.web.composer.tools._registry import resolve_tool_effects
+from elspeth.web.composer.tools.declarations import EffectDomain
+from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
@@ -7237,122 +7240,18 @@ class ComposerServiceImpl:
             )
         return response
 
-    def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> dict[str, Any] | None:
-        """Validate advisor tool arguments at the Tier-3 trust boundary.
-
-        Returns ``None`` if valid; otherwise returns an ARG_ERROR payload
-        ready to embed in the outer tool-result envelope.
-
-        The compose-loop's ``_TOOL_REQUIRED_PATHS`` check upstream guarantees
-        ``trigger``, ``problem_summary``, ``recent_errors``, and
-        ``attempted_actions`` are present in ``arguments`` — but only their
-        *presence*, not their
-        type or size. Without this validator:
-
-        - A non-list ``recent_errors`` would be silently iterated by Python
-          (string → char-by-char, int → TypeError, dict → keys), producing
-          a corrupt prompt that we would still pay full provider cost for.
-        - A megabyte-scale value would be sent verbatim to LiteLLM,
-          rendering ``composer_advisor_max_prompt_tokens`` (declared as a
-          cap) into dead config — operators would believe they had a cap
-          and they would not.
-
-        Both are Tier-3 trust-boundary failures: the LLM is providing
-        external input, and the trust model
-        (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
-        Model) permits ``isinstance`` checks (and other defensive validation)
-        at this boundary. Anti-anchor tracking on the caller side ensures
-        repeated identical ARG_ERRORs surface the §7.7 structural hint.
-        """
-        unknown_keys = sorted(set(arguments) - _ADVISOR_ARGUMENT_KEYS)
-        if unknown_keys:
+    def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | dict[str, Any]:
+        """Admit complete public input before advisor budget or provider effects."""
+        try:
+            validated = RequestAdvisorHintArgumentsModel.model_validate(arguments)
+        except PydanticValidationError as exc:
+            errors = exc.errors(include_input=False, include_context=False, include_url=False)
+            type_error = any(error["type"] in {"string_type", "list_type"} for error in errors)
             return {
                 "status": "ARG_ERROR",
-                "error": f"request_advisor_hint received {len(unknown_keys)} unknown argument(s)",
-                "error_class": "ValueError",
+                "error": "request_advisor_hint arguments must conform to the published schema; check field types, limits, and extra keys",
+                "error_class": "TypeError" if type_error else "ValueError",
             }
-
-        trigger = arguments["trigger"]
-        if not isinstance(trigger, str):
-            return {
-                "status": "ARG_ERROR",
-                "error": "trigger must be a string",
-                "error_class": "TypeError",
-            }
-        if trigger not in ADVISOR_TRIGGER_VALUES:
-            return {
-                "status": "ARG_ERROR",
-                "error": f"trigger must be one of: {', '.join(ADVISOR_TRIGGER_VALUES)}",
-                "error_class": "ValueError",
-            }
-
-        if not isinstance(arguments["problem_summary"], str):
-            return {
-                "status": "ARG_ERROR",
-                "error": "problem_summary must be a string",
-                "error_class": "TypeError",
-            }
-        if len(arguments["problem_summary"]) > _ADVISOR_PROBLEM_SUMMARY_MAX_CHARS:
-            return {
-                "status": "ARG_ERROR",
-                "error": f"problem_summary exceeds {_ADVISOR_PROBLEM_SUMMARY_MAX_CHARS} characters",
-                "error_class": "ValueError",
-            }
-
-        recent = arguments["recent_errors"]
-        if not isinstance(recent, list) or not all(isinstance(e, str) for e in recent):
-            return {
-                "status": "ARG_ERROR",
-                "error": "recent_errors must be a list of strings",
-                "error_class": "TypeError",
-            }
-        if len(recent) > _ADVISOR_RECENT_ERRORS_MAX_ITEMS:
-            return {
-                "status": "ARG_ERROR",
-                "error": f"recent_errors may include at most {_ADVISOR_RECENT_ERRORS_MAX_ITEMS} entries",
-                "error_class": "ValueError",
-            }
-        if any(len(error) > _ADVISOR_LIST_ITEM_MAX_CHARS for error in recent):
-            return {
-                "status": "ARG_ERROR",
-                "error": f"recent_errors entries may be at most {_ADVISOR_LIST_ITEM_MAX_CHARS} characters",
-                "error_class": "ValueError",
-            }
-
-        attempted = arguments["attempted_actions"]
-        if not isinstance(attempted, list) or not all(isinstance(a, str) for a in attempted):
-            return {
-                "status": "ARG_ERROR",
-                "error": "attempted_actions must be a list of strings",
-                "error_class": "TypeError",
-            }
-        if len(attempted) > _ADVISOR_ATTEMPTED_ACTIONS_MAX_ITEMS:
-            return {
-                "status": "ARG_ERROR",
-                "error": f"attempted_actions may include at most {_ADVISOR_ATTEMPTED_ACTIONS_MAX_ITEMS} entries",
-                "error_class": "ValueError",
-            }
-        if any(len(action) > _ADVISOR_LIST_ITEM_MAX_CHARS for action in attempted):
-            return {
-                "status": "ARG_ERROR",
-                "error": f"attempted_actions entries may be at most {_ADVISOR_LIST_ITEM_MAX_CHARS} characters",
-                "error_class": "ValueError",
-            }
-
-        if "schema_excerpt" in arguments and arguments["schema_excerpt"] is not None:
-            candidate = arguments["schema_excerpt"]
-            if not isinstance(candidate, str):
-                return {
-                    "status": "ARG_ERROR",
-                    "error": "schema_excerpt must be a string when provided",
-                    "error_class": "TypeError",
-                }
-            if len(candidate) > _ADVISOR_SCHEMA_EXCERPT_MAX_CHARS:
-                return {
-                    "status": "ARG_ERROR",
-                    "error": f"schema_excerpt exceeds {_ADVISOR_SCHEMA_EXCERPT_MAX_CHARS} characters",
-                    "error_class": "ValueError",
-                }
 
         # Approximate provider cost cap: rough 4 chars / token. Compute the
         # exact formatted user-message char count we would emit if the call
@@ -7360,7 +7259,7 @@ class ComposerServiceImpl:
         # fixed system side is bounded separately by the packaged skill plus
         # load_deployment_skill's byte cap; this setting bounds the
         # LLM-controlled variable part.
-        total_chars = len(_build_advisor_user_message(arguments))
+        total_chars = len(_build_advisor_user_message(validated.to_internal_request()))
         char_cap = self._settings.composer_advisor_max_prompt_tokens * 4
         if total_chars > char_cap:
             return {
@@ -7373,7 +7272,7 @@ class ComposerServiceImpl:
                 "error_class": "ValueError",
             }
 
-        return None
+        return validated
 
     async def _dispatch_session_aware_tool(
         self,
@@ -7487,6 +7386,8 @@ class ComposerServiceImpl:
                 post_version=state.version,
             )
 
+        if resolve_tool_effects(tool_name, arguments).domains != (EffectDomain.INTERPRETATION,):
+            raise AssertionError("Session-aware dispatch requires owned interpretation effects.")
         handler = _SESSION_AWARE_TOOL_HANDLERS[tool_name]
         kwargs = self._build_session_aware_kwargs(
             tool_name=tool_name,
@@ -7678,7 +7579,7 @@ class ComposerServiceImpl:
 
     async def _call_advisor_for_tool(
         self,
-        arguments: Mapping[str, Any],
+        arguments: RequestAdvisorHintArgumentsModel,
         *,
         recorder: BufferingRecorder | None,
         timeout: float | None = None,
@@ -7694,7 +7595,7 @@ class ComposerServiceImpl:
         """
         try:
             guidance, metadata = await self._call_advisor_with_audit(
-                arguments,
+                arguments.to_internal_request(),
                 recorder=recorder,
                 timeout=timeout,
             )

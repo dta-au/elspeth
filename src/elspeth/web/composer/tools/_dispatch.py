@@ -62,8 +62,11 @@ from elspeth.web.composer.tools._registry import (
     _SECRET_MUTATION_TOOL_NAMES,
     _SECRET_MUTATION_TOOLS,
     _TOOL_DEFS_BY_NAME,
+    ASYNC_TOOL_EFFECTS,
+    resolve_tool_effects,
     should_augment_with_plugin_schemas,
 )
+from elspeth.web.composer.tools.declarations import EffectDomain, ToolEffects
 from elspeth.web.composer.tools.discovery import _SESSION_AWARE_TOOL_NAMES
 from elspeth.web.composer.tools.generation import build_validation_guidance
 from elspeth.web.composer.tools.sessions import (
@@ -130,7 +133,6 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
         "name": "request_advisor_hint",
         "description": (
             "ESCAPE HATCH — call when one of the declared trigger criteria applies: "
-            "reactive validation-loop recovery after two or more unchanged failures, "
             "proactive security/safety wiring review before `set_pipeline`, or "
             "proactive red-listed plugin review before `set_pipeline`. The proactive "
             "security trigger covers content moderation, prompt-injection defence, "
@@ -247,7 +249,9 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "`interpretation_source` names the automatic interpretation that "
             "stood in) — proceed without waiting; "
             "`interpretation_review_pending_idempotent` means an identical "
-            "request was already staged — treat it as pending. `message` "
+            "request was already staged — treat it as pending. `event_id` identifies the recorded review: "
+            "an idempotent pending result reuses its existing id; an opt-out result identifies the automatic "
+            "interpretation record, not a card awaiting approval. `message` "
             "restates the outcome in prose."
         ),
         "parameters": {
@@ -421,22 +425,6 @@ def _inject_prior_validation(
 # tool in the union of the three mutation registries; aliased here for the
 # ``_inject_prior_validation`` wrap step in ``execute_tool``.
 _ALL_MUTATION_TOOL_NAMES: Final[frozenset[str]] = _MUTATION_TOOL_NAMES | _BLOB_MUTATION_TOOL_NAMES | _SECRET_MUTATION_TOOL_NAMES
-
-# Every public tool that can publish a new CompositionState. Blob-only
-# create/update/delete tools are intentionally excluded: they persist blob
-# records/files but never publish composition state, so a composition gate
-# after their handler would be too late to protect those external side effects.
-_COMPOSITION_STATE_MUTATION_TOOL_NAMES: Final[frozenset[str]] = (
-    _MUTATION_TOOL_NAMES
-    | _SECRET_MUTATION_TOOL_NAMES
-    | frozenset(
-        {
-            "set_source_from_blob",
-            "set_source_from_blobs",
-            "wire_blob_inline_ref",
-        }
-    )
-)
 
 
 def _closed_root_schema(tool_name: str) -> dict[str, Any]:
@@ -614,10 +602,11 @@ def _enforce_composition_interpretation_gate(
     result: ToolResult,
     *,
     tool_name: str,
+    effects: ToolEffects,
     prior_state: CompositionState,
 ) -> ToolResult:
     """Reject a successful public state mutation before its result is published."""
-    if not result.success or tool_name not in _COMPOSITION_STATE_MUTATION_TOOL_NAMES:
+    if not result.success or EffectDomain.GRAPH not in effects.domains:
         return result
     canonical_error = _composition_canonical_interpretation_requirement_error(
         result.updated_state,
@@ -811,10 +800,12 @@ def execute_tool(
         _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
     )
 
+    effects = resolve_tool_effects(tool_name, arguments)
     result = handler(arguments, state, context)
     result = _enforce_composition_interpretation_gate(
         result,
         tool_name=tool_name,
+        effects=effects,
         prior_state=state,
     )
 
@@ -966,6 +957,10 @@ from elspeth.web.composer.redaction import MANIFEST as _MANIFEST  # noqa: E402  
 _expected_manifest_names: frozenset[str] = (
     frozenset(decl.name for decl in _REGISTERED_TOOLS) | frozenset(_SESSION_AWARE_TOOL_HANDLERS) | frozenset({"request_advisor_hint"})
 )
+if frozenset(ASYNC_TOOL_EFFECTS) != frozenset(_SESSION_AWARE_TOOL_HANDLERS) | {"request_advisor_hint"}:
+    raise RuntimeError("Async tool effects diverge from async dispatch authority.")
+if _sync_declared_names | frozenset(ASYNC_TOOL_EFFECTS) != frozenset(definition["name"] for definition in get_tool_definitions()):
+    raise RuntimeError("Tool effects diverge from shipped tool definitions.")
 _manifest_names: frozenset[str] = frozenset(_MANIFEST.keys())
 if _expected_manifest_names != _manifest_names:
     raise RuntimeError(

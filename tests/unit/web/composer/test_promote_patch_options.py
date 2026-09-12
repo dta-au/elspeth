@@ -475,8 +475,8 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
         )
 
         assert result.success is False
-        assert "drop_raw_html_fields" in result.data["error"]
-        assert "pipeline_decision" in result.data["error"]
+        assert "drop_raw_html_fields" in result.validation.errors[0].message
+        assert "pipeline_decision" in result.validation.errors[0].message
 
     def test_patch_rejects_raw_cleanup_review_on_non_cleanup_node(self) -> None:
         """A raw-cleanup review belongs on the mapper that implements the drop."""
@@ -550,8 +550,8 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
         )
 
         assert result.success is False
-        assert "raw-html cleanup decision" in result.data["error"]
-        assert "must be implemented by a field_mapper" in result.data["error"]
+        assert "raw-html cleanup decision" in result.validation.errors[0].message
+        assert "must be implemented by a field_mapper" in result.validation.errors[0].message
 
     def test_manifest_entry_is_type_driven(self) -> None:
         assert "patch_node_options" in MANIFEST

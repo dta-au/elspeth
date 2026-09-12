@@ -1,8 +1,12 @@
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import {
   ArgumentFields,
+  PROJECTED_TOOL_NAMES,
+  TOOL_PROJECTORS,
   buildProposalDiff,
   ProposalChanges,
 } from "./ProposalDiff";
@@ -697,4 +701,24 @@ describe("ArgumentFields", () => {
     render(<ArgumentFields args={{}} />);
     expect(screen.getByText("No settings change in this step.")).toBeInTheDocument();
   });
+});
+
+describe("projector registry ownership", () => {
+  it("derives exported and fixture tools from the actual dispatch registry", () => {
+    const fixture = JSON.parse(readFileSync("src/test/fixtures/redacted-tool-arguments.json", "utf8"));
+    // Frontend CI provisions TypeScript; Python's producer gate does not.
+    const bridgeNames = JSON.parse(execFileSync(
+      process.execPath,
+      ["scripts/projected-tool-names.mjs"],
+      { encoding: "utf8" },
+    ));
+    expect(bridgeNames).toEqual(Object.keys(TOOL_PROJECTORS));
+    expect(PROJECTED_TOOL_NAMES).toEqual(Object.keys(TOOL_PROJECTORS));
+    expect(fixture.projected_tools).toEqual(Object.keys(TOOL_PROJECTORS));
+  });
+
+  it.each(["toString", "constructor", "__proto__", "unknown_tool"])(
+    "does not dispatch inherited or unknown tool %s",
+    (tool) => expect(buildProposalDiff(tool, {}, makeState())).toBeNull(),
+  );
 });

@@ -285,7 +285,7 @@ class TestAutoWireSplicing:
 
         wired = wire_required_controls(bare, snapshot, view)
         candidate = build_set_pipeline_candidate(wired, _empty_state(), context)
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"auto-wired candidate rejected: {rejection}"
 
         result = view.validate_authored_state(candidate.result.updated_state)
@@ -322,7 +322,7 @@ class TestAutoWireSplicing:
         # disclosure over placeholder config.
         context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
         built = build_set_pipeline_candidate(candidate, _empty_state(), context)
-        assert built.acceptable is True, (built.result.data or {}).get("error")
+        assert built.acceptable is True, built.result.validation.errors[0].message
         result = view.validate_authored_state(built.result.updated_state)
         coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
         assert coverage, "the required-control coverage finding must be preserved"
@@ -478,7 +478,7 @@ class TestLLMSourceAutoWireSplicing:
         wired = wire_required_controls(bare, snapshot, view)
         candidate = build_set_pipeline_candidate(wired, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"wired candidate rejected: {rejection}"
         state = candidate.result.updated_state
         assert state.sources["source"].on_validation_failure == "discard"
@@ -1063,8 +1063,8 @@ class TestDisclosureRegistry:
         candidate = build_set_pipeline_candidate(forged, _empty_state(), context)
 
         assert candidate.result.success is False
-        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in (candidate.result.data or {})["error"]
-        assert "server" in (candidate.result.data or {})["error"]
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in candidate.result.validation.errors[0].message
+        assert "server" in candidate.result.validation.errors[0].message
 
     def test_artifact_hash_binds_to_the_inserted_edge(self) -> None:
         def _control(node_id: str, *, input_stream: str) -> NodeSpec:

@@ -537,133 +537,143 @@ function projectEntries(
 ): DiffEntry[] | null {
   if (currentState === null) return null;
 
-  switch (toolName) {
-    case "set_source": {
-      const name = asString(args.source_name) ?? "source";
-      const afterSummary = sourceSummaryFromArgs(name, args);
-      if (afterSummary === null) return null;
-      const before = currentState.sources?.[name];
-      return [
-        upsertEntry(
-          "source",
-          name,
-          before,
-          before === undefined ? null : sourceEntrySummary([name, before]),
-          afterSummary,
-          args,
-        ),
-      ];
-    }
-    case "clear_source": {
-      const name = asString(args.source_name) ?? "source";
-      const before = currentState.sources?.[name];
-      if (before === undefined) return [];
-      return [removeEntry("source", name, before, sourceEntrySummary([name, before]))];
-    }
-    case "upsert_node": {
-      const id = asString(args.id);
-      const afterSummary = nodeSummaryFromArgs(args);
-      if (id === null || afterSummary === null) return null;
-      const before = currentState.nodes.find((node) => node.id === id);
-      return [
-        upsertEntry(
-          "node",
-          id,
-          before,
-          before === undefined ? null : nodeSummary(before),
-          afterSummary,
-          args,
-        ),
-      ];
-    }
-    case "remove_node": {
-      const id = asString(args.id);
-      if (id === null) return null;
-      const before = currentState.nodes.find((node) => node.id === id);
-      if (before === undefined) return [];
-      return [removeEntry("node", id, before, nodeSummary(before))];
-    }
-    case "upsert_edge": {
-      const id = asString(args.id);
-      const afterSummary = edgeSummaryFromArgs(args);
-      if (id === null || afterSummary === null) return null;
-      const before = currentState.edges.find((edge) => edge.id === id);
-      return [
-        upsertEntry(
-          "edge",
-          id,
-          before,
-          before === undefined ? null : edgeSummary(before),
-          afterSummary,
-          args,
-        ),
-      ];
-    }
-    case "remove_edge": {
-      const id = asString(args.id);
-      if (id === null) return null;
-      const before = currentState.edges.find((edge) => edge.id === id);
-      if (before === undefined) return [];
-      return [removeEntry("edge", id, before, edgeSummary(before))];
-    }
-    case "set_output": {
-      const name = asString(args.sink_name);
-      const afterSummary = outputSummaryFromArgs(args);
-      if (name === null || afterSummary === null) return null;
-      const before = currentState.outputs.find((output) => output.name === name);
-      return [
-        upsertEntry(
-          "output",
-          name,
-          before,
-          before === undefined ? null : outputSummary(before),
-          afterSummary,
-          args,
-        ),
-      ];
-    }
-    case "remove_output": {
-      const name = asString(args.sink_name);
-      if (name === null) return null;
-      const before = currentState.outputs.find((output) => output.name === name);
-      if (before === undefined) return [];
-      return [removeEntry("output", name, before, outputSummary(before))];
-    }
-    // The four arms below read `args.patch`, which the redactor replaces with
-    // a summary before it reaches this surface. They hand it to the shared
-    // decoders in utils/redactedArguments rather than to asRecord, which
-    // returns null for every string and left all four arms unreachable
-    // (elspeth-b1c14dd3c2).
-    case "set_metadata": {
-      return metadataPatchEntries(currentState, args.patch);
-    }
-    case "patch_source_options": {
-      const name = asString(args.source_name) ?? "source";
-      const fragment = currentState.sources?.[name];
-      if (fragment === undefined) return null;
-      return optionPatchEntries(name, fragment.options, args.patch);
-    }
-    case "patch_node_options": {
-      const nodeId = asString(args.node_id);
-      if (nodeId === null) return null;
-      const fragment = currentState.nodes.find((node) => node.id === nodeId);
-      if (fragment === undefined) return null;
-      return optionPatchEntries(nodeId, fragment.options, args.patch);
-    }
-    case "patch_output_options": {
-      const name = asString(args.sink_name);
-      if (name === null) return null;
-      const fragment = currentState.outputs.find((output) => output.name === name);
-      if (fragment === undefined) return null;
-      return optionPatchEntries(name, fragment.options, args.patch);
-    }
-    case "set_pipeline": {
-      return setPipelineEntries(currentState, args, ledger);
-    }
-    default:
-      return null;
-  }
+  if (!Object.prototype.hasOwnProperty.call(TOOL_PROJECTORS, toolName)) return null;
+  return TOOL_PROJECTORS[toolName as keyof typeof TOOL_PROJECTORS](args, currentState, ledger);
 }
+
+type ToolProjector = (
+  args: Record<string, unknown>,
+  currentState: CompositionState,
+  ledger: ComparisonLedger,
+) => DiffEntry[] | null;
+
+/** Single owner of runtime projection dispatch and fixture coverage. */
+export const TOOL_PROJECTORS = {
+  set_source: (args, currentState) => {
+    const name = asString(args.source_name) ?? "source";
+    const afterSummary = sourceSummaryFromArgs(name, args);
+    if (afterSummary === null) return null;
+    const before = currentState.sources?.[name];
+    return [
+      upsertEntry(
+        "source",
+        name,
+        before,
+        before === undefined ? null : sourceEntrySummary([name, before]),
+        afterSummary,
+        args,
+      ),
+    ];
+  },
+  clear_source: (args, currentState) => {
+    const name = asString(args.source_name) ?? "source";
+    const before = currentState.sources?.[name];
+    if (before === undefined) return [];
+    return [removeEntry("source", name, before, sourceEntrySummary([name, before]))];
+  },
+  upsert_node: (args, currentState) => {
+    const id = asString(args.id);
+    const afterSummary = nodeSummaryFromArgs(args);
+    if (id === null || afterSummary === null) return null;
+    const before = currentState.nodes.find((node) => node.id === id);
+    return [
+      upsertEntry(
+        "node",
+        id,
+        before,
+        before === undefined ? null : nodeSummary(before),
+        afterSummary,
+        args,
+      ),
+    ];
+  },
+  remove_node: (args, currentState) => {
+    const id = asString(args.id);
+    if (id === null) return null;
+    const before = currentState.nodes.find((node) => node.id === id);
+    if (before === undefined) return [];
+    return [removeEntry("node", id, before, nodeSummary(before))];
+  },
+  upsert_edge: (args, currentState) => {
+    const id = asString(args.id);
+    const afterSummary = edgeSummaryFromArgs(args);
+    if (id === null || afterSummary === null) return null;
+    const before = currentState.edges.find((edge) => edge.id === id);
+    return [
+      upsertEntry(
+        "edge",
+        id,
+        before,
+        before === undefined ? null : edgeSummary(before),
+        afterSummary,
+        args,
+      ),
+    ];
+  },
+  remove_edge: (args, currentState) => {
+    const id = asString(args.id);
+    if (id === null) return null;
+    const before = currentState.edges.find((edge) => edge.id === id);
+    if (before === undefined) return [];
+    return [removeEntry("edge", id, before, edgeSummary(before))];
+  },
+  set_output: (args, currentState) => {
+    const name = asString(args.sink_name);
+    const afterSummary = outputSummaryFromArgs(args);
+    if (name === null || afterSummary === null) return null;
+    const before = currentState.outputs.find((output) => output.name === name);
+    return [
+      upsertEntry(
+        "output",
+        name,
+        before,
+        before === undefined ? null : outputSummary(before),
+        afterSummary,
+        args,
+      ),
+    ];
+  },
+  remove_output: (args, currentState) => {
+    const name = asString(args.sink_name);
+    if (name === null) return null;
+    const before = currentState.outputs.find((output) => output.name === name);
+    if (before === undefined) return [];
+    return [removeEntry("output", name, before, outputSummary(before))];
+  },
+  // The four arms below read `args.patch`, which the redactor replaces with
+  // a summary before it reaches this surface. They hand it to the shared
+  // decoders in utils/redactedArguments rather than to asRecord, which
+  // returns null for every string and left all four arms unreachable
+  // (elspeth-b1c14dd3c2).
+  set_metadata: (args, currentState) => {
+    return metadataPatchEntries(currentState, args.patch);
+  },
+  patch_source_options: (args, currentState) => {
+    const name = asString(args.source_name) ?? "source";
+    const fragment = currentState.sources?.[name];
+    if (fragment === undefined) return null;
+    return optionPatchEntries(name, fragment.options, args.patch);
+  },
+  patch_node_options: (args, currentState) => {
+    const nodeId = asString(args.node_id);
+    if (nodeId === null) return null;
+    const fragment = currentState.nodes.find((node) => node.id === nodeId);
+    if (fragment === undefined) return null;
+    return optionPatchEntries(nodeId, fragment.options, args.patch);
+  },
+  patch_output_options: (args, currentState) => {
+    const name = asString(args.sink_name);
+    if (name === null) return null;
+    const fragment = currentState.outputs.find((output) => output.name === name);
+    if (fragment === undefined) return null;
+    return optionPatchEntries(name, fragment.options, args.patch);
+  },
+  set_pipeline: (args, currentState, ledger) => {
+    return setPipelineEntries(currentState, args, ledger);
+  },
+} satisfies Record<string, ToolProjector>;
+
+export const PROJECTED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(TOOL_PROJECTORS));
 
 /**
  * The sections whose rows are built from REDACTED values, and therefore know

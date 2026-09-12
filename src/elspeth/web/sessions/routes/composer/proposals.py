@@ -16,7 +16,6 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import ProposalStateConflictError, StaleComposeStateError
 
 from .._helpers import (
-    _DATA_ERROR_KEY,
     UUID,
     AcceptProposalRequest,
     Any,
@@ -459,25 +458,11 @@ async def accept_composition_proposal(
                 # frontend without revealing the validation errors that were
                 # the actual blocker).
                 if not result.success:
-                    # ``result`` is our own ``execute_tool`` output. Every
-                    # ``success=False`` ToolResult is built by one of the two
-                    # failure factories in ``web/composer/tools/_common.py``
-                    # (``_failure_result`` and the credential-repair factory),
-                    # both of which set ``data`` to a Mapping carrying
-                    # ``_DATA_ERROR_KEY``. That is a first-party contract — read
-                    # it directly and let a contract violation (a future tool
-                    # building ``success=False`` without the error key) crash
-                    # loudly rather than degrade to a generic message.
-                    # ``ToolResult.data`` is the closed ``ToolResultData`` union
-                    # (Mapping | Sequence | BaseModel | None), so the carrier half
-                    # of that contract is asserted before the read rather than
-                    # assumed by indexing (ADR-032). The key half stays a bare
-                    # subscript: a missing ``_DATA_ERROR_KEY`` is the loud KeyError
-                    # the comment above asks for.
-                    failure_data = result.data
-                    if not isinstance(failure_data, Mapping):
-                        raise TypeError(f"a success=False ToolResult must carry a Mapping data payload, got {type(failure_data).__name__}")
-                    error_summary = failure_data[_DATA_ERROR_KEY] or "Composer proposal failed validation."
+                    # Helper rejections lead with their own detail. Standing-state
+                    # errors on a general failure do not identify this rejection.
+                    error_summary = "Composer proposal failed validation."
+                    if result.validation.errors and result.validation.errors[0].component == "rejected_mutation":
+                        error_summary = result.validation.errors[0].message or error_summary
                     validation_errors_payload = (
                         [{"component": entry.component, "message": entry.message} for entry in result.validation.errors]
                         if result.validation is not None

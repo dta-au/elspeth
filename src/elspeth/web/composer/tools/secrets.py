@@ -11,16 +11,19 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secrets import SecretInventoryItem, SecretScope, SecretUnavailabilityReason
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.redaction import _OmittableString
 from elspeth.web.composer.state import (
     CompositionState,
 )
 from elspeth.web.composer.tools._common import (
+    EmptyToolArgumentsModel,
     ToolContext,
     ToolResult,
     _discovery_result,
     _failure_result,
     _mutation_result,
     _secret_ref_placement_error,
+    _validate_mutation_arguments,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -81,7 +84,7 @@ class _WireSecretRefArgumentsModel(BaseModel):
 
     name: str
     target: Literal["source", "node", "output"]
-    target_id: str | None = None
+    target_id: _OmittableString = None
     option_key: str
 
     model_config = ConfigDict(extra="forbid")
@@ -118,6 +121,7 @@ def _handle_list_secret_refs(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_secret_refs arguments")
     if context.secret_service is None or context.user_id is None:
         return _failure_result(state, "Secret tools require secret service context.")
     items = context.secret_service.list_refs(context.user_id)
@@ -131,7 +135,7 @@ _LIST_SECRET_REFS_DECLARATION = ToolDeclaration(
     handler=_handle_list_secret_refs,
     kind=ToolKind.SECRET_DISCOVERY,
     description=(
-        "List available secret references (API keys, credentials). Each entry carries the reference name, its "
+        "List available secret references (API keys, credentials). Each entry carries the reference `name`, its "
         "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
         "does not); never values."
     ),
@@ -175,8 +179,9 @@ _VALIDATE_SECRET_REF_DECLARATION = ToolDeclaration(
     handler=_handle_validate_secret_ref,
     kind=ToolKind.SECRET_DISCOVERY,
     description=(
-        "Check if a secret reference exists and is accessible to the current user. Returns `available` (true when "
-        "it resolves for you) with its `scope` and `source_kind`, or `reason` when it does not."
+        "Check if a secret reference exists and is accessible to the current user. Returns the checked reference `name` "
+        "and `available` (true when it resolves for you). When the reference appears in your inventory, also returns "
+        "its `scope`, `source_kind`, and `reason` (null when available; otherwise the reason it cannot resolve)."
     ),
     json_schema={
         "type": "object",

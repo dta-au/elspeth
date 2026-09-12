@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict, cast
 from uuid import UUID, uuid4
 
+from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine, func, select
 
@@ -67,6 +68,7 @@ from elspeth.web.blobs.service import (
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     CreateBlobArgumentsModel,
+    GetBlobContentArgumentsModel,
     UpdateBlobArgumentsModel,
 )
 from elspeth.web.composer.state import (
@@ -77,12 +79,14 @@ from elspeth.web.composer.tools._common import (
     _INTERPRETATION_REVIEW_FOLLOWUP,
     _RUNTIME_OWNED_LLM_OPTION_KEYS,
     _SERVER_OWNED_SOURCE_OPTION_KEYS,
+    EmptyToolArgumentsModel,
     ToolContext,
     ToolResult,
     _composition_canonical_interpretation_requirement_error,
     _discovery_result,
     _failure_result,
     _mutation_result,
+    _validate_mutation_arguments,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -94,6 +98,20 @@ from elspeth.web.sessions.models import (
     blobs_table,
 )
 from elspeth.web.sessions.protocol import SessionOperationAuthority
+
+
+class BlobIdArgumentsModel(BaseModel):
+    blob_id: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class WireBlobInlineRefArgumentsModel(BaseModel):
+    field_path: str
+    blob_id: str
+    encoding: ContentEncoding = "utf-8"
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class BlobToolRecord(TypedDict):
@@ -123,6 +141,16 @@ class BlobToolRecord(TypedDict):
     creating_provider: str | None
     creating_composer_skill_hash: str | None
     creating_arguments_hash: str | None
+
+
+class BlobInlineDescriptor(TypedDict):
+    """Closed file metadata exposed by the ready-blob discovery helper."""
+
+    blob_id: str
+    mime_type: str
+    size_bytes: int
+    content_hash: str
+    filename: str
 
 
 class BlobCreatePayload(TypedDict):
@@ -323,7 +351,7 @@ def _sync_list_blobs(engine: Engine, session_id: str) -> list[dict[str, Any]]:
         ]
 
 
-def _sync_list_ready_blob_inline_descriptors(engine: Engine, session_id: str) -> list[dict[str, Any]]:
+def _sync_list_ready_blob_inline_descriptors(engine: Engine, session_id: str) -> list[BlobInlineDescriptor]:
     """Return H4 visibility descriptors for ready session blobs."""
     with engine.connect() as conn:
         rows = conn.execute(
@@ -334,7 +362,7 @@ def _sync_list_ready_blob_inline_descriptors(engine: Engine, session_id: str) ->
             .limit(50)
         ).fetchall()
 
-    descriptors: list[dict[str, Any]] = []
+    descriptors: list[BlobInlineDescriptor] = []
     for row in rows:
         blob = _blob_row_to_tool_dict(row)
         if blob["content_hash"] is None:
@@ -356,6 +384,7 @@ def _handle_list_blobs(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_blobs arguments")
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
@@ -369,7 +398,7 @@ _LIST_BLOBS_DECLARATION = ToolDeclaration(
     handler=_handle_list_blobs,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
-        "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+        "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, "
         "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -387,7 +416,7 @@ def _handle_list_composer_blobs(
     marker. Bytes, previews, storage paths, and free-text descriptions stay
     out of the response surface.
     """
-    del arguments
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_composer_blobs arguments")
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
@@ -413,14 +442,15 @@ def _handle_get_blob_metadata(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    validated = _validate_mutation_arguments(BlobIdArgumentsModel, arguments, "get_blob_metadata arguments")
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    blob_id_error = _blob_id_uuid_validation_error(arguments["blob_id"])
+    blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    blob = _sync_get_blob(session_engine, arguments["blob_id"], session_id)
+    blob = _sync_get_blob(session_engine, validated.blob_id, session_id)
     if blob is None:
         return _failure_result(state, "Blob not found for this session.")
     safe_blob = {
@@ -438,7 +468,7 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
     name="get_blob_metadata",
     handler=_handle_get_blob_metadata,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
+    description="Get metadata for a specific blob (file) by ID: `id`, `filename`, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
     json_schema={
         "type": "object",
         "properties": {
@@ -624,31 +654,20 @@ def _execute_wire_blob_inline_ref(
     context: ToolContext,
 ) -> ToolResult:
     """Author a widened blob_ref inline-content marker into composition state."""
+    validated = _validate_mutation_arguments(WireBlobInlineRefArgumentsModel, arguments, "wire_blob_inline_ref arguments")
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
 
-    field_path = arguments["field_path"]
-    blob_id_error = _blob_id_uuid_validation_error(arguments["blob_id"])
+    field_path = validated.field_path
+    blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    blob_id = UUID(arguments["blob_id"])
+    blob_id = UUID(validated.blob_id)
 
-    # Tier-3 LLM tool argument. Absent ``encoding`` means utf-8 by the
-    # published tool-schema contract (json_schema declares default "utf-8").
-    # The ``isinstance(..., str)`` guard is load-bearing and must precede the
-    # membership test: the LLM may emit a JSON array/object (Python
-    # list/dict), and ``unhashable_value not in ALLOWED_CONTENT_ENCODINGS``
-    # would raise TypeError out of the dispatcher rather than returning the
-    # explicit failure result. The str narrowing also satisfies the
-    # ContentEncoding cast below.
-    encoding_value = arguments["encoding"] if "encoding" in arguments else "utf-8"
-    if type(encoding_value) is not str:
-        return _failure_result(state, f"encoding must be a string, got {type(encoding_value).__name__}")
-    if encoding_value not in ALLOWED_CONTENT_ENCODINGS:
-        return _failure_result(state, f"encoding must be one of {sorted(ALLOWED_CONTENT_ENCODINGS)}, got {encoding_value!r}")
-    encoding = cast(ContentEncoding, encoding_value)
+    # The argument model validates ContentEncoding and defaults absence to utf-8.
+    encoding = validated.encoding
 
     blob = _sync_get_blob(session_engine, str(blob_id), session_id)
     if blob is None:
@@ -658,13 +677,6 @@ def _execute_wire_blob_inline_ref(
     pinned_hash = blob["content_hash"]
     if pinned_hash is None:
         raise AuditIntegrityError(f"Ready blob '{blob_id}' has null content_hash; cannot author inline_content ref")
-
-    # Optional Tier-3 LLM tool argument; its absence honestly means "no
-    # override supplied" (None), so the missing key is recorded as None
-    # rather than fabricated into a value.
-    sha256_override = arguments["sha256_override"] if "sha256_override" in arguments else None
-    if sha256_override is not None and sha256_override != pinned_hash:
-        return _failure_result(state, "sha256 override disagrees with authoritative blob content_hash; composer pins from blob metadata")
 
     try:
         ref = BlobInlineRef(
@@ -1283,7 +1295,7 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
     description=(
         "Create a new file (blob) from inline content. "
         "Use this to create seed input files (URLs, JSON, CSV snippets) "
-        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, "
+        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, `filename`, `mime_type`, "
         "`content_hash`, `size_bytes`, and `originated_in` (`this_tool_call`: the blob was authored by "
         "this call, not uploaded)."
     ),
@@ -1408,7 +1420,7 @@ _UPDATE_BLOB_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_MUTATION,
     description=(
         "Update the content of an existing blob (file). Overwrites the file content while preserving metadata. "
-        "Returns the new `content_hash` and `size_bytes`."
+        "Returns `blob_id`, `filename`, `mime_type`, and the new `content_hash` and `size_bytes`."
     ),
     json_schema={
         "type": "object",
@@ -1435,13 +1447,14 @@ def _execute_delete_blob(
     context: ToolContext,
 ) -> ToolResult:
     """Delete through the same custody ledger as the authenticated API."""
+    validated = _validate_mutation_arguments(BlobIdArgumentsModel, arguments, "delete_blob arguments")
     from elspeth.web.coordination.repository import SessionDerivedCustodyError
 
     if context.session_engine is None or context.session_id is None:
         return _failure_result(state, "Blob tools require session context.")
     if context.data_dir is None:
         return _failure_result(state, "Blob tools require data_dir for storage.")
-    blob_id = arguments["blob_id"]
+    blob_id = validated.blob_id
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
@@ -1482,7 +1495,7 @@ _DELETE_BLOB_DECLARATION = ToolDeclaration(
     name="delete_blob",
     handler=_execute_delete_blob,
     kind=ToolKind.BLOB_MUTATION,
-    description="Delete a blob (file) and its storage. Returns `deleted`: true.",
+    description="Delete a blob (file) and its storage. Returns the deleted `blob_id` and `deleted`: true.",
     json_schema={
         "type": "object",
         "properties": {
@@ -1627,7 +1640,8 @@ def _execute_get_blob_content(
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
 
-    blob_id = arguments["blob_id"]
+    validated = _validate_mutation_arguments(GetBlobContentArgumentsModel, arguments, "get_blob_content arguments")
+    blob_id = validated.blob_id
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
@@ -1696,7 +1710,8 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     handler=_execute_get_blob_content,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
-        "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters "
+        "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
+        "Large files are truncated to 50,000 characters "
         "(`truncated` is true when so; `size_bytes` is the full size). "
         "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
         "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."

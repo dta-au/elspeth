@@ -68,6 +68,7 @@ recipe miss, or an unloaded schema into a capability denial. Recipes
 accelerate common builds; they never define the language or replace arbitrary
 canonical authoring.
 
+<!-- taught:begin tool-data list_sources data.available; tool-data list_sources data.prohibited; tool-data list_transforms data.available; tool-data list_transforms data.prohibited; tool-data list_sinks data.available; tool-data list_sinks data.prohibited -->
 When a user names a specific plugin and asks why it cannot be used, check the
 relevant discovery tool's `prohibited` array before answering. A plugin listed
 there is closed by standing security policy, not by anything an operator can
@@ -76,6 +77,7 @@ guessing, retrying, or silently dropping the question. A plugin absent from
 both `available` and `prohibited` has some other cause (not installed, not
 authorized, missing credential, no operator profile); name that distinction
 instead of collapsing every unavailability into "policy-denied."
+<!-- taught:end -->
 
 Model identifiers come from the supplied model catalog where the request
 provides one, and otherwise only from `list_models`. Read the complete
@@ -195,6 +197,13 @@ to converge.
 
 The terminal schema is authoritative. Its covered structural families are:
 
+`get_pipeline_state` inspection uses these canonical structural field names:
+the full document has the pipeline containers and metadata below. A component
+request returns a single `node` with the node family's fields, or a single
+`output` with the output family's fields (including `sink_name`). These are
+inspection records, not a substitute for exact `set_pipeline_arguments`.
+
+<!-- taught:begin tool-data get_pipeline_state data.source row=pipeline; tool-data get_pipeline_state data.sources row=pipeline; tool-data get_pipeline_state data.nodes row=pipeline; tool-data get_pipeline_state data.edges row=pipeline; tool-data get_pipeline_state data.outputs row=pipeline; tool-data get_pipeline_state data.metadata row=pipeline; tool-data get_pipeline_state data.node.* row=node; tool-data get_pipeline_state data.output.* row=output; tool-data get_pipeline_state data.metadata.* row=metadata -->
 <!-- canonical-field-inventory:start -->
 | Family | Fields |
 | --- | --- |
@@ -208,6 +217,7 @@ The terminal schema is authoritative. Its covered structural families are:
 | output | `sink_name`, `plugin`, `options`, `on_write_failure`, `description` |
 | metadata | `name`, `description` |
 <!-- canonical-field-inventory:end -->
+<!-- taught:end -->
 
 Named sources use the same routing semantics as the singular source without
 inline custody fields.

@@ -1,7 +1,104 @@
 {
   "_comment": "GENERATED FILE -- do not hand-edit. Each 'redacted' payload is the output of elspeth.web.composer.redaction.redact_tool_call_arguments for its 'arguments'. Frontend tests read these payloads so they are driven by the real producer; a Python test re-derives them so the two languages cannot drift (elspeth-b1c14dd3c2).",
   "_regenerate": ".venv/bin/python scripts/cicd/bootstrap_proposal_diff_fixture.py --write",
+  "projected_tools": [
+    "set_source",
+    "clear_source",
+    "upsert_node",
+    "remove_node",
+    "upsert_edge",
+    "remove_edge",
+    "set_output",
+    "remove_output",
+    "set_metadata",
+    "patch_source_options",
+    "patch_node_options",
+    "patch_output_options",
+    "set_pipeline"
+  ],
   "cases": {
+    "set_pipeline_ambiguous_inline_empty_options": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": {},
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": {}
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": null,
+          "description": null,
+          "blob_id": null,
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "<inline-blob:58-bytes>",
+            "description": null
+          }
+        },
+        "sources": null,
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": "<metadata-patch:description,name>"
+      }
+    },
+    "set_pipeline_ambiguous_inline_nonempty_options": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": {
+            "delimiter": ","
+          },
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": {}
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": null,
+          "description": null,
+          "blob_id": null,
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "<inline-blob:58-bytes>",
+            "description": null
+          }
+        },
+        "sources": null,
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": "<metadata-patch:description,name>"
+      }
+    },
     "patch_source_options_two_scalars": {
       "tool": "patch_source_options",
       "arguments": {

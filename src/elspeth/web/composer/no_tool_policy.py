@@ -1244,8 +1244,6 @@ def is_referential_pipeline_mutation_intent(message: str) -> bool:
 def _tool_failure_detail(payload: Mapping[str, Any]) -> str:
     """Extract a concise semantic failure detail from a ToolResult payload."""
     match payload:
-        case {"data": {"error": error}}:
-            return f": {error}"
         case {"validation": {"errors": [first_error, *_]}}:
             match first_error:
                 case {"message": message}:

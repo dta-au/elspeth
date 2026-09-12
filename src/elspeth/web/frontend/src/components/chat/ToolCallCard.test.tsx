@@ -49,6 +49,81 @@ const proposal: CompositionProposal = {
 };
 
 describe("ToolCallCard", () => {
+  it.each([
+    ["get_blob_content", /text content of a session file/],
+    ["get_blob_metadata", /session file's name, size, and status/],
+    ["inspect_source", /headers, inferred types, and sample-row count/],
+    ["set_source_from_blob", /session file as the pipeline's data source/],
+    ["set_source_from_blobs", /files containing user-provided content/],
+    ["wire_blob_inline_ref", /session file's content/],
+  ])("shows %s guidance without claiming an uploaded-only origin", (name, description) => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall(name)}
+        proposal={null}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(description, { selector: ".tool-call-ribbon-text" })).toBeInTheDocument();
+    expect(screen.getByRole("tooltip")).toHaveTextContent(description);
+    expect(screen.queryByText(/uploaded file/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["update_blob", "Replaces the content of a session file.", "Overwrite session file \"assistant-created-file\"."],
+    ["delete_blob", "Deletes a session file and its storage.", "Delete session file \"assistant-created-file\"."],
+    ["patch_node_options", "Updates configuration options on a pipeline node.", "Update options for node \"collector\"."],
+  ])("describes the full %s proposal without narrowing its supported targets", (name, heading, summary) => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall(name)}
+        proposal={{ ...proposal, tool_name: name, summary, arguments_redacted_json: { target: "safe-label" } }}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(`Proposed: ${heading}`)).toBeInTheDocument();
+    expect(screen.getByText(summary)).toBeInTheDocument();
+    expect(screen.getByText(proposal.rationale)).toBeInTheDocument();
+    expect(screen.queryByText(/uploaded file|transform or gate/)).not.toBeInTheDocument();
+  });
+
+  it.each(["source_data_contract", "pipeline_decision"])("renders kind-neutral Why text for %s review", (kind) => {
+    const rationale = "Review the planner's proposed interpretation or assumption before it is accepted into the pipeline.";
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("request_interpretation_review")}
+        proposal={{
+          ...proposal,
+          tool_name: "request_interpretation_review",
+          summary: "Surface an interpretation draft for user review.",
+          rationale,
+          affects: ["interpretation"],
+          arguments_redacted_json: { kind },
+        }}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Proposed: Asks you to review an assumption the planner made before it is built into the pipeline.")).toBeInTheDocument();
+    expect(screen.getByText(rationale)).toBeInTheDocument();
+    expect(screen.queryByText(/subjective|underspecified|prompt template/)).not.toBeInTheDocument();
+  });
+
+  it("labels blob storage effects as session files while preserving other domains", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("update_blob")}
+        proposal={{ ...proposal, tool_name: "update_blob", affects: ["blob_store", "future-domain"] }}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Session files, future-domain")).toBeInTheDocument();
+    expect(screen.queryByText(/blob_store/)).not.toBeInTheDocument();
+  });
+
   it("renders pending write proposals with balanced accept and reject actions", () => {
     render(
       <ToolCallCard

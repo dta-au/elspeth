@@ -267,11 +267,15 @@ result.
 
 ## Reading a tool result
 
+<!-- taught:begin envelope * success; envelope * version; envelope * affected_nodes; envelope * data; envelope * validation -->
 Every tool returns one JSON object with the same framing: `success` is the
 outcome; `version` is the state version after the call; `affected_nodes`
 lists the component ids the call touched; `data` is the tool-specific
-payload each tool's own description names. `validation` is always present —
-the whole-document check after the call: `is_valid`, and `errors` /
+payload each tool's own description names. `validation` is always present.
+<!-- taught:end -->
+
+<!-- taught:begin validation * validation.is_valid; validation * validation.errors; validation * validation.warnings; validation * validation.suggestions; validation * validation.errors[].*; validation * validation.warnings[].*; validation * validation.suggestions[].*; delta * validation_delta.new_errors[].*; delta * validation_delta.resolved_errors[].*; delta * validation_delta.new_warnings[].*; delta * validation_delta.resolved_warnings[].* -->
+The whole-document validation check after the call carries `is_valid`, and `errors` /
 `warnings` / `suggestions` entries, each with `component`, `message`,
 `severity`, and a closed `error_code`; when the code carries facts they ride
 as a `contract`, `row_union_schema`, or `coalesce_union_type` block. An
@@ -282,11 +286,16 @@ component it is about in `rejected_component` (`source`, `source:<name>`,
 ABSENT the rejection is about the whole candidate rather than any one
 component, so repair from its `message`. A single-component tool's rejection
 is about the component you called it with.
+<!-- taught:end -->
+
+<!-- taught:begin validation * validation.semantic_contracts; validation * validation.semantic_contracts[].* -->
 `semantic_contracts` lists each edge's `producer_field` → `consumer_field`
 check with its `outcome` and `requirement_code` (`from_id`, `to_id`,
 `producer_plugin`, `consumer_plugin` locate the edge); a `requirement_code`
 is the `issue_code` to pass to `get_plugin_assistance` for the repair.
+<!-- taught:end -->
 
+<!-- taught:begin failure-data * data.status; failure-data * data.proposal_id; failure-data * data.tool_name; failure-data * data.summary; failure-data * data.message; failure-data * data.applied; failure-data * data.candidate_version -->
 Two `status` values ride under `data` regardless of `success`.
 `APPROVAL_REQUIRED` (with `proposal_id`, `tool_name`, `summary`, `message`)
 means the change is a proposal awaiting human approval and nothing was
@@ -297,26 +306,43 @@ not the unchanged state the envelope's `version` names. Nothing changed, so
 `affected_nodes` is empty and there is no `validation_delta`;
 `candidate_version` is the version the candidate would have taken (equal to
 `version` when it failed before one was assigned).
+<!-- taught:end -->
 
+<!-- taught:begin validation * validation.graph_repair_suggestions; validation * validation.graph_repair_suggestions[].* -->
 `graph_repair_suggestions` gives a ready repair for a duplicate consumer:
-`code`, `connection`, `strategy`, the `affected_consumers` (`id`,
+`code`, `connection`, `strategy`, `reason` (why the repair is suggested), the `affected_consumers` (`id`,
 `current_input`, `new_input`), and a `tool_sequence` of tool-call objects —
 call each `tool` directly with its `arguments`, in order; never quote
-`arguments` back to the user. A different `tool_sequence` appears under a
+`arguments` back to the user.
+<!-- taught:end -->
+
+<!-- taught:begin failure-data * data.repair.post_hoc_form.tool_sequence -->
+A different `tool_sequence` appears under a
 credential failure's `repair` → `post_hoc_form`: a plain list of tool NAMES
 to call in order, with no `arguments`; build each call's arguments yourself
 from `credential_fields` and `components`.
+<!-- taught:end -->
 
 ### On failure
 
-A failed mutation carries `error` under `data` and, when the failure has a
-closed code, `error_code`. A top-level `validation_guidance` maps each
+Rejection details are authoritative in `validation.errors`: read each entry's
+`message` and optional `error_code`. Helper-generated rejections lead with
+`component="rejected_mutation"`; a full candidate can report several component
+rejections in order. Other failed tools can report different validation entries
+or none. Independent credential repair metadata remains under `data`.
+
+<!-- taught:begin envelope * validation_guidance; guidance * validation_guidance.codes; guidance * validation_guidance.codes.*; guidance * validation_guidance.explain_tool -->
+A top-level `validation_guidance` maps each
 `error_code` in `codes` to an `explanation` and a `suggested_fix`; when
 `explain_tool` is present, some entry had no matching code — call
 `explain_validation_error` with that entry's `error_code`, or with its full
-`message` when it has none. A top-level `plugin_schemas` (when present) is
+`message` when it has none.
+<!-- taught:end -->
+
+<!-- taught:begin envelope * plugin_schemas; plugin-schema * plugin_schemas.<kind/plugin>.name; plugin-schema * plugin_schemas.<kind/plugin>.description; plugin-schema * plugin_schemas.<kind/plugin>.plugin_type; plugin-schema * plugin_schemas.<kind/plugin>.json_schema; plugin-schema * plugin_schemas.<kind/plugin>.knob_schema; plugin-schema * plugin_schemas.<kind/plugin>.web_config_authority; plugin-schema * plugin_schemas.<kind/plugin>.composer_hints; plugin-schema * plugin_schemas.<kind/plugin>.secret_requirements -->
+A top-level `plugin_schemas` (when present) is
 the option schema for each plugin a rejected component uses, keyed
-`<kind>/<name>`, each with `plugin_type`, `json_schema`, `knob_schema`,
+`<kind>/<name>`, each with `name` (the plugin identifier), `description` (its purpose), `plugin_type`, `json_schema`, `knob_schema`,
 `web_config_authority`, `composer_hints`, and `secret_requirements` (the
 credential fields YOU must wire; empty when there are none — an
 `operator_profiled` plugin's credentials live in its profile, not in your
@@ -329,7 +355,9 @@ component to repair, from its `message`. `web_config_authority` tells you whethe
 `options` (`user_configurable` or `user_configurable_with_policy`) or to
 author `options.profile` instead and leave the plugin's own options alone
 (`operator_profiled`).
+<!-- taught:end -->
 
+<!-- taught:begin failure-data * data.credential_fields; failure-data * data.components; failure-data * data.components[].*; failure-data * data.components_withheld; failure-data * data.repair; failure-data * data.repair.* -->
 A credential failure carries `credential_fields`, `components`
 (`component_id`, `component_type`, `fields`), and `repair` with an
 `inline_form` (`instruction`, `example_options` — each defective field shown
@@ -338,31 +366,52 @@ as a `secret_ref` marker to copy) and a `post_hoc_form`
 one form exactly. A full-replacement rejection may add
 `components_withheld`: the count of further defective components not
 listed; repair the listed ones and resubmit.
+<!-- taught:end -->
 
 ### On success
 
+<!-- taught:begin tool-data set_source data.note; tool-data set_source_from_blob data.note; tool-data set_source_from_blobs data.note; tool-data set_pipeline data.note -->
 A `note` under `data` on a successful source, node, or `set_pipeline`
 mutation can name a real problem the mutation did not block on (for example
 an `on_validation_failure` destination that matches no configured output):
 read it and repair what it names before the next turn; it is not optional.
+<!-- taught:end -->
 
+<!-- taught:begin envelope * applied_component; envelope * validation_delta; envelope * post_call_hints; echo * applied_component.source; echo * applied_component.sources; echo * applied_component.nodes; echo * applied_component.outputs; echo * applied_component.edges; delta * validation_delta.new_errors; delta * validation_delta.resolved_errors; delta * validation_delta.new_warnings; delta * validation_delta.resolved_warnings -->
 A successful incremental mutation carries `applied_component` (`source`,
 `sources`, `nodes`, `outputs`, `edges` as stored) and `validation_delta`
 (`new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings`, each a
 list of the entries described above); read the delta to choose the next
 repair and never re-read state to confirm the echo. `post_call_hints` are
 plugin-authored next steps.
+<!-- taught:end -->
 
+<!-- taught:begin tool-data patch_node_options data.server_owned_metadata_note; tool-data patch_source_options data.server_owned_metadata_note; tool-data set_pipeline data.server_owned_metadata_note; tool-data set_source data.server_owned_metadata_note; tool-data set_source_from_blob data.server_owned_metadata_note; tool-data set_source_from_blobs data.server_owned_metadata_note; tool-data upsert_node data.server_owned_metadata_note -->
 Housekeeping keys: `server_owned_metadata_note` means you may omit that
-field on future writes; a blob-backed source mutation may add `source_blob`
-/ `source_blobs` (the bound blob's identity); a `set_pipeline` that resolved
-`source.inline_blob` returns the created blob under `inline_blob`
-(`blob_id`, `content_hash`, `originated_in`) — that id is the bound source
-blob; do not call `list_blobs` to rediscover it. `runtime_preflight` appears
+field on future writes.
+<!-- taught:end -->
+
+<!-- taught:begin tool-data set_pipeline data.source_blob; tool-data set_source_from_blob data.source_blob; tool-data set_source_from_blobs data.source_blobs -->
+A blob-backed source mutation may add `source_blob`
+/ `source_blobs` (the bound blob's identity).
+<!-- taught:end -->
+
+<!-- taught:begin tool-data set_pipeline data.inline_blob; tool-data set_pipeline data.inline_blob.* -->
+A `set_pipeline` that resolved
+`source.inline_blob` returns the created blob under `inline_blob`: `blob_id`
+identifies the bound source blob; `filename` and `mime_type` describe the
+created file, `size_bytes` is its size in bytes, `content_hash` identifies its
+bytes, and `originated_in` is `this_tool_call` because this call authored it.
+Do not call `list_blobs` to rediscover it.
+<!-- taught:end -->
+
+<!-- taught:begin envelope * runtime_preflight; preflight * runtime_preflight.is_valid; preflight * runtime_preflight.checks; preflight * runtime_preflight.readiness; preflight * runtime_preflight.errors; preflight * runtime_preflight.warnings; preflight * runtime_preflight.semantic_contracts -->
+`runtime_preflight` appears
 only on `preview_pipeline`, and only when a runtime check ran, as its own
 top-level field: `is_valid`, `checks`,
 `readiness` (`execution_ready` and `blockers` say whether it can run), and
 runtime `errors` / `warnings` / `semantic_contracts`.
+<!-- taught:end -->
 
 ## Audit Boundaries
 
