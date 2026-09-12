@@ -39,6 +39,7 @@ from starlette.responses import Response as StarletteResponse
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
 from elspeth.contracts import RunStatus
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.secrets import (
@@ -1652,6 +1653,11 @@ def _create_app(
 
     session_service = SessionServiceImpl(
         session_engine,
+        chargeable_admission_policy=ChargeableAdmissionPolicy(
+            identity_token_quota_configured=settings.quota_default_tokens_per_day is not None,
+            container_token_quota_configured=settings.quota_container_tokens_per_day is not None,
+            secret_wiring_hash=runtime_secret_wiring_policy(settings.secret_wiring_allowlist).canonical_hash,
+        ),
         data_dir=settings.data_dir,
         telemetry=sessions_telemetry,
         log=structlog.get_logger("sessions"),

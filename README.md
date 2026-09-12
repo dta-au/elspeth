@@ -165,13 +165,24 @@ contract and remaining acceptance limits are documented in
 acceptance is not claimed.
 
 **Operational:** 0.8.1 is a pre-1.0 database cutover from session epoch 53
-to 54 and Landscape epoch 38 to 39; guided schema remains at 11. Archive or
+to 55 and Landscape epoch 38 to 40; guided schema remains at 11. Archive or
 export required evidence, stop the old service, recreate both stale databases
 in the same service-stop window, and install 0.8.1.
 Preserve `data/auth.db` and follow the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md),
 including account re-admission. Do not roll older code back over recreated
 databases.
+
+- **Identity and admission evidence.** Session owners are constrained to real
+  identities, withdrawn identity authority revokes awaiting approvals, and
+  run admission retains the quota-policy and secret-wiring decision. Reported
+  LLM token usage is queryable in the audit trail; unknown usage remains
+  unknown. Token-quota deployments refuse chargeable work until complete
+  accounting is available.
+- **Signed authentication exports.** Operator exports can include a bounded
+  authentication-event snapshot and explicitly distinguish omitted events
+  from an included empty set. Web run exports cannot include deployment-wide
+  authentication history.
 
 - **Coordination deadlines come from fresh post-lock database time.** Lease
   deadlines are issued after locked admission instead of from a clock read

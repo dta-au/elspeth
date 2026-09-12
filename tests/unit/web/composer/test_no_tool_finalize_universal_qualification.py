@@ -380,6 +380,9 @@ def _build_composer(
 async def _seed_session(sessions_service: SessionServiceImpl) -> str:
     session_id = uuid4()
     with sessions_service._engine.begin() as conn:
+        from tests.fixtures.identities import ensure_test_identity
+
+        ensure_test_identity(conn, identity_id="alice")
         conn.execute(
             insert(sessions_table).values(
                 id=str(session_id),

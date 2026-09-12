@@ -9,11 +9,18 @@ from uuid import uuid4
 import pytest
 
 import elspeth.web.sessions._auto_title as at
+from elspeth.contracts.chargeable_admission import (
+    AdmissionPolicyEvidence,
+    ChargeableAdmissionDecision,
+    ChargeableOperation,
+    QuotaDisposition,
+)
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 
+_TEST_SESSION_ID = uuid4()
 _TEST_CONTEXT = SessionOperationContext(
     fence=SessionOperationFence(
-        session_id="auto-title-sampling-session",
+        session_id=str(_TEST_SESSION_ID),
         operation_id="auto-title-sampling-operation",
         lease_token="auto-title-sampling-token",
         operation_epoch=2,
@@ -25,6 +32,16 @@ _TEST_CONTEXT = SessionOperationContext(
 class _TitleService:
     def __init__(self) -> None:
         self.updates: list[tuple[object, str]] = []
+
+    async def assess_chargeable_operation(
+        self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision:
+        assert session_operation_context == _TEST_CONTEXT
+        assert operation is ChargeableOperation.AUTO_TITLE
+        return ChargeableAdmissionDecision(
+            refusal_reason=None,
+            evidence=AdmissionPolicyEvidence(quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash="a" * 64),
+        )
 
     async def update_session_title(
         self,
@@ -54,7 +71,7 @@ async def test_auto_title_omits_sampling_when_none(monkeypatch: pytest.MonkeyPat
 
     await at.maybe_auto_title_session(
         service=service,
-        session_id=uuid4(),
+        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="gpt-5",
         temperature=None,
@@ -79,7 +96,7 @@ async def test_auto_title_sends_configured_sampling(monkeypatch: pytest.MonkeyPa
 
     await at.maybe_auto_title_session(
         service=_TitleService(),
-        session_id=uuid4(),
+        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="gpt-4o",
         temperature=0.0,

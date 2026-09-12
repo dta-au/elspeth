@@ -101,6 +101,8 @@ class WebPluginPolicyExportRecord(TypedDict):
     plugin_code_identities: list[list[str]]
     binding_generation_fingerprint: str
     decision_codes: list[str]
+    admission_decision_json: str | None
+    admission_decision_hash: str | None
 
 
 class NodeExportRecord(TypedDict):

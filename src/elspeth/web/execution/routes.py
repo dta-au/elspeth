@@ -41,7 +41,7 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerService, ComposerServiceError
-from elspeth.web.composer.service import _BadRequestLLMError
+from elspeth.web.composer.service import ComposerAdmissionRefused, _BadRequestLLMError
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -1426,10 +1426,19 @@ def create_execution_router() -> APIRouter:
                 )
 
         try:
-            explanation = await composer.explain_run_diagnostics(
-                llm_safe_diagnostics_snapshot(diagnostics),
-                recorder=recorder,
-            )
+            session_service: SessionServiceProtocol = request.app.state.session_service
+            async with await SessionOperationLease.acquire(
+                session_service.session_operation_authority,
+                session_id=run.session_id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=session_service.session_operation_owner_instance_id,
+                lease_seconds=session_service.session_operation_lease_seconds,
+            ) as diagnostics_lease:
+                explanation = await composer.explain_run_diagnostics(
+                    llm_safe_diagnostics_snapshot(diagnostics),
+                    recorder=recorder,
+                    session_operation_context=diagnostics_lease.context,
+                )
         except _BadRequestLLMError as exc:
             await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             # Provider rejected the request (400-class). Carrier exposes
@@ -1444,6 +1453,11 @@ def create_execution_router() -> APIRouter:
                     exc,
                     expose_provider_error=settings.composer_expose_provider_errors,
                 ),
+            ) from exc
+        except ComposerAdmissionRefused as exc:
+            raise HTTPException(
+                status_code=403,
+                detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
             ) from exc
         except ComposerServiceError as exc:
             await _persist_diagnostics_llm_calls(plugin_crash_pending=True)

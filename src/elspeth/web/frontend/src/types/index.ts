@@ -373,6 +373,7 @@ export type ComposerProgressReason =
   // retryable — deliberately not part of the provider_* family.
   | "planner_repair_exhausted"
   | "service_setup_failed"
+  | "admission_refused"
   // Required when phase === "cancelled" — distinguishes a client disconnect
   // from a future operator-initiated cancel without parsing the headline.
   | "client_cancelled"

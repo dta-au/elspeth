@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import Engine, func, insert, select
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
@@ -25,6 +26,13 @@ from elspeth.web.sessions.models import (
     runs_table,
 )
 from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation
+
+
+@pytest.fixture(autouse=True)
+def session_owner(engine: Engine) -> None:
+    """The session mutations in this module belong to an admitted identity."""
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
 
 
 def _create(authority: SQLiteLocalSessionOperationAuthority, *, title: str):

@@ -978,6 +978,8 @@ class TestExportRunUnsigned:
             ],
             "binding_generation_fingerprint": "c" * 64,
             "decision_codes": ["policy_allowed"],
+            "admission_decision_json": None,
+            "admission_decision_hash": None,
         }
 
     def test_run_record_has_timestamps(self) -> None:

@@ -35,6 +35,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import CallType, NodeStateStatus, NodeType
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, ChargeableAdmissionDecision, QuotaDisposition
 from elspeth.contracts.enums import CreationModality, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
 from elspeth.contracts.freeze import deep_thaw
@@ -70,6 +71,7 @@ from elspeth.web.blobs.protocol import (
     BlobServiceProtocol,
     BlobStateError,
 )
+from elspeth.web.coordination.contracts import StartPermitState
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
@@ -111,6 +113,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     IllegalRunTransitionError,
     RunAlreadyActiveError,
+    RunStartPermitRecord,
     SessionRunStatus,
     SessionServiceProtocol,
 )
@@ -739,6 +742,25 @@ def _install_ready_proof_blobs(
 @pytest.fixture
 def mock_session_service() -> MagicMock:
     svc = create_autospec(SessionServiceProtocol, instance=True)
+    admission = ChargeableAdmissionDecision(
+        evidence=AdmissionPolicyEvidence(quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash="d" * 64),
+        refusal_reason=None,
+    )
+    svc.assess_chargeable_operation.return_value = admission
+
+    async def issue_run_start_permit(run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+        return RunStartPermitRecord(
+            run_id=str(run_id),
+            state=StartPermitState.START_PERMITTED,
+            permit_id="test-permit",
+            permit_epoch=1,
+            subject_hash="a" * 64,
+            issued_at=datetime.now(UTC),
+            cancelled_at=None,
+            admission_decision=admission,
+        )
+
+    svc.issue_run_start_permit.side_effect = issue_run_start_permit
     # state_record needs fields that state_from_record() accesses
     state = SimpleNamespace(
         id=uuid4(),
@@ -8475,16 +8497,14 @@ class TestRunningStatusFailure:
     ) -> None:
         """If update_run_status('running') fails, the except BaseException
         block attempts to set 'failed'. Run stays 'pending' if both fail."""
-        # Make the first _call_async raise (simulating event loop issues)
+        # Fail the running-status write, after the independent admission call.
+        mock_session_service.update_run_status.side_effect = [ConnectionError("DB connection lost"), None]
         original_call_async = service._call_async
         call_count = 0
 
         def failing_call_async(coro: Coroutine[Any, Any, Any]) -> Any:
             nonlocal call_count
             call_count += 1
-            if call_count == 1:  # First call = update to "running"
-                coro.close()
-                raise ConnectionError("DB connection lost")
             return original_call_async(coro)
 
         cast(Any, service)._call_async = failing_call_async
@@ -8492,8 +8512,9 @@ class TestRunningStatusFailure:
         with _admitted_runtime_setup(), pytest.raises(ConnectionError):
             service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
-        # The except block tried to set "failed" via the second _call_async call
+        # The except block tried to set "failed" after the running write failed.
         assert call_count >= 2
+        assert [call.kwargs["status"] for call in mock_session_service.update_run_status.call_args_list] == ["running", "failed"]
 
 
 # ── IDOR Protection: verify_run_ownership ─────────────────────────────

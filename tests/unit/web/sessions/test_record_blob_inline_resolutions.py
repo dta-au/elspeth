@@ -130,6 +130,8 @@ async def test_record_blob_inline_resolutions_raises_audit_integrity_error_on_db
         log=structlog.get_logger("test.record-blob-inline-resolutions"),
     )
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="writer-test-user")
     session = await service.create_session("writer-test-user", "Writer test", "local")
     run_id = uuid4()
     blob_id = uuid4()
@@ -177,6 +179,8 @@ async def test_record_blob_inline_resolutions_empty_batch_wraps_cas_database_fai
         log=structlog.get_logger("test.record-blob-inline-resolutions"),
     )
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="writer-test-user")
     session = await service.create_session("writer-test-user", "Empty batch database failure", "local")
     execute_context = service.session_operation_authority.acquire(
         session_id=session.id,

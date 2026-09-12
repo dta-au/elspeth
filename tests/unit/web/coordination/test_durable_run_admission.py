@@ -5,15 +5,21 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, insert, select, update
+from tests.fixtures.identities import ensure_test_identity
 
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationKind, StartPermitState
 from elspeth.web.coordination.repository import SessionDerivedCustodyError
 from elspeth.web.coordination.run_cancellation_authority import RepositoryRunCancellationAuthority
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.envelope import RunExecutionInput
+from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.models import (
     composition_states_table,
+    identities_table,
+    quota_policies_table,
     run_events_table,
     run_execution_inputs_table,
     run_start_permits_table,
@@ -23,8 +29,12 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import RunAlreadyActiveError
 
+NO_QUOTA_POLICY = ChargeableAdmissionPolicy(secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
+
 
 def _admission(engine):
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="admission", auth_provider_type="local", owner_instance_id="owner", lease_seconds=30
@@ -94,7 +104,7 @@ def test_cancel_before_permit_forbids_dispatch_and_is_durable(engine):
     cancelled = cancel.request(run.id, session_id=run.session_id, user_id="alice", auth_provider_type="local")
     assert cancelled.status == "cancelled"
     assert cancelled.cancel_requested_at is not None
-    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id))
+    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
     assert permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT
     assert permit.permit_id is None
     assert cancel.request(run.id, session_id=run.session_id, user_id="alice", auth_provider_type="local") == cancelled
@@ -116,14 +126,14 @@ def test_cancel_before_permit_forbids_dispatch_and_is_durable(engine):
 
 def test_issued_permit_is_immutable_and_cancel_after_permit_is_cooperative(engine):
     authority, context, run, _ = _admission(engine)
-    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id))
+    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
     assert permit.state is StartPermitState.START_PERMITTED
     cancelled = RepositoryRunCancellationAuthority(engine).request(
         run.id, session_id=run.session_id, user_id="alice", auth_provider_type="local"
     )
     assert cancelled.status == "pending"
     assert cancelled.cancel_requested_at is not None
-    assert authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id)) == permit
+    assert authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY)) == permit
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(run_events_table)).scalar_one() == 0
 
@@ -151,7 +161,7 @@ def test_expired_owner_cannot_issue_but_peer_can_cancel(engine):
             .values(lease_expires_at=datetime(2000, 1, 1, tzinfo=UTC))
         )
     with pytest.raises(SessionOperationFenceLost):
-        authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id))
+        authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
     assert RepositoryGlobalRunRecoveryAuthority(engine).list_recoverable_run_records()[0].id == run.id
     cancelled = RepositoryRunCancellationAuthority(engine).request(
         run.id, session_id=UUID(context.fence.session_id), user_id="alice", auth_provider_type="local"
@@ -241,3 +251,139 @@ def test_archived_session_cannot_receive_durable_cancellation(engine):
         assert row.cancel_requested_at is None
         assert row.status == "pending"
         assert conn.execute(select(func.count()).select_from(run_events_table)).scalar_one() == 0
+
+
+@pytest.mark.parametrize(
+    "access_state,reason", [("disabled", AdmissionRefusalReason.IDENTITY_DISABLED), ("pending", AdmissionRefusalReason.IDENTITY_PENDING)]
+)
+def test_inactive_owner_refusal_commits_terminal_run_and_event(engine, access_state, reason):
+    authority, context, run, _ = _admission(engine)
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == "alice").values(access_state=access_state))
+    refused = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    assert refused.state is StartPermitState.REFUSED
+    assert refused.admission_decision.refusal_reason is reason
+    assert refused.permit_id is None
+    with engine.connect() as conn:
+        saved = conn.execute(select(runs_table).where(runs_table.c.id == str(run.id))).one()
+        assert saved.status == "failed" and saved.finished_at is not None
+        event = conn.execute(select(run_events_table).where(run_events_table.c.run_id == str(run.id))).one()
+        assert event.event_type == "failed"
+        assert reason.value in event.data["detail"]
+    assert authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY)) == refused
+
+
+@pytest.mark.parametrize("with_policy", [False, True])
+def test_enabled_quota_never_treats_empty_ledger_as_zero(engine, with_policy):
+    authority, context, run, _ = _admission(engine)
+    if with_policy:
+        with engine.begin() as conn:
+            conn.execute(
+                insert(quota_policies_table).values(
+                    policy_id="quota-alice",
+                    identity_id="alice",
+                    tokens_per_day=1000,
+                    storage_bytes=1000,
+                    set_by_actor="identity",
+                    set_by_identity_id="alice",
+                    set_at=datetime.now(UTC),
+                )
+            )
+    policy = ChargeableAdmissionPolicy(identity_token_quota_configured=True, secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
+    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=policy))
+    expected = AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE if with_policy else AdmissionRefusalReason.QUOTA_POLICY_MISSING
+    assert permit.admission_decision.refusal_reason is expected
+    assert permit.admission_decision.evidence.identity_policy_id == ("quota-alice" if with_policy else None)
+
+
+def test_recovery_refuses_disabled_owner_without_rewriting_original_permit(engine):
+    authority, context, run, _ = _admission(engine)
+    first = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == "alice").values(access_state="disabled"))
+    second = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    assert second.subject_hash == first.subject_hash
+    assert second.admission_decision == first.admission_decision
+    assert second.execution_refusal.refusal_reason is AdmissionRefusalReason.IDENTITY_DISABLED
+    with engine.connect() as conn:
+        assert conn.execute(select(runs_table.c.status).where(runs_table.c.id == str(run.id))).scalar_one() == "failed"
+
+
+def test_disabled_owner_does_not_block_existing_cancel_cleanup_binding(engine):
+    authority, context, run, _ = _admission(engine)
+    issued = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    RepositoryRunCancellationAuthority(engine).request(run.id, session_id=run.session_id, user_id="alice", auth_provider_type="local")
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == "alice").values(access_state="disabled"))
+    assert authority.mutate(context, lambda tx: tx.runs.observe_start_permit_for_cleanup(run_id=run.id)) == issued
+
+
+def test_wiring_generation_change_refuses_recovery_with_original_evidence_intact(engine):
+    authority, context, run, _ = _admission(engine)
+    issued = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    changed = ChargeableAdmissionPolicy(secret_wiring_hash="f" * 64)
+    refused = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=changed))
+    assert refused.subject_hash == issued.subject_hash
+    assert refused.admission_decision == issued.admission_decision
+    assert refused.execution_refusal.refusal_reason is AdmissionRefusalReason.POLICY_GENERATION_CHANGED
+
+
+def test_permit_evidence_hash_is_checked_on_replay(engine):
+    authority, context, run, _ = _admission(engine)
+    authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    with engine.begin() as conn:
+        conn.execute(
+            update(run_start_permits_table).where(run_start_permits_table.c.run_id == str(run.id)).values(admission_decision_hash="f" * 64)
+        )
+    with pytest.raises(AuditIntegrityError, match="evidence hash"):
+        authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+
+
+def test_refusal_remains_recoverable_until_cleanup_acknowledged(engine):
+    authority, context, run, _ = _admission(engine)
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == "alice").values(access_state="disabled"))
+    authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    authority.release(context)
+    candidates = RepositoryGlobalRunRecoveryAuthority(engine).list_recoverable_run_records()
+    assert [candidate.id for candidate in candidates] == [run.id]
+    assert candidates[0].saga_state.value == "admission_refusal_pending"
+    recovered = authority.acquire(
+        session_id=run.session_id, operation_kind=SessionOperationKind.EXECUTE, owner_instance_id="recovery", lease_seconds=30
+    )
+    authority.mutate(recovered, lambda tx: tx.runs.complete_admission_refusal(run_id=run.id))
+    authority.release(recovered)
+    assert RepositoryGlobalRunRecoveryAuthority(engine).list_recoverable_run_records() == ()
+
+
+def test_owner_provider_custody_corruption_cannot_issue_permit(engine):
+    authority, context, run, _ = _admission(engine)
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == "alice").values(provider="oidc"))
+    with pytest.raises(AuditIntegrityError, match="provider custody"):
+        authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+    with engine.connect() as conn:
+        assert conn.execute(select(run_start_permits_table.c.start_state)).scalar_one() == "pending"
+
+
+def test_stored_admission_evidence_rejects_boolean_version_and_unassessed_accounting():
+    import json
+
+    from pydantic import ValidationError
+
+    from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, QuotaDisposition
+
+    valid = AdmissionPolicyEvidence(
+        quota_disposition=QuotaDisposition.ACCOUNTING_UNAVAILABLE,
+        identity_policy_id="quota-alice",
+        secret_wiring_hash=NO_QUOTA_POLICY.secret_wiring_hash,
+    )
+    assert AdmissionPolicyEvidence.model_validate_json(valid.model_dump_json(), strict=True) == valid
+    boolean_version = valid.model_dump(mode="json")
+    boolean_version["schema_version"] = True
+    with pytest.raises(ValidationError, match="exact integer"):
+        AdmissionPolicyEvidence.model_validate_json(json.dumps(boolean_version), strict=True)
+    missing_policy = valid.model_dump(mode="json")
+    missing_policy["identity_policy_id"] = None
+    with pytest.raises(ValidationError, match="assessed quota policy"):
+        AdmissionPolicyEvidence.model_validate_json(json.dumps(missing_policy), strict=True)

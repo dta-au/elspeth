@@ -15,7 +15,13 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.coordination.contracts import FenceLossReason, RecoveryRequiredReason, SessionOperationFenceLost, SessionOperationKind
+from elspeth.web.coordination.contracts import (
+    FenceLossReason,
+    RecoveryRequiredReason,
+    RunSagaState,
+    SessionOperationFenceLost,
+    SessionOperationKind,
+)
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.execution.accounting import load_run_accounting_from_db
@@ -256,6 +262,11 @@ class RunRecoveryCoordinator:
             )
             lease.guard_external_effect()
             if observation.live_leader:
+                return
+            if run.saga_state is RunSagaState.ADMISSION_REFUSAL_PENDING:
+                if not await self._rebind(run, lease):
+                    return
+                transferred = await self._execution.recover_run(run, lease, resume_existing=observation.status is not None)
                 return
             if observation.status is not None and observation.status != RunStatus.RUNNING:
                 if observation.status in {RunStatus.FAILED, RunStatus.INTERRUPTED}:

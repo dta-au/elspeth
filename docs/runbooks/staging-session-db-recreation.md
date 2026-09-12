@@ -2,13 +2,19 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.1 durable Composer progress and run admission (session epoch 54 and Landscape epoch 39)
+## Current Cutover: 0.8.1 replica recovery and identity admission (session epoch 55 and Landscape epoch 40)
 
-0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 54 and Landscape
-`SQLITE_SCHEMA_EPOCH` from 38 to 39. Session epoch 54 adds durable Composer
+0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 55 and Landscape
+`SQLITE_SCHEMA_EPOCH` from 38 to 40. Session epoch 54 adds durable Composer
 progress snapshots and exact request lifecycle leases. Landscape epoch 39
 adds immutable web run-start permit binding and recoverable pre-effect
-admission state. Stop the service, archive/export required evidence, recreate
+admission state. Session epoch 55 adds identity ownership foreign keys,
+approval revocation provenance and durable admission/refusal decisions.
+Landscape epoch 40 adds nullable call token measures and the persisted
+quota-policy/secret-wiring admission evidence. These intermediate definitions
+share one prepared 0.8.1 cutover; installing the intermediate ACA pair is not
+required. This procedure describes an operator action, not an already
+performed reset. Stop the service, archive/export required evidence, recreate
 both stale stores, and install 0.8.1 using the procedure below.
 
 The preceding 0.8.0 release advanced `SESSION_SCHEMA_EPOCH` from 35 to 53
@@ -125,8 +131,8 @@ Epoch 36 binds every coalesce effect to its non-null lineage group.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 37. Landscape epoch 39
-is the current release boundary, so a Landscape database left at epoch 38 or
+session epoch is a recreate boundary, including epoch 37. Landscape epoch 40
+is the current release boundary, so a Landscape database left at epoch 39 or
 below is stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
 
@@ -147,9 +153,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-54 release forward,
+unsupported: keep the service drained, repair the epoch-55 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-54/Landscape-epoch-39 record when binding candidate and rollback
+session-epoch-55/Landscape-epoch-40 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
@@ -762,8 +768,8 @@ sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
 resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 54 (== SESSION_SCHEMA_EPOCH)
-sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 39 (== SQLITE_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 55 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 40 (== SQLITE_SCHEMA_EPOCH)
 ```
 
 Any predecessor session or Landscape epoch is not repairable in place: keep the

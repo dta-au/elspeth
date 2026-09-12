@@ -44,8 +44,8 @@ def test_replica_schema_cutover_belongs_to_0_8_1() -> None:
 
     assert "## Current Cutover: 0.8.1" in runbook
     assert "install 0.8.1" in runbook
-    assert "`SESSION_SCHEMA_EPOCH` advances from 53\nto 54" in release_0_8_1
-    assert "`SQLITE_SCHEMA_EPOCH` advances from 38 to 39" in release_0_8_1
+    assert f"`SESSION_SCHEMA_EPOCH` advances from 53\nto {SESSION_SCHEMA_EPOCH}" in release_0_8_1
+    assert f"`SQLITE_SCHEMA_EPOCH` advances from 38 to {SQLITE_SCHEMA_EPOCH}" in release_0_8_1
     assert "then install 0.8.1" in release_0_8_1
     assert "`SESSION_SCHEMA_EPOCH` advances from 35\nto 53" in release_0_8_0
     assert "`SQLITE_SCHEMA_EPOCH` advances from 29 to 38" in release_0_8_0

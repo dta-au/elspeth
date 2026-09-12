@@ -2,7 +2,7 @@
 
 Use this runbook when a run has durable sink debt, an effect lease expired, or
 an external call may have completed without its response reaching ELSPETH. It
-applies to Landscape schema epoch 39 and the `sink-effect-v1` protocol. A
+applies to Landscape schema epoch 40 and the `sink-effect-v1` protocol. A
 Landscape store still at epoch 31 or below predates aggregation result
 receipts, any store below epoch 33 predates the composite token-outcome
 access path, any store below epoch 34 predates the unified-lineage
@@ -14,7 +14,8 @@ non-null lineage-group binding on coalesce effects, and any store below epoch
 `run_attributions`, and any store below epoch 38 predates the
 `scheduler_events.seq` replay key that orders scheduler transitions. Any store
 below epoch 39 also lacks immutable web run-start permit binding and recoverable
-pre-effect admission state. All are
+pre-effect admission state. Epoch 40 adds nullable call token measures and
+quota-policy/secret-wiring admission evidence. All are
 pre-1.0 recreate
 boundaries: recreate the store
 (see [Staging Session DB Recreation](staging-session-db-recreation.md)) rather

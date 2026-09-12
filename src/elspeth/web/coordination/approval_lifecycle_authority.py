@@ -1,11 +1,14 @@
 """Approval-owned reaction to identity authority withdrawal.
 
 Lock order is identity then approval. No session locks are acquired here.
-Future approval creation and decisions must serialize on the approver identity
-before touching approval rows, and reject non-active approvers.
+Future approval creation and decisions must lock both participating identities
+before touching approval rows, and reject either participant when non-active.
+They must preserve identity authority's admin-population-before-target order
+if an administrator can participate; stable identity-ID order alone does not
+replace that population lock. Non-admin participants use stable ID order.
 """
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 
 from elspeth.web.coordination.identity_lifecycle import IdentityAuthorityRevoked
 from elspeth.web.coordination.mutation_connection_registry import _resolve_mutation_connection
@@ -20,7 +23,10 @@ class RepositoryApprovalLifecycleAuthority:
         connection.execute(
             update(approvals_table)
             .where(
-                approvals_table.c.approver_identity_id == event.identity_id,
+                or_(
+                    approvals_table.c.approver_identity_id == event.identity_id,
+                    approvals_table.c.requested_by_identity_id == event.identity_id,
+                ),
                 approvals_table.c.decision.is_(None),
             )
             .values(

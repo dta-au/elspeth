@@ -144,7 +144,7 @@ class RepositoryGlobalRunRecoveryAuthority:
         with self._engine.connect() as conn:
             candidates = conn.execute(
                 select(runs_table.c.id, runs_table.c.session_id).where(
-                    runs_table.c.status.in_(("pending", "running")) | (runs_table.c.saga_state == "running"),
+                    runs_table.c.status.in_(("pending", "running")) | runs_table.c.saga_state.in_(("running", "admission_refusal_pending")),
                     runs_table.c.saga_state != "recovery_required",
                 )
             ).all()
@@ -157,7 +157,7 @@ class RepositoryGlobalRunRecoveryAuthority:
                 if (
                     row is not None
                     and row.saga_state != "recovery_required"
-                    and (row.status in {"pending", "running"} or row.saga_state == "running")
+                    and (row.status in {"pending", "running"} or row.saga_state in {"running", "admission_refusal_pending"})
                 ):
                     result.append(_run_record_from_row(row))
         return tuple(result)

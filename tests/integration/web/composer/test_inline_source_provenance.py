@@ -50,6 +50,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -89,6 +90,8 @@ def _session_with_user_message() -> tuple[Any, str, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session_id = str(uuid4())
     user_message_id = str(uuid4())
     now = datetime.now(UTC)
@@ -295,6 +298,7 @@ def test_cross_session_message_id_rejected(tmp_path: Path) -> None:
     session_b_message_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="bob")
         conn.execute(
             insert(sessions_table).values(
                 id=session_b_id,

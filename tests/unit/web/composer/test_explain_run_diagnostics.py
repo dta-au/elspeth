@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 from litellm.exceptions import (
@@ -25,10 +25,28 @@ from litellm.exceptions import (
     GuardrailRaisedException,
 )
 
+from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, ChargeableAdmissionDecision, QuotaDisposition
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerServiceError
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.sessions.protocol import SessionServiceProtocol
+
+
+@pytest.fixture
+def admission_context(composer_service_without_sessions_service: ComposerServiceImpl) -> SessionOperationContext:
+    """Provider error tests begin after an explicit no-quota admission."""
+    sessions = create_autospec(SessionServiceProtocol, instance=True)
+    sessions.assess_chargeable_operation.return_value = ChargeableAdmissionDecision(
+        refusal_reason=None,
+        evidence=AdmissionPolicyEvidence(quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash="a" * 64),
+    )
+    composer_service_without_sessions_service._sessions_service = sessions
+    return SessionOperationContext(
+        fence=SessionOperationFence(session_id="diagnostics-session", operation_id="operation", lease_token="token", operation_epoch=1),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
 
 
 @pytest.mark.parametrize(
@@ -45,6 +63,7 @@ async def test_explain_run_diagnostics_records_each_outbound_call_once(
     composer_service_without_sessions_service: ComposerServiceImpl,
     outcome: str,
     expected_status: ComposerLLMCallStatus,
+    admission_context: SessionOperationContext,
 ) -> None:
     service = composer_service_without_sessions_service
     recorder = BufferingRecorder()
@@ -68,10 +87,13 @@ async def test_explain_run_diagnostics_records_each_outbound_call_once(
 
     with patch.object(service, "_call_text_llm", new=fake_call_text_llm):
         if outcome == "success":
-            assert await service.explain_run_diagnostics(snapshot, recorder=recorder) == "The run is processing one row."
+            assert (
+                await service.explain_run_diagnostics(snapshot, recorder=recorder, session_operation_context=admission_context)
+                == "The run is processing one row."
+            )
         else:
             with pytest.raises(ComposerServiceError):
-                await service.explain_run_diagnostics(snapshot, recorder=recorder)
+                await service.explain_run_diagnostics(snapshot, recorder=recorder, session_operation_context=admission_context)
 
     assert len(recorder.llm_calls) == 1
     call = recorder.llm_calls[0]
@@ -106,6 +128,7 @@ async def test_explain_run_diagnostics_records_each_outbound_call_once(
 async def test_explain_run_diagnostics_wraps_litellm_policy_exceptions(
     composer_service_without_sessions_service: ComposerServiceImpl,
     exc_factory: Any,
+    admission_context: SessionOperationContext,
 ) -> None:
     """Policy-gate LiteLLM exceptions surface as ``ComposerServiceError``.
 
@@ -134,7 +157,7 @@ async def test_explain_run_diagnostics_wraps_litellm_policy_exceptions(
         ),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
-        await service.explain_run_diagnostics(snapshot)
+        await service.explain_run_diagnostics(snapshot, session_operation_context=admission_context)
 
     # Wrap message mirrors the existing ``LLM unavailable ({type})`` pattern.
     assert "LLM unavailable" in str(exc_info.value)
@@ -146,6 +169,7 @@ async def test_explain_run_diagnostics_wraps_litellm_policy_exceptions(
 async def test_unrelated_exceptions_propagate(
     composer_service_without_sessions_service: ComposerServiceImpl,
     exc_cls: type[BaseException],
+    admission_context: SessionOperationContext,
 ) -> None:
     """Widened catch must NOT swallow unrelated exception types.
 
@@ -165,4 +189,4 @@ async def test_unrelated_exceptions_propagate(
         patch.object(service, "_call_text_llm", new=fake_call_text_llm),
         pytest.raises(exc_cls),
     ):
-        await service.explain_run_diagnostics(snapshot)
+        await service.explain_run_diagnostics(snapshot, session_operation_context=admission_context)

@@ -32,6 +32,8 @@ from elspeth.web.composer.service import (
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.routes._helpers import _composer_chat_history
+from tests.fixtures.identities import ensure_test_identity
+from tests.unit.web.composer._helpers import _composer_service_with_session
 
 from .conftest import build_test_sessions_service
 
@@ -149,7 +151,7 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
     after the third tool result.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     state = _empty_state()
 
     identical_args = {"patch": {"name": "Anchored Build"}}
@@ -174,7 +176,7 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
         ),
     ):
         mock_llm.side_effect = turns
-        await service.compose("Build something", [], state)
+        await service.compose("Build something", [], state, session_id=session_id)
 
     # The fourth LLM call is the post-hint LLM call. Inspect its messages
     # argument and find the system-injected hint.
@@ -200,6 +202,8 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
     """The provider-visible hint must be committed before the call it changes."""
     catalog = _mock_catalog()
     sessions = build_test_sessions_service(data_dir=tmp_path)
+    with sessions._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="anti-anchor-user")
     session = await sessions.create_session("anti-anchor-user", "Anti-anchor audit", "local")
     service = ComposerServiceImpl.for_trained_operator(
         catalog=catalog,
@@ -257,6 +261,8 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
 @pytest.mark.asyncio
 async def test_replayed_anti_anchor_user_role_is_not_misattributed_to_the_human(tmp_path: Path) -> None:
     sessions = build_test_sessions_service(data_dir=tmp_path)
+    with sessions._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="anti-anchor-user")
     session = await sessions.create_session("anti-anchor-user", "History custody", "local")
     await sessions.add_message(
         session.id,
@@ -308,7 +314,7 @@ def test_anti_anchor_control_replay_fails_closed_on_provenance_tamper(tamper: st
 async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_prose() -> None:
     """The synthetic hint must not cause failed argument values to become durable prose."""
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     state = _empty_state()
     canary = "anti-anchor-sensitive-canary"
     identical_args = {"patch": {"name": canary}}
@@ -337,7 +343,7 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
             side_effect=[arg_error, arg_error, arg_error],
         ),
     ):
-        result = await service.compose("Build something", [], state)
+        result = await service.compose("Build something", [], state, session_id=session_id)
 
     assert mock_llm.call_count == 4
     fourth_call_messages = mock_llm.call_args_list[3].args[0]
@@ -355,7 +361,7 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
 async def test_three_distinct_arg_error_failures_inject_drift_hint_before_fourth_turn() -> None:
     """Same-tool failed payload drift must also reach the model before surrender."""
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     state = _empty_state()
 
     turns = [
@@ -375,7 +381,7 @@ async def test_three_distinct_arg_error_failures_inject_drift_hint_before_fourth
         ),
     ):
         mock_llm.side_effect = turns
-        await service.compose("Build something", [], state)
+        await service.compose("Build something", [], state, session_id=session_id)
 
     assert mock_llm.call_count == 4
     fourth_call_messages = mock_llm.call_args_list[3].args[0]
@@ -413,7 +419,7 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
     Asserts that turn 6's LLM call sees the [ELSPETH-SYSTEM-HINT].
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     state = _empty_state()
 
     identical_args = {"patch": {"name": "Anchored Across Discoveries"}}
@@ -470,7 +476,7 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=side_effects),
     ):
         mock_llm.side_effect = turns
-        await service.compose("Build something", [], state)
+        await service.compose("Build something", [], state, session_id=session_id)
 
     # 6th LLM call should see the hint after the 3rd identical mutation failure.
     assert mock_llm.call_count == 6, f"expected 6 LLM calls, got {mock_llm.call_count}"
@@ -491,7 +497,7 @@ async def test_mutation_success_breaks_anchor() -> None:
     hint must NOT fire (only 2 consecutive failures post-success).
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     state = _empty_state()
 
     args = {"patch": {"name": "Two-Then-Reset"}}
@@ -532,7 +538,7 @@ async def test_mutation_success_breaks_anchor() -> None:
         ),
     ):
         mock_llm.side_effect = turns
-        await service.compose("Build something", [], state)
+        await service.compose("Build something", [], state, session_id=session_id)
 
     sixth_call_messages = mock_llm.call_args_list[-1].args[0]
     hint_messages = [m for m in sixth_call_messages if isinstance(m, dict) and "[ELSPETH-SYSTEM-HINT]" in str(m.get("content", ""))]
@@ -545,7 +551,7 @@ async def test_mutation_success_breaks_anchor() -> None:
 async def test_two_identical_failures_do_not_inject_hint() -> None:
     """Below threshold (N=3) the hint must not fire."""
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     state = _empty_state()
 
     args = {"patch": {"name": "Two Strikes"}}
@@ -564,7 +570,7 @@ async def test_two_identical_failures_do_not_inject_hint() -> None:
         ),
     ):
         mock_llm.side_effect = turns
-        await service.compose("Build something", [], state)
+        await service.compose("Build something", [], state, session_id=session_id)
 
     # Inspect the THIRD (final) LLM call — should contain no hint.
     third_call_messages = mock_llm.call_args_list[2].args[0]

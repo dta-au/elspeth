@@ -47,6 +47,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_live_compose_context
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -59,6 +60,8 @@ def engine():
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return eng
 
 

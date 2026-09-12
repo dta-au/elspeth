@@ -58,6 +58,7 @@ from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedRespondRequest
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.guided_leases import abandon_guided_worker_leases
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
@@ -70,6 +71,8 @@ def file_composer_test_client(composer_test_client: TestClient, tmp_path: Path) 
     """Rebind the minimal app to file SQLite for real multi-connection races."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'respond-races.db'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     composer_test_client.app.state.session_engine = engine
     session_service = DualFencedSessionServiceHarness(
         engine,

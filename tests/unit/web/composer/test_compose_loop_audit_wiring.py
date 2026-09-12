@@ -51,7 +51,11 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
-from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
+from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
+    _persisted_tool_responses,
+    _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles — mirror the shapes used by tests/unit/web/composer/test_service.py
@@ -191,7 +195,8 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
     Asserts:
 
     - ``ComposerPluginCrashError`` propagates out of ``compose()``
-    - ``exc.tool_invocations`` carries exactly three records, in order
+    - The recorder captures exactly three records, in order; persisted
+      responses remain durable and the exception carries no replay trail.
     - status / version_after / error_class line up with the dispatch
       semantics: SUCCESS bumps the version, ARG_ERROR and PLUGIN_CRASH
       both record ``version_after is None``.
@@ -202,7 +207,7 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     # Three LLM turns — one tool_call each. The arguments here only need
@@ -252,7 +257,11 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
         affected_nodes=(),
     )
 
+    from elspeth.web.composer.audit import BufferingRecorder
+
+    recorder = BufferingRecorder()
     with (
+        patch("elspeth.web.composer.service.BufferingRecorder", return_value=recorder),
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
@@ -269,42 +278,82 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
     ):
         mock_llm.side_effect = [turn1, turn2, turn3]
         with pytest.raises(ComposerPluginCrashError) as exc_info:
-            await service.compose("Drive the sequence", [], state)
+            await service.compose("Drive the sequence", [], state, session_id=session_id)
 
-    invocations = exc_info.value.tool_invocations
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
+    assert [row["tool_call_id"] for row in durable_responses] == [
+        "call_success",
+        "call_arg_error",
+        "call_plugin_crash",
+    ]
+    success_payload = json.loads(durable_responses[0]["result_canonical"])
+    assert success_payload["success"] is True
+    assert success_payload["version"] == 2
+    state_id = durable_responses[0]["composition_state_id"]
+    assert state_id is not None
+    assert durable_responses[1]["composition_state_id"] is None
+    assert durable_responses[2]["composition_state_id"] is None
+    assert json.loads(durable_responses[1]["result_canonical"]) == {
+        "_redaction_status": "arg_error",
+        "error_class": "ToolArgumentError",
+        "error_message": "<redacted-arg-error-message>",
+    }
+    assert json.loads(durable_responses[2]["result_canonical"]) == {
+        "_redaction_status": "plugin_crash",
+        "error_class": "RuntimeError",
+        "error_message": "<redacted-failure-message>",
+    }
+    from sqlalchemy import select
+
+    from elspeth.web.sessions.models import composition_rejection_events_table
+
+    with service._require_sessions_service()._engine.connect() as conn:
+        rejections = conn.execute(
+            select(composition_rejection_events_table)
+            .where(
+                composition_rejection_events_table.c.session_id == session_id,
+            )
+            .order_by(composition_rejection_events_table.c.created_at)
+        ).all()
+    assert [(row.tool_call_id, row.error_code, row.message, row.composition_state_id) for row in rejections] == [
+        ("call_arg_error", "ToolArgumentError", "'tool argument' must be a string, got int", state_id),
+        ("call_plugin_crash", "RuntimeError", "RuntimeError", state_id),
+    ]
+    invocations = [invocation.to_dict() for invocation in recorder.invocations]
     assert len(invocations) == 3, (
-        f"Expected 3 audit invocations (SUCCESS, ARG_ERROR, PLUGIN_CRASH); got {len(invocations)}: {[inv.status for inv in invocations]}"
+        f"Expected 3 audit invocations (SUCCESS, ARG_ERROR, PLUGIN_CRASH); got {len(invocations)}: {[inv['status'] for inv in invocations]}"
     )
 
     # SUCCESS — version advanced from 1 to 2
     success_inv = invocations[0]
-    assert success_inv.status == ComposerToolStatus.SUCCESS
-    assert success_inv.tool_call_id == "call_success"
-    assert success_inv.version_before == 1
-    assert success_inv.version_after == 2
-    assert success_inv.version_after is not None
-    assert success_inv.version_after > success_inv.version_before
-    assert success_inv.error_class is None
+    assert success_inv["status"] == ComposerToolStatus.SUCCESS
+    assert success_inv["tool_call_id"] == "call_success"
+    assert success_inv["version_before"] == 1
+    assert success_inv["version_after"] == 2
+    assert success_inv["version_after"] is not None
+    assert success_inv["version_after"] > success_inv["version_before"]
+    assert success_inv["error_class"] is None
 
     # ARG_ERROR — version_after must be None (dispatch did not complete)
     arg_error_inv = invocations[1]
-    assert arg_error_inv.status == ComposerToolStatus.ARG_ERROR
-    assert arg_error_inv.tool_call_id == "call_arg_error"
-    assert arg_error_inv.version_after is None
-    assert arg_error_inv.error_class == "ToolArgumentError"
+    assert arg_error_inv["status"] == ComposerToolStatus.ARG_ERROR
+    assert arg_error_inv["tool_call_id"] == "call_arg_error"
+    assert arg_error_inv["version_after"] is None
+    assert arg_error_inv["error_class"] == "ToolArgumentError"
 
     # PLUGIN_CRASH — version_after None, error_class is the original
     # exception class. error_message MUST be class-name only (redaction
     # discipline; pin against future drift that would echo str(exc)).
     plugin_crash_inv = invocations[2]
-    assert plugin_crash_inv.status == ComposerToolStatus.PLUGIN_CRASH
-    assert plugin_crash_inv.tool_call_id == "call_plugin_crash"
-    assert plugin_crash_inv.version_after is None
-    assert plugin_crash_inv.error_class == "RuntimeError"
-    assert plugin_crash_inv.error_message == "RuntimeError"
+    assert plugin_crash_inv["status"] == ComposerToolStatus.PLUGIN_CRASH
+    assert plugin_crash_inv["tool_call_id"] == "call_plugin_crash"
+    assert plugin_crash_inv["version_after"] is None
+    assert plugin_crash_inv["error_class"] == "RuntimeError"
+    assert plugin_crash_inv["error_message"] == "RuntimeError"
 
     # Tool-call ordering reflects the dispatch sequence as the loop saw it.
-    assert [inv.tool_call_id for inv in invocations] == [
+    assert [inv["tool_call_id"] for inv in invocations] == [
         "call_success",
         "call_arg_error",
         "call_plugin_crash",
@@ -328,7 +377,7 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn = _make_llm_response(
@@ -369,7 +418,7 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
     ):
         mock_llm.return_value = turn
         with pytest.raises(AssertionError):
-            await service.compose("Trigger invariant", [], state)
+            await service.compose("Trigger invariant", [], state, session_id=session_id)
 
     spy = captured_recorder["instance"]
     invocations = spy.invocations
@@ -412,7 +461,7 @@ async def test_compose_loop_crashes_when_success_canonical_json_fails() -> None:
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     mutated_state = replace(state, version=2)
@@ -466,7 +515,7 @@ async def test_compose_loop_crashes_when_success_canonical_json_fails() -> None:
         pytest.raises(ComposerPluginCrashError) as exc_info,
     ):
         mock_llm.side_effect = [turn1, turn2]
-        await service.compose("Trigger non-finite payload", [], state)
+        await service.compose("Trigger non-finite payload", [], state, session_id=session_id)
 
     # The canonicalization failure on our own dispatch output surfaces as
     # a loud crash whose root cause is the rfc8785 ``ValueError`` — never
@@ -486,7 +535,7 @@ async def test_timeout_after_successful_tool_carries_audit_invocations() -> None
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     mutated_state = replace(state, version=2)
@@ -529,7 +578,7 @@ async def test_timeout_after_successful_tool_carries_audit_invocations() -> None
         ) as mock_execute_tool,
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        await service.compose("Timeout after the tool", [], state)
+        await service.compose("Timeout after the tool", [], state, session_id=session_id)
 
     assert exc_info.value.budget_exhausted == "timeout"
     assert calls["count"] == 2
@@ -553,7 +602,7 @@ async def test_preview_runtime_preflight_failure_records_tool_invocation() -> No
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn = _make_llm_response(
@@ -573,7 +622,7 @@ async def test_preview_runtime_preflight_failure_records_tool_invocation() -> No
         pytest.raises(ComposerRuntimePreflightError) as exc_info,
     ):
         mock_llm.return_value = turn
-        await service.compose("Preview the current pipeline", [], state)
+        await service.compose("Preview the current pipeline", [], state, session_id=session_id)
 
     mock_execute_tool.assert_not_called()
     invocations = exc_info.value.tool_invocations
@@ -601,7 +650,7 @@ async def test_preview_tolerant_preflight_failure_records_tool_invocation() -> N
 
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     handoff = ValidationResult(
@@ -645,7 +694,7 @@ async def test_preview_tolerant_preflight_failure_records_tool_invocation() -> N
         pytest.raises(ComposerRuntimePreflightError) as exc_info,
     ):
         mock_llm.return_value = turn
-        await service.compose("Preview the current pipeline", [], state)
+        await service.compose("Preview the current pipeline", [], state, session_id=session_id)
 
     mock_execute_tool.assert_not_called()
     invocations = exc_info.value.tool_invocations
@@ -671,7 +720,7 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
 
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     handoff = ValidationResult(
@@ -743,7 +792,7 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
         ) as mock_execute_tool,
         pytest.raises(ComposerConvergenceError),
     ):
-        await service.compose("Preview the current pipeline", [], state)
+        await service.compose("Preview the current pipeline", [], state, session_id=session_id)
 
     assert mock_execute_tool.call_count == 1
     kwargs = mock_execute_tool.call_args.kwargs
@@ -789,7 +838,7 @@ async def test_dispatch_records_cancelled_status_on_cancelled_error() -> None:
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn = _make_llm_response(
@@ -825,7 +874,7 @@ async def test_dispatch_records_cancelled_status_on_cancelled_error() -> None:
     ):
         mock_llm.return_value = turn
         with pytest.raises(asyncio.CancelledError):
-            await service.compose("Trigger client disconnect", [], state)
+            await service.compose("Trigger client disconnect", [], state, session_id=session_id)
 
     spy = captured_recorder["instance"]
     invocations = spy.invocations
@@ -852,7 +901,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn1 = _make_llm_response(
@@ -873,7 +922,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
     ):
         mock_llm.side_effect = [turn1, turn2]
-        result = await service.compose("Trigger non-finite object arguments", [], state)
+        result = await service.compose("Trigger non-finite object arguments", [], state, session_id=session_id)
 
     assert result.message == "Recovered."
     mock_execute_tool.assert_not_called()
@@ -895,7 +944,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
     """Top-level Infinity must use the non-object ARG_ERROR audit path."""
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn1 = _make_llm_response(
@@ -916,7 +965,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
     ):
         mock_llm.side_effect = [turn1, turn2]
-        result = await service.compose("Trigger non-finite scalar arguments", [], state)
+        result = await service.compose("Trigger non-finite scalar arguments", [], state, session_id=session_id)
 
     assert result.message == "Recovered."
     mock_execute_tool.assert_not_called()
@@ -1068,7 +1117,7 @@ class TestComposerDiscoveryAuditPreservesResult:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         discovery_result = _discovery_result(tool_name, state, catalog)
@@ -1098,7 +1147,7 @@ class TestComposerDiscoveryAuditPreservesResult:
             ),
         ):
             mock_llm.side_effect = [turn1, turn2]
-            result = await service.compose(f"Run {tool_name}", [], state)
+            result = await service.compose(f"Run {tool_name}", [], state, session_id=session_id)
 
         invocations = result.tool_invocations
         assert len(invocations) == 1, f"{tool_name}: expected exactly one audit row"
@@ -1141,7 +1190,7 @@ class TestComposerDiscoveryAuditPreservesResult:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         discovery_result = _discovery_result(tool_name, state, catalog)
@@ -1178,7 +1227,7 @@ class TestComposerDiscoveryAuditPreservesResult:
             ) as mock_execute_tool,
         ):
             mock_llm.side_effect = [turn1, turn2, turn3]
-            result = await service.compose(f"Cache {tool_name}", [], state)
+            result = await service.compose(f"Cache {tool_name}", [], state, session_id=session_id)
 
         # Cache hit means execute_tool was called only once across both
         # turns — the second turn served the result from

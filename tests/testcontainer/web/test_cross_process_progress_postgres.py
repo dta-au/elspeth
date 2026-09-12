@@ -21,6 +21,7 @@ from tests.unit.web.execution.test_websocket import FakeBroadcaster
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.auth.models import IdentityClaims, UserIdentity
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
@@ -232,7 +233,7 @@ def progress_identity(external_deployment_postgres_url: str) -> Iterator[tuple[s
     engine = create_session_engine(external_deployment_postgres_url)
     initialize_session_schema(engine)
     subject = f"progress-{uuid4()}"
-    outcome = RepositoryIdentityAuthority(engine).ensure_identity(
+    outcome = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply).ensure_identity(
         claims=_claims(subject, f"{subject}@example.com"),
         activate=True,
         quota_tokens_per_day=None,
@@ -301,7 +302,9 @@ def test_existing_reader_rechecks_identity_after_revocation(
             try:
                 # The production rebound policy disables an identity when its
                 # verified email changes; no test-only SQL revocation path.
-                outcome = RepositoryIdentityAuthority(engine).ensure_identity(
+                outcome = RepositoryIdentityAuthority(
+                    engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply
+                ).ensure_identity(
                     claims=_claims(subject, f"changed-{subject}@example.com"),
                     activate=False,
                     quota_tokens_per_day=None,
@@ -376,7 +379,9 @@ def test_websocket_route_streams_peer_commit_without_local_broadcast(
             else:
                 engine = create_session_engine(url)
                 try:
-                    outcome = RepositoryIdentityAuthority(engine).ensure_identity(
+                    outcome = RepositoryIdentityAuthority(
+                        engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply
+                    ).ensure_identity(
                         claims=_claims(subject, f"changed-{subject}@example.com"),
                         activate=False,
                         quota_tokens_per_day=None,

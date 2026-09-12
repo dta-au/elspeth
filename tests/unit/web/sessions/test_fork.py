@@ -2028,6 +2028,8 @@ def _make_fork_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -2924,6 +2926,8 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         # Create a session as "bob" directly in the service (bypassing auth)
+        with service._engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="bob")
         bob_session = await service.create_session("bob", "Bob's Session", "local")
         msg = await service.add_message(bob_session.id, "user", "Hello", writer_principal="route_user_message")
 
@@ -3287,6 +3291,8 @@ class TestForkEndpoint:
             poolclass=StaticPool,
         )
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session_service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),

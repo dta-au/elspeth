@@ -3516,7 +3516,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // error state (that would contradict the copy's own instruction): the
       // review returns to active so the revise affordances stay live.
       const policyBlocked =
-        !retainsRetryCustody && apiErr.failure_code === "policy_blocked";
+        !retainsRetryCustody && (apiErr.failure_code === "policy_blocked" || apiErr.failure_code === "admission_refused");
       const proposalErrorReview: GuidedProposalReviewState | null =
         proposalBinding === null
           ? null

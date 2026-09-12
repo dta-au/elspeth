@@ -14,7 +14,8 @@ def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
     # then -> 54 for durable Composer progress and inflight requests.
     # One integer names exactly one shape, so every union takes the next free
     # one rather than reusing a number already spent.
-    assert SESSION_SCHEMA_EPOCH == 54
+    # Paired with Landscape40: identity ownership and admission evidence.
+    assert SESSION_SCHEMA_EPOCH == 55
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

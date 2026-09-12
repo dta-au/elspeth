@@ -32,6 +32,7 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -196,6 +197,7 @@ GuidedOperationFailureCode = Literal[
     # collapsing the two blamed the provider for a policy decision and told the
     # user to retry an operation that cannot ever succeed.
     "policy_blocked",
+    "admission_refused",
     "stale_conflict",
     "integrity_error",
     "custody_error",
@@ -360,6 +362,8 @@ class RunStartPermitRecord:
     subject_hash: str | None
     issued_at: datetime | None
     cancelled_at: datetime | None
+    admission_decision: ChargeableAdmissionDecision | None = None
+    execution_refusal: ChargeableAdmissionDecision | None = None
 
 
 @final
@@ -3238,6 +3242,10 @@ class RunDiagnosticsAuditMutationAuthority(Protocol):
 class SessionOperationSessionMutations(Protocol):
     """Session-row mutations available inside one exact operation fence."""
 
+    def assess_chargeable_operation(
+        self, *, policy: ChargeableAdmissionPolicy, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision: ...
+
     def record_plugin_crash_breadcrumb(self) -> None: ...
 
     def mark_session_updated(self, *, updated_at: datetime) -> None: ...
@@ -3321,7 +3329,11 @@ class SessionOperationInterpretationMutations(Protocol):
 class SessionOperationRunMutations(Protocol):
     """Run mutations available inside one exact EXECUTE operation fence."""
 
-    def issue_start_permit(self, *, run_id: UUID) -> RunStartPermitRecord: ...
+    def issue_start_permit(self, *, run_id: UUID, policy: ChargeableAdmissionPolicy) -> RunStartPermitRecord: ...
+
+    def observe_start_permit_for_cleanup(self, *, run_id: UUID) -> RunStartPermitRecord: ...
+
+    def complete_admission_refusal(self, *, run_id: UUID) -> None: ...
 
     def rebind_run_ownership(self, *, run_id: UUID) -> RunSagaState: ...
 
@@ -4602,6 +4614,14 @@ class SessionServiceProtocol(Protocol):
     ) -> RunRecord: ...
 
     async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord: ...
+
+    async def observe_run_start_permit_for_cleanup(
+        self, run_id: UUID, *, session_operation_context: SessionOperationContext
+    ) -> RunStartPermitRecord: ...
+
+    async def assess_chargeable_operation(
+        self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision: ...
 
     async def request_run_cancellation(
         self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType

@@ -33,6 +33,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture
@@ -80,6 +81,7 @@ def test_user_version_stamped_with_new_epoch(engine) -> None:
 
 
 def _insert_session(conn, session_id: str = "s1", user_id: str = "user1") -> None:
+    ensure_test_identity(conn, identity_id=user_id)
     now = datetime.now(UTC)
     conn.execute(
         insert(sessions_table).values(

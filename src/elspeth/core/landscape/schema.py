@@ -378,7 +378,20 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        boundary; no migration, rollback_permitted: false.
 #   39 → immutable web run-start permit binding and recoverable pre-effect
 #        admission state. Pre-1.0 delete-and-recreate boundary; no migration.
-SQLITE_SCHEMA_EPOCH = 39
+#   40 → VANguard residual schema batch (elspeth-255ae1a544,
+#        elspeth-ff89d2bea0): nullable prompt_tokens, completion_tokens,
+#        cached_prompt_tokens and reasoning_tokens on calls preserve reported
+#        usage, including measured zero, without inventing usage when unknown.
+#        Run policy evidence gains the assessed quota-policy identities and
+#        canonical secret-wiring hash bound to the durable admission decision.
+#        These items missed the epoch-38 window; their named trigger is this
+#        prepared residual batch after ACA epoch 39, not a future incidental
+#        bump. Deploy together with Sessions epoch 55 in ONE service-stop
+#        window. Definitions and admission checks prepare that window; they
+#        do not perform a deployed cutover or assert complete token accounting.
+#        Pre-1.0 delete-and-recreate boundary; no migration,
+#        rollback_permitted: false. Preserve/export evidence before cutover.
+SQLITE_SCHEMA_EPOCH = 40
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -535,6 +548,13 @@ run_web_plugin_policy_table = Table(
     Column("plugin_code_identities_json", Text, nullable=False),
     Column("binding_generation_fingerprint", String(64), nullable=False),
     Column("decision_codes_json", Text, nullable=False),
+    Column("admission_decision_json", Text, nullable=True),
+    Column("admission_decision_hash", String(64), nullable=True),
+    CheckConstraint(
+        "(admission_decision_json IS NULL AND admission_decision_hash IS NULL) OR "
+        "(admission_decision_json IS NOT NULL AND admission_decision_hash IS NOT NULL)",
+        name="ck_run_web_plugin_policy_admission_pair",
+    ),
     CheckConstraint("schema_version >= 1", name="ck_run_web_plugin_policy_schema_version"),
 )
 

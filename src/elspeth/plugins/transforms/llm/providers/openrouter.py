@@ -390,6 +390,7 @@ class OpenRouterLLMProvider:
                     json=request_body,
                     headers={"Content-Type": "application/json"},
                 )
+                observed_usage = observe_http_token_usage(response.content)
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
                 status_code = e.response.status_code
@@ -415,7 +416,6 @@ class OpenRouterLLMProvider:
             except httpx.RequestError as e:
                 raise NetworkError(f"Network error: {e}") from e
 
-            observed_usage = observe_http_token_usage(response.content)
             data, content, usage, finish_reason, response_model = _validate_chat_completion_response(response)
 
             result = LLMQueryResult(

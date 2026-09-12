@@ -2509,6 +2509,8 @@ async def test_fork_completion_rejects_target_without_exact_lineage_and_principa
                 update(sessions_table).where(sessions_table.c.id == str(target.id)).values(forked_from_session_id=str(other_parent.id))
             )
     else:
+        with file_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="bob")
         target = await service.create_session("bob", "Cross-user child", "local")
         with file_engine.begin() as conn:
             conn.execute(update(sessions_table).where(sessions_table.c.id == str(target.id)).values(forked_from_session_id=str(parent_id)))

@@ -732,6 +732,12 @@ class LandscapeExporter:
                 "plugin_code_identities": [list(item) for item in policy_evidence.plugin_code_identities],
                 "binding_generation_fingerprint": policy_evidence.binding_generation_fingerprint,
                 "decision_codes": list(policy_evidence.decision_codes),
+                "admission_decision_json": (
+                    policy_evidence.admission_decision.model_dump_json() if policy_evidence.admission_decision is not None else None
+                ),
+                "admission_decision_hash": (
+                    policy_evidence.admission_decision.canonical_hash if policy_evidence.admission_decision is not None else None
+                ),
             }
             yield policy_record
 

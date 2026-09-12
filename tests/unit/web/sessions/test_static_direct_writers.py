@@ -2085,6 +2085,14 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
     ReviewedWriter(
+        path="tests/testcontainer/web/test_chargeable_admission_postgres.py",
+        enclosing_symbol="_admit",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Identity/permit lock fixture: one version-1 session_seed FK parent before authority-owned run creation and contenders.",
+        count=1,
+    ),
+    ReviewedWriter(
         path="tests/testcontainer/web/test_cross_process_run_control_postgres.py",
         enclosing_symbol="_prepare",
         table="composition_states",

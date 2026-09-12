@@ -599,6 +599,7 @@ class GatewayLLMProvider:
 
             response = self._post_chat_completion(http_client, request_body)
             observed_usage = observe_http_token_usage(response.content)
+            self._validate_completion_status(response)
 
             data, content, usage, finish_reason, response_model = _validate_gateway_success_response(
                 response, usage_required=self._usage_required
@@ -654,7 +655,7 @@ class GatewayLLMProvider:
                     raise cleanup_error
 
     def _post_chat_completion(self, http_client: AuditedHTTPClient, request_body: dict[str, Any]) -> httpx.Response:
-        """POST one request, mapping transport and gateway-envelope failures.
+        """POST one request, mapping transport failures.
 
         ``httpx.TimeoutException`` is a subclass of ``httpx.RequestError`` —
         the timeout-specific except clause is listed first (mirroring the
@@ -673,6 +674,10 @@ class GatewayLLMProvider:
         except httpx.RequestError as e:
             raise NetworkError(_STATIC_GATEWAY_ERROR) from e
 
+        return response
+
+    def _validate_completion_status(self, response: httpx.Response) -> None:
+        """Reject gateway envelopes after execution has observed reported usage."""
         # Contract-header verification applies to every response — success
         # or error — before any status-code or body classification.
         _validate_contract_header(response, self._contract_major)
@@ -684,8 +689,6 @@ class GatewayLLMProvider:
             # HTTP status code itself (a buggy/malicious gateway could send
             # a misleading status alongside a correct code, or vice versa).
             raise _classify_gateway_http_error(e.response) from e
-
-        return response
 
     def _build_llm_request_payload(
         self,
@@ -836,6 +839,7 @@ class GatewayLLMProvider:
                 "max_tokens": 32,
             }
             response = self._post_chat_completion(http_client, request_body)
+            self._validate_completion_status(response)
             _validate_gateway_success_response(response, usage_required=self._usage_required)
         finally:
             http_client.close()

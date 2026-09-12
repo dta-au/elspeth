@@ -23,6 +23,7 @@ from elspeth.web.composer.service import ComposerServiceImpl, _MalformedLLMRespo
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ToolResult
 from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
     _empty_state,
     _make_llm_response,
     _make_settings,
@@ -423,7 +424,7 @@ def _mutating_set_source_tool(
     )
 
 
-async def _run_mutate_then_timeout(service: ComposerServiceImpl) -> tuple[ComposerConvergenceError, int]:
+async def _run_mutate_then_timeout(service: ComposerServiceImpl, session_id: str) -> tuple[ComposerConvergenceError, int]:
     """Drive a real ``_compose_loop``: one mutating turn, then a timeout.
 
     The fake raises ``TimeoutError`` from inside ``_call_llm``, which
@@ -448,7 +449,7 @@ async def _run_mutate_then_timeout(service: ComposerServiceImpl) -> tuple[Compos
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=_mutating_set_source_tool),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        await service.compose("Build pipeline", [], _empty_state())
+        await service.compose("Build pipeline", [], _empty_state(), session_id=session_id)
     return exc_info.value, call_count
 
 
@@ -463,9 +464,9 @@ async def test_compose_loop_timeout_reports_the_turns_already_spent() -> None:
     which is precisely what a wiring test has to exclude.
     """
 
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
 
-    exc, call_count = await _run_mutate_then_timeout(service)
+    exc, call_count = await _run_mutate_then_timeout(service, session_id)
 
     assert exc.budget_exhausted == "timeout"
     assert call_count == 2
@@ -490,12 +491,12 @@ async def test_bonus_call_timeout_reports_the_charged_composition_turn() -> None
     ``"timeout"`` proves the raise came from inside the bonus call.
     """
 
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=_mock_catalog(),
         settings=_make_settings(composer_max_composition_turns=1),
     )
 
-    exc, call_count = await _run_mutate_then_timeout(service)
+    exc, call_count = await _run_mutate_then_timeout(service, session_id)
 
     assert exc.budget_exhausted == "timeout"
     assert call_count == 2

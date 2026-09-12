@@ -30,6 +30,7 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch
@@ -408,6 +409,13 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         (
             (session_protocol, implementation_types[1]),
             {
+                "assess_chargeable_operation": (
+                    (
+                        ("policy", inspect.Parameter.KEYWORD_ONLY, ChargeableAdmissionPolicy),
+                        ("operation", inspect.Parameter.KEYWORD_ONLY, ChargeableOperation),
+                    ),
+                    ChargeableAdmissionDecision,
+                ),
                 "record_plugin_crash_breadcrumb": (
                     (),
                     type(None),
@@ -458,8 +466,19 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
             (run_protocol, implementation_types[2]),
             {
                 "issue_start_permit": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("policy", inspect.Parameter.KEYWORD_ONLY, ChargeableAdmissionPolicy),
+                    ),
+                    sessions_protocol.RunStartPermitRecord,
+                ),
+                "observe_start_permit_for_cleanup": (
                     (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
                     sessions_protocol.RunStartPermitRecord,
+                ),
+                "complete_admission_refusal": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    type(None),
                 ),
                 "rebind_run_ownership": (
                     (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
@@ -820,6 +839,46 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                 _assert_no_authority_escape(owner=owner, member_name=name, member=member)
 
 
+def _assert_background_lease_transfer(source: str) -> None:
+    """Bind the submitted worker and its completion callback to the same lease."""
+    tree = ast.parse(textwrap.dedent(source))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    submissions = [node for node in calls if ast.unparse(node.func) == "self._executor.submit"]
+    callbacks = [node for node in calls if ast.unparse(node.func) == "future.add_done_callback"]
+    assert len(submissions) == len(callbacks) == 1
+    submission = submissions[0]
+    assert ast.unparse(submission.args[0]) == "self._run_pipeline"
+    assert [(item.arg, ast.unparse(item.value)) for item in submission.keywords if item.arg == "session_operation_lease"] == [
+        ("session_operation_lease", "session_operation_lease")
+    ]
+    callback = callbacks[0]
+    assert len(callback.args) == 1
+    bound_callback = callback.args[0]
+    assert isinstance(bound_callback, ast.Call)
+    assert ast.unparse(bound_callback.func) == "partial"
+    assert ast.unparse(bound_callback.args[0]) == "self._on_pipeline_done"
+    assert [(item.arg, ast.unparse(item.value)) for item in bound_callback.keywords if item.arg == "session_operation_lease"] == [
+        ("session_operation_lease", "session_operation_lease")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("self._run_pipeline,", "self._different_worker,"),
+        ("self._on_pipeline_done,", "self._different_completion,"),
+        ("session_operation_lease=session_operation_lease", "session_operation_lease=another_lease"),
+        ("future.add_done_callback", "future.ignore_callback"),
+    ],
+)
+def test_background_lease_transfer_rejects_changed_worker_callback_or_authority(before: str, after: str) -> None:
+    source = inspect.getsource(ExecutionServiceImpl.execute)
+    assert before in source
+    _assert_background_lease_transfer(source)
+    with pytest.raises(AssertionError):
+        _assert_background_lease_transfer(source.replace(before, after))
+
+
 def test_execute_transfers_one_renewable_lease_to_background_completion() -> None:
     lease = _required_parameter(ExecutionServiceImpl, "execute", "session_operation_lease")
     assert lease.annotation is SessionOperationLease or lease.annotation == "SessionOperationLease"
@@ -831,9 +890,7 @@ def test_execute_transfers_one_renewable_lease_to_background_completion() -> Non
 
     execute_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl.execute))
     assert "session_operation_context = session_operation_lease.context" in execute_source
-    assert "session_operation_lease=session_operation_lease" in execute_source
-    assert "_executor.submit" in execute_source
-    assert "future.add_done_callback" in execute_source
+    _assert_background_lease_transfer(execute_source)
     worker_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl._run_pipeline))
     assert "session_operation_context = session_operation_lease.context" in worker_source
     assert "session_operation_lease.guard_external_effect" in worker_source

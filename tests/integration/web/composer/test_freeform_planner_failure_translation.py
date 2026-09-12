@@ -52,6 +52,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -196,6 +197,8 @@ def _build_app(
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     sessions = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),

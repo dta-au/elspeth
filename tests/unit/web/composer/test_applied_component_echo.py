@@ -33,6 +33,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
 
 
@@ -221,6 +222,8 @@ def blob_env(tmp_path: Path) -> dict[str, Any]:
     """Minimal session + blob storage for the inline-ref tool."""
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:

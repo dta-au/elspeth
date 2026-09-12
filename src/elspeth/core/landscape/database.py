@@ -302,6 +302,9 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("run_web_plugin_policy", "plugin_code_identities_json"),
     ("run_web_plugin_policy", "binding_generation_fingerprint"),
     ("run_web_plugin_policy", "decision_codes_json"),
+    # Epoch 40: exact admission decision, distinct from preparation evidence.
+    ("run_web_plugin_policy", "admission_decision_json"),
+    ("run_web_plugin_policy", "admission_decision_hash"),
     # Epoch 35 flip: lineage lives on token_lineage_frames + group_records now.
     ("token_lineage_frames", "member_key"),
     ("group_records", "member_count"),
@@ -677,6 +680,7 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("auth_events", "ck_auth_events_provider"),
     ("run_attributions", "ck_run_attributions_auth_provider_type"),
     ("run_web_plugin_policy", "ck_run_web_plugin_policy_schema_version"),
+    ("run_web_plugin_policy", "ck_run_web_plugin_policy_admission_pair"),
     ("run_sources", "ck_run_sources_lifecycle_state"),
     ("token_work_items", "ck_token_work_items_status"),
     ("token_work_items", "ck_token_work_items_lease_owner_required_when_leased"),

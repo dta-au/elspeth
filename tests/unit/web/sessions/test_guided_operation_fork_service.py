@@ -1464,6 +1464,8 @@ async def test_parent_archive_and_fork_staging_serialize_under_lock_contention(
     race_service = _service_for(durable_engine)
     other_service = _service_for(durable_engine)
     user_id = f"fork-archive-race-{uuid4()}"
+    with durable_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
     parent = await race_service.create_session(user_id, "Parent", "local")
     message = await race_service.add_message(
         parent.id,
@@ -1549,6 +1551,8 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
     race_service = _service_for(durable_engine)
     blob_service = BlobServiceImpl(durable_engine, tmp_path / f"blob-race-{uuid4()}")
     user_id = f"fork-blob-race-{uuid4()}"
+    with durable_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
     parent = await race_service.create_session(user_id, "Parent", "local")
     source_blob = await _create_test_blob(race_service, blob_service, parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
     state = await _save_composition_state(
@@ -1737,6 +1741,8 @@ async def test_current_fence_and_concurrent_takeover_reuse_one_hidden_child(dura
 
     race_service = _service_for(durable_engine)
     user_id = f"fork-takeover-race-{uuid4()}"
+    with durable_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
     parent = await race_service.create_session(user_id, "Parent", "local")
     message = await race_service.add_message(
         parent.id,

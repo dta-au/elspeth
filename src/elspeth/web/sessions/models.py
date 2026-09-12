@@ -311,7 +311,25 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        rollback_permitted: false.
 #   54 -> Durable Composer progress snapshots and exact request lifecycle leases.
 #        Pre-release delete-and-recreate boundary; no migration or rollback.
-SESSION_SCHEMA_EPOCH = 54
+#   55 -> VANguard residual schema batch (elspeth-e6c2d254b2,
+#        elspeth-2371269e07, elspeth-dcd26dcfe5): reserve workflow_inspect in
+#        audit_access_log.writer_principal; enforce the identity ownership
+#        already carried by sessions, user_secrets and user_preferences with
+#        RESTRICT foreign keys; retain approval revocation actor/transition
+#        provenance and durable run admission/refusal policy evidence.
+#        Guided operations gain admission_refused as a distinct terminal
+#        failure code, so policy refusal cannot masquerade as provider outage.
+#        Admission refusal remains retryable until Landscape and retained
+#        output cleanup settle; a failed Sessions row alone is not completion.
+#        The epoch-52 ownership statement above described the intended batch;
+#        its three ownership foreign keys and third read principal did not
+#        ship then. This prepared residual batch after ACA epoch 54 is the
+#        explicit trigger for those missed shapes. Deploy together with
+#        Landscape epoch 40 in ONE service-stop window, after preserving or
+#        exporting required evidence. Preparation is not a deployed cutover.
+#        Pre-1.0 delete-and-recreate boundary; no migration,
+#        rollback_permitted: false (sessions.db only; auth.db is untouched).
+SESSION_SCHEMA_EPOCH = 55
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1062,7 +1080,7 @@ guided_operations_table = Table(
     ),
     CheckConstraint(
         "failure_code IS NULL OR failure_code IN ('provider_unavailable', 'provider_timeout', "
-        "'invalid_provider_response', 'planner_repair_exhausted', 'policy_blocked', 'stale_conflict', 'integrity_error', 'custody_error', "
+        "'invalid_provider_response', 'planner_repair_exhausted', 'policy_blocked', 'admission_refused', 'stale_conflict', 'integrity_error', 'custody_error', "
         "'quota_exceeded', 'operation_failed', 'request_cancelled')",
         name="ck_guided_operations_failure_code",
     ),
@@ -2394,7 +2412,7 @@ runs_table = Table(
     ),
     CheckConstraint(
         "saga_state IN ('draft', 'start_intent', 'start_permit_issued', 'baseline_checkpointed', "
-        "'running', 'recovery_required', 'cancel_pending', 'terminal', 'terminal_cancelled')",
+        "'running', 'recovery_required', 'cancel_pending', 'terminal', 'terminal_cancelled', 'admission_refusal_pending')",
         name="ck_runs_saga_state",
     ),
     CheckConstraint(
@@ -2444,8 +2462,9 @@ _RUN_START_PERMIT_SUBJECT_IS_NULL = (
 
 def _run_start_permits_state_fields_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
     return (
-        f"((start_state = 'pending' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL) OR "
-        f"(start_state = 'cancelled_before_permit' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NOT NULL) OR "
+        f"((start_state = 'pending' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL AND admission_decision IS NULL AND admission_decision_hash IS NULL AND decided_at IS NULL) OR "
+        f"(start_state = 'cancelled_before_permit' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NOT NULL AND admission_decision IS NULL AND admission_decision_hash IS NULL AND decided_at IS NULL) OR "
+        f"(start_state = 'refused' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL AND admission_decision IS NOT NULL AND admission_decision_hash IS NOT NULL AND decided_at IS NOT NULL) OR "
         "(start_state = 'start_permitted' AND permit_id IS NOT NULL AND "
         f"{_sql_non_blank_text('permit_id', dialect=dialect)} AND "
         "permit_epoch IS NOT NULL AND permit_epoch > 0 AND session_operation_id IS NOT NULL AND "
@@ -2461,7 +2480,7 @@ def _run_start_permits_state_fields_check(*, dialect: Literal["sqlite", "postgre
         "session_epoch IS NOT NULL AND session_epoch > 0 AND landscape_epoch IS NOT NULL AND landscape_epoch > 0 AND "
         "coordination_protocol IS NOT NULL AND coordination_protocol > 0 AND permit_subject_hash IS NOT NULL AND "
         f"{_lower_sha256_check('permit_subject_hash', dialect=dialect)} AND "
-        "issued_at IS NOT NULL AND cancelled_at IS NULL))"
+        "issued_at IS NOT NULL AND cancelled_at IS NULL AND admission_decision IS NOT NULL AND admission_decision_hash IS NOT NULL AND decided_at IS NOT NULL))"
     )
 
 
@@ -2487,8 +2506,23 @@ run_start_permits_table = Table(
     Column("permit_subject_hash", String, nullable=True),
     Column("issued_at", DateTime(timezone=True), nullable=True),
     Column("cancelled_at", DateTime(timezone=True), nullable=True),
+    Column("admission_decision", JSON(none_as_null=True), nullable=True),
+    Column("admission_decision_hash", String, nullable=True),
+    Column("decided_at", DateTime(timezone=True), nullable=True),
+    Column("execution_refusal", JSON(none_as_null=True), nullable=True),
     Column("retention_expires_at", DateTime(timezone=True), nullable=True, index=True),
-    CheckConstraint("start_state IN ('pending', 'start_permitted', 'cancelled_before_permit')", name="ck_run_start_permits_state"),
+    CheckConstraint(
+        "start_state IN ('pending', 'start_permitted', 'cancelled_before_permit', 'refused')", name="ck_run_start_permits_state"
+    ),
+    CheckConstraint("execution_refusal IS NULL OR start_state = 'start_permitted'", name="ck_run_start_permits_recovery_refusal"),
+    CheckConstraint(
+        f"admission_decision_hash IS NULL OR ({_lower_sha256_check('admission_decision_hash', dialect='sqlite')})",
+        name="ck_run_start_permits_admission_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        f"admission_decision_hash IS NULL OR ({_lower_sha256_check('admission_decision_hash', dialect='postgresql')})",
+        name="ck_run_start_permits_admission_hash",
+    ).ddl_if(dialect="postgresql"),
     *_non_blank_text_constraints("run_id", name="ck_run_start_permits_run_id_nonblank"),
     CheckConstraint(
         _run_start_permits_state_fields_check(dialect="sqlite"),

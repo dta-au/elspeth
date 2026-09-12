@@ -43,6 +43,7 @@ from elspeth.contracts.blobs import (
     names_same_blob,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationEventRecord,
@@ -55,6 +56,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.web.composer.redaction import assert_guided_custody_persistable
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
+from elspeth.web.coordination.chargeable_admission_authority import RepositoryChargeableAdmissionAuthority
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
@@ -563,6 +565,17 @@ class _RepositorySessionMutations:
 
     def __init__(self, state: _RepositoryMutationState) -> None:
         self.__state = state
+
+    def assess_chargeable_operation(
+        self, *, policy: ChargeableAdmissionPolicy, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision:
+        state = self.__state
+        state._require_active()
+        context = state._operation_context
+        expected = SessionOperationKind.EXECUTE if operation is ChargeableOperation.RUN else SessionOperationKind.COMPOSE
+        if type(operation) is not ChargeableOperation or context is None or context.operation_kind is not expected:
+            raise AuditIntegrityError("Chargeable admission operation does not match session custody")
+        return RepositoryChargeableAdmissionAuthority.assess(state._connection_token, session_id=state._session_id, policy=policy)
 
     def record_plugin_crash_breadcrumb(self) -> None:
         """Bump the bound session timestamp under exact COMPOSE authority."""
@@ -1534,13 +1547,43 @@ class _RepositoryRunMutations:
             saga_state=RunSagaState.START_INTENT if execution_input is not None else RunSagaState.DRAFT,
         )
 
-    def issue_start_permit(self, *, run_id: UUID) -> RunStartPermitRecord:
+    def issue_start_permit(self, *, run_id: UUID, policy: ChargeableAdmissionPolicy) -> RunStartPermitRecord:
         state = self.__state
         state._require_active()
         context = self._require_execute()
         state._validate_uuid(run_id, field_name="run_id")
-        return RepositoryRunStartPermitAuthority.issue(
-            state._connection_token, run_id=str(run_id), context=context, now=state._database_now
+        permit = RepositoryRunStartPermitAuthority.issue(
+            state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy
+        )
+        refusal = permit.execution_refusal or permit.admission_decision
+        if refusal is not None and not refusal.allowed:
+            reason = refusal.refusal_reason
+            assert reason is not None
+            self.append_terminal_run_event_once(
+                run_id=run_id,
+                timestamp=state._database_now,
+                event_type="failed",
+                data={"status": "failed", "detail": f"Run admission refused: {reason.value}", "node_id": None},
+            )
+        return permit
+
+    def observe_start_permit_for_cleanup(self, *, run_id: UUID) -> RunStartPermitRecord:
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        return RepositoryRunStartPermitAuthority.observe_for_cleanup(state._connection_token, run_id=str(run_id), context=context)
+
+    def complete_admission_refusal(self, *, run_id: UUID) -> None:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        row = state._require_run(run_id)
+        if row.status != "failed" or row.saga_state not in {"admission_refusal_pending", "terminal"}:
+            raise AuditIntegrityError("Run is not awaiting admission refusal reconciliation")
+        _resolve_mutation_connection(state._connection_token).execute(
+            update(runs_table).where(runs_table.c.id == str(run_id)).values(saga_state="terminal")
         )
 
     def rebind_run_ownership(self, *, run_id: UUID) -> RunSagaState:

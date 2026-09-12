@@ -67,6 +67,7 @@ from elspeth.web.sessions.routes._helpers import _initial_composition_state_with
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -89,6 +90,8 @@ def service() -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -1025,6 +1028,8 @@ def profile_service(tmp_path: Path) -> SimpleNamespace:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=15,

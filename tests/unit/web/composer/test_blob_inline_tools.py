@@ -33,6 +33,7 @@ from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
 
 
@@ -194,6 +195,8 @@ def execute_tool(
 def blob_env(tmp_path: Path) -> Iterator[dict[str, Any]]:
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:

@@ -40,9 +40,10 @@ from elspeth.config_loading import load_settings_from_config_dict, load_settings
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionRefused, ChargeableOperation
 from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.enums import NodeStateStatus, RunStatus, is_llm_authored_creation_modality
-from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
+from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
@@ -1919,7 +1920,7 @@ class ExecutionServiceImpl:
         resume_existing: bool,
     ) -> bool:
         """Rehydrate one admitted run and transfer its renewable web lease."""
-        from elspeth.web.coordination.contracts import RecoveryRequiredReason
+        from elspeth.web.coordination.contracts import RecoveryRequiredReason, StartPermitState
 
         if run.cancel_requested_at is not None:
             try:
@@ -1927,6 +1928,12 @@ class ExecutionServiceImpl:
             except NonResumableRunError:
                 # A still-live Landscape seat is retryable; do not project it.
                 return False
+            return False
+        permit = await self._session_service.issue_run_start_permit(run.id, session_operation_context=session_operation_lease.context)
+        if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
+            return False
+        if permit.state is StartPermitState.REFUSED or permit.execution_refusal is not None:
+            await self._settle_admission_refusal(run.id, session_operation_lease)
             return False
         session = await self._session_service.get_session(run.session_id)
         active = self._principal_is_active
@@ -1980,6 +1987,79 @@ class ExecutionServiceImpl:
         future.add_done_callback(partial(self._on_pipeline_done, session_operation_lease=session_operation_lease, loss_watcher=watcher))
         return True
 
+    async def _settle_admission_refusal(self, run_id: UUID, lease: SessionOperationLease) -> None:
+        """Reconcile refused work before removing its durable recovery candidacy."""
+        from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+        from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+
+        loop = asyncio.get_running_loop()
+
+        async def finish_cleanup() -> None:
+            if self._blob_service is not None:
+                lease.guard_external_effect()
+                outcome = await self._blob_service.finalize_run_output_blobs(
+                    run_id,
+                    success=False,
+                    session_operation_context=lease.context,
+                )
+                if outcome.errors:
+                    raise RuntimeError("Admission refusal output cleanup remains pending")
+            await run_sync_in_worker(
+                self._session_service.session_operation_authority.mutate,
+                lease.context,
+                lambda transaction: transaction.runs.complete_admission_refusal(run_id=run_id),
+            )
+
+        def reconcile_landscape() -> None:
+            with open_landscape_db(self._settings) as db:
+                repositories = RecorderFactory(db)
+                existing = repositories.run_lifecycle.get_run(str(run_id))
+                if existing is None:
+                    asyncio.run_coroutine_threadsafe(finish_cleanup(), loop).result()
+                    return
+                if existing is not None and existing.status is RunStatus.RUNNING:
+                    transition_token = repositories.run_coordination.acquire_run_leadership(
+                        run_id=str(run_id),
+                        worker_id=mint_worker_id(str(run_id)),
+                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                        entry_point="web-admission-refusal",
+                    )
+                    try:
+                        lease.guard_external_effect()
+                        repositories.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=transition_token)
+                    finally:
+                        repositories.run_coordination.release_seat(token=transition_token)
+                    expected_status = RunStatus.FAILED
+                else:
+                    expected_status = existing.status
+                if expected_status not in {RunStatus.FAILED, RunStatus.INTERRUPTED}:
+                    raise AuditIntegrityError("Admission refusal conflicts with a successful Landscape result")
+                reconciliation_token = repositories.run_coordination.acquire_reconciliation_leadership(
+                    run_id=str(run_id),
+                    worker_id=mint_worker_id(str(run_id)),
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    expected_status=expected_status,
+                )
+                try:
+                    with fenced_leader_transaction(
+                        db.engine,
+                        token=reconciliation_token,
+                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                        verb="web_admission_refusal_reconciliation",
+                    ):
+                        # Acquisition checked the expected status under the
+                        # seat lock; this fence proves that same leader epoch
+                        # still owns it and holds the seat until cleanup ends.
+                        lease.guard_external_effect()
+                        asyncio.run_coroutine_threadsafe(finish_cleanup(), loop).result()
+                finally:
+                    repositories.run_coordination.release_seat(token=reconciliation_token)
+
+        # The lock owner must not occupy the shared pool used by the awaited
+        # Sessions/blob operations. Keep the task alive until authority releases.
+        task = lease.create_task(asyncio.to_thread(reconcile_landscape), name="admission-refusal-reconciliation")
+        await asyncio.shield(task)
+
     async def _materialize_durable_cancellation(self, run: RunRecord, lease: SessionOperationLease) -> None:
         from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
         from elspeth.contracts.hashing import CANONICAL_VERSION
@@ -1991,8 +2071,8 @@ class ExecutionServiceImpl:
         if execution_input is None:
             raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
         cancellation = read_cancelled_execution_envelope(execution_input)
-        permit = await self._session_service.issue_run_start_permit(run.id, session_operation_context=lease.context)
-        if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
+        permit = await self._session_service.observe_run_start_permit_for_cleanup(run.id, session_operation_context=lease.context)
+        if permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}:
             return
         assert permit.permit_id is not None and permit.permit_epoch is not None and permit.subject_hash is not None
         binding = RunStartPermitBinding(str(run.id), permit.permit_id, permit.permit_epoch, permit.subject_hash)
@@ -2024,7 +2104,11 @@ class ExecutionServiceImpl:
                     openrouter_catalog_source=cancellation.openrouter_catalog_source,
                     initiated_by_user_id=cancellation.user_id,
                     auth_provider_type=cancellation.auth_provider_type,
-                    web_plugin_policy_evidence=cancellation.web_plugin_policy_evidence,
+                    web_plugin_policy_evidence=(
+                        replace(cancellation.web_plugin_policy_evidence, admission_decision=permit.admission_decision)
+                        if cancellation.web_plugin_policy_evidence is not None
+                        else None
+                    ),
                     pre_effect_guard=lease.guard_external_effect,
                 )
 
@@ -2347,6 +2431,8 @@ class ExecutionServiceImpl:
         session_operation_context = session_operation_lease.context
         sink_effect_gate_passed = False
         run_start_permit: RunStartPermitBinding | None = None
+        admission_decision: ChargeableAdmissionDecision | None = None
+        admission_refusal_pending = False
         try:
             session_operation_lease.guard_external_effect()
             if durable_admission and restored_envelope is None:
@@ -2354,23 +2440,32 @@ class ExecutionServiceImpl:
                 if admitted_run.cancel_requested_at is not None:
                     self._call_async(self._materialize_durable_cancellation(admitted_run, session_operation_lease))
                     return None
-                restored_envelope = self._call_async(
-                    self._restore_admitted_run(
-                        admitted_run,
-                        user_id=user_id,
-                        auth_provider_type=auth_provider_type,
-                        session_operation_context=session_operation_context,
-                    )
-                )
-                frozen_run_settings = restored_envelope.settings
             if durable_admission:
                 from elspeth.web.coordination.contracts import StartPermitState
 
                 permit = self._call_async(
                     self._session_service.issue_run_start_permit(run_uuid, session_operation_context=session_operation_context)
                 )
-                if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
+                if (
+                    permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}
+                    or permit.execution_refusal is not None
+                ):
+                    if permit.state is not StartPermitState.CANCELLED_BEFORE_PERMIT:
+                        admission_refusal_pending = True
+                        self._call_async(self._settle_admission_refusal(run_uuid, session_operation_lease))
                     return None
+                admission_decision = permit.admission_decision
+                if restored_envelope is None:
+                    admitted_run = self._call_async(self._session_service.get_run(run_uuid))
+                    restored_envelope = self._call_async(
+                        self._restore_admitted_run(
+                            admitted_run,
+                            user_id=user_id,
+                            auth_provider_type=auth_provider_type,
+                            session_operation_context=session_operation_context,
+                        )
+                    )
+                    frozen_run_settings = restored_envelope.settings
                 assert permit.permit_id is not None and permit.permit_epoch is not None and permit.subject_hash is not None
                 run_start_permit = RunStartPermitBinding(run_id, permit.permit_id, permit.permit_epoch, permit.subject_hash)
                 from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
@@ -2385,6 +2480,16 @@ class ExecutionServiceImpl:
                 if shutdown_event.is_set() and not resume_existing:
                     self._call_async(self._materialize_durable_cancellation(latest_run, session_operation_lease))
                     return None
+            if not durable_admission:
+                admission_decision = self._call_async(
+                    self._session_service.assess_chargeable_operation(
+                        session_operation_context=session_operation_context,
+                        operation=ChargeableOperation.RUN,
+                    )
+                )
+                if not admission_decision.allowed:
+                    assert admission_decision.refusal_reason is not None
+                    raise ChargeableAdmissionRefused(admission_decision)
             # Early shutdown check: if cancel()/shutdown() fired before we
             # start setup, skip the expensive LandscapeDB/plugin/graph work.
             if shutdown_event.is_set() and not resume_existing:
@@ -3041,9 +3146,11 @@ class ExecutionServiceImpl:
                     auth_provider_type=auth_provider_type,
                     openrouter_catalog_sha256=catalog_sha,
                     openrouter_catalog_source=catalog_source,
-                    web_plugin_policy_evidence=_build_web_plugin_policy_evidence(
-                        snapshot=plugin_snapshot,
-                        policy=self._web_plugin_policy,
+                    web_plugin_policy_evidence=replace(
+                        restored_envelope.web_plugin_policy_evidence
+                        if restored_envelope is not None and restored_envelope.web_plugin_policy_evidence is not None
+                        else _build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
+                        admission_decision=admission_decision,
                     ),
                     check_coordination_latch=session_operation_lease.guard_external_effect,
                     pre_effect_guard=session_operation_lease.guard_external_effect,
@@ -3345,6 +3452,10 @@ class ExecutionServiceImpl:
             return _RUN_PIPELINE_GRACEFUL_SHUTDOWN_HANDLED
 
         except BaseException as exc:
+            if admission_refusal_pending:
+                # The terminal refusal is already durable; preserve its pending
+                # reconciliation marker so a peer retries failed cleanup.
+                raise
             if durable_admission and isinstance(exc, (SinkEffectCapabilityError, IncompleteSourceResumeError)):
                 reason = (
                     RecoveryRequiredReason.UNSAFE_EFFECT

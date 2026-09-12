@@ -8,12 +8,15 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, insert, select
+from tests.fixtures.identities import ensure_test_identity
 from tests.testcontainer.web.test_global_run_recovery_postgres import _register_live_instance
 
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.run_cancellation_authority import RepositoryRunCancellationAuthority
 from elspeth.web.execution.envelope import RunExecutionInput
+from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     composition_states_table,
@@ -26,6 +29,11 @@ from elspeth.web.sessions.protocol import RunAlreadyActiveError
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
+_NO_QUOTA_POLICY = ChargeableAdmissionPolicy(
+    identity_token_quota_configured=False,
+    container_token_quota_configured=False,
+    secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash,
+)
 
 
 def _envelope():
@@ -70,7 +78,7 @@ def _contend(url, context, state_id, run_id, action, barrier, results):
             except RunAlreadyActiveError:
                 results.put(("lost", str(run_id)))
         elif action == "permit":
-            permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run_id))
+            permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run_id, policy=_NO_QUOTA_POLICY))
             results.put(("permit", permit.state.value))
         elif action == "cancel":
             run = RepositoryRunCancellationAuthority(engine).request(
@@ -113,6 +121,8 @@ def _race(url, context, state_id, first_run_id, second_run_id, actions):
 def _prepare(url):
     engine = create_session_engine(url)
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     authority = PostgresSessionOperationRepository(engine)
     owner = f"process-admission-{uuid4()}"
     _register_live_instance(engine, owner)

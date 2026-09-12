@@ -237,6 +237,7 @@ class RestoredExecutionEnvelope:
     openrouter_catalog_sha256: str | None
     openrouter_catalog_source: Literal["live", "bundled"] | None
     blob_inputs: tuple[RetainedBlobInput, ...]
+    web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None
 
 
 class _RecordingResolver(ScopedSecretResolverContract):
@@ -416,6 +417,7 @@ def restore_execution_envelope(
         openrouter_catalog_sha256=payload.openrouter_catalog_sha256,
         openrouter_catalog_source=payload.openrouter_catalog_source,
         blob_inputs=payload.blob_inputs,
+        web_plugin_policy_evidence=payload.web_plugin_policy_evidence,
     )
 
 

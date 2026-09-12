@@ -687,7 +687,7 @@ _EXPECTED_DML_COUNT = 158
 # Fresh-time renewal and explicit registration finalizers add four DML sites;
 # the approved helper extraction adds seven edges. Table/operation shapes and
 # public caller inventories remain unchanged (measured from the live AST).
-_EXPECTED_DML_INVENTORY_SHA256 = "8b0ae236f5005e11d5a4626bfcb3fe3bb5ea47c6a665eca794e4fe7f77325302"
+_EXPECTED_DML_INVENTORY_SHA256 = "f2b187e1571fdfeab1564f02f20d20333cba549e7f55a38e4d33330923addd93"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -774,14 +774,14 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_lifecycle.complete_run#1
 #   + engine/orchestrator/abandon.py _acquire_leaderless_run_seat -> factory.run_coordination.acquire_run_leadership#1
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_coordination.release_seat#1
-_EXPECTED_CALL_COUNT = 279
+_EXPECTED_CALL_COUNT = 280
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "5e5c154a49a2689ea4d783880a951165e615fcf5d52281108396b527adc998d1"
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "0b7a93820401e5a6878e38c28827b557e51f712ba865facd26ade2dd92fd3fc4"
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 138
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "84327c0bcbbf9e2e7f46f206d6fccc70ae79a5a0b93fb6d54d1d50319eb00f94"
-_EXPECTED_COORDINATION_CALL_COUNT = 39
-_EXPECTED_COORDINATION_CALL_SHA256 = "ff8a26cb2828009160ea7c434c37378945eb50fbf7ca0bff661490e89fd4f906"
+_EXPECTED_COORDINATION_CALL_COUNT = 43
+_EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92
 _EXPECTED_INTERNAL_EDGE_SHA256 = "d1af3e662208f61e4514edd9cc62e5e30fb573f047d2916b108c5a7c0c392c39"
 
@@ -3820,6 +3820,17 @@ class _AuthorityProof:
         function, producer_resolver = producer
         if id(function) in seen:
             return False
+        caller = _owner_function(call)
+        if (
+            caller is not None
+            and (producer_resolver.unit.path, _symbol(function))
+            == (_RUN_COORDINATION_PATH, "RunCoordinationRepository.acquire_reconciliation_leadership")
+            and _admission_refusal_establishment_is_proven(caller, resolver)
+        ):
+            # This exact recipe obtains expected_status from two validated
+            # branches. It is a scalar admission subject, not a relayed token.
+            # The factory's own source still must prove current authority.
+            return _authority_factory_return_contract(self, function, producer_resolver, scope)
         seen = seen | {id(call), id(function)}
         substitutions = dict(parameter_values or {})
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args) if arg.arg not in {"self", "cls"}]
@@ -4670,10 +4681,19 @@ _EXACT_PERMIT_TAKEOVER_CALLERS = {
     ("src/elspeth/engine/orchestrator/run_lifecycle.py", "RunLifecycleCoordinator.initialize_database_phase"): "prepared-restart",
     ("src/elspeth/web/execution/service.py", "ExecutionServiceImpl._materialize_durable_cancellation.materialize"): "web-durable-cancel",
 }
+_ADMISSION_REFUSAL_CALLER = (
+    "src/elspeth/web/execution/service.py",
+    "ExecutionServiceImpl._settle_admission_refusal.reconcile_landscape",
+)
+# Closed recipe: closure-bound UUID; observed terminal status; distinct running
+# and reconciliation leaders; cleanup held inside the latter's current fence.
+# Equality includes both finally releases and the durable completion ordering.
+_ADMISSION_REFUSAL_RECIPE_SHA256 = "5fa9c45dcfdd026ab4bd079bf39133958b9831267c168e8637bb20f930506297"
 _EXACT_ESTABLISHMENT_CALLERS = {
     "acquire_reconciliation_leadership": frozenset(
         {
             ("src/elspeth/web/execution/recovery.py", "RunRecoveryCoordinator._reconcile_resumable_terminal"),
+            _ADMISSION_REFUSAL_CALLER,
         }
     ),
     "acquire_run_leadership": frozenset(
@@ -4681,6 +4701,7 @@ _EXACT_ESTABLISHMENT_CALLERS = {
             ("src/elspeth/engine/orchestrator/resume.py", "ResumeCoordinator._acquire_resume_leadership"),
             *_EXACT_TAKEOVER_HELPERS,
             *_EXACT_PERMIT_TAKEOVER_CALLERS,
+            _ADMISSION_REFUSAL_CALLER,
         }
     ),
     "admit_follower": frozenset(
@@ -4791,6 +4812,69 @@ def _establishment_window_is_proven(
     )
 
 
+def _admission_refusal_establishment_is_proven(owner: ast.FunctionDef | ast.AsyncFunctionDef, resolver: _Resolver) -> bool:
+    if (resolver.unit.path, _symbol(owner)) != _ADMISSION_REFUSAL_CALLER:
+        return False
+    outers = [
+        node
+        for node in ast.walk(resolver.unit.tree)
+        if isinstance(node, ast.AsyncFunctionDef) and _symbol(node) == "ExecutionServiceImpl._settle_admission_refusal"
+    ]
+    if len(outers) != 1 or owner not in ast.walk(outers[0]):
+        return False
+    outer = outers[0]
+    if hashlib.sha256(_finalization_recipe_dump(outer).encode()).hexdigest() != _ADMISSION_REFUSAL_RECIPE_SHA256:
+        return False
+    # The body binds local imports; nominal global dependencies must also resolve
+    # to their owned definitions, rather than merely having familiar spellings.
+    dependencies = {
+        "UUID": "uuid.UUID",
+        "RunStatus": "elspeth.contracts.enums.RunStatus",
+        "RecorderFactory": "elspeth.core.landscape.factory.RecorderFactory",
+        "mint_worker_id": "elspeth.contracts.coordination.mint_worker_id",
+        "DEFAULT_RUN_LIVENESS_WINDOW_SECONDS": "elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS",
+        "fenced_leader_transaction": "elspeth.core.landscape.run_coordination_repository.fenced_leader_transaction",
+    }
+    return all(
+        resolver.qualified_name(ast.Name(id=name, ctx=ast.Load()), use=owner) == qualified for name, qualified in dependencies.items()
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (None, None),
+        ('entry_point="web-admission-refusal"', 'entry_point="resume"'),
+        ("expected_status=expected_status", "expected_status=RunStatus.FAILED"),
+        ("token=reconciliation_token,", "token=transition_token,"),
+        ("release_seat(token=reconciliation_token)", "release_seat(token=transition_token)"),
+        ("transaction.runs.complete_admission_refusal(run_id=run_id)", "transaction.runs.complete_admission_refusal(run_id=UUID(int=0))"),
+        ("if expected_status not in {RunStatus.FAILED, RunStatus.INTERRUPTED}:", "if False:"),
+        ("await asyncio.shield(task)", "await task"),
+        ("from uuid import UUID", "from uuid import uuid4 as UUID"),
+    ],
+)
+def test_admission_refusal_establishment_requires_exact_custody_recipe(before: str | None, after: str | None) -> None:
+    path = _ADMISSION_REFUSAL_CALLER[0]
+    source = (_repo_root() / path).read_text()
+    if before is not None:
+        assert after is not None and before in source
+        source = source.replace(before, after)
+    unit = _parse_source(path, source)
+    calls = [
+        node
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"acquire_run_leadership", "acquire_reconciliation_leadership"}
+        and _symbol(node) == _ADMISSION_REFUSAL_CALLER[1]
+    ]
+    assert len(calls) == 2
+    for call in calls:
+        assert isinstance(call.func, ast.Attribute)
+        assert (_establishment_call_shape_violation(call.func.attr, call) is None) is (before is None)
+
+
 def _establishment_call_shape_violation(method: str, call: ast.Call) -> str | None:
     arguments = _exact_keyword_arguments(call)
     required = {
@@ -4810,6 +4894,10 @@ def _establishment_call_shape_violation(method: str, call: ast.Call) -> str | No
     if not _establishment_window_is_proven(arguments["window_seconds"], owner=owner, resolver=resolver, call=call):
         return "authority-establishment window is not a required parameter or exact owned default/fallback"
     identity = (resolver.unit.path, _symbol(owner))
+    if identity == _ADMISSION_REFUSAL_CALLER:
+        if not _admission_refusal_establishment_is_proven(owner, resolver):
+            return "admission refusal lacks its exact observed-status and fenced cleanup recipe"
+        return None
     if method == "acquire_reconciliation_leadership" or identity in _EXACT_PERMIT_TAKEOVER_CALLERS:
         if method == "acquire_reconciliation_leadership":
             status = arguments["expected_status"]
@@ -7623,7 +7711,10 @@ _REVIEWED_REGISTRY_MODULES = {
     # against the previous integration: release contributed only that
     # declaration, the branch only its install_deadline_guard calls; no
     # deadline, clock, or journal code moved.
-    "src/elspeth/core/landscape/database.py": "9f58928f0881a31a45feaa8557c1ada48432e578d4c6773ecb559bcc2b314156",
+    # VANguard adds required admission/token schema fields and disposes the
+    # engine if construction fails. Guard installation still follows journal
+    # attachment and precedes schema initialization/return on both dialects.
+    "src/elspeth/core/landscape/database.py": "0da498712352bd340c8f5db2c12764b3ea25015ca3cc0082c4a594c7216e15cb",
 }
 
 
@@ -9225,7 +9316,11 @@ def _observe_permitted_run_on(self, conn: Connection, binding: RunStartPermitBin
         raise AuditIntegrityError('Permit retry added web plugin policy evidence')
     else:
         evidence = web_plugin_policy_evidence
-        if (policy.schema_version, policy.policy_hash, policy.snapshot_hash, policy.authorized_plugin_ids_json, policy.available_plugin_ids_json, policy.control_modes_json, policy.selected_implementations_json, policy.selected_profile_aliases_json, policy.plugin_code_identities_json, policy.binding_generation_fingerprint, policy.decision_codes_json) != (evidence.schema_version, evidence.policy_hash, evidence.snapshot_hash, canonical_json(evidence.authorized_plugin_ids), canonical_json(evidence.available_plugin_ids), canonical_json(evidence.control_modes), canonical_json(evidence.selected_implementations), canonical_json(evidence.selected_profile_aliases), canonical_json(evidence.plugin_code_identities), evidence.binding_generation_fingerprint, canonical_json(evidence.decision_codes)):
+        try:
+            admission_decision = decode_admission_decision(policy.admission_decision_json, policy.admission_decision_hash)
+        except ValueError as exc:
+            raise AuditIntegrityError('Permit retry found corrupt admission evidence') from exc
+        if (policy.schema_version, policy.policy_hash, policy.snapshot_hash, policy.authorized_plugin_ids_json, policy.available_plugin_ids_json, policy.control_modes_json, policy.selected_implementations_json, policy.selected_profile_aliases_json, policy.plugin_code_identities_json, policy.binding_generation_fingerprint, policy.decision_codes_json, admission_decision) != (evidence.schema_version, evidence.policy_hash, evidence.snapshot_hash, canonical_json(evidence.authorized_plugin_ids), canonical_json(evidence.available_plugin_ids), canonical_json(evidence.control_modes), canonical_json(evidence.selected_implementations), canonical_json(evidence.selected_profile_aliases), canonical_json(evidence.plugin_code_identities), evidence.binding_generation_fingerprint, canonical_json(evidence.decision_codes), evidence.admission_decision):
             raise AuditIntegrityError('Permit retry changed web plugin policy evidence')
     return self._run_loader.load(row)
 """
@@ -9275,6 +9370,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES[
     "run_attributions_table": "elspeth.core.landscape.schema.run_attributions_table",
     "run_web_plugin_policy_table": "elspeth.core.landscape.schema.run_web_plugin_policy_table",
     "canonical_json": "elspeth.core.canonical.canonical_json",
+    "decode_admission_decision": "elspeth.contracts.plugin_policy_audit.decode_admission_decision",
 }
 _COORDINATION_FINALIZATION_DEPENDENCIES[("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.observe_on")] = {
     "Connection": "sqlalchemy.Connection",
@@ -9354,8 +9450,8 @@ async def _materialize_durable_cancellation(self, run: RunRecord, lease: Session
     if execution_input is None:
         raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
     cancellation = read_cancelled_execution_envelope(execution_input)
-    permit = await self._session_service.issue_run_start_permit(run.id, session_operation_context=lease.context)
-    if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
+    permit = await self._session_service.observe_run_start_permit_for_cleanup(run.id, session_operation_context=lease.context)
+    if permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}:
         return
     assert permit.permit_id is not None and permit.permit_epoch is not None and (permit.subject_hash is not None)
     binding = RunStartPermitBinding(str(run.id), permit.permit_id, permit.permit_epoch, permit.subject_hash)
@@ -9374,7 +9470,7 @@ async def _materialize_durable_cancellation(self, run: RunRecord, lease: Session
                 return
             existing = repositories.run_lifecycle.get_run(str(run.id))
             config = json.loads(existing.settings_json) if existing is not None else deep_thaw(cancellation.audit_safe_config)
-            repositories.run_lifecycle.materialize_cancelled_permit(binding, config, CANONICAL_VERSION, openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256, openrouter_catalog_source=cancellation.openrouter_catalog_source, initiated_by_user_id=cancellation.user_id, auth_provider_type=cancellation.auth_provider_type, web_plugin_policy_evidence=cancellation.web_plugin_policy_evidence, pre_effect_guard=lease.guard_external_effect)
+            repositories.run_lifecycle.materialize_cancelled_permit(binding, config, CANONICAL_VERSION, openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256, openrouter_catalog_source=cancellation.openrouter_catalog_source, initiated_by_user_id=cancellation.user_id, auth_provider_type=cancellation.auth_provider_type, web_plugin_policy_evidence=replace(cancellation.web_plugin_policy_evidence, admission_decision=permit.admission_decision) if cancellation.web_plugin_policy_evidence is not None else None, pre_effect_guard=lease.guard_external_effect)
     await run_sync_in_worker(materialize)
 """
 
@@ -9413,6 +9509,8 @@ def _cancelled_permit_caller_is_proven(unit: SourceUnit, call: ast.Call, proof: 
         None,
     )
     if outer is None or _finalization_recipe_dump(outer) != _finalization_recipe_dump(ast.parse(_CANCELLED_PERMIT_CALLER_RECIPE).body[0]):
+        return False
+    if _resolver_for_unit(unit).qualified_name(ast.Name(id="replace", ctx=ast.Load()), use=outer) != "dataclasses.replace":
         return False
     target = proof.called_function(call, _resolver_for_unit(unit), call)
     if target is None or (target[1].unit.path, _symbol(target[0])) != (

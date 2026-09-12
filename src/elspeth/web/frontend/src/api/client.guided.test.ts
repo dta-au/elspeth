@@ -1061,6 +1061,7 @@ describe("api/client guided functions", () => {
       [{ status: "failed", failure_code: "request_cancelled" }],
       // F13-D: the permanent policy failure code is in the closed vocabulary.
       [{ status: "failed", failure_code: "policy_blocked" }],
+      [{ status: "failed", failure_code: "admission_refused" }],
       // elspeth-5904b1683a: honest planner-exhaustion code is in the closed
       // vocabulary (transient — retry affordances stay enabled).
       [{ status: "failed", failure_code: "planner_repair_exhausted" }],

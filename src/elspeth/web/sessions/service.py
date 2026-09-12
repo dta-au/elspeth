@@ -32,6 +32,7 @@ from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.blobs import BlobForkPlanEntry, BlobGuidedOperationWriteFence, fork_blob_id
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
 from elspeth.contracts.composer_audit import ComposerToolStatus, PipelineDispatchAuditPayload
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -109,6 +110,7 @@ from elspeth.web.coordination.run_cancellation_authority import RepositoryRunCan
 from elspeth.web.coordination.run_diagnostics_authority import RepositoryRunDiagnosticsAuditAuthority
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions._persist_payload import AuditMessageDraft, AuditOutcome, RedactedToolRow, RejectionRecord, StatePayload
 from elspeth.web.sessions.archive_quarantine import (
     ArchiveQuarantineIdentity,
@@ -4393,6 +4395,7 @@ class SessionServiceImpl:
         owner_instance_id: str | None = None,
         session_operation_lease_seconds: int = 30,
         runtime_preflight: SessionRuntimePreflight | None = None,
+        chargeable_admission_policy: ChargeableAdmissionPolicy | None = None,
     ) -> None:
         from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 
@@ -4408,6 +4411,9 @@ class SessionServiceImpl:
         self._operator_profile_registry = operator_profile_registry
         self._catalog = catalog
         self._runtime_preflight = runtime_preflight
+        self._chargeable_admission_policy = chargeable_admission_policy or ChargeableAdmissionPolicy(
+            secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash
+        )
         if owner_instance_id is not None and (type(owner_instance_id) is not str or not owner_instance_id.strip()):
             raise ValueError("owner_instance_id must be a nonblank exact string")
         if type(session_operation_lease_seconds) is not int or not 1 <= session_operation_lease_seconds <= 3600:
@@ -10044,7 +10050,33 @@ class SessionServiceImpl:
             await self._run_sync(
                 self._session_operation_authority.mutate,
                 session_operation_context,
-                lambda transaction: transaction.runs.issue_start_permit(run_id=run_id),
+                lambda transaction: transaction.runs.issue_start_permit(run_id=run_id, policy=self._chargeable_admission_policy),
+            ),
+        )
+
+    async def observe_run_start_permit_for_cleanup(
+        self, run_id: UUID, *, session_operation_context: SessionOperationContext
+    ) -> RunStartPermitRecord:
+        return cast(
+            "RunStartPermitRecord",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.runs.observe_start_permit_for_cleanup(run_id=run_id),
+            ),
+        )
+
+    async def assess_chargeable_operation(
+        self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision:
+        return cast(
+            "ChargeableAdmissionDecision",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.session.assess_chargeable_operation(
+                    policy=self._chargeable_admission_policy, operation=operation
+                ),
             ),
         )
 

@@ -47,6 +47,7 @@ from elspeth.web.composer.guided.state_machine import (
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.redaction import assert_guided_custody_persistable
+from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_INTEGRITY_ERRORS,
     SourceInspectionBlobLifecycleError,
@@ -5728,7 +5729,7 @@ async def post_guided_respond(
                     else "integrity_error"
                     if isinstance(exc, (AuditIntegrityError, *SOURCE_INSPECTION_INTEGRITY_ERRORS, InvariantError))
                     else _guided_full_failure_code(exc)
-                    if isinstance(exc, PipelinePlannerError)
+                    if isinstance(exc, (PipelinePlannerError, ComposerAdmissionRefused))
                     else "operation_failed"
                 )
                 _log_last_resort_diagnostic(

@@ -39,7 +39,7 @@ from elspeth.contracts.coordination import (
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunLeadershipLostError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence, decode_admission_decision
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.runtime_val_manifest import (
@@ -547,6 +547,10 @@ class RunLifecycleRepository:
             raise AuditIntegrityError("Permit retry added web plugin policy evidence")
         else:
             evidence = web_plugin_policy_evidence
+            try:
+                admission_decision = decode_admission_decision(policy.admission_decision_json, policy.admission_decision_hash)
+            except ValueError as exc:
+                raise AuditIntegrityError("Permit retry found corrupt admission evidence") from exc
             if (
                 policy.schema_version,
                 policy.policy_hash,
@@ -559,6 +563,7 @@ class RunLifecycleRepository:
                 policy.plugin_code_identities_json,
                 policy.binding_generation_fingerprint,
                 policy.decision_codes_json,
+                admission_decision,
             ) != (
                 evidence.schema_version,
                 evidence.policy_hash,
@@ -571,6 +576,7 @@ class RunLifecycleRepository:
                 canonical_json(evidence.plugin_code_identities),
                 evidence.binding_generation_fingerprint,
                 canonical_json(evidence.decision_codes),
+                evidence.admission_decision,
             ):
                 raise AuditIntegrityError("Permit retry changed web plugin policy evidence")
         return self._run_loader.load(row)
@@ -685,6 +691,10 @@ class RunLifecycleRepository:
                 plugin_code_identities_json=canonical_json(evidence.plugin_code_identities),
                 binding_generation_fingerprint=evidence.binding_generation_fingerprint,
                 decision_codes_json=canonical_json(evidence.decision_codes),
+                admission_decision_json=(
+                    evidence.admission_decision.model_dump_json() if evidence.admission_decision is not None else None
+                ),
+                admission_decision_hash=(evidence.admission_decision.canonical_hash if evidence.admission_decision is not None else None),
             )
         )
 
@@ -707,6 +717,7 @@ class RunLifecycleRepository:
                 plugin_code_identities=tuple(tuple(item) for item in json.loads(row.plugin_code_identities_json)),
                 binding_generation_fingerprint=row.binding_generation_fingerprint,
                 decision_codes=tuple(json.loads(row.decision_codes_json)),
+                admission_decision=decode_admission_decision(row.admission_decision_json, row.admission_decision_hash),
             )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AuditIntegrityError(f"Web plugin-policy evidence is corrupt for run {run_id}") from exc

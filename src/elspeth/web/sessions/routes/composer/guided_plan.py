@@ -26,6 +26,7 @@ from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.guided_replay import project_composition_proposal, project_guided_full_decline
@@ -133,6 +134,14 @@ def _guided_full_complete_outcome_unreadable_progress_event() -> ComposerProgres
 
 
 def _guided_full_failed_progress_event(failure_code: GuidedOperationFailureCode) -> ComposerProgressEvent:
+    if failure_code == "admission_refused":
+        return ComposerProgressEvent(
+            phase="failed",
+            headline="This request was refused by the admission policy.",
+            evidence=("The guided operation was refused before provider work.",),
+            likely_next="Ask an administrator to review your access and quota configuration.",
+            reason="admission_refused",
+        )
     if failure_code == "planner_repair_exhausted":
         # Planner-owned non-convergence (elspeth-5904b1683a): honest about WHO
         # failed (the planner loop, not the provider) and honest that a retry
@@ -262,6 +271,8 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
         return "quota_exceeded"
     if isinstance(exc, BlobError):
         return "custody_error"
+    if isinstance(exc, ComposerAdmissionRefused):
+        return "admission_refused"
     if isinstance(exc, ComposerServiceError):
         return "provider_unavailable"
     if isinstance(exc, PipelinePlannerError):

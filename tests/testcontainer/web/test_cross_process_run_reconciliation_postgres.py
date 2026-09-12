@@ -15,6 +15,7 @@ import structlog
 from psycopg import sql
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
+from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import leader_coordination_token, register_test_node
 from tests.testcontainer.web.test_cross_process_run_control_postgres import _envelope
 from tests.testcontainer.web.test_global_run_recovery_postgres import _expire_fence, _expire_instance, _register_live_instance
@@ -22,6 +23,7 @@ from tests.unit.web.blobs.test_service_fencing import _reserve_output_blob
 from tests.unit.web.test_app import _settings
 
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy
 from elspeth.contracts.declaration_contracts import freeze_declaration_registry
 from elspeth.contracts.enums import NodeType, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.tier_registry import freeze_tier_registry
@@ -35,6 +37,7 @@ from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.recovery import RunRecoveryCoordinator
 from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, run_events_table, runs_table
 from elspeth.web.sessions.protocol import CompositionStateData
@@ -44,6 +47,11 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 pytestmark = pytest.mark.testcontainer
 _OUTPUT = b"value\n"
+_NO_QUOTA_POLICY = ChargeableAdmissionPolicy(
+    identity_token_quota_configured=False,
+    container_token_quota_configured=False,
+    secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash,
+)
 
 
 @pytest.fixture
@@ -75,6 +83,8 @@ def _die_after_engine_result(session_url, landscape_url, data_dir, terminal, con
     async def seed():
         engine = create_session_engine(session_url)
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         owner = f"crashed-admitter-{uuid4()}"
         sessions = _service(engine, owner)
         session = await sessions.create_session("alice", "crash handoff", "local")
@@ -93,7 +103,7 @@ def _die_after_engine_result(session_url, landscape_url, data_dir, terminal, con
             session_id=session.id, operation_kind=SessionOperationKind.EXECUTE, owner_instance_id=owner, lease_seconds=300
         )
         run = await sessions.create_run(session.id, state.id, session_operation_context=execute, execution_input=_envelope())
-        authority.mutate(execute, lambda tx: tx.runs.issue_start_permit(run_id=run.id))
+        authority.mutate(execute, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=_NO_QUOTA_POLICY))
         blobs = BlobServiceImpl(engine, Path(data_dir))
         blob = _reserve_output_blob(blobs, execute, run.id)
         Path(blob.storage_path).write_bytes(_OUTPUT)

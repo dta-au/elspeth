@@ -108,6 +108,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -541,6 +542,8 @@ class _ProgressRouteSessionService:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(operation_engine)
+        with operation_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
         self._engine = operation_engine
         self.session_operation_authority = SQLiteLocalSessionOperationAuthority(operation_engine)
         self.session_operation_owner_instance_id = f"progress-route-{uuid.uuid4()}"
@@ -851,6 +854,8 @@ def _make_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
     telemetry = build_sessions_telemetry()
     service = DualFencedSessionServiceHarness(
         engine,
@@ -3864,6 +3869,9 @@ class TestIDORProtection:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
+            ensure_test_identity(conn, identity_id="bob")
         service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
@@ -3872,6 +3880,8 @@ class TestIDORProtection:
 
         # Create two apps sharing the same service
         def make_app_for_user(uid: str) -> FastAPI:
+            with engine.begin() as conn:
+                ensure_test_identity(conn, identity_id=uid)
             app = FastAPI()
             identity = UserIdentity(user_id=uid, username=uid)
 
@@ -4185,6 +4195,9 @@ class TestSendMessageStateIdValidation:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
+            ensure_test_identity(conn, identity_id="bob")
         service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
@@ -4192,6 +4205,8 @@ class TestSendMessageStateIdValidation:
         )
 
         def make_app_for_user(uid: str) -> FastAPI:
+            with engine.begin() as conn:
+                ensure_test_identity(conn, identity_id=uid)
             app = FastAPI()
             identity = UserIdentity(user_id=uid, username=uid)
 
@@ -7867,6 +7882,9 @@ transforms:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
+            ensure_test_identity(conn, identity_id="bob")
         service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
@@ -7874,6 +7892,8 @@ transforms:
         )
 
         def make_app_for_user(uid: str) -> FastAPI:
+            with engine.begin() as conn:
+                ensure_test_identity(conn, identity_id=uid)
             app = FastAPI()
             identity = UserIdentity(user_id=uid, username=uid)
 

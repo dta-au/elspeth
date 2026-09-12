@@ -1240,7 +1240,10 @@ class TestCancelAllOrphanedRuns:
 class TestLandscapeReconciliationMarkers:
     @staticmethod
     async def _cancelled_run(service, *, reason: str, landscape_run_id: str | None) -> RunRecord:
-        session = await service.create_session(str(uuid.uuid4()), "Pipeline", "local")
+        owner_id = str(uuid.uuid4())
+        with service._engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=owner_id)
+        session = await service.create_session(owner_id, "Pipeline", "local")
         state = await service.save_composition_state(
             session.id,
             CompositionStateData(is_valid=True),
@@ -1881,6 +1884,8 @@ class TestAddMessageWithTranscript:
         """
         engine = create_session_engine(f"sqlite:///{tmp_path / 'stale-reader-sessions.db'}")
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         try:
             service = DualFencedSessionServiceHarness(
                 engine,
@@ -1935,6 +1940,8 @@ class TestAddMessageWithTranscript:
         """
         engine = create_session_engine(f"sqlite:///{tmp_path / 'one-conn-sessions.db'}")
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         try:
             service = DualFencedSessionServiceHarness(
                 engine,
@@ -2082,6 +2089,8 @@ class TestCreateRunSessionLockDomain:
     def test_create_run_waits_for_session_custody_lock(self, tmp_path) -> None:
         engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),

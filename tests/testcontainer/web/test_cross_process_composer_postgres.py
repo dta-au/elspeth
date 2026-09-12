@@ -22,6 +22,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.web.auth.models import IdentityClaims, UserIdentity
 from elspeth.web.composer.progress import ComposerProgressSnapshot, ComposerRequestLease, tool_completed_progress_event
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.composer_progress_authority import (
     ComposerRequestLeaseLost,
     DatabaseComposerProgressRegistry,
@@ -126,7 +127,7 @@ def composer_session(external_deployment_postgres_url: str) -> Iterator[tuple[En
     initialize_session_schema(engine)
     subject = f"composer-pg-{uuid4().hex}"
     identity = (
-        RepositoryIdentityAuthority(engine)
+        RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
         .ensure_identity(
             claims=IdentityClaims(provider="local", subject=subject, username=subject, display_name=None, email=None, organisation_id=None),
             activate=True,

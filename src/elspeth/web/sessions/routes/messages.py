@@ -6,6 +6,7 @@ from dataclasses import replace as _replace_dataclass
 from elspeth.contracts.errors import GuidedCustodyIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
+from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.titles import is_default_session_title
 
@@ -650,6 +651,21 @@ def register_message_routes(router: APIRouter) -> None:
                         session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
+                except ComposerAdmissionRefused as exc:
+                    await _publish_progress(
+                        progress_sink,
+                        event=ComposerProgressEvent(
+                            phase="failed",
+                            headline="This request was refused by the admission policy.",
+                            evidence=(str(exc),),
+                            likely_next="Ask an administrator to review your access and quota configuration.",
+                            reason="admission_refused",
+                        ),
+                    )
+                    raise HTTPException(
+                        status_code=403,
+                        detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
+                    ) from exc
                 except ComposerServiceError as exc:
                     await _publish_progress(
                         progress_sink,

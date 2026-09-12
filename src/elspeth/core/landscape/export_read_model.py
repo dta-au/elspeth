@@ -17,7 +17,7 @@ from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.export_records import AuthEventExportRecord
 from elspeth.contracts.identity import LineageFrame
-from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence, decode_admission_decision
 from elspeth.core.landscape.model_loaders import (
     ArtifactLoader,
     BatchLoader,
@@ -229,6 +229,7 @@ class ConnectionBoundExportReadModel:
                 plugin_code_identities=tuple(tuple(item) for item in json.loads(row.plugin_code_identities_json)),
                 binding_generation_fingerprint=row.binding_generation_fingerprint,
                 decision_codes=tuple(json.loads(row.decision_codes_json)),
+                admission_decision=decode_admission_decision(row.admission_decision_json, row.admission_decision_hash),
             )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AuditIntegrityError(f"Web plugin-policy evidence is corrupt for run {run_id}") from exc

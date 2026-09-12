@@ -7,18 +7,34 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
-to 54 for durable Composer progress snapshots and exact request lifecycle
-leases. Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 39 for immutable
-web run-start permit binding and recoverable pre-effect admission state.
+to 55 for durable Composer progress, request lifecycle leases, identity owner
+foreign keys, approval revocation provenance and run admission decisions.
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 40 for immutable web
+run-start permit binding, recoverable pre-effect admission, nullable LLM token
+usage and the quota-policy/secret-wiring evidence used at admission. These
+changes share one paired cutover; the intermediate ACA epochs are not a
+separate deployment requirement.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 54 and Landscape databases below epoch 39 must be recreated together.
+epoch 55 and Landscape databases below epoch 40 must be recreated together.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service
 drained and repair this release forward.
+
+- **VANguard identity residual.** Configured administrator seeding is consumed
+  permanently, authentication audit reuses an application-owned engine, and
+  authority withdrawal revokes awaiting approvals and refuses new execution.
+  Run decisions retain quota-policy identifiers and a canonical wiring hash;
+  token-quota deployments refuse chargeable work while complete accounting
+  remains unavailable. Nullable call counters preserve reported usage,
+  including zero and usage reported on failed responses.
+- **Authentication events in signed exports.** Operator exports record an
+  explicit inclusion policy and bounded event snapshot. Omitted history and
+  an included empty set are distinct. Web exports refuse deployment-wide
+  history, and no historical identity snapshot is invented from current rows.
 
 - **Coordination deadlines are decided from fresh post-lock database time.**
   Lease deadlines are now issued after locked admission rather than from a

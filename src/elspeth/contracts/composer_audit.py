@@ -10,10 +10,21 @@ Two surfaces consume :class:`ComposerToolInvocation`:
 
 1. The standalone composer MCP server appends one JSONL line per invocation
    to a per-session events sidecar.
-2. The web composer service buffers invocations during the compose loop;
-   the route handler persists each as a ``role=tool`` chat message with
-   the audit sidecar carried inside the existing ``tool_calls`` JSON
-   column under a ``_kind`` discriminator.
+2. The web composer service buffers complete invocation records. Its compose
+   loop persists redacted assistant/tool responses, state revisions, and
+   rejection evidence during phase P4. Those tool rows do not contain the
+   invocation envelope; successful P4 clears the corresponding exception
+   replay trail. Guided settlement and legacy route drains instead persist
+   redacted invocation envelopes in chat-message ``tool_calls`` under the
+   ``_kind=audit`` discriminator, using ``role=audit`` or linked ``role=tool``
+   rows as appropriate.
+
+Buffered invocation fields and durable response fields are distinct contracts.
+P4 response content can retain a successful dispatch's Composer version and
+redacted failure classification, while state bindings identify persisted
+revisions. It does not separately persist every invocation field, such as
+``version_before`` or dispatch timing. Session revision numbers and Composer
+dispatch versions are separate version domains.
 
 Layer: L0 (contracts). Imports nothing above. Canonical-JSON serialization
 and SHA-256 hashing happen at L3 construction sites (recorders/dispatchers),
@@ -163,9 +174,11 @@ class ComposerToolInvocation:
         ``started_at``/``finished_at`` are emitted as ISO-8601 strings so
         the dict is directly ``json.dumps``-able. ``status`` becomes its
         string value. The output shape is the canonical sidecar payload
-        used by both standalone-MCP JSONL lines and web-composer
-        ``role=tool`` chat-message ``tool_calls`` entries (under the
-        ``_kind=audit`` discriminator).
+        used by standalone-MCP JSONL lines and as input to web-composer
+        invocation-envelope projections. Web storage applies its redaction
+        policy before persisting those envelopes under ``_kind=audit``.
+        Compose-loop P4 response rows use a separate projection and do not
+        serialize this complete record.
         """
         raw = asdict(self)
         raw["status"] = self.status.value
@@ -186,10 +199,12 @@ class ComposerToolRecorder(Protocol):
       events sidecar (``{scratch}/{session_id}.events.jsonl``). When the
       session_id is unresolved (the very first ``new_session`` call), the
       recorder buffers in memory and flushes on first resolution.
-    - Web composer: in-memory buffer surfaced on
-      :class:`ComposerResult` (and on partial-state errors) so the
-      route handler can persist as ``role=tool`` chat messages inside
-      the same DB transaction as the assistant message.
+    - Web composer: in-memory buffer consumed by compose-loop processing,
+      guided settlement, and legacy route drains. P4 commits redacted
+      response/state/rejection evidence inside the loop; already persisted
+      tool turns do not replay their invocations through exception carriers.
+      Guided settlement and legacy drains persist redacted invocation
+      envelopes through their own transactional storage paths.
 
     Recorder calls happen synchronously from the dispatch site. Every
     code path through the dispatcher MUST call ``record(...)`` before
