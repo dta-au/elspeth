@@ -14,6 +14,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import compositionStateFixture from "../../../../../../tests/fixtures/web/composer/composition_state_validation_errors.json";
 import { chatGuided, convertToGuided, forkFromMessage, ForkCommittedResponseError, getGuided, GuidedResponseReceiptError, reconcileGuidedStartOperation, reenterGuided, respondGuided, revertToVersion, startGuidedSession } from "./client";
 import type {
   GetGuidedResponse,
@@ -1191,10 +1192,11 @@ describe("api/client guided functions", () => {
     });
 
     it("sends the same explicit operation id with a state revert", async () => {
-      fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => ({ id: "state-new" }) } as Response);
+      fetchSpy.mockResolvedValue(new Response(JSON.stringify(compositionStateFixture.states.coded)));
 
-      await revertToVersion("sess-1", "state-old", "00000000-0000-4000-8000-000000000002");
+      const restored = await revertToVersion("sess-1", "state-old", "00000000-0000-4000-8000-000000000002");
 
+      expect(restored).toEqual(compositionStateFixture.states.coded);
       const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
       expect(url).toBe("/api/sessions/sess-1/state/revert");
       expect(JSON.parse(init.body as string)).toEqual({

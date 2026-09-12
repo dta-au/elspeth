@@ -213,7 +213,7 @@ describe("deriveVersionLabel", () => {
       ]),
     ];
     expect(deriveVersionLabel(v5, [v2, v5], messages)).toBe(
-      "Applied: Updates one or more configuration options on a transform or gate node.",
+      "Applied: Updates configuration options on a pipeline node.",
     );
   });
 
