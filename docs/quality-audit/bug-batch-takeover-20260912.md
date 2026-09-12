@@ -8,6 +8,7 @@ Target: `release/0.8.1`. This report is in progress, not a release-readiness cer
 - Reviewed heartbeat/CLI and regression repairs: `e064ecd52ad04608bc4a3402af7c826b78b7f40f`.
 - Release synchronization into the task branch: `0966eda0f17c78e97aff0c9ec2265baf0f8dae67`.
 - DAG version-oracle correction: `e19a1a23cce65bca5a59104fb94f81d8b48cfa7f`.
+- Acceptance version and plugin hash repairs: `5e911e6f8c903d24ab4ec5c80fbd88b33d7616c3`.
 - Release integration and structural remediation: pending.
 
 The original four unstaged heartbeat/error files were preserved and reviewed.
@@ -90,6 +91,9 @@ was not literally a test of only its own mock assignment.
 | Baseline freeze check | Frozen=yes; overall RESULT=FAIL. |
 | Release-synced DAG suite | Exit 0; 661 passed, two existing retirement-comparator skips. |
 | Whole-tree default suite at `e19a1a23c` | Exit 1; 10 failed, 50,499 passed, 87 skipped, two xfailed. |
+| PostgreSQL suite at `e19a1a23c` | Exit 0; 394 passed, one skipped; frozen=yes, overall RESULT=FAIL. |
+| Whole-tree default suite at `5e911e6f8` | Exit 1; three failed, 50,509 passed, 87 skipped, two xfailed. |
+| PostgreSQL suite at `5e911e6f8` | Exit 0; 394 passed, one skipped; frozen=yes, overall RESULT=FAIL. |
 | Release plugin-hash failure reproduction | Exit 1; exact failing test reproduces both stale declarations. |
 | Repaired plugin-contract module | Exit 0; 29 passed. |
 | Combined gate-repair focused selection | Exit 0; 334 passed. |
@@ -121,8 +125,7 @@ writer was used.
 The next whole-tree run exposed release-inherited gate drift: one test rejects
 stale JSONSource and ChromaSink source hashes after release comment edits;
 nine AWS/Azure acceptance tests use compatibility fixtures still bound to
-`0.8.0`. Repairs are being verified in a separate task worktree while the
-`e19a1a23c` PostgreSQL stage keeps its inputs frozen. The source changes are
+`0.8.0`. Those repairs were committed in a separate task worktree. The source changes are
 exactly two hash literals computed by the existing canonical hash function,
 not signature changes. Positive fixtures use the current package authority;
 explicit stale-version rejection controls preserve independent negative
@@ -138,8 +141,23 @@ The exact additional gate-repair paths are:
 - `tests/unit/web/azure_container_apps_acceptance/test_receipt_contracts.py`
 - `docs/runbooks/azure-container-apps-deployment.md`
 
-This report is also updated. Final repaired-candidate gates and release
-integration are still pending.
+The full gate on that repair commit exposed three DAG failures: exact plugin
+provenance, the JSON explode parent-child production path, and the B3 exact
+contract check. The first explicitly reports the old JSONSource hash in the
+manifest against the corrected declaration. The dependent oracle update was
+missed in the hash repair. A real scenario projection comparison establishes
+that all three failures arise from that single provenance value: replacing
+only the actual source hash recovers the entire expected projection. The
+follow-through updates that one manifest value and the complete case-registry
+digest. Reversing only that hash recovers the previous digest exactly. No
+resumed projection digest depends on this case; the complete isolated corpus,
+production-path, and frozen-oracle selection passes (exit 0; 661 passed, two
+existing skips). No frozen semantic oracle is rewritten.
+The coordinator's actual-candidate corpus and production-path run also exits
+0 (611 passed), with both import roots verified inside the worktree.
+
+Release integration remains pending. Both completed gate runs kept
+their trees frozen; neither is an overall passing result.
 
 ## Structural remediation remaining
 
@@ -158,9 +176,16 @@ Chroma. These repairs remain pending. Dataverse also misses a locked-contract
 rejection in its counters.
 
 Provider preflight HTTP status is retained in audited child calls and safe
-operation text, but omitted from typed MCP operation-call details. This is a
-missing projection, not total audit-evidence loss; expanding generic operation
-payload access is unnecessary. The raw commencement-gate context snapshot is
+operation text, but omitted from typed MCP operation-call details. Further
+contract review classifies that projection as an additive API/schema feature,
+not a demonstrated breach of the existing call-detail contract. Opaque call
+payloads cannot safely be treated as nominal HTTP error records by matching
+keys or discriminator strings. Do not introduce a reader heuristic to retain
+an unused exception field: remove the redundant wrapper status field while
+preserving the original cause and audited evidence. A dedicated typed HTTP
+status channel would require a separately scoped schema change.
+
+The raw commencement-gate context snapshot is
 an evidenced privacy exclusion, not a proven production consumer: an actual
 CLI negative-disclosure test passes and its disclosure control fails. The
 exception needs a local explanatory note and maintained consumer coverage.
@@ -180,7 +205,11 @@ informative. Keep it ready for narrow adjudication; do not label owned data as
 Tier 3 or distort code to evade the lint. At `e19a1a23c`, a controlled normalized
 multiset comparison found only that additional finding versus release
 (1,849 versus 1,848); selected signed-entry diagnoses remained identical.
-The gate-repair candidate requires a fresh comparison after its hash repairs.
+At `5e911e6f8`, the controlled normalized multiset comparison is 1,847 versus
+release's 1,848: the same added R5 and removal of the two repaired plugin-hash
+findings. Identical-input and synthetic-change controls pass. The nine selected
+signed-entry diagnoses have identical keys, statuses, details, and notes versus
+release; this remains key-free diagnosis, not signature authentication.
 
 The attempted code-map refresh failed at its entity-count cap and published no
 usable index. Current Git and direct source inspection were used instead.

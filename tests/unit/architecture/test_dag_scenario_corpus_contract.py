@@ -676,7 +676,9 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # manifest and this digest covers both.
 # Release 0.8.1: refresh only engine-owned node plugin_version audit metadata.
 # Frozen semantic oracles and behavioral expectations are unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "2ef9008da15b6446407c30ab7f1504555ccf14787898a55f55d6523735a8bf05"
+# JSON source provenance refresh: update its one exact audit-record hash pin
+# after the plugin hash repair; behavioral and frozen semantic oracles stay fixed.
+EXPECTED_CASE_REGISTRY_SHA256 = "25d4bc8d7ee2d22151653d05c5c0c44df849e77d0d5407bb647aad84148a851c"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
