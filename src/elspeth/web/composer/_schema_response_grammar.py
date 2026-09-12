@@ -10,6 +10,7 @@ from typing import Final, cast
 from pydantic import JsonValue
 
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.composer._response_json import FrozenResponseJSON, encode_response_json, parse_frozen_response_json, parse_response_json
 
 _JSON_SCHEMA_PROSE_KEYS: Final[frozenset[str]] = frozenset(
@@ -252,6 +253,9 @@ class JSONSchemaSnapshot:
 
     keywords: Mapping[str, FrozenResponseJSON]
 
+    def __post_init__(self) -> None:
+        freeze_fields(self, "keywords")
+
     def to_wire(self) -> dict[str, JsonValue]:
         """Encode admitted leaves; cached values must pass readmission first."""
         return {key: encode_response_json(value) for key, value in self.keywords.items()}
@@ -262,6 +266,9 @@ class KnobSchemaSnapshot:
     """Closed knob root and recursively validated field/predicate records."""
 
     fields: tuple[Mapping[str, FrozenResponseJSON], ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "fields")
 
     def to_wire(self) -> dict[str, JsonValue]:
         """Encode admitted leaves; cached values must pass readmission first."""

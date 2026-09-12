@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import FrozenInstanceError
+from types import MappingProxyType
 
 import pytest
 
@@ -39,6 +40,24 @@ def schema() -> PluginSchemaInfo:
         },
         composer_hints=("Use exact fields",),
     )
+
+
+@pytest.mark.parametrize("proxy", [False, True])
+def test_schema_snapshot_constructor_detaches_nested_caller_containers(proxy: bool) -> None:
+    from elspeth.web.composer._schema_response_grammar import JSONSchemaSnapshot, KnobSchemaSnapshot
+
+    keywords = {"default": {"nested": [1]}}
+    field = {"name": "example", "default": {"nested": [1]}}
+    json_snapshot = JSONSchemaSnapshot(MappingProxyType(keywords) if proxy else keywords)
+    knob_snapshot = KnobSchemaSnapshot((MappingProxyType(field) if proxy else field,))
+    keywords["default"]["nested"].append(2)
+    field["default"]["nested"].append(2)
+    assert json_snapshot.to_wire() == {"default": {"nested": [1]}}
+    assert knob_snapshot.to_wire() == {"fields": [{"name": "example", "default": {"nested": [1]}}]}
+    with pytest.raises(TypeError):
+        json_snapshot.keywords["new"] = None
+    with pytest.raises(TypeError):
+        knob_snapshot.fields[0]["new"] = None
 
 
 def test_snapshot_preserves_wire_and_detaches_producer() -> None:
