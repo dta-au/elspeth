@@ -754,7 +754,7 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
     from elspeth.web.composer.tools import execute_tool
     from elspeth.web.execution.schemas import ValidationResult
     from elspeth.web.sessions.converters import state_from_record
-    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError
     from tests.unit.web._sync_asgi_client import SyncASGITestClient
     from tests.unit.web.composer.conftest import _make_settings
     from tests.unit.web.sessions.test_routes import _async_return, _make_app
@@ -795,7 +795,10 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
             outputs=initial_payload["outputs"],
             metadata_=initial_payload["metadata"],
             is_valid=False,
-            validation_errors=[entry.message for entry in initial_state.validate().errors],
+            validation_errors=[
+                CompositionValidationError(message=entry.message, error_code=entry.error_code, component=entry.component)
+                for entry in initial_state.validate().errors
+            ],
         ),
         provenance="session_seed",
     )
@@ -1092,7 +1095,7 @@ def test_accept_incremental_proposal_wires_controls_before_state_publication(
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
     from elspeth.web.execution.schemas import ValidationResult
-    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError
     from tests.unit.web._sync_asgi_client import SyncASGITestClient
     from tests.unit.web.sessions.test_routes import _async_return, _make_app
 
@@ -1139,7 +1142,10 @@ def test_accept_incremental_proposal_wires_controls_before_state_publication(
                 outputs=state_payload["outputs"],
                 metadata_=state_payload["metadata"],
                 is_valid=False,
-                validation_errors=[entry.message for entry in initial_state.validate().errors],
+                validation_errors=[
+                    CompositionValidationError(message=entry.message, error_code=entry.error_code, component=entry.component)
+                    for entry in initial_state.validate().errors
+                ],
             ),
             provenance="session_seed",
         )

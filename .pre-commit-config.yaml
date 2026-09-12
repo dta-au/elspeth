@@ -173,7 +173,7 @@ repos:
         entry: env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules contract_invariants.session_engine_factory --root . --files
         language: system
         types: [python]
-        files: ^(src/elspeth/web/.*\.py|tests/(unit|integration|property|e2e|testcontainer)/web/.*\.py)$
+        files: ^(src/elspeth/web/.*\.py|tests/(unit|integration|property|e2e|testcontainer|fixtures)/web/.*\.py)$
 
       - id: elspeth-lints-contract-manifest
         name: elspeth-lints contract manifest

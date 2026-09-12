@@ -1606,9 +1606,9 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
   "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 55, "landscape_epoch": 40, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 56, "landscape_epoch": 40, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "structural_changes": "session_epoch_35_to_55_landscape_epoch_29_to_40_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema",
+    "structural_changes": "session_epoch_35_to_56_landscape_epoch_29_to_40_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema",
     "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
     "archive_export_decision": "required_before_forward_migration",
     "destructive_reset_required": false

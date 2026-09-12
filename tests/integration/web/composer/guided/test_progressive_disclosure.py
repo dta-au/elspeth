@@ -550,7 +550,9 @@ class TestRecomposeTransitionPrompt:
 
         gs_dict = _get_current_guided_session(composer_freeform_client, session_id)
         assert gs_dict.get("transition_consumed") is True, f"transition_consumed not set to True after recompose. GuidedSession: {gs_dict}"
-        assert body["state"]["validation_errors"] == ["guided_composition_invalid"]
+        assert body["state"]["validation_errors"] == [
+            {"message": "guided_composition_invalid", "error_code": "guided_composition_invalid", "component": None}
+        ]
 
     def test_recompose_guided_session_persisted_in_composer_meta(self, composer_freeform_client: TestClient) -> None:
         """guided_session is included in composer_meta after recompose, not silently dropped."""

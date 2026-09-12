@@ -53,6 +53,7 @@ from elspeth.web.composer.redaction import (
     MANIFEST,
     SetPipelineArgumentsModel,
     redact_tool_call_arguments,
+    semantic_redacted_pipeline_arguments_hash,
 )
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -1208,7 +1209,7 @@ def test_set_pipeline_metadata_matches_set_metadata_redaction_contract() -> None
 
 
 def test_set_pipeline_redaction_does_not_reintroduce_absent_inline_blob_default() -> None:
-    """Absent and explicit-null legacy custody fields have one audit shape.
+    """Sparse audit shapes preserve presence while retaining semantic hash equivalence.
 
     ``PipelineProposal`` validation materializes ``source.inline_blob=None``
     while the provider-authored proposal may omit the field. The redacted
@@ -1230,8 +1231,12 @@ def test_set_pipeline_redaction_does_not_reintroduce_absent_inline_blob_default(
         telemetry=NoopRedactionTelemetry(),
     )
 
-    assert omitted_redaction == explicit_null_redaction
     assert "inline_blob" not in omitted_redaction["source"]
+    assert explicit_null_redaction["source"]["inline_blob"] is None
+    assert omitted_redaction != explicit_null_redaction
+    assert semantic_redacted_pipeline_arguments_hash(omitted_redaction) == semantic_redacted_pipeline_arguments_hash(
+        explicit_null_redaction
+    )
 
 
 def test_redaction_substitutes_source_options_via_summarizer() -> None:
@@ -1353,17 +1358,9 @@ def test_redaction_substitutes_nested_node_and_output_dicts() -> None:
     # ``routes`` and ``trigger`` pass through with their original shapes
     # — structurally exempt under §4.4.2 (closed-list scalar element types).
     assert redacted["nodes"][0]["routes"] == {"true": _CANARY_ROUTES}
-    # ``trigger`` is dumped from :class:`_NodeTriggerModel` via the
-    # redaction walker's BaseModel descent — the redacted shape carries
-    # every declared field (the absent ``count`` / ``timeout_seconds``
-    # slots surface as ``None``, matching the model defaults).  The
-    # canary lives on ``condition``; the other slots are present but
-    # null.
-    assert redacted["nodes"][0]["trigger"] == {
-        "condition": _CANARY_TRIGGER,
-        "count": None,
-        "timeout_seconds": None,
-    }
+    # The sparse projection retains the supplied condition without adding
+    # absent count or timeout fields from model defaults.
+    assert redacted["nodes"][0]["trigger"] == {"condition": _CANARY_TRIGGER}
     # Option canaries are removed by the shared option summarizer. Routes and
     # triggers remain typed Python containers and keep their structural scalar
     # values under the F3 contract.
