@@ -43,9 +43,9 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [021](021-sources-and-sinks-uniformly-boundary.md) | Sources and Sinks Are Uniformly Boundary by Architecture | 2026-05-18 | **Accepted** |
 | [022](022-shareable-reviews.md) | Shareable Reviews — Completion Gestures, Signed Tokens, and the Composer Completion Events Table | 2026-05-19 | **Accepted** |
 | [023](023-custom-python-ci-analyzer.md) | Custom Python Static Analyzer for ELSPETH-Specific CI Invariants (the `elspeth-lints` Package) | 2026-05-19 | **Accepted** |
-| [024](024-delivery-governance-for-single-maintainer-mode.md) | Delivery Governance for Single-Maintainer Mode | 2026-05-19 | **Accepted** |
+| [024](024-delivery-governance-for-single-maintainer-mode.md) | Delivery Governance for Single-Maintainer Mode | 2026-05-19 | **Retired** — not an architecture decision; see [GOVERNANCE.md](../../../GOVERNANCE.md) |
 | [025](025-multi-source-ingestion.md) | Multi-Source Ingestion — Source Surface Is Plural | 2026-05-23 | **Accepted** |
-| [026](026-durable-token-scheduler.md) | Durable Token Scheduler | 2026-05-23 | **Accepted** (with stated preconditions) |
+| [026](026-durable-token-scheduler.md) | Durable Token Scheduler | 2026-05-23 | **Accepted** |
 | [027](027-composer-operator-set-sampling.md) | Composer Sampling Is Operator-Set Configuration | 2026-06-04 | **Accepted** |
 | [028](028-queue-vs-coalesce-not-duplicates.md) | QUEUE and COALESCE Are Not Duplicates — Leave Them Separate | 2026-06-11 | **Accepted** |
 | [029](029-journal-is-barrier-buffer-truth.md) | Scheduler Journal Is the Single Source of Barrier-Buffer Truth | 2026-06-11 | **Accepted** |
@@ -74,6 +74,9 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 - **Accepted:** Decision has been made and is in effect
 - **Deprecated:** Decision is no longer recommended but still in use
 - **Superseded:** Decision has been replaced by a newer ADR
+- **Retired:** The record was not an architecture decision. The subject is
+  governed elsewhere, or was set outside this project; the file is kept as a
+  pointer so existing references resolve. No successor ADR.
 
 ## Creating a New ADR
 

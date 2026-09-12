@@ -542,8 +542,11 @@ true; each ticket is then a focused fix)
   `web/audit_readiness/service._build_plugin_trust_row`) is
   independent of source count.
 - **ADR-024** (delivery governance for single-maintainer mode) —
-  preserved; this ADR is itself the governance artifact ADR-024
-  contemplates for a structural change of this size.
+  **Retired 2026-09-13**; the assurance posture moved to
+  `GOVERNANCE.md` § Maintainer Continuity. The point stands under
+  that posture: with no independent reviewer available, a recorded
+  ADR is the control for a structural change of this size, and this
+  ADR is that record.
 - **ADR-026** (durable token scheduler) — companion. ADR-025 records
   *what* the source surface looks like; ADR-026 records *how* tokens
   produced by that surface survive crash and resume.

@@ -28,7 +28,7 @@
 #                                 documents and their PDFs stay together).
 #   FORCE_DATE                Override the title-page date (default: today).
 #
-# Note: docs/project-control/ is gitignored per ADR-024, so this tracked
+# Note: docs/project-control/ is gitignored (see its README), so this tracked
 # builder reads untracked sources by design — the same arrangement as the
 # arch pack, which discovers its chapters under the ignored docs-archive/.
 
