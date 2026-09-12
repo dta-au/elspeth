@@ -52,7 +52,7 @@ _EXPECTED_CREATE_BLOB_DEFINITION: dict[str, object] = {
     "description": (
         "Create a new file (blob) from inline content. "
         "Use this to create seed input files (URLs, JSON, CSV snippets) "
-        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, "
+        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, `filename`, `mime_type`, "
         "`content_hash`, `size_bytes`, and `originated_in` (`this_tool_call`: the blob was authored by "
         "this call, not uploaded)."
     ),
@@ -87,7 +87,7 @@ _EXPECTED_UPDATE_BLOB_DEFINITION: dict[str, object] = {
     "name": "update_blob",
     "description": (
         "Update the content of an existing blob (file). Overwrites the file content while preserving metadata. "
-        "Returns the new `content_hash` and `size_bytes`."
+        "Returns `blob_id`, `filename`, `mime_type`, and the new `content_hash` and `size_bytes`."
     ),
     "parameters": {
         "type": "object",
@@ -109,7 +109,7 @@ _EXPECTED_UPDATE_BLOB_DEFINITION: dict[str, object] = {
 
 _EXPECTED_DELETE_BLOB_DEFINITION: dict[str, object] = {
     "name": "delete_blob",
-    "description": "Delete a blob (file) and its storage. Returns `deleted`: true.",
+    "description": "Delete a blob (file) and its storage. Returns the deleted `blob_id` and `deleted`: true.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -488,6 +488,8 @@ class TestStep3DiscoveryTierMigration:
                     "limit": {
                         "type": "integer",
                         "description": "Max models to return (default 50).",
+                        "minimum": 1,
+                        "default": 50,
                     },
                 },
                 "required": [],
@@ -570,7 +572,8 @@ class TestStep3DiscoveryTierMigration:
             "`structural_preview` when present (an advisory re-check whose "
             "`is_valid` is not the verdict), and a read-only overview: `sources` "
             "(keyed by source name, each with `plugin`, `on_success` and "
-            "`has_schema_config`), `nodes`, `outputs`, `node_count`, "
+            "`has_schema_config`), `nodes` (each with `id`, `node_type`, `plugin`), "
+            "`outputs` (each with `name`, `plugin`), `node_count`, "
             "`output_count`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -640,7 +643,12 @@ class TestStep3MutationTierMigration:
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "source_name": {"type": "string", "description": "Source root name to clear. Defaults to 'source'."},
+                    "source_name": {
+                        "type": "string",
+                        "description": "Source root name to clear. Defaults to 'source'.",
+                        "minLength": 1,
+                        "default": "source",
+                    },
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -699,6 +707,7 @@ class TestStep3MutationTierMigration:
                     "patch": {
                         "type": "object",
                         "description": "Partial metadata update. Only included fields are changed.",
+                        "additionalProperties": False,
                         "properties": {
                             "name": {"type": "string"},
                             "description": {"type": "string"},
@@ -895,7 +904,7 @@ class TestStep3BlobDiscoveryTierMigration:
         assert self._get("list_blobs") == {
             "name": "list_blobs",
             "description": (
-                "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+                "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, "
                 "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -918,7 +927,7 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_get_blob_metadata(self) -> None:
         assert self._get("get_blob_metadata") == {
             "name": "get_blob_metadata",
-            "description": "Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
+            "description": "Get metadata for a specific blob (file) by ID: `id`, `filename`, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -933,7 +942,8 @@ class TestStep3BlobDiscoveryTierMigration:
         assert self._get("get_blob_content") == {
             "name": "get_blob_content",
             "description": (
-                "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters "
+                "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
+                "Large files are truncated to 50,000 characters "
                 "(`truncated` is true when so; `size_bytes` is the full size). "
                 "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
                 "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
@@ -956,7 +966,7 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "inspect_source",
             "description": (
                 "Return bounded structural facts about a blob-backed source: `source_kind`, "
-                "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
+                "`observed_headers`, `sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
                 "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
                 "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
                 "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
@@ -1037,7 +1047,7 @@ class TestStep3SecretTierMigration:
         assert self._get("list_secret_refs") == {
             "name": "list_secret_refs",
             "description": (
-                "List available secret references (API keys, credentials). Each entry carries the reference name, its "
+                "List available secret references (API keys, credentials). Each entry carries the reference `name`, its "
                 "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
                 "does not); never values."
             ),
@@ -1048,8 +1058,9 @@ class TestStep3SecretTierMigration:
         assert self._get("validate_secret_ref") == {
             "name": "validate_secret_ref",
             "description": (
-                "Check if a secret reference exists and is accessible to the current user. Returns `available` (true when "
-                "it resolves for you) with its `scope` and `source_kind`, or `reason` when it does not."
+                "Check if a secret reference exists and is accessible to the current user. Returns the checked reference `name` "
+                "and `available` (true when it resolves for you). When the reference appears in your inventory, also returns "
+                "its `scope`, `source_kind`, and `reason` (null when available; otherwise the reason it cannot resolve)."
             ),
             "parameters": {
                 "type": "object",

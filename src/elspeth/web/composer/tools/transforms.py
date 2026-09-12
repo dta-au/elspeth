@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Annotated, Any, Final, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.core.config import RuntimeNodeName
@@ -81,6 +81,17 @@ from elspeth.web.interpretation_state import (
 _NODE_ROUTING_OPTION_PATCH_KEYS: Final[frozenset[str]] = frozenset({"input", "on_success", "on_error", "routes", "fork_to"})
 
 
+class _UpsertNodeTriggerModel(_NodeTriggerModel):
+    """Admit the positive trigger bounds disclosed by incremental authoring.
+
+    Full-state admission retains its separate shape-only trigger contract;
+    TriggerConfig applies these domain bounds during semantic validation.
+    """
+
+    count: _JsonInteger | None = Field(default=None, ge=1)
+    timeout_seconds: StrictFloat | None = Field(default=None, gt=0)
+
+
 class _UpsertNodeArgumentsModel(BaseModel):
     id: str
     node_type: NodeType
@@ -95,7 +106,7 @@ class _UpsertNodeArgumentsModel(BaseModel):
     branches: list[str] | dict[str, str] | None = None
     policy: str | None = None
     merge: str | None = None
-    trigger: _NodeTriggerModel | None = None
+    trigger: _UpsertNodeTriggerModel | None = None
     output_mode: Literal["passthrough", "transform"] | None = None
     expected_output_count: _JsonInteger | None = None
     timeout_seconds: _StrictTimeoutSeconds | None = None

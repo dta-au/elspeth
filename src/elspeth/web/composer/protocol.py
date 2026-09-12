@@ -809,54 +809,65 @@ _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS = MappingProxyType(
     }
 )
 
-_SAFE_TOOL_ARGUMENT_EXPECTATIONS = frozenset(
-    {
-        "'source' for invented_source or 'source:<name>' for a named source",
-        "a declared read-only discovery tool",
-        (
-            "a fresh interpretation review (this kind+user_term+affected_node_id "
-            "tuple has already been resolved in this composition branch — carry "
-            "the resolved value forward, do not re-stage)"
-        ),
-        "a non-empty string",
-        "a 12-character lowercase hex string",
-        (
-            "a persisted composition state; call set_pipeline or another "
-            "state-staging tool successfully, wait for its tool result, "
-            "then call request_interpretation_review"
-        ),
-        "a sanitizable filename (no path separators, non-empty after stripping)",
-        "a string",
-        "a valid composer source name",
-        "content that does not match a known credential shape",
-        "content without template metacharacters, control characters, or credential patterns",
-        "id of a node whose plugin is 'llm'",
-        "only the optional 'source_name' key",
-        "source artifact content without template metacharacters, credential patterns, or non-printable controls",
-        REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
-        SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
-        SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
-        SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
-        SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
-        "source with composer-authored source metadata",
-        "the exact node review requirement draft staged in options.interpretation_requirements",
-        "the exact source review requirement draft staged in source.options.interpretation_requirements",
-        "valid UTF-8 text",
-        "well-formed interpretation authoring metadata",
-        "a valid value",
-        "an object conforming to the declared argument schema",
-        "a pipeline decision without preserved raw HTML/fingerprint fields",
-        "a pending interpretation requirement",
-        "a pending interpretation requirement or placeholder",
-        "id of an existing LLM transform",
-        "one of: the allowed values",
-        "prompt_template_parts interpretation_ref or placeholder wiring",
-        "the current non-empty options.model",
-        "the current non-empty options.prompt_template",
-        "within the per session per UTC day interpretation request limit",
-        "within the per-term interpretation request limit",
-    }
-) | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
+_TOOL_ARGUMENT_JSON_TYPE_GUIDANCE = (
+    ". Match the tool's declared JSON types. Supply object and array fields as actual JSON objects and arrays, not strings containing JSON."
+)
+
+_SAFE_TOOL_ARGUMENT_EXPECTATIONS = (
+    frozenset(
+        {
+            "'source' for invented_source or 'source:<name>' for a named source",
+            "a declared read-only discovery tool",
+            (
+                "a fresh interpretation review (this kind+user_term+affected_node_id "
+                "tuple has already been resolved in this composition branch — carry "
+                "the resolved value forward, do not re-stage)"
+            ),
+            "a non-empty string",
+            "a 12-character lowercase hex string",
+            (
+                "a persisted composition state; call set_pipeline or another "
+                "state-staging tool successfully, wait for its tool result, "
+                "then call request_interpretation_review"
+            ),
+            "a sanitizable filename (no path separators, non-empty after stripping)",
+            "a string",
+            "a valid composer source name",
+            "content that does not match a known credential shape",
+            "content without template metacharacters, control characters, or credential patterns",
+            "id of a node whose plugin is 'llm'",
+            "only the optional 'source_name' key",
+            "source artifact content without template metacharacters, credential patterns, or non-printable controls",
+            REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+            SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
+            SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+            SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
+            SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+            "source with composer-authored source metadata",
+            "the exact node review requirement draft staged in options.interpretation_requirements",
+            "the exact source review requirement draft staged in source.options.interpretation_requirements",
+            "valid UTF-8 text",
+            "well-formed interpretation authoring metadata",
+            "a valid value",
+            "an object conforming to the declared argument schema",
+            "a pipeline decision without preserved raw HTML/fingerprint fields",
+            "a pending interpretation requirement",
+            "a pending interpretation requirement or placeholder",
+            "id of an existing LLM transform",
+            "one of: the allowed values",
+            "prompt_template_parts interpretation_ref or placeholder wiring",
+            "the current non-empty options.model",
+            "the current non-empty options.prompt_template",
+            "within the per session per UTC day interpretation request limit",
+            "within the per-term interpretation request limit",
+        }
+    )
+    | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
+    | frozenset(
+        expectation + _TOOL_ARGUMENT_JSON_TYPE_GUIDANCE
+        for expectation in (*_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values(), "an object conforming to the declared argument schema")
+    )
+)
 
 _SAFE_TOOL_ARGUMENT_EXPECTATIONS = _SAFE_TOOL_ARGUMENT_EXPECTATIONS | frozenset(
     f"a pending {kind.value} interpretation requirement{suffix}" for kind in InterpretationKind for suffix in ("", " or placeholder")
@@ -943,10 +954,7 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
             if argument in _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS
             else "an object conforming to the declared argument schema"
         )
-        return (
-            f"{schema_expectation}. Match the tool's declared JSON types. "
-            "Supply object and array fields as actual JSON objects and arrays, not strings containing JSON."
-        )
+        return schema_expectation + _TOOL_ARGUMENT_JSON_TYPE_GUIDANCE
     if value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
         return value
     if "per session per utc day" in lowered:

@@ -261,6 +261,8 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "properties": {
                 "affected_node_id": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
                     "description": (
                         "Component id. Use 'source' or 'source:<name>' for invented source data and source data contracts; "
                         "use the LLM node id for vague terms and model choices."
@@ -278,6 +280,8 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
                 },
                 "user_term": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8192,
                     "description": (
                         "Stable user-facing label for the assumption being reviewed; for kind='pipeline_decision', "
                         "copy exactly one of drop_raw_html_fields, prompt_injection_shield_recommendation, or "
@@ -286,6 +290,8 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
                 },
                 "llm_draft": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8192,
                     "description": (
                         "OMIT this when the review site already carries a staged "
                         "interpretation_requirements draft (the normal case): the server resolves "

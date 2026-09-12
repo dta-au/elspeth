@@ -6197,7 +6197,10 @@ class TestToolArgumentError:
             actual_type="ValidationError",
         )
         assert exc.argument == argument
-        assert exc.expected == f"object conforming to {model_name}"
+        assert exc.expected == (
+            f"object conforming to {model_name}. Match the tool's declared JSON types. "
+            "Supply object and array fields as actual JSON objects and arrays, not strings containing JSON."
+        )
         assert argument in exc.safe_message
 
     def test_oversized_diagnostic_strings_take_early_fixed_fallback(self) -> None:

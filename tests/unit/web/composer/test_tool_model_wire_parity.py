@@ -10,8 +10,10 @@ from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 from scripts.cicd.composer_wire_census import census_model_wire
 
+from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.tool_error_payloads import arg_error_payload
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.schema_contract import assert_tool_model_key_parity
 from elspeth.web.composer.tools.transforms import _UpsertNodeArgumentsModel
@@ -28,6 +30,27 @@ def test_every_shipped_tool_has_proven_original_input_model() -> None:
         assert_tool_model_key_parity(tool_name=row.tool, shipped=row.shipped, model_fields=row.model_fields)
 
 
+@pytest.mark.parametrize("tool", [definition["name"] for definition in get_tool_definitions()])
+def test_schema_feedback_remains_safe_when_read_and_reconstructed(tool: str) -> None:
+    error = ToolArgumentError(
+        argument=f"{tool} arguments",
+        expected="object conforming to secret-model-name",
+        actual_type="dict",
+    )
+    assert "actual JSON objects and arrays" in error.expected
+    assert "secret-model-name" not in error.expected
+    assert str(error) == f"'{error.argument}' must be {error.expected}, got {error.actual_type}"
+    rebuilt = ToolArgumentError(argument=error.argument, expected=error.expected, actual_type=error.actual_type)
+    assert rebuilt.expected == error.expected
+    assert str(rebuilt) == str(error)
+
+
+def test_unknown_feedback_prose_is_not_admitted() -> None:
+    error = ToolArgumentError(argument="tool arguments", expected="secret-model-name", actual_type="dict")
+    assert error.expected == "a valid value"
+    assert "secret-model-name" not in str(error)
+
+
 @pytest.mark.parametrize("shipped,model", [(frozenset({"new"}), frozenset()), (frozenset(), frozenset({"hidden"}))])
 def test_model_key_pin_refuses_both_directions(shipped, model) -> None:
     with pytest.raises(RuntimeError, match="MODEL key mismatch"):
@@ -40,7 +63,7 @@ _EMPTY_TOOLS = tuple(definition["name"] for definition in get_tool_definitions()
 @pytest.mark.parametrize("tool", _EMPTY_TOOLS)
 def test_empty_handler_admits_only_empty_original_input(tool: str) -> None:
     state = _empty_state()
-    secrets = MagicMock()
+    secrets = MagicMock(spec=WebSecretResolver)
     secrets.list_refs.return_value = []
     # Domain failures without session context are legitimate positive admission.
     execute_tool(tool, {}, state, _mock_catalog(), secret_service=secrets, user_id="test")
@@ -196,5 +219,6 @@ def test_structural_feedback_teaches_actual_json_types(tool, arguments) -> None:
     with pytest.raises(ToolArgumentError) as caught:
         execute_tool(tool, arguments, _empty_state(), _mock_catalog(), validate_arguments=True, raise_schema_argument_errors=True)
     assert "actual JSON objects and arrays" in caught.value.expected
+    assert "actual JSON objects and arrays" in arg_error_payload(caught.value, tool)["error"]
     assert "invalid-secret-value" not in str(caught.value)
     assert "do-not-echo" not in str(caught.value)

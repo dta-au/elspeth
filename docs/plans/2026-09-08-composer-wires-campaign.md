@@ -9,13 +9,17 @@ on branch `composer-wires-consolidated`, in
 changed paths before the newer campaign overlay. This identifies the recovery
 inputs; it does not certify campaign acceptance or a merge into the release.
 
-The current request is **consolidation and a plan to finish**, not execution of
-all remaining milestones. Consolidation commits are authorized by that request,
-superseding the September 8 commit ban for this scope. Keep the September 10
+**Execution authorized — 2026-09-12.** Following consolidation at
+`e5060442893b64a2718e186c3987ce25b17cc74d`, the operator requested completion of
+the full campaign with regular checkpoints: MODEL; READ and ADMITTED;
+diagnostics and count applicability; discovery responses; sparse presence and
+persisted errors; remaining response/evaluation, scorecard and integrated/live
+acceptance. Implementation and checkpoint commits are authorized, superseding
+the September 8 commit ban. Keep the September 10
 [pause checkpoint](2026-09-10-composer-wires-campaign-checkpoint.md) as historical
 evidence. Its interrupted implementation, prior reviews and exact test results
 remain useful; its paused-work, original checkout and commit instructions no
-longer control this consolidation. Historical no-model alternatives and pending
+longer control execution. Historical no-model alternatives and pending
 contract decisions below have been replaced by the accepted rulings in this plan.
 
 ## Outcome and scope
@@ -35,7 +39,7 @@ do not add a parallel registry or reporting framework.
 The scope authority remains this plan and epic `elspeth-54bd0b84cd`. Use
 [the existing explore-and-pin methodology](../agents/explore-and-pin-methodology.md)
 for bounded census, verdict, structural repair, behavioral probes and review.
-When implementation resumes, use the repository's existing execution skills,
+During implementation, use the repository's existing execution skills,
 read CONTRIBUTING's whole-tree gates before code edits, and retain one
 implementation owner across overlapping Composer/session files. Independent
 read-only preparation and reviews can run in parallel.

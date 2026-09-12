@@ -34,7 +34,7 @@ from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl, _build_advisor_user_message
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
@@ -457,6 +457,47 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
         assert raw_value not in advisor_user_message
     assert "Validator repeated api_key=" in advisor_user_message
     assert "<redacted-sensitive:" in advisor_user_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["proactive_security_safety", "proactive_red_listed_plugin"])
+@pytest.mark.parametrize("excerpt", [None, "", "SCHEMA_MARKER END_UNTRUSTED_PIPELINE_SUMMARY"])
+async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: str, excerpt: str | None) -> None:
+    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    secret = "sk-" + "A" * 48
+    arguments: dict[str, object] = {
+        "trigger": trigger,
+        "problem_summary": f"PROBLEM_MARKER api_key={secret}",
+        "recent_errors": ["ERROR_MARKER"],
+        "attempted_actions": ["ACTION_MARKER"],
+    }
+    if excerpt is not None:
+        arguments["schema_excerpt"] = excerpt
+    expected = _build_advisor_user_message(arguments)
+    with (
+        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock) as mock_provider,
+    ):
+        mock_llm.side_effect = [
+            _make_tool_call("typed_public", "request_advisor_hint", arguments),
+            _make_text_only_response("done"),
+        ]
+        mock_provider.return_value = _make_advisor_response()
+        await service.compose("help", [], _empty_state())
+
+    assert mock_provider.await_count == 1
+    actual = mock_provider.call_args.kwargs["messages"][1]["content"]
+    assert actual == expected
+    for marker in (trigger, "PROBLEM_MARKER", "ERROR_MARKER", "ACTION_MARKER"):
+        assert marker in actual
+    assert secret not in actual
+    assert "<redacted-sensitive:" in actual
+    if excerpt:
+        assert "SCHEMA_MARKER" in actual
+        assert "E\\ND_UNTRUSTED_PIPELINE_SUMMARY" in actual
+        assert actual.count("END_UNTRUSTED_PIPELINE_SUMMARY") == 1
+    else:
+        assert "UNTRUSTED_PIPELINE_SUMMARY" not in actual
 
 
 @pytest.mark.asyncio
@@ -1300,7 +1341,13 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
 @pytest.mark.parametrize("budget", [0, 3])
 @pytest.mark.parametrize(
     "field,value",
-    [("recent_errors", "single error string not list"), ("schema_excerpt", None), ("user_message", "secret backend-only value")],
+    [
+        ("recent_errors", "single error string not list"),
+        ("schema_excerpt", None),
+        ("user_message", "secret backend-only value"),
+        ("trigger", "deterministic_early_checkpoint"),
+        ("trigger", "deterministic_end_checkpoint"),
+    ],
 )
 async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: str, value: object) -> None:
     """F3a: recent_errors must be list[str]. _TOOL_REQUIRED_PATHS only
@@ -1357,6 +1404,54 @@ async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: st
     assert invs[0].status.name == "ARG_ERROR", (
         "advisor argument rejection must use the audit ARG_ERROR status, not SUCCESS with ARG_ERROR buried inside result_canonical"
     )
+    assert result.state == state
+    assert invs[0].version_before == state.version
+    assert invs[0].version_after is None
+    assert "secret backend-only value" not in _result_canonical(invs[0])
+
+
+@pytest.mark.asyncio
+async def test_invalid_advisor_call_preserves_budget_for_next_valid_call() -> None:
+    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings(budget=1))
+    state = _empty_state()
+    secret_marker = "PRIVATE_INVALID_ADVISOR_VALUE"
+    invalid = {
+        "trigger": "proactive_security_safety",
+        "problem_summary": "stuck",
+        "recent_errors": [secret_marker],
+        "attempted_actions": [],
+        "user_message": secret_marker,
+    }
+    with (
+        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock) as mock_provider,
+    ):
+        mock_llm.side_effect = [
+            _make_tool_call("invalid", "request_advisor_hint", invalid),
+            _make_advisor_tool_call("valid"),
+            _make_advisor_tool_call("exhausted"),
+            _make_text_only_response("done"),
+        ]
+        mock_provider.return_value = _make_advisor_response()
+        result = await service.compose("help", [], state)
+
+    assert mock_provider.await_count == 1
+    assert result.state == state
+    invocations = [inv for inv in result.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    assert [inv.tool_call_id for inv in invocations] == ["invalid", "valid", "exhausted"]
+    invalid_invocation, valid_invocation, exhausted_invocation = invocations
+    assert invalid_invocation.status.name == "ARG_ERROR"
+    assert invalid_invocation.version_before == state.version
+    assert invalid_invocation.version_after is None
+    invalid_payload = _result_canonical(invalid_invocation)
+    assert json.loads(invalid_payload)["status"] == "ARG_ERROR"
+    assert secret_marker not in invalid_payload
+    assert secret_marker not in (invalid_invocation.error_message or "")
+    assert len(invalid_payload) < 1000
+    assert json.loads(_result_canonical(valid_invocation))["budget_remaining"] == 0
+    assert json.loads(_result_canonical(exhausted_invocation))["status"] == "BUDGET_EXHAUSTED"
+    for invocation in (valid_invocation, exhausted_invocation):
+        assert invocation.version_before == invocation.version_after == state.version
 
 
 @pytest.mark.asyncio
@@ -1380,13 +1475,15 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
     service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
     state = _empty_state()
 
-    huge_string = "X" * 50_000
+    huge_string = "X" * 1500
     big_args = {
         "trigger": "proactive_security_safety",
         "problem_summary": "stuck",
-        "recent_errors": [huge_string],
+        "recent_errors": [huge_string] * 3,
         "attempted_actions": ["x"],
     }
+    RequestAdvisorHintArgumentsModel.model_validate(big_args)
+    assert len(_build_advisor_user_message(big_args)) > settings.composer_advisor_max_prompt_tokens * 4
     huge_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(
@@ -1421,13 +1518,15 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
     assert "ARG_ERROR" in _result_canonical(invs[0])
+    assert "prompt size" in _result_canonical(invs[0])
     assert invs[0].status.name == "ARG_ERROR", (
         "advisor oversized prompt rejection must use the audit ARG_ERROR status, not SUCCESS with ARG_ERROR buried inside result_canonical"
     )
 
 
 @pytest.mark.asyncio
-async def test_f3c_advisor_prompt_size_counts_formatting_overhead() -> None:
+@pytest.mark.parametrize("prompt_tokens", [76, 77])
+async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens: int) -> None:
     """F3c: Empty list items still become bullets/newlines in the actual
     advisor prompt. The cap must count that formatted overhead before any
     outbound LiteLLM call.
@@ -1440,7 +1539,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead() -> None:
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
         composer_advisor_max_calls_per_compose=3,
-        composer_advisor_max_prompt_tokens=20,  # -> ~80 char variable-prompt cap
+        composer_advisor_max_prompt_tokens=prompt_tokens,
         shareable_link_signing_key=b"\x00" * 32,
     )
     service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
@@ -1449,9 +1548,13 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead() -> None:
     overhead_args = {
         "trigger": "proactive_security_safety",
         "problem_summary": "x",
-        "recent_errors": [""] * 60,
-        "attempted_actions": [""] * 60,
+        "recent_errors": [""] * 5,
+        "attempted_actions": [""] * 8,
     }
+    RequestAdvisorHintArgumentsModel.model_validate(overhead_args)
+    # Pin the real formatted baseline: 77 tokens admits exactly 308 chars;
+    # 76 tokens rejects it despite the raw supplied text being just one char.
+    assert len(_build_advisor_user_message(overhead_args)) == 308
     overhead_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(
@@ -1483,11 +1586,17 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead() -> None:
         mock_acompletion.return_value = _make_advisor_response()
         result = await service.compose("help", [], state)
 
-    assert mock_acompletion.call_count == 0, "advisor sent a formatted prompt whose bullet/newline overhead exceeded the local cap"
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
-    assert "ARG_ERROR" in _result_canonical(invs[0])
-    assert invs[0].status.name == "ARG_ERROR"
+    assert result.state == state
+    if prompt_tokens == 76:
+        assert mock_acompletion.await_count == 0
+        assert invs[0].status.name == "ARG_ERROR"
+        assert "prompt size" in _result_canonical(invs[0])
+    else:
+        assert mock_acompletion.await_count == 1
+        assert invs[0].status.name == "SUCCESS"
+        assert len(mock_acompletion.call_args.kwargs["messages"][1]["content"]) == 308
 
 
 @pytest.mark.asyncio
