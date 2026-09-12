@@ -103,7 +103,7 @@
       <span class="eyebrow">Important upgrade posture</span>
       <h2>Pre-1.0 databases are recreated, not migrated.</h2>
       <p>APIs, interfaces, and schemas are unstable before 1.0; ELSPETH makes no backward-compatibility promise.</p>
-      <p data-release="0.8.1">From 0.8.0 to 0.8.1, <code>SESSION_SCHEMA_EPOCH</code> changes 53 → 55 and Landscape <code>SQLITE_SCHEMA_EPOCH</code> changes 38 → 40 in one paired recreation window. The guided schema remains at 11.</p>
+      <p data-release="0.8.1">From 0.8.0 to 0.8.1, <code>SESSION_SCHEMA_EPOCH</code> changes 53 → 56 and Landscape <code>SQLITE_SCHEMA_EPOCH</code> changes 38 → 40 in one paired recreation window. The guided schema remains at 11.</p>
       <p data-release="0.8.0">The earlier upgrade from 0.7.1 to 0.8.0 changed the session epoch 35 → 53 and Landscape epoch 29 → 38; guided schema changed 10 → 11.</p>
       <p>Archive or export needed evidence, stop the old service, and recreate both incompatible databases in the same service-stop window before installing 0.8.1. Do not run older code over the recreated databases: there is no in-place migration. Preserve the separate <code>auth.db</code> and follow the <a href="https://github.com/dta-au/elspeth/blob/main/docs/runbooks/staging-session-db-recreation.md">session DB reset runbook</a>, including account re-admission.</p>
     </div>

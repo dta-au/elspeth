@@ -49,8 +49,9 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Session epoch 55 adds identity-owner foreign keys, durable admission
     # policy evidence and approval revocation provenance. Landscape epoch 40
     # adds nullable call token measures and immutable run policy evidence.
-    # These VANguard changes deploy together as the pair (55, 40).
-    assert SESSION_SCHEMA_EPOCH == 55
+    # Session epoch 56 adds sparse proposal arguments and structured validation
+    # errors. These changes deploy together as the pair (56, 40).
+    assert SESSION_SCHEMA_EPOCH == 56
     assert SQLITE_SCHEMA_EPOCH == 40
 
 

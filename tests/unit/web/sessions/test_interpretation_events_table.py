@@ -198,7 +198,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_55() -> None:
+def test_current_session_schema_epoch_is_56() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -225,7 +225,8 @@ def test_current_session_schema_epoch_is_55() -> None:
     # 54: durable Composer progress and inflight request records.
     # 55: ownership FKs, revocation provenance and permit admission evidence;
     # paired with Landscape40 in the identity residual schema window.
-    assert SESSION_SCHEMA_EPOCH == 55
+    # 56: sparse proposal arguments and structured validation errors.
+    assert SESSION_SCHEMA_EPOCH == 56
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

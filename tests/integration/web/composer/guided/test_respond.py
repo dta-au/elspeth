@@ -68,7 +68,12 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
     proposal_events_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationClaimed, GuidedPipelineProposalBackEditCommand
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionValidationError,
+    GuidedOperationClaimed,
+    GuidedPipelineProposalBackEditCommand,
+)
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _SessionComposeLockRegistry
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -5503,7 +5508,9 @@ class TestStep2IntraStep:
         assert "blob_ref" in proof_authority.proof_source_options
         assert accepted["terminal"]["kind"] == "completed"
         assert accepted["composition_state"]["is_valid"] is False
-        assert accepted["composition_state"]["validation_errors"] == ["guided_composition_invalid"]
+        assert accepted["composition_state"]["validation_errors"] == [
+            {"message": "guided_composition_invalid", "error_code": "guided_composition_invalid", "component": None}
+        ]
 
     def test_respond_planner_call_threads_a_live_progress_sink(
         self,
@@ -6322,7 +6329,9 @@ class TestStep2IntraStep:
                     outputs=committed.outputs or [],
                     metadata_=committed.metadata_ or {},
                     is_valid=False,
-                    validation_errors=["advanced past the surfaced node"],
+                    validation_errors=[
+                        CompositionValidationError(message="advanced past the surfaced node", error_code=None, component=None)
+                    ],
                     composer_meta=committed.composer_meta or {},
                 ),
                 provenance="tool_call",
