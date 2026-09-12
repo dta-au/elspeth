@@ -190,7 +190,9 @@ def test_l0_module_has_no_upward_imports() -> None:
 def test_cache_token_fields_default_to_none() -> None:
     """Cache token fields default to None — absence is evidence, not zero.
 
-    Per CLAUDE.md fabrication policy and elspeth-4e79436719 §Bug C: a
+    An absent value stays None rather than being coerced to zero — absence is
+    evidence, and a fabricated zero is indistinguishable from a measured zero.
+    Per elspeth-4e79436719 §Bug C: a
     missing provider cache statistic must NOT be coerced to zero. The
     audit row distinguishes "no cache reported" from "cache reported
     zero hits" — only the latter is a real provider claim.

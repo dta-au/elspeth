@@ -51,8 +51,9 @@ def init_display_headers(
     """
     # Offensive assertion: _output_contract must already be set by BaseSink.__init__().
     # Access directly — if it's missing, AttributeError IS the correct crash.
-    # Per CLAUDE.md: "hasattr() is unconditionally banned" and try/except AttributeError
-    # is equivalent banned defensive programming.
+    # Per the engine-patterns-reference skill §hasattr Alternatives, "hasattr() is
+    # unconditionally banned" and try/except AttributeError is equivalent banned
+    # defensive programming.
     _ = sink._output_contract  # Crashes with AttributeError if super().__init__() not called
 
     if headers_mode == HeaderMode.CUSTOM and headers_custom_mapping is None:

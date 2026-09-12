@@ -3098,8 +3098,9 @@ class TestProviderCacheTokenAudit:
 
     Both must land on the ``ComposerLLMCall`` audit record with their
     canonical names, so the audit DB records what the provider actually
-    reported. A missing field must remain ``None`` per the
-    "absence as evidence" rule from CLAUDE.md.
+    reported. A missing field must remain ``None`` rather than be coerced to
+    zero: absence is evidence, and a fabricated zero is indistinguishable from
+    a measured zero.
 
     LiteLLM-shape deduplication: when LiteLLM is the wire to an
     Anthropic-family provider (Anthropic direct, Bedrock-Claude,
@@ -4622,7 +4623,8 @@ class TestPluginBugCrashesFromToolExecution:
 
     The compose loop catches ONLY ToolArgumentError around execute_tool.
     Any other TypeError/ValueError/UnicodeError is a plugin bug — per
-    CLAUDE.md, silently laundering a plugin bug as an LLM-argument error
+    docs/guides/data-trust-and-error-handling.md §Plugin Ownership, silently
+    laundering a plugin bug as an LLM-argument error
     is worse than crashing, because the audit trail records a confident
     but wrong Tier-3 story.
 

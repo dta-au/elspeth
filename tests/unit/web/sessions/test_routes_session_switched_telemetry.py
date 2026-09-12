@@ -80,7 +80,8 @@ def test_route_emits_session_switched_on_mode_change(test_client: TestClient) ->
     # Attribute contract: ``from_mode`` / ``to_mode`` drawn from the
     # per-session vocabulary (NOT ``guided`` / ``freeform``).  Narrow
     # the type via isinstance against ``_FakeCounter`` rather than
-    # ``hasattr`` (CLAUDE.md unconditionally bans hasattr) — see the
+    # ``hasattr`` (unconditionally banned — engine-patterns-reference skill
+    # §hasattr Alternatives) — see the
     # canonical pattern in ``test_telemetry_phase8.py``.
     counter = telemetry.session_switched_total
     assert isinstance(counter, _FakeCounter), "test must run against _FakeCounter (build_sessions_telemetry(meter=None))"

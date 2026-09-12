@@ -1020,8 +1020,9 @@ class ToolArgumentError(Exception):
     This is the ONLY exception class the compose loop catches around
     execute_tool(). Any other TypeError/ValueError/UnicodeError/KeyError
     escaping a tool handler is a plugin bug and MUST crash — per
-    CLAUDE.md, plugin bugs that silently produce wrong results are worse
-    than a crash because they pollute the audit trail with confidently
+    docs/guides/data-trust-and-error-handling.md §Plugin Ownership: System
+    Code, Not User Code, plugin bugs that silently produce wrong results are
+    worse than a crash because they pollute the audit trail with confidently
     wrong data.
 
     Inheritance rationale: this class inherits from ``Exception`` directly,

@@ -1,6 +1,7 @@
 """Tests for ``elspeth.web.composer.telemetry_phase8`` (Phase 8 Task 1).
 
-Per CLAUDE.md primacy, the audit row is the legal record; these counters
+Per the ``logging-telemetry-policy`` skill §Logging Policy, the audit row is
+the legal record; these counters
 are operational signals. Each helper here is verified for:
 
 1. Correct counter slot is incremented.
@@ -372,8 +373,8 @@ def test_record_session_completed_accepts_all_valid_combinations(sessions_teleme
     UI-only vocabulary (different from the DB audit row) and
     ``run_pipeline`` has no audit row in
     ``composer_completion_events_table`` (its audit lives under
-    ``runs/``); both would violate the CLAUDE.md superset rule and
-    are rejected by the negative tests below.
+    ``runs/``); both would violate the ``logging-telemetry-policy`` skill
+    §The Superset Rule and are rejected by the negative tests below.
     """
     record_session_completed(sessions_telemetry, completion_verb=completion_verb)  # type: ignore[arg-type]
     assert observed_value(sessions_telemetry.session_completed_total) == 1

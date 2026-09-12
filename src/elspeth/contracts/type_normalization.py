@@ -5,7 +5,9 @@ contract storage and validation.
 
 Fast path: Uses type() with frozenset membership for standard Python types (performance).
 Slow path: Uses isinstance() checks for numpy/pandas type hierarchies.
-Avoids string matching on __name__ per CLAUDE.md.
+Avoids string matching on __name__: type identity is decided nominally,
+against concrete classes, never by name (CONTRIBUTING.md §Convention:
+validate by trust domain).
 """
 
 from __future__ import annotations

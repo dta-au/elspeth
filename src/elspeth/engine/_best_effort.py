@@ -9,7 +9,7 @@ which followed the same pattern — can collapse to one reviewable surface.
 The single broad-catch in this module carries one tier-model allowlist
 entry instead of the previous fan-out.
 
-Per CLAUDE.md logging-telemetry-policy primacy (audit > telemetry > logger):
+Per the logging-telemetry-policy skill §The Primacy Test (audit > telemetry > logger):
 this helper logs at the **logger** layer because the work it wraps is
 post-audit ceremony or telemetry, and any failure here means the ceremony
 itself (the secondary channel) is the failing system. Logger is the

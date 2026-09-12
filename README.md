@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.0](https://img.shields.io/badge/status-0.8.0-green.svg)
+![Status: 0.8.1](https://img.shields.io/badge/status-0.8.1-green.svg)
 
 > **Pre-release status:** ELSPETH may be suitable for carefully evaluated,
 > use-case-specific applications, but it is not yet ready for general production use.
@@ -155,6 +155,29 @@ runtime check that holds a plugin to its own declaration; see
 
 ---
 
+## What changed in 0.8.1
+
+0.8.1 is a correctness and hardening release on top of 0.8.0, with no schema
+cutover: the session store stays at epoch 53 and Landscape at epoch 38.
+
+- **Coordination deadlines come from fresh post-lock database time.** Lease
+  deadlines are issued after locked admission instead of from a clock read
+  before the lock, and sink-effect clocks are sampled after their lease locks,
+  so two workers cannot disagree about when a lease expired.
+- **A contended PostgreSQL heartbeat is degraded liveness, not a failed run.**
+  The lock timeout is classified and retried rather than failing closed.
+- **Failures survive transaction unwind.** An invalidated Landscape
+  transaction reports the error that caused it, not the rollback's own error.
+- **Blob custody stays fenced across durable effects and recovery**, and
+  custody walkers reject null canonical sections instead of reading them as
+  empty.
+- **SSO hardening.** Dormancy is enforced on bound identities, bound profiles
+  refresh, database work moves off the request path, and response streams
+  carry size caps.
+- **Azure Container Apps.** Schema credentials are isolated from the
+  application identity, revision secret bindings survive new revisions, and
+  Key Vault write authority is confirmed before SQL bootstrap.
+
 ## What changed in 0.8.0
 
 0.8.0 hardens the production paths introduced in 0.7.1 across deployment,
@@ -210,7 +233,7 @@ from epoch 35 to 53; guided schema moves to 11, and Landscape moves from epoch
 | 48 | Adds the session-operation coordination tables (retained per-session fences, guided-operation leases, and fork/blob-effect receipts) that ground the multi-replica fencing work |
 
 Archive or export evidence as required, stop the old service, recreate
-a stale session store and a Landscape store left at epoch 29, and install 0.8.0.
+a stale session store and a Landscape store left at epoch 29, and install 0.8.1.
 Do not roll older code back over the recreated databases.
 `data/auth.db` remains separate; recreating the session store does not remove
 local user accounts.

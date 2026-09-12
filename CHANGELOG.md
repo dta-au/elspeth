@@ -4,6 +4,36 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.1 - 2026-09-10 (Coordination-clock correctness and deployment hardening)
+
+0.8.1 is a correctness and hardening release on top of 0.8.0. It carries no
+schema cutover: `SESSION_SCHEMA_EPOCH` stays at 53 and the Landscape epoch at
+38. The notes below intentionally cover only major changes and critical
+correctness or security fixes.
+
+- **Coordination deadlines are decided from fresh post-lock database time.**
+  Lease deadlines are now issued after locked admission rather than from a
+  clock sampled before it, and sink-effect clocks are sampled after their lease
+  locks. A deadline derived from a pre-lock reading could be stale by the width
+  of the lock wait, so two workers could disagree about when a lease expired.
+- **A PostgreSQL heartbeat lock timeout is degraded liveness, not failure.**
+  A contended heartbeat no longer fails the run closed; the lock timeout is
+  classified as degraded liveness and retried.
+- **Landscape failures survive transaction unwind.** An invalidated
+  transaction no longer discards the failure that caused it, so the original
+  error reaches the audit trail instead of the rollback's own error.
+- **Blob custody stays fenced across durable effects and recovery.** Collector
+  blob custody and fatal archive failures are preserved, and custody walkers
+  reject null canonical sections rather than treating them as empty.
+- **SSO hardening.** Dormancy is enforced on bound identities, bound profiles
+  refresh, database work is offloaded off the request path, and response
+  streams carry size caps.
+- **Azure Container Apps deployment.** Schema credentials are isolated from
+  the application identity, revision secret bindings are retained across
+  revisions, and Key Vault write authority is confirmed before SQL bootstrap.
+
+---
+
 ## 0.8.0 - 2026-09-07 (Unified lineage and production hardening)
 
 0.8.0 unifies ELSPETH's group-lineage and settlement model while carrying

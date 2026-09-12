@@ -14,7 +14,8 @@ SDK wrappers. The helpers:
 - Apply Anthropic prompt-cache markers to messages and tools before the
   request goes on the wire.
 
-Tier 3 boundary discipline (per ELSPETH CLAUDE.md):
+Tier 3 boundary discipline (per docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model):
 
 - Provider values are read from Mapping keys or object-owned fields only.
   Hidden/dynamic provider properties are treated as absent rather than invoked.

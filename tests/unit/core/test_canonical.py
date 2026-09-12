@@ -72,7 +72,8 @@ class TestNanInfinityRejection:
 class TestDecimalNonFiniteRejection:
     """Decimal NaN and Infinity must be rejected like float NaN/Infinity.
 
-    Per CLAUDE.md: "NaN and Infinity are strictly rejected, not silently converted."
+    Per the ``engine-patterns-reference`` skill §Canonical JSON: "NaN and
+    Infinity are strictly rejected, not silently converted."
     This applies to Decimal as well as float - both are numeric types that can
     represent non-finite values which would corrupt audit hash integrity.
     """

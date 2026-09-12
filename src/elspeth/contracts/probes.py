@@ -20,9 +20,9 @@ class CollectionReadinessResult:
     and non-negative count.
 
     count is None when the count is unknown (unreachable, malformed response,
-    collection absent). Per the data manifesto: absence is evidence, not an
-    invitation to invent a default. Fabricating count=0 for "unknown" conflates
-    "empty" with "we don't know."
+    collection absent). Absence is evidence, not an invitation to invent a
+    default. Fabricating count=0 for "unknown" conflates "empty" with "we
+    don't know."
     """
 
     collection: str

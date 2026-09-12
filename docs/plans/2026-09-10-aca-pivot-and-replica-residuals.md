@@ -60,7 +60,7 @@ verdict. Preserve them while extending the runtime.
 | P1 / P2 | `src/elspeth/web/_acceptance_common/replica_probes.py`: concurrent guided/run-start contention is scored through session-operation fences. P2 requires one run and one conflict; it does not prove a durable run-start permit saga. |
 | P3 | Expired dead-owner lease recovery; a graceful stop is a different mechanism and cannot count as proof of dead-owner takeover. It is not a transparent run-resume claim. |
 | P4a / P4b | P4a proves shared database state and blob visibility. P4b records owner-affine live progress/tickets and structurally cannot pass. Sticky routing is a mitigation, not durable state. |
-| Lease clock | The [Landscape clock plan](2026-09-08-landscape-lease-clock.md) and ADR-047 describe the separate engine authority contract. New web ownership must preserve Landscape fencing and fresh post-lock time decisions. |
+| Lease clock | The 2026-09-08 Landscape clock plan (retired from active docs; retrievable from git history) and ADR-047 describe the separate engine authority contract. New web ownership must preserve Landscape fencing and fresh post-lock time decisions. |
 
 ## July work mapped to the ACA pivot
 

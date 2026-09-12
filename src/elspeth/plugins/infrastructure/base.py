@@ -9,7 +9,8 @@ Why base class inheritance is required:
 - Python's Protocol with non-method members (name, determinism, etc.) cannot
   support issubclass() - only isinstance() on already-instantiated objects
 - Base classes enforce self-consistency via __init_subclass__ hooks
-- Per CLAUDE.md "Plugin Ownership", all plugins are system code, not user extensions
+- Per docs/guides/data-trust-and-error-handling.md §Plugin Ownership, all plugins
+  are system code, not user extensions
 
 The protocol definitions (SourceProtocol, TransformProtocol, SinkProtocol) exist
 for type-checking purposes only - they define the interface contract but cannot

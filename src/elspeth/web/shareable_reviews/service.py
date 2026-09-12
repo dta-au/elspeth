@@ -298,9 +298,9 @@ def _build_snapshot(
     composition_dict = generate_public_composition_dict(composition_state)
     # ``metadata`` is normalised to ``{"name", "description"}`` by
     # CompositionState.to_dict — that IS the pipeline_metadata wire shape.
-    # Direct indexing per CLAUDE.md offensive programming: ``to_dict``
-    # always emits a ``metadata`` key. KeyError here is a contract
-    # violation of CompositionState.to_dict.
+    # Direct indexing per the engine-patterns-reference skill §Offensive
+    # Programming Examples: ``to_dict`` always emits a ``metadata`` key.
+    # KeyError here is a contract violation of CompositionState.to_dict.
     pipeline_metadata = composition_dict["metadata"]
     # The blob carries ONLY content-addressed content. Mark-time and
     # mint-time live in the token envelope (and the audit row), not here,

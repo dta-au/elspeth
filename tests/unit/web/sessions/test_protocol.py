@@ -365,8 +365,10 @@ class TestChatMessageRecord:
     def test_tool_call_linkage_fields_are_exposed(self) -> None:
         """Rev-4: ``tool_call_id`` and ``parent_assistant_id`` are scalar
         linkage fields on the record. They must be accessible without
-        requiring a freeze guard (CLAUDE.md "Scalar-Only Fields Need No
-        Guard")."""
+        requiring a freeze guard: ``frozen=True`` leaves container contents
+        mutable through the attribute reference, so container fields are
+        deep-frozen in ``__post_init__`` while scalar-only fields need no
+        guard."""
         parent_id = uuid4()
         record = ChatMessageRecord(
             id=uuid4(),

@@ -778,9 +778,9 @@ def create_server(
 
         def _capture_plugin_crash(exc: Exception) -> None:
             nonlocal status, error_class, error_message
-            # PLUGIN_CRASH path. CLAUDE.md "Plugin Ownership": let
-            # the exception propagate. Record the crash before re-raise
-            # so the audit trail captures the bug.
+            # PLUGIN_CRASH path. Per docs/guides/data-trust-and-error-handling.md
+            # §Plugin Ownership: let the exception propagate. Record the crash
+            # before re-raise so the audit trail captures the bug.
             status = ComposerToolStatus.PLUGIN_CRASH
             error_class = type(exc).__name__
             error_message = type(exc).__name__

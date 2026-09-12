@@ -98,8 +98,12 @@ the inline first-fence deadline requirement, the fence's SQLite formatting
 exception, and corresponding consequences and clock pins below. Database
 custody, aware UTC, separate Landscape/Sessions domains, forensic-clock
 freedom, and the prohibition on caller-clock injection remain in force.
-The implementation and verification plan is
-[Landscape lease clocks](../../plans/2026-09-08-landscape-lease-clock.md).
+The implementation and verification plan — "Landscape lease clocks",
+2026-09-08 — has been retired from the active public docs and is retrievable
+from git history. The 0.8.1 entry of the [changelog](../../../CHANGELOG.md)
+records the resulting behaviour: lease deadlines are issued after locked
+admission rather than from a clock sampled before it, and sink-effect clocks
+are sampled after their lease locks.
 
 ### Evidence and limits
 

@@ -3050,7 +3050,9 @@ def _pipeline_public_metadata(authority: AuthoritativePipelineProposal) -> Pipel
 def _interpretation_event_record_from_row(row: Any) -> InterpretationEventRecord:
     """Convert a SQLAlchemy row to an InterpretationEventRecord.
 
-    Per the Tier-1 audit-trust contract (CLAUDE.md), this conversion crashes
+    Per the Tier-1 audit-trust contract
+    (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
+    this conversion crashes
     loudly on any anomaly — the enum constructors raise ValueError on an
     unrecognised string, and the UUID/datetime constructors raise on
     malformed values. The schema CHECK constraints guarantee the closed-
@@ -6141,8 +6143,10 @@ class SessionServiceImpl:
         messages whose visible ``content`` was rewritten by runtime
         preflight redaction. It MUST be persisted as supplied —
         silently discarding it would regress the pre-rev-4
-        ``add_message`` behaviour and create audit-data loss (per
-        CLAUDE.md, silent wrong results are worse than a crash).
+        ``add_message`` behaviour and create audit-data loss (silent wrong
+        results are worse than a crash — see
+        docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model).
 
         If ``role == "tool"``, this helper additionally verifies that
         ``parent_assistant_id`` references an assistant row in the
@@ -6709,8 +6713,9 @@ class SessionServiceImpl:
             #    a separate ``AuditIntegrityError`` here would mask
             #    the original tool failure (which is what the operator
             #    needs to see). Record the audit failure via counter
-            #    + slog (the slog call is permitted under CLAUDE.md
-            #    primacy because the audit system itself failed —
+            #    + slog (the slog call is permitted under the
+            #    logging-telemetry-policy skill §Logging Policy
+            #    because the audit system itself failed —
             #    telemetry has nowhere to write the structured event)
             #    and return ``AuditOutcome(unwind_audit_failed=True)``
             #    so the caller can raise the captured plugin
@@ -6719,7 +6724,9 @@ class SessionServiceImpl:
             #
             # 2. ``plugin_crash_pending=False`` — the tool succeeded
             #    but the audit insert failed. This is a Tier-1 audit
-            #    corruption per CLAUDE.md doctrine: the system did
+            #    corruption per the trust model
+            #    (docs/guides/data-trust-and-error-handling.md §The
+            #    Three-Tier Trust Model): the system did
             #    work that it cannot prove it did. Returning a flag
             #    would let the caller proceed with corrupted audit
             #    state (synthesised review finding H1).
@@ -7356,8 +7363,9 @@ class SessionServiceImpl:
                     interpretation_review_disabled=bool(prior_row.interpretation_review_disabled),
                     updated_at=self._ensure_utc(prior_row.updated_at),
                 )
-                # Audit fires before state mutation per CLAUDE.md
-                # §"Telemetry and Logging" primacy rule. B1 (load-bearing):
+                # Audit fires before state mutation per the
+                # logging-telemetry-policy skill §The Primacy Test.
+                # B1 (load-bearing):
                 # the payload now carries ``prior_trust_mode`` so a
                 # downstream telemetry counter emitting
                 # ``{from_mode, to_mode}`` attributes remains a strict
@@ -8361,7 +8369,8 @@ class SessionServiceImpl:
         converts to ARG_ERROR. Genuine audit anomalies (missing state row,
         malformed structures) raise bare :class:`ValueError` and crash.
 
-        Per CLAUDE.md offensive-programming rules, the writer-boundary
+        Per the engine-patterns-reference skill §Offensive Programming
+        Examples, the writer-boundary
         validation reads the parent composition_states row inside the
         locked transaction and inspects its ``nodes`` JSON before INSERT —
         a malformed reference is a Tier-1 audit anomaly we crash on rather

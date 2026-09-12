@@ -281,9 +281,10 @@ function tutorialStep2ActiveSubstep(
  * Best-effort row-count from CSV-like text content.
  *
  * Returns `null` when the mime type is not CSV-shaped — we'd rather be honest
- * about not knowing than infer a misleading number (see CLAUDE.md "fabrication
- * decision test"). For text/csv we count newline-separated rows after
- * trimming, subtracting one for the header row when there is content.
+ * about not knowing than infer a misleading number: absence is evidence, and a
+ * fabricated count is indistinguishable from a measured one. For text/csv we
+ * count newline-separated rows after trimming, subtracting one for the header
+ * row when there is content.
  *
  * MIME normalisation: the input may be parameterised (e.g.
  * "text/csv; charset=utf-8" — a perfectly valid value the server may
@@ -2107,8 +2108,8 @@ export function ChatPanel({
         //   * The Tier-1 hash-invariant throw above lands here.
         // `console.error` follows the in-codebase frontend convention
         // (see App.tsx [preferences], CatalogDrawer.tsx, etc.) — it is
-        // NOT the backend `slog` channel (CLAUDE.md "Telemetry and
-        // Logging").  The audit trail of the failure itself lives on
+        // NOT the backend `slog` channel (the logging-telemetry-policy skill
+        // §Logging Policy).  The audit trail of the failure itself lives on
         // the server (blob-fetch attempts are recorded server-side);
         // this is the operational mirror so a developer opening
         // devtools sees the projection failure.

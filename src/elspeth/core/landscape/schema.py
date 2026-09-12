@@ -471,11 +471,12 @@ runs_table = Table(
     # under prime-order; source ∈ {"live", "bundled"} distinguishes
     # online-probed snapshots from the bundled litellm fallback.  Both
     # NOT NULL — see ``read_openrouter_catalog_snapshot_id`` for the
-    # reader the orchestrator uses to populate them.  Per CLAUDE.md
-    # Tier-1 doctrine no ``server_default`` is set: a synthetic
-    # placeholder in the audit trail would be indistinguishable from a
-    # real hash to any downstream reader, violating the fabrication
-    # test.  Production goes through :meth:`RunLifecycleRepository.begin_run`
+    # reader the orchestrator uses to populate them.  Under Tier-1 rules
+    # (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    # Model) no ``server_default`` is set: a synthetic placeholder in the
+    # audit trail would be indistinguishable from a real hash to any
+    # downstream reader, and a fabricated value is not evidence.
+    # Production goes through :meth:`RunLifecycleRepository.begin_run`
     # which validates both fields; direct ``runs_table.insert()`` from
     # test fixtures must supply them explicitly.
     Column("openrouter_catalog_sha256", String(64), nullable=False),

@@ -109,9 +109,11 @@ NOT be unified.**
   control surface*.
 
 These answer different audit questions. **Sanitizing the error-path hash
-would be fabrication** under CLAUDE.md's fabrication test: the audit
-record would attest to a normalized value (`None`) the external system
-never sent, erasing the very anomaly the error record exists to capture.
+would be fabrication** under the decision test
+(docs/guides/data-trust-and-error-handling.md §The Decision Test): the
+audit record would attest to a normalized value (`None`) the external
+system never sent, erasing the very anomaly the error record exists to
+capture.
 
 The three `repr_hash` fallbacks in `data_flow_repository.py` **stay**.
 They are load-bearing: they hash raw Tier-3 data that genuinely can
@@ -196,7 +198,8 @@ algorithm — matching the orchestrator telemetry path.
 
 **Rejected because:** It would sanitize the row **before** the error-path
 hash, making `validation_errors.row_hash` attest to a normalized value
-the external system never sent — fabrication under the CLAUDE.md test, and
+the external system never sent — fabrication under the decision test
+(docs/guides/data-trust-and-error-handling.md §The Decision Test), and
 the destruction of the raw-anomaly fingerprint the error record exists to
 preserve. It would also change emitted hash *values* (a schema-semantics
 migration that breaks historical reproducibility, baselines, and fixtures)

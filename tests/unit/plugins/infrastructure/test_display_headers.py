@@ -536,7 +536,8 @@ class TestInitDisplayHeaders:
     def test_raises_if_output_contract_not_set(self) -> None:
         """Sinks must call super().__init__() before init_display_headers().
 
-        Per CLAUDE.md offensive programming: direct attribute access crashes
+        Per the ``engine-patterns-reference`` skill §Offensive Programming
+        Examples: direct attribute access crashes
         with AttributeError if _output_contract is missing — no defensive
         try/except wrapping.
         """

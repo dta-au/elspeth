@@ -3819,9 +3819,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   ) {
     const { activeSessionId, guidedSession, guidedNextTurn, compositionState } = get();
     // Offensive guards: caller must not invoke without an active session
-    // or before guidedSession is loaded.  Per CLAUDE.md "proactively detect
-    // invalid states and throw meaningful exceptions" — silent ?. would
-    // mask a UI bug (ChatInput rendered with no guided session attached).
+    // or before guidedSession is loaded.  Per the engine-patterns-reference
+    // skill §Offensive Programming Examples, detect invalid states and throw
+    // meaningful exceptions — a silent ?. would mask a UI bug (ChatInput
+    // rendered with no guided session attached).
     if (activeSessionId === null) {
       throw new Error("chatGuided called without active session");
     }

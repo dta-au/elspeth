@@ -2437,7 +2437,8 @@ class TestMultiSourceResumeContractDispatch:
     schemas legitimately differ (e.g., a fan-in pipeline merging
     ``orders`` and ``refunds``) were validated under whichever
     contract happened to be returned first by the SQL query — a
-    Tier-1 audit-integrity violation per CLAUDE.md.
+    Tier-1 audit-integrity violation (see
+    docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
 
     These tests pin the post-ADR-025 behaviour through the PUBLIC
     resume path (``RecoveryManager.get_resume_point`` +
@@ -2454,8 +2455,9 @@ class TestMultiSourceResumeContractDispatch:
        (no regression on the legitimate-single case).
     4. The ``ResumeState`` dataclass has no singular
        ``schema_contract`` field (introspected via
-       ``dataclasses.fields``, not ``hasattr`` — ``hasattr`` is
-       banned per CLAUDE.md).
+       ``dataclasses.fields``, not ``hasattr`` — ``hasattr`` is banned by
+       docs/guides/data-trust-and-error-handling.md §The Defensive
+       Programming Prohibition).
     """
 
     @staticmethod
@@ -2819,8 +2821,9 @@ class TestMultiSourceResumeContractDispatch:
 
         Future-proof against typo-restorations: introspect the dataclass
         fields directly via ``dataclasses.fields`` rather than
-        ``hasattr`` (which is banned per CLAUDE.md because it swallows
-        @property exceptions). A regression that re-adds a singular
+        ``hasattr`` (which is banned because it swallows @property exceptions —
+        see the ``engine-patterns-reference`` skill §hasattr Alternatives).
+        A regression that re-adds a singular
         field will be visible immediately.
         """
         import dataclasses

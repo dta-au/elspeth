@@ -9,13 +9,19 @@
 ## Context
 
 Through RC5.2 the pipeline source surface was singular by contract and by
-code. The CLAUDE.md project overview still records the rule verbatim:
+code. The CLAUDE.md project overview recorded the rule at the time of
+this decision, condensed here:
 *"Source: Load data — exactly 1 per run."* `ElspethSettings` carried a
 single `source: SourceSettings`, `ExecutionGraph.from_plugin_instances`
 took one `source` keyword argument, and every downstream consumer
 (orchestrator, processor, audit trail, composer, redaction policy,
 runbooks, runtime contract) modelled the pipeline as exactly one
 producer feeding zero-or-more transforms feeding one-or-more sinks.
+
+**Current implementation note (2026-09-11):** that CLAUDE.md line no
+longer exists. It left the tracked tree when CLAUDE.md was untracked at
+commit `6d5a930c6` (2026-06-05), and the CLAUDE.md re-tracked at commit
+`90539384d` (2026-07-28) states no source-cardinality rule.
 
 The RC6 branch (`feat/multi-source-token-scheduler`) adds first-class
 multi-source ingestion: a pipeline may declare N named sources, fan-in
@@ -119,7 +125,8 @@ by code**. The singular `source` surface is deleted, not deprecated.
    the same commit that lands the structural fix. A YAML that supplies
    `source:` instead of `sources:` is a configuration error, not a
    shim activation. ELSPETH has no users yet; no compatibility path
-   is preserved (CLAUDE.md: *No Legacy Code Policy*).
+   is preserved (CONTRIBUTING.md §Code Standards: *no legacy shims or
+   backwards compatibility*).
 
 2. **`build_execution_graph` takes plural sources only.** The
    `legacy_single_source_invocation` branch
@@ -156,11 +163,13 @@ by code**. The singular `source` surface is deleted, not deprecated.
    loud chokepoint downstream. (Closes G2 / elspeth-01942858c3.)
 
    *Doctrine note (2026-05-23): Tier-1 graceful refuse via a typed
-   upstream-interpretable exception is in-scope — the CLAUDE.md
-   doctrine forbids implicit fabrication (e.g., `.get(k, default)`
-   pitching the decision to an untrusted provider), not explicit
-   exception-raising for graceful upstream management. A future
-   refactor (filigree elspeth-4b61252164) may strengthen this to a
+   upstream-interpretable exception is in-scope — the defensive-
+   programming prohibition (see
+   docs/guides/data-trust-and-error-handling.md) forbids implicit
+   fabrication (e.g., `.get(k, default)` pitching the decision to an
+   untrusted provider), not explicit exception-raising for graceful
+   upstream management. A future refactor (filigree
+   elspeth-4b61252164) may strengthen this to a
    discriminated-union return type so the empty case becomes
    literally unrepresentable at the type level rather than
    runtime-rejected.*
@@ -361,14 +370,15 @@ validator, and the `populate_legacy_source_view` shim. Document the
 singular surface as the "simple path" for tutorials and the plural
 surface as the "advanced path" for fan-in.
 
-**Rejected because:** The *No Legacy Code Policy* (CLAUDE.md) is
-unconditional and the project's compensating control is *we have no
-users yet*. A documented escape hatch is exactly the *"both old and
-new branches"* anti-pattern the policy forbids; the existence of two
-paths through `build_execution_graph` is the source of the dual-truth
-critique the reviewers raised. The composer-skill consequence is
-also asymmetric: teaching the LLM that the singular form *is also
-valid* leaks back into engine call sites that defensively accept
+**Rejected because:** The *No Legacy Code Policy* (CONTRIBUTING.md
+§Code Standards) is unconditional and the project's compensating
+control is *we have no users yet*. A documented escape hatch is
+exactly the *"both old and new branches"* anti-pattern the policy
+forbids; the existence of two paths through `build_execution_graph`
+is the source of the dual-truth critique the reviewers raised. The
+composer-skill consequence is also asymmetric: teaching the LLM that
+the singular form *is also valid* leaks back into engine call sites
+that defensively accept
 both, which reproduces the present state.
 
 ## Tickets this ADR covers / unblocks
@@ -458,7 +468,8 @@ true; each ticket is then a focused fix)
 ### Documentation / governance follow-ups (RC6 publish gate, not merge gate)
 
 - **G13 / elspeth-2409a7c7bf** — `CLAUDE.md "exactly 1 source per
-  run"` (correct for RC5.2 today; update on RC6 ship).
+  run"` (correct for RC5.2 when this ADR was written; update on RC6
+  ship).
 - **G14 / elspeth-e4cf92586c** — Single-source doc corpus stale
   (omnibus, 6 files enumerated in consolidation note).
 - **G15 / elspeth-bc91898548** — `docs/release/guarantees.md §7.1`
@@ -569,9 +580,10 @@ true; each ticket is then a focused fix)
 
 ### Project policies
 
-- `CLAUDE.md` — *No Legacy Code Policy*, *Three-Tier Trust Model* (the
-  Tier-1 audit-integrity rule that the arbitrary `schema_contract`
-  pick violated).
+- `CONTRIBUTING.md` §Code Standards — *No Legacy Code Policy*.
+- `docs/guides/data-trust-and-error-handling.md` §The Three-Tier Trust
+  Model — the Tier-1 audit-integrity rule that the arbitrary
+  `schema_contract` pick violated.
 - `docs/reference/configuration.md` — pre-1.0 Landscape schema policy.
 - `CHANGELOG.md` — the 0.6.0 multi-source and scheduler release record.
 

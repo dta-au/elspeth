@@ -532,7 +532,8 @@ def _find_merged_token_id(db: LandscapeDB, run_id: str) -> str:
 class TestUnionMergeFieldProvenance:
     """Verify union_field_origins reaches the audit trail AND the explain() API.
 
-    Covers both concerns raised by CLAUDE.md's attributability standard:
+    Covers both concerns raised by the attributability standard
+    (``engine-patterns-reference`` skill §The Attributability Test):
 
     * **Audit trail surface**: the underlying ``node_states.context_after_json``
       column captures ``union_field_origins`` and ``union_field_collisions``.
@@ -562,7 +563,8 @@ class TestUnionMergeFieldProvenance:
           * Calling ``explain(run_id, token_id=merged_token_id)`` and then
             drilling into each consumed parent token's ``LineageResult`` exposes
             the same provenance via ``NodeState.context_after_json`` — the API
-            contract auditors rely on under CLAUDE.md's attributability standard.
+            contract auditors rely on under the attributability standard
+            (``engine-patterns-reference`` skill §The Attributability Test).
 
         This exercises the production code path:
         ExecutionGraph.from_plugin_instances -> Orchestrator.run -> CoalesceExecutor
@@ -649,7 +651,8 @@ class TestUnionMergeFieldProvenance:
         assert ctx["merge_strategy"] == "union"
 
         # ─────────────────────────────────────────────────────────────────
-        # explain() API contract: CLAUDE.md attributability standard
+        # explain() API contract: the attributability standard
+        # (engine-patterns-reference skill §The Attributability Test)
         # ─────────────────────────────────────────────────────────────────
         # The audit trail (above) holds the data, but the attributability
         # standard is specifically about the explain(recorder, run_id, token_id)
@@ -698,7 +701,7 @@ class TestUnionMergeFieldProvenance:
 
         assert provenance_via_explain is not None, (
             "explain() did not surface union_field_origins on any parent token's "
-            "node_states. This breaks CLAUDE.md's attributability standard — "
+            "node_states. This breaks the attributability standard — "
             "auditors cannot reach field provenance through the explain() API."
         )
 

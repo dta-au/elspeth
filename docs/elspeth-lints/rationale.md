@@ -28,13 +28,16 @@ when a second maintainer is assigned.
 
 ### Trust Tier
 
-The trust-tier rules enforce the data manifesto and the layer model described
-in [CLAUDE.md](../../CLAUDE.md). They catch defensive access patterns such as
-silent `.get()` fallbacks on data ELSPETH owns, plus imports that flow upward
-through the L0-L3 architecture. A missed violation can turn a corruption bug
-into quiet behavior: a missing Tier-1 field becomes `None`, an invalid external
-value travels too far before validation, or a lower layer learns about a higher
-layer that should have depended on it instead.
+The trust-tier rules enforce the three-tier trust model described in
+[Data Trust and Error Handling](../guides/data-trust-and-error-handling.md)
+and the layer model in the `engine-patterns-reference` skill §Layer
+Architecture & Dependency Analysis. They catch defensive access patterns such
+as silent `.get()` fallbacks on data ELSPETH owns, plus imports that flow
+upward through the L0-L3 architecture. A missed violation can turn a
+corruption bug into quiet behavior: a missing Tier-1 field becomes
+`None`, an invalid external value travels too far before validation, or
+a lower layer learns about a higher layer that should have depended on
+it instead.
 
 This family came from repeated boundary bugs where the type system expressed an
 invariant but runtime code still treated the value as untrusted. The rule is

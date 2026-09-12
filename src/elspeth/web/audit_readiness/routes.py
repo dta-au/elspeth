@@ -81,8 +81,9 @@ def create_audit_readiness_router() -> APIRouter:
         # a read-path-health signal: emit telemetry, then re-raise
         # so the exception still propagates to FastAPI's default
         # error handling (we deliberately do not swallow into a 200).
-        # Telemetry-only signal under CLAUDE.md non-decision read
-        # superset exception — no companion audit event is required.
+        # Telemetry-only signal under the non-decision read exemption in the
+        # logging-telemetry-policy skill §The Superset Rule — no companion
+        # audit event is required.
         try:
             try:
                 result = await service.compute_snapshot(

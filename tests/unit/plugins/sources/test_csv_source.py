@@ -162,7 +162,8 @@ class TestCSVSource:
     def test_has_plugin_version(self) -> None:
         """CSVSource has explicit plugin_version for audit trail.
 
-        Per CLAUDE.md auditability standard: every decision must be traceable
+        Per the auditability principle (ARCHITECTURE.md §Design Principles):
+        every decision must be traceable
         to source data, configuration, AND code version. The plugin_version
         attribute is recorded in the Landscape audit trail's nodes table.
         """

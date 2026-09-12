@@ -46,10 +46,11 @@ recurring smells:
 - **Three-read attributability for routed-and-sunk.** Under ADR-018, an auditor
   asking "did row 42 succeed?" must read the audit terminal (`ROUTED`), the
   gate event (was it MOVE or DIVERT?), and the sink event (was the write
-  durable?) to confirm. CLAUDE.md's Auditability Standard and the
-  attributability test (`explain(recorder, run_id, token_id)` must prove
-  complete lineage in one call) assume the audit terminal carries the
-  lifecycle answer in one read.
+  durable?) to confirm. ELSPETH's auditability standard (ARCHITECTURE.md
+  §Design Principles) and the attributability test (the
+  `engine-patterns-reference` skill §The Attributability Test —
+  `explain(recorder, run_id, token_id)` must prove complete lineage in one
+  call) assume the audit terminal carries the lifecycle answer in one read.
 
 The team has already factored lifecycle and provenance as two axes on the
 **counter** side (`ExecutionCounters.rows_routed_success` is provenance;
@@ -107,8 +108,6 @@ mapping table below.
 | `ROUTED_ON_ERROR` | `True` | `FAILURE` | `ON_ERROR_ROUTED` | `rows_failed`, `rows_routed_failure` | Yes |
 | `DROPPED_BY_FILTER` | `True` | `SUCCESS` | `FILTER_DROPPED` | `rows_succeeded` | Yes |
 | `COALESCED` | `True` | `SUCCESS` | `COALESCED` | `rows_succeeded`, `rows_coalesced` (structural) | Predicate only (`rows_coalesced` not re-derived) |
-
-A consumed member of a closer's release — a coalesce branch input, and (META-32, 2026-08-25) a collector member consumed into its group's release — also carries `(SUCCESS, COALESCED)` but with `sink_name` NULL, and is deliberately uncounted (`is_counted_coalesced_output`); a collector's released output is an ordinary `(SUCCESS, DEFAULT_FLOW)` row, so a collector-only run leaves `rows_coalesced` at 0.
 | `FAILED` | `True` | `FAILURE` | `UNROUTED` | `rows_failed` | Yes |
 | `QUARANTINED` | `True` | `FAILURE` | `QUARANTINED_AT_SOURCE` | `rows_quarantined`, `rows_failed` | Yes |
 | `DIVERTED` (failsink) | `True` | `TRANSIENT` | `SINK_FALLBACK_TO_FAILSINK` | `rows_diverted` (structural) | No |
@@ -117,6 +116,9 @@ A consumed member of a closer's release — a coalesce branch input, and (META-3
 | `EXPANDED` | `True` | `TRANSIENT` | `EXPAND_PARENT` | `rows_expanded` (structural) | No |
 | `CONSUMED_IN_BATCH` | `True` | `TRANSIENT` | `BATCH_CONSUMED` | (deferred — counted at flush) | N/A — flush-time outcome carries the predicate role |
 | `BUFFERED` | `False` | `NULL` | `BUFFERED` | `rows_buffered` (structural, non-terminal) | No |
+
+**Note on `COALESCED`.**
+A consumed member of a closer's release — a coalesce branch input, and (META-32, 2026-08-25) a collector member consumed into its group's release — also carries `(SUCCESS, COALESCED)` but with `sink_name` NULL, and is deliberately uncounted (`is_counted_coalesced_output`); a collector's released output is an ordinary `(SUCCESS, DEFAULT_FLOW)` row, so a collector-only run leaves `rows_coalesced` at 0.
 
 > **Note on `DIVERTED` two-flavor split.** `RowOutcome.DIVERTED` is a single
 > enum value today used for two materially different cases. **Failsink mode**
@@ -225,9 +227,9 @@ layer — both create a paired `NodeStateStatus.COMPLETED` `node_state` for the
 same `token_id` at a different node, plus a registered `artifacts` row. Only
 the producer knows whether "transform's work failed but routing succeeded"
 versus "original sink-write failed but failsink absorbed." The audit DB
-cannot recover that distinction. CLAUDE.md's Auditability Standard ("no
-inference — if it's not recorded, it didn't happen") forecloses the
-reconstruction.
+cannot recover that distinction. ELSPETH's auditability standard
+(ARCHITECTURE.md §Design Principles) — no inference: if it is not
+recorded, it did not happen — forecloses the reconstruction.
 
 **Classification rationale (descriptive, not derivational):** a `TRANSIENT`
 token has its row's lifecycle answer durably recorded *elsewhere* — either
@@ -292,13 +294,25 @@ the two-axis model and the public counter surface that
 `RunResult.__post_init__` (`src/elspeth/contracts/run_result.py:77-142`)
 consumes to derive `RunStatus` (the four-value taxonomy made publicly
 visible at `/api/runs/{rid}` by commit `cc895589`). The Mapping table at
-lines 99-115 above IS this contract; read it by `(outcome, path)` as the
+lines 102-118 above IS this contract; read it by `(outcome, path)` as the
 key. The accumulator at
 `src/elspeth/engine/orchestrator/outcomes.py:235-307` is the authoritative
 implementation; any deviation between the table and the accumulator is a
 bug to fix in the accumulator, not a permitted hidden behavior.
 
 #### Behavior change at the contract layer
+
+**Current implementation note (2026-09-11):** both accumulator behaviour
+changes described below shipped with the migration — see the dated closure
+note under §Migration policy. `(SUCCESS, GATE_ROUTED)` increments
+`rows_succeeded` AND `rows_routed_success`, and `(FAILURE, ON_ERROR_ROUTED)`
+increments `rows_failed` AND `rows_routed_failure`, in
+`TERMINAL_PAIR_COUNTER_EFFECTS`
+(`src/elspeth/engine/orchestrator/counter_classification.py`), which
+`outcomes.py` applies; `RunResult` enforces the pairing as an invariant
+(`rows_routed_success` must be a subset of `rows_succeeded`). The "Live code
+on RC5 does NOT yet match" framing below records the pre-migration state as it
+stood on 2026-05-04, not a present divergence.
 
 Two existing accumulator behaviors change under the new model to align
 producer emissions with the canonical predicate
@@ -353,6 +367,16 @@ predicate-input counters. Structural counters (`rows_coalesced`, `rows_forked`,
 all-rows-already-processed branch (preserving ADR-018 line 70-82 nuance).
 
 ### Migration policy
+
+**Current implementation note (2026-09-11):** the five-stage migration below
+shipped. Stage 5 — the final sweep that deletes the temporary `RowOutcome`
+derivable view — landed in commit `159a6fcb4` ("feat(adr-019): complete stage 5
+migration cleanup", 2026-05-06). `TerminalOutcome` and `TerminalPath` are the
+live contract types in `src/elspeth/contracts/enums.py`, and `RowOutcome` has
+no remaining references under `src/`. The staged plan, the migration-surface
+estimates and the re-grep instructions below are the historical execution
+record of that programme; they are not the current inventory and not current
+execution instructions.
 
 ELSPETH's pre-1.0 Landscape schema policy in
 `docs/reference/configuration.md` applies to the Landscape audit store.
@@ -546,11 +570,12 @@ of the mapping table above; a future change requires an ADR amendment.
 
 1. **`QUARANTINED` path naming.** **Verdict: distinct (`QUARANTINED_AT_SOURCE`
    vs `UNROUTED`).** Source-side coercion failure is a Tier 3 trust-boundary
-   outcome (CLAUDE.md "Three-Tier Trust Model"); transform-time unrouted
-   failure is a Tier 2 outcome. Collapsing them erases the trust-tier
-   provenance an auditor needs to distinguish "the input failed" from "our
-   routing config has a gap." Operator-UI argument for collapsing is L9
-   (parameter) and does not drive an L6 (information-structure) decision.
+   outcome (docs/guides/data-trust-and-error-handling.md §The Three-Tier
+   Trust Model); transform-time unrouted failure is a Tier 2 outcome.
+   Collapsing them erases the trust-tier provenance an auditor needs to
+   distinguish "the input failed" from "our routing config has a gap."
+   Operator-UI argument for collapsing is L9 (parameter) and does not
+   drive an L6 (information-structure) decision.
 
 2. **`DROPPED_BY_FILTER`.** **Verdict: `outcome=SUCCESS, path=FILTER_DROPPED`.**
    The transform's intent was to drop the row — the row succeeded at being
@@ -655,6 +680,16 @@ are insufficient when the claim references audit-table sequencing.
   motivated ADR-018.
 
 ## Implementation Notes
+
+**Historical record — fenced 2026-09-11.** This section is the original
+2026-05-04 implementation plan, preserved as written. The migration it plans
+completed at stage 5, commit `159a6fcb4` (2026-05-06). Its numbered steps,
+source line references and invariant-translation table describe that historical
+programme; they are not current execution instructions and not a current
+inventory of the code. §Related Decisions above already records the
+invariant-translation table below as the ORIGINAL 2026-05-04 design left
+unchanged as historical record — this note extends the same fence to the whole
+section.
 
 The implementation surface, in order of dependency:
 

@@ -185,7 +185,8 @@ class FilesystemPayloadStore:
                         or if resolved path escapes base_path
         """
         # Validate hash format - must be exactly 64 lowercase hex characters.
-        # Per CLAUDE.md Tier 1 rules: crash immediately on invalid audit data.
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, Tier 1 rules require crashing immediately on invalid audit data.
         # ``fullmatch`` (not ``match``) because Python's ``$`` would accept a
         # trailing newline — see the _SHA256_HEX_PATTERN comment above.
         if not _SHA256_HEX_PATTERN.fullmatch(content_hash):

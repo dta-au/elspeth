@@ -19,9 +19,10 @@ from elspeth.web.config import WebSettings
 from elspeth.web.middleware.rate_limit import check_auth_rate_limit
 
 # Operational signal for over-limit auth failures whose durable audit write was
-# skipped. Per logging-telemetry-policy this is a "drop rate" — meta-operational,
-# telemetry-only — so the suppression is never silent even though the audit row
-# is intentionally capped. NOT slog (forbidden for operational metrics).
+# skipped. This is a "drop rate" — meta-operational, telemetry-only under the
+# system-health exemption in the logging-telemetry-policy skill §The Superset
+# Rule — so the suppression is never silent even though the audit row is
+# intentionally capped. NOT slog (forbidden for operational metrics).
 _AUTH_FAILURE_AUDIT_SUPPRESSED_TOTAL = metrics.get_meter(__name__).create_counter(
     "auth_failure_audit.suppressed_total",
     description="Auth-failure audit writes skipped because the per-client rate limit was exceeded.",

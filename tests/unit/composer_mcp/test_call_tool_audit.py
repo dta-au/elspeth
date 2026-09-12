@@ -521,8 +521,9 @@ async def test_plugin_crash_path_records_before_reraise() -> None:
         probe = _ProbeRecorder()
         server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         # Patch the dispatcher seam to raise a plain RuntimeError —
-        # the canonical "plugin bug" shape per CLAUDE.md "Plugin
-        # Ownership". Anything other than ToolArgumentError /
+        # the canonical "plugin bug" shape per
+        # docs/guides/data-trust-and-error-handling.md §Plugin
+        # Ownership. Anything other than ToolArgumentError /
         # (ValueError, KeyError, TypeError) flows through the
         # PLUGIN_CRASH except branch.
         with patch(

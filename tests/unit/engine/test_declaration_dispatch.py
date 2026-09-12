@@ -12,7 +12,8 @@ rather than short-circuiting on first-fire, and at loop end:
   * >=2 violations → wraps in ``AggregateDeclarationContractViolation``.
 
 Plugin-bug exceptions (non-audit-evidence ``RuntimeError`` / ``KeyError``)
-propagate unmodified per CLAUDE.md plugin-ownership posture.
+propagate unmodified per the plugin-ownership posture
+(docs/guides/data-trust-and-error-handling.md §Plugin Ownership).
 """
 
 from __future__ import annotations
@@ -202,7 +203,8 @@ class _RaisesSecondViolationContract(DeclarationContract):
 
 class _ApplyRaisesContract(DeclarationContract):
     """Simulates a buggy contract whose applies_to raises — must propagate
-    unmodified per CLAUDE.md plugin-ownership posture."""
+    unmodified per the plugin-ownership posture
+    (docs/guides/data-trust-and-error-handling.md §Plugin Ownership)."""
 
     name = "apply_raises"
     payload_schema: type = _Payload
@@ -289,7 +291,8 @@ def test_dispatch_propagates_violation() -> None:
 
 
 def test_dispatch_propagates_unexpected_exception_from_applies_to() -> None:
-    """Reviewer B17 / CLAUDE.md plugin-ownership posture: a buggy contract
+    """Reviewer B17 / the plugin-ownership posture
+    (docs/guides/data-trust-and-error-handling.md §Plugin Ownership): a buggy contract
     must crash loudly. Non-audit-evidence exceptions from ``applies_to``
     propagate unmodified — they are NOT caught by the audit-complete
     collection branch."""

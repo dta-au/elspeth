@@ -20,8 +20,9 @@ key ``__elspeth_type__`` are escaped via ``_escape_reserved_keys()`` before
 encoding, preventing incorrect deserialization.
 
 This replaces the old shape-based tag ``{"__datetime__": iso_string}`` which
-could collide with user data matching the same shape. Per CLAUDE.md No Legacy
-Code Policy, the old tag format is not supported during deserialization.
+could collide with user data matching the same shape. Per the no-legacy-shims
+rule (CONTRIBUTING.md §Code Standards), the old tag format is not supported
+during deserialization.
 
 This is distinct from canonical_json() which:
 1. Is designed for hashing (normalized output)
@@ -30,7 +31,7 @@ This is distinct from canonical_json() which:
 
 Checkpoint serialization needs round-trip fidelity, not canonical form.
 
-Per CLAUDE.md:
+Per the engine-patterns-reference skill §Canonical JSON:
 - NaN/Infinity are rejected (audit integrity)
 - datetime must round-trip correctly (type fidelity)
 """
@@ -95,7 +96,8 @@ class CheckpointEncoder(json.JSONEncoder):
     (int/float/bool), mirroring canonical_json's normalization. numpy-ness is not
     semantic data.
 
-    NaN and Infinity are rejected per CLAUDE.md audit integrity requirements.
+    NaN and Infinity are rejected for audit integrity (see the
+    engine-patterns-reference skill §Canonical JSON).
     """
 
     def default(self, obj: Any) -> Any:
@@ -270,7 +272,8 @@ def checkpoint_dumps(obj: Any) -> str:
     Preserves rich types (datetime, Decimal, date, time, bytes, UUID) using
     collision-safe type envelopes; numpy scalars convert to Python primitives.
     Escapes user dicts that coincidentally contain the reserved key.
-    Rejects NaN/Infinity per CLAUDE.md audit integrity requirements.
+    Rejects NaN/Infinity for audit integrity (see the
+    engine-patterns-reference skill §Canonical JSON).
 
     Args:
         obj: Data structure to serialize (typically aggregation state)
