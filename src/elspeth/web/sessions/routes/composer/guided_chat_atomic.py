@@ -2526,9 +2526,7 @@ async def post_guided_chat_schema8(
                         raise exc from settlement_exc
                     raise
                 else:
-                    if failure_code == "integrity_error":
-                        raise
-                    raise guided_operation_failure_error(failed)
+                    raise guided_operation_failure_error(failed) from exc
             finally:
                 await lease_guard.finish_active_exception()
         if rejoin_after_lock:

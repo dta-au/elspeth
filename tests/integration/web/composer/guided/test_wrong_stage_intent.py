@@ -29,7 +29,6 @@ from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentEditAction,
     DeferredIntentManagementAction,
 )
-from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.intent_management import deferred_intent_management_option
 from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved
@@ -2074,7 +2073,7 @@ def test_pair_with_rejected_transition_still_retains_and_says_so(
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _pair_sink_provider(valid_sink, _action()))
 
     def _forced_rejection(*_args: object, **_kwargs: object) -> object:
-        raise InvariantError("forced pair transition failure")
+        raise ValueError("forced pair response rejection")
 
     monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", _forced_rejection)
     response = _post(

@@ -317,12 +317,13 @@ def test_uploaded_bind_integrity_failure_fails_the_operation_closed(
 
     monkeypatch.setattr(guided_chat_atomic, "_prepare_step_1_uploaded_source_bind", break_bind)
 
-    with pytest.raises(error_type) as caught:
-        client.post(
-            f"/api/sessions/{session_id}/guided/chat",
-            json=_chat_body(initial_turn, _UPLOAD_SENTINEL.format(filename="inventory.csv")),
-        )
-    assert caught.value is primary
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(initial_turn, _UPLOAD_SENTINEL.format(filename="inventory.csv")),
+    )
+    assert response.status_code == 500
+    assert response.json()["detail"]["failure_code"] == "integrity_error"
+    assert str(primary) not in response.text
     assert _guided(client, session_id)["composition_state"]["sources"] == {}
 
 
