@@ -376,6 +376,33 @@ def test_admitted_state_is_detached_from_mutable_raw_inputs():
     assert json.dumps(admitted.to_wire()) == LEGACY_WIRES["full"]
 
 
+@pytest.mark.parametrize("case", ["sources", "full", "named_authoring"])
+@pytest.mark.parametrize("proxy", [False, True])
+def test_state_response_constructor_detaches_sources_backing(case, proxy):
+    admitted = _contract().admit(json.loads(LEGACY_WIRES[case]))
+    backing = dict(admitted.value.sources)
+    rebuilt = replace(admitted.value, sources=MappingProxyType(backing) if proxy else backing)
+    expected_names = tuple(backing)
+    backing.clear()
+    assert tuple(rebuilt.sources) == expected_names
+    assert json.dumps(_contract().admit(rebuilt).to_wire()) == LEGACY_WIRES[case]
+    with pytest.raises(TypeError):
+        rebuilt.sources["new"] = None
+
+
+@pytest.mark.parametrize("case", ["full", "authoring"])
+def test_state_response_constructor_detaches_sequence_arguments(case):
+    admitted = _contract().admit(json.loads(LEGACY_WIRES[case]))
+    nodes = list(admitted.value.nodes)
+    edges = list(admitted.value.edges)
+    outputs = list(admitted.value.outputs)
+    rebuilt = replace(admitted.value, nodes=nodes, edges=edges, outputs=outputs)
+    nodes.clear()
+    edges.clear()
+    outputs.clear()
+    assert json.dumps(_contract().admit(rebuilt).to_wire()) == LEGACY_WIRES[case]
+
+
 def test_admitted_state_and_nested_configuration_are_immutable():
     from elspeth.web.composer.tools.state_responses import SourceStateResponse
 

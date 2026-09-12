@@ -11,7 +11,7 @@ from typing import Literal
 from pydantic import JsonValue, TypeAdapter
 
 from elspeth.contracts.errors import FrameworkBugError
-from elspeth.contracts.freeze import FrozenJsonArray
+from elspeth.contracts.freeze import FrozenJsonArray, freeze_fields
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse, ResponseContract
 from elspeth.web.composer.state import EdgeSpec, EdgeType, NodeSpec, NodeType, OutputSpec, SourceSpec
@@ -27,6 +27,9 @@ from elspeth.web.composer.tools._common import (
 @dataclass(frozen=True, slots=True)
 class SourceStateResponse:
     sources: Mapping[str, SourceSpec]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "sources")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +64,9 @@ class FullStateResponse:
     metadata: StateMetadata
     inspection: StateInspection
 
+    def __post_init__(self) -> None:
+        freeze_fields(self, "sources", "nodes", "outputs", "edges")
+
 
 @dataclass(frozen=True, slots=True)
 class AuthoringSource:
@@ -76,6 +82,9 @@ class AuthoringStateResponse:
     metadata: StateMetadata
     source: AuthoringSource | None
     sources: Mapping[str, AuthoringSource] | None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "nodes", "edges", "outputs", "sources")
 
 
 type PipelineStateResponse = SourceStateResponse | NodeStateResponse | OutputStateResponse | FullStateResponse | AuthoringStateResponse
