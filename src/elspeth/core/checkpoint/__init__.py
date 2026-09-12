@@ -12,7 +12,7 @@ Provides:
 """
 
 from elspeth.contracts import ResumeCheck, ResumePoint
-from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator, IncompatibleCheckpointError
+from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager
 from elspeth.core.checkpoint.recovery import (
     GroupBindingView,
@@ -35,7 +35,6 @@ __all__ = [
     "GroupBindingView",
     "GroupSatisfiabilityResumeGate",
     "GroupUnsatisfiableResumeError",
-    "IncompatibleCheckpointError",
     "IncompleteTokenSpec",
     "NonResumableRunError",
     "RecoveryManager",

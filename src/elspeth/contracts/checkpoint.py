@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from elspeth.contracts.audit import Checkpoint
@@ -49,6 +50,24 @@ class CheckpointDraft:
         require_int(self.format_version, "CheckpointDraft.format_version", min_value=0)
 
 
+class ResumeRefusalCause(StrEnum):
+    """Cause observed by a resume, abandon, or export admission decision."""
+
+    RUN_NOT_FOUND = "run_not_found"
+    RUN_TERMINAL = "run_terminal"
+    RUN_NOT_RUNNING = "run_not_running"
+    LEADER_LIVE = "leader_live"
+    RUN_NOT_FINALIZED = "run_not_finalized"
+    CHECKPOINT_MISSING = "checkpoint_missing"
+    CHECKPOINT_NOT_LATEST = "checkpoint_not_latest"
+    CHECKPOINT_FORMAT_MISSING = "checkpoint_format_missing"
+    CHECKPOINT_FORMAT_INCOMPATIBLE = "checkpoint_format_incompatible"
+    CHECKPOINT_TOPOLOGY_CHANGED = "checkpoint_topology_changed"
+    SOURCE_NOT_EXHAUSTED = "source_not_exhausted"
+    GROUP_UNSATISFIABLE = "group_unsatisfiable"
+    EXPORT_ALREADY_COMPLETED = "export_already_completed"
+
+
 @dataclass(frozen=True, slots=True)
 class ResumeCheck:
     """Result of checking if a run can be resumed.
@@ -59,12 +78,17 @@ class ResumeCheck:
 
     can_resume: bool
     reason: str | None = None
+    cause: ResumeRefusalCause | None = None
 
     def __post_init__(self) -> None:
         if self.can_resume and self.reason is not None:
             raise ValueError("can_resume=True should not have a reason")
         if not self.can_resume and self.reason is None:
             raise ValueError("can_resume=False must have a reason explaining why")
+        if self.can_resume and self.cause is not None:
+            raise ValueError("can_resume=True must not have a cause")
+        if not self.can_resume and not isinstance(self.cause, ResumeRefusalCause):
+            raise ValueError("can_resume=False must have a ResumeRefusalCause")
 
 
 @dataclass(frozen=True, slots=True)

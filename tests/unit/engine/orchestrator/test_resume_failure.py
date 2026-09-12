@@ -21,7 +21,7 @@ from pydantic import BaseModel, ValidationError
 
 from elspeth.contracts import Checkpoint, NodeID, PluginSchema, ResumedRow, ResumePoint, RoutingMode, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenOutcome
-from elspeth.contracts.checkpoint import ResumeCheck
+from elspeth.contracts.checkpoint import ResumeCheck, ResumeRefusalCause
 from elspeth.contracts.coordination import CoordinationSnapshot, CoordinationToken
 from elspeth.contracts.enums import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
@@ -472,10 +472,11 @@ class TestResumeFinalizesAsFailed:
 
         with (
             patch("elspeth.engine.orchestrator.resume.RecorderFactory") as recorder_factory,
-            pytest.raises(NonResumableRunError, match="missing format_version"),
+            pytest.raises(NonResumableRunError, match="missing format_version") as exc_info,
         ):
             orch._resume_coordinator.reconstruct_resume_state(resume_point, MagicMock(spec=PayloadStore))
 
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_FORMAT_MISSING
         recorder_factory.assert_not_called()
 
     def test_resume_failure_finalizes_run_as_failed(self) -> None:

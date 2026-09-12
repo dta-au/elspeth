@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from elspeth.core.landscape.factory import RecorderFactory
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.checkpoint import ResumeCheck, ResumeRefusalCause
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.engine.orchestrator.schema_reconstruction import (
     _create_schema_model as _create_schema_model,
@@ -298,8 +299,8 @@ def export_landscape(
         sink.close()
 
 
-def audit_export_resume_refusal(run: object | None, run_id: str) -> str | None:
-    """Return why ``run`` cannot have its audit export resumed, or None if it can.
+def audit_export_resume_refusal(run: Run | None, run_id: str) -> ResumeCheck:
+    """Return the observed admission verdict for resuming this run's audit export.
 
     Fail-closed eligibility gate shared by :func:`resume_audit_export` and its
     production drivers (elspeth-8fd1f415b9): resume applies only to runs that
@@ -309,13 +310,21 @@ def audit_export_resume_refusal(run: object | None, run_id: str) -> str | None:
     from elspeth.core.landscape.export_read_model import _EXPORT_TERMINAL
 
     if run is None:
-        return f"run {run_id!r} not found in the audit database"
-    status = run.status  # type: ignore[attr-defined]
+        return ResumeCheck(False, f"run {run_id!r} not found in the audit database", ResumeRefusalCause.RUN_NOT_FOUND)
+    status = run.status
     if status not in _EXPORT_TERMINAL:
-        return f"run {run_id!r} has status {status.value!r}, which is not export-terminal; audit export resume requires a finalized run"
-    if run.export_status is ExportStatus.COMPLETED:  # type: ignore[attr-defined]
-        return f"run {run_id!r} audit export already completed; refusing to re-run publication"
-    return None
+        return ResumeCheck(
+            False,
+            f"run {run_id!r} has status {status.value!r}, which is not export-terminal; audit export resume requires a finalized run",
+            ResumeRefusalCause.RUN_NOT_FINALIZED,
+        )
+    if run.export_status is ExportStatus.COMPLETED:
+        return ResumeCheck(
+            False,
+            f"run {run_id!r} audit export already completed; refusing to re-run publication",
+            ResumeRefusalCause.EXPORT_ALREADY_COMPLETED,
+        )
+    return ResumeCheck(True)
 
 
 def _audit_export_resume_target_refusal(
@@ -373,8 +382,9 @@ def resume_audit_export(
     PENDING -> FAILED (with the error recorded) on failure.
 
     Raises:
-        ValueError: If export is not enabled, the run does not exist, the run
-            is not export-terminal, or its export already completed.
+        ValueError: If export is disabled or its target identity is incompatible.
+        NonResumableRunError: If the run is missing, is not export-terminal,
+            its export already completed, or export leadership is refused.
         Exception: Re-raises any export failure after recording FAILED status.
     """
     from elspeth.core.landscape.factory import RecorderFactory
@@ -387,16 +397,19 @@ def resume_audit_export(
     factory = RecorderFactory(db, payload_store=payload_store)
     run = factory.run_lifecycle.get_run(run_id)
     refusal = audit_export_resume_refusal(run, run_id)
-    if refusal is not None:
-        raise ValueError(refusal)
+    if not refusal.can_resume:
+        from elspeth.core.checkpoint.recovery import NonResumableRunError
+
+        assert refusal.reason is not None and refusal.cause is not None
+        raise NonResumableRunError(run_id, refusal.reason, cause=refusal.cause)
     assert run is not None
-    refusal = _audit_export_resume_target_refusal(
+    target_refusal = _audit_export_resume_target_refusal(
         run,
         settings,
         factory.execution.sink_effects.get_effects_for_run(run_id),
     )
-    if refusal is not None:
-        raise ValueError(refusal)
+    if target_refusal is not None:
+        raise ValueError(target_refusal)
 
     # ADR-048 §4: an operator action that cannot take the seat must not write
     # the row. The export seat is a leader seat on a finalized run — no status

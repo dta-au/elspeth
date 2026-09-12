@@ -553,7 +553,7 @@ files:
   src/elspeth/plugins/transforms/rag/query.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/rag/transform.py:
-    dict[str, Any]: 6
+    dict[str, Any]: 5
   src/elspeth/plugins/transforms/reference_join.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
@@ -1015,6 +1015,6 @@ totals:
   Mapping[str, object]: 290
   MutableMapping[str, Any]: 13
   boundary: 64
-  dict[str, Any]: 1141
+  dict[str, Any]: 1140
   dict[str, object]: 399
-  soft: 2704
+  soft: 2703

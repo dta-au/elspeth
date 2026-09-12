@@ -31,6 +31,7 @@ FrameworkBugError = tier_1_error(
 )(_FrameworkBugError)
 
 if TYPE_CHECKING:
+    from elspeth.contracts.checkpoint import ResumeRefusalCause
     from elspeth.contracts.coalesce_metadata import CoalesceMetadata
     from elspeth.contracts.coordination import RegisteredWorker
 
@@ -1252,18 +1253,16 @@ class AbandonRefusedError(Exception):
     :class:`~elspeth.core.checkpoint.recovery.NonResumableRunError`.
     """
 
-    def __init__(self, run_id: str, reason: str) -> None:
+    def __init__(self, run_id: str, reason: str, *, cause: "ResumeRefusalCause") -> None:
         self.run_id = run_id
         self.reason = reason
+        self.cause = cause
         super().__init__(f"Cannot abandon run {run_id!r}: {reason}")
 
 
-# The audit DB write lock is held by a live or frozen process, so the takeover
-# CAS could not even begin (SQLITE_BUSY after the busy_timeout poll). NOT
-# "leadership held": ADR-030 §B.4 requires BUSY to be reported distinctly from a
-# clean CAS loss. The remediation is operator SIGKILL of the wedged holder
-# (locks release on process death); registered-worker forensics remain structured
-# on the exception for trusted operator surfaces.
+# ADR-030 §B.4 distinguishes write contention from a clean seat-CAS loss.
+# Registration records identify candidates for local operator investigation,
+# not confirmed lock holders. Generic error surfaces omit those records.
 # TIER-2: Operator-actionable environmental refusal — a held WAL write lock surfaced with pid forensics for remediation; the audit DB is intact, not corruption.
 class WriteLockHeldError(Exception):
     """Raised when a coordination write times out on the audit DB write lock.
@@ -1272,13 +1271,15 @@ class WriteLockHeldError(Exception):
     leader): a busy timeout means some process — live or frozen — holds the
     WAL write lock. Carries the run's registered workers (pid/hostname/role
     forensics from ``run_workers``) as structured data for trusted operator
-    surfaces, while the default string is safe for generic CLI/API error paths.
+    surfaces. The local CLI explicitly renders these candidates; the default
+    string remains safe for generic API and logging paths.
 
     Attributes:
         run_id: The run whose coordination write was refused.
         workers: Registered ``run_workers`` rows for the run at refusal time
             (read on a plain read connection; WAL readers don't block on the
-            writer). May be empty if the registry could not be read.
+            writer). Empty means no rows were available or the registry could
+            not be read. Records may be stale and may omit the actual holder.
     """
 
     def __init__(self, *, run_id: str, workers: tuple["RegisteredWorker", ...]) -> None:
@@ -1287,10 +1288,10 @@ class WriteLockHeldError(Exception):
         worker_count = len(workers)
         worker_label = "registered worker" if worker_count == 1 else "registered workers"
         super().__init__(
-            f"The audit DB write lock is held by a live or frozen process; the "
-            f"coordination write for run {run_id!r} timed out at BEGIN IMMEDIATE. "
-            f"Registered workers: {worker_count} {worker_label}. If a worker is frozen inside a "
-            "transaction, SIGKILL it (SQLite locks release on process death) and retry."
+            f"The audit database write lock prevented a coordination write for run {run_id!r}. "
+            f"Registered workers: {worker_count} {worker_label}. "
+            "Inspect the database writer and verify its process identity before stopping it; "
+            "retry after the lock is released."
         )
 
 
@@ -1599,7 +1600,7 @@ class PluginRetryableError(Exception):
     Deliberate engine-classified carve-out: the processor additionally treats
     the Python runtime's canonical transient transport signals —
     ``ConnectionError`` and ``TimeoutError`` — and the contract-owned
-    ``CapacityError`` (``retryable`` always True) as retryable, because they
+    ``CapacityError`` as retryable by nominal classification, because they
     can surface from beneath provider SDKs without a plugin seam to classify
     them. No other unclassified exception is retried; in particular bare
     ``OSError`` (``FileNotFoundError``, ``PermissionError``, ...) is a plugin
@@ -1634,7 +1635,6 @@ class RuntimePreflightFailedError(AuditEvidenceBase, Exception):
         self.cause_type = type(cause).__name__
         retryable_cause = cast(PluginRetryableError, cause) if issubclass(type(cause), PluginRetryableError) else None
         self.retryable = retryable_cause.retryable if retryable_cause is not None else False
-        self.status_code = retryable_cause.status_code if retryable_cause is not None else None
         message = (
             f"{self.error_class}: {plugin_name} provider {provider} failed runtime preflight "
             f"before row processing: {self.cause_type}: {cause}"
@@ -2207,7 +2207,14 @@ class DependencyFailedError(Exception):
 
 # TIER-2: Commencement gate failure signal — config-driven pre-flight check rejected the run; not a framework bug or audit corruption.
 class CommencementGateFailedError(Exception):
-    """A commencement gate evaluated to falsy or raised an error."""
+    """A commencement gate evaluated to falsy or raised an error.
+
+    Note:
+        Raw ``context_snapshot`` is retained for programmatic inspection, but
+        deliberately excluded from generic messages, CLI output and telemetry
+        because its nested values may contain sensitive context. Retention does
+        not imply that failed snapshots are persisted in the audit trail.
+    """
 
     def __init__(
         self,
@@ -2297,7 +2304,6 @@ class CapacityError(Exception):
 
     Attributes:
         status_code: HTTP status code that triggered this error
-        retryable: Always True for capacity errors
     """
 
     def __init__(self, status_code: int, message: str) -> None:
@@ -2305,7 +2311,6 @@ class CapacityError(Exception):
             raise ValueError(f"CapacityError.status_code must be a valid HTTP status (100-599), got {status_code}")
         super().__init__(message)
         self.status_code = status_code
-        self.retryable = True
 
 
 # TIER-2: telemetry-subsystem configuration/initialization failure.

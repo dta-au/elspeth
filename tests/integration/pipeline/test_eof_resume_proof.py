@@ -46,6 +46,7 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts import Determinism, PipelineRow, ResumePoint, RunStatus
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
@@ -53,6 +54,7 @@ from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import AggregationName
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
+from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
@@ -517,7 +519,9 @@ class TestExhaustedSourceEOFResume:
         assert check.can_resume is False
         assert check.reason is not None
         assert "primary=interrupted" in check.reason
-        assert recovery.get_resume_point(run_id, graph) is None
+        with pytest.raises(NonResumableRunError) as exc_info:
+            recovery.get_resume_point(run_id, graph)
+        assert exc_info.value.cause is ResumeRefusalCause.SOURCE_NOT_EXHAUSTED
 
         # resume() is advisory-independent: a hand-built ResumePoint that
         # skips can_resume must still be refused by the enforcing guard.

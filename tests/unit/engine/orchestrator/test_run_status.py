@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 import pytest
 
 from elspeth.contracts.audit import TokenOutcome
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.enums import FrameKind, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.events import RunCompletionStatus
@@ -285,7 +286,10 @@ class TestAssertBoundGroupsSettledFromAudit:
         reason = "1 bound-group member(s) can never settle — expand group 'grp-1' member 'mem-1' at closer 'stitch'"
         self._wire(
             monkeypatch,
-            GroupSatisfiabilityResumeGate(unsatisfiable_members=(member,), check=_ResumeCheck(can_resume=False, reason=reason)),
+            GroupSatisfiabilityResumeGate(
+                unsatisfiable_members=(member,),
+                check=_ResumeCheck(can_resume=False, reason=reason, cause=ResumeRefusalCause.GROUP_UNSATISFIABLE),
+            ),
         )
         with pytest.raises(OrchestrationInvariantError) as exc_info:
             assert_bound_groups_settled_from_audit(self._DB, "run-1", self._GRAPH)  # type: ignore[arg-type]

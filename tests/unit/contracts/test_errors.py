@@ -274,6 +274,10 @@ class TestWriteLockHeldError:
         assert "active" not in message
         assert "4242" not in message
         assert "build-host.internal" not in message
+        assert "SIGKILL" not in message
+        assert "kill -9" not in message
+        assert "BEGIN IMMEDIATE" not in message
+        assert "verify its process identity" in message
 
 
 class TestRunWorkerEvictedError:

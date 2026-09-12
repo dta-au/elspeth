@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import PipelineRow, ResumedRow, RunStatus
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
@@ -623,7 +624,8 @@ class ResumeCoordinator:
         format_check = CheckpointCompatibilityValidator().validate_format_version(resume_point.checkpoint)
         if not format_check.can_resume:
             assert format_check.reason is not None
-            raise NonResumableRunError(resume_point.checkpoint.run_id, format_check.reason)
+            assert format_check.cause is not None
+            raise NonResumableRunError(resume_point.checkpoint.run_id, format_check.reason, cause=format_check.cause)
 
         # Stage 1 — READ-ONLY reconstruction (no durable mutation).
         snapshot = self._load_resume_audit_snapshot(resume_point, payload_store, worker_id=worker_id)
@@ -938,11 +940,12 @@ class ResumeCoordinator:
         guarded_run_id = resume_point.checkpoint.run_id
         run_status, status_check = check_run_status_resumable(self._db, guarded_run_id)
         if not status_check.can_resume:
+            assert status_check.reason is not None and status_check.cause is not None
             if run_status is not None and run_status in _IMMUTABLE_SUCCESS_RUN_STATUSES:
                 refusal_reason = f"Run is terminal (status {run_status.value!r}); successful terminal runs are immutable"
             else:
-                refusal_reason = status_check.reason or f"Run status {run_status!r} precludes resume"
-            raise NonResumableRunError(guarded_run_id, refusal_reason)
+                refusal_reason = status_check.reason
+            raise NonResumableRunError(guarded_run_id, refusal_reason, cause=status_check.cause)
 
         # ---- resume() entry guard, part 2: checkpoint currency + topology ----
         # (elspeth-5129406607) RecoveryManager.get_resume_point() is ADVISORY
@@ -956,9 +959,8 @@ class ResumeCoordinator:
         # checkpoint fields from a hand-built ResumePoint. Both are READ-ONLY
         # refusals fired before the first mutation (prepare_for_run /
         # rebase_sequence / the seat CAS in reconstruct_resume_state),
-        # mirroring the status guard above. A format-incompatible checkpoint
-        # row (IncompatibleCheckpointError from get_latest_checkpoint)
-        # propagates as-is — structured, fail-closed.
+        # mirroring the status guard above. Format incompatibility is refused
+        # by the validator below; corrupt persisted checkpoint data propagates.
         if self._checkpoint_manager is None:
             raise OrchestrationInvariantError(
                 "CheckpointManager is required for resume - Orchestrator must be initialized with checkpoint_manager"
@@ -968,6 +970,7 @@ class ResumeCoordinator:
             raise NonResumableRunError(
                 guarded_run_id,
                 "run has no checkpoint rows; the supplied resume point cannot be validated as the run's resume baseline",
+                cause=ResumeRefusalCause.CHECKPOINT_MISSING,
             )
         if (
             latest_checkpoint.checkpoint_id != resume_point.checkpoint.checkpoint_id
@@ -978,12 +981,15 @@ class ResumeCoordinator:
                 f"supplied checkpoint '{resume_point.checkpoint.checkpoint_id}' (sequence {resume_point.sequence_number}) "
                 f"is not the run's latest resume point '{latest_checkpoint.checkpoint_id}' "
                 f"(sequence {latest_checkpoint.sequence_number})",
+                cause=ResumeRefusalCause.CHECKPOINT_NOT_LATEST,
             )
         topology_check = CheckpointCompatibilityValidator().validate(latest_checkpoint, graph)
         if not topology_check.can_resume:
+            assert topology_check.reason is not None and topology_check.cause is not None
             raise NonResumableRunError(
                 guarded_run_id,
-                topology_check.reason or "checkpoint topology is incompatible with the current execution graph",
+                topology_check.reason,
+                cause=topology_check.cause,
             )
 
         # ---- resume() entry guard, part 3: group satisfiability (spec §8) ----

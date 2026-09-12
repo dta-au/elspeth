@@ -66,6 +66,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationSnapshot,
@@ -857,6 +858,7 @@ class RunCoordinationRepository:
             raise NonResumableRunError(
                 run_id,
                 f"run leadership is held by {prior_worker!r} (seat expires {expiry_text})",
+                cause=ResumeRefusalCause.LEADER_LIVE,
             )
         new_epoch = int(seat.leader_epoch) + 1
         token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
@@ -986,7 +988,9 @@ class RunCoordinationRepository:
         if run_status == RunStatus.RUNNING.value:
             from elspeth.core.checkpoint.recovery import NonResumableRunError
 
-            raise NonResumableRunError(run_id, "run is not terminal; its running leader owns finalization")
+            raise NonResumableRunError(
+                run_id, "run is not terminal; its running leader owns finalization", cause=ResumeRefusalCause.RUN_NOT_FINALIZED
+            )
         if run_status not in _EXPORT_SEAT_RUN_STATUSES:
             raise AuditIntegrityError(
                 f"Cannot acquire export leadership: run {run_id} is {run_status!r}, not terminal. "
@@ -1016,6 +1020,7 @@ class RunCoordinationRepository:
             raise NonResumableRunError(
                 run_id,
                 f"run leadership is held by {prior_worker!r} (seat expires {expiry_text})",
+                cause=ResumeRefusalCause.LEADER_LIVE,
             )
         new_epoch = int(seat.leader_epoch) + 1
         token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)

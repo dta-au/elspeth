@@ -13,6 +13,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -116,7 +117,7 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
         self.input_schema, self.output_schema = self._create_schemas(cfg.schema_config, schema_name)
         self._recorder: PluginAuditWriter | None = None
         self._run_id = ""
-        self._telemetry_emit: Callable[[Any], None] = lambda _event: None
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = lambda _event: None
         self._sdk_client: Any | None = None
 
     @property

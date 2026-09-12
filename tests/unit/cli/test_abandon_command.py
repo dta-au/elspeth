@@ -22,7 +22,7 @@ from typer.testing import CliRunner
 
 from elspeth.cli import _emit_leaderless_run_guidance, _emit_not_resumable_event, app
 from elspeth.contracts import NodeType, RunStatus
-from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck
+from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck, ResumeRefusalCause
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import IncompleteSourceResumeError
 from elspeth.core.checkpoint import CheckpointManager
@@ -386,7 +386,9 @@ class TestResumePreflightAbandonHint:
         monkeypatch.setattr(
             RecoveryManager,
             "can_resume",
-            lambda self, run_id, graph: ResumeCheck(can_resume=False, reason="source lifecycle is incomplete (primary=loading)"),
+            lambda self, run_id, graph: ResumeCheck(
+                can_resume=False, reason="source lifecycle is incomplete (primary=loading)", cause=ResumeRefusalCause.SOURCE_NOT_EXHAUSTED
+            ),
         )
 
         result = runner.invoke(app, ["resume", RUN_ID, "--settings", str(settings_file)])
@@ -405,7 +407,9 @@ class TestResumePreflightAbandonHint:
         monkeypatch.setattr(
             RecoveryManager,
             "can_resume",
-            lambda self, run_id, graph: ResumeCheck(can_resume=False, reason="Run is in progress under live leader"),
+            lambda self, run_id, graph: ResumeCheck(
+                can_resume=False, reason="Run is in progress under live leader", cause=ResumeRefusalCause.LEADER_LIVE
+            ),
         )
 
         result = runner.invoke(app, ["resume", RUN_ID, "--settings", str(settings_file)])

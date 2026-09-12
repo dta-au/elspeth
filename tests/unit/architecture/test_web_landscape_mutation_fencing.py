@@ -740,7 +740,10 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 #   + engine/orchestrator/abandon.py _acquire_leaderless_run_seat -> factory.run_coordination.acquire_run_leadership#1
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_coordination.release_seat#1
 _EXPECTED_CALL_COUNT = 275
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "d0824a8cd25f6e8d537549a6a9b77465dd4e8b4153a7f5b2cedb8273f9ba7017"
+# Dataverse lifecycle observation wraps load(); its six unchanged validation
+# writes now belong to _load_rows. Reversing only those six symbol names in
+# the complete live scanner output restores the prior digest exactly.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "3247bfa5da30f249af1c6b8f82fcc5a88ad0d97aa7ed879b47dfaa4499d1ad7e"
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 136
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "0561dddd71e704031510290def021516e75e0d0668316c25a6e659ad2702c6fe"
 _EXPECTED_COORDINATION_CALL_COUNT = 25
@@ -8416,7 +8419,7 @@ def _acquire_run_leadership_on(self, conn: Connection, *, run_id: str, worker_id
         from elspeth.core.checkpoint.recovery import NonResumableRunError
         held_expiry = seat.leader_heartbeat_expires_at
         expiry_text = 'unknown' if held_expiry is None else _utc(held_expiry).isoformat()
-        raise NonResumableRunError(run_id, f'run leadership is held by {prior_worker!r} (seat expires {expiry_text})')
+        raise NonResumableRunError(run_id, f'run leadership is held by {prior_worker!r} (seat expires {expiry_text})', cause=ResumeRefusalCause.LEADER_LIVE)
     new_epoch = int(seat.leader_epoch) + 1
     token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
     record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
@@ -8451,7 +8454,7 @@ def _acquire_export_leadership_on(self, conn: Connection, *, run_id: str, worker
     run_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one_or_none()
     if run_status == RunStatus.RUNNING.value:
         from elspeth.core.checkpoint.recovery import NonResumableRunError
-        raise NonResumableRunError(run_id, 'run is not terminal; its running leader owns finalization')
+        raise NonResumableRunError(run_id, 'run is not terminal; its running leader owns finalization', cause=ResumeRefusalCause.RUN_NOT_FINALIZED)
     if run_status not in _EXPORT_SEAT_RUN_STATUSES:
         raise AuditIntegrityError(f"Cannot acquire export leadership: run {run_id} is {run_status!r}, not terminal. An audit export is re-driven only for a finalized run; a RUNNING run is its leader's.")
     prior_worker: str | None = seat.leader_worker_id
@@ -8461,7 +8464,7 @@ def _acquire_export_leadership_on(self, conn: Connection, *, run_id: str, worker
         from elspeth.core.checkpoint.recovery import NonResumableRunError
         held_expiry = seat.leader_heartbeat_expires_at
         expiry_text = 'unknown' if held_expiry is None else _utc(held_expiry).isoformat()
-        raise NonResumableRunError(run_id, f'run leadership is held by {prior_worker!r} (seat expires {expiry_text})')
+        raise NonResumableRunError(run_id, f'run leadership is held by {prior_worker!r} (seat expires {expiry_text})', cause=ResumeRefusalCause.LEADER_LIVE)
     new_epoch = int(seat.leader_epoch) + 1
     token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
     record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
@@ -8570,6 +8573,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
         "timedelta": "datetime.timedelta",
         "RunStatus": "elspeth.contracts.enums.RunStatus",
         "NonResumableRunError": "elspeth.core.checkpoint.recovery.NonResumableRunError",
+        "ResumeRefusalCause": "elspeth.contracts.checkpoint.ResumeRefusalCause",
         "_leader_deadline_key": "elspeth.core.landscape.run_coordination_repository._leader_deadline_key",
         "_utc": "elspeth.core.landscape.run_coordination_repository._utc",
         "select": "sqlalchemy.select",
@@ -8593,6 +8597,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
         "record_coordination_event": "elspeth.core.landscape.run_coordination_repository.record_coordination_event",
         "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
         "NonResumableRunError": "elspeth.core.checkpoint.recovery.NonResumableRunError",
+        "ResumeRefusalCause": "elspeth.contracts.checkpoint.ResumeRefusalCause",
         "timedelta": "datetime.timedelta",
         "RunStatus": "elspeth.contracts.enums.RunStatus",
         "_leader_deadline_key": "elspeth.core.landscape.run_coordination_repository._leader_deadline_key",

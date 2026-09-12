@@ -20,8 +20,9 @@ Value objects threaded through the leader/follower coordination protocol
   followers learn of seat handover on their existing cadence (§A.3;
   consumed by the slice-4 heartbeat thread).
 - :class:`RegisteredWorker` — forensic registry row surfaced by the §B.4
-  BUSY-takeover diagnostic (``WriteLockHeldError``): pid is the one forensic
-  column with a functional consumer (the operator's SIGKILL target).
+  BUSY-takeover diagnostic (``WriteLockHeldError``). The local CLI presents
+  registered candidates, including host and PID; these may be stale and do
+  not establish the identity of the database lock holder.
 """
 
 from __future__ import annotations

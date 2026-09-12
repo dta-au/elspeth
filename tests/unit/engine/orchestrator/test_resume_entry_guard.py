@@ -38,6 +38,7 @@ from typing import Any, cast
 import pytest
 
 from elspeth.contracts import Checkpoint, RunStatus
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError
 from elspeth.core.checkpoint.recovery import NonResumableRunError, check_run_status_resumable
@@ -188,6 +189,7 @@ class TestCheckRunStatusResumable:
         assert run_status is None
         assert check.can_resume is False
         assert check.reason == "Run missing not found"
+        assert check.cause is ResumeRefusalCause.RUN_NOT_FOUND
 
     @pytest.mark.parametrize(
         ("status", "reason"),
@@ -207,6 +209,7 @@ class TestCheckRunStatusResumable:
         run_status, check = check_run_status_resumable(db, "run-x")
         assert run_status is status
         assert check.can_resume is False
+        assert check.cause is ResumeRefusalCause.RUN_TERMINAL
         assert check.reason == reason
 
     def test_running_with_absent_seat_is_resumable_in_slice_4(self, db: LandscapeDB) -> None:
@@ -293,6 +296,7 @@ class TestResumeEntryGuard:
             )
 
         assert exc_info.value.run_id == "run-running"
+        assert exc_info.value.cause is ResumeRefusalCause.LEADER_LIVE
         assert "in progress" in exc_info.value.reason
         assert checkpoints.rebase_calls == [], "entry guard must fire BEFORE rebase_sequence (the first mutation)"
         assert _run_status_of(db, "run-running") == RunStatus.RUNNING.value
@@ -402,6 +406,7 @@ class TestResumeEntryGuard:
             )
 
         assert exc_info.value.run_id == "run-gone"
+        assert exc_info.value.cause is ResumeRefusalCause.RUN_NOT_FOUND
         assert checkpoints.rebase_calls == []
 
     @pytest.mark.parametrize(
@@ -434,6 +439,7 @@ class TestResumeEntryGuard:
 
         assert exc_info.value.run_id == run_id
         assert status.value in exc_info.value.reason
+        assert exc_info.value.cause is ResumeRefusalCause.RUN_TERMINAL
         assert "immutable" in exc_info.value.reason
         assert checkpoints.rebase_calls == [], "terminal refusal must fire BEFORE rebase_sequence (the first mutation)"
         assert _run_status_of(db, run_id) == status.value
@@ -485,6 +491,7 @@ class TestResumeCheckpointCurrencyGuard:
             )
 
         assert exc_info.value.run_id == "run-no-cp"
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_MISSING
         assert checkpoints.rebase_calls == [], "refusal must fire BEFORE rebase_sequence (the first mutation)"
 
     def test_stale_checkpoint_id_refused_before_any_mutation(self, db: LandscapeDB) -> None:
@@ -504,6 +511,7 @@ class TestResumeCheckpointCurrencyGuard:
             )
 
         assert "cp-old" in exc_info.value.reason
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_NOT_LATEST
         assert "cp-latest" in exc_info.value.reason
         assert checkpoints.rebase_calls == []
 
@@ -520,13 +528,14 @@ class TestResumeCheckpointCurrencyGuard:
             latest=_latest_checkpoint("run-stale-seq", checkpoint_id="cp-1", sequence_number=9),
         )
 
-        with pytest.raises(NonResumableRunError, match=r"not the run's latest resume point"):
+        with pytest.raises(NonResumableRunError, match=r"not the run's latest resume point") as exc_info:
             coordinator.resume(
                 _full_resume_point("run-stale-seq", checkpoint_id="cp-1", sequence_number=7),
                 cast(Any, None),
                 cast(Any, None),
                 payload_store=MockPayloadStore(),
             )
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_NOT_LATEST
 
         assert checkpoints.rebase_calls == []
 
@@ -559,6 +568,7 @@ class TestResumeCheckpointCurrencyGuard:
             )
 
         assert exc_info.value.run_id == "run-topo-drift"
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED
         assert checkpoints.rebase_calls == []
 
     def test_stored_latest_topology_refused_even_when_hand_built_resume_point_claims_current_hash(self, db: LandscapeDB) -> None:
@@ -592,6 +602,7 @@ class TestResumeCheckpointCurrencyGuard:
             )
 
         assert exc_info.value.run_id == "run-stored-topo-drift"
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED
         assert checkpoints.rebase_calls == []
 
     def test_current_checkpoint_and_matching_topology_admitted(self, db: LandscapeDB) -> None:

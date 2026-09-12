@@ -7,12 +7,13 @@ by CLI formatters for human-readable or structured output.
 
 import copy
 import dataclasses
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.enums import (
@@ -258,6 +259,99 @@ class TelemetryEvent:
         # the Any return type is for the recursive leaf cases.
         result: dict[str, Any] = _event_field_to_serializable(self)
         return result
+
+
+def _validate_statistics_identity(timestamp: datetime, run_id: str, node_id: str, plugin_name: str) -> None:
+    if type(timestamp) is not datetime or timestamp.utcoffset() is None:
+        raise ValueError("timestamp must be an aware datetime")
+    for field_name, value in (("run_id", run_id), ("node_id", node_id), ("plugin_name", plugin_name)):
+        if type(value) is not str or not value.strip() or len(value) > 256:
+            raise ValueError(f"{field_name} must be a bounded non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class DataverseLoadStatistics(TelemetryEvent):
+    """Observed source work at cleanup, not a declaration of run success.
+
+    Counts describe this source invocation only, not cross-resume totals.
+    Pages count audited fetches; rows_yielded counts valid source emissions,
+    not downstream acknowledgements. Rejections include discarded rows.
+    A suspended or closed generator is partial; failed means the source's
+    own work raised, whereas downstream failure does not change exhausted.
+    """
+
+    node_id: str
+    plugin_name: str
+    pages_fetched: int
+    rows_yielded: int
+    rows_rejected: int
+    load_state: Literal["not_started", "partial", "exhausted", "failed"]
+
+    def __post_init__(self) -> None:
+        _validate_statistics_identity(self.timestamp, self.run_id, self.node_id, self.plugin_name)
+        require_int(self.pages_fetched, "pages_fetched", min_value=0)
+        require_int(self.rows_yielded, "rows_yielded", min_value=0)
+        require_int(self.rows_rejected, "rows_rejected", min_value=0)
+        if self.load_state not in ("not_started", "partial", "exhausted", "failed"):
+            raise ValueError("load_state must describe observed source progress")
+        if self.load_state == "not_started" and (self.pages_fetched or self.rows_yielded or self.rows_rejected):
+            raise ValueError("not_started cannot carry observed work")
+
+
+@dataclass(frozen=True, slots=True)
+class RAGRetrievalStatistics(TelemetryEvent):
+    """Per-invocation retrieval throughput and best-score statistics.
+
+    No queries, retrieved content, collection names or error payloads leave
+    the plugin. Each nonempty accepted query contributes its best score once;
+    score_count is not a count of retrieved chunks. Missing score observations
+    remain unknown, not zero.
+    """
+
+    node_id: str
+    plugin_name: str
+    provider: str
+    total_queries: int
+    total_chunks: int
+    quarantine_count: int
+    score_count: int
+    score_mean: float | None
+    score_std: float | None
+
+    def __post_init__(self) -> None:
+        _validate_statistics_identity(self.timestamp, self.run_id, self.node_id, self.plugin_name)
+        if type(self.provider) is not str or not self.provider.strip() or len(self.provider) > 64:
+            raise ValueError("provider must be a bounded non-empty string")
+        require_int(self.total_queries, "total_queries", min_value=0)
+        require_int(self.total_chunks, "total_chunks", min_value=0)
+        require_int(self.quarantine_count, "quarantine_count", min_value=0)
+        require_int(self.score_count, "score_count", min_value=0)
+        if self.score_count > self.total_queries or self.score_count > self.total_chunks:
+            raise ValueError("score_count cannot exceed query or chunk observations")
+        if (self.score_mean is None) != (self.score_count == 0):
+            raise ValueError("score_mean is unknown exactly when score_count is zero")
+        if (self.score_std is None) != (self.score_count < 2):
+            raise ValueError("sample score_std is unknown exactly when fewer than two scores were observed")
+        for field_name, value in (("score_mean", self.score_mean), ("score_std", self.score_std)):
+            if value is not None and (type(value) not in (float, int) or not math.isfinite(value)):
+                raise ValueError(f"{field_name} must be finite when observed")
+        if self.score_std is not None and self.score_std < 0:
+            raise ValueError("score_std must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class ChromaWriteStatistics(TelemetryEvent):
+    """Per-invocation observed sink throughput, without collection content."""
+
+    node_id: str
+    plugin_name: str
+    total_written: int
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        _validate_statistics_identity(self.timestamp, self.run_id, self.node_id, self.plugin_name)
+        require_int(self.total_written, "total_written", min_value=0)
+        require_int(self.total_bytes, "total_bytes", min_value=0)
 
 
 _ENGINE_SPAN_ALLOWED_ATTRIBUTES: Mapping[EngineSpanName, frozenset[str]] = MappingProxyType(
