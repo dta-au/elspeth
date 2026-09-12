@@ -142,27 +142,6 @@ describe("inlineSourceStore", () => {
     expect(useInlineSourceStore.getState().getSummary("session-2")?.provenance).toBe("llm-generated");
   });
 
-  // --- Disambiguation re-fire guard tests (F-11) ---
-
-  it("addUserRequestedSingleRow stores the message ID and prevents re-check", () => {
-    useInlineSourceStore.getState().addUserRequestedSingleRow("msg-1");
-    expect(
-      useInlineSourceStore.getState().userRequestedSingleRowForMessageIds.has("msg-1"),
-    ).toBe(true);
-    expect(
-      useInlineSourceStore.getState().userRequestedSingleRowForMessageIds.has("msg-2"),
-    ).toBe(false);
-  });
-
-  // --- "Not source data" escape tests (F-10) ---
-
-  it("addNonSourceMessage stores the message ID", () => {
-    useInlineSourceStore.getState().addNonSourceMessage("msg-escape-1");
-    expect(
-      useInlineSourceStore.getState().nonSourceMessageIds.has("msg-escape-1"),
-    ).toBe(true);
-  });
-
   // --- Fallback-prompt dismiss persistence tests (F-20) ---
 
   it("markDismissed records a session-scoped dismissal timestamp", () => {

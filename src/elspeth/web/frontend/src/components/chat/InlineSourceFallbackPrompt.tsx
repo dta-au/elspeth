@@ -11,11 +11,9 @@
 // source has been proposed, a small affordance surfaces above the chat
 // input offering to create a source from the typed text directly.
 //
-// Cousin of InlineSourceCreatedTurn (Task 3, post-success informational)
-// and InlineSourceDisambiguationTurn (Task 4, pre-success interactive).
-// KEY DIFFERENCE from those: this widget renders OUTSIDE the chat message
-// stream — it lives above the ChatInput. The other two widgets live
-// inside the role="log" messages region; this one is an interactive
+// InlineSourceCreatedTurn (Task 3) renders post-success information inside
+// the role="log" messages region. This widget lives above ChatInput,
+// outside the chat message stream, as an interactive
 // affordance attached to the input control surface.
 //
 // Design constraints (load-bearing — do not change without re-reading the

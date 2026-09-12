@@ -323,6 +323,7 @@ def projected_tool_names() -> list[str]:
 def build_fixture() -> dict[str, Any]:
     """Redact every case through the live producer and assemble the fixture."""
     # Imported lazily so ``--help`` works without the package importable.
+    from elspeth.web.composer.proposals import build_tool_proposal_summary
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
@@ -343,10 +344,12 @@ def build_fixture() -> dict[str, Any]:
         ("set_pipeline_empty_options_replaying_current_state", "set_pipeline", empty_options),
     )
     for case_name, tool_name, arguments in (*CASES, *presence_cases):
+        redacted = redact_tool_call_arguments(tool_name, arguments, telemetry=telemetry)
         cases[case_name] = {
             "tool": tool_name,
             "arguments": arguments,
-            "redacted": redact_tool_call_arguments(tool_name, arguments, telemetry=telemetry),
+            "redacted": redacted,
+            "proposal_summary": build_tool_proposal_summary(tool_name=tool_name, arguments=arguments, redacted_arguments=redacted).summary,
         }
     return {
         "_comment": (

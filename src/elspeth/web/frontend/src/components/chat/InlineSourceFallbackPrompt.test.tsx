@@ -2,7 +2,7 @@
 // InlineSourceFallbackPrompt.test.tsx — Phase 5a Task 5
 //
 // Widget tests for the LLM-skip safety-net prompt. Mirrors the test shape of
-// InlineSourceCreatedTurn.test.tsx and InlineSourceDisambiguationTurn.test.tsx
+// InlineSourceCreatedTurn.test.tsx
 // — same role="region" surface, same load-bearing accessible-name pattern.
 //
 // The widget renders the fallback affordance ABOVE the chat input when the

@@ -4,18 +4,15 @@
 //
 // This store is a caching/projection layer, NOT a source of truth. The
 // derivation that populates it lives in the ChatPanel wiring (computed from
-// compositionState.sources + blob metadata). Three
+// compositionState.sources + blob metadata). The
 // downstream consumers read from here:
 //   - InlineSourceCreatedTurn — confirmation widget after creation.
-//   - InlineSourceDisambiguationTurn — ambiguous-input picker.
 //   - Audit-readiness panel surface — readiness row for inline source.
 //
-// The store has THREE responsibilities, intentionally co-located in one
+// The store has two responsibilities, intentionally co-located in one
 // container:
 //   1. Per-session inline-source summary projection (summariesBySession).
-//   2. Disambiguation-related message-ID sets (F-11 re-fire guard for
-//      "treat as single row"; F-10 escape for "this isn't source data").
-//   3. Per-session dismissal timestamp for the fallback prompt (F-20),
+//   2. Per-session dismissal timestamp for the fallback prompt (F-20),
 //      so a dismissed prompt does not re-fire within the same session
 //      regardless of predicate re-evaluation.
 // ============================================================================
@@ -151,18 +148,6 @@ interface InlineSourceState {
   clearSummary: (sessionId: string) => void;
   getSummary: (sessionId: string) => InlineSourceSummary | null;
 
-  // --- Disambiguation re-fire guard (F-11) ---
-  // Message IDs for which the user explicitly chose "treat as 1 row".
-  // The disambiguation predicate in ChatPanel skips these message IDs.
-  userRequestedSingleRowForMessageIds: Set<string>;
-  addUserRequestedSingleRow: (messageId: string) => void;
-
-  // --- "Not source data" escape (F-10) ---
-  // Message IDs for which the user explicitly chose "this isn't source data".
-  // The disambiguation predicate and fallback-prompt predicate skip these.
-  nonSourceMessageIds: Set<string>;
-  addNonSourceMessage: (messageId: string) => void;
-
   // --- Fallback-prompt dismiss persistence (F-20) ---
   // Keyed by sessionId. A dismissed fallback prompt must not re-fire
   // within the same session regardless of predicate re-evaluation.
@@ -184,21 +169,6 @@ export const useInlineSourceStore = create<InlineSourceState>((set, get) => ({
       return { summariesBySession: next };
     }),
   getSummary: (sessionId) => get().summariesBySession[sessionId] ?? null,
-
-  userRequestedSingleRowForMessageIds: new Set(),
-  addUserRequestedSingleRow: (messageId) =>
-    set((s) => ({
-      userRequestedSingleRowForMessageIds: new Set([
-        ...s.userRequestedSingleRowForMessageIds,
-        messageId,
-      ]),
-    })),
-
-  nonSourceMessageIds: new Set(),
-  addNonSourceMessage: (messageId) =>
-    set((s) => ({
-      nonSourceMessageIds: new Set([...s.nonSourceMessageIds, messageId]),
-    })),
 
   dismissedAt: new Map(),
   markDismissed: (sessionId) =>

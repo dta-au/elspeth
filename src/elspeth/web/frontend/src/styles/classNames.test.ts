@@ -195,16 +195,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
   "inline-source-fallback-prompt-accept":
     "Compact primary Button composing .btn-compact + .btn-primary (documented " +
     "in-file); the token is a per-instance hook.",
-  "inline-source-disambiguation-turn-confirm":
-    "Button variant=primary hook — .btn/.btn-primary carry the chrome; also " +
-    "the F-19 focus-on-mount target via a React ref, not a selector.",
-  "inline-source-disambiguation-turn-single":
-    "Button default-variant hook — .btn carries the chrome.",
-  "inline-source-disambiguation-turn-edit":
-    "Button default-variant hook — .btn carries the chrome.",
-  "inline-source-disambiguation-turn-not-source":
-    "Bare Button styled by the defined .link-button co-class (the F-10 " +
-    "link-style escape); the bespoke token is an identity hook.",
   "inline-source-created-turn-edit":
     "Bare Button styled by the defined .link-button co-class; the bespoke " +
     "token is an identity hook.",
@@ -345,15 +335,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
   "inline-source-created-turn-header":
     "Layout-neutral <header> wrapper; the child .inline-source-created-turn-" +
     "facts rule supplies the whole layout.",
-  "inline-source-disambiguation-turn-header":
-    "Layout-neutral <header> wrapper; its children (-title, -explainer, " +
-    "-input) carry the content treatment.",
-  "inline-source-disambiguation-turn-escape":
-    "Single-child presentational wrapper around the escape Button, " +
-    "documented in-file as presentational.",
-  "inline-source-disambiguation-turn-row":
-    "List item inheriting marker, indent and rhythm from the defined parent " +
-    "-rows rule — the list level is the treatment's correct home.",
   "chat-panel-guided-log":
     "Live-region/focus container addressed by a React ref; scroll ownership " +
     "belongs to .guided-authoring-scroll and each appended turn carries its " +

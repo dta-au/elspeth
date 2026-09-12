@@ -86,6 +86,12 @@ read-only preparation and reviews can run in parallel.
 - Prioritize correctness and useful teaching before performance optimization.
   No provider bypass, tutorial-special path, new broad fence, global signature
   clearance or weakened admission/disclosure is authorized by this plan.
+- **Source review ruling — 2026-09-13:** retire the specialized rootless inline
+  interpretation widget and its acceptance requirement. Use the existing generic
+  source proposal review, preserving the provider-authored proposal's ID through
+  browser approval, persistence and replay. Proposal approval does not replace
+  the required execution content review for LLM-authored source data. This ruling
+  supersedes widget acceptance in earlier campaign references.
 
 ## State at the interrupted checkpoint
 
@@ -96,7 +102,7 @@ consolidated tree. Subsequent MODEL changes overlapped earlier reviewed files.
 |---|---|---|
 | Initial MODEL census | Reviewed bounded census; unfinished admission later extended it | Finish MODEL behavior, typing, mutation proofs and fresh review |
 | Frontend projection registry | Reviewed; source-derived dispatch guard rejects joint fixture/export omission | Integrated frontend/Python fixture regression |
-| Shared option decoder | Implemented | Sparse presence plus rootless widget acceptance |
+| Shared option decoder | Implemented | Sparse presence plus generic rootless source proposal review acceptance |
 | Prospective approval effects | Reviewed declaration-derived implementation and card wording | Integrated behavior and text regression |
 | Response-envelope measurement | Reviewed structural repair | Preserve derived coverage through remaining response work |
 | Teaching ownership | Reviewed own-context lexical gate | Semantic teaching review and final integration |
@@ -447,9 +453,17 @@ Use the [scorecard charter](composer-wires/scorecard-integration-charter.md).
   baseline/candidate commands, model/settings and bounded inputs before seeking
   any still-required provider-egress approval.
 - [ ] After authorized trials, record repair turns, calls per transition,
-  unknown-key placeholders and approval-card rows. Rootless/widget acceptance
+  unknown-key placeholders and approval-card rows. Rootless source acceptance
   requires per-transition provider-call scrutiny; the old single baseline
   transition did not exercise that path.
+- [ ] In a rootless session, render the real provider-authored source proposal
+  through the existing generic review surface. Reload the session, approve that
+  same persisted proposal ID in the browser, and verify settlement and replay
+  against that ID and its original invocation authority. Do not synthesize a
+  replacement proposal or require the retired interpretation widget to appear.
+- [ ] Retain the execution content review for LLM-authored source data after
+  source proposal approval. Verify that proposal approval alone does not satisfy
+  that review and that execution follows its existing acknowledgement path.
 - [ ] Close campaign scope only when current gate results and live evidence
   account for every tool and each residue item. Reverify tracker/HEAD status
   before reporting completion; no inferred fence or incomplete scorer counts.

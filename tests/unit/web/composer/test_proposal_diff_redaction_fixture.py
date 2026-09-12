@@ -30,14 +30,15 @@ from typing import Any
 import pytest
 from scripts.cicd import composer_frontend_wire as frontend
 
+from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
 
-def test_inline_widget_positive_preserves_the_authored_presence() -> None:
+def test_inline_proposal_generic_review_preserves_the_authored_presence() -> None:
     cases = frontend.fixture_cases()
     name = "set_pipeline_ambiguous_inline_omitted_metadata"
-    assert name in cases, "The widget positive must come from an actual producer fixture"
+    assert name in cases, "Generic source review must use an actual producer fixture"
     case = cases[name]
     arguments = case["arguments"]
     assert "metadata" not in arguments
@@ -49,6 +50,9 @@ def test_inline_widget_positive_preserves_the_authored_presence() -> None:
     assert actual["source"]["description"] is None
     assert json.loads(actual["source"]["options"])["entry_count"] == 0
     assert json.loads(json.dumps(actual)) == case["redacted"]
+    summary = build_tool_proposal_summary(tool_name=case["tool"], arguments=arguments, redacted_arguments=actual)
+    assert summary.summary == case["proposal_summary"]
+    assert summary.summary == "Replace the pipeline with 1 input, 0 processing nodes, and 0 outputs."
 
 
 @pytest.mark.parametrize("case_name", sorted(frontend.fixture_cases()))
@@ -63,6 +67,10 @@ def test_recorded_redaction_matches_the_live_redactor(case_name: str) -> None:
     # crosses the HTTP boundary.
     assert json.loads(json.dumps(actual)) == case["redacted"], (
         f"Redaction drift for fixture case '{case_name}' ({case['tool']}). {frontend.REGENERATE_HINT}"
+    )
+    assert (
+        build_tool_proposal_summary(tool_name=case["tool"], arguments=case["arguments"], redacted_arguments=actual).summary
+        == case["proposal_summary"]
     )
 
 

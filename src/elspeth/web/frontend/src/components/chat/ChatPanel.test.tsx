@@ -1,5 +1,4 @@
-import { isEmptyRedactedOptions } from "./ChatPanel";
-import { redactedArguments, redactedCase } from "@/test/redactedArgumentFixture";
+import { redactedCase } from "@/test/redactedArgumentFixture";
 import type { CompositionValidationError } from "@/types/index";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -17,12 +16,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChatPanel,
   deriveRowCount,
-  findOriginatingMessageId,
   hasExistingCompositionContent,
-  hasSafeInlineSourceDisambiguationBase,
-  isAmbiguousInlineProposal,
   looksLikeData,
-  parseProposedRowsFromUserInput,
 } from "./ChatPanel";
 import {
   GUIDED_EXPLAIN_MESSAGE,
@@ -8207,358 +8202,8 @@ describe("deriveRowCount", () => {
   });
 });
 
-// ── isAmbiguousInlineProposal unit tests (Phase 5a Task 4) ────────────────────
-//
-// Phase 5a Task 4 ambiguity heuristic v1. False negatives are recoverable
-// (proposal still routes through the standard banner); false positives are
-// disruptive (a disambiguation widget appears where a banner would have
-// sufficed). The canonical demo prompt MUST be a false negative — that's
-// the load-bearing constraint.
-describe("isAmbiguousInlineProposal", () => {
-  function makeInlineProposal(
-    summary: string,
-    overrides: Partial<CompositionProposal> = {},
-  ): CompositionProposal {
-    return {
-      id: "prop-1",
-      session_id: "session-1",
-      tool_call_id: "tc-1",
-      tool_name: "set_pipeline",
-      status: "pending",
-      summary,
-      rationale: "",
-      affects: ["source"],
-      arguments_redacted_json: structuredClone(redactedArguments("set_pipeline_ambiguous_inline_omitted_metadata")),
-      base_state_id: null,
-      committed_state_id: null,
-      audit_event_id: null,
-      created_at: "2026-05-18T10:00:00Z",
-      updated_at: "2026-05-18T10:00:00Z",
-      ...overrides,
-    };
-  }
-
-  it("keeps standard approval for the producer's sparse empty metadata payload", () => {
-    const proposal = makeInlineProposal("I read your message as 3 rows.");
-    expect(redactedCase("set_pipeline_ambiguous_inline_empty_options").arguments.metadata).toEqual({});
-    proposal.arguments_redacted_json = redactedArguments("set_pipeline_ambiguous_inline_empty_options");
-    expect(proposal.arguments_redacted_json.metadata).toBe("<metadata-patch:empty>");
-    expect(isAmbiguousInlineProposal(proposal)).toBe(false);
-  });
-
-  it("accepts the producer's omitted metadata, explicit null description and empty options", () => {
-    const proposal = makeInlineProposal("I read your message as 3 rows.");
-    const recorded = redactedCase("set_pipeline_ambiguous_inline_omitted_metadata");
-    expect(recorded.arguments).not.toHaveProperty("metadata");
-    expect(proposal.arguments_redacted_json).not.toHaveProperty("metadata");
-    expect(proposal.arguments_redacted_json.source).toHaveProperty("description", null);
-    expect(isAmbiguousInlineProposal(proposal)).toBe(true);
-  });
-
-  it.each(["metadata", "description", "options"] as const)(
-    "independently refuses the historical %s blocker on the producer positive",
-    (blocker) => {
-      const proposal = makeInlineProposal("I read your message as 3 rows.");
-      expect(isAmbiguousInlineProposal(proposal)).toBe(true);
-      const payload = proposal.arguments_redacted_json;
-      const source = payload.source as Record<string, unknown>;
-      // Deliberate corrupt/changed-input controls, not producer fixtures.
-      if (blocker === "metadata") payload.metadata = "<metadata-patch:invalid>";
-      if (blocker === "description") source.description = "An authored description";
-      if (blocker === "options") source.options = "{}";
-      expect(isAmbiguousInlineProposal(proposal)).toBe(false);
-    },
-  );
-
-  it.each(["<metadata-patch:invalid>", "<metadata-patch:name>", "not a summary", {}])(
-    "rejects metadata that does not prove an empty write: %j",
-    (metadata) => {
-      const proposal = makeInlineProposal("I read your message as 3 rows.");
-      proposal.arguments_redacted_json.metadata = metadata;
-      expect(isAmbiguousInlineProposal(proposal)).toBe(false);
-    },
-  );
-
-  it("rejects a source description that the compact approval cannot expose", () => {
-    const proposal = makeInlineProposal("I read your message as 3 rows.");
-    (proposal.arguments_redacted_json.source as Record<string, unknown>).description = "Additional authored description";
-    expect(isAmbiguousInlineProposal(proposal)).toBe(false);
-  });
-
-  it("returns true when summary contains 'I read'", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("I read your message as 3 separate URLs."),
-      ),
-    ).toBe(true);
-  });
-
-  it("returns true when summary contains 'interpreted as'", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("Input interpreted as 3 rows for the inline source."),
-      ),
-    ).toBe(true);
-  });
-
-  it("is case-insensitive on the phrase match", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("I READ this as several rows."),
-      ),
-    ).toBe(true);
-  });
-
-  // The canonical demo proposal MUST be classified as non-ambiguous. The
-  // composer narration for that case describes generation ("a list of 5
-  // government web pages") not interpretation of user input.
-  it("returns FALSE for the canonical demo proposal (no ambiguity phrases)", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal(
-          "Created an inline source with 5 Australian government web pages " +
-            "and wired an LLM transform to rate each on coolness.",
-        ),
-      ),
-    ).toBe(false);
-  });
-
-  it("returns false when the tool_name is not set_pipeline", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("I read your input as 3 rows.", {
-          tool_name: "patch_source_options",
-        }),
-      ),
-    ).toBe(false);
-  });
-
-  it("returns false when arguments lack an inline_blob", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("I read your input as 3 rows.", {
-          arguments_redacted_json: {
-            source: {
-              plugin: "csv_file",
-              on_success: "csv_rows",
-              blob_id: null,
-              options: '{"path":"<redacted-option-value>"}',
-              on_validation_failure: null,
-            },
-            sources: null,
-            nodes: [],
-            edges: [],
-            outputs: [],
-            metadata: null,
-          },
-        }),
-      ),
-    ).toBe(false);
-  });
-
-  it("returns false when set_pipeline includes hidden full-pipeline changes", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("I read your input as 3 rows.", {
-          arguments_redacted_json: {
-            source: {
-              plugin: "csv",
-              on_success: "csv_rows",
-              blob_id: null,
-              options: "{}",
-              on_validation_failure: null,
-              inline_blob: {
-                filename: "chat.csv",
-                mime_type: "text/csv",
-                content: "<inline-blob:42-bytes>",
-                description: null,
-              },
-            },
-            sources: null,
-            nodes: [],
-            edges: [],
-            outputs: [
-              {
-                sink_name: "exfil",
-                plugin: "webhook",
-                options: { url: "<redacted-option-value>" },
-              },
-            ],
-            metadata: null,
-          },
-        }),
-      ),
-    ).toBe(false);
-  });
-
-  it("returns false when set_pipeline includes hidden transform nodes", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("I read your input as 3 rows.", {
-          arguments_redacted_json: {
-            source: {
-              plugin: "csv",
-              on_success: "csv_rows",
-              blob_id: null,
-              options: "{}",
-              on_validation_failure: null,
-              inline_blob: {
-                filename: "chat.csv",
-                mime_type: "text/csv",
-                content: "<inline-blob:42-bytes>",
-                description: null,
-              },
-            },
-            sources: null,
-            nodes: [
-              {
-                id: "unexpected_transform",
-                node_type: "transform",
-                plugin: "llm_filter",
-                input: "source",
-                options: { prompt: "<redacted-option-value>" },
-              },
-            ],
-            edges: [],
-            outputs: [],
-            metadata: null,
-          },
-        }),
-      ),
-    ).toBe(false);
-  });
-
-  it("returns false when the source carries validation-failure routing", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("I read your input as 3 rows.", {
-          arguments_redacted_json: {
-            source: {
-              plugin: "csv",
-              on_success: "csv_rows",
-              blob_id: null,
-              options: "{}",
-              on_validation_failure: "unexpected_route",
-              inline_blob: {
-                filename: "chat.csv",
-                mime_type: "text/csv",
-                content: "<inline-blob:42-bytes>",
-                description: null,
-              },
-            },
-            sources: null,
-            nodes: [],
-            edges: [],
-            outputs: [],
-            metadata: null,
-          },
-        }),
-      ),
-    ).toBe(false);
-  });
-
-  it("returns false when the inline source carries extra source options", () => {
-    expect(
-      isAmbiguousInlineProposal(
-        makeInlineProposal("I read your input as 3 rows.", {
-          arguments_redacted_json: {
-            source: {
-              plugin: "csv",
-              on_success: "csv_rows",
-              blob_id: null,
-              options: '{"delimiter":"|"}',
-              on_validation_failure: null,
-              inline_blob: {
-                filename: "chat.csv",
-                mime_type: "text/csv",
-                content: "<inline-blob:42-bytes>",
-                description: null,
-              },
-            },
-            sources: null,
-            nodes: [],
-            edges: [],
-            outputs: [],
-            metadata: null,
-          },
-        }),
-      ),
-    ).toBe(false);
-  });
-
-  it("returns false when set_pipeline includes non-default metadata", () => {
-    const proposal = makeInlineProposal("I read your input as 3 rows.");
-    expect(
-      isAmbiguousInlineProposal({
-        ...proposal,
-        arguments_redacted_json: {
-          ...proposal.arguments_redacted_json,
-          metadata: { name: "Hidden pipeline name", description: null },
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("returns false when set_pipeline includes alternate sources", () => {
-    const proposal = makeInlineProposal("I read your input as 3 rows.");
-    expect(
-      isAmbiguousInlineProposal({
-        ...proposal,
-        arguments_redacted_json: {
-          ...proposal.arguments_redacted_json,
-          sources: {
-            extra: {
-              plugin: "csv",
-              on_success: "csv_rows",
-              options: "{}",
-            },
-          },
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("returns false when the inline blob carries a non-default description", () => {
-    const proposal = makeInlineProposal("I read your input as 3 rows.");
-    const source = proposal.arguments_redacted_json[
-      "source"
-    ] as Record<string, unknown>;
-    const inlineBlob = source["inline_blob"] as Record<string, unknown>;
-    expect(
-      isAmbiguousInlineProposal({
-        ...proposal,
-        arguments_redacted_json: {
-          ...proposal.arguments_redacted_json,
-          source: {
-            ...source,
-            inline_blob: {
-              ...inlineBlob,
-              description: "Hidden source description",
-            },
-          },
-        },
-      }),
-    ).toBe(false);
-  });
-});
 
 describe("hasExistingCompositionContent", () => {
-  const proposal: CompositionProposal = {
-    id: "prop-1",
-    session_id: "session-1",
-    tool_call_id: "tc-1",
-    tool_name: "set_pipeline",
-    status: "pending",
-    summary: "I read your input as 3 rows.",
-    rationale: "",
-    affects: ["source"],
-    arguments_redacted_json: {},
-    base_state_id: null,
-    committed_state_id: null,
-    audit_event_id: null,
-    created_at: "2026-05-18T10:00:00Z",
-    updated_at: "2026-05-18T10:00:00Z",
-  };
 
   it("returns false for null or empty composition state", () => {
     expect(hasExistingCompositionContent(null)).toBe(false);
@@ -8630,136 +8275,52 @@ describe("hasExistingCompositionContent", () => {
     ).toBe(true);
   });
 
-  it("allows an unknown state only for proposals against a null base state", () => {
-    expect(hasSafeInlineSourceDisambiguationBase(proposal, null)).toBe(true);
-    expect(
-      hasSafeInlineSourceDisambiguationBase(
-        { ...proposal, base_state_id: "existing-state" },
-        null,
-      ),
-    ).toBe(false);
-  });
-
-  it("denies any proposal when the known composition has replaceable content", () => {
-    expect(
-      hasSafeInlineSourceDisambiguationBase(proposal, makeComposition(1)),
-    ).toBe(false);
-  });
 });
 
-// ── findOriginatingMessageId unit tests ───────────────────────────────────────
-describe("findOriginatingMessageId", () => {
-  const userMessage: ChatMessage = {
-    id: "user-1",
-    session_id: "s",
-    role: "user",
-    content: "check these URLs: a, b, c",
-    tool_calls: null,
-    created_at: "2026-05-18T10:00:00Z",
-  };
-  const assistantMessage: ChatMessage = {
-    id: "asst-1",
-    session_id: "s",
-    role: "assistant",
-    content: "I'll add those.",
-    tool_calls: [
-      { id: "tc-1", type: "function", function: { name: "set_pipeline", arguments: "{}" } },
-    ],
-    created_at: "2026-05-18T10:00:01Z",
-  };
 
-  it("returns the immediately-preceding user message id", () => {
-    expect(
-      findOriginatingMessageId([userMessage, assistantMessage], "tc-1"),
-    ).toBe("user-1");
-  });
-
-  it("returns null when no message carries that tool_call_id", () => {
-    expect(
-      findOriginatingMessageId([userMessage, assistantMessage], "tc-other"),
-    ).toBeNull();
-  });
-
-  it("returns null when no user message precedes the assistant turn", () => {
-    expect(findOriginatingMessageId([assistantMessage], "tc-1")).toBeNull();
-  });
-});
-
-// ── parseProposedRowsFromUserInput unit tests ─────────────────────────────────
-describe("parseProposedRowsFromUserInput", () => {
-  it("splits a colon-led list on commas", () => {
-    expect(
-      parseProposedRowsFromUserInput("check these URLs: a.com, b.com, c.com"),
-    ).toEqual(["a.com", "b.com", "c.com"]);
-  });
-
-  it("splits on newlines", () => {
-    expect(parseProposedRowsFromUserInput("rows:\na\nb\nc")).toEqual([
-      "a",
-      "b",
-      "c",
-    ]);
-  });
-
-  it("returns the whole input as one row when no delimiter is present", () => {
-    expect(parseProposedRowsFromUserInput("just one line")).toEqual([
-      "just one line",
-    ]);
-  });
-});
-
-// ── ChatPanel disambiguation wiring tests (Phase 5a Task 4) ───────────────────
-//
-// Verifies the routing layer in ChatPanel that decides whether a pending
-// inline-blob proposal surfaces via the disambiguation widget or via the
-// standard PendingProposalsBanner. The widget itself is tested in
-// InlineSourceDisambiguationTurn.test.tsx; here we only check the
-// predicate-and-guard plumbing.
-describe("ChatPanel inline-source disambiguation routing", () => {
+// Inline source proposals use the same review and custody path as every
+// other pipeline proposal, regardless of assistant interpretation prose.
+describe("ChatPanel generic inline-source proposal review", () => {
   const sessionFixture: Session = {
-    id: "session-disamb",
-    title: "Disambiguation session",
+    id: "session-source-review",
+    title: "Source review session",
     created_at: "2026-05-18T10:00:00Z",
     updated_at: "2026-05-18T10:00:00Z",
   };
 
-  function makeAmbiguousProposalAndMessages(): {
-    proposal: CompositionProposal;
-    userMessage: ChatMessage;
-    assistantMessage: ChatMessage;
-  } {
+  function makeProposalAndMessages() {
+    const recorded = redactedCase("set_pipeline_ambiguous_inline_omitted_metadata");
     const userMessage: ChatMessage = {
-      id: "user-disamb-1",
+      id: "user-source-review",
       session_id: sessionFixture.id,
       role: "user",
-      content: "check these URLs: a.com, b.com, c.com",
+      // Deliberately has more text lines than records in the proposed artifact.
+      content: "Ava — access problem\nstill cannot sign in\nBen — invoice wrong\nbilled twice",
       tool_calls: null,
       created_at: "2026-05-18T10:00:00Z",
     };
     const assistantMessage: ChatMessage = {
-      id: "asst-disamb-1",
+      id: "assistant-source-review",
       session_id: sessionFixture.id,
       role: "assistant",
-      content: "I'll add those.",
-      tool_calls: [
-        {
-          id: "tc-disamb-1",
-          type: "function",
-          function: { name: "set_pipeline", arguments: "{}" },
-        },
-      ],
+      content: "I read those notes as records for review.",
+      tool_calls: [{
+        id: "tool-source-review",
+        type: "function",
+        function: { name: recorded.tool, arguments: JSON.stringify(recorded.arguments) },
+      }],
       created_at: "2026-05-18T10:00:01Z",
     };
     const proposal: CompositionProposal = {
-      id: "prop-disamb-1",
+      id: "proposal-source-review",
       session_id: sessionFixture.id,
-      tool_call_id: "tc-disamb-1",
-      tool_name: "set_pipeline",
+      tool_call_id: "tool-source-review",
+      tool_name: recorded.tool,
       status: "pending",
-      summary: "I read your message as 3 separate URLs.",
+      summary: recorded.proposal_summary,
       rationale: "",
       affects: ["source"],
-      arguments_redacted_json: structuredClone(redactedArguments("set_pipeline_ambiguous_inline_omitted_metadata")),
+      arguments_redacted_json: structuredClone(recorded.redacted),
       base_state_id: null,
       committed_state_id: null,
       audit_event_id: null,
@@ -8767,6 +8328,17 @@ describe("ChatPanel inline-source disambiguation routing", () => {
       updated_at: "2026-05-18T10:00:00Z",
     };
     return { proposal, userMessage, assistantMessage };
+  }
+
+  function seedReview() {
+    const fixture = makeProposalAndMessages();
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: [fixture.userMessage, fixture.assistantMessage],
+      compositionProposals: [fixture.proposal],
+    });
+    return fixture;
   }
 
   beforeEach(() => {
@@ -8783,196 +8355,100 @@ describe("ChatPanel inline-source disambiguation routing", () => {
     });
   });
 
-  it("renders the disambiguation widget for an ambiguous inline-blob proposal", () => {
-    const { proposal, userMessage, assistantMessage } =
-      makeAmbiguousProposalAndMessages();
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [userMessage, assistantMessage],
-      compositionProposals: [proposal],
-    });
-
+  it("renders the producer's omitted-metadata proposal once in the generic banner without guessing user-text row counts", () => {
+    const { proposal, userMessage, assistantMessage } = seedReview();
+    expect(proposal.arguments_redacted_json).not.toHaveProperty("metadata");
     render(<ChatPanel />);
 
-    expect(
-      screen.getByRole("region", { name: /row count/i }),
-    ).toBeInTheDocument();
+    const banners = screen.getAllByRole("region", { name: "Pending changes (1)" });
+    expect(banners).toHaveLength(1);
+    expect(within(banners[0]).getAllByRole("listitem")).toHaveLength(1);
+    expect(within(banners[0]).getByText(proposal.summary)).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /row count/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /yes.*rows|one row|not source data/i })).not.toBeInTheDocument();
+    expect(useSessionStore.getState().compositionProposals).toEqual([proposal]);
+    expect(useSessionStore.getState().messages).toEqual([userMessage, assistantMessage]);
   });
 
-  it.each(["nonempty", "malformed"])(
-    "does not render disambiguation for %s redacted options",
-    (kind) => {
-      const { proposal, userMessage, assistantMessage } = makeAmbiguousProposalAndMessages();
-      const payload = structuredClone(redactedArguments("set_pipeline_ambiguous_inline_nonempty_options"));
-      // Isolate options from the independent metadata-defaulting blocker.
-      payload.metadata = null;
-      if (kind === "malformed") {
-        (payload.source as Record<string, unknown>).options = "{}";
-      }
-      proposal.arguments_redacted_json = payload;
-      useSessionStore.setState({
-        activeSessionId: sessionFixture.id,
-        sessions: [sessionFixture],
-        messages: [userMessage, assistantMessage],
-        compositionProposals: [proposal],
-      });
+  it.each(["I read your message as 4 rows.", "Input interpreted as 4 rows."])(
+    "keeps legacy interpretation narration on the generic review path: %s",
+    (summary) => {
+      const { proposal } = seedReview();
+      useSessionStore.setState({ compositionProposals: [{ ...proposal, summary }] });
       render(<ChatPanel />);
+      expect(screen.getByRole("region", { name: "Pending changes (1)" })).toBeInTheDocument();
       expect(screen.queryByRole("region", { name: /row count/i })).not.toBeInTheDocument();
     },
   );
 
-  it("excludes the ambiguous proposal from the standard PendingProposalsBanner", () => {
-    const { proposal, userMessage, assistantMessage } =
-      makeAmbiguousProposalAndMessages();
+  it.each(["accept", "reject"] as const)(
+    "%s delegates the exact original proposal ID without replacing its base or transcript associations",
+    async (action) => {
+      const { proposal, userMessage, assistantMessage } = seedReview();
+      const acceptProposal = vi.fn().mockResolvedValue(undefined);
+      const rejectProposal = vi.fn().mockResolvedValue(undefined);
+      useSessionStore.setState({ acceptProposal, rejectProposal });
+      render(<ChatPanel />);
+      const banner = screen.getByRole("region", { name: "Pending changes (1)" });
+      if (action === "accept") {
+        fireEvent.click(within(banner).getByRole("button", { name: `Accept proposal: ${proposal.summary}` }));
+        expect(acceptProposal).toHaveBeenCalledExactlyOnceWith(proposal.id);
+        expect(rejectProposal).not.toHaveBeenCalled();
+      } else {
+        fireEvent.click(within(banner).getByRole("button", { name: `Reject proposal: ${proposal.summary}` }));
+        expect(rejectProposal).not.toHaveBeenCalled();
+        const dialog = await screen.findByRole("alertdialog", { name: "Reject proposal" });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Reject proposal" }));
+        expect(rejectProposal).toHaveBeenCalledExactlyOnceWith(proposal.id);
+        expect(acceptProposal).not.toHaveBeenCalled();
+      }
+      expect(useSessionStore.getState().compositionProposals).toEqual([proposal]);
+      expect(proposal.base_state_id).toBeNull();
+      expect(proposal.tool_call_id).toBe(assistantMessage.tool_calls![0].id);
+      expect(useSessionStore.getState().messages).toEqual([userMessage, assistantMessage]);
+      expect(useComposer().sendMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps stale proposals out of actionable review and retains the stale tool association", () => {
+    const { proposal } = seedReview();
     useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [userMessage, assistantMessage],
-      compositionProposals: [proposal],
+      compositionProposals: [{ ...proposal, base_state_id: "previous-state" }],
+      staleProposalIds: [proposal.id],
     });
-
     render(<ChatPanel />);
-
-    // The PendingProposalsBanner uses aria-label="Pending changes (N)".
-    // When the only pending proposal is claimed by the disambiguation
-    // widget the banner has zero actionable items and returns null.
-    expect(
-      screen.queryByRole("region", { name: /pending changes/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("region", { name: /pending changes|row count/i })).not.toBeInTheDocument();
+    expect(screen.getByText("Stale proposal")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /accept proposal/i })).not.toBeInTheDocument();
   });
 
-  it("skips the widget when the originating message is in userRequestedSingleRowForMessageIds (F-11)", () => {
-    const { proposal, userMessage, assistantMessage } =
-      makeAmbiguousProposalAndMessages();
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [userMessage, assistantMessage],
-      compositionProposals: [proposal],
-    });
-    // Seed the F-11 guard BEFORE render.
-    act(() => {
-      useInlineSourceStore
-        .getState()
-        .addUserRequestedSingleRow(userMessage.id);
-    });
-
+  it("keeps in-flight proposal actions disabled", () => {
+    const { proposal } = seedReview();
+    useSessionStore.setState({ proposalActionPendingIds: [proposal.id] });
     render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /row count/i }),
-    ).toBeNull();
-    // Falls back to the standard banner.
-    expect(
-      screen.getByRole("region", { name: /pending changes/i }),
-    ).toBeInTheDocument();
+    const banner = screen.getByRole("region", { name: "Pending changes (1)" });
+    expect(within(banner).getByRole("button", { name: /accept proposal/i })).toBeDisabled();
+    expect(within(banner).getByRole("button", { name: /reject proposal/i })).toBeDisabled();
   });
 
-  it("skips the widget when the originating message is in nonSourceMessageIds (F-10)", () => {
-    const { proposal, userMessage, assistantMessage } =
-      makeAmbiguousProposalAndMessages();
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [userMessage, assistantMessage],
-      compositionProposals: [proposal],
-    });
-    act(() => {
-      useInlineSourceStore.getState().addNonSourceMessage(userMessage.id);
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /row count/i }),
-    ).toBeNull();
-    expect(
-      screen.getByRole("region", { name: /pending changes/i }),
-    ).toBeInTheDocument();
-  });
-
-  it("does NOT render the widget for a non-ambiguous proposal (canonical demo)", () => {
-    const { proposal, userMessage, assistantMessage } =
-      makeAmbiguousProposalAndMessages();
-    // Rewrite the summary to the canonical demo narration; the
-    // heuristic should classify this as non-ambiguous.
-    const demoProposal: CompositionProposal = {
+  it("preserves generic review for a source proposal that also replaces outputs and existing composition", () => {
+    const { proposal } = seedReview();
+    const replacementProposal = {
       ...proposal,
-      summary:
-        "Created an inline source with 5 Australian government web pages " +
-          "and wired an LLM transform to rate each on coolness.",
-    };
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [userMessage, assistantMessage],
-      compositionProposals: [demoProposal],
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /row count/i }),
-    ).toBeNull();
-    // Falls back to the standard banner.
-    expect(
-      screen.getByRole("region", { name: /pending changes/i }),
-    ).toBeInTheDocument();
-  });
-
-  it("routes inline_blob set_pipeline proposals with hidden outputs to the standard banner", () => {
-    const { proposal, userMessage, assistantMessage } =
-      makeAmbiguousProposalAndMessages();
-    const fullPipelineProposal: CompositionProposal = {
-      ...proposal,
+      base_state_id: "existing-state",
       arguments_redacted_json: {
         ...proposal.arguments_redacted_json,
-        outputs: [
-          {
-            sink_name: "unexpected",
-            plugin: "jsonl",
-            options: { path: "<redacted-option-value>" },
-          },
-        ],
+        outputs: [{ sink_name: "result", plugin: "json", options: { path: "<redacted-option-value>" } }],
       },
     };
     useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [userMessage, assistantMessage],
-      compositionProposals: [fullPipelineProposal],
-    });
-
-    render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /row count/i }),
-    ).toBeNull();
-    expect(
-      screen.getByRole("region", { name: /pending changes/i }),
-    ).toBeInTheDocument();
-  });
-
-  it("routes ambiguous inline_blob proposals to the banner when accepting would replace existing state", () => {
-    const { proposal, userMessage, assistantMessage } =
-      makeAmbiguousProposalAndMessages();
-    useSessionStore.setState({
-      activeSessionId: sessionFixture.id,
-      sessions: [sessionFixture],
-      messages: [userMessage, assistantMessage],
-      compositionProposals: [proposal],
+      compositionProposals: [replacementProposal],
       compositionState: makeComposition(1),
     });
-
     render(<ChatPanel />);
-
-    expect(
-      screen.queryByRole("region", { name: /row count/i }),
-    ).toBeNull();
-    expect(
-      screen.getByRole("region", { name: /pending changes/i }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Pending changes (1)" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /row count/i })).not.toBeInTheDocument();
+    expect(useSessionStore.getState().compositionProposals).toEqual([replacementProposal]);
   });
 });
 
@@ -10963,19 +10439,4 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
     const indicator = panel!.querySelector(".composing-indicator");
     if (indicator !== null) expect(dock!.contains(indicator)).toBe(true);
   });
-});
-
-describe("isEmptyRedactedOptions producer contract", () => {
-  it.each([["empty", true], ["nonempty", false]] as const)(
-    "decodes actual %s set_pipeline options",
-    (kind, expected) => {
-      const source = redactedArguments(`set_pipeline_ambiguous_inline_${kind}_options`).source as Record<string, unknown>;
-      expect(isEmptyRedactedOptions(source.options)).toBe(expected);
-    },
-  );
-
-  it.each([null, undefined, {}, "{}", "invalid", "<invalid-options>"])(
-    "rejects malformed or absent present-field values: %j",
-    (value) => expect(isEmptyRedactedOptions(value)).toBe(false),
-  );
 });

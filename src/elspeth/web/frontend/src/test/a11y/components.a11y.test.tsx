@@ -44,7 +44,6 @@ const AUDITED_COMPONENTS = [
   "HeaderVersionSelector",
   "GraphMiniView",
   "InlineSourceCreatedTurn",
-  "InlineSourceDisambiguationTurn",
   "InlineSourceFallbackPrompt",
   "CompletionBar",
   "PluginCard",
@@ -136,7 +135,6 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "HeaderVersionSelector",
   "HelloWorldTutorial",
   "InlineSourceCreatedTurn",
-  "InlineSourceDisambiguationTurn",
   "InlineSourceFallbackPrompt",
   "LoginPage",
   "ModeSwitchButton",
@@ -307,7 +305,6 @@ import { HeaderSessionSwitcher } from "@/components/sessions/HeaderSessionSwitch
 import { HeaderVersionSelector } from "@/components/header/HeaderVersionSelector";
 import { GraphMiniView } from "@/components/sidebar/GraphMiniView";
 import { InlineSourceCreatedTurn } from "@/components/chat/InlineSourceCreatedTurn";
-import { InlineSourceDisambiguationTurn } from "@/components/chat/InlineSourceDisambiguationTurn";
 import { InlineSourceFallbackPrompt } from "@/components/chat/InlineSourceFallbackPrompt";
 import { CompletionBar } from "@/components/composer/CompletionBar";
 import { PluginCard } from "@/components/catalog/PluginCard";
@@ -840,24 +837,6 @@ describe("InlineSourceCreatedTurn", () => {
     };
     const { container } = render(
       <InlineSourceCreatedTurn summary={summary} onEdit={() => {}} />,
-    );
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("InlineSourceDisambiguationTurn", () => {
-  it("has no axe violations", async () => {
-    const { container } = render(
-      <InlineSourceDisambiguationTurn
-        userInput="check these URLs: a.com, b.com, c.com"
-        proposedRows={["a.com", "b.com", "c.com"]}
-        proposalId="p1"
-        messageId="msg-1"
-        onConfirmMultiRow={() => {}}
-        onTreatAsOneRow={() => {}}
-        onEditRows={() => {}}
-        onNotSourceData={() => {}}
-      />,
     );
     expect(await axe(container)).toHaveNoViolations();
   });

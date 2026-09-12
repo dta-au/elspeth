@@ -1,4 +1,3 @@
-import { decodeRedactedOptionSummary } from "@/utils/redactedArguments";
 // src/components/chat/ChatPanel.tsx
 import {
   Fragment,
@@ -92,14 +91,12 @@ import {
 import type { WireBlockerLink } from "./guided/WireStageTurn";
 import { wireStagePlaceholder } from "./guided/WireStageTurn";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
-import { InlineSourceDisambiguationTurn } from "./InlineSourceDisambiguationTurn";
 import { InlineSourceFallbackPrompt } from "./InlineSourceFallbackPrompt";
 import { sortedSourceEntries } from "@/utils/compositionState";
 import { preferredScrollBehavior } from "@/utils/motion";
 import type {
   BlobMetadata,
   ChatMessage,
-  CompositionProposal,
   CompositionState,
   InlineSourceSummary,
 } from "@/types/api";
@@ -116,29 +113,6 @@ function isTerminalComposerPhase(
   phase: string | null | undefined,
 ): boolean {
   return phase === "complete" || phase === "failed" || phase === "cancelled";
-}
-
-function objectHasOnlyKeys(
-  value: Record<string, unknown>,
-  allowed: ReadonlySet<string>,
-): boolean {
-  return Object.keys(value).every((key) => allowed.has(key));
-}
-
-function hasOwn(value: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isAbsentOrNull(value: Record<string, unknown>, key: string): boolean {
-  return !hasOwn(value, key) || value[key] === null;
-}
-
-export function isEmptyRedactedOptions(value: unknown): boolean {
-  return decodeRedactedOptionSummary(value)?.entryCount === 0;
 }
 
 const DEFAULT_PIPELINE_METADATA_NAME = "Untitled Pipeline";
@@ -302,143 +276,6 @@ export function deriveRowCount(
   return deriveInlineSourceRowCount(mimeType, text);
 }
 
-// ── Inline-source disambiguation heuristic (Phase 5a Task 4) ─────────────────
-//
-// Detect whether a pending composer proposal is BOTH (a) an inline-blob
-// source-creation proposal AND (b) one whose row-count interpretation
-// looks ambiguous enough to warrant explicit confirmation from the user.
-//
-// Heuristic v1 (intentionally narrow — false negatives are recoverable
-// because the standard PendingProposalsBanner still routes the proposal;
-// false positives DO produce a disruptive widget where a banner would
-// have sufficed):
-//
-//   * The proposal's `tool_name` must be "set_pipeline" (the only tool
-//     surface that carries an inline_blob source today; the inline-blob
-//     create path lives inside set_pipeline.source.inline_blob — see
-//     src/elspeth/web/composer/redaction.py:_InlineBlobModel).
-//   * The proposal's `arguments_redacted_json` must contain the production
-//     set_pipeline scaffold — `source`, `nodes`, `edges`, `outputs` — but
-//     `nodes` / `edges` / `outputs` must be empty arrays and `source` must be
-//     an inline blob with only the required source plugin/routing label plus
-//     backend-redaction defaults. `sources`, `metadata`, `blob_id`,
-//     `on_validation_failure`, and `inline_blob.description` must be absent or
-//     null, and `options` must be absent or the redacted empty object. Because
-//     `set_pipeline` is an atomic full-state replacement, any non-default graph,
-//     output, metadata, source-option, or routing change stays on the standard
-//     approval banner with the full context visible.
-//   * The proposal's `summary` must contain a recognised
-//     row-count-ambiguity phrase — currently "I read" or "interpreted as".
-//     A Phase 5b refactor will replace this with a structured annotation
-//     emitted by the composer pipeline; until then the heuristic is the
-//     contract.
-//
-// The canonical demo prompt (create a data source with government-page URLs
-// and explicit scrape-contact fields) MUST NOT trip this heuristic —
-// that proposal's summary describes LLM-generated source rows, not an
-// interpretation of the user's input. The
-// `isAmbiguousInlineProposal` unit tests pin this behaviour.
-//
-// Exported for the ChatPanel test seam.
-export function isAmbiguousInlineProposal(
-  proposal: CompositionProposal,
-): boolean {
-  if (proposal.tool_name !== "set_pipeline") return false;
-
-  // Walk the arguments tree without coercion. The redaction layer
-  // preserves the inline_blob marker even when the content has been
-  // summarised, so a structural check is sufficient and does NOT need
-  // to peek at the (possibly redacted) content string. Because set_pipeline
-  // is a full-state replacement, the widget is allowed only for the narrow
-  // production source-only scaffold: source plus empty nodes/edges/outputs.
-  // Any non-empty graph/output/metadata/source-option change stays on the
-  // standard proposal banner with the full approval context visible.
-  const args = proposal.arguments_redacted_json;
-  if (
-    !objectHasOnlyKeys(
-      args,
-      new Set(["source", "sources", "nodes", "edges", "outputs", "metadata"]),
-    )
-  ) {
-    return false;
-  }
-  if (!isAbsentOrNull(args, "sources") || !isAbsentOrNull(args, "metadata")) {
-    return false;
-  }
-  if (
-    !hasOwn(args, "nodes") ||
-    !hasOwn(args, "edges") ||
-    !hasOwn(args, "outputs") ||
-    !Array.isArray(args["nodes"]) ||
-    !Array.isArray(args["edges"]) ||
-    !Array.isArray(args["outputs"]) ||
-    args["nodes"].length !== 0 ||
-    args["edges"].length !== 0 ||
-    args["outputs"].length !== 0
-  ) {
-    return false;
-  }
-
-  const source = args["source"];
-  if (!isRecord(source)) return false;
-  const sourceRecord = source;
-  if (
-    !objectHasOnlyKeys(
-      sourceRecord,
-      new Set([
-        "plugin",
-        "on_success",
-        "blob_id",
-        "options",
-        "on_validation_failure",
-        "description",
-        "inline_blob",
-      ]),
-    )
-  ) {
-    return false;
-  }
-  if (
-    !isAbsentOrNull(sourceRecord, "description") ||
-    !isAbsentOrNull(sourceRecord, "blob_id") ||
-    !isAbsentOrNull(sourceRecord, "on_validation_failure") ||
-    (hasOwn(sourceRecord, "options") &&
-      !isEmptyRedactedOptions(sourceRecord["options"]))
-  ) {
-    return false;
-  }
-  if (typeof sourceRecord["plugin"] !== "string" || sourceRecord["plugin"] === "") {
-    return false;
-  }
-  if (
-    typeof sourceRecord["on_success"] !== "string" ||
-    sourceRecord["on_success"] === ""
-  ) {
-    return false;
-  }
-
-  const inlineBlob = sourceRecord["inline_blob"];
-  if (!isRecord(inlineBlob)) return false;
-  if (
-    !objectHasOnlyKeys(
-      inlineBlob,
-      new Set(["filename", "mime_type", "content", "description"]),
-    )
-  ) {
-    return false;
-  }
-  if (!isAbsentOrNull(inlineBlob, "description")) return false;
-
-  const summary = proposal.summary;
-  // Case-insensitive substring match. Two recognised ambiguity phrases
-  // — composer narration that explicitly frames "I parsed your input
-  // as N rows" or "interpreted as N items". The canonical demo
-  // proposal does NOT use either phrase (it describes generation, not
-  // interpretation).
-  const lowered = summary.toLowerCase();
-  return lowered.includes("i read") || lowered.includes("interpreted as");
-}
-
 export function hasExistingCompositionContent(
   state: CompositionState | null | undefined,
 ): boolean {
@@ -455,86 +292,6 @@ export function hasExistingCompositionContent(
         metadataName !== DEFAULT_PIPELINE_METADATA_NAME) ||
       metadataDescription.length > 0)
   );
-}
-
-export function hasSafeInlineSourceDisambiguationBase(
-  proposal: CompositionProposal,
-  state: CompositionState | null | undefined,
-): boolean {
-  if (hasExistingCompositionContent(state)) return false;
-  if (state === null || state === undefined) return proposal.base_state_id === null;
-  return true;
-}
-
-// ── Originating user-message resolution ──────────────────────────────────────
-//
-// The F-10 / F-11 re-fire guards key on the user message ID that
-// triggered the assistant's tool-call. The proposal itself only
-// carries `tool_call_id`; we recover the user message by walking the
-// chat history: find the assistant message bearing that tool call,
-// then walk backwards to the nearest preceding user message.
-//
-// Returns null when:
-//   * No assistant message has a tool call with the given id (proposal
-//     orphaned from its message — should not happen in production but
-//     we surface as null rather than crash).
-//   * The assistant message exists but no user message precedes it
-//     (also shouldn't happen — the composer always responds to a user
-//     turn — but null is the honest signal).
-//
-// Callers that need a non-null message ID (e.g., to populate the F-10
-// guard) MUST handle null by falling back to the standard banner —
-// firing the F-10 guard with a synthesised ID would corrupt the
-// guard's data model.
-export function findOriginatingMessageId(
-  messages: ReadonlyArray<ChatMessage>,
-  toolCallId: string,
-): string | null {
-  const assistantIndex = messages.findIndex((m) =>
-    m.tool_calls?.some((tc) => tc.id === toolCallId) ?? false,
-  );
-  if (assistantIndex < 0) return null;
-  for (let i = assistantIndex - 1; i >= 0; i -= 1) {
-    if (messages[i].role === "user") return messages[i].id;
-  }
-  return null;
-}
-
-/**
- * Extract the proposed-rows list from an inline-blob proposal's
- * arguments tree. The redaction layer summarises the content string
- * itself, so the only durable row-count signal in the proposal is
- * the structural shape of any inline-blob fields the LLM populated
- * alongside the (now-redacted) content — chiefly the JSON schema's
- * own row metadata. Today the inline_blob redacted shape exposes
- * `filename` / `mime_type` but NOT a parsed row list — see
- * `_InlineBlobModel` in redaction.py.
- *
- * For Phase 5a Task 4 we surface the user's original input as the
- * source of truth for the row list (split on common delimiters) so
- * the widget has something concrete to show. This is a presentation
- * concern only — the authoritative row data lives in the eventual
- * inline_blob.content on the server; the displayed list is a parse
- * preview the user is being asked to confirm.
- *
- * Exported for the ChatPanel test seam.
- */
-export function parseProposedRowsFromUserInput(
-  userInput: string,
-): ReadonlyArray<string> {
-  // Strip a leading prose preamble like "check these URLs:" — the
-  // rows-of-interest are typically after the first ":" when present.
-  const afterColon = userInput.includes(":")
-    ? userInput.slice(userInput.indexOf(":") + 1)
-    : userInput;
-  // Split on commas OR newlines; trim each fragment; drop empties.
-  // We intentionally use a permissive split rather than try to do
-  // CSV-grade quoting — the user has the "Edit the rows" affordance
-  // for cases where the heuristic guesses wrong.
-  return afterColon
-    .split(/[,\n]/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
 }
 
 // ── Inline-source fallback heuristic (Phase 5a Task 5) ───────────────────────
@@ -2042,23 +1799,6 @@ export function ChatPanel({
     return tail;
   }, [approvedInterpretations, renderedTurns]);
 
-  // Disambiguation re-fire guards (F-10 / F-11). Subscribed via the
-  // store so the widget surface updates when a guard flips — without
-  // this, clicking "treat as 1 row" once would not remove the widget
-  // for the same proposal/message on the next render until something
-  // else triggered a re-render.
-  const userRequestedSingleRowForMessageIds = useInlineSourceStore(
-    (s) => s.userRequestedSingleRowForMessageIds,
-  );
-  const nonSourceMessageIds = useInlineSourceStore(
-    (s) => s.nonSourceMessageIds,
-  );
-  const addUserRequestedSingleRow = useInlineSourceStore(
-    (s) => s.addUserRequestedSingleRow,
-  );
-  const addNonSourceMessage = useInlineSourceStore(
-    (s) => s.addNonSourceMessage,
-  );
   const markFallbackDismissed = useInlineSourceStore((s) => s.markDismissed);
   // Subscribe through the dismissedAt Map so the predicate re-evaluates
   // when a dismissal lands. Calling `isDismissed(sessionId)` inside the
@@ -2128,92 +1868,6 @@ export function ChatPanel({
     clearInlineSourceSummary,
   ]);
 
-  // ── Disambiguation candidate set (Phase 5a Task 4) ─────────────────────────
-  //
-  // A proposal is a disambiguation candidate iff:
-  //   1. It is currently pending (status === "pending") and not stale.
-  //   2. `isAmbiguousInlineProposal(proposal)` is true (source-only inline
-  //      blob + row-count-ambiguity narration phrases).
-  //   3. The current known composition has no content that a source-only
-  //      set_pipeline could silently replace. If the state is not loaded, the
-  //      proposal must itself declare a null base_state_id.
-  //   4. We can resolve a non-null originating user message ID for it
-  //      (the F-10/F-11 guards need a stable key).
-  //   5. The originating message ID is NOT in either re-fire guard
-  //      set — the user has already disambiguated in either direction
-  //      and we must not re-prompt.
-  //
-  // Each surviving proposal yields one widget. The matching proposal
-  // IDs are also removed from the standard PendingProposalsBanner
-  // input set so a single proposal does not appear in BOTH surfaces.
-  //
-  // useMemo is used here because the computation walks the message
-  // list per proposal; recomputing on every render (especially while
-  // typing in the chat input, which fires re-renders via the
-  // ChatInput's onChange callback) is wasted work.
-  const disambiguationCandidates = useMemo(() => {
-    return compositionProposals
-      .filter((p) => p.status === "pending")
-      .filter((p) => !staleProposalIds.includes(p.id))
-      .filter(
-        (proposal) =>
-          isAmbiguousInlineProposal(proposal) &&
-          hasSafeInlineSourceDisambiguationBase(proposal, compositionState),
-      )
-      .map((proposal) => {
-        const messageId = findOriginatingMessageId(
-          messages,
-          proposal.tool_call_id,
-        );
-        if (messageId === null) return null;
-        if (userRequestedSingleRowForMessageIds.has(messageId)) return null;
-        if (nonSourceMessageIds.has(messageId)) return null;
-        const userMessage = messages.find((m) => m.id === messageId);
-        // userMessage existence is implied by findOriginatingMessageId
-        // returning a non-null id (it found the id by walking the same
-        // messages array), but TypeScript can't see that — narrow with
-        // an explicit guard. A null here would be a bug we want to
-        // surface, but rather than crash the chat panel we skip the
-        // candidate; the standard banner picks it up.
-        if (!userMessage) return null;
-        return {
-          proposal,
-          messageId,
-          userInput: userMessage.content,
-          proposedRows: parseProposedRowsFromUserInput(userMessage.content),
-        };
-      })
-      .filter(
-        (c): c is {
-          proposal: CompositionProposal;
-          messageId: string;
-          userInput: string;
-          proposedRows: ReadonlyArray<string>;
-        } => c !== null,
-      );
-  }, [
-    compositionProposals,
-    staleProposalIds,
-    compositionState,
-    messages,
-    userRequestedSingleRowForMessageIds,
-    nonSourceMessageIds,
-  ]);
-
-  // Proposal IDs claimed by the disambiguation widget — excluded from
-  // the standard PendingProposalsBanner so a single proposal does not
-  // appear in both surfaces.
-  const disambiguationProposalIds = useMemo(
-    () => new Set(disambiguationCandidates.map((c) => c.proposal.id)),
-    [disambiguationCandidates],
-  );
-
-  const bannerProposals = useMemo(
-    () =>
-      compositionProposals.filter((p) => !disambiguationProposalIds.has(p.id)),
-    [compositionProposals, disambiguationProposalIds],
-  );
-
   // A newly-actionable proposal must be SEEN (elspeth-2d1cf8908c). The dock
   // is a scroll container by design (elspeth-ecf973fb9f), so a banner that
   // mounts below its fold — an open blob drawer or a tall composing card is
@@ -2230,8 +1884,8 @@ export function ChatPanel({
   // any waiting decision via attachDock — a fresh mount has no operator
   // scroll state to fight.
   const actionableBannerProposalIds = useMemo(
-    () => actionableProposals(bannerProposals, staleProposalIds).map((p) => p.id),
-    [bannerProposals, staleProposalIds],
+    () => actionableProposals(compositionProposals, staleProposalIds).map((p) => p.id),
+    [compositionProposals, staleProposalIds],
   );
   const seenActionableBannerIdsRef = useRef<ReadonlySet<string>>(new Set());
   const revealActionableProposals = useCallback(
@@ -2275,93 +1929,6 @@ export function ChatPanel({
     // before or not. The change-effect above stays arrival-keyed.
     revealActionableProposalsRef.current(true);
   }, []);
-
-  // ── Disambiguation action handlers ─────────────────────────────────────────
-  //
-  // Each handler is bound to one button on the widget. The accessible
-  // names on those buttons are load-bearing — see the CLOSED LIST
-  // comment in InlineSourceDisambiguationTurn.tsx.
-  //
-  // "Yes — N rows":   delegate to acceptProposal (the standard
-  //                   accept-proposal flow lands the inline_blob and
-  //                   the inlineSourceStore projection effect picks it
-  //                   up on the next composition-state update).
-  // "No — treat as 1 row":  reject the proposal + record the F-11 guard
-  //                          + ask the LLM to re-interpret as a single
-  //                          row. The LLM re-issuing a multi-row
-  //                          interpretation for the same message would
-  //                          re-fire this widget without the guard.
-  // "Edit the rows":   reject the proposal + ask the LLM for an
-  //                    in-chat edit of the row list (mirrors the
-  //                    chat-mediated edit path Task 3 introduced for
-  //                    the post-success surface).
-  // "This isn't source data":  record the F-10 guard + tell the LLM
-  //                            the message wasn't source data and to
-  //                            continue without creating one. We do
-  //                            NOT reject the proposal here because
-  //                            the F-10 surface implies "stop framing
-  //                            my message as source"; the next
-  //                            assistant turn will rebuild without
-  //                            the inline source and the stale
-  //                            proposal will be marked stale by the
-  //                            standard rebase pipeline.
-  const handleDisambiguationConfirmMultiRow = useCallback(
-    (proposalId: string) => {
-      void acceptProposal(proposalId);
-    },
-    [acceptProposal],
-  );
-
-  const handleDisambiguationTreatAsOneRow = useCallback(
-    (proposalId: string) => {
-      const candidate = disambiguationCandidates.find(
-        (c) => c.proposal.id === proposalId,
-      );
-      if (!candidate) return;
-      addUserRequestedSingleRow(candidate.messageId);
-      void rejectProposal(proposalId);
-      sendMessage(
-        "Treat my previous message as a single row, not multiple — " +
-          "please re-interpret the input as one row and update the source.",
-      );
-    },
-    [
-      disambiguationCandidates,
-      addUserRequestedSingleRow,
-      rejectProposal,
-      sendMessage,
-    ],
-  );
-
-  const handleDisambiguationEditRows = useCallback(
-    (proposalId: string) => {
-      const candidate = disambiguationCandidates.find(
-        (c) => c.proposal.id === proposalId,
-      );
-      if (!candidate) return;
-      void rejectProposal(proposalId);
-      const rowsListing = candidate.proposedRows
-        .map((row, idx) => `${idx + 1}. ${row}`)
-        .join("\n");
-      sendMessage(
-        `I'd like to edit the proposed row list before continuing.\n\n` +
-          `Current rows:\n${rowsListing}\n\n` +
-          `Please ask me what changes I want, then update the inline source.`,
-      );
-    },
-    [disambiguationCandidates, rejectProposal, sendMessage],
-  );
-
-  const handleDisambiguationNotSourceData = useCallback(
-    (messageId: string) => {
-      addNonSourceMessage(messageId);
-      sendMessage(
-        "That message isn't source data — please continue without " +
-          "creating a source from it.",
-      );
-    },
-    [addNonSourceMessage, sendMessage],
-  );
 
   // ── Inline-source fallback predicate (Phase 5a Task 5) ───────────────────
   //
@@ -3930,31 +3497,6 @@ export function ChatPanel({
               ))}
             </section>
           )}
-          {/*
-            Inline-source disambiguation widgets (Phase 5a Task 4).
-
-            One widget per pending+non-stale ambiguous-inline proposal
-            that survives the F-10 / F-11 re-fire guards (see
-            `disambiguationCandidates` derivation above for the
-            predicate). Each widget claims its proposal id; the same id
-            is excluded from `bannerProposals` so the standard
-            PendingProposalsBanner does not duplicate the action
-            surface. Non-ambiguous proposals continue to route through
-            the banner unchanged.
-          */}
-          {disambiguationCandidates.map((candidate) => (
-            <InlineSourceDisambiguationTurn
-              key={candidate.proposal.id}
-              userInput={candidate.userInput}
-              proposedRows={candidate.proposedRows}
-              proposalId={candidate.proposal.id}
-              messageId={candidate.messageId}
-              onConfirmMultiRow={handleDisambiguationConfirmMultiRow}
-              onTreatAsOneRow={handleDisambiguationTreatAsOneRow}
-              onEditRows={handleDisambiguationEditRows}
-              onNotSourceData={handleDisambiguationNotSourceData}
-            />
-          ))}
         </div>
 
         {/* Scroll-to-bottom button — sibling of the scrolling element, so it
@@ -4013,23 +3555,17 @@ export function ChatPanel({
             operator approval, co-located with the input so the user does not
             have to scroll up to find the Accept button on the originating
             tool-call message. Component returns null when nothing is pending. */}
-        {/* Phase 5a Task 4: `bannerProposals` excludes any proposal
-            currently surfaced by an InlineSourceDisambiguationTurn
-            widget above so a single proposal does not appear in BOTH
-            surfaces. The widget handlers ultimately funnel through
-            acceptProposal / rejectProposal so the audit chain is
-            identical regardless of which surface lands the action. */}
         {/* Persistent announcer for banner arrivals (elspeth-2d1cf8908c):
             the banner returns null when empty, so a live-region role on the
             banner itself would mount WITH its content — the unreliable
             pattern AcknowledgementLiveRegion documents. This node pre-exists
             the content; only its text mutates. */}
         <PendingProposalsLiveRegion
-          proposals={bannerProposals}
+          proposals={compositionProposals}
           staleProposalIds={staleProposalIds}
         />
         <PendingProposalsBanner
-          proposals={bannerProposals}
+          proposals={compositionProposals}
           staleProposalIds={staleProposalIds}
           proposalActionPendingIds={proposalActionPendingIds}
           onAccept={acceptProposal}
