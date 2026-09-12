@@ -263,12 +263,13 @@ def test_taught_census_matches_live_argument_schemas() -> None:
     assert rows["upsert_node"].taught == rows["upsert_node"].shipped
 
 
-def test_direct_cli_needs_only_the_two_source_roots(tmp_path: Path) -> None:
+@pytest.mark.parametrize("scorecard", [False, True])
+def test_direct_cli_needs_only_the_two_source_roots(tmp_path: Path, scorecard: bool) -> None:
     root = Path(__file__).resolve().parents[3]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root / "elspeth-lints/src")))}
     environment["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     result = subprocess.run(
-        [sys.executable, str(root / "scripts/cicd/composer_wire_census.py")],
+        [sys.executable, str(root / "scripts/cicd/composer_wire_census.py"), *(["--scorecard"] if scorecard else [])],
         cwd=tmp_path,
         env=environment,
         capture_output=True,
@@ -278,6 +279,11 @@ def test_direct_cli_needs_only_the_two_source_roots(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     rows = json.loads(result.stdout)
+    if scorecard:
+        assert rows["failures"] == []
+        assert rows["tool_count"] == len(census_taught_wire())
+        assert rows["scope"] == "static source relations"
+        return
     expected = census_taught_wire()
     assert {row["tool"] for row in rows} == set(expected)
     assert all(row["untaught"] == [] and row["stale_argument_declarations"] == [] for row in rows)

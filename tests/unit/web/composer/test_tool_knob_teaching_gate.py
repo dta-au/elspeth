@@ -11,16 +11,16 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from scripts.cicd.composer_wire_census import census_taught_wire
-
-from elspeth.web.composer.tools._dispatch import get_tool_definitions
-from tests.unit.web.composer._teaching_gate_support import (
+from scripts.cicd.composer_teaching import (
     argument_teaching,
     is_quoted_leaf,
     owned_teaching_text,
     teaching_blocks,
     validate_teaching_scopes,
 )
+from scripts.cicd.composer_wire_census import census_taught_wire
+
+from elspeth.web.composer.tools._dispatch import get_tool_definitions
 
 
 def test_every_shipped_argument_is_taught_in_its_own_context() -> None:

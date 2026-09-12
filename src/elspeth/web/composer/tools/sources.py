@@ -76,7 +76,6 @@ from elspeth.web.composer.tools._common import (
     _validate_mutation_arguments,
     _validate_plugin_name,
     _validate_source_path,
-    _vf_destination_note,
     canonicalize_source_validation_failure,
     review_reconciliation_failure_message,
 )
@@ -1171,10 +1170,8 @@ def _execute_set_source(
     )
     new_state = state.with_named_source(source_name, source)
     affected = (_source_component_id(source_name),)
-    data = _vf_destination_note(new_state, on_vf)
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
-    if echo_note is not None:
-        data = {"server_owned_metadata_note": echo_note} if data is None else {**data, "server_owned_metadata_note": echo_note}
+    data = {"server_owned_metadata_note": echo_note} if echo_note is not None else None
     return _mutation_result(new_state, affected, data=data)
 
 
@@ -1298,10 +1295,8 @@ def _execute_set_source_from_blob(
         on_validation_failure=on_vf,
     )
     new_state = state.with_named_source(source_name, source)
-    data = _vf_destination_note(new_state, on_vf) or {}
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
-    if echo_note is not None:
-        data["server_owned_metadata_note"] = echo_note
+    data = {"server_owned_metadata_note": echo_note} if echo_note is not None else {}
     return _mutation_result(new_state, (_source_component_id(source_name),), data={**data, "source_blob": resolved.payload})
 
 
@@ -1518,10 +1513,8 @@ def _execute_set_source_from_blobs(
         on_validation_failure=on_vf,
     )
     new_state = state.with_named_source(source_name, source)
-    data = _vf_destination_note(new_state, on_vf) or {}
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
-    if echo_note is not None:
-        data["server_owned_metadata_note"] = echo_note
+    data = {"server_owned_metadata_note": echo_note} if echo_note is not None else {}
     return _mutation_result(
         new_state,
         (_source_component_id(source_name),),

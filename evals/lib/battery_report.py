@@ -7,7 +7,7 @@ import json
 import math
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -145,7 +145,7 @@ def _rates(scores: list[Score]) -> dict[str, Any]:
     }
 
 
-def _median(values: list[float]) -> float | None:
+def _median(values: Sequence[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
@@ -201,7 +201,7 @@ def build_report(
         degraded_reasons.append("exclusions above 15%")
     if corpus and pooled["excluded_measurement"] / len(corpus) > 0.15:
         findings.append(
-            f"measurement exclusions (surface/no_calls) in {round(100 * pooled['excluded_measurement'] / len(corpus))}% of runs — the corpus routes to the planner or the model never calls a tool; a corpus/kit finding, not an instrument fault"
+            f"measurement exclusions (surface/no_calls/approval_unobservable) in {round(100 * pooled['excluded_measurement'] / len(corpus))}% of runs — the capture uses another surface, has no tool calls, or lacks mutation approval/application evidence; a measurement limit, not an instrument fault"
         )
     if pooled["n"] and pooled["unattributed_excess"] / pooled["n"] > 0.15:
         degraded_reasons.append("unattributed_excess above 15%")

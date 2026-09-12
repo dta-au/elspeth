@@ -34,13 +34,7 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict
 
 import pytest
-
-from elspeth.web.composer import pipeline_planner, state
-from elspeth.web.composer.guided import planning as guided_planning
-from elspeth.web.composer.pipeline_planner import route_destination_fact_keys
-from elspeth.web.composer.reviewed_output_projection import ReviewedOutputProjectionConflict
-from elspeth.web.composer.tools import generation
-from tests.unit.web.composer._teaching_gate_support import (
+from scripts.cicd.composer_teaching import (
     _call_name,
     _display,
     _enclosing_function,
@@ -51,6 +45,12 @@ from tests.unit.web.composer._teaching_gate_support import (
     composer_python_files,
     is_quoted_leaf,
 )
+
+from elspeth.web.composer import pipeline_planner, state
+from elspeth.web.composer.guided import planning as guided_planning
+from elspeth.web.composer.pipeline_planner import route_destination_fact_keys
+from elspeth.web.composer.reviewed_output_projection import ReviewedOutputProjectionConflict
+from elspeth.web.composer.tools import generation
 
 FENCE_PATH = Path(__file__).with_name("planner_teaching_fence.json")
 

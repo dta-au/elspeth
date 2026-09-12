@@ -17,7 +17,7 @@ from typing import NamedTuple
 
 from elspeth_lints.core.ast_walker import iter_python_files
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 # The whole web package, not only the composer: ``ValidationEntry`` is also
 # constructed in web/plugin_policy and web/sessions (detail-free today), and a
 # detail added there would otherwise be outside the walk (final red-team).

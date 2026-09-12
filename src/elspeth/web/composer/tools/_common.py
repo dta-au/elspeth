@@ -1602,32 +1602,6 @@ def _mutation_result(
     )
 
 
-def _vf_destination_note(
-    state: CompositionState,
-    on_vf: str,
-) -> dict[str, str] | None:
-    """Advisory note when on_validation_failure references an unknown output.
-
-    Returns a dict with a ``note`` key suitable for ``ToolResult.data``,
-    or ``None`` when no advisory is needed (destination is ``"discard"``
-    or matches a configured output).
-    """
-    if on_vf == "discard":
-        return None
-    output_names = {o.name for o in state.outputs}
-    if on_vf not in output_names:
-        current = sorted(output_names) if output_names else "(none)"
-        return {
-            "note": (
-                f"on_validation_failure='{on_vf}' does not match any configured output. "
-                "Use 'discard' to drop invalid rows without routing, or "
-                f"add an output named '{on_vf}' before running the pipeline. "
-                f"Current outputs: {current}."
-            ),
-        }
-    return None
-
-
 def _apply_merge_patch(
     target: Mapping[str, Any],
     patch: dict[str, Any],

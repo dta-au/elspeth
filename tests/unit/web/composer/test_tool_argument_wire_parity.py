@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from jsonschema import Draft202012Validator
 from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
+from scripts.cicd.composer_admitted_wire import admitted_wire_rows, model_argument_keys
 
 from elspeth.web.composer import redaction
 from elspeth.web.composer.redaction import (
@@ -89,32 +90,15 @@ def _shipped_argument_keys() -> dict[str, frozenset[str]]:
 
 
 def _model_argument_keys(tool: str, model: type[BaseModel]) -> frozenset[str]:
-    """Measure accepted root names; diagnose unsupported aliases explicitly."""
-    for name, field in model.model_fields.items():
-        assert field.alias in (None, name), f"{tool}.{name}: unsupported input alias"
-        assert field.validation_alias in (None, name), f"{tool}.{name}: unsupported validation alias"
-        assert field.serialization_alias in (None, name), f"{tool}.{name}: unsupported serialization alias"
-    assert model.model_config["extra"] == "forbid", f"{tool}: argument model must reject unknown root keys"
-    schema = model.model_json_schema(mode="validation", by_alias=True)
-    assert schema["type"] == "object", f"{tool}: unsupported argument root"
-    accepted = frozenset(schema["properties"])
-    assert accepted == frozenset(model.model_fields), f"{tool}: accepted schema/field names disagree"
-    return accepted
+    return model_argument_keys(tool, model)
 
 
 def _admitted_argument_keys() -> dict[str, frozenset[str]]:
     """Keep every manifest entry, including closed policies with zero keys."""
-    admitted: dict[str, frozenset[str]] = {}
-    for name, entry in redaction.MANIFEST.items():
-        model = entry.argument_model
-        if model is not None:
-            admitted[name] = _model_argument_keys(name, model)
-        else:
-            policy = entry.policy
-            assert policy is not None
-            assert policy_closes_unknown_arguments(policy), f"{name}: open argument policy"
-            admitted[name] = frozenset(policy.known_argument_keys)
-    return admitted
+    rows = admitted_wire_rows(redaction.MANIFEST, policy_closes_unknown_arguments)
+    for name, row in rows.items():
+        assert row.mode != "open_declarative", f"{name}: open argument policy"
+    return {name: row.accepted for name, row in rows.items()}
 
 
 def _assert_admitted_wire() -> None:

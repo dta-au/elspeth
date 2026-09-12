@@ -13,17 +13,15 @@ input-field extractions, not causal use or execution of every branch.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import builtins
 import inspect
 import json
-import runpy
 import textwrap
-from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from types import FunctionType, ModuleType
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel
 
@@ -32,7 +30,17 @@ from elspeth.web.composer.redaction import MANIFEST
 from elspeth.web.composer.tools._common import _validate_mutation_arguments
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
+from elspeth.web.composer.tools.schema_contract import assert_set_pipeline_schema_compatible, assert_upsert_node_schema_compatible
 from elspeth.web.composer.tools.sessions import _SESSION_AWARE_TOOL_HANDLERS
+
+if TYPE_CHECKING or __package__:
+    from .composer_admitted_wire import admitted_wire_rows, model_argument_keys
+    from .composer_frontend_wire import census_frontend_wire
+    from .composer_teaching import argument_teaching
+else:
+    from composer_admitted_wire import admitted_wire_rows, model_argument_keys
+    from composer_frontend_wire import census_frontend_wire
+    from composer_teaching import argument_teaching
 
 # Explicitly emitted by _dispatch and intercepted by ComposerServiceImpl;
 # absence from the callable registry must never silently admit another tool.
@@ -50,6 +58,7 @@ class ModelWireRow:
     model_class: str | None
     model_fields: frozenset[str]
     site: str
+    accepted_wire_names: frozenset[str] | None = None
 
 
 def _body_nodes(node: ast.AST) -> list[ast.AST]:
@@ -374,12 +383,18 @@ def census_model_wire() -> dict[str, ModelWireRow]:
             rows[name] = ModelWireRow(name, shipped, None, frozenset(), f"unresolved:{exc}")
             continue
         handler_site = f"handler:{handler.__module__}.{handler.__qualname__}"
+        try:
+            accepted = None if model is None else model_argument_keys(name, model)
+        except AssertionError as exc:
+            rows[name] = ModelWireRow(name, shipped, None, frozenset(), f"unresolved:{exc}")
+            continue
         rows[name] = ModelWireRow(
             name,
             shipped,
             None if model is None else f"{model.__module__}.{model.__qualname__}",
             frozenset() if model is None else frozenset(model.model_fields),
             handler_site + (" -> " + ", ".join(sites) if sites else " (no input model found)"),
+            accepted,
         )
     return rows
 
@@ -831,26 +846,163 @@ class TaughtWireRow:
 
 
 def census_taught_wire() -> dict[str, TaughtWireRow]:
-    """Measure own-context teaching using the same authority as the response gate.
-
-    Load the small helper by its explicit repository path. Direct script
-    execution has only the two source roots on PYTHONPATH; importing ``tests``
-    would depend on pytest path injection or an unrelated installed package.
-    run_path gives the helper a bounded namespace and imports no test gate.
-    """
-    helper_path = Path(__file__).resolve().parents[2] / "tests/unit/web/composer/_teaching_gate_support.py"
-    helper = runpy.run_path(str(helper_path))
-    reader = cast(
-        Callable[..., dict[str, tuple[frozenset[str], frozenset[str], frozenset[str]]]],
-        helper["argument_teaching"],
-    )
+    """Measure lexical own-context teaching using the gates' shared authority."""
     return {
         name: TaughtWireRow(name, shipped, taught, declared)
-        for name, (shipped, taught, declared) in reader(get_tool_definitions(), build_system_prompt(None)).items()
+        for name, (shipped, taught, declared) in argument_teaching(get_tool_definitions(), build_system_prompt(None)).items()
     }
 
 
-if __name__ == "__main__":
+def _reconcile_wire(family: str, shipped: frozenset[str], keys: list[str], tools: list[str]) -> None:
+    if len(tools) != len(set(tools)):
+        duplicates = sorted({tool for tool in tools if tools.count(tool) > 1})
+        raise CensusError(f"{family}: duplicate tool rows: {duplicates}")
+    if keys != tools:
+        raise CensusError(f"{family}: row identities disagree with mapping keys: {list(zip(keys, tools, strict=True))}")
+    actual = frozenset(keys)
+    if actual != shipped:
+        raise CensusError(f"{family}: missing={sorted(shipped - actual)}; unexpected={sorted(actual - shipped)}")
+
+
+def census_scorecard() -> dict[str, Any]:
+    """Join source relations; never imply these extractors executed behavior tests."""
+    definitions = get_tool_definitions()
+    names = [definition["name"] for definition in definitions]
+    universe = frozenset(names)
+    if not universe or len(universe) != len(names):
+        raise CensusError("SHIPPED: empty registry or duplicate tool definitions")
+    models = census_model_wire()
+    reads = census_read_wire()
+    taught = census_taught_wire()
+    admitted = admitted_wire_rows(MANIFEST)
+    frontend = census_frontend_wire(manifest=MANIFEST)
+    for family, rows in (("MODEL", models), ("READ", reads), ("TAUGHT", taught), ("ADMITTED", admitted), ("FRONTEND", frontend)):
+        _reconcile_wire(family, universe, list(rows), [row.tool for row in rows.values()])
+
+    # These are existing named schema authorities, not a new per-tool key matrix.
+    semantic_authorities = {
+        "set_pipeline": assert_set_pipeline_schema_compatible,
+        "upsert_node": assert_upsert_node_schema_compatible,
+    }
+    result = []
+    failures: list[str] = []
+    for definition in definitions:
+        name = definition["name"]
+        shipped = frozenset(definition["parameters"]["properties"])
+        model, read, teaching, admission, projection = models[name], reads[name], taught[name], admitted[name], frontend[name]
+        for family, observed in (("MODEL", model.shipped), ("READ", read.shipped), ("TAUGHT", teaching.shipped)):
+            if observed != shipped:
+                raise CensusError(f"{family}: {name}: SHIPPED keys changed during extraction")
+        model_keys = model.accepted_wire_names
+        model_unresolved = model_keys is None or model.model_class is None or model.site.startswith("unresolved:")
+        missing_model = shipped if model_keys is None else shipped - model_keys
+        extra_model = frozenset() if model_keys is None else model_keys - shipped
+        semantic = "root names only; no general semantic equivalence claim"
+        semantic_failure = None
+        if name in semantic_authorities:
+            authority = semantic_authorities[name]
+            semantic = f"directional schema relation: {authority.__module__}.{authority.__qualname__}"
+            try:
+                authority(advertised_schema=definition["parameters"])
+            except RuntimeError as exc:
+                semantic_failure = str(exc)
+        differences = {
+            "MODEL": sorted(missing_model | extra_model),
+            "READ": sorted((shipped - read.read) | (read.read - shipped)),
+            "ADMITTED": sorted((shipped - admission.accepted) | (admission.accepted - shipped)),
+            "TAUGHT": sorted((shipped - teaching.taught) | (teaching.declared - shipped)),
+        }
+        problems = [f"{family}: {', '.join(keys)}" for family, keys in differences.items() if keys]
+        if model_unresolved:
+            problems.append(f"MODEL unresolved: {model.site}")
+        problems.extend(f"READ unresolved: {item}" for item in read.unresolved)
+        if semantic_failure is not None:
+            problems.append(f"MODEL schema: {semantic_failure}")
+        if admission.mode == "open_declarative":
+            problems.append("ADMITTED: open policy; pending tightening")
+        if projection.missing_fixture:
+            problems.append("FRONTEND: summarized projected argument has no fixture")
+        failures.extend(f"{name}: {problem}" for problem in problems)
+        result.append(
+            {
+                "tool": name,
+                "SHIPPED": {
+                    "root_keys": sorted(shipped),
+                    "root_key_count": len(shipped),
+                    "source": f"elspeth.web.composer.tools._dispatch.get_tool_definitions[{name!r}]",
+                    "schema_root": definition["parameters"]["type"],
+                },
+                "MODEL": {
+                    "model": model.model_class,
+                    "source": model.site,
+                    "accepted_wire_names": None if model_keys is None else sorted(model_keys),
+                    "shipped_not_model": sorted(missing_model),
+                    "model_not_shipped": sorted(extra_model),
+                    "unresolved": model_unresolved,
+                    "schema_relation": semantic,
+                    "schema_failure": semantic_failure,
+                },
+                "READ": {
+                    "attributed": sorted(read.read),
+                    "unattributed": sorted(shipped - read.read),
+                    "extra_attributions": sorted(read.read - shipped),
+                    "unresolved": list(read.unresolved),
+                    "extractions": [{"field": item.field, "site": item.site, "callers": list(item.callers)} for item in read.extractions],
+                    "presence": [{"field": item.field, "site": item.site, "callers": list(item.callers)} for item in read.presence],
+                },
+                "ADMITTED": {
+                    "mode": admission.mode,
+                    "accepted_wire_names": sorted(admission.accepted),
+                    "unadmitted": sorted(shipped - admission.accepted),
+                    "unadvertised": sorted(admission.accepted - shipped),
+                    "model": admission.model_class,
+                    "source": f"elspeth.web.composer.redaction.MANIFEST[{name!r}]",
+                },
+                "TAUGHT": {
+                    "lexical_own_context": sorted(teaching.taught),
+                    "declared": sorted(teaching.declared),
+                    "untaught": sorted(shipped - teaching.taught),
+                    "stale_declarations": sorted(teaching.declared - shipped),
+                    "source": "scripts/cicd/composer_teaching.py:argument_teaching",
+                },
+                "FRONTEND": {
+                    "projected_inventory_member": projection.projected,
+                    "summarizes_argument": projection.summarizes_argument,
+                    "fixture_cases": sorted(projection.fixture_cases),
+                    "source": "src/elspeth/web/frontend/src/test/fixtures/redacted-tool-arguments.json",
+                },
+                "differences": differences,
+                "problems": problems,
+            }
+        )
+    return {
+        "scope": "static source relations",
+        "tool_count": len(result),
+        "rows": result,
+        "failures": failures,
+        "limitations": [
+            "MODEL is original-input admission attribution plus root names; only named schema authorities add directional semantics.",
+            "READ is direct/delegated source attribution, not runtime branch execution or behavioral effect.",
+            "ADMITTED is root-name policy, not sensitive-value redaction or emitted-value correctness.",
+            "TAUGHT is lexical own-context coverage, not explanation quality.",
+            "FRONTEND is generated registry/fixture membership; ProposalDiff.test.tsx Vitest guard owns live dispatch parity and was not executed by this command.",
+            "No live battery, provider, approval, persistence or per-transition effects are established by this report.",
+        ],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scorecard", action="store_true", help="join all static argument wire authorities")
+    args = parser.parse_args()
+    if args.scorecard:
+        try:
+            report = census_scorecard()
+        except (CensusError, AssertionError, ValueError, OSError) as exc:
+            print(json.dumps({"extraction_error": str(exc)}))
+            return 1
+        print(json.dumps(report, indent=2))
+        return 1 if report["failures"] else 0
     redaction_models = census_redaction_models()
     taught_rows = census_taught_wire()
     read_rows = census_read_wire()
@@ -889,3 +1041,8 @@ if __name__ == "__main__":
             indent=2,
         )
     )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

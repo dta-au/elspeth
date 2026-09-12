@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -65,7 +66,11 @@ from evals.lib.battery_topology import observed_option_values, topologies_match,
 from evals.lib.scenario_from_example import BUILD_FAILURE_SENTINELS, PASSIVITY_PHRASES
 
 INSTRUMENT_KINDS: tuple[str, ...] = ("capture", "truncated", "read_integrity", "auth", "http", "transport", "terminal_missing")
-MEASUREMENT_KINDS: tuple[str, ...] = ("surface", "no_calls")  # the product routed elsewhere / never called a tool: a finding, not a fault
+MEASUREMENT_KINDS: tuple[str, ...] = (
+    "surface",
+    "no_calls",
+    "approval_unobservable",
+)  # the product routed elsewhere / never called a tool: a finding, not a fault
 EXCLUSION_KINDS: tuple[str, ...] = (
     "no_calls",
     "auth",
@@ -76,6 +81,7 @@ EXCLUSION_KINDS: tuple[str, ...] = (
     "terminal_missing",
     "transport",
     "capture",
+    "approval_unobservable",
 )
 assert set(EXCLUSION_KINDS) == set(INSTRUMENT_KINDS) | set(MEASUREMENT_KINDS)
 
@@ -202,6 +208,9 @@ class PathScore:
     schema_read_before_first_mutation: bool | None  # None when no mutation was applied
     passivity_hits: tuple[str, ...]
     sentinel_hits: tuple[str, ...]
+    approval_pending_calls: int = 0
+    applied_mutation_calls: int = 0
+    approval_unknown_calls: int = 0
 
     @property
     def excluded_by_instrument(self) -> bool:
@@ -232,6 +241,9 @@ class Score:
     tokens: dict[str, int]
     cost: float | None
     wall_ms: int
+    approval_pending_calls: int = 0
+    applied_mutation_calls: int = 0
+    approval_unknown_calls: int = 0
     red_reasons: list[str] = field(default_factory=list)
     green_reasons: list[str] = field(default_factory=list)
     exclusion_evidence: str | None = None
@@ -360,7 +372,10 @@ class _Event:
 
 def _events(capture: Capture, tool_bearing_seqs: list[int]) -> list[_Event]:
     outcomes = tool_outcomes(capture)
-    rows_by_id = {r.tool_call_id: r for r in tool_rows(capture)}
+    rows = tool_rows(capture)
+    row_counts = Counter(r.tool_call_id for r in rows)
+    call_counts = Counter(c.id for t in assistant_turns(capture) for c in t.tool_calls)
+    rows_by_id = {r.tool_call_id: r for r in rows if row_counts[r.tool_call_id] == 1}
     events: list[_Event] = []
     for turn in assistant_turns(capture):
         ordinal = sum(
@@ -368,12 +383,26 @@ def _events(capture: Capture, tool_bearing_seqs: list[int]) -> list[_Event]:
         )  # 1-based index of the last tool-bearing audit row at/before this turn
         for c in turn.tool_calls:
             row = rows_by_id.get(c.id)
+            if call_counts[c.id] != 1 or (
+                row is not None and (row.parent_assistant_id != turn.message_id or row.sequence_no <= turn.sequence_no)
+            ):
+                row = None
+            if row is not None and row.envelope is not None:
+                invocation = row.envelope.get("invocation")
+                if isinstance(invocation, Mapping) and (
+                    ("tool_call_id" in invocation and invocation["tool_call_id"] != c.id)
+                    or ("tool_name" in invocation and invocation["tool_name"] != c.name)
+                ):
+                    row = None
+            outcome = outcomes.get(c.id, "unknown") if row is not None else "unknown"
+            if row is not None and outcome == "applied" and row.content is not None and _approval_required(row.content):
+                outcome = "completed"  # explicit pending custody takes precedence over a state stamp
             events.append(
                 _Event(
                     turn.sequence_no,
                     row.sequence_no if row else turn.sequence_no,
                     c,
-                    outcomes.get(c.id, "cancelled"),
+                    outcome,
                     row.content if row else None,
                     ordinal,
                 )
@@ -440,6 +469,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
     patched: set[tuple[str, str]] = set()
     pending_failed: _Event | None = None
     applied_any = applied_set_pipeline = blob_created = False
+    approval_pending_calls = applied_mutation_calls = approval_unknown_calls = 0
     for ev in events:
         name, args = ev.call.name, ev.call.arguments
         digest = _digest(args)
@@ -449,6 +479,17 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
                 deviations.append(Deviation("excess_discovery", (ev.turn_seq, ev.row_seq), name, digest, (), ev.audit_ordinal))
             seen_discovery.add(key)
             continue
+        if is_mutation_tool(name) and ev.outcome not in _NOT_APPLIED:
+            if ev.outcome == "applied":
+                applied_mutation_calls += 1
+            elif isinstance(ev.content, Mapping) and ev.content.get("success") is True and _approval_required(ev.content):
+                approval_pending_calls += 1
+                deviations.append(
+                    Deviation("approval_pending", (ev.turn_seq, ev.row_seq), name, digest, ("APPROVAL_REQUIRED",), ev.audit_ordinal)
+                )
+                continue
+            else:
+                approval_unknown_calls += 1
         # data tools (spec §3, _DATA_TOOLS) ARE mutation tools in the registry; they are classified here,
         # ahead of the generic pipeline-mutation path, so a data detour never reads as a repair/backtrack.
         # wire_blob_inline_ref is the BIND half of a create_blob detour — create_blob already charged the
@@ -484,10 +525,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
         if ev.outcome in _NOT_APPLIED:
             pending_failed = ev
             continue
-        if isinstance(ev.content, Mapping) and ev.content.get("success") is True and _approval_required(ev.content):
-            deviations.append(
-                Deviation("approval_pending", (ev.turn_seq, ev.row_seq), name, digest, ("APPROVAL_REQUIRED",), ev.audit_ordinal)
-            )
+        if ev.outcome != "applied":
             continue
         # applied
         if (name in _REMOVAL_TOOLS and applied_any) or (name == "set_pipeline" and applied_set_pipeline):
@@ -514,7 +552,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
             )
         )
     first_mut = next(
-        (e for e in events if is_mutation_tool(e.call.name) and e.call.name not in _DATA_TOOLS and e.outcome not in _NOT_APPLIED),
+        (e for e in events if is_mutation_tool(e.call.name) and e.call.name not in _DATA_TOOLS and e.outcome == "applied"),
         None,
     )
     schema_before: bool | None = (
@@ -531,7 +569,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
             deviations.append(Deviation("malformed_output", (c.sequence_no, c.sequence_no), None, None, (c.status,), None))
 
     # ── terminal classes (from the captured body only) ──
-    post = next((h for h in http_steps if h.get("step") == "post_message"), {})
+    post: Mapping[str, Any] = next((h for h in http_steps if h.get("step") == "post_message"), {})
     post_status = post.get("status")
     budget = terminal.get("budget_exhausted")
     if not is_valid:
@@ -573,6 +611,10 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
     elif not is_valid and post_status != 200 and terminal.get("source", "none") == "none":
         excluded, evidence = "terminal_missing", f"post_message status {post_status} and no server terminal reason"
 
+    if excluded is None and approval_unknown_calls:
+        excluded = "approval_unobservable"
+        evidence = f"{approval_unknown_calls} mutation calls lack unambiguous approval or applied evidence"
+
     return PathScore(
         repeat=repeat,
         surface_observed=surface,
@@ -591,6 +633,9 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
         tokens=tokens,
         cost=(cost if cost_known else None),
         wall_ms=wall_ms,
+        approval_pending_calls=approval_pending_calls,
+        applied_mutation_calls=applied_mutation_calls,
+        approval_unknown_calls=approval_unknown_calls,
         applied_any=applied_any,
         attempted_any=attempted_any,
         schema_read_before_first_mutation=schema_before,
@@ -601,7 +646,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
 
 def _first_applied_seq(events: list[_Event]) -> int:
     for e in events:
-        if is_mutation_tool(e.call.name) and e.outcome not in _NOT_APPLIED:
+        if is_mutation_tool(e.call.name) and e.outcome == "applied":
             return e.row_seq
     return 0
 
@@ -692,6 +737,8 @@ def judge(scenario: Scenario, path: PathScore) -> Score:
         green_reasons.append(f"topology: {shape_reason or 'no valid state'}")
     if gc.get("must_discover_schema_before_first_mutation", True) and path.schema_read_before_first_mutation is False:
         green_reasons.append("no get_plugin_schema before the first applied mutation")
+    if path.approval_unknown_calls:
+        green_reasons.append("mutation approval/application evidence is unobservable")
     green = not green_reasons and not red_reasons
     red = bool(red_reasons)
 
@@ -724,6 +771,9 @@ def judge(scenario: Scenario, path: PathScore) -> Score:
         tokens=path.tokens,
         cost=path.cost,
         wall_ms=path.wall_ms,
+        approval_pending_calls=path.approval_pending_calls,
+        applied_mutation_calls=path.applied_mutation_calls,
+        approval_unknown_calls=path.approval_unknown_calls,
         red_reasons=red_reasons,
         green_reasons=green_reasons,
         exclusion_evidence=path.exclusion_evidence,

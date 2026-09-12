@@ -370,13 +370,6 @@ listed; repair the listed ones and resubmit.
 
 ### On success
 
-<!-- taught:begin tool-data set_source data.note; tool-data set_source_from_blob data.note; tool-data set_source_from_blobs data.note; tool-data set_pipeline data.note -->
-A `note` under `data` on a successful source, node, or `set_pipeline`
-mutation can name a real problem the mutation did not block on (for example
-an `on_validation_failure` destination that matches no configured output):
-read it and repair what it names before the next turn; it is not optional.
-<!-- taught:end -->
-
 <!-- taught:begin envelope * applied_component; envelope * validation_delta; envelope * post_call_hints; echo * applied_component.source; echo * applied_component.sources; echo * applied_component.nodes; echo * applied_component.outputs; echo * applied_component.edges; delta * validation_delta.new_errors; delta * validation_delta.resolved_errors; delta * validation_delta.new_warnings; delta * validation_delta.resolved_warnings -->
 A successful incremental mutation carries `applied_component` (`source`,
 `sources`, `nodes`, `outputs`, `edges` as stored) and `validation_delta`

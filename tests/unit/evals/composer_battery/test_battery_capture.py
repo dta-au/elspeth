@@ -65,7 +65,7 @@ def test_envelope_cancelled_and_failed_statuses() -> None:
     assert tool_outcomes(cap)["call_sp"] == "cancelled"
     tool["tool_calls"] = [{"_kind": "audit", "invocation": {"status": "arg_error", "version_before": 1, "version_after": 1}}]
     assert tool_outcomes(cap)["call_sp"] == "failed"
-    tool["tool_calls"] = [{"_kind": "audit", "invocation": {"status": "ok", "version_before": 1, "version_after": 2}}]
+    tool["tool_calls"] = [{"_kind": "audit", "invocation": {"status": "success", "version_before": 1, "version_after": 2}}]
     assert tool_outcomes(cap)["call_sp"] == "applied"
 
 
@@ -184,3 +184,13 @@ def test_tool_outcomes_agree_with_the_server_projection() -> None:
             "err_cancelled": "cancelled",
         }
     )
+
+
+def test_duplicate_durable_rows_do_not_prove_application() -> None:
+    rows = [
+        tg.assistant_row(1, [tg.call("mutation", "set_pipeline", {})]),
+        tg.tool_row(2, "mutation", "as1", state_id="state-2"),
+        tg.tool_row(3, "mutation", "as1", content={"success": True}),
+    ]
+    assert tool_outcomes(tg.capture(rows, state=None))["mutation"] == "unknown"
+    assert tool_outcomes(tg.capture(list(reversed(rows)), state=None))["mutation"] == "unknown"

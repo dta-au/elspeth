@@ -1858,16 +1858,16 @@ class TestSetSource:
 
 
 class TestVfDestinationAdvisory:
-    """Advisory note when on_validation_failure references an unknown output.
+    """Structured guidance when on_validation_failure references an unknown output.
 
     The set_source tool schema accepts any string for on_validation_failure
     (not just 'discard'/'quarantine'). When the value doesn't match a
-    configured output, ToolResult.data includes a note so the LLM can
-    self-correct before pipeline validation fails at engine startup.
+    configured output, validation carries the closed error once, without
+    duplicating its repair target in a free-text data note.
     """
 
-    def test_set_source_unknown_vf_sink_includes_note(self) -> None:
-        """Unknown on_validation_failure destination produces advisory note."""
+    def test_set_source_unknown_vf_sink_has_only_structured_error(self) -> None:
+        """Unknown destinations retain their structured validation error."""
         state = _empty_state()
         catalog = _mock_catalog()
         result = execute_tool(
@@ -1882,10 +1882,8 @@ class TestVfDestinationAdvisory:
             catalog,
         )
         assert result.success is True
-        assert result.data is not None
-        assert "nonexistent" in result.data["note"]
-        assert "output" in result.data["note"].lower()
-        assert "discard" in result.data["note"]
+        assert result.data is None
+        assert [entry.error_code for entry in result.validation.errors].count("quarantine_unknown_output") == 1
 
     def test_set_source_discard_vf_no_note(self) -> None:
         """'discard' is a built-in value — no advisory needed."""
@@ -1904,6 +1902,7 @@ class TestVfDestinationAdvisory:
         )
         assert result.success is True
         assert result.data is None
+        assert all(entry.error_code != "quarantine_unknown_output" for entry in result.validation.errors)
 
     def test_set_source_known_vf_sink_no_note(self) -> None:
         """When the named output exists, no advisory is needed."""
@@ -1936,9 +1935,10 @@ class TestVfDestinationAdvisory:
         )
         assert r2.success is True
         assert r2.data is None
+        assert all(entry.error_code != "quarantine_unknown_output" for entry in r2.validation.errors)
 
-    def test_set_pipeline_unknown_vf_sink_includes_note(self) -> None:
-        """set_pipeline with unknown on_validation_failure produces advisory."""
+    def test_set_pipeline_unknown_vf_sink_has_only_structured_error(self) -> None:
+        """Full replacement reports the same validation error once."""
         state = _empty_state()
         catalog = _mock_catalog()
         args = _valid_pipeline_args()
@@ -1946,8 +1946,8 @@ class TestVfDestinationAdvisory:
         args["source"]["on_validation_failure"] = "typo_sink"
         result = execute_tool("set_pipeline", args, state, catalog)
         assert result.success is True
-        assert result.data is not None
-        assert "typo_sink" in result.data["note"]
+        assert result.data is None
+        assert [entry.error_code for entry in result.validation.errors].count("quarantine_unknown_output") == 1
 
     def test_set_pipeline_vf_matches_output_no_note(self) -> None:
         """set_pipeline with on_validation_failure matching an output — no note."""
@@ -5429,8 +5429,8 @@ class TestBlobTools:
         delta_threaded = result_threaded.to_dict()["validation_delta"]
         assert delta_fresh == delta_threaded
 
-    def test_set_source_from_blob_unknown_vf_sink_includes_note(self) -> None:
-        """Blob-backed source with unknown on_validation_failure gets advisory note."""
+    def test_blob_source_unknown_vf_sink_has_only_structured_error(self) -> None:
+        """The blob adapter retains the error and its blob metadata."""
         state = _empty_state()
         catalog = _mock_catalog()
         result = execute_tool(
@@ -5448,8 +5448,9 @@ class TestBlobTools:
         )
         assert result.success is True
         assert result.data is not None
-        assert "nonexistent" in result.data["note"]
-        assert "discard" in result.data["note"]
+        assert "note" not in result.data
+        assert "source_blob" in result.data
+        assert [entry.error_code for entry in result.validation.errors].count("quarantine_unknown_output") == 1
 
     def test_create_blob_cleans_file_on_interrupted_atomic_write(self, tmp_path: Path) -> None:
         """A failed create_blob publication must delete its orphaned storage file."""

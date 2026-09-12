@@ -114,6 +114,17 @@ def _run(harness, arguments: dict[str, Any], state: CompositionState | None = No
 
 
 class TestSetSourceFromBlobs:
+    @pytest.mark.parametrize("destination", ["discard", "missing-quarantine"])
+    def test_destination_error_is_structured_without_redundant_note(self, harness, destination: str) -> None:
+        blob_id = _create_ready_blob(harness, content=_PNG, filename="page.png", mime_type="image/png")
+        result = _run(harness, {"blob_ids": [blob_id], "on_success": "documents", "on_validation_failure": destination})
+
+        assert result.success, _first_error(result)
+        assert "note" not in result.data
+        assert result.data["source_blobs"][0]["blob_id"] == blob_id
+        codes = [entry.error_code for entry in result.validation.errors]
+        assert codes.count("quarantine_unknown_output") == (0 if destination == "discard" else 1)
+
     def test_binds_ready_blobs_in_order_with_authoritative_fields(self, harness) -> None:
         import hashlib
 

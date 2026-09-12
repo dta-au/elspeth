@@ -38,18 +38,7 @@ from typing import NamedTuple, NotRequired, TypedDict
 
 import pytest
 from pydantic import BaseModel
-
-from elspeth.web.catalog.schemas import PluginSchemaInfo
-from elspeth.web.composer import provider_discovery_response, redaction, state, tool_batch
-from elspeth.web.composer import tool_result_envelope as env
-from elspeth.web.composer.prompts import build_system_prompt
-from elspeth.web.composer.tools import _common as common
-from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets
-from elspeth.web.composer.tools._dispatch import get_tool_definitions
-from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
-from elspeth.web.execution.schemas import ValidationResult
-from tests.helpers.tree_gate import ParsedPythonFile, iter_gate_sources
-from tests.unit.web.composer._teaching_gate_support import (
+from scripts.cicd.composer_teaching import (
     REPO_ROOT,
     WEB_SRC,
     TeachingBlock,
@@ -65,6 +54,17 @@ from tests.unit.web.composer._teaching_gate_support import (
     teaching_blocks,
     validate_teaching_scopes,
 )
+
+from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.composer import provider_discovery_response, redaction, state, tool_batch
+from elspeth.web.composer import tool_result_envelope as env
+from elspeth.web.composer.prompts import build_system_prompt
+from elspeth.web.composer.tools import _common as common
+from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets
+from elspeth.web.composer.tools._dispatch import get_tool_definitions
+from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
+from elspeth.web.execution.schemas import ValidationResult
+from tests.helpers.tree_gate import ParsedPythonFile, iter_gate_sources
 
 FENCE_PATH = Path(__file__).with_name("tool_result_envelope_fence.json")
 COMPOSER = WEB_SRC / "composer"
@@ -156,7 +156,6 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _ListPayload | _Literal | None] = {
     "_sync_list_ready_blob_inline_descriptors": _ListPayload(blobs.BlobInlineDescriptor),
     "facts_to_dict": _Literal(COMPOSER / "source_inspection.py", "facts_to_dict"),
     "diff_states": _Literal(COMMON, "diff_states"),
-    "_vf_destination_note": _Literal(COMMON, "_vf_destination_note"),
     # Element builders of a shipped container. Unreachable from a ``data=`` site directly —
     # each is called once per item inside a comprehension or splatted into one — and
     # unattributed until ``_nested_value_keys`` stopped declining containers (RED2-2 residue).

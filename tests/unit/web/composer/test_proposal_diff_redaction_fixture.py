@@ -28,45 +28,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from scripts.cicd import composer_frontend_wire as frontend
 
-from elspeth.web.composer.redaction import (
-    MANIFEST,
-    ToolRedaction,
-    _SensitiveMarker,
-    redact_tool_call_arguments,
-    walk_model_schema,
-)
+from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
-# ``__file__`` is ``<project_root>/tests/unit/web/composer/<this file>``.
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-FIXTURE_PATH = PROJECT_ROOT / "src" / "elspeth" / "web" / "frontend" / "src" / "test" / "fixtures" / "redacted-tool-arguments.json"
-REGENERATE_HINT = (
-    "Run '.venv/bin/python scripts/cicd/bootstrap_proposal_diff_fixture.py --write' "
-    "to regenerate, then review the diff AND the frontend tests that read the "
-    "changed cases (src/elspeth/web/frontend/src/**/*.test.ts*) before merging: "
-    "a grammar change here can make a frontend projection unreachable without "
-    "reddening any frontend test."
-)
 
-
-def _load_fixture() -> dict[str, Any]:
-    assert FIXTURE_PATH.is_file(), f"Missing {FIXTURE_PATH}. {REGENERATE_HINT}"
-    loaded = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-    assert isinstance(loaded, dict), "fixture root must be an object"
-    return loaded
-
-
-def _cases() -> dict[str, Any]:
-    cases = _load_fixture()["cases"]
-    assert isinstance(cases, dict) and cases, "fixture must record at least one case"
-    return cases
-
-
-@pytest.mark.parametrize("case_name", sorted(_cases()))
+@pytest.mark.parametrize("case_name", sorted(frontend.fixture_cases()))
 def test_recorded_redaction_matches_the_live_redactor(case_name: str) -> None:
     """Each recorded payload is what the redactor produces today."""
-    case = _cases()[case_name]
+    case = frontend.fixture_cases()[case_name]
     actual = redact_tool_call_arguments(case["tool"], case["arguments"], telemetry=NoopRedactionTelemetry())
 
     # Round-trip through JSON so the comparison is against the wire form the
@@ -74,31 +45,8 @@ def test_recorded_redaction_matches_the_live_redactor(case_name: str) -> None:
     # (_TrustedRedactionSummary) that compare equal to str but are not what
     # crosses the HTTP boundary.
     assert json.loads(json.dumps(actual)) == case["redacted"], (
-        f"Redaction drift for fixture case '{case_name}' ({case['tool']}). {REGENERATE_HINT}"
+        f"Redaction drift for fixture case '{case_name}' ({case['tool']}). {frontend.REGENERATE_HINT}"
     )
-
-
-def _projected_tools() -> frozenset[str]:
-    names = _load_fixture()["projected_tools"]
-    assert isinstance(names, list) and names
-    assert all(isinstance(name, str) for name in names)
-    assert len(names) == len(set(names))
-    return frozenset(names)
-
-
-def _summarizes_an_argument(entry: ToolRedaction) -> bool:
-    """Does this manifest entry replace any ARGUMENT with a summary?
-
-    Mirrors the two manifest shapes (``ToolRedaction`` invariant: exactly one).
-    Deliberately argument-only — a tool that summarizes only its RESPONSE
-    changes nothing about the payload the proposal card renders.
-    """
-    if entry.argument_model is not None:
-        return any(
-            any(isinstance(marker, _SensitiveMarker) for marker in node.metadata) for node in walk_model_schema(entry.argument_model)
-        )
-    assert entry.policy is not None  # ToolRedaction invariant
-    return bool(entry.policy.sensitive_argument_keys)
 
 
 def test_fixture_records_every_projected_tool_whose_arguments_are_summarized() -> None:
@@ -114,14 +62,10 @@ def test_fixture_records_every_projected_tool_whose_arguments_are_summarized() -
     bridge. Vitest owns their parity with live frontend dispatch; Python owns
     their coverage against the live redaction manifest.
     """
-    tools_recorded = {case["tool"] for case in _cases().values()}
-    must_record = {name for name, entry in MANIFEST.items() if name in _projected_tools() and _summarizes_an_argument(entry)}
-
-    assert must_record, "manifest introspection found nothing — the derivation is broken"
-    missing = must_record - tools_recorded
-    assert not missing, (
-        f"Projected tools whose arguments are summarized but have no fixture case: {sorted(missing)}. Add them to CASES. {REGENERATE_HINT}"
-    )
+    rows = frontend.census_frontend_wire()
+    assert any(row.fixture_required for row in rows.values()), "manifest introspection found nothing"
+    missing = {name for name, row in rows.items() if row.missing_fixture}
+    assert not missing, f"Summarized projected tools missing fixture cases: {sorted(missing)}. {frontend.REGENERATE_HINT}"
 
 
 def test_uncovered_projected_tools_really_do_carry_no_summarized_argument() -> None:
@@ -133,15 +77,9 @@ def test_uncovered_projected_tools_really_do_carry_no_summarized_argument() -> N
     was wrong: `set_source.options` goes through the same
     ``_summarize_set_source_options`` as `upsert_node` and `set_output`.
     """
-    tools_recorded = {case["tool"] for case in _cases().values()}
-    omitted = _projected_tools() - tools_recorded
-
-    wrongly_omitted = {name for name in omitted if name in MANIFEST and _summarizes_an_argument(MANIFEST[name])}
-    assert not wrongly_omitted, (
-        f"These projected tools are absent from the fixture but DO summarize an "
-        f"argument, so their live shape is unverified: {sorted(wrongly_omitted)}. "
-        f"{REGENERATE_HINT}"
-    )
+    rows = frontend.census_frontend_wire()
+    wrongly_omitted = {name for name, row in rows.items() if row.missing_fixture}
+    assert not wrongly_omitted, f"Summarized projected tools missing fixture cases: {sorted(wrongly_omitted)}"
 
 
 def _key_order(value: Any) -> Any:
@@ -153,7 +91,7 @@ def _key_order(value: Any) -> Any:
     return None
 
 
-@pytest.mark.parametrize("case_name", sorted(_cases()))
+@pytest.mark.parametrize("case_name", sorted(frontend.fixture_cases()))
 def test_recorded_payload_preserves_the_producers_key_order(case_name: str) -> None:
     """Key ORDER is fixture content, because the consumer depends on it.
 
@@ -169,20 +107,19 @@ def test_recorded_payload_preserves_the_producers_key_order(case_name: str) -> N
     ``test_recorded_redaction_matches_the_live_redactor`` compares parsed
     dicts and would stay green against a re-sorted fixture.
     """
-    case = _cases()[case_name]
+    case = frontend.fixture_cases()[case_name]
     actual = redact_tool_call_arguments(case["tool"], case["arguments"], telemetry=NoopRedactionTelemetry())
 
     assert _key_order(json.loads(json.dumps(actual))) == _key_order(case["redacted"]), (
         f"Key-order drift for fixture case '{case_name}'. The generator must NOT "
         f"sort keys — the frontend's short-circuit depends on the producer's own "
-        f"order. {REGENERATE_HINT}"
+        f"order. {frontend.REGENERATE_HINT}"
     )
 
 
 def test_projected_tools_all_exist_in_the_manifest() -> None:
     """Every frontend projector must name a live producer tool."""
-    unknown = _projected_tools() - set(MANIFEST)
-    assert not unknown, f"_projected_tools() names tools absent from MANIFEST: {sorted(unknown)}"
+    frontend.census_frontend_wire()  # Exact projected/case references checked by shared authority.
 
 
 def test_every_summarized_argument_is_recorded_as_a_string() -> None:
@@ -206,15 +143,74 @@ def test_every_summarized_argument_is_recorded_as_a_string() -> None:
         "set_metadata",
     }
     saw_absent_patch = False
-    for case_name, case in _cases().items():
+    for case_name, case in frontend.fixture_cases().items():
         if case["tool"] not in summarized_patch_tools:
             continue
         if "patch" not in case["redacted"]:
             saw_absent_patch = True
             continue
         patch = case["redacted"]["patch"]
-        assert isinstance(patch, str), f"Fixture case '{case_name}' records a non-string patch ({type(patch).__name__}). {REGENERATE_HINT}"
+        assert isinstance(patch, str), (
+            f"Fixture case '{case_name}' records a non-string patch ({type(patch).__name__}). {frontend.REGENERATE_HINT}"
+        )
 
     # Keep the absent-patch case in the corpus deliberately: it is the only
     # one that exercises `args.patch === undefined` on the consumer side.
-    assert saw_absent_patch, f"Fixture no longer records a case with an absent `patch`. {REGENERATE_HINT}"
+    assert saw_absent_patch, f"Fixture no longer records a case with an absent `patch`. {frontend.REGENERATE_HINT}"
+
+
+def test_shared_frontend_missing_fixture_is_an_extraction_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(frontend, "FIXTURE_PATH", tmp_path / "missing.json")
+    with pytest.raises(frontend.FrontendCensusError, match=r"missing\.json"):
+        frontend.census_frontend_wire()
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_projected", "unknown_projected", "unknown_case", "duplicate_case", "missing_inventory"])
+def test_shared_frontend_rejects_invalid_inventory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
+    fixture = frontend.load_fixture()
+    if mutation == "duplicate_projected":
+        name = fixture["projected_tools"][0]
+        fixture["projected_tools"].append(name)
+        expected = name
+    elif mutation == "unknown_projected":
+        fixture["projected_tools"].append("not_a_producer")
+        expected = "not_a_producer"
+    elif mutation == "unknown_case":
+        name = next(iter(fixture["cases"]))
+        fixture["cases"][name]["tool"] = "not_a_case_producer"
+        expected = name
+    elif mutation == "missing_inventory":
+        del fixture["projected_tools"]
+        expected = "missing projected_tools"
+    else:
+        expected = "duplicate_case"
+    payload = json.dumps(fixture)
+    if mutation == "duplicate_case":
+        payload = payload.replace('"cases": {', '"cases": {"duplicate_case": {}, "duplicate_case": {},', 1)
+    path = tmp_path / "fixture.json"
+    path.write_text(payload)
+    monkeypatch.setattr(frontend, "FIXTURE_PATH", path)
+    with pytest.raises(frontend.FrontendCensusError, match=expected):
+        frontend.census_frontend_wire()
+
+
+def test_shared_frontend_reports_summarized_fixture_loss_and_restoration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = frontend.load_fixture()
+    baseline = frontend.census_frontend_wire()
+    name = next(name for name, row in baseline.items() if row.fixture_required and row.fixture_cases)
+    path = tmp_path / "fixture.json"
+    path.write_text(json.dumps(original))
+    monkeypatch.setattr(frontend, "FIXTURE_PATH", path)
+    assert not frontend.census_frontend_wire()[name].missing_fixture
+    original_cases = original["cases"]
+    original["cases"] = {case_name: case for case_name, case in original_cases.items() if case["tool"] != name}
+    path.write_text(json.dumps(original))
+    row = frontend.census_frontend_wire()[name]
+    assert row.projected and row.summarizes_argument and row.missing_fixture
+    assert row.fixture_cases == frozenset()
+    with pytest.raises(AssertionError, match=name):
+        test_fixture_records_every_projected_tool_whose_arguments_are_summarized()
+    original["cases"] = original_cases
+    path.write_text(json.dumps(original))
+    assert not frontend.census_frontend_wire()[name].missing_fixture
+    test_fixture_records_every_projected_tool_whose_arguments_are_summarized()

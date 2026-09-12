@@ -101,7 +101,6 @@ from elspeth.web.composer.tools._common import (
     _validate_source_path,
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
-    _vf_destination_note,
     canonicalize_source_validation_failure,
     normalize_tool_result_validation,
     rejected_component_prefix,
@@ -890,7 +889,6 @@ def build_set_pipeline_candidate(
 
     source_specs: dict[str, SourceSpec] = {}
     resolved_source_blob: _ResolvedSourceBlob | None = None
-    single_source_on_vf: str | None = None
 
     def _legacy_source_rejection() -> SetPipelineCandidate | None:
         """Validate the single legacy ``source`` block; return its rejection.
@@ -901,7 +899,7 @@ def build_set_pipeline_candidate(
         call's result) lets the node and output sections still report their
         own defects in the same turn (elspeth-4fad98a453).
         """
-        nonlocal prepared_inline_blob, resolved_source_blob, single_source_on_vf
+        nonlocal prepared_inline_blob, resolved_source_blob
 
         legacy_source_model = validated.source
         if legacy_source_model is None:
@@ -978,7 +976,6 @@ def build_set_pipeline_candidate(
         # None and "" both mean 'discard' — one shared owner
         # (elspeth-bcd7051143), so persistence agrees with auto-wiring.
         src_on_vf = canonicalize_source_validation_failure(legacy_source_model.on_validation_failure)
-        single_source_on_vf = src_on_vf
         if source_blob_id is not None and inline_blob is not None:
             return _failure_result(
                 state, "set_pipeline source must use either an existing blob_id or inline_blob, not both.", rejected_component="source"
@@ -1851,7 +1848,7 @@ def build_set_pipeline_candidate(
 
     # 6. Report all nodes + sources + outputs as affected
     affected = (*(_source_component_id(name) for name in source_specs), *(n.id for n in node_specs), *(o.name for o in output_specs))
-    data: dict[str, Any] | None = _vf_destination_note(new_state, single_source_on_vf) if single_source_on_vf is not None else None
+    data: dict[str, Any] | None = None
     if resolved_source_blob is not None:
         source_blob_payload = {"source_blob": resolved_source_blob.payload}
         data = source_blob_payload if data is None else {**data, **source_blob_payload}
