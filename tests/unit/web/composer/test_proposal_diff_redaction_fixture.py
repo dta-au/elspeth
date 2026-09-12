@@ -34,6 +34,23 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
 
+def test_inline_widget_positive_preserves_the_authored_presence() -> None:
+    cases = frontend.fixture_cases()
+    name = "set_pipeline_ambiguous_inline_omitted_metadata"
+    assert name in cases, "The widget positive must come from an actual producer fixture"
+    case = cases[name]
+    arguments = case["arguments"]
+    assert "metadata" not in arguments
+    assert arguments["source"]["description"] is None
+    assert arguments["source"]["options"] == {}
+    assert arguments["source"]["inline_blob"]["content"]
+    actual = redact_tool_call_arguments(case["tool"], arguments, telemetry=NoopRedactionTelemetry())
+    assert "metadata" not in actual
+    assert actual["source"]["description"] is None
+    assert json.loads(actual["source"]["options"])["entry_count"] == 0
+    assert json.loads(json.dumps(actual)) == case["redacted"]
+
+
 @pytest.mark.parametrize("case_name", sorted(frontend.fixture_cases()))
 def test_recorded_redaction_matches_the_live_redactor(case_name: str) -> None:
     """Each recorded payload is what the redactor produces today."""

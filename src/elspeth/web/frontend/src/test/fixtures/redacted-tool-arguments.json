@@ -59,6 +59,41 @@
         "description": null
       }
     },
+    "set_pipeline_ambiguous_inline_omitted_metadata": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "description": null,
+          "options": {},
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": []
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "description": null,
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "<inline-blob:58-bytes>"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": []
+      }
+    },
     "set_pipeline_ambiguous_inline_empty_options": {
       "tool": "set_pipeline",
       "arguments": {

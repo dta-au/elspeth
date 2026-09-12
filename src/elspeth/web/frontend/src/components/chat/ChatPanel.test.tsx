@@ -8228,12 +8228,7 @@ describe("isAmbiguousInlineProposal", () => {
       summary,
       rationale: "",
       affects: ["source"],
-      // Synthetic metadata absence isolates the classifier; the producer-backed
-      // case below separately verifies the sparse empty-metadata summary.
-      arguments_redacted_json: {
-        ...structuredClone(redactedArguments("set_pipeline_ambiguous_inline_empty_options")),
-        metadata: null,
-      },
+      arguments_redacted_json: structuredClone(redactedArguments("set_pipeline_ambiguous_inline_omitted_metadata")),
       base_state_id: null,
       committed_state_id: null,
       audit_event_id: null,
@@ -8250,6 +8245,30 @@ describe("isAmbiguousInlineProposal", () => {
     expect(proposal.arguments_redacted_json.metadata).toBe("<metadata-patch:empty>");
     expect(isAmbiguousInlineProposal(proposal)).toBe(false);
   });
+
+  it("accepts the producer's omitted metadata, explicit null description and empty options", () => {
+    const proposal = makeInlineProposal("I read your message as 3 rows.");
+    const recorded = redactedCase("set_pipeline_ambiguous_inline_omitted_metadata");
+    expect(recorded.arguments).not.toHaveProperty("metadata");
+    expect(proposal.arguments_redacted_json).not.toHaveProperty("metadata");
+    expect(proposal.arguments_redacted_json.source).toHaveProperty("description", null);
+    expect(isAmbiguousInlineProposal(proposal)).toBe(true);
+  });
+
+  it.each(["metadata", "description", "options"] as const)(
+    "independently refuses the historical %s blocker on the producer positive",
+    (blocker) => {
+      const proposal = makeInlineProposal("I read your message as 3 rows.");
+      expect(isAmbiguousInlineProposal(proposal)).toBe(true);
+      const payload = proposal.arguments_redacted_json;
+      const source = payload.source as Record<string, unknown>;
+      // Deliberate corrupt/changed-input controls, not producer fixtures.
+      if (blocker === "metadata") payload.metadata = "<metadata-patch:invalid>";
+      if (blocker === "description") source.description = "An authored description";
+      if (blocker === "options") source.options = "{}";
+      expect(isAmbiguousInlineProposal(proposal)).toBe(false);
+    },
+  );
 
   it.each(["<metadata-patch:invalid>", "<metadata-patch:name>", "not a summary", {}])(
     "rejects metadata that does not prove an empty write: %j",
@@ -8740,12 +8759,7 @@ describe("ChatPanel inline-source disambiguation routing", () => {
       summary: "I read your message as 3 separate URLs.",
       rationale: "",
       affects: ["source"],
-      // Synthetic metadata absence isolates widget routing. The full producer
-      // still emits a key-bearing metadata summary until seam 4.4.
-      arguments_redacted_json: {
-        ...structuredClone(redactedArguments("set_pipeline_ambiguous_inline_empty_options")),
-        metadata: null,
-      },
+      arguments_redacted_json: structuredClone(redactedArguments("set_pipeline_ambiguous_inline_omitted_metadata")),
       base_state_id: null,
       committed_state_id: null,
       audit_event_id: null,

@@ -94,6 +94,26 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
         {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard", "description": None},
     ),
     (
+        "set_pipeline_ambiguous_inline_omitted_metadata",
+        "set_pipeline",
+        {
+            "source": {
+                "plugin": "csv",
+                "on_success": "csv_rows",
+                "description": None,
+                "options": {},
+                "inline_blob": {
+                    "filename": "chat.csv",
+                    "mime_type": "text/csv",
+                    "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n",
+                },
+            },
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+        },
+    ),
+    (
         "set_pipeline_ambiguous_inline_empty_options",
         "set_pipeline",
         {
