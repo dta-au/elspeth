@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCallStatus
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
@@ -71,6 +72,7 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_schema_form,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
+from elspeth.web.composer.source_inspection import SourceInspectionFacts
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
@@ -540,6 +542,114 @@ class _FakeLLMResponse:
 
 def _ok_response(text: str) -> _FakeLLMResponse:
     return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=text))])
+
+
+def _existing_upload_context() -> chat_solver.Step1ExistingUploadContext:
+    return chat_solver.Step1ExistingUploadContext(
+        upload_ref="offered-upload",
+        facts=SourceInspectionFacts(
+            source_kind="csv",
+            redacted_identity={"path": "PRIVATE_STORAGE_PATH", "sha256": "PRIVATE_FULL_HASH"},
+            byte_range_inspected=(0, 30),
+            sample_row_count=2,
+            observed_headers=("sku", "quantity"),
+            inferred_types={"sku": "str", "quantity": "int"},
+            url_candidates=("PRIVATE_RAW_URL",),
+            warnings=(),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolve", [True, False])
+async def test_existing_upload_real_solver_uses_only_provider_authored_choices(monkeypatch: pytest.MonkeyPatch, resolve: bool) -> None:
+    captured = []
+    authored = {
+        "upload_ref": "offered-upload",
+        "plugin": "csv",
+        "options": {"schema": {"mode": "fixed", "fields": ["sku: str", "quantity: int"]}, "delimiter": ";"},
+        "on_validation_failure": "rejected_rows",
+        "assistant_message": "Review this source configuration before confirming the inspection.",
+    }
+
+    async def completion(**kwargs: Any) -> _FakeLLMResponse:
+        captured.append(kwargs)
+        if not resolve:
+            return _ok_response("Please clarify the intended schema before we continue.")
+        call = SimpleNamespace(id="upload-call", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(authored)))
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", completion)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Please use this upload.",
+        plugin_hint=None,
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30,
+        existing_upload=_existing_upload_context(),
+    )
+    assert len(captured) == 1
+    wire = captured[0]
+    prompt = json.dumps(wire["messages"])
+    assert "offered-upload" in prompt and "quantity" in prompt
+    assert all(canary not in prompt for canary in ("PRIVATE_STORAGE_PATH", "PRIVATE_FULL_HASH", "PRIVATE_RAW_URL"))
+    upload_message = next(message for message in wire["messages"] if "Existing upload inspection" in message["content"])
+    assert upload_message["role"] == "user"
+    schema = wire["tools"][0]["function"]["parameters"]
+    assert schema["properties"]["upload_ref"]["enum"] == ["offered-upload"]
+    assert len(schema["oneOf"]) == 2
+    if resolve:
+        assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+        assert type(outcome.resolution) is chat_solver.Step1UploadedSourceChatResolution
+        assert deep_thaw(outcome.resolution.options) == authored["options"]
+        assert outcome.resolution.plugin == "csv"
+        assert outcome.resolution.on_validation_failure == "rejected_rows"
+    else:
+        assert type(outcome) is chat_solver.GuidedChatProseOutcome
+
+
+@pytest.mark.parametrize("defect", ["wrong_ref", "no_context", "inline_content", "omitted_plugin", "omitted_routing", "path", "blob_ref"])
+def test_existing_upload_resolution_rejects_custody_and_mixed_arms(defect: str) -> None:
+    arguments = {
+        "upload_ref": "offered-upload",
+        "plugin": "csv",
+        "options": {"schema": {"mode": "observed"}},
+        "on_validation_failure": "discard",
+        "assistant_message": "Review the uploaded source.",
+    }
+    context = _existing_upload_context()
+    if defect == "wrong_ref":
+        arguments["upload_ref"] = "another-upload"
+    elif defect == "no_context":
+        context = None
+    elif defect == "inline_content":
+        arguments["content"] = "sku\n1\n"
+    elif defect == "omitted_plugin":
+        del arguments["plugin"]
+    elif defect == "omitted_routing":
+        del arguments["on_validation_failure"]
+    else:
+        arguments["options"] = {defect: "another-blob"}
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError):
+        _parse_step_1_source_tool_arguments(json.dumps(arguments), plugin_hint="csv", existing_upload=context)
+
+
+def test_existing_upload_resolution_snapshots_nested_provider_options() -> None:
+    options = {"schema": {"mode": "fixed", "fields": ["sku: str"]}}
+    resolution = chat_solver.Step1UploadedSourceChatResolution(
+        assistant_message="Review the source configuration.",
+        plugin="csv",
+        upload_ref="offered-upload",
+        options=options,
+        on_validation_failure="discard",
+    )
+    options["schema"]["fields"].append("unreviewed: str")
+    assert deep_thaw(resolution.options) == {"schema": {"mode": "fixed", "fields": ["sku: str"]}}
+    with pytest.raises(TypeError):
+        resolution.options["schema"]["mode"] = "observed"
 
 
 @pytest.mark.asyncio

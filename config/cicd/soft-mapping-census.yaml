@@ -994,13 +994,13 @@ files:
     dict[str, Any]: 1
   src/elspeth/web/sessions/routes/composer/guided.py:
     Mapping[str, Any]: 11
-    dict[str, Any]: 5
+    dict[str, Any]: 4
     dict[str, object]: 6
   src/elspeth/web/sessions/routes/composer/guided_chat_atomic.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 1
     dict[str, Any]: 1
-    dict[str, object]: 3
+    dict[str, object]: 2
   src/elspeth/web/sessions/routes/composer/guided_chat_intent_management.py:
     Mapping[str, Any]: 1
   src/elspeth/web/sessions/routes/composer/pipeline_settlement.py:
@@ -1028,6 +1028,6 @@ totals:
   Mapping[str, object]: 298
   MutableMapping[str, Any]: 13
   boundary: 63
-  dict[str, Any]: 1137
-  dict[str, object]: 401
-  soft: 2716
+  dict[str, Any]: 1136
+  dict[str, object]: 400
+  soft: 2714

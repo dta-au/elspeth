@@ -8,7 +8,7 @@ import functools
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, Request
@@ -18,15 +18,15 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.web.composer.guided._display import plugin_display_label
 from elspeth.web.composer.guided.audit import emit_intent_cancelled
 from elspeth.web.composer.guided.chat_solver import (
     DeferredIntentManagementChatRequest,
     GuidedAdvisoryGraphAuthority,
+    Step1ExistingUploadContext,
     Step1SourceChatResolution,
+    Step1UploadedSourceChatResolution,
     resolved_sink_config_error,
 )
-from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.planning import (
@@ -54,7 +54,7 @@ from elspeth.web.composer.guided.state_machine import (
     TerminalState,
 )
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
-from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
+from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content, inspect_selected_ready_session_blob
 from elspeth.web.sessions._guided_step_chat import (
     GuidedStepChatOnlyResult,
     GuidedStepDeferredClarificationResult,
@@ -167,16 +167,6 @@ type GuidedChatProviderOutcome = (
 
 ProviderRunner = Callable[..., Awaitable[GuidedChatProviderOutcome]]
 
-# Human labels for an inspected upload's content kind (presentation only — the
-# closed ``SourceInspectionFacts.source_kind`` vocabulary stays authoritative).
-_SOURCE_KIND_LABELS = {
-    "csv": "CSV",
-    "json": "JSON",
-    "jsonl": "JSON Lines",
-    "text": "plain text",
-    "unknown": "unknown",
-}
-
 
 @dataclass(frozen=True, slots=True)
 class _ChatPreflight:
@@ -201,7 +191,7 @@ class _IntermediateOccurrence:
 
 @dataclass(frozen=True, slots=True)
 class _UploadedSourceBind:
-    """The prepared cohort for a deterministic uploaded-blob source bind."""
+    """The prepared cohort for a planner-authored uploaded-blob source bind."""
 
     state: CompositionState
     response_payload: PreparedGuidedJsonPayload
@@ -603,6 +593,7 @@ async def run_guided_chat_provider_attempt(
     progress: Any,
     current_turn: Turn | None = None,
     current_payload: PreparedGuidedJsonPayload | None = None,
+    existing_upload: Step1ExistingUploadContext | None = None,
     # F2 marking hook: the caller binds the composer service's per-session
     # get_plugin_schema tracker; only the Step-2 discovery loop consumes it.
     mark_schema_loaded: Callable[[str, str], None] | None = None,
@@ -690,7 +681,7 @@ async def run_guided_chat_provider_attempt(
                 None,
             )
             plugin_hint = pending.plugin if pending is not None else None
-            allow_plugin_reselection = pending is not None and pending.phase == "plugin_options"
+            allow_plugin_reselection = pending is not None and pending.phase == "plugin_options" and existing_upload is None
         source_outcome = await resolve_step_1_source_chat_with_auto_drop(
             site="post_guided_chat",
             session_id=str(session_id),
@@ -698,6 +689,7 @@ async def run_guided_chat_provider_attempt(
             model=settings.composer_model,
             user_message=message,
             plugin_hint=plugin_hint,
+            existing_upload=existing_upload,
             current_source=source,
             available_source_plugins=tuple(plugin.name for plugin in catalog.list_sources()),
             temperature=settings.composer_temperature,
@@ -979,62 +971,29 @@ def _step_1_uploaded_bind_is_consumable(
     return bound_blob_id is not None and bound_blob_id == _step_1_inspected_blob_id(inspection_facts)
 
 
-def _step_1_uploaded_bind_form_options(form_turn: Turn) -> dict[str, object]:
-    """Return the schema form's own server-projected prefill as its answer.
-
-    The prefill IS the inspected upload's resolution (``blob:<id>`` path,
-    inspected schema, discard-on-validation-failure), so answering the form
-    with it keeps the submitted options byte-identical to the authority the
-    same turn advertised — the custody and knob checks in
-    ``transition_source_schema_form`` then validate exactly what a user
-    pressing Continue on that form would have submitted.
-    """
-    prefilled = form_turn["payload"]["prefilled"]
-    # Exact ``dict``: both ``form_turn`` producers — ``guided._finalize_guided_turn``
-    # and ``guided._load_durable_current_turn`` — build the payload as
-    # ``dict(deep_thaw(...))`` with recursive thaw, so the server-held prefill
-    # is a plain dict on live and replay paths alike (measured 2026-08-29).
-    # Serialization and read-back do not demote first-party authorship; a
-    # Mapping-tolerant read here would be latent recovery from a hypothetical
-    # future producer bug (a moved thaw), which is exactly the defensive
-    # pattern the tier model forbids. Anything but an exact dict is
-    # first-party corruption and crashes.
-    if type(prefilled) is not dict:
-        raise AuditIntegrityError("source schema form has no server-held prefill to bind")
-    return cast("dict[str, object]", deep_thaw(prefilled))
-
-
 def _prepare_step_1_uploaded_source_bind(
     *,
     guided_route: Any,
     current_state: CompositionState,
     prospective: Any,
     current_turn: Turn,
-    source: Any,
+    source: Step1UploadedSourceChatResolution,
     inspection_facts: SourceInspectionFacts,
     catalog: Any,
     shield_available: bool,
     payload_store: Any,
     new_stable_id: UUID,
 ) -> _UploadedSourceBind:
-    """Bind an uploaded blob deterministically and stop at the review card.
-
-    The upload helper's bind request names no blob id and no plugin, so a
-    provider cannot resolve it without inventing the file's content. Answer
-    the live Step-1 turn from server-held inspection facts instead: a plugin
-    SELECTION turn is answered with the blob-derived plugin, its projected
-    schema form is answered with that form's own prefill, and the settlement
-    stops on the ``inspect_and_confirm`` review card.
-
-    Nothing is committed. ``reviewed_sources`` — and therefore
-    ``composition_state.sources`` — stays empty until the user confirms the
-    observed columns through the ordinary wizard control.
-    """
+    """Apply the planner's plugin/options and stop at explicit inspection review."""
     if prospective.step is not GuidedStep.STEP_1_SOURCE:
         raise AuditIntegrityError("uploaded source bind escaped Step 1")
     blob_id = _step_1_inspected_blob_id(inspection_facts)
     if blob_id is None:
         raise AuditIntegrityError("uploaded source bind has no inspected blob custody")
+    if blob_id != source.upload_ref:
+        raise AuditIntegrityError("uploaded source resolution changed its inspected blob identity")
+    if not _inspection_matches_source_plugin(source.plugin, inspection_facts):
+        raise PluginConfigError("planner source plugin does not match the inspected upload")
     updated = prospective
     form_turn = current_turn
     form_payload: PreparedGuidedJsonPayload | None = None
@@ -1075,7 +1034,9 @@ def _prepare_step_1_uploaded_source_bind(
     target_id, held_plugin = guided_route._schema8_form_target(updated, source=True)
     if held_plugin != source.plugin:
         raise AuditIntegrityError("uploaded source bind lost its server-held source plugin")
-    form_options = _step_1_uploaded_bind_form_options(form_turn)
+    form_options = dict(deep_thaw(source.options))
+    form_options["path"] = f"blob:{blob_id}"
+    form_options["on_validation_failure"] = source.on_validation_failure
     updated = transition_source_schema_form(
         updated,
         target_id=target_id,
@@ -1448,12 +1409,8 @@ async def post_guided_chat_schema8(
                 started_at = datetime.now(UTC)
                 async with _cancel_on_client_disconnect(request):
                     uploaded_candidate = None
-                    # The upload sentinel binds deterministically on every live
-                    # Step-1 turn that can hold a source resolution, not just a
-                    # schema form: a fresh session opens on the plugin SELECT
-                    # turn, which is exactly where a first upload arrives. The
-                    # message is matched FIRST so an ordinary chat turn neither
-                    # reads blob storage nor requires it to be configured.
+                    # Discover bounded upload evidence before the provider runs.
+                    # Ordinary chat does not require blob storage.
                     if (
                         frozen.guided.step is GuidedStep.STEP_1_SOURCE
                         and TurnType(frozen.current_turn["type"])
@@ -1465,165 +1422,92 @@ async def post_guided_chat_schema8(
                     ):
                         uploaded_candidate = await guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
                             message=body.message,
-                            plugin_hint=guided_route._step_1_plugin_hint(frozen.guided),
-                            selectable_plugins=(
-                                guided_route._schema8_permitted_plugins(frozen.current_turn)
-                                if TurnType(frozen.current_turn["type"]) is TurnType.SINGLE_SELECT
-                                else ()
-                            ),
                             blob_service=request.app.state.blob_service,
                             session_id=session_id,
                             session_operation_context=reserved.session_operation_context,
                         )
-                    uploaded_mismatch_facts = (
-                        uploaded_candidate[1] if uploaded_candidate is not None and uploaded_candidate[0] is None else None
-                    )
-                    uploaded_bind: tuple[Any, SourceInspectionFacts] | None = None
-                    if (
-                        uploaded_candidate is not None
-                        and uploaded_candidate[0] is not None
-                        and _step_1_uploaded_bind_is_consumable(
-                            guided_route=guided_route,
-                            guided=frozen.guided,
-                            current_turn=frozen.current_turn,
-                            inspection_facts=uploaded_candidate[1],
-                        )
+                    existing_upload = None
+                    uploaded_bind: tuple[Step1UploadedSourceChatResolution, SourceInspectionFacts] | None = None
+                    if uploaded_candidate is not None and _step_1_uploaded_bind_is_consumable(
+                        guided_route=guided_route,
+                        guided=frozen.guided,
+                        current_turn=frozen.current_turn,
+                        inspection_facts=uploaded_candidate,
                     ):
-                        uploaded_bind = (uploaded_candidate[0], uploaded_candidate[1])
-
-                    if uploaded_mismatch_facts is not None:
-                        filename = guided_route._step_1_uploaded_input_filename(body.message)
-                        if filename is None:  # pragma: no cover - upload helper contract
-                            raise AuditIntegrityError("uploaded mismatch facts have no upload-helper filename")
-                        source_kind_label = _SOURCE_KIND_LABELS[uploaded_mismatch_facts.source_kind]
-                        plugin_hint = guided_route._step_1_plugin_hint(frozen.guided)
-                        if plugin_hint is None:  # pragma: no cover - upload helper contract
-                            raise AuditIntegrityError("uploaded mismatch facts have no selected Step-1 plugin")
-                        selected_plugin_labels = {
-                            "csv": "CSV",
-                            "json": "JSON",
-                            "text": "Text",
-                        }
-                        selected_plugin_label = (
-                            selected_plugin_labels[plugin_hint]
-                            if plugin_hint in selected_plugin_labels
-                            else plugin_hint.replace("_", " ").title()
+                        upload_ref = _step_1_inspected_blob_id(uploaded_candidate)
+                        if upload_ref is None:
+                            raise AuditIntegrityError("uploaded source evidence has no blob identity")
+                        existing_upload = Step1ExistingUploadContext(upload_ref=upload_ref, facts=uploaded_candidate)
+                    # F2 marking hook, bound ONLY for the step that
+                    # consumes it. Step 2's discovery loop is the sole
+                    # consumer (run_guided_chat_provider_attempt passes it
+                    # to resolve_step_2_sink_chat_with_auto_drop and
+                    # nowhere else), so binding the service attribute
+                    # eagerly on every turn coupled steps 1/3/4 to a
+                    # collaborator they never use.
+                    mark_schema_loaded = (
+                        functools.partial(
+                            request.app.state.composer_service._mark_plugin_schema_loaded,
+                            str(session_id),
                         )
-                        chat_result = StepChatResult(
-                            assistant_message=(
-                                f'I received "{filename}" and inspected it as {source_kind_label} content, '
-                                f"but the current source type is {selected_plugin_label}. I did not apply it; "
-                                "the file is still uploaded. Use a source configured for "
-                                f"{source_kind_label} content, or upload content that matches {selected_plugin_label}."
-                            ),
-                            status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-                            latency_ms=max(0, int((datetime.now(UTC) - started_at).total_seconds() * 1000)),
-                            error_class="UploadedSourceTypeMismatch",
-                        )
-                        source_resolution = None
-                        source_plugin_reselection = None
-                        sink_resolution = None
-                        deferred_actions: tuple[DeferredIntentAction, ...] = ()
-                        deferred_management_action = None
-                        deferred_clarification = False
-                        deferred_paired_resolution = False
-                    elif uploaded_bind is not None:
-                        # No provider work: the bind request names a file this
-                        # session already holds, and its inspected facts are the
-                        # authority. Asking a model to "resolve" it would demand
-                        # content it cannot know (and the solver correctly
-                        # rejects an empty-content resolution).
-                        bind_filename = guided_route._step_1_uploaded_input_filename(body.message)
-                        if bind_filename is None:  # pragma: no cover - upload helper contract
-                            raise AuditIntegrityError("uploaded source bind has no upload-helper filename")
-                        bind_source, bind_facts = uploaded_bind
-                        chat_result = StepChatResult(
-                            assistant_message=(
-                                f'I inspected "{bind_filename}" as {_SOURCE_KIND_LABELS[bind_facts.source_kind]} content '
-                                f"and prepared it as a {plugin_display_label(bind_source.plugin)} input. "
-                                "Confirm the observed columns below and it becomes your pipeline source."
-                            ),
-                            status=ComposerChatTurnStatus.SUCCESS,
-                            latency_ms=max(0, int((datetime.now(UTC) - started_at).total_seconds() * 1000)),
-                            error_class=None,
-                        )
-                        source_resolution = None
-                        source_plugin_reselection = None
-                        sink_resolution = None
-                        deferred_actions = ()
-                        deferred_management_action = None
-                        deferred_clarification = False
-                        deferred_paired_resolution = False
+                        if frozen.guided.step is GuidedStep.STEP_2_SINK
+                        else None
+                    )
+                    provider_outcome = await provider_runner(
+                        session_id=session_id,
+                        user=user,
+                        step=frozen.guided.step,
+                        guided=frozen.guided,
+                        state=frozen.state,
+                        message=body.message,
+                        settings=settings,
+                        catalog=catalog,
+                        plugin_snapshot=plugin_snapshot,
+                        secret_service=request.app.state.scoped_secret_resolver,
+                        recorder=recorder,
+                        progress=progress_sink,
+                        current_turn=frozen.current_turn,
+                        current_payload=frozen.current_payload,
+                        existing_upload=existing_upload,
+                        # Same per-session tracker the freeform batch and
+                        # planner surfaces write; a Step-2 get_plugin_schema
+                        # success recorded here saves the NEXT planner
+                        # request a re-fetch (F2).
+                        mark_schema_loaded=mark_schema_loaded,
+                    )
+                    chat_result = provider_outcome.chat
+                    source_resolution = provider_outcome.resolution if type(provider_outcome) is Step1SourceResolvedResult else None
+                    source_plugin_reselection = (
+                        provider_outcome.plugin if type(provider_outcome) is Step1SourcePluginReselectedResult else None
+                    )
+                    sink_resolution = provider_outcome.sink if type(provider_outcome) is Step2SinkResolvedResult else None
+                    if type(provider_outcome) is GuidedStepDeferredIntentResult:
+                        deferred_actions = provider_outcome.actions
+                    elif type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult:
+                        # Retains-alone: the group's resolution half was
+                        # withheld; its chat carries the scoped not-applied
+                        # failure and composes with the disposition below,
+                        # exactly like the F1 contract.
+                        deferred_actions = provider_outcome.actions
+                    elif type(provider_outcome) is Step1SourceResolvedResult:
+                        # A resolve+retain GROUP: the resolution applies at
+                        # this stage AND every future-stage instruction is
+                        # retained in the same settlement (R2-F15,
+                        # generalized by elspeth-3a21f09f09).
+                        deferred_actions = provider_outcome.deferred_actions
+                    elif type(provider_outcome) is Step2SinkResolvedResult:
+                        deferred_actions = provider_outcome.deferred_actions
                     else:
-                        # F2 marking hook, bound ONLY for the step that
-                        # consumes it. Step 2's discovery loop is the sole
-                        # consumer (run_guided_chat_provider_attempt passes it
-                        # to resolve_step_2_sink_chat_with_auto_drop and
-                        # nowhere else), so binding the service attribute
-                        # eagerly on every turn coupled steps 1/3/4 to a
-                        # collaborator they never use.
-                        mark_schema_loaded = (
-                            functools.partial(
-                                request.app.state.composer_service._mark_plugin_schema_loaded,
-                                str(session_id),
-                            )
-                            if frozen.guided.step is GuidedStep.STEP_2_SINK
-                            else None
-                        )
-                        provider_outcome = await provider_runner(
-                            session_id=session_id,
-                            user=user,
-                            step=frozen.guided.step,
-                            guided=frozen.guided,
-                            state=frozen.state,
-                            message=body.message,
-                            settings=settings,
-                            catalog=catalog,
-                            plugin_snapshot=plugin_snapshot,
-                            secret_service=request.app.state.scoped_secret_resolver,
-                            recorder=recorder,
-                            progress=progress_sink,
-                            current_turn=frozen.current_turn,
-                            current_payload=frozen.current_payload,
-                            # Same per-session tracker the freeform batch and
-                            # planner surfaces write; a Step-2 get_plugin_schema
-                            # success recorded here saves the NEXT planner
-                            # request a re-fetch (F2).
-                            mark_schema_loaded=mark_schema_loaded,
-                        )
-                        chat_result = provider_outcome.chat
-                        source_resolution = provider_outcome.resolution if type(provider_outcome) is Step1SourceResolvedResult else None
-                        source_plugin_reselection = (
-                            provider_outcome.plugin if type(provider_outcome) is Step1SourcePluginReselectedResult else None
-                        )
-                        sink_resolution = provider_outcome.sink if type(provider_outcome) is Step2SinkResolvedResult else None
-                        if type(provider_outcome) is GuidedStepDeferredIntentResult:
-                            deferred_actions = provider_outcome.actions
-                        elif type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult:
-                            # Retains-alone: the group's resolution half was
-                            # withheld; its chat carries the scoped not-applied
-                            # failure and composes with the disposition below,
-                            # exactly like the F1 contract.
-                            deferred_actions = provider_outcome.actions
-                        elif type(provider_outcome) is Step1SourceResolvedResult:
-                            # A resolve+retain GROUP: the resolution applies at
-                            # this stage AND every future-stage instruction is
-                            # retained in the same settlement (R2-F15,
-                            # generalized by elspeth-3a21f09f09).
-                            deferred_actions = provider_outcome.deferred_actions
-                        elif type(provider_outcome) is Step2SinkResolvedResult:
-                            deferred_actions = provider_outcome.deferred_actions
-                        else:
-                            deferred_actions = ()
-                        deferred_paired_resolution = bool(deferred_actions) and (
-                            type(provider_outcome) is Step1SourceResolvedResult
-                            or type(provider_outcome) is Step2SinkResolvedResult
-                            or type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult
-                        )
-                        deferred_management_action = (
-                            provider_outcome.action if type(provider_outcome) is GuidedStepDeferredManagementResult else None
-                        )
-                        deferred_clarification = type(provider_outcome) is GuidedStepDeferredClarificationResult
+                        deferred_actions = ()
+                    deferred_paired_resolution = bool(deferred_actions) and (
+                        type(provider_outcome) is Step1SourceResolvedResult
+                        or type(provider_outcome) is Step2SinkResolvedResult
+                        or type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult
+                    )
+                    deferred_management_action = (
+                        provider_outcome.action if type(provider_outcome) is GuidedStepDeferredManagementResult else None
+                    )
+                    deferred_clarification = type(provider_outcome) is GuidedStepDeferredClarificationResult
                     revision_kind = _active_component_revision_kind(frozen.guided, frozen.guided.step)
                     if revision_kind is not None and (
                         source_resolution is not None or source_plugin_reselection is not None or sink_resolution is not None
@@ -1652,6 +1536,33 @@ async def post_guided_chat_schema8(
                                     revision_kind,
                                 )
                             ),
+                        )
+                    if type(source_resolution) is Step1UploadedSourceChatResolution:
+                        if existing_upload is None or source_resolution.upload_ref != existing_upload.upload_ref:
+                            raise AuditIntegrityError("planner upload resolution escaped its frozen upload custody")
+                        uploaded_bind = (source_resolution, existing_upload.facts)
+                        source_resolution = None
+                    elif source_resolution is not None and guided_route._step_1_uploaded_input_filename(body.message) is not None:
+                        source_resolution = None
+                        chat_result = StepChatResult(
+                            assistant_message=(
+                                "I did not apply generated content in place of your uploaded file. "
+                                "I left the current source unchanged. Please check the file and try again."
+                            ),
+                            status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                            latency_ms=chat_result.latency_ms,
+                            error_class="InlineSourceNotApplied",
+                        )
+                    if source_plugin_reselection is not None and guided_route._step_1_uploaded_input_filename(body.message) is not None:
+                        source_plugin_reselection = None
+                        chat_result = StepChatResult(
+                            assistant_message=(
+                                "I did not change the source type while resolving your uploaded file. "
+                                "Choose the source type in the wizard, then ask me to use that file again."
+                            ),
+                            status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                            latency_ms=chat_result.latency_ms,
+                            error_class="UploadedSourceReselectionNotApplied",
                         )
                     if source_resolution is not None and TurnType(frozen.current_turn["type"]) is TurnType.SCHEMA_FORM:
                         source_resolution = None
@@ -1794,7 +1705,7 @@ async def post_guided_chat_schema8(
                     cancelled_intent = management.effective_intent if type(management) is DeferredRequestCancelled else None
                     source_inspection_facts: SourceInspectionFacts | None = None
                     if (
-                        source_resolution is not None
+                        type(source_resolution) is Step1SourceChatResolution
                         and prospective.step is GuidedStep.STEP_1_SOURCE
                         and TurnType(current_turn["type"]) is TurnType.SINGLE_SELECT
                     ):
@@ -1985,6 +1896,14 @@ async def post_guided_chat_schema8(
                         transition_succeeded = True
                         rewound = True
                     elif uploaded_bind is not None:
+                        refreshed_facts = await inspect_selected_ready_session_blob(
+                            request.app.state.blob_service,
+                            session_id,
+                            selected_blob_id=UUID(uploaded_bind[0].upload_ref),
+                            session_operation_context=reserved.session_operation_context,
+                        )
+                        if refreshed_facts != uploaded_bind[1]:
+                            raise AuditIntegrityError("uploaded source evidence changed during planner work")
                         try:
                             bind = _prepare_step_1_uploaded_source_bind(
                                 guided_route=guided_route,
@@ -2002,14 +1921,17 @@ async def post_guided_chat_schema8(
                             # Same degradation as a rejected chat transition: the
                             # upload stays uploaded and the authoritative turn is
                             # unchanged, so the wizard remains usable.
-                            chat_result = StepChatResult(
-                                assistant_message=(
-                                    "I couldn't apply that uploaded file to this step, so I didn't change your "
-                                    "pipeline. The file is still uploaded — continue with the wizard controls."
+                            chat_result = _with_pair_disposition(
+                                StepChatResult(
+                                    assistant_message=(
+                                        "I couldn't apply that uploaded file to this step, so I didn't change your "
+                                        "pipeline. The file is still uploaded — continue with the wizard controls."
+                                    ),
+                                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                    latency_ms=chat_result.latency_ms,
+                                    error_class="StepTransitionRejected",
                                 ),
-                                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-                                latency_ms=chat_result.latency_ms,
-                                error_class="StepTransitionRejected",
+                                deferred_disposition_message,
                             )
                             next_turn = current_turn
                             prepared_next = planned_current
@@ -2357,9 +2279,7 @@ async def post_guided_chat_schema8(
                             phase="saving",
                             headline="I'm saving this guided turn.",
                             evidence=(
-                                ("The uploaded file was inspected and its source-type mismatch was preserved without provider work.")
-                                if uploaded_mismatch_facts is not None
-                                else ("The uploaded file was inspected and bound for confirmation without provider work.")
+                                "The planner's uploaded-source proposal was checked against inspected custody."
                                 if uploaded_bind is not None
                                 else "The provider response passed the guided transition checks.",
                             ),
