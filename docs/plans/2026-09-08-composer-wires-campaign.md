@@ -290,34 +290,57 @@ full repository, PostgreSQL, moving-release and live acceptance remain later wor
 
 Use the [diagnostic catalogue charter](composer-wires/diagnostic-catalogue-implementation-charter.md).
 
-- [ ] Capture the dependency-complete expanded legacy records, code order and
+- [x] Capture the dependency-complete expanded legacy records, code order and
   first-match relationships from the accepted post-MODEL snapshot. Refuse
   unresolved generator expansion; record ordered occurrences, not a set/count.
-- [ ] Add direct immutable code-guidance records and derive exact lookup,
+- [x] Add direct immutable code-guidance records and derive exact lookup,
   fuzzy/help vocabulary and producer coverage without a second code inventory.
-- [ ] Preserve required legacy prose behavior, Expected hints and terminal
+- [x] Preserve required legacy prose behavior, Expected hints and terminal
   guidance. Reject new/replaced/reordered regex rows, duplicate direct codes and
   accidental authority collisions. Do not delete fallback before a separate
   complete uncoded-producer census justifies it.
-- [ ] Point teaching/terminal consumers at the unified record authority and run
+- [x] Point teaching/terminal consumers at the unified record authority and run
   behavioral baseline/mutant/restored lookup and ordering checks.
+
+Implemented against accepted `9ab705381`: the dependency-complete capture contains
+144 ordered regex occurrences and 123 seed codes. Exact lookup now uses immutable
+records; new quarantine and count guidance reaches planner feedback from actual
+producers. Review found and retained existing nonseed guided, diff and coalesce
+codes with their original first-match guidance. Public prose and Expected hints
+remain supported. Literal-producer compatibility was compared with the accepted
+snapshot; dynamic forwarding remains outside that bounded comparison, so this
+does not establish that uncoded producers are absent.
 
 ### 4. Enforce aggregation count applicability across authoring/runtime surfaces
 
 Use the [count charter](composer-wires/count-applicability-implementation-charter.md)
 and [audit-ordering constraints](composer-wires/expected-output-count-audit-ordering.md).
 
-- [ ] Add the smallest pure authority to the existing `OutputMode`, rejecting
+- [x] Add the smallest pure authority to the existing `OutputMode`, rejecting
   passthrough plus non-null count. Preserve omitted/null Composer transform
   defaults and runtime's existing null-mode restriction.
-- [ ] Apply it after structural admission in upsert and full set_pipeline,
+- [x] Apply it after structural admission in upsert and full set_pipeline,
   before source/blob resolution/preparation. Collect bounded diagnostics in input
   order, preserve state/version and permitted redacted attempted values.
-- [ ] Apply the same rule in runtime settings, state validation, YAML import and
+- [x] Apply the same rule in runtime settings, state validation, YAML import and
   public export/lowering; keep historical hydration readable. Register new
   guidance through milestone 3 without growing legacy regexes.
-- [ ] Test actual audit serialization, pre-custody call boundaries, import/export
+- [x] Test actual audit serialization, pre-custody call boundaries, import/export
   round trips and unchanged transform/passthrough executor behavior.
+
+The shared rule and adapters preserve historical hydration and authored optional
+values. Actual handler plus audit-wrapper tests distinguish structural ARG_ERROR
+from semantic unsuccessful results recorded as successfully dispatched; permitted
+mode/count arguments survive the real audit serializer. This is not full-service
+persistence acceptance. Runtime rejection parity adds one generated mirrored site;
+the soft-mapping census is unchanged. Both authoring schemas teach applicability.
+
+Combined Composer/MCP, census, runtime parity, enum/configuration, aggregation and
+blob-provenance selection: `9535 passed, 1 warning`, exit 0. Eight-file mypy passes.
+The first run exposed two stale test expectations (the grown enum stand-in and
+generic hatch classification), repaired with their original assertions preserved
+or strengthened. Whole-repository, PostgreSQL, release integration and live
+acceptance remain in the final campaign checkpoint below.
 
 ### 5. Close producer-owned restricted discovery responses
 

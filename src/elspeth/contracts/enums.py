@@ -442,12 +442,18 @@ class OutputMode(StrEnum):
     Stored in database.
 
     Values:
-        PASSTHROUGH: Emit buffered rows unchanged after flush
+        PASSTHROUGH: Preserve corresponding input identities; output data may be enriched
         TRANSFORM: Emit transformed output from aggregation plugin
     """
 
     PASSTHROUGH = "passthrough"
     TRANSFORM = "transform"
+
+    def expected_output_count_error(self, count: int | None) -> str | None:
+        """Return the intrinsic error for a count unused by this output mode."""
+        if self is OutputMode.PASSTHROUGH and count is not None:
+            return "expected_output_count requires output_mode='transform' (the default); omit expected_output_count for 'passthrough'."
+        return None
 
 
 class AggregationMemberAction(StrEnum):

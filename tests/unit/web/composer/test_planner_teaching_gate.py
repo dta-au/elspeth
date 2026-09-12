@@ -347,7 +347,7 @@ def test_every_shipped_fact_key_is_taught_or_fenced() -> None:
     lines = [f"{surface} {code} {key}  <- {', '.join(sites)}" for (surface, code, key), sites in sorted(unexplained.items())]
     assert not unexplained, (
         f"{len(unexplained)} repair-feedback key(s) reach the planner with guidance that never names them. "
-        "Teach each key in tools/generation.py (_VALIDATION_ERROR_PATTERNS entry for its code) or fence it with a "
+        "Teach each key in tools/generation.py (a direct guidance record for its code) or fence it with a "
         "checkable reason in planner_teaching_fence.json:\n" + "\n".join(lines)
     )
 

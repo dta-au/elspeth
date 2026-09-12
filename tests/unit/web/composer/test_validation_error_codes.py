@@ -734,12 +734,17 @@ class TestClosedCodeCatalogueInvariants:
 
         # Representative fragment of the real builder message
         # (core/dag/builder.py rule-9 resolution pass).
-        by_runtime_text = explain_validation_code(
+        from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, execute_tool
+
+        runtime_text = (
             "Transform 'cleanup' on_error 'merge_paths' names closer 'merge_paths' but 'cleanup' "
             "is not inside that closer's bound region. A closer is a legal on_error target only "
             "from inside its own region (spec §7 rule 9)."
         )
-        assert by_runtime_text == by_code
+        assert explain_validation_code(runtime_text) is None
+        result = execute_tool("explain_validation_error", {"error_text": runtime_text}, _empty_state(), _mock_catalog())
+        assert result.data is not None
+        assert (result.data["explanation"], result.data["suggested_fix"]) == by_code
 
     def test_query_template_unbound_row_fields_resolves_to_multi_query_guidance(self) -> None:
         """The multi-query row-binding code must not fall through to the

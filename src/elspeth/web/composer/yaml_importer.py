@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import yaml
 
+from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.state import (
     CompositionState,
@@ -718,6 +719,12 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
         expected_output_count = entry.get("expected_output_count")
         if expected_output_count is not None and (not isinstance(expected_output_count, int) or isinstance(expected_output_count, bool)):
             raise RuntimeYamlImportError(f"{path}.expected_output_count must be an integer when provided")
+        output_mode = _optional_str(entry, "output_mode")
+        if node_type == "aggregation" and (output_mode is None or output_mode in OutputMode):
+            mode = OutputMode.TRANSFORM if output_mode is None else OutputMode(output_mode)
+            count_error = mode.expected_output_count_error(expected_output_count)
+            if count_error is not None:
+                raise RuntimeYamlImportError(f"{path}.expected_output_count: {count_error}")
         nodes.append(
             NodeSpec(
                 id=_require_str(entry, "name", path),
@@ -734,7 +741,7 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 policy=None,
                 merge=None,
                 trigger=_json_mapping(entry.get("trigger"), f"{path}.trigger") if entry.get("trigger") is not None else None,
-                output_mode=_optional_str(entry, "output_mode"),
+                output_mode=output_mode,
                 expected_output_count=expected_output_count,
             )
         )

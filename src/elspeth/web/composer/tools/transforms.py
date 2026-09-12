@@ -9,6 +9,7 @@ from typing import Annotated, Any, Final, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.enums import OutputMode
 from elspeth.core.config import RuntimeNodeName
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
@@ -331,7 +332,10 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         },
         "expected_output_count": {
             "type": ["integer", "null"],
-            "description": "Expected aggregation output row count; omit when output count depends on group_by distinct values.",
+            "description": (
+                "Expected aggregation output row count for output_mode='transform' (the default); omit for 'passthrough'. "
+                "Also omit when output count depends on group_by distinct values."
+            ),
         },
         "timeout_seconds": {
             "type": ["number", "null"],
@@ -622,6 +626,17 @@ def _execute_upsert_node(
 ) -> ToolResult:
     """Add or update a pipeline node."""
     validated = _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments")
+    if validated.node_type == "aggregation" and (validated.output_mode is None or validated.output_mode in OutputMode):
+        mode = OutputMode.TRANSFORM if validated.output_mode is None else OutputMode(validated.output_mode)
+        count_error = mode.expected_output_count_error(validated.expected_output_count)
+        if count_error is not None:
+            return _failure_result(
+                state,
+                count_error,
+                error_code="aggregation_expected_output_count_mode_invalid",
+                rejected_component=f"node:{validated.id}",
+                with_state_validation=False,
+            )
     node_id = validated.id
     node_type = validated.node_type
     plugin = validated.plugin

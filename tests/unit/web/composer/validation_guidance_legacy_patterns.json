@@ -1,0 +1,851 @@
+{
+  "purpose": "Historical compatibility freeze: regex membership, ordered occurrences and multiplicity; prose may evolve.",
+  "captured_head": "9ab705381d916825160ee1ae0f7904bb6cf3249a",
+  "rows": [
+    {
+      "ordinal": 0,
+      "pattern": "diff_baseline_unavailable|No baseline available",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 1,
+      "pattern": "No source configured",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 2,
+      "pattern": "No sinks configured",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 3,
+      "pattern": "references unknown node '(.+)' as from_node",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 4,
+      "pattern": "references unknown node '(.+)' as to_node",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 5,
+      "pattern": "Duplicate node ID: '(.+)'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 6,
+      "pattern": "Duplicate output name: '(.+)'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 7,
+      "pattern": "Duplicate edge ID: '(.+)'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 8,
+      "pattern": "Gate '(.+)' is missing required field '(.+)'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 9,
+      "pattern": "Transform '(.+)' must not have '(.+)' field",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 10,
+      "pattern": "Coalesce '(.+)' is missing required field '(.+)'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 11,
+      "pattern": "coalesce_config_invalid|Coalesce '(.+)' does not accept options",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 12,
+      "pattern": "row_union_config_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 13,
+      "pattern": "row_union_name_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 14,
+      "pattern": "row_union_branches_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 15,
+      "pattern": "row_union_branch_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 16,
+      "pattern": "row_union_input_mismatch",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 17,
+      "pattern": "row_union_on_success_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 18,
+      "pattern": "row_union_timeout_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 19,
+      "pattern": "row_union_branch_alias_unreachable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 20,
+      "pattern": "row_union_branch_unreachable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 21,
+      "pattern": "row_union_branch_not_downstream",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 22,
+      "pattern": "row_union_branch_aggregation_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 23,
+      "pattern": "row_union_nested_fork_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 24,
+      "pattern": "row_union_downstream_group_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 25,
+      "pattern": "row_union_schema_incompatible",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 26,
+      "pattern": "fork_branch_multiple_barriers",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 27,
+      "pattern": "fork_mixed_closure_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 28,
+      "pattern": "fork_multiple_closers_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 29,
+      "pattern": "fork_roster_mismatch",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 30,
+      "pattern": "bound_region_sink_inside",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 31,
+      "pattern": "bound_region_undeclared_expand|Multi-row transform '(.+)' inside bound region",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 32,
+      "pattern": "bound_region_row_union_fork|Fork gate '(.+)' inside bound region '(.+)' closes at row_union",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 33,
+      "pattern": "bound_region_unbound_fork|Fork gate '(.+)' inside bound region '(.+)' is unbound",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 34,
+      "pattern": "bound_region_aggregation_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 35,
+      "pattern": "on_error_closer_out_of_region|names closer .* but .* is not inside that closer's bound region",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 36,
+      "pattern": "collector_missing_scope|has no complete scope binding|no scopes: entry",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 37,
+      "pattern": "collector_scope_policy_invalid|scope_policy .* is not a valid policy",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 38,
+      "pattern": "guided_collector_opener_unresolved",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 39,
+      "pattern": "scope_opener_unknown|scope_opener '(.+)' does not name a transform",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 40,
+      "pattern": "scope_opener_not_multi_row|opener '(.+)' is not a multi-row transform",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 41,
+      "pattern": "collector_has_trigger_invalid|Collector '(.+)' does not accept 'trigger'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 42,
+      "pattern": "collector_has_on_error_invalid|Collector '(.+)' does not accept 'on_error'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 43,
+      "pattern": "collector_missing_plugin|Collector '(.+)' is missing required field 'plugin'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 44,
+      "pattern": "collector_plugin_not_batch_aware|is_batch_aware=False",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 45,
+      "pattern": "collector_config_invalid|Collector '(.+)' does not accept field",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 46,
+      "pattern": "collector_on_success_dangling|Collector '(.+)' on_success '(.+)' is neither a sink",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 47,
+      "pattern": "scope_name_duplicate|Scope name '(.+)' is declared twice",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 48,
+      "pattern": "scope_opener_duplicate|Transform '(.+)' opens two scopes",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 49,
+      "pattern": "scope_name_invalid|Scope name '(.+)' (?:is reserved|contains invalid characters)|Scope name exceeds max length",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 50,
+      "pattern": "node_scope_fields_unsupported|does not accept collector scope field",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 51,
+      "pattern": "gate_duplicate_fork_branch",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 52,
+      "pattern": "row_union_on_success_must_be_connection",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 53,
+      "pattern": "row_union_on_success_dangling",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 54,
+      "pattern": "aggregation_missing_plugin|Aggregation '(.+)' is missing required field 'plugin'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 55,
+      "pattern": "coalesce_branch_unreachable|branches .* are not reachable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 56,
+      "pattern": "coalesce_branch_alias_unreachable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 57,
+      "pattern": "node_input_not_reachable|input '(.+)' is not reachable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 58,
+      "pattern": "Unknown .+ plugin '(.+)'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 59,
+      "pattern": "Path violation \\(S2\\).*[Ss]ource",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 60,
+      "pattern": "Path violation \\(S2\\).*[Ss]ink",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 61,
+      "pattern": "Path violation \\(S2\\)",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 62,
+      "pattern": "Invalid options for source '(.+)':",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 63,
+      "pattern": "Invalid options for transform '(.+)':",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 64,
+      "pattern": "Invalid options for sink '(.+)':",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 65,
+      "pattern": "sink_locked_extras|Extra fields rejected by sink input contract",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 66,
+      "pattern": "locked_input_extras|Extra fields rejected by consumer input contract",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 67,
+      "pattern": "transform_declared_output_not_guaranteed|Transform output guarantee violation:",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 68,
+      "pattern": "transform_contract_violation|Transform contract violation:",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 69,
+      "pattern": "semantic_contract_violation|Semantic contract violation:|Semantic contract:",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 70,
+      "pattern": "contract_config_invalid|Invalid contract config:",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 71,
+      "pattern": "coalesce_schema_mode_mixed|mixed observed/explicit schemas",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 72,
+      "pattern": "coalesce_union_type_incompatible|[Ii]ncompatible types for field",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 73,
+      "pattern": "sink_contract_violation|Schema contract violation: '.*' -> 'output:[^']+'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 74,
+      "pattern": "schema_contract_violation|Schema contract violation:",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 75,
+      "pattern": "unknown[ _]node_type",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 76,
+      "pattern": "coalesce_on_success_must_be_sink|coalesce_on_success_unknown_sink|Coalesce on_success must point to a sink|Coalesce '(.+)' on_success references unknown sink",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 77,
+      "pattern": "coalesce_missing_branches|Coalesce '(.+)' is missing required field 'branches'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 78,
+      "pattern": "transform_missing_on_success|Transform '(.+)' is missing required field 'on_success'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 79,
+      "pattern": "transform_missing_on_error|Transform '(.+)' is missing required field 'on_error'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 80,
+      "pattern": "gate_missing_condition|Gate '(.+)' is missing required field 'condition'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 81,
+      "pattern": "gate_missing_routes|Gate '(.+)' is missing required field 'routes'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 82,
+      "pattern": "fork_branch_no_destination|fork branch '(.+)' with no destination",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 83,
+      "pattern": "coalesce_policy_invalid|coalesce_merge_invalid|coalesce_policy_quorum_unsupported|coalesce_merge_select_unsupported|coalesce_best_effort_requires_timeout",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 84,
+      "pattern": "pipeline_decision_unregistered",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 85,
+      "pattern": "interpretation_requirements_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 86,
+      "pattern": "plugin_options_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 87,
+      "pattern": "transform_on_success_dangling|aggregation_on_success_dangling|source_on_success_dangling|is neither a sink nor a known connection",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 88,
+      "pattern": "guided_delta_unknown_stable_id",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 89,
+      "pattern": "guided_delta_duplicate_stable_id",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 90,
+      "pattern": "guided_delta_authority_violation",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 91,
+      "pattern": "guided_delta_nonincident_route",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 92,
+      "pattern": "guided_delta_unknown_reference",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 93,
+      "pattern": "guided_delta_reviewed_failure_route_required",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 94,
+      "pattern": "guided_route_target_unknown",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 95,
+      "pattern": "guided_output_alias_collision",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 96,
+      "pattern": "guided_reviewed_name_shadowed",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 97,
+      "pattern": "reviewed_output_projection_conflict",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 98,
+      "pattern": "gate_on_error_unknown_sink",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 99,
+      "pattern": "transform_on_error_unknown_sink|references unknown sink",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 100,
+      "pattern": "gate_route_labels_mismatch|route labels don't match",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 101,
+      "pattern": "gate_condition_ignores_stated_threshold",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 102,
+      "pattern": "passthrough_cannot_produce_declared_fields",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 103,
+      "pattern": "proposal_missing_requested_transforms",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 104,
+      "pattern": "guided_correction_unchanged",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 105,
+      "pattern": "guided_amend_contract_violation",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 106,
+      "pattern": "guided_revision_unchanged",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 107,
+      "pattern": "review_reconciliation_failed|Authoritative interpretation-review reconciliation failed",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 108,
+      "pattern": "vague_term_unwired|Pending vague_term review is not wired for resolution",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 109,
+      "pattern": "interpretation_review_draft_malformed|cleanup review draft is malformed",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 110,
+      "pattern": "interpretation_review_contract_unsatisfied|drops web-scrape raw field",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 111,
+      "pattern": "file_sink_write_policy_invalid|must set collision_policy explicitly|must set mode explicitly",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 112,
+      "pattern": "no_source_configured|No source configured",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 113,
+      "pattern": "no_sinks_configured|No sinks configured",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 114,
+      "pattern": "source_name_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 115,
+      "pattern": "reserved_node_id|Reserved node id|reserved source producer namespace",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 116,
+      "pattern": "duplicate_node_id|Duplicate node ID",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 117,
+      "pattern": "duplicate_output_name|Duplicate output name",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 118,
+      "pattern": "duplicate_edge_id|Duplicate edge ID",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 119,
+      "pattern": "edge_unknown_node|references unknown node",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 120,
+      "pattern": "duplicate_connection_producer|Duplicate producer for connection",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 121,
+      "pattern": "duplicate_connection_consumer|Duplicate consumer for connection",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 122,
+      "pattern": "connection_sink_name_overlap|Connection names overlap with sink names|collides with a sink of the same name",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 123,
+      "pattern": "gate_condition_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 124,
+      "pattern": "aggregation_missing_on_error|Aggregation '(.+)' is missing required field 'on_error'",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 125,
+      "pattern": "aggregation_output_mode_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 126,
+      "pattern": "batch_transform_misplaced",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 127,
+      "pattern": "batch_required_fields_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 128,
+      "pattern": "batch_value_field_not_numeric",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 129,
+      "pattern": "queue_config_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 130,
+      "pattern": "structural_node_plugin_forbidden",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 131,
+      "pattern": "queue_no_consumer",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 132,
+      "pattern": "queue_name_collision|collides with a source of the same name",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 133,
+      "pattern": "aggregation_trigger_invalid|trigger is invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 134,
+      "pattern": "web_scrape_http_identity_invalid",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 135,
+      "pattern": "prompt_template_unbound_variables|prompt render context does not define",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 136,
+      "pattern": "query_template_unbound_row_fields|input_fields binds only",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 137,
+      "pattern": "prompt_template_undeclared_row_fields|required_input_fields does not declare",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 138,
+      "pattern": "plugin_not_enabled",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 139,
+      "pattern": "plugin_not_installed",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 140,
+      "pattern": "plugin_unavailable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 141,
+      "pattern": "credential_unavailable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 142,
+      "pattern": "profile_unavailable",
+      "occurrence": 0
+    },
+    {
+      "ordinal": 143,
+      "pattern": "plugin_not_allowed_on_web",
+      "occurrence": 0
+    }
+  ],
+  "legacy_codes": [
+    "unknown_node_type",
+    "coalesce_on_success_must_be_sink",
+    "coalesce_missing_branches",
+    "coalesce_config_invalid",
+    "coalesce_policy_invalid",
+    "coalesce_merge_invalid",
+    "coalesce_branch_alias_unreachable",
+    "row_union_config_invalid",
+    "row_union_name_invalid",
+    "row_union_branches_invalid",
+    "row_union_branch_invalid",
+    "row_union_input_mismatch",
+    "row_union_on_success_invalid",
+    "row_union_timeout_invalid",
+    "row_union_branch_alias_unreachable",
+    "row_union_branch_unreachable",
+    "row_union_branch_not_downstream",
+    "row_union_branch_aggregation_invalid",
+    "row_union_nested_fork_invalid",
+    "row_union_downstream_group_invalid",
+    "row_union_schema_incompatible",
+    "row_union_on_success_must_be_connection",
+    "row_union_on_success_dangling",
+    "fork_branch_multiple_barriers",
+    "fork_mixed_closure_invalid",
+    "fork_multiple_closers_invalid",
+    "fork_roster_mismatch",
+    "bound_region_sink_inside",
+    "bound_region_aggregation_invalid",
+    "gate_duplicate_fork_branch",
+    "transform_missing_on_success",
+    "transform_missing_on_error",
+    "transform_on_success_dangling",
+    "transform_on_error_unknown_sink",
+    "gate_on_error_unknown_sink",
+    "aggregation_on_success_dangling",
+    "source_on_success_dangling",
+    "gate_missing_condition",
+    "gate_missing_routes",
+    "gate_route_labels_mismatch",
+    "fork_branch_no_destination",
+    "pipeline_decision_unregistered",
+    "interpretation_requirements_invalid",
+    "plugin_options_invalid",
+    "schema_contract_violation",
+    "sink_contract_violation",
+    "locked_input_extras",
+    "sink_locked_extras",
+    "transform_contract_violation",
+    "transform_declared_output_not_guaranteed",
+    "semantic_contract_violation",
+    "contract_config_invalid",
+    "coalesce_schema_mode_mixed",
+    "coalesce_union_type_incompatible",
+    "no_source_configured",
+    "no_sinks_configured",
+    "source_name_invalid",
+    "reserved_node_id",
+    "duplicate_node_id",
+    "duplicate_output_name",
+    "duplicate_edge_id",
+    "edge_unknown_node",
+    "duplicate_connection_producer",
+    "duplicate_connection_consumer",
+    "connection_sink_name_overlap",
+    "gate_condition_invalid",
+    "aggregation_missing_plugin",
+    "aggregation_missing_on_error",
+    "aggregation_output_mode_invalid",
+    "batch_transform_misplaced",
+    "batch_required_fields_invalid",
+    "batch_value_field_not_numeric",
+    "queue_config_invalid",
+    "collector_missing_scope",
+    "collector_scope_policy_invalid",
+    "scope_opener_unknown",
+    "scope_opener_not_multi_row",
+    "guided_collector_opener_unresolved",
+    "collector_has_trigger_invalid",
+    "collector_has_on_error_invalid",
+    "collector_missing_plugin",
+    "collector_plugin_not_batch_aware",
+    "collector_config_invalid",
+    "collector_on_success_dangling",
+    "scope_name_duplicate",
+    "scope_opener_duplicate",
+    "scope_name_invalid",
+    "node_scope_fields_unsupported",
+    "structural_node_plugin_forbidden",
+    "queue_no_consumer",
+    "queue_name_collision",
+    "coalesce_branch_unreachable",
+    "node_input_not_reachable",
+    "coalesce_on_success_unknown_sink",
+    "aggregation_trigger_invalid",
+    "web_scrape_http_identity_invalid",
+    "prompt_template_unbound_variables",
+    "query_template_unbound_row_fields",
+    "prompt_template_undeclared_row_fields",
+    "interpretation_review_contract_unsatisfied",
+    "interpretation_review_draft_malformed",
+    "vague_term_unwired",
+    "review_reconciliation_failed",
+    "file_sink_write_policy_invalid",
+    "proposal_missing_requested_transforms",
+    "guided_correction_unchanged",
+    "guided_amend_contract_violation",
+    "guided_revision_unchanged",
+    "guided_delta_unknown_stable_id",
+    "guided_delta_duplicate_stable_id",
+    "guided_delta_authority_violation",
+    "guided_delta_nonincident_route",
+    "guided_delta_unknown_reference",
+    "guided_delta_reviewed_failure_route_required",
+    "reviewed_output_projection_conflict",
+    "passthrough_cannot_produce_declared_fields",
+    "gate_condition_ignores_stated_threshold",
+    "plugin_not_enabled",
+    "plugin_not_installed",
+    "plugin_unavailable",
+    "credential_unavailable",
+    "profile_unavailable",
+    "plugin_not_allowed_on_web"
+  ]
+}

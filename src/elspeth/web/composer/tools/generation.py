@@ -11,6 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Final, Literal, TypedDict, final
 from uuid import UUID
 
@@ -392,6 +393,16 @@ _PLUGIN_UNAVAILABLE_FIXES: Final[dict[PluginUnavailableReason, str]] = {
         "not re-emit it."
     ),
 }
+
+
+_LEGACY_PLUGIN_UNAVAILABLE_REASONS: Final = (
+    PluginUnavailableReason.NOT_AUTHORIZED,
+    PluginUnavailableReason.NOT_INSTALLED,
+    PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING,
+    PluginUnavailableReason.CREDENTIAL_MISSING,
+    PluginUnavailableReason.PROFILE_UNAVAILABLE,
+    PluginUnavailableReason.WEB_SURFACE_PROHIBITED,
+)
 
 
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
@@ -1462,7 +1473,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
             f"The pipeline names a plugin that cannot be used in this deployment: {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}.",
             _PLUGIN_UNAVAILABLE_FIXES[reason],
         )
-        for reason in PluginUnavailableReason
+        for reason in _LEGACY_PLUGIN_UNAVAILABLE_REASONS
     ),
 )
 
@@ -1473,7 +1484,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
 # advertises this list and its fuzzy route scans for these substrings, so a
 # dead entry would route the model to a code that then explains nothing
 # (test_closed_code_catalogue_is_fully_explainable pins the invariant).
-_CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
+_LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "unknown_node_type",
     "coalesce_on_success_must_be_sink",
     "coalesce_missing_branches",
@@ -1657,14 +1668,101 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # validator can raise this. The shape it rejects is legal everywhere else.
     "gate_condition_ignores_stated_threshold",
     # ── Plugin-unavailability family (same sweep) ──────────────────────────
-    # Every ``PluginUnavailableReason`` value is a live tool ``error_code``
-    # (``_plugin_policy_failure``), so each can reach planner feedback. Derived
-    # from the enum rather than transcribed: a new reason joins the catalogue
-    # and the explain patterns together, or the explain-pattern generator's
-    # ``_PLUGIN_UNAVAILABLE_FIXES[reason]`` lookup raises KeyError at import
-    # time — totality is enforced by that lookup, not by an assert.
-    *(reason.value for reason in PluginUnavailableReason),
+    # Historical expansion only. New policy members get direct records from
+    # their owner's explanation and fix mappings, never new legacy regexes.
+    *(reason.value for reason in _LEGACY_PLUGIN_UNAVAILABLE_REASONS),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectValidationGuidance:
+    """Owned machine-code guidance, independent of legacy prose matching."""
+
+    code: str
+    explanation: str
+    suggested_fix: str
+
+
+def _direct_plugin_policy_guidance() -> tuple[DirectValidationGuidance, ...]:
+    """New policy reasons require their owner's explanation and repair text."""
+    return tuple(
+        DirectValidationGuidance(
+            reason.value,
+            f"The pipeline names a plugin that cannot be used in this deployment: {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}.",
+            _PLUGIN_UNAVAILABLE_FIXES[reason],
+        )
+        for reason in PluginUnavailableReason
+        if reason not in _LEGACY_PLUGIN_UNAVAILABLE_REASONS
+    )
+
+
+_DIRECT_VALIDATION_GUIDANCE: Final = (
+    DirectValidationGuidance(
+        "quarantine_unknown_output",
+        "The source on_validation_failure names an output that is not declared.",
+        "Declare the intended quarantine output and reference its name in on_validation_failure, "
+        "or choose 'discard' only if discarding invalid source rows is intended.",
+    ),
+    DirectValidationGuidance(
+        "aggregation_expected_output_count_mode_invalid",
+        "expected_output_count is only applicable to aggregation output_mode='transform'.",
+        "For passthrough, omit expected_output_count. If transformed output is intended, choose "
+        "output_mode='transform' and specify the expected count. These modes have different row semantics; "
+        "choose according to the intended pipeline behavior.",
+    ),
+    *_direct_plugin_policy_guidance(),
+)
+
+
+def _build_validation_guidance_index(
+    patterns: tuple[tuple[str, str, str], ...],
+    legacy_codes: tuple[str, ...],
+    direct_records: tuple[DirectValidationGuidance, ...],
+) -> Mapping[str, tuple[str, str, str] | DirectValidationGuidance]:
+    index: dict[str, tuple[str, str, str] | DirectValidationGuidance] = {}
+    for code in legacy_codes:
+        if code in index:
+            raise AssertionError(f"duplicate legacy validation code: {code}")
+        for record in patterns:
+            if re.search(record[0], code):
+                index[code] = record
+                break
+        else:
+            raise AssertionError(f"unresolved legacy validation code: {code}")
+    for direct in direct_records:
+        if direct.code in index:
+            kind = "duplicate" if isinstance(index[direct.code], DirectValidationGuidance) else "collision"
+            raise AssertionError(f"{kind} validation code: {direct.code}")
+        index[direct.code] = direct
+    return MappingProxyType(index)
+
+
+_VALIDATION_GUIDANCE_BY_CODE: Final = _build_validation_guidance_index(
+    _VALIDATION_ERROR_PATTERNS,
+    # Historical public alias: runtime also emits corresponding prose.
+    (
+        *_LEGACY_VALIDATION_ERROR_CODES,
+        "on_error_closer_out_of_region",
+        "guided_output_alias_collision",
+        "guided_reviewed_name_shadowed",
+        "guided_route_target_unknown",
+        "diff_baseline_unavailable",
+        "coalesce_policy_quorum_unsupported",
+        "coalesce_best_effort_requires_timeout",
+        "coalesce_merge_select_unsupported",
+    ),
+    _DIRECT_VALIDATION_GUIDANCE,
+)
+_CLOSED_VALIDATION_ERROR_CODES: Final = tuple(_VALIDATION_GUIDANCE_BY_CODE)
+
+
+def validation_guidance_items() -> Iterable[tuple[str, tuple[str, str]]]:
+    """Read the unified catalogue without depending on regex spellings."""
+    for code, record in _VALIDATION_GUIDANCE_BY_CODE.items():
+        if isinstance(record, DirectValidationGuidance):
+            yield code, (record.explanation, record.suggested_fix)
+        else:
+            yield code, (record[1], record[2])
 
 
 def _extract_validator_expected_hint(error_text: str) -> str | None:
@@ -1710,25 +1808,23 @@ def explain_validation_code(code: str) -> tuple[str, str] | None:
     messages before returning a rejection to the model — a redaction boundary,
     since a raw message can quote plugin names, option values, or row content
     (see ``pipeline_planner._allowlisted_candidate_feedback``). The closed
-    ``error_code`` is the only signal that survives. The "Closed structural
-    node-shape codes" entries in :data:`_VALIDATION_ERROR_PATTERNS` deliberately
-    embed those codes as regex alternations precisely so the *code alone*
-    resolves to the same guidance the ``explain_validation_error`` tool returns
-    for the full message — this accessor is what lets the planner feedback carry
-    that fix (e.g. "there is no 'fork' node_type; fork with a gate") without
-    re-opening the message boundary.
+    ``error_code`` selects an exact catalogue record. Legacy codes retain their
+    original first-match record; new codes carry direct guidance. Prose belongs
+    to the public ``explain_validation_error`` tool, not this boundary.
 
-    Returns ``None`` when no pattern matches, so callers attach nothing rather
+    Returns ``None`` when no exact code exists, so callers attach nothing rather
     than a misleading generic. The ``_augment_with_expected_hint`` span is
     intentionally NOT applied: there is no error_text to mine an ``Expected …``
     hint from — only the bare code.
     """
     if type(code) is not str or not code:
         return None
-    for pattern, explanation, fix in _VALIDATION_ERROR_PATTERNS:
-        if re.search(pattern, code):
-            return explanation, fix
-    return None
+    record = _VALIDATION_GUIDANCE_BY_CODE.get(code)
+    if record is None:
+        return None
+    if isinstance(record, DirectValidationGuidance):
+        return record.explanation, record.suggested_fix
+    return record[1], record[2]
 
 
 # Static usage line, never per-request data. Live planners called
@@ -1854,6 +1950,16 @@ def _execute_explain_validation_error(
     """Explain a validation error with human-readable diagnosis and fix."""
     validation = context.catalog.validate_composition_state(state).validation
     error_text = validated.error_text
+    exact = explain_validation_code(error_text)
+    if exact is not None:
+        explanation, fix = exact
+        return ToolResult(
+            success=True,
+            updated_state=state,
+            validation=validation,
+            affected_nodes=(),
+            data={"error_text": error_text, "explanation": explanation, "suggested_fix": fix},
+        )
     for pattern, explanation, fix in _VALIDATION_ERROR_PATTERNS:
         if re.search(pattern, error_text):
             return ToolResult(

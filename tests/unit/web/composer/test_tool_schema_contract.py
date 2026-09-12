@@ -1266,6 +1266,12 @@ def test_enforced_output_mode_vocabulary_derives_from_the_enum(monkeypatch: pyte
         TRANSFORM = "transform"
         SIDEWAYS = "sideways"
 
+        def expected_output_count_error(self, count: int | None) -> str | None:
+            # This vocabulary-growth witness supplies no count; model the
+            # owned enum method without inventing semantics for a new mode.
+            assert count is None
+            return None
+
     monkeypatch.setattr(state_module, "OutputMode", _GrownOutputMode)
     entries = _validation_errors_for(_aggregation_node(output_mode="sideways"))
 

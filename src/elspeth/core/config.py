@@ -667,7 +667,7 @@ class AggregationSettings(BaseModel):
     )
     expected_output_count: int | None = Field(
         default=None,
-        description="Optional: validate aggregation produces exactly this many output rows.",
+        description="Optional exact output row count for output_mode='transform' (the default); omit for 'passthrough'.",
     )
     options: dict[str, Any] = Field(
         default_factory=dict,
@@ -708,6 +708,14 @@ class AggregationSettings(BaseModel):
             return None
         value = v.strip()
         return _validate_connection_or_sink_name(value, field_label="Aggregation on_success connection name")
+
+    @model_validator(mode="after")
+    def validate_expected_output_count_mode(self) -> "AggregationSettings":
+        """Reject a count that the selected aggregation mode does not enforce."""
+        error = self.output_mode.expected_output_count_error(self.expected_output_count)
+        if error is not None:
+            raise ValueError(error)
+        return self
 
 
 class GateSettings(BaseModel):

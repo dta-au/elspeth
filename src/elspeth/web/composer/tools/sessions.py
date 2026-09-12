@@ -19,7 +19,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
-from elspeth.contracts.enums import is_llm_authored_creation_modality
+from elspeth.contracts.enums import OutputMode, is_llm_authored_creation_modality
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -867,6 +867,25 @@ def build_set_pipeline_candidate(
             rejected_component=None,
             error_code="no_source_configured",
         )
+
+    # Intrinsic applicability is checked before resolving or preparing source
+    # custody. Report only these checks; later plugin/source work has not run.
+    for node in validated.nodes:
+        if node.node_type == "aggregation" and (node.output_mode is None or node.output_mode in OutputMode):
+            mode = OutputMode.TRANSFORM if node.output_mode is None else OutputMode(node.output_mode)
+            count_error = mode.expected_output_count_error(node.expected_output_count)
+            if count_error is not None:
+                _record_component_rejection(
+                    _failure_result(
+                        state,
+                        count_error,
+                        rejected_component=f"node:{node.id}",
+                        error_code="aggregation_expected_output_count_mode_invalid",
+                    )
+                )
+    intrinsic_failure = _collected_component_failure()
+    if intrinsic_failure is not None:
+        return intrinsic_failure
 
     source_specs: dict[str, SourceSpec] = {}
     resolved_source_blob: _ResolvedSourceBlob | None = None
@@ -2068,7 +2087,13 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "additionalProperties": False,
                         },
                         "output_mode": {"type": ["string", "null"]},
-                        "expected_output_count": {"type": ["integer", "null"]},
+                        "expected_output_count": {
+                            "type": ["integer", "null"],
+                            "description": (
+                                "Expected aggregation output row count for output_mode='transform' (the default); omit for 'passthrough'. "
+                                "Also omit when output count depends on group_by distinct values."
+                            ),
+                        },
                         "timeout_seconds": {
                             "type": ["number", "null"],
                             "exclusiveMinimum": 0,

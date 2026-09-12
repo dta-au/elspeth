@@ -98,6 +98,20 @@ sites:
   disposition: structural
   note: generate_yaml always dumps a dict (yaml_generator.py:612-616), which round-trips to a dict; config.py:3007-3008
     cannot fire for composer-generated YAML.
+- key: 38a8418bf8466eb4
+  path: src/elspeth/core/config.py
+  qualname: AggregationSettings.validate_expected_output_count_mode
+  exception: ValueError
+  message: <dynamic:error>
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_expected_output_count_mode_invalid
+  note: Runtime AggregationSettings and CompositionState.validate use OutputMode.expected_output_count_error
+    to reject any non-null count in passthrough mode. tests/unit/web/composer/test_count_applicability.py
+    tests both runtime modes with null, negative, zero and positive counts; its historical-state test
+    asserts this exact Stage-1 code, then removes the count and asserts the code disappears. Transform
+    and omitted-mode controls preserve the supplied count.
 - key: 3d4dabaae9897318
   path: src/elspeth/core/config.py
   qualname: AggregationSettings.validate_input

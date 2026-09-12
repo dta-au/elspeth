@@ -5251,9 +5251,9 @@ def test_terminal_binding_rejections_are_exactly_the_codes_whose_fix_says_do_not
     the predicate arm turns this red.
     """
     from elspeth.web.composer.pipeline_planner import _binding_rejection_is_terminal
-    from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS, explain_validation_code
+    from elspeth.web.composer.tools.generation import explain_validation_code, validation_guidance_items
 
-    do_not_re_emit = {pattern for pattern, _explanation, fix in _VALIDATION_ERROR_PATTERNS if "Do not re-emit" in fix}
+    do_not_re_emit = {code for code, (_explanation, fix) in validation_guidance_items() if "Do not re-emit" in fix}
     assert do_not_re_emit == {"guided_delta_reviewed_failure_route_required"}
     for code in do_not_re_emit:
         assert code.isidentifier(), code
@@ -6959,9 +6959,17 @@ async def test_escape_hatch_finalizer_rejection_records_candidate_classification
     hatch_attempt = recorder.planner_attempts[-1]
     assert hatch_attempt.phase is ComposerPlannerAttemptPhase.HATCH
     assert hatch_attempt.outcome is ComposerPlannerAttemptOutcome.CANDIDATE_REJECTED
-    assert hatch_attempt.rejection_codes == ("validation_error",)
+    assert hatch_attempt.rejection_codes == ("guided_route_target_unknown",)
     assert hatch_attempt.planner_code is None
     assert hatch_attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
+
+
+def test_attempt_classification_retains_known_diagnostic_but_closes_unknown_codes() -> None:
+    from elspeth.web.composer.pipeline_planner import _closed_planner_rejection_codes
+
+    assert _closed_planner_rejection_codes(
+        ("guided_route_target_unknown", "PRIVATE_UNREGISTERED_CODE", "prefix guided_route_target_unknown suffix")
+    ) == ("guided_route_target_unknown", "validation_error")
 
 
 @pytest.mark.asyncio

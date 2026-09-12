@@ -36,6 +36,7 @@ from typing import Any, Final, Protocol, TypedDict, cast
 
 import yaml
 
+from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.errors import AuditIntegrityError, PipelineLoweringError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.state_machine import TerminalKind
@@ -272,6 +273,12 @@ def _lower_row_union_nodes(doc: LoweredPipelineDocument, *, state: CompositionSt
 
 def _lower_aggregation_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Aggregations
+    for node in state.nodes:
+        if node.node_type == "aggregation" and (node.output_mode is None or node.output_mode in OutputMode):
+            mode = OutputMode.TRANSFORM if node.output_mode is None else OutputMode(node.output_mode)
+            count_error = mode.expected_output_count_error(node.expected_output_count)
+            if count_error is not None:
+                raise PipelineLoweringError(f"Aggregation '{node.id}': {count_error}")
     aggregations = [n for n in state_dict["nodes"] if n["node_type"] == "aggregation"]
     if aggregations:
         doc["aggregations"] = []

@@ -7759,6 +7759,11 @@ class CompositionState:
                             "aggregation_output_mode_invalid",
                         )
                     )
+                else:
+                    mode = OutputMode.TRANSFORM if node.output_mode is None else OutputMode(node.output_mode)
+                    count_error = mode.expected_output_count_error(node.expected_output_count)
+                    if count_error is not None:
+                        errors.append(_err(f"node:{node.id}", count_error, "high", "aggregation_expected_output_count_mode_invalid"))
             elif node.node_type == "queue":
                 # Intrinsic (topology-free) queue shape: id == input, no
                 # plugin/routing, description-only options (elspeth-a5b86149d4).
