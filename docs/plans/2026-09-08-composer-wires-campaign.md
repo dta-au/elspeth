@@ -1,5 +1,18 @@
 # Composer Wires Campaign Implementation Plan
 
+**Completion evidence — 2026-09-13.** Implementation, final frozen default and
+PostgreSQL gates, and the amended generic source-review/browser acceptance are
+recorded in [the verification report](composer-wires/verification-2026-09-13.md)
+for `c56b807d5a7c7f79d8c3d30fcf7e8e3702b77f38`. The 30 corpus-dependent eval
+cases omitted by the donor checkout also passed on the canonical candidate.
+The latest incorporated release input is
+`1e2a31d7eb4ab4257ac81faa40afdfbd63f97830`, verified as an ancestor of c56.
+Historical checkpoint statements below about unfinished implementation,
+unincorporated release inputs and outstanding local verification are superseded
+by that report. Partial live cases remain partial; remote integration and
+operator signature clearance are not claimed. Existing failure-policy parity
+work `elspeth-22ebd35458` remains outside this campaign.
+
 **Custody and consolidation update — 2026-09-12.** Resume this existing campaign
 on branch `composer-wires-consolidated`, in
 `.claude/worktrees/composer-wires-consolidated`, with custodian
@@ -161,7 +174,11 @@ selection also recorded an unresolved executor-shutdown warning. Re-measure the
 fixed release input and consolidated candidate where needed; none of these
 historical exceptions is a permanent waiver on the moving release.
 
-## Remaining execution order
+## Execution order and historical checkpoints
+
+The dated checkpoints in this section retain their original observations.
+Their open-work statements describe those snapshots, not the completion state
+in the verification report above.
 
 **Execution checkpoint — 2026-09-12.** Commit
 `73f6ea15de460065845fdb6f18f5e6b1cac6efb3` repairs safe JSON guidance readback,
@@ -371,19 +388,19 @@ verification must cover that final refinement before this milestone is
 accepted. Whole-repository, PostgreSQL, release-integration and live-provider
 acceptance remain outstanding campaign gates.
 
-- [ ] Reconcile the historical producer table against the live discovery registry.
+- [x] Reconcile the historical producer table against the live discovery registry.
   Select contracts from declarations, owned beside producers; admit real
   successful variants and permitted absence/failure families only.
-- [ ] Close fixed roots and nested records while preserving legitimate dynamic
+- [x] Close fixed roots and nested records while preserving legitimate dynamic
   leaf grammar, nominal ownership, list roots, insertion order and omission.
   No arbitrary object/Any/BaseModel/JSON root fallback or giant trial union.
-- [ ] Preserve independent error authority and exact disclosure/projection
+- [x] Preserve independent error authority and exact disclosure/projection
   precedence, cache eligibility and current state/schema budget on reuse. Build
   the final restricted envelope once without later ambient mapping mutation.
-- [ ] Exercise real producer variants, corruption, current-surface cache reuse,
+- [x] Exercise real producer variants, corruption, current-surface cache reuse,
   restricted/full-state selectors, preview refusal and schema budget boundaries.
   Prove actual wrong-field/wrong-type mutations fail for intended reasons.
-- [ ] After correctness freezes, use the [local performance checks](composer-wires/contract-performance-checks.md)
+- [x] After correctness freezes, use the [local performance checks](composer-wires/contract-performance-checks.md)
   for adapter construction/traversal costs. No performance target weakens admission.
 
 ### 6. Implement sparse presence and structured persisted errors together
@@ -391,21 +408,21 @@ acceptance remain outstanding campaign gates.
 Use the [combined charter](composer-wires/combined-presence-errors-charter.md),
 with the [detailed presence fixtures](composer-wires/frontend-presence-handoff.md).
 
-- [ ] Re-read both session schema epoch pins at the incorporated release state;
+- [x] Re-read both session schema epoch pins at the incorporated release state;
   advance them together for these two persisted changes. Test fresh and stale
   temporary SQLite/PostgreSQL stores. No actual session store reset, backfill,
   legacy reader or historical rewriting is part of implementation.
-- [ ] Preserve sparse argument display through sensitive summarization,
+- [x] Preserve sparse argument display through sensitive summarization,
   publication, row/event restoration and frontend comparison. Responses retain
   existing default-inclusive redaction. Replacement caveats are unconditional.
-- [ ] Share the narrowly scoped semantic-redacted hash helper between the
+- [x] Share the narrowly scoped semantic-redacted hash helper between the
   persisted dispatch-binding constructor and all five service comparisons.
   Exact display, draft, audit-payload and private invocation hashes remain exact.
-- [ ] Carry frozen required-key `{message, error_code, component}` records through
+- [x] Carry frozen required-key `{message, error_code, component}` records through
   composition-state persistence, strict decoder/HTTP projection, guided replay,
   frontend and RGR scoring. Code remains `str | None`; preserve null/empty
   semantics, message-only pending digest authority and guided disclosure.
-- [ ] Prove explicit inline_blob:null and omission through first durable guided
+- [x] Prove explicit inline_blob:null and omission through first durable guided
   dispatch, settlement, rejection, retry and recovery, with non-normalized-field
   tampering controls. Run frontend fixture/decoder/humanizer/component checks
   and PostgreSQL persistence/epoch proofs.
@@ -415,21 +432,21 @@ with the [detailed presence fixtures](composer-wires/frontend-presence-handoff.m
 Use the [residue handoff](composer-wires/remaining-residue-handoff.md) and
 [hidden-label disposition](composer-wires/hidden-label-disposition.md).
 
-- [ ] `elspeth-5e81b50f2e`: remove the redundant destination data.note; retain the
+- [x] `elspeth-5e81b50f2e`: remove the redundant destination data.note; retain the
   existing `quarantine_unknown_output` error once, with direct guidance and
   independent server-owned metadata notes preserved.
-- [ ] `elspeth-72ce6749ac`: keep legitimate dynamic keys private; document and
+- [x] `elspeth-72ce6749ac`: keep legitimate dynamic keys private; document and
   test mapping-local input-order labels through real redaction/audit persistence.
   Approved fixed vocabulary may retain names; unknown external names/hashes may not.
-- [ ] `elspeth-c00e6d9795`: finish immutable restricted construction in milestone 5.
-- [ ] `elspeth-6aa477c78e`: make battery approval observability explicit; redacted
+- [x] `elspeth-c00e6d9795`: finish immutable restricted construction in milestone 5.
+- [x] `elspeth-6aa477c78e`: make battery approval observability explicit; redacted
   status is not evidence approval was absent or a mutation definitely applied.
   If a minimal status carrier is needed, identify its actual producer/capture
   seam and prove current disclosure policy permits it. Full canonical payload
   capture would require a separate disclosure decision.
-- [ ] `elspeth-9e76d9436b`: consume actual structured HTTP state from milestone 6
+- [x] `elspeth-9e76d9436b`: consume actual structured HTTP state from milestone 6
   with producer-backed fixtures; preserve correct mocked-harness behavior.
-- [ ] Reconcile already reviewed error-twin, envelope-census and teaching repairs
+- [x] Reconcile already reviewed error-twin, envelope-census and teaching repairs
   with their owning tests. Do not redo historical fixes or silently drop their
   independent repair/failure/cache contracts.
 
@@ -437,34 +454,34 @@ Use the [residue handoff](composer-wires/remaining-residue-handoff.md) and
 
 Use the [scorecard charter](composer-wires/scorecard-integration-charter.md).
 
-- [ ] Extend `composer_wire_census.py --scorecard` using each gate's actual census
+- [x] Extend `composer_wire_census.py --scorecard` using each gate's actual census
   authority. Join every wire onto the live registered universe after exact-set
   and duplicate checks. Missing/unresolved cells fail honestly, not as N/A.
-- [ ] Distinguish root/schema relation, static attribution, value redaction,
+- [x] Distinguish root/schema relation, static attribution, value redaction,
   lexical teaching, generated frontend membership and executed behavioral proof.
   The Python fixture consumer remains independent of Node; Vitest proves the
   runtime dispatch relation. A table is not a test execution receipt.
-- [ ] At the frozen integrated candidate, run backend default and serial
+- [x] At the frozen integrated candidate, run backend default and serial
   PostgreSQL suites, full frontend tests/typecheck/lint, Ruff/mypy/contracts and
   key-free lint-corpus comparison. Account for each new failure or binding delta.
-- [ ] Prepare the existing [standard battery](../../evals/composer-standard-battery/battery.md)
+- [x] Prepare the existing [standard battery](../../evals/composer-standard-battery/battery.md)
   plus one scenario per repaired seam, including silently dropped knobs and
   explicit-approval cards. Reuse the existing Composer harnesses. Prepare exact
   baseline/candidate commands, model/settings and bounded inputs before seeking
   any still-required provider-egress approval.
-- [ ] After authorized trials, record repair turns, calls per transition,
+- [x] After authorized trials, record repair turns, calls per transition,
   unknown-key placeholders and approval-card rows. Rootless source acceptance
   requires per-transition provider-call scrutiny; the old single baseline
   transition did not exercise that path.
-- [ ] In a rootless session, render the real provider-authored source proposal
+- [x] In a rootless session, render the real provider-authored source proposal
   through the existing generic review surface. Reload the session, approve that
   same persisted proposal ID in the browser, and verify settlement and replay
   against that ID and its original invocation authority. Do not synthesize a
   replacement proposal or require the retired interpretation widget to appear.
-- [ ] Retain the execution content review for LLM-authored source data after
+- [x] Retain the execution content review for LLM-authored source data after
   source proposal approval. Verify that proposal approval alone does not satisfy
   that review and that execution follows its existing acknowledgement path.
-- [ ] Close campaign scope only when current gate results and live evidence
+- [x] Close campaign scope only when current gate results and live evidence
   account for every tool and each residue item. Reverify tracker/HEAD status
   before reporting completion; no inferred fence or incomplete scorer counts.
 
@@ -549,20 +566,21 @@ launch global restaging. Preserve necessary contract census changes honestly.
 
 John assigned the upload-source planner bypass found during ACA/VANguard review
 to this campaign on 2026-09-12. It is an additional completion requirement.
-The route's `_prepare_step_1_uploaded_source_bind` selects a plugin and answers
-the source schema form from inspection facts; the upload branch bypasses
-`provider_runner`. Keeping committed sources empty until confirmation does not
-remove those server-authored decisions.
+The original route's `_prepare_step_1_uploaded_source_bind` selected a plugin
+and answered the source schema form from inspection facts, bypassing
+`provider_runner`. Keeping committed sources empty until confirmation did not
+remove those server-authored decisions. The completed repair routes these
+choices through the real planner and retains confirmation and replay custody.
 
-- [ ] Pass structured upload inspection facts and custody references through the
+- [x] Pass structured upload inspection facts and custody references through the
   real planner and its tools; apply only the planner-authored source proposal.
-- [ ] Preserve uploaded content custody, validation, inspection review and user
+- [x] Preserve uploaded content custody, validation, inspection review and user
   confirmation, atomic settlement, replay, and failure behavior. Add no
   server-authored fallback or tutorial-specific path.
-- [ ] Test provider participation for each authoring transition, including a
+- [x] Test provider participation for each authoring transition, including a
   conversation that has already called the provider. Verify unsuccessful
   planner outcomes leave the upload available and do not author pending intent.
-- [ ] Reconcile the release session's guided-plan lease cleanup, guided-chat
+- [x] Reconcile the release session's guided-plan lease cleanup, guided-chat
   integrity propagation, and admission refusal changes before integration.
   The release session retains ACA/VANguard custody; this campaign owns the
   planner bypass repair in its separate worktree.
@@ -582,8 +600,10 @@ During consolidation the local release advanced to
 `d1b473c8f846f9ed7dc1da1d6c2dd6641abfed8a`. Git measured six newly reachable
 commits and 40 changed paths since the fixed input, with no direct overlap with
 the captured campaign paths plus `tools/outputs.py` housekeeping. Those release
-changes are not incorporated here. This is a dated path comparison, not proof
-that dependencies cannot interact; refresh it before the next integration.
+changes were not incorporated at that checkpoint. The later incorporated input
+is `1e2a31d7eb4ab4257ac81faa40afdfbd63f97830`, an ancestor of the final c56
+candidate. The earlier path comparison remains historical, not proof that
+dependencies cannot interact.
 
 Deployment-only changes may be separate, but session service, schema epoch,
 durable dispatch/recovery, guided replay and PostgreSQL contention are real
