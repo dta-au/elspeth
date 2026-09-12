@@ -5813,21 +5813,13 @@ class TestMessageRoutes:
                 json=_guided_chat_body(guided_resp.json(), "Use this source"),
             )
 
-        # The transition authority rejected the proposal. The atomic settlement
-        # records a typed, non-applying synthetic turn instead of returning a
-        # fatal response. The raw tool result (which can carry Tier-3 row data)
-        # must not reach the response body on any exit path.
-        assert send_resp.status_code == 200
-        response_json = send_resp.json()
+        # A broken owned transition aborts; it must not settle as user-fixable
+        # input. Its raw tool result can carry row data and stays out of HTTP.
+        assert send_resp.status_code == 500
         body = send_resp.text
         assert "ToolResult(" not in body
         assert raw_row_secret not in body
         assert tool_result_private_detail not in body
-        # No mutation: the rejected commit must not advance or apply.
-        assert response_json["guided_session"]["step"] == "step_1_source"
-        persisted_turn = response_json["guided_session"]["chat_history"][-1]
-        assert persisted_turn["assistant_message_kind"] == "synthetic_failure"
-        assert persisted_turn["synthetic_failure_reason"] == "not_applied"
 
     def test_guided_chat_malformed_source_tool_args_return_model_shape_rejection(self, tmp_path) -> None:
         """Malformed Step-1 source resolver tool output must not escape as HTTP 500.

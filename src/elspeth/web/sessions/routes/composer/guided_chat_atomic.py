@@ -1998,7 +1998,7 @@ async def post_guided_chat_schema8(
                                 payload_store=payload_store,
                                 new_stable_id=uuid4(),
                             )
-                        except (PluginConfigError, InvariantError, TypeError, ValueError):
+                        except (PluginConfigError, ValueError):
                             # Same degradation as a rejected chat transition: the
                             # upload stays uploaded and the authoritative turn is
                             # unchanged, so the wizard remains usable.
@@ -2064,7 +2064,7 @@ async def post_guided_chat_schema8(
                             )
                             next_turn = current_turn
                             prepared_next = planned_current
-                        except (PluginConfigError, InvariantError, TypeError, ValueError):
+                        except (PluginConfigError, ValueError):
                             chat_result = _with_pair_disposition(
                                 StepChatResult(
                                     assistant_message=(
@@ -2517,9 +2517,17 @@ async def post_guided_chat_schema8(
                         ),
                         session_operation_context=reserved.session_operation_context,
                     )
-                except GuidedOperationFenceLostError:
+                except GuidedOperationFenceLostError as settlement_exc:
+                    if failure_code == "integrity_error":
+                        raise exc from settlement_exc
                     rejoin_after_lock = True
+                except Exception as settlement_exc:
+                    if failure_code == "integrity_error":
+                        raise exc from settlement_exc
+                    raise
                 else:
+                    if failure_code == "integrity_error":
+                        raise
                     raise guided_operation_failure_error(failed)
             finally:
                 await lease_guard.finish_active_exception()
