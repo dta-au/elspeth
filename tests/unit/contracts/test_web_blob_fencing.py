@@ -3186,13 +3186,14 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     pluggable-SSO identity substrate landed on top of it, 53 once the read
     admissions took their own rows (elspeth-f98e0ae8b2), and 54 for durable
     Composer progress and inflight requests, then 55 for identity ownership
-    constraints and admission evidence. The claim the test
+    constraints and admission evidence, then 56 for sparse proposal arguments
+    and structured validation errors. The claim the test
     makes is unchanged either way: the fence vocabulary lives in the session
     schema and the web coordination PROTOCOL version does not move with it.
     The assertion exists to fail when someone bumps one without the other.
     """
     assert SessionOperationKind.BLOB_READ.value == "blob_read"
-    assert SESSION_SCHEMA_EPOCH == 55
+    assert SESSION_SCHEMA_EPOCH == 56
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"
