@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -254,8 +255,20 @@ def test_action_is_frozen_exact_and_decoder_rejects_open_or_coerced_shapes() -> 
         deferred_intent_action_from_dict({**encoded, "raw_user_message": "secret"})
     with pytest.raises(GuidedSolverResponseShapeError, match="constraints must be a list"):
         deferred_intent_action_from_dict({**encoded, "constraints": tuple(encoded["constraints"])})
-    with pytest.raises(InvariantError, match="catalog fields must be paired"):
+    # Anchored on the whole model-facing text: the repair turn hands exactly this
+    # back, and the pre-fix "catalog fields must be paired" named no exit
+    # (elspeth-44c1f6662d).
+    pairing_rejection = re.escape(
+        "DeferredIntentAction catalog fields must be paired: set catalog_kind and catalog_name both to null when no "
+        "specific plugin is named, or both to the exact catalog plugin. A kind without a name cannot be recorded; "
+        "target_stage already names the stage."
+    )
+    with pytest.raises(InvariantError, match=f"^{pairing_rejection}$"):
         _action(catalog_kind=None, catalog_name="llm")
+    # The live direction: a planner that knows the KIND but will not invent a
+    # NAME, through the wire decoder the repair turn reads its error from.
+    with pytest.raises(GuidedSolverResponseShapeError, match=f"^{pairing_rejection}$"):
+        deferred_intent_action_from_dict({**encoded, "catalog_name": None})
     with pytest.raises(InvariantError, match="at least one structural constraint"):
         DeferredIntentAction(
             target_stage="topology",

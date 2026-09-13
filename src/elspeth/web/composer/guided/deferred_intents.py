@@ -113,8 +113,9 @@ class DeferredIntentAction:
             raise InvariantError("DeferredIntentAction.target_stage is unsupported")
         if (self.catalog_kind is None) != (self.catalog_name is None):
             raise InvariantError(
-                "DeferredIntentAction catalog fields must be paired: name the exact catalog plugin "
-                "(catalog_kind AND catalog_name together) or set both to null when no specific plugin is chosen yet"
+                "DeferredIntentAction catalog fields must be paired: set catalog_kind and catalog_name both to null when no "
+                "specific plugin is named, or both to the exact catalog plugin. A kind without a name cannot be recorded; "
+                "target_stage already names the stage."
             )
         if self.catalog_kind is not None and self.catalog_kind not in _PLUGIN_STAGE:
             raise InvariantError("DeferredIntentAction.catalog_kind is unsupported")

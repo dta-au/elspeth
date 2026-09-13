@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import get_args
 
@@ -262,6 +263,40 @@ def test_decoders_keep_exact_types_closed_vocabularies_and_constraint_validation
     )
     with pytest.raises(InvariantError):
         decoder(value)
+
+
+@pytest.mark.parametrize(("plugin_kind", "plugin_name"), [("transform", None), (None, "llm")])
+def test_component_count_plugin_identity_is_paired_and_its_rejection_names_both_exits(
+    plugin_kind: PluginKind | None,
+    plugin_name: str | None,
+) -> None:
+    """The tool schema admits either half alone; the invariant refuses it with the exits the repair turn needs.
+
+    Twin of the DeferredIntentAction catalog pairing (elspeth-44c1f6662d): the
+    pre-fix text "plugin_kind/plugin_name must be paired" named no exit.
+    """
+    encoded = {
+        "kind": "component_count",
+        "component_kind": "node",
+        "plugin_kind": plugin_kind,
+        "plugin_name": plugin_name,
+        "operator": "at_least",
+        "count": 1,
+    }
+    rejection = re.escape(
+        "ComponentCountConstraint plugin_kind/plugin_name must be paired: set both to null to count every component "
+        "of this component_kind, or both to the exact catalog plugin to count only that plugin."
+    )
+    with pytest.raises(InvariantError, match=f"^{rejection}$"):
+        constraint_from_dict(encoded)
+    assert constraint_from_dict({**encoded, "plugin_kind": None, "plugin_name": None}) == ComponentCountConstraint(
+        kind="component_count",
+        component_kind="node",
+        plugin_kind=None,
+        plugin_name=None,
+        operator="at_least",
+        count=1,
+    )
 
 
 def test_catalog_resolution_returns_unique_exact_kind_and_name() -> None:

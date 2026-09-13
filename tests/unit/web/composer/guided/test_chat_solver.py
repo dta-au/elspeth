@@ -715,9 +715,11 @@ async def test_step_1_solver_returns_only_the_closed_deferred_intent_action(monk
     tool_names = [tool["function"]["name"] for tool in captured["tools"]]
     assert tool_names == ["resolve_source", "retain_deferred_intent", "manage_deferred_intent"]
     deferred_schema = captured["tools"][1]["function"]["parameters"]
-    # Flat object on purpose: a top-level oneOf degrades provider steering
-    # (elspeth-3a21f09f09 washup). The both-or-neither catalog pairing is
-    # taught in the tool description instead.
+    # Flat object: the both-or-null pairings are not expressed structurally
+    # (see the schema comment). They are taught in the tool description AND on
+    # each paired property, so the rule sits where each field is generated and
+    # travels with the parameters object manage_deferred_intent's replacement
+    # reuses (elspeth-44c1f6662d).
     assert deferred_schema["type"] == "object"
     assert deferred_schema["additionalProperties"] is False
     assert set(deferred_schema["required"]) == {
@@ -728,7 +730,21 @@ async def test_step_1_solver_returns_only_the_closed_deferred_intent_action(monk
         "constraints",
     }
     description = captured["tools"][1]["function"]["description"]
-    assert "BOTH to the exact known catalog plugin, or BOTH to null" in description
+    assert "BOTH to null when the instruction does not name one specific plugin, or BOTH to the exact known catalog plugin" in description
+    management_replacement = captured["tools"][2]["function"]["parameters"]["properties"]["replacement"]
+    component_count = next(
+        variant
+        for variant in deferred_schema["properties"]["constraints"]["items"]["oneOf"]
+        if variant["properties"]["kind"]["enum"] == ["component_count"]
+    )
+    for (kind_field, name_field), properties in (
+        (("catalog_kind", "catalog_name"), deferred_schema["properties"]),
+        (("catalog_kind", "catalog_name"), management_replacement["properties"]),
+        (("plugin_kind", "plugin_name"), component_count["properties"]),
+    ):
+        for field, partner in ((kind_field, name_field), (name_field, kind_field)):
+            assert partner in properties[field]["description"]
+            assert "null" in properties[field]["description"].lower()
 
 
 @pytest.mark.asyncio
@@ -1758,6 +1774,102 @@ async def test_deferred_repair_is_bounded_to_one_turn(
         await _run_stage_solver(stage)
 
     assert len(calls) == 2
+
+
+_UNNAMED_TRANSFORM_COUNT: dict[str, Any] = {
+    "kind": "component_count",
+    "component_kind": "node",
+    "plugin_kind": None,
+    "plugin_name": None,
+    "operator": "at_least",
+    "count": 1,
+}
+
+_UNNAMED_TRANSFORM_ARGUMENTS: dict[str, Any] = {
+    "target_stage": "topology",
+    "catalog_kind": None,
+    "catalog_name": None,
+    "redacted_summary": "Add a transform during topology authoring; no specific plugin was named.",
+    "constraints": [_UNNAMED_TRANSFORM_COUNT],
+}
+
+# The two half identities the tool schema admits and the owned invariants
+# refuse, each with the exact rejection text the one repair turn hands back.
+_HALF_IDENTITY_REPLIES: dict[str, tuple[dict[str, Any], str]] = {
+    "catalog": (
+        {**_UNNAMED_TRANSFORM_ARGUMENTS, "catalog_kind": "transform"},
+        "DeferredIntentAction catalog fields must be paired: set catalog_kind and catalog_name both to null when no "
+        "specific plugin is named, or both to the exact catalog plugin. A kind without a name cannot be recorded; "
+        "target_stage already names the stage.",
+    ),
+    "component_count": (
+        {**_UNNAMED_TRANSFORM_ARGUMENTS, "constraints": [{**_UNNAMED_TRANSFORM_COUNT, "plugin_kind": "transform"}]},
+        "ComponentCountConstraint plugin_kind/plugin_name must be paired: set both to null to count every component "
+        "of this component_kind, or both to the exact catalog plugin to count only that plugin.",
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("half", sorted(_HALF_IDENTITY_REPLIES))
+async def test_half_plugin_identity_is_repaired_by_the_rejection_text_it_is_handed(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    half: str,
+) -> None:
+    """A KIND without a NAME converges in the one repair turn (elspeth-44c1f6662d).
+
+    It is the honest reply of a planner that will not invent a plugin, the
+    schema admits it, and the invariant refuses it. The live repro exhausted
+    repair on exactly this shape while the rejection read only "catalog fields
+    must be paired", so the tool result must carry the text naming the exit.
+    """
+    half_reply, rejection = _HALF_IDENTITY_REPLIES[half]
+    calls: list[dict[str, Any]] = []
+
+    async def repairing_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        call = SimpleNamespace(
+            id=f"call_retain_{len(calls)}",
+            function=SimpleNamespace(
+                name="retain_deferred_intent",
+                arguments=json.dumps(half_reply if len(calls) == 1 else _UNNAMED_TRANSFORM_ARGUMENTS),
+            ),
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
+    outcome = await _run_stage_solver(stage)
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert outcome.actions == (
+        DeferredIntentAction(
+            target_stage="topology",
+            catalog_kind=None,
+            catalog_name=None,
+            redacted_summary="Add a transform during topology authoring; no specific plugin was named.",
+            constraints=(
+                ComponentCountConstraint(
+                    kind="component_count",
+                    component_kind="node",
+                    plugin_kind=None,
+                    plugin_name=None,
+                    operator="at_least",
+                    count=1,
+                ),
+            ),
+        ),
+    )
+    assert len(calls) == 2
+    assert calls[1]["messages"][-1] == {
+        "role": "tool",
+        "tool_call_id": "call_retain_1",
+        "content": (
+            f"retain_deferred_intent rejected: {rejection} "
+            "Correct the arguments and call retain_deferred_intent again with the complete structural constraints."
+        ),
+    }
 
 
 _PAIR_SINK_ARGUMENTS: dict[str, Any] = {

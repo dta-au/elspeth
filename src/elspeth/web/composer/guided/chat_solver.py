@@ -704,8 +704,19 @@ _DEFERRED_CONSTRAINT_SCHEMA: dict[str, Any] = {
             "properties": {
                 "kind": {"type": "string", "enum": ["component_count"]},
                 "component_kind": {"type": "string", "enum": ["source", "node", "edge", "output"]},
-                "plugin_kind": {"type": ["string", "null"], "enum": ["source", "transform", "sink", None]},
-                "plugin_name": {"type": ["string", "null"], "minLength": 1},
+                "plugin_kind": {
+                    "type": ["string", "null"],
+                    "enum": ["source", "transform", "sink", None],
+                    "description": "Null to count every component of component_kind; set only together with plugin_name.",
+                },
+                "plugin_name": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "description": (
+                        "The exact catalog plugin to count, set together with plugin_kind; "
+                        "null together with plugin_kind to count every component of component_kind."
+                    ),
+                },
                 "operator": {"type": "string", "enum": ["equals", "at_least", "at_most"]},
                 "count": {"type": "integer", "minimum": 0},
             },
@@ -851,24 +862,40 @@ _DEFERRED_INTENT_TOOL: dict[str, Any] = {
             f"{_sentence_case(_node_kind_phrase(PLUGIN_FREE_NODE_TYPES))} are structural node types, never transform plugins; "
             f"{_node_kind_phrase(PLUGIN_BEARING_NODE_TYPES)} are node types that each REQUIRE a transform plugin, "
             "so naming that plugin does not make the node an ordinary transform. "
-            "catalog_kind and catalog_name are a pair: set BOTH to the exact known catalog plugin, or BOTH to null "
-            "when the instruction does not name one specific plugin. "
+            "catalog_kind and catalog_name are a pair: set BOTH to null when the instruction does not name one specific "
+            "plugin, or BOTH to the exact known catalog plugin. "
             "If this schema cannot faithfully encode the instruction, ask for clarification instead of fabricating a catalog identity."
         ),
         "parameters": {
-            # Flat object schema on purpose: a top-level oneOf here measurably
-            # DEGRADES provider steering (models start inventing keys — 0/3 on
-            # the elspeth-3a21f09f09 repro). The both-or-neither catalog
-            # pairing is carried by the tool description and enforced by the
-            # DeferredIntentAction invariant, whose error text names the fix
-            # for the bounded repair turn.
+            # Flat object schema: the both-or-null catalog pairing is NOT
+            # expressed structurally. What was measured is narrower than "flat
+            # is better": a ROOT-level oneOf scored 0/3 on the
+            # elspeth-3a21f09f09 repro (one model, one OpenRouter route, n=3),
+            # and LiteLLM's Anthropic and Bedrock adapters discard root-level
+            # combinators anyway (see manage_deferred_intent below). A nested
+            # nullable ``catalog`` carrier was never tried; elspeth-6730c58e4f
+            # owns that trial. Until then the pairing is taught in the tool
+            # description and on each paired property, and enforced by the
+            # DeferredIntentAction invariant, whose error text names both
+            # exits for the bounded repair turn.
             "type": "object",
             "additionalProperties": False,
             "required": ["target_stage", "catalog_kind", "catalog_name", "redacted_summary", "constraints"],
             "properties": {
                 "target_stage": {"type": "string", "enum": ["source", "output", "topology", "wire_review"]},
-                "catalog_kind": {"type": ["string", "null"], "enum": ["source", "transform", "sink", None]},
-                "catalog_name": {"type": ["string", "null"], "minLength": 1},
+                "catalog_kind": {
+                    "type": ["string", "null"],
+                    "enum": ["source", "transform", "sink", None],
+                    "description": "Null unless catalog_name names one specific catalog plugin; never set a kind without its name.",
+                },
+                "catalog_name": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "description": (
+                        "The exact catalog plugin name, set together with catalog_kind; "
+                        "null together with catalog_kind when no specific plugin is named."
+                    ),
+                },
                 "redacted_summary": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "constraints": {"type": "array", "minItems": 1, "maxItems": 64, "items": _DEFERRED_CONSTRAINT_SCHEMA},
             },

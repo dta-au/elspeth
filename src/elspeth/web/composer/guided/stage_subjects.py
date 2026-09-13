@@ -417,7 +417,10 @@ class ComponentCountConstraint:
         if self.kind != "component_count" or self.component_kind not in _COMPONENT_KINDS:
             raise InvariantError("ComponentCountConstraint component kind is unsupported")
         if (self.plugin_kind is None) != (self.plugin_name is None):
-            raise InvariantError("ComponentCountConstraint plugin_kind/plugin_name must be paired")
+            raise InvariantError(
+                "ComponentCountConstraint plugin_kind/plugin_name must be paired: set both to null to count every component "
+                "of this component_kind, or both to the exact catalog plugin to count only that plugin."
+            )
         if self.plugin_kind is not None and self.plugin_kind not in _PLUGIN_KIND_SET:
             raise InvariantError("ComponentCountConstraint.plugin_kind is unsupported")
         expected_plugin_kind: dict[str, PluginKind] = {"source": "source", "node": "transform", "output": "sink"}
