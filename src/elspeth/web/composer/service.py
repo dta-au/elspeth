@@ -200,7 +200,7 @@ from elspeth.web.composer.source_demand import (
     parse_source_data_contract_accepted_fields,
     sample_header_for_source,
 )
-from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary
+from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary, _well_formed_query_entries
 from elspeth.web.composer.tools import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
@@ -7908,7 +7908,10 @@ class ComposerServiceImpl:
                 "pipeline evidence is internally sound and whether the visible user-request excerpt "
                 "aligns with it. Flag any concrete visible mismatch, broken field contract, or "
                 "subjective rubric that should have been surfaced. "
-                "Use each LLM node's visible prompt_template excerpt and its listed, "
+                "Use each LLM node's visible effective prompt text (its prompt_template, or in "
+                "multi-query mode each queries.<name>.template plus the shared system_prompt; a "
+                "prompt_template_in_use marker says which of those the node-level template still "
+                "serves) and its listed, "
                 "length-independent interpolated row fields to check one concrete degeneracy: "
                 "FLAG when the supplied evidence shows that the prompt interpolates no varying "
                 "content, or asks the model to judge a page or record from a URL or identifier "
@@ -9255,11 +9258,14 @@ def _advisor_prompt_option_values(options: Mapping[str, Any]) -> list[tuple[str,
 
     Yields ``(key, text, prose_shaped)`` triples (elspeth-cd9af8e61d).
     ``prose_shaped`` is True for free-text prompt values
-    (``prompt_template``/``template``), which receive the full prose
+    (``prompt_template``/``template``/``system_prompt`` and every per-query
+    ``queries.<name>.template`` override), which receive the full prose
     injection scan; every other rendered value is structural — identifier
     lists, mappings, the owned schema projection — and receives the
     per-segment scan of
-    :func:`_structural_value_contains_advisor_prompt_injection`.
+    :func:`_structural_value_contains_advisor_prompt_injection`. The
+    ``queries`` option is expanded through
+    :func:`_advisor_query_option_values`, the same walk the renderer takes.
     """
     values: list[tuple[str, str, bool]] = []
     for key in sorted(options):
@@ -9268,6 +9274,8 @@ def _advisor_prompt_option_values(options: Mapping[str, Any]) -> list[tuple[str,
         raw = options[key]
         if key == "schema":
             values.append((key, _render_schema_for_advisor(raw), False))
+        elif key == "queries":
+            values.extend(_advisor_query_option_values(options))
         else:
             # Scan the complete value rather than the display-truncated form:
             # an instruction suffix beyond the compact evidence cap is still
@@ -9417,6 +9425,15 @@ _ADVISOR_SUMMARY_VALUE_KEYS: Final[frozenset[str]] = frozenset(
         "model",
         "prompt_template",
         "template",
+        # The rest of an LLM node's prompt surface. A multi-query node sends
+        # each query's ``template`` override (the node-level ``prompt_template``
+        # renders only for queries without one) under one ``system_prompt``;
+        # withholding them left the END gate judging a prompt that never runs
+        # and blind to a repair landing in the prompts that do (session
+        # 94f6f00c, 2026-09-13). ``queries`` is expanded per query by
+        # ``_advisor_query_option_values``, never rendered as one blob.
+        "queries",
+        "system_prompt",
         "column",
         "columns",
         "field",
@@ -9465,17 +9482,170 @@ _ADVISOR_SUMMARY_VALUE_MAX_CHARS: Final[int] = 120
 _ADVISOR_SUMMARY_SCHEMA_MAX_FIELDS: Final[int] = 8
 _ADVISOR_SUMMARY_SCHEMA_MAX_CONTRACT_FIELDS: Final[int] = 8
 _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS: Final[int] = 1000
-# Prompt-shaped option values (``prompt_template``/``template``) get a much
-# larger render budget so the advisor sees the WHOLE prompt — its rubric
-# anchors and (for the degeneracy check) its row-field interpolations — not
-# just the opening line. Kept well under the per-call char_cap
-# (composer_advisor_max_prompt_tokens * 4) enforced in
-# ``_validate_advisor_arguments``; the global 120 cap is deliberately left
-# unchanged so every non-prompt value stays compact.
+# Prompt-shaped option values (``prompt_template``/``template``/
+# ``system_prompt`` and each per-query template) get a much larger render
+# budget so the advisor sees the WHOLE prompt — its rubric anchors and (for
+# the degeneracy check) its row-field interpolations — not just the opening
+# line. Sized so one prompt sits well under the per-call char_cap
+# (composer_advisor_max_prompt_tokens * 4) that ``_validate_advisor_arguments``
+# enforces on the ``request_advisor_hint`` TOOL path. The EARLY/END checkpoint
+# path builds its arguments in ``_build_checkpoint_arguments`` and bypasses
+# that validator, so the pipeline summary's TOTAL size is bounded only by these
+# per-value budgets (this cap, the 120-char compact cap, 8 schema fields, 8
+# query templates per node) times the number of nodes — there is no whole-
+# summary ceiling on the checkpoint path. The global 120 cap is deliberately
+# left unchanged so every non-prompt value stays compact.
 _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS: Final[int] = 1000
 # Option keys whose VALUE is prompt-shaped (free-text the model is told to
 # follow). Rendered with the larger budget above.
-_ADVISOR_SUMMARY_PROMPT_VALUE_KEYS: Final[frozenset[str]] = frozenset({"prompt_template", "template"})
+_ADVISOR_SUMMARY_PROMPT_VALUE_KEYS: Final[frozenset[str]] = frozenset({"prompt_template", "template", "system_prompt"})
+# A multi-query node renders at most this many per-query templates (each on
+# the prompt budget); the remainder is counted under
+# ``additional_queries_withheld`` so the omission is rubric-legible — the END
+# rubric reads every ``additional_*_withheld`` count as "that many further
+# entries exist but are not shown" and forbids a FLAG on them.
+_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES: Final[int] = 8
+_ADVISOR_SUMMARY_INVALID_QUERIES_MARKER: Final[str] = "<invalid queries>"
+_ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER: Final[str] = "(node-level prompt_template)"
+
+
+@observation_boundary(
+    tier=3,
+    source="web-authored llm node options carrying an untrusted multi-query ``queries`` mapping or list",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "walks only well-formed query entries in authoring order, emits each string template "
+        "override as prose-shaped and each input_fields mapping as structural, substitutes fixed "
+        "markers for a fallback-to-node-template query and for a malformed queries value, bounds "
+        "the rendered entries with an explicit withheld count, and never raises"
+    ),
+)
+def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, str, bool]]:
+    """ONE source of truth for a multi-query LLM node's prompt evidence surface.
+
+    Yields ``(key, text, prose_shaped)`` triples in the convention of
+    :func:`_advisor_prompt_option_values`; BOTH consumers walk this list —
+    :func:`_render_options_for_advisor` publishes it to the advisor and
+    :func:`_advisor_prompt_option_values` scans it — so a per-query prompt is
+    rendered AND scanned by construction (the :func:`_advisor_control_flow_fields`
+    discipline, elspeth-eacfec09a6).
+
+    Per well-formed query entry (mapping form keyed by name, or list form
+    carrying ``name`` — :func:`_well_formed_query_entries` is the composer's
+    single reading of that shape), in authoring order, up to
+    :data:`_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES`:
+
+    * ``queries.<name>.input_fields`` — the variable-to-column binding,
+      structural;
+    * ``queries.<name>.template`` — the override text, prose-shaped, or the
+      fixed :data:`_ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER` when the
+      query falls back to the node-level ``prompt_template``.
+
+    Then ``additional_queries_withheld`` when entries were cut, and
+    ``prompt_template_in_use`` naming which queries render the node-level
+    template — or stating that none does. The plugin's effective-template rule
+    (``LLMConfig._validate_template_variable_bindings``: override wins, the
+    node-level template renders only for queries without one) is what makes
+    that marker honest: without it the advisor reads a rendered
+    ``prompt_template`` as THE prompt and judges dead text.
+
+    A ``queries`` value with no well-formed entry yields the single fixed
+    :data:`_ADVISOR_SUMMARY_INVALID_QUERIES_MARKER`; plugin schema validation
+    owns reporting the malformation. Absent ``queries`` yields nothing —
+    single-prompt mode carries no marker at all.
+
+    The expansion describes how ``queries`` relate to a node-level
+    ``prompt_template``, so it applies only when that template is present as
+    a string. ``queries`` is not an LLM-only key: the AWS Textract transforms
+    carry a ``queries`` list of document questions with no prompt at all, and
+    expanding those would publish false prompt-surface markers ("queries
+    without their own template: #0, #1") about a plugin that has no templates.
+    Without a node-level template the key keeps today's name-only treatment
+    (the caller lists it under ``values withheld``). Never raises.
+    """
+    raw = options.get("queries")
+    if raw is None or not isinstance(options.get("prompt_template"), str):
+        return []
+    entries = _well_formed_query_entries(raw)
+    if not entries:
+        return [("queries", _ADVISOR_SUMMARY_INVALID_QUERIES_MARKER, False)]
+    values: list[tuple[str, str, bool]] = []
+    node_template_users: list[str] = []
+    for label, entry in entries[:_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES]:
+        input_fields = entry.get("input_fields")
+        if isinstance(input_fields, Mapping):
+            values.append((f"queries.{label}.input_fields", str(dict(input_fields)), False))
+        override = entry.get("template")
+        if isinstance(override, str):
+            values.append((f"queries.{label}.template", override, True))
+        elif override is None:
+            node_template_users.append(label)
+            values.append((f"queries.{label}.template", _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER, False))
+        # A present-but-non-string override is unknowable until schema
+        # validation rejects it (state.py's binding guard skips it the same
+        # way); it is neither rendered nor counted as a node-template user.
+    withheld = len(entries) - _ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES
+    if withheld > 0:
+        values.append(("additional_queries_withheld", str(withheld), False))
+        # Queries beyond the bound may still fall back to the node template;
+        # count them so the in-use marker stays truthful.
+        for label, entry in entries[_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES:]:
+            if entry.get("template") is None:
+                node_template_users.append(label)
+    # Fact-register wording ("not used" / "used by"), never an editorial
+    # "dead"/"leftover": the rubric owns prompt correctness, not composer
+    # hygiene, and a judgement word primes the advisor to FLAG an inert but
+    # honestly-present field as a defect in itself.
+    if node_template_users:
+        values.append(("prompt_template_in_use", "queries without their own template: " + ", ".join(node_template_users), False))
+    else:
+        values.append(("prompt_template_in_use", "not used (every query supplies its own template)", False))
+    # ``system_prompt`` is rendered by the generic prompt-key path; in
+    # multi-query mode the runtime prepends it as the system message of EVERY
+    # query's call (transform.py multi-query branch), so state that scope
+    # beside the per-query templates rather than let the advisor read it as
+    # one more peer prompt.
+    if isinstance(options.get("system_prompt"), str):
+        values.append(("system_prompt_scope", "applies to every query on this node", False))
+    return values
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored llm options (untrusted prompt_template and queries entries)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns only string templates: each well-formed query's string override, the node-level "
+        "template for queries without one, or the node-level template alone outside multi-query "
+        "mode; non-string pieces are skipped and nothing is raised"
+    ),
+)
+def _node_effective_prompt_templates(node: NodeSpec) -> list[str]:
+    """The prompt texts an LLM node actually renders, per the plugin's rule.
+
+    Single-prompt mode: the node-level ``prompt_template`` (flat or nested
+    shape via :func:`_node_prompt_template`). Multi-query mode: each
+    well-formed query's ``template`` override, or the node-level template for
+    a query without one — mirroring ``LLMConfig``'s own field extraction over
+    the same union. A node-level template no query falls back to is dead and
+    is NOT included: the degeneracy signal must describe the prompts the model
+    will see, not a slot that never renders. Never raises.
+    """
+    node_template = _node_prompt_template(node)
+    raw_queries = node.options.get("queries")
+    entries = _well_formed_query_entries(raw_queries) if raw_queries is not None else ()
+    if not entries:
+        return [node_template] if node_template is not None else []
+    templates: list[str] = []
+    for _label, entry in entries:
+        override = entry.get("template")
+        if isinstance(override, str):
+            templates.append(override)
+        elif override is None and node_template is not None:
+            templates.append(node_template)
+    return templates
 
 
 def _advisor_summary_renders_option_value(key: str) -> bool:
@@ -9722,6 +9892,23 @@ def _render_options_for_advisor(options: Mapping[str, Any]) -> str:
     name_only: list[str] = []
     for key in sorted(options.keys()):
         if _advisor_summary_renders_option_value(key):
+            if key == "queries":
+                # Per-query prompt surface: one entry per triple, prompt-shaped
+                # texts on the prompt budget with the untrusted-JSON framing,
+                # structural bindings and markers on the compact cap. An empty
+                # expansion (no node-level prompt_template — e.g. a Textract
+                # queries list) keeps the key name-only.
+                expansion = _advisor_query_option_values(options)
+                if not expansion:
+                    name_only.append(key)
+                    continue
+                for query_key, text, prose_shaped in expansion:
+                    if prose_shaped:
+                        rendered = _truncate_for_advisor(text, _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS)
+                        value_parts.append(f"{query_key}_untrusted_json={json.dumps(rendered)}")
+                    else:
+                        value_parts.append(f"{query_key}={_truncate_for_advisor(text)}")
+                continue
             if key == "schema":
                 rendered = _render_schema_for_advisor(options[key])
             elif key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
@@ -9835,18 +10022,22 @@ def _interpolated_row_fields(prompt_template: str) -> list[str]:
 def _render_interpolated_row_fields(node: NodeSpec) -> str:
     """Render the length-independent degeneracy signal for an LLM node.
 
-    ``interpolates row fields: [url, content]`` when the prompt references row
-    fields; ``interpolates row fields: NONE`` (rendered loudly) when it does
+    ``interpolates row fields: [url, content]`` when the prompts reference row
+    fields; ``interpolates row fields: NONE`` (rendered loudly) when they do
     not — a prompt that sees no per-row data will fabricate or repeat one answer
-    for every row. Returns ``""`` for a node with no prompt_template at all.
+    for every row. Computed over the union of the node's EFFECTIVE templates
+    (:func:`_node_effective_prompt_templates`): in multi-query mode that is the
+    per-query overrides plus the node-level template only where a query falls
+    back to it, so a dead node-level prompt can neither mask a degenerate query
+    template nor be reported as degenerate itself. A node with no effective
+    prompt at all reads NONE.
     """
-    prompt = _node_prompt_template(node)
-    if prompt is None:
-        return "interpolates row fields: NONE"
-    fields = _interpolated_row_fields(prompt)
+    fields: set[str] = set()
+    for prompt in _node_effective_prompt_templates(node):
+        fields.update(_interpolated_row_fields(prompt))
     if not fields:
         return "interpolates row fields: NONE"
-    return "interpolates row fields: [" + ", ".join(fields) + "]"
+    return "interpolates row fields: [" + ", ".join(sorted(fields)) + "]"
 
 
 # END authoritative advisor gate. The synthetic ValidationResult builder is
