@@ -55,7 +55,10 @@ import type {
   TurnRecord,
   WireStageData,
 } from "@/types/guided";
-import { COMPOSE_TIMEOUT_ABORT_REASON } from "@/config/composer";
+import {
+  COMPOSE_CONNECTING_MESSAGE,
+  COMPOSE_TIMEOUT_ABORT_REASON,
+} from "@/config/composer";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX } from "@/types/interpretation";
 
@@ -10470,5 +10473,148 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
     // phase), so it is the load-bearing member of the group.
     const indicator = panel!.querySelector(".composing-indicator");
     if (indicator !== null) expect(dock!.contains(indicator)).toBe(true);
+  });
+});
+
+// ── Decision panel wiring (elspeth-cb0d4b8dba) ───────────────────────────────
+//
+// The live 94f6f00c shape: a green build whose completion the advisor gate
+// withheld, plus the validator's S1 suggestion on the composition. Before
+// this panel the Compose view carried no affordance for it at all.
+describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
+  const S1 = {
+    component: "pipeline",
+    message:
+      "Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
+    severity: "low",
+  };
+
+  function withheldValidation() {
+    return {
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [],
+      readiness: {
+        authoring_valid: true,
+        execution_ready: true,
+        completion_ready: false,
+        blockers: [
+          {
+            code: "advisor_signoff_blocked",
+            component_id: "pipeline",
+            component_type: "pipeline",
+            detail:
+              "Completion advisory review did not clear after the available attempts.",
+          },
+        ],
+      },
+    };
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+    resetStore(useSessionStore);
+    resetStore(useInlineSourceStore);
+    resetStore(useExecutionStore);
+    resetStore(useInterpretationEventsStore);
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+      compositionState: makeComposition(7, { validation_suggestions: [S1] }),
+      composeTimeoutReady: true,
+      composerTimeoutUnavailable: false,
+    });
+  });
+
+  it("renders no panel while validation is green and nothing is pending", () => {
+    useExecutionStore.setState({ validationResult: { ...withheldValidation(), readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] } } });
+    render(<ChatPanel />);
+    expect(screen.queryByRole("region", { name: /awaiting your decision/i })).toBeNull();
+  });
+
+  it("surfaces the withheld completion and the suggestion above the input, with Apply sending the pinned prompt", () => {
+    useExecutionStore.setState({ validationResult: withheldValidation() });
+    render(<ChatPanel />);
+
+    const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
+    expect(
+      within(panel).getByText("Save for review is blocked. Run pipeline is still available."),
+    ).toBeInTheDocument();
+    expect(
+      within(panel).getByText(
+        "Completion advisory review did not clear after the available attempts.",
+      ),
+    ).toBeInTheDocument();
+
+    // Anchored above the input, not inside the transcript log.
+    const log = screen.getByRole("log", { name: "Conversation" });
+    expect(log.contains(panel)).toBe(false);
+
+    fireEvent.click(within(panel).getByRole("button", { name: /^Apply suggestion/ }));
+    expect(useComposer().sendMessage).toHaveBeenCalledExactlyOnceWith(
+      "Please apply this suggestion to the pipeline:\n\n**pipeline:** Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
+    );
+  });
+
+  it("Open checks requests the Checks artifact tab for the active session", () => {
+    useExecutionStore.setState({ validationResult: withheldValidation() });
+    const seen: unknown[] = [];
+    const listener = (event: Event): void => {
+      seen.push((event as CustomEvent).detail);
+    };
+    window.addEventListener("elspeth:request-artifact-view", listener);
+    try {
+      render(<ChatPanel />);
+      fireEvent.click(screen.getByRole("button", { name: "Open checks" }));
+    } finally {
+      window.removeEventListener("elspeth:request-artifact-view", listener);
+    }
+    expect(seen).toEqual([{ tab: "checks", focusMode: false, sessionId: "session-1" }]);
+  });
+
+  it("holds Apply closed until the compose wall clock lands", () => {
+    useExecutionStore.setState({ validationResult: withheldValidation() });
+    useSessionStore.setState({ composeTimeoutReady: false });
+    render(<ChatPanel />);
+    const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
+    expect(within(panel).getByRole("button", { name: /^Apply suggestion/ })).toBeDisabled();
+    expect(within(panel).getByRole("status")).toHaveTextContent(COMPOSE_CONNECTING_MESSAGE);
+  });
+
+  it("keeps the proposals banner reachable under its pinned name inside the panel", () => {
+    useExecutionStore.setState({ validationResult: withheldValidation() });
+    useSessionStore.setState({
+      compositionProposals: [
+        {
+          id: "proposal-1",
+          session_id: "session-1",
+          tool_call_id: "call-1",
+          tool_name: "patch_node_options",
+          status: "pending",
+          summary: "Change one option on colour_questions.",
+          rationale: "Requested by the current composer turn.",
+          affects: ["nodes"],
+          arguments_redacted_json: {},
+          base_state_id: null,
+          committed_state_id: null,
+          audit_event_id: null,
+          created_at: "2026-09-13T11:16:03Z",
+          updated_at: "2026-09-13T11:16:03Z",
+        },
+      ],
+    });
+    render(<ChatPanel />);
+    const panel = screen.getByRole("region", { name: "Awaiting your decision (3)" });
+    expect(within(panel).getByRole("region", { name: "Pending changes (1)" })).toBeInTheDocument();
+    expect(screen.getAllByRole("region", { name: "Pending changes (1)" })).toHaveLength(1);
   });
 });

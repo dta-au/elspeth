@@ -17,6 +17,7 @@ import {
   useInterpretationEventsStore,
 } from "@/stores/interpretationEventsStore";
 import type { InterpretationEvent } from "@/types/interpretation";
+import type { ValidationEntryDTO } from "@/types/index";
 import { useBlobStore } from "@/stores/blobStore";
 import {
   deriveInlineSourceRowCount,
@@ -43,7 +44,6 @@ import { BlobManager } from "@/components/blobs/BlobManager";
 import { CompletionSummary } from "./guided/CompletionSummary";
 import { ModeSwitchButton } from "./guided/ModeSwitchButton";
 import {
-  PendingProposalsBanner,
   PendingProposalsLiveRegion,
   actionableProposals,
 } from "./PendingProposalsBanner";
@@ -81,8 +81,17 @@ import {
   useHasPendingGuidedInterpretations,
   usePendingAcknowledgements,
 } from "./AcknowledgementStack";
-import { acknowledgementCardTitle } from "./AcknowledgementCard";
-import { humaniseStepLabel, humaniseStepTitle } from "./interpretationStepLabel";
+import { acknowledgementCardDomId, acknowledgementCardTitle } from "./AcknowledgementCard";
+import {
+  humaniseStepLabel,
+  humaniseStepTitle,
+  stepLabelForNodeId,
+} from "./interpretationStepLabel";
+import { DecisionPanel, DecisionPanelLiveRegion } from "./DecisionPanel";
+import { projectDecisionRows } from "./decisionPanelRows";
+import { useExecutionStore } from "@/stores/executionStore";
+import { applySuggestionPrompt } from "@/lib/suggestionPrompts";
+import { dispatchArtifactViewIntent } from "@/lib/composer-events";
 import {
   COMPOSE_CONNECTING_MESSAGE,
   COMPOSE_UNAVAILABLE_MESSAGE,
@@ -2013,6 +2022,81 @@ export function ChatPanel({
   const sessionDismissed =
     activeSessionId !== null && fallbackDismissedAt.has(activeSessionId);
 
+  // ── Decision panel (elspeth-cb0d4b8dba) ──────────────────────────────────
+  // The one "Awaiting your decision" surface above the input. Every input is
+  // an existing store fact: the durable readiness gate the server re-emits on
+  // each validate, the composition's validator suggestions, the pending
+  // review cards, and the proposals the banner already showed here. The
+  // projection is pure (decisionPanelRows.ts); the panel is a dumb render;
+  // the handlers below send canned chat prompts so each click that changes
+  // the pipeline is a planner call.
+  const validationResult = useExecutionStore((s) => s.validationResult);
+  const pendingInterpretationsById = useInterpretationEventsStore((state) =>
+    activeSessionId === null ? undefined : state.pendingBySession[activeSessionId],
+  );
+  const pendingInterpretations = useMemo<InterpretationEvent[]>(
+    () =>
+      pendingInterpretationsById === undefined
+        ? []
+        : Object.values(pendingInterpretationsById),
+    [pendingInterpretationsById],
+  );
+  const decisionRows = useMemo(
+    () =>
+      projectDecisionRows({
+        validationResult,
+        compositionState,
+        pendingInterpretations,
+        proposals: compositionProposals,
+        staleProposalIds,
+      }),
+    [
+      validationResult,
+      compositionState,
+      pendingInterpretations,
+      compositionProposals,
+      staleProposalIds,
+    ],
+  );
+  const decisionPhraseFor = useMemo(
+    () => makePhraseFor(compositionState),
+    [compositionState],
+  );
+  const decisionStepLabelFor = useCallback(
+    (componentId: string): string | null =>
+      stepLabelForNodeId(compositionState, componentId),
+    [compositionState],
+  );
+  // Same gate as the side rail's SuggestionList: a send started before the
+  // backend compose wall clock lands at boot could be aborted before the
+  // backend's 422 (bootstrap race), so Apply stays closed until
+  // composeTimeoutReady, and reads as connecting (or the stuck unavailable
+  // state) rather than as a dead click.
+  const decisionApplyDisabled = isComposing || !composeTimeoutReady;
+  const decisionApplyDisabledReason = composerTimeoutUnavailable
+    ? COMPOSE_UNAVAILABLE_MESSAGE
+    : COMPOSE_CONNECTING_MESSAGE;
+  const handleApplySuggestion = useCallback(
+    (suggestion: ValidationEntryDTO) => {
+      void sendMessage(applySuggestionPrompt(suggestion));
+    },
+    [sendMessage],
+  );
+  const handleOpenChecks = useCallback(() => {
+    dispatchArtifactViewIntent({
+      tab: "checks",
+      focusMode: false,
+      sessionId: activeSessionId,
+    });
+  }, [activeSessionId]);
+  const handleShowInterpretation = useCallback((eventId: string) => {
+    const card = document.getElementById(acknowledgementCardDomId(eventId));
+    if (card === null) return;
+    card.scrollIntoView({ block: "center", behavior: preferredScrollBehavior() });
+    const focusable = card.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
+    (focusable ?? card).focus({ preventScroll: true });
+  }, []);
+
   const shouldRenderFallback =
     fallbackCandidate !== null &&
     !isComposing &&
@@ -3583,12 +3667,35 @@ export function ChatPanel({
           proposals={compositionProposals}
           staleProposalIds={staleProposalIds}
         />
-        <PendingProposalsBanner
+        {/* Decision panel (elspeth-cb0d4b8dba): blockers, validator
+            suggestions with Apply, pointers to pending review cards, and
+            the pending-proposals banner hosted inside one region. Its own
+            always-mounted live region announces the non-proposal rows; the
+            proposals region above keeps announcing proposals, so one
+            arrival is never announced twice. */}
+        <DecisionPanelLiveRegion
+          count={
+            decisionRows.rows.filter((row) => row.kind !== "pending_proposal")
+              .length
+          }
+        />
+        <DecisionPanel
+          rows={decisionRows.rows}
+          blockedVerbs={decisionRows.blockedVerbs}
+          count={decisionRows.count}
           proposals={compositionProposals}
           staleProposalIds={staleProposalIds}
           proposalActionPendingIds={proposalActionPendingIds}
-          onAccept={acceptProposal}
-          onReject={rejectProposal}
+          isComposing={isComposing}
+          applyDisabled={decisionApplyDisabled}
+          applyDisabledReason={decisionApplyDisabledReason}
+          phraseFor={decisionPhraseFor}
+          stepLabelFor={decisionStepLabelFor}
+          onApplySuggestion={handleApplySuggestion}
+          onOpenChecks={handleOpenChecks}
+          onShowInterpretation={handleShowInterpretation}
+          onAcceptProposal={acceptProposal}
+          onRejectProposal={rejectProposal}
         />
 
         {/*
