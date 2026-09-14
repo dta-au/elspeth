@@ -107,29 +107,29 @@ relies on, and says so in place where it departs from one.
 
 Rows are in execution order within each workstream.
 
-| Task | File | Runs after | Lines |
-| --- | --- | --- | --- |
-| K0: Spike — measure the platform facts the manifests depend on | [K0-platform-facts-spike.md](K0-platform-facts-spike.md) | — | 892 |
-| K1: Provider-neutral Kustomize base at the multi-replica bar | [K1-kustomize-base.md](K1-kustomize-base.md) | K0 | 967 |
-| K2: A real startup profile for the `kubernetes` target | [K2-startup-profile.md](K2-startup-profile.md) | K1 | 307 |
-| K3: Checksum-pinned render gate in CI | [K3-render-gate.md](K3-render-gate.md) | K2 | 565 |
-| K4: kind harness — two replicas, shared RWX, real PostgreSQL, provider-free run | [K4-kind-harness.md](K4-kind-harness.md) | K3 | 1,371 |
-| K5: Acceptance probes — the four replica probes on Kubernetes | [K5-acceptance-probes.md](K5-acceptance-probes.md) | K4 | 1,997 |
-| K6: AKS overlay | [K6-aks-overlay.md](K6-aks-overlay.md) | K1 | 707 |
-| K7: Qualify routing without affinity | [K7-no-affinity-routing.md](K7-no-affinity-routing.md) | K5, K6 | 628 |
-| K8: Runbook and public-claim flip | [K8-runbook-and-claim-flip.md](K8-runbook-and-claim-flip.md) | K7, I11 | 1,378 |
-| I0: One schema pass: token ledger nullability | [I0-ledger-nullability.md](I0-ledger-nullability.md) | — | 373 |
-| I8: The enforcement switch and the R11 startup refusal | [I8-governance-switch.md](I8-governance-switch.md) | I0 | 676 |
-| I1: Token usage ledger and R14 daily enforcement | [I1-token-ledger-quota.md](I1-token-ledger-quota.md) | I8 | 4,548 |
-| I2: Storage quota R13 at every byte-admitting site | [I2-storage-quota.md](I2-storage-quota.md) | I1 | 2,711 |
-| I3: Approvals — request, decide, withdraw, supersede, and the R2 execute gate | [I3-approvals.md](I3-approvals.md) | I2 | 4,061 |
-| I4: Review requests and reviewer attestations | [I4-reviews.md](I4-reviews.md) | I3 | 2,136 |
-| I5: Shared library — publish, curate, browse, fork | [I5-shared-library.md](I5-shared-library.md) | I3 | 2,272 |
-| I6: Compartment marking | [I6-compartment-marking.md](I6-compartment-marking.md) | I4, I5 | 1,577 |
-| I7: Scoped reads — workflow inspect, approver audit view, delegated administration | [I7-scoped-reads.md](I7-scoped-reads.md) | I6 | 2,718 |
-| I9: Frontend — mailbox, completion bar, readiness row, admin UI, library, quota status | [I9-frontend.md](I9-frontend.md) | I7 | 7,343 |
-| I10: Workflow-governance suite (fire + mutation per refusal) | [I10-governance-suite.md](I10-governance-suite.md) | I8, I9 | 1,454 |
-| I11: Cutover mechanics — the operator's instructions for the workflow-epoch window | [I11-cutover.md](I11-cutover.md) | I10 | 733 |
+| Task | File | Runs after |
+| --- | --- | --- |
+| K0: Spike — measure the platform facts the manifests depend on | [K0-platform-facts-spike.md](K0-platform-facts-spike.md) | — |
+| K1: Provider-neutral Kustomize base at the multi-replica bar | [K1-kustomize-base.md](K1-kustomize-base.md) | K0 |
+| K2: A real startup profile for the `kubernetes` target | [K2-startup-profile.md](K2-startup-profile.md) | K1 |
+| K3: Checksum-pinned render gate in CI | [K3-render-gate.md](K3-render-gate.md) | K2 |
+| K4: kind harness — two replicas, shared RWX, real PostgreSQL, provider-free run | [K4-kind-harness.md](K4-kind-harness.md) | K3 |
+| K5: Acceptance probes — the four replica probes on Kubernetes | [K5-acceptance-probes.md](K5-acceptance-probes.md) | K4 |
+| K6: AKS overlay | [K6-aks-overlay.md](K6-aks-overlay.md) | K1 |
+| K7: Qualify routing without affinity | [K7-no-affinity-routing.md](K7-no-affinity-routing.md) | K5, K6 |
+| K8: Runbook and public-claim flip | [K8-runbook-and-claim-flip.md](K8-runbook-and-claim-flip.md) | K7, I11 |
+| I0: One schema pass: token ledger nullability | [I0-ledger-nullability.md](I0-ledger-nullability.md) | — |
+| I8: The enforcement switch and the R11 startup refusal | [I8-governance-switch.md](I8-governance-switch.md) | I0 |
+| I1: Token usage ledger and R14 daily enforcement | [I1-token-ledger-quota.md](I1-token-ledger-quota.md) | I8 |
+| I2: Storage quota R13 at every byte-admitting site | [I2-storage-quota.md](I2-storage-quota.md) | I1 |
+| I3: Approvals — request, decide, withdraw, supersede, and the R2 execute gate | [I3-approvals.md](I3-approvals.md) | I2 |
+| I4: Review requests and reviewer attestations | [I4-reviews.md](I4-reviews.md) | I3 |
+| I5: Shared library — publish, curate, browse, fork | [I5-shared-library.md](I5-shared-library.md) | I3 |
+| I6: Compartment marking | [I6-compartment-marking.md](I6-compartment-marking.md) | I4, I5 |
+| I7: Scoped reads — workflow inspect, approver audit view, delegated administration | [I7-scoped-reads.md](I7-scoped-reads.md) | I6 |
+| I9: Frontend — mailbox, completion bar, readiness row, admin UI, library, quota status | [I9-frontend.md](I9-frontend.md) | I7 |
+| I10: Workflow-governance suite (fire + mutation per refusal) | [I10-governance-suite.md](I10-governance-suite.md) | I8, I9 |
+| I11: Cutover mechanics — the operator's instructions for the workflow-epoch window | [I11-cutover.md](I11-cutover.md) | I10 |
 
 ---
 
@@ -147,6 +147,7 @@ Rows are in execution order within each workstream.
   6. The CHANGELOG section for both workstreams is a decision to confirm with the operator (see Global Constraints).
 - **Operator decisions still open (raised by the task authors, 2026-09-14; each task states the default it took):**
   - **K5:** the P4a probe needs a composer provider in the kind lane. Either the `kubernetes-kind` job gets a provider secret, or P4a gives no evidence in CI.
+  - **K5:** the acceptance controller takes `replicas: tuple[ProbePod, ProbePod]` with `ProbePod(address, deployment, role)`, the shape of ACA's `ProbeReplica`, instead of a `deployments=` mapping. Confirm that shape, or require `deployments=` with each replica's origin and role derived inside the controller.
   - **K6:** the application-routing NGINX ingress is supported only through November 2026. Ship it for 0.8.1, or choose the Gateway API implementation or Application Gateway for Containers now.
   - **K6:** Key Vault CSI identity: the add-on's user-assigned managed identity (the task's default), or Workload ID with two ServiceAccounts mirroring ACA's two-identity split.
   - **K6:** keep the Azure Load Balancer's 4-minute idle default (230 s transport ceiling, 180 s composer timeout), or raise it and move both pinned values.

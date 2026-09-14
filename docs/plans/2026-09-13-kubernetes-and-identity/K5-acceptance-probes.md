@@ -132,7 +132,7 @@ a controller also needs each replica's origin and runtime role, so the
 signature takes `replicas: tuple[ProbePod, ProbePod]` with
 `ProbePod(address, deployment, role)` — the same shape as the Container Apps
 `ProbeReplica(address, revision, role)` (`controller.py:185-197`) — and the
-deployment names are exactly those two. **Open question (DECISIONS F12):** this constructor departs from the K12 text (`deployments={...}` → `replicas: tuple[ProbePod, ProbePod]`); either amend DECISIONS K12 to the `ProbePod` shape or rule that K5 must take `deployments=` and derive origin and role another way. Until ruled, the `ProbePod` shape is what this block builds.
+deployment names are exactly those two. **Open question (listed under K5 in the master's Self-review notes):** this constructor departs from the working decisions' form (`deployments={...}` → `replicas: tuple[ProbePod, ProbePod]`); either confirm the `ProbePod` shape or rule that K5 must take `deployments=` and derive origin and role another way. Until ruled, the `ProbePod` shape is what this block builds.
 
 **Files:**
 - Create: `src/elspeth/web/_acceptance_common/postgres_observer.py`
