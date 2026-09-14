@@ -227,7 +227,8 @@ class TestGatewayRegistryAndSchema:
         assert len(schema["oneOf"]) == 4
         assert set(schema["discriminator"]["mapping"].keys()) == {"azure", "openrouter", "bedrock", "gateway"}
         gateway_schema = schema["$defs"]["GatewayConfig"]
-        assert set(gateway_schema["required"]) >= {"model", "endpoint", "api_key", "prompt_template"}
+        assert set(gateway_schema["required"]) >= {"model", "endpoint", "api_key"}
+        assert "prompt_template" not in gateway_schema["required"]
 
     def test_get_config_model_dispatches_to_gateway_config(self) -> None:
         assert LLMTransform.get_config_model({"provider": "gateway"}) is GatewayConfig

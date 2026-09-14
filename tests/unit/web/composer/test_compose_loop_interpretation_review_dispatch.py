@@ -4570,3 +4570,104 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
             "cancel": ComposerLLMCallStatus.CANCELLED,
         }
         assert recorder.llm_calls[-1].status == expected[mode]
+
+
+@pytest.mark.asyncio
+async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from copy import deepcopy
+
+    import litellm
+    from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
+
+    from elspeth.web.composer import service as service_module
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = await _seed_bare_session(sessions_service, "Portable reply history")
+    model = "anthropic.claude-sonnet-4-6"
+    adapter = AmazonConverseConfig()
+    monkeypatch.setattr(litellm, "modify_params", False)
+    histories: list[list[dict[str, Any]]] = []
+    reply_wire: list[dict[str, Any]] = []
+    original_classify = composer._classify_and_budget_turn
+
+    async def capture_history(**kwargs: Any) -> Any:
+        before = deepcopy(kwargs["llm_messages"])
+        histories.append(before)
+        outcome = await original_classify(**kwargs)
+        assert kwargs["llm_messages"] == before, "reply projection must not rewrite audit/planning history"
+        return outcome
+
+    monkeypatch.setattr(composer, "_classify_and_budget_turn", capture_history)
+    scripted = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                content=None,
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content="Café\nreview narration.",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear. Café\nwith a newline.",
+                },
+            ),
+        ]
+    )
+
+    async def installed_adapter_completion(**kwargs: Any) -> Any:
+        if "tools" in kwargs:
+            return await scripted(kwargs["messages"], kwargs["tools"])
+        reply_wire.extend(deepcopy(kwargs["messages"]))
+        wire = adapter.transform_request(
+            model=model,
+            messages=deepcopy(kwargs["messages"]),
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+        assert "toolConfig" not in wire
+        assert wire["messages"]
+        for turn in wire["messages"]:
+            for block in turn["content"]:
+                assert "toolUse" not in block
+                assert "toolResult" not in block
+        return _fake_text_response("A fork keeps both persona answers.")
+
+    monkeypatch.setattr(service_module, "_litellm_acompletion", installed_adapter_completion)
+    result = await composer._run_one_turn_for_test(session_id=str(session_id), message="Should we use a fork?")
+    assert result.raw_assistant_content == "A fork keeps both persona answers."
+    assert len(histories) == 2
+    original_history = histories[-1]
+    # Negative control: the same installed adapter rejects the old protocol
+    # history when no tools are advertised; no dummy-tool setting rescues it.
+    with pytest.raises(litellm.UnsupportedParamsError, match="tools="):
+        adapter.transform_request(
+            model=model,
+            messages=deepcopy(original_history),
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+    assert len(reply_wire) == len(original_history) + 1
+    tool_records = 0
+    for original, projected in zip(original_history, reply_wire, strict=False):
+        if original["role"] == "tool" or "tool_calls" in original:
+            tool_records += 1
+            assert "tool_calls" not in projected
+            assert "tool_call_id" not in projected
+            assert projected["role"] == ("user" if original["role"] == "tool" else original["role"])
+            assert json.loads(projected["content"].split("\n", 1)[1]) == original
+        else:
+            assert projected["role"] == original["role"]
+            assert projected["content"] == original["content"]
+    assert tool_records == 4

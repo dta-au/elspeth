@@ -386,3 +386,22 @@ async def test_long_single_prompt_card_is_bounded_and_resolves_to_an_executable_
     assert isinstance(materialized, CompositionState)
     # The run receives the full template, not the bounded card text.
     assert _node_options(materialized)["prompt_template"] == template
+
+
+@pytest.mark.asyncio
+async def test_review_acceptance_keeps_no_full_artifact_for_blob_backed_system(sessions_service: SessionServiceImpl) -> None:
+    options = _multi_query_options()
+    options["system_prompt"] = {"blob_ref": "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b", "mode": "inline_content", "sha256": "a" * 64}
+    options["approved_prompt_artifact_hash"] = "b" * 64
+    staged = _options_with_default_prompt_template_review(node_id=_NODE_ID, plugin="llm", options=options)
+    session_id = await _new_session(sessions_service)
+    record = await _persist(sessions_service, session_id, _state_with_node_options(staged))
+    await _run_surfacer(sessions_service, session_id, record)
+    event = await _single_pending_prompt_card(sessions_service, session_id, record)
+    resolved, state = await _accept_as_drafted(sessions_service, session_id, event)
+    assert resolved.approved_prompt_artifact_hash is None
+    assert _node_options(state)["approved_prompt_artifact_hash"] is None
+    assert _prompt_requirement(_node_options(state))["status"] == "resolved"
+    materialized = materialize_state_for_execution(state)
+    assert isinstance(materialized, CompositionState)
+    assert "approved_prompt_artifact_hash" not in _node_options(materialized)

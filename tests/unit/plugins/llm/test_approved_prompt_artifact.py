@@ -32,6 +32,20 @@ def test_mixed_queries_bind_fallback() -> None:
     )
 
 
+@pytest.mark.parametrize("queries", [None, {"fallback": {"input_fields": {"colour": "colour"}}}])
+def test_missing_effective_prompt_is_attributed_to_the_required_fallback(queries: object) -> None:
+    with pytest.raises(ValidationError) as exc:
+        LLMConfig.model_validate(
+            {
+                "provider": "azure",
+                "queries": queries,
+                "schema_config": SchemaConfig.from_dict({"mode": "observed"}),
+                "required_input_fields": [],
+            }
+        )
+    assert [(error["loc"], error["type"]) for error in exc.value.errors()] == [(("prompt_template",), "missing")]
+
+
 @pytest.mark.parametrize("provider", ["azure", "openrouter", "bedrock", "gateway"])
 def test_config_artifact_validates_for_each_provider_and_rejects_system_drift(provider: str) -> None:
     artifact = approved_prompt_artifact_hash(prompt_template=None, system_prompt="Decorator", queries=(("answer", "Choose a colour"),))

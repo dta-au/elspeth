@@ -2179,7 +2179,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "_RepositoryInterpretationMutations.resolve_pending_event",
         "interpretation_events",
         "update",
-        "9f581942e7ea4c5a",
+        "569666d773a0b112",
         1,
         "SessionInterpretationAuthority",
         line=1431,

@@ -1013,7 +1013,7 @@ def _resolve_vague_term(
     user_term: str,
     llm_draft: str,
     accepted_value: str,
-) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str]:
+) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str | None]:
     live_node = _find_llm_transform_node(
         state_record,
         affected_node_id=affected_node_id,
@@ -1159,7 +1159,7 @@ def _resolve_prompt_template_review(
     user_term: str,
     accepted_value: str,
     surfacing_structure_hash: str | None,
-) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str]:
+) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str | None]:
     node = _find_llm_transform_node(
         state_record,
         affected_node_id=affected_node_id,

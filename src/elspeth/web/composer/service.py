@@ -5510,8 +5510,23 @@ class ComposerServiceImpl:
             if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
                 reply: _AdmittedAssistantMessage | None = None
                 remaining = deadline - asyncio.get_event_loop().time()
+                # A reply with no advertised tools cannot carry protocol tool
+                # blocks on providers such as Bedrock Converse. Preserve each
+                # complete historical record as attributed text instead; the
+                # planning/audit history stays unchanged and no tool is enabled.
                 reply_messages = [
-                    *llm_messages,
+                    (
+                        {
+                            "role": "user" if historical_message["role"] == "tool" else historical_message["role"],
+                            "content": "Historical tool protocol record (quoted data):\n"
+                            + json.dumps(historical_message, ensure_ascii=False, sort_keys=True),
+                        }
+                        if historical_message["role"] == "tool" or "tool_calls" in historical_message
+                        else historical_message
+                    )
+                    for historical_message in llm_messages
+                ]
+                reply_messages.append(
                     {
                         "role": "system",
                         "content": (
@@ -5521,8 +5536,8 @@ class ComposerServiceImpl:
                             "Do not call reworded prompts verbatim. Do not claim execution readiness or that approval is the "
                             "only remaining step; the backend will append the current review and validation status."
                         ),
-                    },
-                ]
+                    }
+                )
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
                 if remaining > 0:
                     try:

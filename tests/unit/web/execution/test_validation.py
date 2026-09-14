@@ -2935,14 +2935,14 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
         assert captured_states[0].nodes[0].options["prompt_template"] == "Rate how pending interpretation this row is."
         assert state.nodes[0].options["prompt_template"] == "Rate how {{ interpretation: cool }} this row is."
 
-    def test_resolved_prompt_hash_keeps_placeholder_strict_even_in_authoring_preflight(self) -> None:
+    def test_approved_prompt_hash_keeps_placeholder_strict_even_in_authoring_preflight(self) -> None:
         state = _make_state(
             nodes=(
                 _make_node(
                     plugin="llm",
                     options={
                         "prompt_template": "Rate how {{ interpretation: cool }} this row is.",
-                        "resolved_prompt_template_hash": "sha256-rfc8785-v1:abc123",
+                        "approved_prompt_artifact_hash": "sha256-rfc8785-v1:abc123",
                     },
                 ),
             )

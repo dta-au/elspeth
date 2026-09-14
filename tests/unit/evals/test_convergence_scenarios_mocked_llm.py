@@ -321,7 +321,8 @@ def _composer_to_thread_uses_test_worker(monkeypatch: pytest.MonkeyPatch) -> Non
 # source schema to mode=observed; turn 4 claims completion → the mandatory
 # llm_prompt_template interpretation review re-prompts (turn 5) → GREEN. The
 # authored prompt_template now requires an interpretation review, adding a second
-# forced repair turn on top of the schema fix (5 calls / 2 repair turns).
+# forced repair turn on top of the schema fix. A sixth, tools-disabled call
+# explains the pending reviews without spending another repair turn.
 # --------------------------------------------------------------------------
 
 
@@ -448,6 +449,8 @@ class TestCsvClassifierScenario:
                 },
             ],
         )
+        review_reply = "The source schema now preserves all ticket columns. Please review the classifier's model and prompt."
+        turn_review_reply = _llm_response(content=review_reply)
 
         empty = _empty_state()
         # NOTE: _runtime_preflight is deliberately NOT patched. An always-pass
@@ -455,19 +458,20 @@ class TestCsvClassifierScenario:
         # at is_valid=false (reviews surfaced, pending out-of-loop resolution).
         # The REAL preflight is what makes is_valid honest here.
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            # Five LLM calls / two forced repair turns (Branch B terminal state):
+            # Six LLM calls / two forced repair turns (Branch B terminal state):
             #   1. set_pipeline (fixed schema omitting four observed columns)
             #   2. claim completion → REPAIR 1 (preflight: schema omits columns)
             #   3. patch_source_options → schema=observed
             #   4. claim completion → REPAIR 2 (orphan gate: llm_model_choice on
             #      'classifier' has no pending review event)
             #   5. request_interpretation_review (llm_model_choice) → pending event
-            #      and immediate terminal user-action handoff. Both interpretation
+            #      and terminal user-action handoff. Both interpretation
             #      reviews (llm_prompt_template auto-surfaced + llm_model_choice
             #      surfaced) are now RESOLVABLE, with zero orphans. The terminal
             #      preflight is invalid-but-pending, so the finalize path SKIPS the
             #      "runtime preflight failed" suffix → clean message, is_valid=false.
-            mock_llm.side_effect = [turn1, turn2, turn3, turn4, turn_surface_model_choice]
+            #   6. tools-disabled explanation of the pending review, not a repair.
+            mock_llm.side_effect = [turn1, turn2, turn3, turn4, turn_surface_model_choice, turn_review_reply]
             result = await service.compose(
                 "Classify these tickets",
                 [],
@@ -479,7 +483,9 @@ class TestCsvClassifierScenario:
 
         # Convergence behaviour: two forced repair turns (schema-mode repair +
         # the orphan-gate repair that surfaces the llm_model_choice review).
-        assert mock_llm.call_count == 5, f"expected 5 LLM calls, got {mock_llm.call_count}"
+        assert mock_llm.call_count == 6, f"expected 6 LLM calls, got {mock_llm.call_count}"
+        assert mock_llm.call_args_list[-1].args[1] == []
+        assert review_reply in result.message
         assert result.repair_turns_used == 2, f"expected 2 repair turns, got {result.repair_turns_used}"
 
         # The terminal state is the honest Branch-B converged shape: a model-

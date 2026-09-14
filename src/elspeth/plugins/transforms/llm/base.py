@@ -13,7 +13,7 @@ from typing import Any, Final, Literal
 
 from jinja2 import TemplateSyntaxError
 from jinja2 import nodes as jinja_nodes
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
@@ -413,6 +413,15 @@ class LLMConfig(TransformDataConfig):
     def _validate_approved_prompt_artifact(self) -> LLMConfig:
         """Refuse runtime configs whose interpretation hash anchor drifted."""
         queries = tuple((spec.name, spec.template) for spec in resolve_queries(self.queries)) if self.queries is not None else None
+        if self.prompt_template is None and (queries is None or any(template is None for _, template in queries)):
+            # Attribute this prerequisite to the absent field. Composer may
+            # have withheld a provisioned inline blob at authoring time; its
+            # partial validator must distinguish that from unrelated model
+            # errors without inventing replacement prompt content.
+            raise ValidationError.from_exception_data(
+                type(self).__name__,
+                [{"type": "missing", "loc": ("prompt_template",), "input": self.prompt_template}],
+            )
         expected_hash = approved_prompt_artifact_hash(
             prompt_template=self.prompt_template, system_prompt=self.system_prompt, queries=queries
         )

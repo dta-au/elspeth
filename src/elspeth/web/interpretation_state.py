@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from difflib import get_close_matches
 from typing import Any, Final, Literal, NotRequired, TypedDict
 
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -1278,6 +1279,10 @@ def _materialize_node_for_execution(
             if requirement is not None:
                 _validate_prompt_template_review(node, prompt_template)
                 return _ensure_prompt_template_hash(node)
+        if "approved_prompt_artifact_hash" in node.options and approved_prompt_artifact_hash_from_options(node.options) is None:
+            options = dict(node.options)
+            del options["approved_prompt_artifact_hash"]
+            return replace(node, options=options)
         return node
     prompt = _render_prompt_parts(parts, _requirements_by_id(node.options), unresolved_text=None)
     _validate_prompt_template_review(node, prompt)
@@ -1310,19 +1315,24 @@ def _materialize_source_for_execution(source: SourceSpec, *, component_id: str) 
 
 def _replace_prompt_if_changed(node: NodeSpec, prompt: str, *, include_hash: bool) -> NodeSpec:
     current = node.options["prompt_template"] if "prompt_template" in node.options else None
-    current_hash = node.options["approved_prompt_artifact_hash"] if "approved_prompt_artifact_hash" in node.options else None
-    next_hash = approved_prompt_artifact_hash_from_options({**node.options, "prompt_template": prompt}) if include_hash else current_hash
-    if current == prompt and current_hash == next_hash:
-        return node
-    options = dict(node.options)
-    options["prompt_template"] = prompt
-    if include_hash:
-        options["approved_prompt_artifact_hash"] = next_hash
-    return replace(node, options=options)
+    if current != prompt:
+        node = replace(node, options={**node.options, "prompt_template": prompt})
+    return _ensure_prompt_template_hash(node) if include_hash else node
+
+
+def _is_inline_prompt_blob(value: object) -> bool:
+    marker = is_widened_blob_ref(deep_thaw(value))
+    return marker is not None and marker.mode == "inline_content"
 
 
 def _ensure_prompt_template_hash(node: NodeSpec) -> NodeSpec:
     artifact_hash = approved_prompt_artifact_hash_from_options(node.options)
+    if artifact_hash is None:
+        if "approved_prompt_artifact_hash" not in node.options:
+            return node
+        options = dict(node.options)
+        del options["approved_prompt_artifact_hash"]
+        return replace(node, options=options)
     if "approved_prompt_artifact_hash" in node.options and node.options["approved_prompt_artifact_hash"] == artifact_hash:
         return node
     return replace(node, options={**node.options, "approved_prompt_artifact_hash": artifact_hash})
@@ -2685,11 +2695,20 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
     """
     raw_queries = options["queries"] if "queries" in options else None
     prompt_template = options["prompt_template"] if "prompt_template" in options else None
-    if raw_queries is None or (prompt_template is not None and not isinstance(prompt_template, str)):
+    if raw_queries is None:
         return None
     entries = _well_formed_query_entries(raw_queries)
     if not entries:
         return None
+    if prompt_template is not None and not isinstance(prompt_template, str):
+        marker = is_widened_blob_ref(deep_thaw(prompt_template))
+        if (
+            marker is None
+            or marker.mode != "inline_content"
+            or any("template" not in entry or entry["template"] is None for _, entry in entries)
+        ):
+            return None
+        prompt_template = None
     raw_system_prompt = options["system_prompt"] if "system_prompt" in options else None
     queries: list[tuple[str, str | InvalidQueryTemplate | None]] = []
     for name, entry in entries:
@@ -2741,17 +2760,45 @@ def prompt_review_anchor_hash_from_options(options: Mapping[str, Any]) -> str | 
     source="Untrusted LLM-authored or YAML-imported prompt/query/system values in node options",
     source_param="options",
     suppresses=("R5",),
-    invariant="rejects non-text prompt, system, or query templates with ValueError; requires an effective template for every query",
+    invariant="rejects malformed non-blob prompt/system/query templates with ValueError; returns None for valid unresolved inline blob sources, otherwise hashes effective text",
     test_ref="tests/unit/web/test_prompt_artifact_boundary.py::test_prompt_artifact_rejects_malformed_options",
     test_fingerprint="8fa66b482b95e4f28e3a87d6a002972ad57a000eadbd54b167f5d793a436cbbf",
 )
-def approved_prompt_artifact_hash_from_options(options: Mapping[str, Any]) -> str:
-    """Hash the resolved, effective artifact shared by session events and calls."""
+def approved_prompt_artifact_hash_from_options(options: Mapping[str, Any]) -> str | None:
+    """Hash resolved text, or return no approval link for unresolved blob sources.
+
+    Uploaded content is verified through blob identity, hash and resolution
+    records. It does not acquire full-text approval merely by substituting
+    after a review. Per-site review evidence remains independently enforced.
+    """
     prompt = options["prompt_template"] if "prompt_template" in options else None
     system = options["system_prompt"] if "system_prompt" in options else None
-    if (prompt is not None and not isinstance(prompt, str)) or (system is not None and not isinstance(system, str)):
-        raise ValueError("Approved prompt artifact requires text prompt and system templates")
     surface = multi_query_prompt_surface_from_options(options)
+    if surface is not None and not surface.node_template_users:
+        prompt = None
+    if (prompt is not None and not isinstance(prompt, str) and not _is_inline_prompt_blob(prompt)) or (
+        system is not None and not isinstance(system, str) and not _is_inline_prompt_blob(system)
+    ):
+        raise ValueError("Approved prompt artifact requires text prompt and system templates")
+    entries = _well_formed_query_entries(options["queries"]) if "queries" in options else ()
+    if "queries" in options:
+        raw_queries = options["queries"]
+        if raw_queries is not None and not entries and not _is_inline_prompt_blob(raw_queries):
+            raise ValueError("Approved prompt artifact requires query definitions")
+        for name, entry in entries:
+            template = entry["template"] if "template" in entry else None
+            if template is not None and not isinstance(template, str) and not _is_inline_prompt_blob(template):
+                raise ValueError(f"Query {name!r} template is not text or an inline blob source")
+    values = [options[key] for key in ("system_prompt", "queries") if key in options]
+    uses_fallback = not entries or any("template" not in query or query["template"] is None for _name, query in entries)
+    if uses_fallback and "prompt_template" in options:
+        values.append(options["prompt_template"])
+    for _name, query in entries:
+        values.append(query)
+        if "template" in query:
+            values.append(query["template"])
+    if any(_is_inline_prompt_blob(value) for value in values):
+        return None
     if surface is not None:
         queries: list[tuple[str, str | None]] = []
         for name, template in surface.queries:

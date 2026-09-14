@@ -317,3 +317,64 @@ def test_validate_and_run_admission_both_admit_the_same_user_uploaded_fixture(tm
     assert [call[0] for call in blob_service.link_blob_to_run_calls] == [_BLOB_ID]
     assert blob_service.read_blob_content_calls == [_BLOB_ID]
     assert len(session_service.recorded_blob_inline_resolutions) == 1
+
+
+@pytest.mark.parametrize("field", ["prompt_template", "system_prompt", "queries.q.template", "queries.q", "queries"])
+def test_unresolved_prompt_blobs_keep_site_evidence_and_remove_stale_full_artifact(tmp_path: Path, field: str) -> None:
+    from elspeth.web.interpretation_state import materialize_state_for_execution
+
+    state = _state(tmp_path, field)
+    node = state.nodes[0]
+    original_reviews = node.options[INTERPRETATION_REQUIREMENTS_KEY]
+    state = replace(state, nodes=(replace(node, options={**node.options, "approved_prompt_artifact_hash": "a" * 64}),))
+    materialized = materialize_state_for_execution(state)
+    assert isinstance(materialized, CompositionState)
+    options = materialized.nodes[0].options
+    assert "approved_prompt_artifact_hash" not in options
+    assert options[INTERPRETATION_REQUIREMENTS_KEY] == original_reviews
+
+
+def test_user_system_blob_substitution_does_not_mint_full_text_approval(tmp_path: Path) -> None:
+    from elspeth.core.blobs_inline import _discover_blob_content_refs, _substitute_blob_content_refs
+    from elspeth.web.interpretation_state import materialize_state_for_execution
+
+    materialized = materialize_state_for_execution(_state(tmp_path, "system_prompt"))
+    assert isinstance(materialized, CompositionState)
+    config = yaml.safe_load(composer_yaml_generator.generate_yaml(materialized))
+    refs = _discover_blob_content_refs(config)
+    resolved, evidence = _substitute_blob_content_refs(
+        config, dict.fromkeys(refs, _CONTENT), refs=refs, blob_metadata={_BLOB_ID: ("text/plain", len(_CONTENT))}
+    )
+    llm_options = resolved["transforms"][0]["options"]
+    assert llm_options["system_prompt"] == _CONTENT.decode()
+    assert "approved_prompt_artifact_hash" not in llm_options
+    assert evidence[0].content_hash == _SHA256
+    assert evidence[0].blob_id == _BLOB_ID
+
+
+def test_unused_fallback_blob_does_not_hide_effective_reviewed_artifact() -> None:
+    from elspeth.web.interpretation_state import approved_prompt_artifact_hash_from_options
+
+    options = {
+        "prompt_template": _marker(),
+        "system_prompt": "Decorator",
+        "queries": {"q": {"input_fields": {"text": "text"}, "template": "Q {{ row.text }}"}},
+    }
+    actual = approved_prompt_artifact_hash_from_options(options)
+    assert actual is not None
+    assert actual == approved_prompt_artifact_hash_from_options({**options, "prompt_template": "unused text"})
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"system_prompt": 7},
+        {"queries": {"q": {"template": 7}}},
+        {"queries": 7},
+    ],
+)
+def test_blob_source_does_not_hide_malformed_sibling_prompt_options(invalid: dict[str, Any]) -> None:
+    from elspeth.web.interpretation_state import approved_prompt_artifact_hash_from_options
+
+    with pytest.raises(ValueError):
+        approved_prompt_artifact_hash_from_options({"prompt_template": _marker(), **invalid})

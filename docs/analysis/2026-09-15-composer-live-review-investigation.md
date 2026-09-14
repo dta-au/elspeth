@@ -10,6 +10,13 @@ checks too. Requirement-level review hashes remain separate. An artifact event
 locates the effective prompt; complete approval evidence also includes the
 composition's requirement events and history.
 
+The reply-only request preserves historical tool records as attributed text so
+providers that prohibit tool protocol blocks without advertised tools can accept
+it. Uploaded prompt content keeps its blob identity and resolution provenance;
+an unresolved blob does not acquire a full-text approval hash through later
+substitution. Individual review evidence remains enforced independently. An
+unused fallback does not affect the effective prompt artifact.
+
 The frontend uses successful mode probes and readable approval labels, and
 displays saved model/profile choices and discard/merge consequences independently
 of planner prose. Planner guidance distinguishes adapted prompts from verbatim

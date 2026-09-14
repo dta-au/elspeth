@@ -687,7 +687,9 @@ _EXPECTED_DML_COUNT = 158
 # Fresh-time renewal and explicit registration finalizers add four DML sites;
 # the approved helper extraction adds seven edges. Table/operation shapes and
 # public caller inventories remain unchanged (measured from the live AST).
-_EXPECTED_DML_INVENTORY_SHA256 = "f2b187e1571fdfeab1564f02f20d20333cba549e7f55a38e4d33330923addd93"
+# Approved artifact column rename changes only SinkEffectLifecycle._insert_call;
+# the scanner still measures 158 identities and the same table/operation set.
+_EXPECTED_DML_INVENTORY_SHA256 = "dbfe48f510f8464bf9c82daa8d3f05b7171fd34358fcfa2ca0f819fed54ae92f"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -7714,7 +7716,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # VANguard adds required admission/token schema fields and disposes the
     # engine if construction fails. Guard installation still follows journal
     # attachment and precedes schema initialization/return on both dialects.
-    "src/elspeth/core/landscape/database.py": "5f3a0ca9871f010e56154db28fa1ec2bf41ea6db34d40232f77dbbdc828da365",
+    # Approved prompt artifact rename changes the required column/index names;
+    # database construction and deadline guard installation are unchanged.
+    "src/elspeth/core/landscape/database.py": "4430861bca6a169282ba94364224571b8c29bc6991200403ac6d22b3031c76b8",
 }
 
 

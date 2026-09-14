@@ -209,7 +209,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
     ):
         outcome = await service._call_model_turn(
             llm_messages=[{"role": "user", "content": "build it"}],
-            tools=[],
+            tools=service._get_litellm_tools(),
             state=state,
             initial_version=state.version,
             deadline=asyncio.get_event_loop().time() + 60.0,

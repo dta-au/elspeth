@@ -2607,7 +2607,7 @@ class TestRun5PackEdits:
         view, _snapshot = _trained_view()
         digest = discovery_digest(view)
         llm_entry = next(e for e in digest["transforms"] if e["name"] == "llm")
-        assert set(llm_entry["required_options"]) == {"schema", "provider", "prompt_template"}
+        assert set(llm_entry["required_options"]) == {"schema", "provider"}
 
 
 class TestSession891b7b1eLiveReviewEdits:

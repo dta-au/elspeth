@@ -215,10 +215,11 @@ def test_all_overrides_need_no_dead_node_template() -> None:
 
 
 def test_missing_effective_query_template_rejected() -> None:
-    with pytest.raises(ValidationError, match="requires prompt_template"):
+    with pytest.raises(ValidationError, match="prompt_template") as exc_info:
         LLMConfig(
             provider="azure",
             schema_config=_OBSERVED_SCHEMA,
             required_input_fields=[],
             queries={"decorate": {"input_fields": {"colour": "colour"}}},
         )
+    assert exc_info.value.errors()[0]["loc"] == ("prompt_template",)
