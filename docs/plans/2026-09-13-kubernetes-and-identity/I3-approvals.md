@@ -29,8 +29,8 @@ Decisions this task owns (DECISIONS.md I3, I8–I12):
    sessions row (`decision='superseded'`, `decided_at`). This DEPARTS from
    DECISIONS.md I3, which lists `superseded` in `record_approval_decided`'s
    decision set; it needs an operator ruling before execution (thread a
-   `record` callback through the composition-state writers, or amend
-   DECISIONS I3 to drop `superseded` from the audited set). See open question 1.
+   `record` callback through the composition-state writers, or rule that
+   `superseded` is not audited). See open question 1.
 2. **The binding.** `build_approval_binding(*, evidence, config_hash,
    canonical_version, openrouter_catalog_sha256, runtime_val_manifest_sha256)`.
    `policy_hash` and `binding_generation_fingerprint` come from
@@ -689,7 +689,7 @@ def test_request_bounds_the_note_at_4096_bytes(fenced_session: Any) -> None:
 
 
 def test_request_by_an_admin_requester_takes_the_population_lock_first(fenced_session: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    """DECISIONS I10 / approval_lifecycle_authority.py:3-8: population lock, then the identity rows, in that order."""
+    """approval_lifecycle_authority.py:3-8: population lock, then the identity rows, in that order."""
     _seed_approver(fenced_session)
     _seed_approver(fenced_session, fenced_session.identity_id, role="admin")
     order: list[str] = []
@@ -1618,7 +1618,7 @@ Add one `WriterIdentity(...)` per listed site to `_REVIEWED_WRITERS` (:1198), di
     ),
 ```
 
-The `<fp from the log>` and `<line from the log>` placeholders are filled from the XFAIL text, never typed from memory: the fingerprint is the AST of the enclosing function and any later edit to that function (Steps 15 and 19 do not touch this file) would print a new one. Re-run the same command; expected: `exit=0` and `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed` or `Stale reviewed` row may name a site this task touches (`grep -c 'ApprovalAuthority' /tmp/i3-lane-manifest-2.log` prints `0`). A `Stale reviewed` line means a copied fingerprint or line is wrong.
+The `<fp from the log>` and `<line from the log>` placeholders are filled from the XFAIL text, never typed from memory: the fingerprint is the AST of the enclosing function and any later edit to that function (Steps 15 and 19 do not touch this file) would print a new one. Re-run the same command with its log path changed to `/tmp/i3-lane-manifest-2.log`; expected: `exit=0` and `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed` or `Stale reviewed` row may name a site this task touches (`grep -c 'ApprovalAuthority' /tmp/i3-lane-manifest-2.log` prints `0`). A `Stale reviewed` line means a copied fingerprint or line is wrong.
 
 - [ ] **Step 13: Write the failing R2 permit-path tests.**
 
@@ -2049,7 +2049,7 @@ Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pyte
 Expected: `exit=0`.
 
 Then: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py::test_all_production_sessions_writers_are_reviewed_typed_authorities -n 0 -rx > /tmp/i3-lane-manifest-3.log 2>&1; echo exit=$?`
-Expected: XFAIL text with `Unexpected/unreviewed (3)` naming the three `RepositoryRunStartPermitAuthority._assess` sites (`run_start_permits update` ×2, `runs update` ×1) with a NEW fingerprint and new lines, and `Stale reviewed (3)` naming the old rows (`fp=2f5970706a950c82`, lines 61/72/80). Edit the three rows at `_REVIEWED_WRITERS` :1213-1246: replace the fingerprint and each `line=` with the printed values (the ordinals 1, 2, 1 and the comment above them stay). Re-run; expected `exit=0` and `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed` or `Stale reviewed` row may name a site this task touches (`grep -c '_assess' /tmp/i3-lane-manifest-4.log` prints `0`).
+Expected: XFAIL text with `Unexpected/unreviewed (3)` naming the three `RepositoryRunStartPermitAuthority._assess` sites (`run_start_permits update` ×2, `runs update` ×1) with a NEW fingerprint and new lines, and `Stale reviewed (3)` naming the old rows (`fp=2f5970706a950c82`, lines 61/72/80). Edit the three rows at `_REVIEWED_WRITERS` :1213-1246: replace the fingerprint and each `line=` with the printed values (the ordinals 1, 2, 1 and the comment above them stay). Re-run it with its log path changed to `/tmp/i3-lane-manifest-4.log`; expected `exit=0` and `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed` or `Stale reviewed` row may name a site this task touches (`grep -c '_assess' /tmp/i3-lane-manifest-4.log` prints `0`).
 
 - [ ] **Step 17: Write the failing supersede-on-new-state tests.**
 
@@ -2058,7 +2058,7 @@ Create `tests/unit/web/coordination/test_state_writers_supersede_approvals.py`:
 ```python
 """Spec :1416: any new ``state_id`` marks the open request superseded — at EVERY head writer.
 
-Two instruments, covering the five writers DECISIONS I9 names. The
+Two instruments, covering the five composition-state head writers. The
 behavioural half drives the four public writers and reads the ``approvals``
 row back: ``save_composition_state`` → ``append_state``;
 ``save_composition_state_with_interpretations`` (empty cohort),
@@ -2293,7 +2293,7 @@ Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pyte
 Expected: `exit=0`.
 
 Then: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py::test_all_production_sessions_writers_are_reviewed_typed_authorities -n 0 -rx > /tmp/i3-lane-manifest-5.log 2>&1; echo exit=$?`
-Expected: XFAIL naming as unexpected the re-fingerprinted `composition_states insert` rows of `SessionServiceImpl._insert_composition_state` (old `fp=abb7447bf7be0537`, :2203-2212), `_RepositoryCompositionStateMutations.append_state` (old `fp=8290255ca5f496f1`, :2213-2222) and `_RepositoryInterpretationMutations.create_or_reconcile_pending` (old `fp=4e9d29a674a21658` for the composition_states insert at :2278-2287 — its interpretation_events rows share the function so they re-fingerprint too, :2248-2277), and the same rows as stale. Replace each stale row's fingerprint and `line=` with the printed values; nothing else in those rows changes. Re-run; expected `exit=0` and `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed` or `Stale reviewed` row may name a site this task touches (`grep -c '_assess' /tmp/i3-lane-manifest-6.log` prints `0`).
+Expected: XFAIL naming as unexpected the re-fingerprinted `composition_states insert` rows of `SessionServiceImpl._insert_composition_state` (old `fp=abb7447bf7be0537`, :2203-2212), `_RepositoryCompositionStateMutations.append_state` (old `fp=8290255ca5f496f1`, :2213-2222) and `_RepositoryInterpretationMutations.create_or_reconcile_pending` (old `fp=4e9d29a674a21658` for the composition_states insert at :2278-2287 — its interpretation_events rows share the function so they re-fingerprint too, :2248-2277), and the same rows as stale. Replace each stale row's fingerprint and `line=` with the printed values; nothing else in those rows changes. Re-run it with its log path changed to `/tmp/i3-lane-manifest-6.log`; expected `exit=0` and `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed` or `Stale reviewed` row may name a site this task touches (`grep -c '_assess' /tmp/i3-lane-manifest-6.log` prints `0`).
 
 - [ ] **Step 21: Write the failing execution-service wiring tests.**
 
@@ -4049,8 +4049,8 @@ Expected: `exit=0`; the stat lists exactly those 31 files (12 created, 19 modifi
    `test_approval_decided_refuses_a_decision_outside_the_identity_made_set`
    plus the route test `test_sent_shows_a_new_state_superseding_the_open_request`
    (`methods() == ["record_approval_requested"]`) pin that. Ruling needed: thread a `record` callback through every
-   composition-state writer so supersession writes `approval_decided`, or amend
-   DECISIONS I3 to drop `superseded` from the audited set.
+   composition-state writer so supersession writes `approval_decided`, or rule that
+   `superseded` is not audited.
 2. **Which `config_hash` is bound?** Decision 2 binds
    `stable_hash(deep_thaw(audit_safe_config))` from the execution envelope,
    not the Landscape `runs.config_hash`, because the latter exists only after
@@ -4058,4 +4058,4 @@ Expected: `exit=0`; the stat lists exactly those 31 files (12 created, 19 modifi
 3. **DECISIONS I6 and I11 wording.** This block does not consume `pg_fenced`
    (DECISIONS I6 says I3 reuses the names) and `withdraw` takes `now` and
    `record` (DECISIONS I11's signature omits them, while DECISIONS I3 requires
-   the callback). Amend DECISIONS I6 and I11 to match, or rule otherwise.
+   the callback). Confirm both deviations from the working decisions.

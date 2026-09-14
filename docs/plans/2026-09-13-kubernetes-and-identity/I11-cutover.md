@@ -99,7 +99,7 @@ Measured on HEAD 072141b75 so the executor knows what is already there:
   than opening four more test files.
 - NOT touched: `src/elspeth/web/frontend/**` (landed, see above);
   `docs/runbooks/kubernetes-deployment.md` (K8's file; may not exist when
-  this task executes — see the open question).
+  this task executes; K8 runs after I11 and appends its own row).
 
 **Interfaces:**
 - Consumes:
@@ -147,7 +147,7 @@ Measured on HEAD 072141b75 so the executor knows what is already there:
   - Runbook headings `### Operator notice for the workflow-epoch window` and
     `### Cutover by deployment shape` inside `## Current Cutover:` of
     `docs/runbooks/staging-session-db-recreation.md`; the second carries the
-    per-shape table K8 appends a Kubernetes row to (see the open question).
+    per-shape table K8 appends a Kubernetes row to (K8 runs after I11).
   - The cutover artifact name `identity-mapping.pre.csv` (columns
     `provider, subject, pre_cutover_identity_id, kind, access_state, role, scope`),
     completed after re-provisioning as `identity-mapping.<window>.csv` with

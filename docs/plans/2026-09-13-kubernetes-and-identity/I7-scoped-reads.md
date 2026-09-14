@@ -80,8 +80,8 @@ Decisions this task owns:
    for `run_attributions` joined to `runs` and for `auth_events`, filtered by
    `identity_id IN scope` and capped at 200. The view writes no
    `audit_access_log` row: `audit_access_log.session_id` is a NOT NULL FK
-   (models.py:3253-3258) and a cross-session view has no single session (see
-   open question 3).
+   (models.py:3253-3258) and a cross-session view has no single session (an operator decision,
+   listed under I7 in the master's Self-review notes).
 5. **Delegated administration is an authority arm, not only a route check.**
    The spec says "route-layer only" (:1369), but HEAD contradicts it:
    `RepositoryIdentityAuthority.grant_role` (identity_authority.py:2573-2646)
@@ -112,11 +112,10 @@ Decisions this task owns:
    using the `refusal` key that `identity_admin_routes._refused` (:371-384)
    already uses on that router. It checks the approver grant first, so a
    non-approver still sees 404. The admin arm does not depend on governance.
-7. **Router shape follows I4 and I5.** Each module exports its own router
+7. **Router shape follows I3, I4 and I5.** Each module exports its own router
    factory (`create_workflow_inspect_router`, `create_workflow_audit_view_router`),
    which `web/app.py` registers directly after I5's `create_library_router()`
-   line. This differs from I3.md's Interfaces line (`create_workflow_router()`
-   plus `register_<module>_routes`); see open question 1.
+   line: the same standalone-factory shape as I3's `create_approvals_router()`.
 
 **Files:**
 - Create: `src/elspeth/web/coordination/workflow_scope_reader.py`

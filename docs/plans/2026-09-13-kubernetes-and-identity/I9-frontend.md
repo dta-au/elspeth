@@ -6,8 +6,9 @@ Ordered after I7 (I0 → I8 → I1 → I2 → I3 → {I4 ∥ I5} → I6 → I7 �
 follows. Spec: §Frontend (sso-design.md:1189-1234), the admin advisory
 (:974-975), D15/D18 (:74, :77), the `approvals` row (:1416: `decision_seen_at`
 "is a UI convenience, never a control"; a rejection must carry a note), the
-`review_requests` row (:1419), the `quota_set` metadata rule (:833-835) and
-DECISIONS I12 and I16. Every frontend path:line below was read with
+`review_requests` row (:1419), the `quota_set` metadata rule (:833-835),
+the exact routes I3 to I7 register, and the identity-row usage, blob-list total
+and single-admin advisory rows (:1199-1203, :974-975). Every frontend path:line below was read with
 `git show 072141b75:<path>` because the shared checkout is dirty in
 `App.tsx`, `App.test.tsx`, `types/index.ts` and `sessionStore.ts`. I0–I7 insert
 lines above several Python anchors; find each site by the quoted anchor text.

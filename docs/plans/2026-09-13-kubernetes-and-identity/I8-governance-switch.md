@@ -2,7 +2,7 @@
 
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I0. Runs before: I1, I10. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
-Ordered directly after I0 (I0 → I8 → I1 ∥ I2; I8 → I3; I8 → I10). Every
+Ordered directly after I0 (I0 → I8 → I1 → I2; I8 → I3; I8 → I10). Every
 later identity task that enforces anything (I3 `_assess`, I5 `publish`,
 I10's governance suite) reads the switch this task creates, and the switch's
 only refusal is the readiness check this task extends. Spec: R11

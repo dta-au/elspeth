@@ -102,7 +102,8 @@ Measured 2026-09-14 on the checkout at `818d04577` (its only delta from
   `collect_progress` (`:437-480`) posts a composer message and requires an
   assistant reply; with no provider the messages route answers 502
   (`sessions/routes/messages.py:390-438`), so P4a runs only when a composer
-  provider is supplied (open question below).
+  provider is supplied (an operator decision, listed under K5 in the master's
+  Self-review notes).
 - `normalize_acceptance_origin` admits `http` only for exact loopback hosts
   (`_acceptance_common/http_client.py:32`, `:48-84`): the NodePort origins
   `http://127.0.0.1:30452|30453` qualify. The runtime image is

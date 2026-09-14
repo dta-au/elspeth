@@ -76,10 +76,10 @@ The decisions those findings forced are listed under Self-review notes.
 
 ```text
 K0 spike facts ──▶ K1 base manifests ──▶ K2 profile arm ──▶ K3 render gate ──▶ K4 kind harness ──▶ K5 acceptance probes ──▶ K7 no-affinity ──▶ K8 docs flip
-                                                                                       └──▶ K6 AKS overlay ─────────────┘
+                   └──▶ K6 AKS overlay ─────────────────────────────────────────────────────────────────────────────────┘
 
 I0 schema pass ──▶ I8 governance switch + R11 ──▶ I1 token ledger + R14 ──▶ I2 storage quota R13 ──▶ I3 approvals + R2 ──▶ I4 reviews ──┐
-                                             └──────────────────────────────────────────────────────────────────────▶ I5 library ─┴─▶ I6 compartment marking ──▶ I7 scoped reads ──▶ I9 frontend ──▶ I10 governance suite ──▶ I11 cutover
+                                                                                                     └──────────────▶ I5 library ─┴─▶ I6 compartment marking ──▶ I7 scoped reads ──▶ I9 frontend ──▶ I10 governance suite ──▶ I11 cutover
                                              └───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────▶ I10 (closed_local_app)
 ```
 
@@ -152,6 +152,7 @@ Rows are in execution order within each workstream.
   - **K6:** keep the Azure Load Balancer's 4-minute idle default (230 s transport ceiling, 180 s composer timeout), or raise it and move both pinned values.
   - **K6:** TLS for `elspeth-web-tls`: cert-manager, or a Key Vault certificate synced by a third SecretProviderClass.
   - **Adjacent finding:** the ACA bundle sets none of the required composer settings (`config.py:306-309`), so an ACA pod refuses to boot unless the operator's parameter file adds them. The Kubernetes base now carries them. This is an ACA defect for its own ticket, not a task here.
+  - **I2:** when the identity storage cap refuses a composer `create_blob` call, the tool message still says "Session blob quota exceeded" (with correct byte counts). Keep that wording, or reword it to name the identity cap.
   - **I3:** a superseded approval writes no `auth_events` row, because supersede runs below the audit seam. Accept, or thread a `record` callback through every composition-state writer.
   - **I3:** the binding's `config_hash` is the web envelope hash, not Landscape `runs.config_hash`. The spec's workflow-tables row should say which.
   - **I3:** compiling a binding on the approval-request route freezes the runtime-VAL registries as a side effect (idempotent, and what the first run does anyway).

@@ -2,7 +2,7 @@
 
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I8, I9. Runs before: I11. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
-Ordered after I9 and before I11 (DECISIONS I18), with the direct edge I8 → I10
+Ordered after I9 and before I11 (see the master's Workstream layout and ordering), with the direct edge I8 → I10
 for the closed deployment. Spec: `docs/specs/2026-09-02-pluggable-sso-design.md`
 §Testing → Workflow governance (:1276-1311) and §Refusals R2, R7, R8, R9, R11,
 R13, R14 (:1057-1188). Measured on the working-tree HEAD `818d04577`, one
