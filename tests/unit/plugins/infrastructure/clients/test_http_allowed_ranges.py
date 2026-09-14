@@ -86,10 +86,10 @@ class FakeCallRecorder:
         work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> RecordedCall:
-        del resolved_prompt_template_hash
+        del approved_prompt_artifact_hash
         assert token_usage == UNKNOWN_TOKEN_USAGE
         call = RecordedCall(
             state_id=state_id,
@@ -121,10 +121,10 @@ class FakeCallRecorder:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> RecordedCall:
-        del resolved_prompt_template_hash
+        del approved_prompt_artifact_hash
         assert token_usage == UNKNOWN_TOKEN_USAGE
         index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
         call = RecordedCall(

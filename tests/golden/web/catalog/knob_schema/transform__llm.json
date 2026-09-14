@@ -180,12 +180,13 @@
         }
       },
       {
-        "description": "Jinja2 prompt template",
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
         "label": "Prompt Template",
         "name": "prompt_template",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "azure",
@@ -693,12 +694,13 @@
         }
       },
       {
-        "description": "Jinja2 prompt template",
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
         "label": "Prompt Template",
         "name": "prompt_template",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "openrouter",
@@ -1194,12 +1196,13 @@
         }
       },
       {
-        "description": "Jinja2 prompt template",
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
         "label": "Prompt Template",
         "name": "prompt_template",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "bedrock",
@@ -1668,12 +1671,13 @@
         }
       },
       {
-        "description": "Jinja2 prompt template",
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
         "label": "Prompt Template",
         "name": "prompt_template",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "gateway",

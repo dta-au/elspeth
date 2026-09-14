@@ -944,7 +944,7 @@ files:
     dict[str, Any]: 5
   src/elspeth/web/interpretation_state.py:
     Mapping[str, Any]: 18
-    boundary: 8
+    boundary: 9
     dict[str, Any]: 6
   src/elspeth/web/plugin_policy/coverage.py:
     Mapping[str, object]: 3
@@ -1031,7 +1031,7 @@ totals:
   Mapping[str, Any]: 872
   Mapping[str, object]: 298
   MutableMapping[str, Any]: 13
-  boundary: 64
+  boundary: 65
   dict[str, Any]: 1136
   dict[str, object]: 403
   soft: 2722

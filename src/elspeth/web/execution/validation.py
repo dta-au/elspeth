@@ -301,7 +301,7 @@ def _identity_state_for_compiled_ids(authored_state: CompositionState) -> Compos
     hashes the strictly materialized authored options, and hashing those same
     bytes from both preflight lanes is what keeps ids stable across the
     tolerant/strict seam (elspeth-ba01834a57 seam B — the tolerant materializer
-    masks placeholders and omits ``resolved_prompt_template_hash``, so
+    masks placeholders and omits ``approved_prompt_artifact_hash``, so
     lane-local materialization would mint a different id per lane). Only when
     strict materialization is impossible on the tolerant lane does identity
     fall back to the authoring-masked state: such a state cannot execute yet,

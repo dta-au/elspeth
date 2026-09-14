@@ -205,6 +205,15 @@ describe("api/client guided functions", () => {
   });
 
   describe("getGuided", () => {
+    it("discovers persisted freeform through a successful nullable probe", async () => {
+      fetchSpy.mockResolvedValueOnce(new Response("null", { status: 200 }));
+      expect(await getGuided("freeform", undefined, true)).toBeNull();
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/sessions/freeform/guided?probe=true",
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
     it("decodes an exact stable-id component review projection", async () => {
       const body = makeGetGuidedResponse();
       body.next_turn = {

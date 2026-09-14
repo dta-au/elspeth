@@ -2,7 +2,7 @@
 
 ``_duplicate_consumer_repair_suggestions`` hands the planner a "copyable"
 ``tool_sequence``. An LLM consumer whose prompt review has been resolved carries
-the runtime-owned node-level ``resolved_prompt_template_hash``; ``upsert_node``
+the runtime-owned node-level ``approved_prompt_artifact_hash``; ``upsert_node``
 refuses that key. Built from the diagnostic ``_serialize_node`` the first call
 failed, the later calls half-applied, and the graph ended worse than it started
 (a new dangling fork branch on top of the duplicate consumer). The skeleton now
@@ -18,7 +18,7 @@ from typing import Any
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, approved_prompt_artifact_hash_from_options
 from tests.unit.web.composer.test_tools import _empty_state, _llm_options_with_api_key, _mock_catalog, execute_tool
 
 
@@ -80,7 +80,7 @@ def _state_with_resolved_llm_consumer() -> CompositionState:
             accepted_artifact_hash=None,
             resolved_prompt_template_hash=stable_hash(row["draft"]),
         )
-    options["resolved_prompt_template_hash"] = stable_hash(options["prompt_template"])
+    options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(options)
     state = state.with_node(replace(llm_node, options=options)).with_node(_passthrough("b"))
     for name in ("out_a", "out_b"):
         state = state.with_output(OutputSpec(name=name, plugin="csv", options={"path": f"outputs/{name}.csv"}, on_write_failure="discard"))
@@ -124,7 +124,7 @@ def test_every_suggested_call_applies_for_a_consumer_with_a_resolved_prompt_revi
     # The skeleton omits the node-level template pin; upsert_node must keep the
     # stored one rather than drop it, or the approval would silently unpin.
     consumer_options = deep_thaw(consumer.options)
-    assert consumer_options["resolved_prompt_template_hash"] == stable_hash(consumer_options["prompt_template"])
+    assert consumer_options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(consumer_options)
 
 
 def test_suggested_consumer_arguments_omit_runtime_owned_llm_keys() -> None:
@@ -133,4 +133,4 @@ def test_suggested_consumer_arguments_omit_runtime_owned_llm_keys() -> None:
     [repair] = execute_tool("preview_pipeline", {}, state, _mock_catalog()).to_dict()["validation"]["graph_repair_suggestions"]
     [consumer_call] = [call for call in repair["tool_sequence"] if call["arguments"].get("id") == "a"]
 
-    assert "resolved_prompt_template_hash" not in consumer_call["arguments"]["options"]
+    assert "approved_prompt_artifact_hash" not in consumer_call["arguments"]["options"]

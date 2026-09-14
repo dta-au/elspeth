@@ -125,14 +125,14 @@ class BedrockLLMProvider:
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
     ) -> None:
         self._region_name = region_name
         self._recorder = recorder
         self._run_id = run_id
         self._telemetry_emit = telemetry_emit
         self._limiter = limiter
-        self._resolved_prompt_template_hash = resolved_prompt_template_hash
+        self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_clients: dict[str, AuditedLLMClient] = {}
         self._llm_clients_lock = Lock()
         self._underlying_client: _LiteLLMSDKAdapter | None = None
@@ -161,7 +161,7 @@ class BedrockLLMProvider:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
-                    resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                    approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
                 )
             except LLMClientError as error:
                 redacted_error = _redacted_bedrock_error(error)

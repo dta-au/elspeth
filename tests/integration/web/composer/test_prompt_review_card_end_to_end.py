@@ -55,6 +55,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SURFACE_REVIEW_MAX_CHARS,
     InterpretationReviewPending,
+    approved_prompt_artifact_hash_from_options,
     materialize_state_for_execution,
     prompt_review_anchor_hash_from_options,
     prompt_review_draft_from_options,
@@ -277,17 +278,22 @@ def _assert_pending_prompt_site_blocks_execution(state: CompositionState) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_fallback", [True, False])
 async def test_multi_query_card_carries_the_surface_and_resolves_to_an_executable_state(
     sessions_service: SessionServiceImpl,
+    with_fallback: bool,
 ) -> None:
     options = _multi_query_options()
+    unused_template = options["prompt_template"]
+    if not with_fallback:
+        del options["prompt_template"]
     surface_draft = prompt_review_draft_from_options(options)
     surface_anchor = prompt_review_anchor_hash_from_options(options)
     assert surface_draft is not None and surface_anchor is not None
     # Instrument controls: the surface and the dead node template differ, and
     # the surface anchor is not the node-level template's text hash.
-    assert surface_draft != options["prompt_template"]
-    assert surface_anchor != stable_hash(options["prompt_template"])
+    assert surface_draft != unused_template
+    assert surface_anchor != stable_hash(unused_template)
 
     staged = _options_with_default_prompt_template_review(node_id=_NODE_ID, plugin="llm", options=options)
     staged_requirement = _prompt_requirement(staged)
@@ -304,7 +310,7 @@ async def test_multi_query_card_carries_the_surface_and_resolves_to_an_executabl
     # Stager, surfacer and writer agree: the persisted card is the rendered
     # prompt surface, never the node-level template.
     assert event.llm_draft == surface_draft
-    assert event.llm_draft != options["prompt_template"]
+    assert event.llm_draft != unused_template
     assert _interpretation_event_response(event).llm_draft == surface_draft
 
     resolved, resolved_state = await _accept_as_drafted(sessions_service, session_id, event)
@@ -316,8 +322,12 @@ async def test_multi_query_card_carries_the_surface_and_resolves_to_an_executabl
     assert requirement["accepted_value"] == surface_draft
     assert requirement["resolved_prompt_template_hash"] == surface_anchor
     # Accepting never rewrites the prompt; the runtime hash covers the real template.
-    assert resolved_options["prompt_template"] == options["prompt_template"]
-    assert resolved_options["resolved_prompt_template_hash"] == stable_hash(options["prompt_template"])
+    if with_fallback:
+        assert resolved_options["prompt_template"] == unused_template
+    else:
+        assert "prompt_template" not in resolved_options
+    assert resolved_options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(options)
+    assert resolved.approved_prompt_artifact_hash == resolved_options["approved_prompt_artifact_hash"]
 
     materialized = materialize_state_for_execution(resolved_state)
 
@@ -363,7 +373,7 @@ async def test_long_single_prompt_card_is_bounded_and_resolves_to_an_executable_
     resolved, resolved_state = await _accept_as_drafted(sessions_service, session_id, event)
 
     assert _interpretation_event_response(resolved).accepted_value == bounded_draft
-    assert resolved.resolved_prompt_template_hash == full_template_hash
+    assert resolved.approved_prompt_artifact_hash == approved_prompt_artifact_hash_from_options(options)
     resolved_options = _node_options(resolved_state)
     requirement = _prompt_requirement(resolved_options)
     assert requirement["status"] == "resolved"

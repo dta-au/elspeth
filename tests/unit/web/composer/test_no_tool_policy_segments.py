@@ -413,6 +413,11 @@ class TestWrappedDiagnosticWireShapeLinkage:
 # family stayed on hand-maintained equality checks until elspeth-25f7b757e7).
 _BARE_SUFFIX_ROUND_TRIP_CASES = [
     pytest.param(
+        no_tool_policy._REVIEW_REPLY_UNAVAILABLE_SUFFIX,
+        no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE,
+        id="_REVIEW_REPLY_UNAVAILABLE_SUFFIX",
+    ),
+    pytest.param(
         no_tool_policy._EMPTY_STATE_FINALIZE_SUFFIX,
         no_tool_policy._EMPTY_STATE_NOTICE_BODY,
         id="_EMPTY_STATE_FINALIZE_SUFFIX",
@@ -697,3 +702,12 @@ class TestInterpretationReviewHandoffSegments:
         content = compose_interpretation_review_handoff_message(prose) + " altered"
 
         assert visible_message_segments(content=content, raw_content=prose) == (AssistantTextSegment(content),)
+
+
+def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
+    handoff = no_tool_policy.compose_interpretation_review_handoff_message("")
+    content = no_tool_policy.compose_review_reply_unavailable_message(handoff)
+    segments = no_tool_policy.visible_message_segments(content=content, raw_content="")
+    assert len(segments) == 2
+    assert all(isinstance(segment, no_tool_policy.TrustedSystemNoticeSegment) for segment in segments)
+    assert segments[-1].content == no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE

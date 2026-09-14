@@ -46,7 +46,8 @@ def test_epoch_is_forty() -> None:
     # identical same-second transitions collided on the old primary key.
     # Epoch 39 binds recoverable web starts to immutable permit subjects.
     # Epoch 40 adds nullable call usage and persisted admission policy evidence.
-    assert SQLITE_SCHEMA_EPOCH == 40
+    # Epoch 41 renames the approved prompt artifact anchor.
+    assert SQLITE_SCHEMA_EPOCH == 41
 
 
 def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:

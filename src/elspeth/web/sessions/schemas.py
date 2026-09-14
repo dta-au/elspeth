@@ -1031,7 +1031,7 @@ class InterpretationEventResponse(_StrictResponse):
     # rows (no prompt template is patched).  Exposed on the wire so
     # audit-tooling consumers can verify hash equality without a second
     # DB round-trip.
-    resolved_prompt_template_hash: str | None = Field(default=None, max_length=64)
+    approved_prompt_artifact_hash: str | None = Field(default=None, max_length=64)
 
 
 class InterpretationResolveRequest(BaseModel):

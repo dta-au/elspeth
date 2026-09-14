@@ -54,6 +54,7 @@ async def test_call_llm_omits_sampling_when_settings_are_none(monkeypatch: pytes
 
     assert "temperature" not in captured
     assert "seed" not in captured
+    assert "tools" not in captured
 
 
 @pytest.mark.asyncio

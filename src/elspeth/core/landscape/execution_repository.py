@@ -608,7 +608,7 @@ class ExecutionRepository:
         work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record an external call for a node state."""
@@ -625,7 +625,7 @@ class ExecutionRepository:
             work_item=work_item,
             request_ref=request_ref,
             response_ref=response_ref,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
         )
 
@@ -687,7 +687,7 @@ class ExecutionRepository:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record an external call made during an operation."""
@@ -703,7 +703,7 @@ class ExecutionRepository:
             call_index=call_index,
             request_ref=request_ref,
             response_ref=response_ref,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
         )
 

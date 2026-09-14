@@ -61,7 +61,7 @@ class _RecordCallRecorder:
         latency_ms: float | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         assert token_usage == UNKNOWN_TOKEN_USAGE
@@ -76,7 +76,7 @@ class _RecordCallRecorder:
             "latency_ms": latency_ms,
             "request_ref": request_ref,
             "response_ref": response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "token_usage": token_usage,
         }
         self.calls.append(_RecordedCall((), kwargs))
@@ -92,7 +92,7 @@ class _RecordCallRecorder:
             response_hash="test-response-hash" if response_data is not None else None,
             response_ref=response_ref or ("test-response-ref-hash" if response_data is not None else None),
             latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
         )
 
 

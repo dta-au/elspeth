@@ -143,7 +143,7 @@ def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() 
             "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
             "prompt_template": "Summarise {{ row.text }}.",
             "required_input_fields": ["text"],
-            "resolved_prompt_template_hash": None,
+            "approved_prompt_artifact_hash": None,
             "schema": {"mode": "observed"},
         }
     )
@@ -161,7 +161,7 @@ def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() 
     assert result.success is False
     assert result.updated_state is state
     assert result.data is None
-    assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+    assert "approved_prompt_artifact_hash" in result.validation.errors[0].message
     assert "retry splice_transform" in result.validation.errors[0].message
 
 

@@ -689,12 +689,13 @@ def _append_server_turn_record(
     return new_guided, new_record, turn_type, payload_hash
 
 
-@router.get("/{session_id}/guided", response_model=GetGuidedResponse)
+@router.get("/{session_id}/guided", response_model=GetGuidedResponse | None)
 async def get_guided(
     session_id: UUID,
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
-) -> GetGuidedResponse:
+    probe: bool = False,
+) -> GetGuidedResponse | None:
     """Return the current guided-mode state for a session.
 
     This read is non-mutating. If there is no existing CompositionState, the
@@ -710,6 +711,8 @@ async def get_guided(
     the requesting user.
     Returns 400 if the session's composition state has no guided_session
     attached (freeform session — use /api/sessions/{id}/messages instead).
+    With ``probe=true``, that expected freeform outcome is HTTP 200 with
+    a null body, so mode discovery does not generate an HTTP error.
     """
     await _verify_session_ownership(session_id, user, request)
     from elspeth.web.composer.guided.planning import (
@@ -742,6 +745,8 @@ async def get_guided(
 
         # Reject freeform sessions.
         if state.guided_session is None:
+            if probe:
+                return None
             raise HTTPException(
                 status_code=400,
                 detail="Session is not in guided mode. Use /api/sessions/{id}/messages.",

@@ -3098,7 +3098,7 @@ def _interpretation_event_record_from_row(row: Any) -> InterpretationEventRecord
         interpretation_source=InterpretationSource(row.interpretation_source),
         runtime_model_identifier_at_resolve=row.runtime_model_identifier_at_resolve,
         runtime_model_version_at_resolve=row.runtime_model_version_at_resolve,
-        resolved_prompt_template_hash=row.resolved_prompt_template_hash,
+        approved_prompt_artifact_hash=row.approved_prompt_artifact_hash,
     )
 
 
@@ -8497,15 +8497,15 @@ class SessionServiceImpl:
             4. Call :func:`_patch_llm_transform_prompt` to produce the
                resolved prompt-template string. Keep a local reference; do
                NOT call again in step 5a.
-            4a. Compute ``resolved_prompt_template_hash`` via
-                :func:`stable_hash` over the resolved prompt string.
-                ``CANONICAL_VERSION = "sha256-rfc8785-v1"``. NOT part of
+            4a. Compute ``approved_prompt_artifact_hash`` via
+                the versioned system-prompt and effective-query artifact.
+                NOT part of
                 ``INTERPRETATION_HASH_DOMAIN_V2`` — covers a different
                 input.
             5. UPDATE interpretation_events with the settled fields.
             5a. Write the new composition_states row with provenance =
                 'interpretation_resolve', version += 1, carrying the
-                patched ``prompt_template`` and ``resolved_prompt_template_hash``
+                patched ``prompt_template`` and ``approved_prompt_artifact_hash``
                 on the affected node JSON.
             6. Return the resolved event + the new state.
 
@@ -8682,9 +8682,9 @@ class SessionServiceImpl:
                         )
                 final_sources: Mapping[str, Mapping[str, Any]] | None
                 final_nodes: list[Mapping[str, Any]]
-                resolved_prompt_template_hash: str | None
+                approved_prompt_artifact_hash: str | None
                 if kind is InterpretationKind.VAGUE_TERM:
-                    final_sources, final_nodes, resolved_prompt_template_hash = _resolve_vague_term(
+                    final_sources, final_nodes, approved_prompt_artifact_hash = _resolve_vague_term(
                         state_record,
                         surfacing_state_record=surfacing_state_record,
                         event_id=eid,
@@ -8702,7 +8702,7 @@ class SessionServiceImpl:
                         surfacing_state_record,
                         affected_node_id=event_row.affected_node_id,
                     )
-                    final_sources, final_nodes, resolved_prompt_template_hash = _resolve_prompt_template_review(
+                    final_sources, final_nodes, approved_prompt_artifact_hash = _resolve_prompt_template_review(
                         state_record,
                         event_id=eid,
                         affected_node_id=event_row.affected_node_id,
@@ -8711,7 +8711,7 @@ class SessionServiceImpl:
                         surfacing_structure_hash=surfacing_structure_hash,
                     )
                 elif kind is InterpretationKind.INVENTED_SOURCE:
-                    final_sources, final_nodes, resolved_prompt_template_hash = _resolve_invented_source(
+                    final_sources, final_nodes, approved_prompt_artifact_hash = _resolve_invented_source(
                         state_record,
                         event_id=eid,
                         affected_node_id=event_row.affected_node_id,
@@ -8720,7 +8720,7 @@ class SessionServiceImpl:
                         accepted_value=accepted_value,
                     )
                 elif kind is InterpretationKind.SOURCE_DATA_CONTRACT:
-                    final_sources, final_nodes, resolved_prompt_template_hash = _resolve_source_data_contract(
+                    final_sources, final_nodes, approved_prompt_artifact_hash = _resolve_source_data_contract(
                         state_record,
                         event_id=eid,
                         affected_node_id=event_row.affected_node_id,
@@ -8729,7 +8729,7 @@ class SessionServiceImpl:
                         accepted_value=accepted_value,
                     )
                 elif kind is InterpretationKind.PIPELINE_DECISION:
-                    final_sources, final_nodes, resolved_prompt_template_hash = _resolve_pipeline_decision_review(
+                    final_sources, final_nodes, approved_prompt_artifact_hash = _resolve_pipeline_decision_review(
                         state_record,
                         event_id=eid,
                         affected_node_id=event_row.affected_node_id,
@@ -8738,7 +8738,7 @@ class SessionServiceImpl:
                         accepted_value=accepted_value,
                     )
                 elif kind is InterpretationKind.LLM_MODEL_CHOICE:
-                    final_sources, final_nodes, resolved_prompt_template_hash = _resolve_model_choice_review(
+                    final_sources, final_nodes, approved_prompt_artifact_hash = _resolve_model_choice_review(
                         state_record,
                         event_id=eid,
                         affected_node_id=event_row.affected_node_id,
@@ -8829,7 +8829,7 @@ class SessionServiceImpl:
                             hash_domain_version="v2",
                             runtime_model_identifier=runtime_model_identifier,
                             runtime_model_version=runtime_model_version,
-                            resolved_prompt_template_hash=resolved_prompt_template_hash,
+                            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                         )
                 except IntegrityError as exc:
                     # F-28: classify the trigger immutability message

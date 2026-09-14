@@ -1002,7 +1002,7 @@ function clearedGuidedState(): Pick<
  * the account's default-mode preference. Collapsing the two would land that
  * reload in freeform — the very defect convert's spurious rootless checkpoint
  * used to paper over. "none" still means a genuinely freeform-only session (the
- * documented 400) or a probe that failed.
+ * successful null probe) or a probe that failed.
  */
 type GuidedSelectProbe =
   | { kind: "state"; response: GetGuidedResponse }
@@ -1014,7 +1014,8 @@ async function fetchGuidedStateForSelect(
   unexpectedFailure: "tolerate" | "throw" = "tolerate",
 ): Promise<GuidedSelectProbe> {
   try {
-    const response = await api.getGuided(sessionId);
+    const response = await api.getGuided(sessionId, undefined, true);
+    if (response === null) return { kind: "none" };
     // GET /guided is non-mutating on a session with NO persisted
     // CompositionState record yet: get_guided's docstring documents that it
     // returns a lazy in-memory stub GuidedSession + first turn with
@@ -1025,8 +1026,8 @@ async function fetchGuidedStateForSelect(
     // here would flip a brand-new, freeform-preferring session straight into
     // the guided surface on its very first load, for no reason the user asked
     // for. Only a response with a non-null composition_state confirms a REAL,
-    // persisted guided_session (get_guided 400s before reaching this success
-    // path whenever the persisted state's guided_session key is unset, so a
+    // persisted guided_session (the probe returns null whenever the
+    // persisted state's guided_session key is unset, so a
     // real composition_state here means it was genuinely set). The stub is
     // reported separately so the ONE caller that has a reason to adopt it —
     // selectSession under a guided default mode — can, and no other does.
@@ -1034,23 +1035,20 @@ async function fetchGuidedStateForSelect(
       ? { kind: "state", response }
       : { kind: "stub", response };
   } catch (err) {
-    // Only the documented 400 (session has no guided_session — a plain
-    // freeform session) is an expected, silent "freeform-only" outcome.
-    // Anything else (500 on corrupt guided state, 502 during a backend
+    // Freeform is a successful null response. Failures (500 on corrupt
+    // guided state, 502 during a backend
     // restart, a network blip) still degrades to freeform because guided
     // restore is best-effort — but it is NOT the same as "never used guided",
     // so surface it in the console so a genuinely stranded mid-build session
     // is at least diagnosable rather than silently indistinguishable.
     const status = (err as ApiError | undefined)?.status;
-    if (status !== 400) {
-      if (unexpectedFailure === "throw") {
-        throw err;
-      }
-      console.warn(
-        `[sessionStore] guided-state probe for session ${sessionId} failed (status ${status ?? "unknown"}); ` +
-          "falling back to freeform. If this session was mid-guided-build, its state was not restored.",
-      );
+    if (unexpectedFailure === "throw") {
+      throw err;
     }
+    console.warn(
+      `[sessionStore] guided-state probe for session ${sessionId} failed (status ${status ?? "unknown"}); ` +
+        "falling back to freeform. If this session was mid-guided-build, its state was not restored.",
+    );
     return { kind: "none" };
   }
 }
@@ -1459,8 +1457,8 @@ interface SessionState {
   //                                                 opens on the goal card and
   //                                                 NOTHING is persisted
   //   * stub, with an intent                     => POST /guided/start with it
-  //   * 400 (worked freeform), with an intent    => convertToGuided(intent)
-  //   * 400, no intent                           => store guard (a goal is
+  //   * null (worked freeform), with an intent   => convertToGuided(intent)
+  //   * null, no intent                          => store guard (a goal is
   //                                                 required); unreachable from
   //                                                 the UI, which always
   //                                                 collects one first
@@ -3808,9 +3806,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     //                         directly through chatGuided's canonical live-start
     //                         branch (POST /guided/start) and the goal card is
     //                         skipped.
-    //   * 400, intent      => a WORKED freeform session: the one case GET cannot
-    //                         serve. Convert it, rooted on the goal.
-    //   * 400, no intent   => guard (see GUIDED_GOAL_REQUIRED_MESSAGE).
+    //   * null, intent     => a WORKED freeform session. Convert it, rooted
+    //                         on the goal.
+    //   * null, no intent  => guard (see GUIDED_GOAL_REQUIRED_MESSAGE).
     //   * persisted state  => adopt unchanged. A completed terminal comes back
     //                         here too, so ChatPanel keeps rendering the
     //                         completion summary; it is not re-entrable.
@@ -3823,25 +3821,22 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       return;
     }
     const requestedSessionId = activeSessionId;
-    let probe: GetGuidedResponse;
+    let probe: GetGuidedResponse | null;
     try {
-      probe = await api.getGuided(requestedSessionId);
+      probe = await api.getGuided(requestedSessionId, undefined, true);
     } catch (err) {
       const apiErr = err as ApiError;
-      // Only the documented 400 means "this session has no guided_session".
-      // Anything else (500 on corrupt state, a network blip) is a failure to
-      // surface, not evidence that a conversion is the right move.
-      if (apiErr?.status !== 400) {
-        if (get().activeSessionId !== requestedSessionId) {
-          return;
-        }
-        set({
-          error:
-            apiErr?.detail ??
-            "Failed to switch to guided mode. Please try again.",
-        });
+      if (get().activeSessionId !== requestedSessionId) {
         return;
       }
+      set({
+        error:
+          apiErr?.detail ??
+          "Failed to switch to guided mode. Please try again.",
+      });
+      return;
+    }
+    if (probe === null) {
       if (intent === undefined) {
         if (get().activeSessionId !== requestedSessionId) {
           return;
@@ -4350,7 +4345,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // only compositionState would leave the stale cached guidedSession
       // rendering the guided wizard over restored freeform state (and the
       // reverse — reverting to a guided version would keep freeform). Probe
-      // GET /guided (non-mutating; 400 => freeform-only) and set the wire
+      // GET /guided?probe=true (non-mutating; null => freeform-only) and set the wire
       // fields to what the reverted version actually is, mirroring
       // selectSession's discriminator.
       // A lazy stub is not a version's guided state, so it is dropped here as

@@ -1273,7 +1273,7 @@ class TestServerOwnedMetadataProjection:
                     options=deep_freeze(
                         {
                             "prompt_template": "Tone: warm",
-                            "resolved_prompt_template_hash": "b" * 64,
+                            "approved_prompt_artifact_hash": "b" * 64,
                             PROMPT_TEMPLATE_PARTS_KEY: [{"kind": "text", "text": "Tone: warm"}],
                             INTERPRETATION_REQUIREMENTS_KEY: [
                                 {
@@ -1312,7 +1312,7 @@ class TestServerOwnedMetadataProjection:
 
         source_options = current["sources"]["source"]["options"]
         assert SOURCE_AUTHORING_KEY not in source_options
-        assert "resolved_prompt_template_hash" not in source_options
+        assert "approved_prompt_artifact_hash" not in source_options
         assert PROMPT_TEMPLATE_PARTS_KEY not in source_options
         # Reduced, not dropped: resolved-vs-pending must stay legible.
         assert source_options[INTERPRETATION_REQUIREMENTS_KEY] == [
@@ -1328,7 +1328,7 @@ class TestServerOwnedMetadataProjection:
         assert source_options["blob_ref"] == "9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e"
 
         node_options = current["nodes"][0]["options"]
-        assert "resolved_prompt_template_hash" not in node_options
+        assert "approved_prompt_artifact_hash" not in node_options
         assert PROMPT_TEMPLATE_PARTS_KEY not in node_options
         assert node_options[INTERPRETATION_REQUIREMENTS_KEY][0] == {
             "id": "vague:tone",
@@ -1345,7 +1345,7 @@ class TestServerOwnedMetadataProjection:
         state = self._review_bound_state()
         serialized = state.to_dict()
         assert SOURCE_AUTHORING_KEY in serialized["sources"]["source"]["options"]
-        assert "resolved_prompt_template_hash" in serialized["nodes"][0]["options"]
+        assert "approved_prompt_artifact_hash" in serialized["nodes"][0]["options"]
         assert PROMPT_TEMPLATE_PARTS_KEY in serialized["nodes"][0]["options"]
         row = serialized["sources"]["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
         assert row["event_id"] == "event-1"

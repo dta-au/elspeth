@@ -33,7 +33,7 @@ PolicyValidationStage = Literal[
     "required_control_coverage",
 ]
 
-_PROFILE_LOWERING_METADATA_OPTION_KEYS = AUTHORING_METADATA_OPTION_KEYS | {"resolved_prompt_template_hash"}
+_PROFILE_LOWERING_METADATA_OPTION_KEYS = AUTHORING_METADATA_OPTION_KEYS | {"approved_prompt_artifact_hash"}
 
 # Profiled plugins whose operator binding is a STORAGE location rather than an
 # LLM-family provider/model/credential set — their rejection prose must speak

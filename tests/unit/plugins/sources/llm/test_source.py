@@ -1212,7 +1212,7 @@ def test_on_start_constructs_real_provider_variant_without_preflight(
         assert provider._run_id == source_context.run_id
         assert provider._telemetry_emit is source_context.telemetry_emit
         assert provider._limiter is source._limiter
-        assert provider._resolved_prompt_template_hash == source._template.template_hash
+        assert provider._approved_prompt_artifact_hash is None
         if isinstance(provider, AzureLLMProvider):
             assert provider._endpoint == "https://example.openai.azure.com"
             assert provider._api_key == "test-api-key"

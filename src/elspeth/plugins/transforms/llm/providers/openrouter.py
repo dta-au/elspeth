@@ -286,7 +286,7 @@ class OpenRouterLLMProvider:
 
     The underlying OpenRouter transport is HTTP, so AuditedHTTPClient records
     the raw transport row. The LLM semantic row is recorded here so
-    ``calls.resolved_prompt_template_hash`` remains attached only to
+    ``calls.approved_prompt_artifact_hash`` remains attached only to
     ``CallType.LLM`` rows.
     """
 
@@ -300,7 +300,7 @@ class OpenRouterLLMProvider:
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
     ) -> None:
         # Pre-build auth headers — avoids storing the raw API key as a named attribute
         self._request_headers = {
@@ -321,7 +321,7 @@ class OpenRouterLLMProvider:
         # Phase 5b Task 9 — cross-DB hash anchor. Forwarded to every HTTP
         # post() call so the Landscape ``calls`` row carries the matching
         # SHA-256.
-        self._resolved_prompt_template_hash = resolved_prompt_template_hash
+        self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
 
         # Client cache with reference counting for parallel multi-query safety.
         # Multiple parallel queries share the same row parent, so _get_http_client()
@@ -521,7 +521,7 @@ class OpenRouterLLMProvider:
             ),
             token_usage=usage,
             latency_ms=(time.perf_counter() - started_at) * 1000,
-            resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
         )
 
     def _record_logical_llm_error(
@@ -548,7 +548,7 @@ class OpenRouterLLMProvider:
                 retryable=exc.retryable,
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
-            resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
         )
 
     def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:

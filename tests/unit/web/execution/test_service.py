@@ -118,6 +118,7 @@ from elspeth.web.execution.validation import validate_pipeline as _real_validate
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
+    approved_prompt_artifact_hash_from_options,
     prompt_review_anchor_hash_from_options,
 )
 from elspeth.web.plugin_policy.models import (
@@ -9884,7 +9885,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
                     # Placeholder resolved — no ``{{interpretation:…}}`` text.
                     "prompt_template": prompt,
                     "model": "test-model",
-                    "resolved_prompt_template_hash": stable_hash(prompt),
+                    "approved_prompt_artifact_hash": approved_prompt_artifact_hash_from_options({"prompt_template": prompt}),
                     INTERPRETATION_REQUIREMENTS_KEY: [
                         {
                             "id": "prompt-template-review",

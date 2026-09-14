@@ -920,7 +920,7 @@ def test_behavior_facts_are_unchanged_by_a_prompt_template_option_patch() -> Non
     """The admission the design requires, argued structurally rather than by luck.
 
     An interpretation Accept rewrites ``prompt_template`` and writes
-    ``resolved_prompt_template_hash`` — both live in ``NodeSpec.options``.
+    ``approved_prompt_artifact_hash`` — both live in ``NodeSpec.options``.
     ``_node_behavior`` reads no option at all (transform and queue project only
     their kind; collector reads ``scope_policy``/``scope_opener``; aggregation
     reads ``trigger``/``output_mode``/``expected_output_count``; the barriers
@@ -940,7 +940,7 @@ def test_behavior_facts_are_unchanged_by_a_prompt_template_option_patch() -> Non
                 state.nodes[1],
                 options={
                     "prompt_template": "Summarise {{ row.name }}",
-                    "resolved_prompt_template_hash": "b" * 64,
+                    "approved_prompt_artifact_hash": "b" * 64,
                 },
             ),
         ),

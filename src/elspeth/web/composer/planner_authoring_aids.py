@@ -330,6 +330,7 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     """Closed section vocabulary for the live planner-authoring payload."""
 
     purpose: Required[str]
+    user_disclosure: Required[_RulesAid]
     source_custody: _SourceCustodyAid
     fork_coalesce: _ForkCoalesceAid
     fork_row_union: _ForkRowUnionAid
@@ -649,6 +650,30 @@ _WEB_SCRAPE_HTTP_IDENTITY_RULES: Final[tuple[str, ...]] = (
 )
 
 
+_USER_DISCLOSURE_RULES: Final[tuple[str, ...]] = (
+    "In your user-facing reply, answer the user's design questions as well as explaining what you authored, "
+    "including when the turn stops at review cards. Compare the actual saved prompt text with the user's words "
+    "before describing it: say 'verbatim' or 'exactly as written' only for unchanged text. Adding row variables, "
+    "rewording a question, or adding output instructions is an adaptation. Name those adaptations and distinguish "
+    "them from an unchanged system prompt; a review card does not replace this explanation.",
+    "Disclose each LLM node's selected profile alias, or its discovery-backed literal model. Name the concrete "
+    "model behind a profile only when the current session's served evidence supplies that binding; otherwise "
+    "say the profile is operator-managed and the concrete model is not exposed here. Never infer a model or "
+    "version from an alias. Operator custody exempts a profile from model-choice approval, not disclosure.",
+    "Explain the saved failure policies before asking the user to proceed. For on_error='discard', "
+    "on_validation_failure='discard', or on_write_failure='discard', identify which rows can be absent from "
+    "the output while their failure remains recorded in the audit trail. A require_all merge needs every "
+    "branch: if one branch is lost, that input has a recorded failed merge and no combined output row. "
+    "Do not promise all input rows reach the CSV when those policies permit missing rows. Describe a named "
+    "failure sink instead when that is the configured policy; do not claim quarantine exists when it does not.",
+    "If consistent presentation is needed, author explicit prompt instructions for plain text, Markdown, "
+    "hex-code case, and explanatory suffixes as appropriate to the user's request, and disclose additions "
+    "as your formatting choices on the review card. 'One short phrase' alone does not prohibit Markdown. "
+    "Prompt instructions are not a guarantee of exact formatting: use a supported structured contract when "
+    "exact values are required. Do not silently rewrite approved prompts or normalize audited responses.",
+)
+
+
 def _model_custody_rules(profile_alias: str | None) -> list[str]:
     """Model-provisioning custody with the sanctioned alternative rendered live.
 
@@ -715,7 +740,7 @@ _WEB_MULTI_QUERY_RETRY_RULE: Final[str] = (
 # (correctly) rejects as an uncontrolled write path. The two variants are
 # module constants so the gating is testable without asserting prose.
 _LLM_ON_ERROR_QUARANTINE_RULE: Final[str] = (
-    "on_error='discard' silently drops failed rows. When the user needs "
+    "on_error='discard' removes failed rows from output while retaining their audit outcomes. Disclose this choice. When the user needs "
     "failures retained or inspected, route on_error to a dedicated "
     "quarantine sink instead of discard."
 )
@@ -2676,6 +2701,7 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     summaries = _plugin_summaries(catalog)
     visible = _visible_plugin_names(catalog, summaries)
     aids: _PlannerAuthoringAids = {
+        "user_disclosure": {"rules": list(_USER_DISCLOSURE_RULES)},
         "purpose": (
             "Server-rendered worked exemplars and catalog digest from the live "
             "policy-visible catalog. These shapes validate against the current deployment. "

@@ -78,10 +78,10 @@ type ArtifactPublicationEvidenceKind = Literal["returned", "reconciled", "inheri
 OPERATION_TYPE_VALUES: tuple[OperationType, ...] = ("source_load", "sink_write", "runtime_preflight")
 
 
-def validate_resolved_prompt_template_hash(call_type: CallType, resolved_prompt_template_hash: str | None) -> None:
+def validate_approved_prompt_artifact_hash(call_type: CallType, approved_prompt_artifact_hash: str | None) -> None:
     """Validate the cross-DB prompt-hash anchor invariant (Tier 1).
 
-    ``resolved_prompt_template_hash`` is defined only for LLM calls and, when
+    ``approved_prompt_artifact_hash`` is defined only for LLM calls and, when
     present, must be a 64-character lowercase hex digest. Raises ``ValueError``
     on violation; ``None`` is always valid.
 
@@ -91,12 +91,12 @@ def validate_resolved_prompt_template_hash(call_type: CallType, resolved_prompt_
     surfaces as a post-commit ``ValueError`` when the ``Call`` is constructed,
     violating the Tier-1 guarantee that the audit trail is always pristine.
     """
-    if resolved_prompt_template_hash is None:
+    if approved_prompt_artifact_hash is None:
         return
     if call_type is not CallType.LLM:
-        raise ValueError(f"Call.resolved_prompt_template_hash is defined only for CallType.LLM calls, got call_type={call_type!r}")
-    if not isinstance(resolved_prompt_template_hash, str) or not _SHA256_HEX_PATTERN.fullmatch(resolved_prompt_template_hash):
-        raise ValueError("Call.resolved_prompt_template_hash must be a 64-character lowercase hex digest")
+        raise ValueError(f"Call.approved_prompt_artifact_hash is defined only for CallType.LLM calls, got call_type={call_type!r}")
+    if not isinstance(approved_prompt_artifact_hash, str) or not _SHA256_HEX_PATTERN.fullmatch(approved_prompt_artifact_hash):
+        raise ValueError("Call.approved_prompt_artifact_hash must be a 64-character lowercase hex digest")
 
 
 def _validate_enum(value: object, enum_type: type, field_name: str, *, optional: bool = False) -> None:
@@ -549,13 +549,13 @@ class Call:
     latency_ms: float | None = None
     # Cross-DB hash anchor for LLM transforms downstream of an interpretation
     # event (Phase 5b Task 9 / Option A). Populated at execution time by the
-    # LLM plugin when it reads ``options.resolved_prompt_template_hash`` from
+    # LLM plugin when it reads ``options.approved_prompt_artifact_hash`` from
     # the node config (written there by ``resolve_interpretation_event`` at
     # compose time). ``None`` for non-LLM calls and for LLM transforms that
     # never went through an interpretation surface. Must equal the matching
-    # ``interpretation_events.resolved_prompt_template_hash`` in the session
+    # ``interpretation_events.approved_prompt_artifact_hash`` in the session
     # audit DB when non-None; inequality = Tier-1 audit anomaly.
-    resolved_prompt_template_hash: str | None = None
+    approved_prompt_artifact_hash: str | None = None
     # None means unreported, including failed calls. It is not zero usage.
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -567,7 +567,7 @@ class Call:
         require_int(self.call_index, "call_index", min_value=0)
         _validate_enum(self.call_type, CallType, "call_type")
         _validate_enum(self.status, CallStatus, "status")
-        validate_resolved_prompt_template_hash(self.call_type, self.resolved_prompt_template_hash)
+        validate_approved_prompt_artifact_hash(self.call_type, self.approved_prompt_artifact_hash)
         require_int(self.prompt_tokens, "prompt_tokens", optional=True, min_value=0)
         require_int(self.completion_tokens, "completion_tokens", optional=True, min_value=0)
         require_int(self.cached_prompt_tokens, "cached_prompt_tokens", optional=True, min_value=0)

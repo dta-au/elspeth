@@ -62,7 +62,7 @@ LLM_PROFILE_PRIVATE_FIELDS = frozenset(
         "prompt_template_source",
         "lookup_source",
         "system_prompt_source",
-        "resolved_prompt_template_hash",
+        "approved_prompt_artifact_hash",
     }
 )
 

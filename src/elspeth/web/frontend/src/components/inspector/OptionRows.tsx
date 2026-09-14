@@ -87,7 +87,7 @@ export const INTERNAL_OPTION_KEYS: ReadonlySet<string> = new Set([
   "interpretation_requirements",
   "blob_ref",
   "source_authoring",
-  "resolved_prompt_template_hash",
+  "approved_prompt_artifact_hash",
   "prompt_template_source",
   "lookup_source",
   "system_prompt_source",

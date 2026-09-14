@@ -3193,7 +3193,8 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     The assertion exists to fail when someone bumps one without the other.
     """
     assert SessionOperationKind.BLOB_READ.value == "blob_read"
-    assert SESSION_SCHEMA_EPOCH == 56
+    # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
+    assert SESSION_SCHEMA_EPOCH == 57
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

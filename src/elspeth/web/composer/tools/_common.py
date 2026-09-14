@@ -132,7 +132,7 @@ class EmptyToolArgumentsModel(BaseModel):
 
 _FULL_STATE_COMPONENT_ALIASES: Final[tuple[str, ...]] = ("", "full", "all", "pipeline")
 _FULL_STATE_COMPONENT_ALIAS_SET: Final[frozenset[str]] = frozenset(_FULL_STATE_COMPONENT_ALIASES)
-_RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"resolved_prompt_template_hash"})
+_RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"approved_prompt_artifact_hash"})
 _SOURCE_BLOB_REF_OPTION_KEY: Final[str] = "blob_ref"
 _SOURCE_BLOBS_OPTION_KEY: Final[str] = "blobs"
 _SERVER_OWNED_SOURCE_OPTION_KEYS: Final[frozenset[str]] = frozenset(
@@ -362,13 +362,13 @@ def _options_with_pending_requirement(
 
 @observation_boundary(
     tier=3,
-    source="composer/LLM-authored node options mapping (Tier-3) whose prompt_template value is "
+    source="composer/LLM-authored node options mapping (Tier-3) whose prompt values are "
     "untyped: an untrusted upsert_node / patch_node_options payload, a YAML import, or a "
     "sessions.db round-trip",
     source_param="options",
     suppresses=("R1", "R5"),
-    invariant="returns options unchanged when the node is not an llm node or carries no non-empty "
-    "string prompt_template, otherwise a copy with the review requirement staged whose draft is the "
+    invariant="returns options unchanged when the node is not an llm node or carries no reviewable "
+    "prompt surface, otherwise a copy with the review requirement staged whose draft is the "
     "prompt_template, shortened to PROMPT_SURFACE_REVIEW_MAX_CHARS with an inline marker when longer, "
     "for a single-prompt node and the rendered multi-query prompt surface "
     "(per-query templates, system prompt, node-level template) for a multi-query node; never raises",
@@ -395,9 +395,6 @@ def _options_with_default_prompt_template_review(
     never re-reviewed).
     """
     if plugin != "llm":
-        return options
-    prompt_template = options["prompt_template"] if "prompt_template" in options else None
-    if not isinstance(prompt_template, str) or not prompt_template:
         return options
     draft = prompt_review_draft_from_options(options)
     if draft is None:
@@ -851,7 +848,7 @@ def _duplicate_consumer_repair_suggestions(
                 # Built from the AUTHORING projection, not the diagnostic
                 # ``_serialize_node``: every call here is replayed through
                 # upsert_node, which refuses runtime-owned options (a resolved
-                # LLM prompt's node-level resolved_prompt_template_hash) and
+                # LLM prompt's node-level approved_prompt_artifact_hash) and
                 # resolver-owned review linkage, so the diagnostic shape made
                 # the first call fail and the rest half-apply.
                 patched_consumers[node.id] = dict(_serialize_set_pipeline_node(node))
@@ -2436,7 +2433,7 @@ def _mask_pending_interpretation_placeholders_for_authoring_validation(
     prompts validate through the normal LLM config path.
     """
 
-    if "resolved_prompt_template_hash" in options:
+    if "approved_prompt_artifact_hash" in options:
         return
     prompt_template = options.get("prompt_template")
     if not isinstance(prompt_template, str):
@@ -2966,7 +2963,7 @@ def _runtime_owned_llm_option_error(
     """Reject composer-authored writes to runtime-owned LLM audit fields.
 
     Two checks: (1) the LLM-only runtime-owned option keys
-    (``_RUNTIME_OWNED_LLM_OPTION_KEYS``, e.g. ``resolved_prompt_template_hash``
+    (``_RUNTIME_OWNED_LLM_OPTION_KEYS``, e.g. ``approved_prompt_artifact_hash``
     at the top level), gated on ``plugin_name == "llm"``; and (2) the
     plugin-agnostic resolver-owned interpretation-requirement check, which also
     guards source write paths via

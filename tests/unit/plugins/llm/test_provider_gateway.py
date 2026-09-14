@@ -919,7 +919,7 @@ class TestAuditRows:
         assert provider._http_clients == {}
         assert provider._http_client_refs == {}
 
-    def test_semantic_row_carries_resolved_prompt_template_hash(
+    def test_semantic_row_carries_approved_prompt_artifact_hash(
         self, audit_recorder: FakeAuditRecorder, telemetry_emit: FakeTelemetryEmit
     ) -> None:
         provider = GatewayLLMProvider(
@@ -929,7 +929,7 @@ class TestAuditRows:
             recorder=audit_recorder,
             run_id="run-1",
             telemetry_emit=telemetry_emit,
-            resolved_prompt_template_hash="sha256:abc123",
+            approved_prompt_artifact_hash="c" * 64,
         )
         with respx.mock:
             respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
@@ -946,7 +946,7 @@ class TestAuditRows:
                 ),
             )
         llm_call = next(call for call in audit_recorder.calls if call["call_type"] == CallType.LLM)
-        assert llm_call["resolved_prompt_template_hash"] == "sha256:abc123"
+        assert llm_call["approved_prompt_artifact_hash"] == "c" * 64
 
     @respx.mock
     def test_error_records_two_rows(self, provider: GatewayLLMProvider, audit_recorder: FakeAuditRecorder) -> None:

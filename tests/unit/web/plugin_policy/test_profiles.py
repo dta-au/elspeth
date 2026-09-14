@@ -1464,7 +1464,7 @@ def test_public_llm_source_schema_excludes_transform_and_private_fields() -> Non
         "timeout_seconds",
         "prompt_template_source",
         "lookup_source",
-        "resolved_prompt_template_hash",
+        "approved_prompt_artifact_hash",
     ):
         assert f'"{excluded}"' not in rendered
 

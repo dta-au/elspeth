@@ -121,7 +121,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:28f1e931824f9fc2"
+    source_file_hash: str | None = "sha256:63808df43872bd80"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -517,7 +517,6 @@ class LLMSource(BaseSource):
             "run_id": self._run_id,
             "telemetry_emit": self._telemetry_emit,
             "limiter": self._limiter,
-            "resolved_prompt_template_hash": self._template.template_hash,
         }
         if isinstance(self._config, AzureOpenAILLMSourceConfig):
             return AzureLLMProvider(

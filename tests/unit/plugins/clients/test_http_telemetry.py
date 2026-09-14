@@ -53,7 +53,7 @@ class _RecordingExecution:
         *,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
@@ -69,7 +69,7 @@ class _RecordingExecution:
             "latency_ms": latency_ms,
             "request_ref": request_ref,
             "response_ref": response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
         }
         self.record_call_calls.append(kwargs)
         if isinstance(self.record_call_effect, Exception):
@@ -91,7 +91,7 @@ class _RecordingExecution:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         coordination_token: CoordinationToken,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> _RecordedCall:

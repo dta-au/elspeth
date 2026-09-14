@@ -454,7 +454,7 @@ def _is_server_stamped_option_path(path: str) -> bool:
 
     The key inventory derives from the same constants the write gates and the
     planner projection use (``AUTHORING_METADATA_OPTION_KEYS`` plus the
-    profile-lowering superset carrying ``resolved_prompt_template_hash``) —
+    profile-lowering superset carrying ``approved_prompt_artifact_hash``) —
     never a hand-rolled list. Only the TOP-LEVEL options segment counts:
     source paths are ``source.<key>...``; node/output paths are
     ``<prefix>.options.<key>...``.
@@ -472,7 +472,7 @@ def _is_server_stamped_option_path(path: str) -> bool:
 def _provenance_for_path(path: str, value: object) -> DecisionProvenance:
     if _is_server_stamped_option_path(path):
         # source_authoring.* / interpretation_requirements /
-        # prompt_template_parts / resolved_prompt_template_hash are written by
+        # prompt_template_parts / approved_prompt_artifact_hash are written by
         # ELSPETH's provenance and review machinery, never chosen by the
         # planner — attributing them to the composer misinforms the auditor
         # (elspeth-c67fbbbd83).

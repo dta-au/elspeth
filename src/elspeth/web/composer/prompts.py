@@ -311,7 +311,7 @@ def project_server_owned_option_metadata(serialized: dict[str, Any]) -> dict[str
     ``provider_current_state`` in ``service.py``) so a read-modify-write over
     what the planner sees is round-trippable into ``set_pipeline``. Drops
     ``source_authoring``, ``prompt_template_parts`` and
-    ``resolved_prompt_template_hash`` from every source/node/output options
+    ``approved_prompt_artifact_hash`` from every source/node/output options
     block, and reduces each ``interpretation_requirements`` row to the
     planner-context projection (id/kind/user_term/draft/status) — resolved
     vs pending stays legible without echoing resolver-owned linkage. Never

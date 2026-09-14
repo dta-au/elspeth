@@ -582,7 +582,7 @@ class TestCallLoader:
             "response_ref": None,
             "error_json": None,
             "latency_ms": None,
-            "resolved_prompt_template_hash": None,
+            "approved_prompt_artifact_hash": None,
             "prompt_tokens": None,
             "completion_tokens": None,
             "cached_prompt_tokens": None,
@@ -602,12 +602,12 @@ class TestCallLoader:
         assert result.state_id == "state-1"
         assert result.operation_id is None
 
-    def test_maps_resolved_prompt_template_hash(self) -> None:
+    def test_maps_approved_prompt_artifact_hash(self) -> None:
         """CallLoader must carry the cross-DB prompt-hash anchor (elspeth-543ee35ed3)."""
         digest = "a" * 64
-        sa_row = self._make_call_row(call_type="llm", resolved_prompt_template_hash=digest)
+        sa_row = self._make_call_row(call_type="llm", approved_prompt_artifact_hash=digest)
         result = CallLoader().load(sa_row)
-        assert result.resolved_prompt_template_hash == digest
+        assert result.approved_prompt_artifact_hash == digest
 
     @pytest.mark.parametrize("field", ["prompt_tokens", "completion_tokens", "cached_prompt_tokens", "reasoning_tokens"])
     @pytest.mark.parametrize("value", [-1, True, "3", 1.5])

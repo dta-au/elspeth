@@ -51,7 +51,7 @@ function makePendingEvent(overrides: Partial<InterpretationEvent> = {}): Interpr
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
     ...overrides,
   };
 }
@@ -153,7 +153,7 @@ describe("api/client interpretation functions", () => {
         resolved_at: "2026-05-18T00:01:00Z",
         arguments_hash: "abc123",
         hash_domain_version: "v1",
-        resolved_prompt_template_hash: "fedcba",
+        approved_prompt_artifact_hash: "fedcba",
       });
       const body: InterpretationResolveResponse = {
         event: resolved,

@@ -172,4 +172,10 @@ async def test_opted_out_session_still_records_surface_specific_rows(composer_te
     assert all(event.hash_domain_version == "v2" for event in surface_opt_outs)
     assert all(event.arguments_hash is not None for event in surface_opt_outs)
     prompt_event = next(event for event in surface_opt_outs if event.kind is InterpretationKind.LLM_PROMPT_TEMPLATE)
-    assert prompt_event.resolved_prompt_template_hash == stable_hash(prompt_event.accepted_value)
+    assert prompt_event.approved_prompt_artifact_hash == stable_hash(
+        {
+            "domain": "elspeth.approved-prompt-artifact.v1",
+            "system_prompt": None,
+            "queries": [(None, prompt_event.accepted_value)],
+        }
+    )

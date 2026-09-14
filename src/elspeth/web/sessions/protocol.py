@@ -1353,7 +1353,7 @@ class SessionPendingInterpretationDecision:
     arguments_hash: str | None = None
     hash_domain_version: str | None = None
     interpretation_source: InterpretationSource | None = None
-    resolved_prompt_template_hash: str | None = None
+    approved_prompt_artifact_hash: str | None = None
     ensure_opt_out_marker: bool = False
     appended_state: SessionCompositionStateCreation | None = None
 
@@ -1377,7 +1377,7 @@ class SessionPendingInterpretationDecision:
                         self.arguments_hash,
                         self.hash_domain_version,
                         self.interpretation_source,
-                        self.resolved_prompt_template_hash,
+                        self.approved_prompt_artifact_hash,
                         self.appended_state,
                     )
                 )
@@ -1395,7 +1395,7 @@ class SessionPendingInterpretationDecision:
                 or self.resolved_at is not None
                 or self.arguments_hash is not None
                 or self.hash_domain_version is not None
-                or self.resolved_prompt_template_hash is not None
+                or self.approved_prompt_artifact_hash is not None
                 or self.ensure_opt_out_marker
                 or self.appended_state is not None
             ):
@@ -1410,8 +1410,8 @@ class SessionPendingInterpretationDecision:
                 raise AuditIntegrityError("automatic opt-out decisions require the v2 lowercase SHA-256 argument binding")
             if not self.ensure_opt_out_marker or self.appended_state is None:
                 raise AuditIntegrityError("automatic opt-out decisions require the marker and appended state")
-            if self.resolved_prompt_template_hash is not None and not is_lower_sha256_hex(self.resolved_prompt_template_hash):
-                raise AuditIntegrityError("resolved prompt-template hash must be lowercase SHA-256 or None")
+            if self.approved_prompt_artifact_hash is not None and not is_lower_sha256_hex(self.approved_prompt_artifact_hash):
+                raise AuditIntegrityError("approved prompt artifact hash must be lowercase SHA-256 or None")
             return
         raise AuditIntegrityError("pending interpretation decision choice/source pairing is invalid")
 
@@ -3422,7 +3422,7 @@ class SessionOperationInterpretationMutations(Protocol):
         hash_domain_version: str,
         runtime_model_identifier: str | None,
         runtime_model_version: str | None,
-        resolved_prompt_template_hash: str | None,
+        approved_prompt_artifact_hash: str | None,
     ) -> None: ...
 
 

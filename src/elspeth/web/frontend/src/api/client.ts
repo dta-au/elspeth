@@ -907,16 +907,27 @@ export async function recompose(
  * returns an in-memory initial GuidedSession and Step 1 turn without creating
  * a composition-state version.
  */
+export function getGuided(
+  sessionId: string,
+  signal: AbortSignal | undefined,
+  probe: true,
+): Promise<GetGuidedResponse | null>;
+export function getGuided(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<GetGuidedResponse>;
 export async function getGuided(
   sessionId: string,
   signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided`, {
+  probe = false,
+): Promise<GetGuidedResponse | null> {
+  const response = await fetch(`/api/sessions/${sessionId}/guided${probe ? "?probe=true" : ""}`, {
     method: "GET",
     headers: authHeaders(),
     signal,
   });
-  return decodeGetGuidedResponse(await parseResponse<unknown>(response));
+  const body = await parseResponse<unknown>(response);
+  return probe && body === null ? null : decodeGetGuidedResponse(body);
 }
 
 /**

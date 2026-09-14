@@ -3140,7 +3140,7 @@ class TestDelegationSignatureAlignment:
 
 
 class TestResolvedPromptTemplateHashAnchor:
-    """A bad resolved_prompt_template_hash must leave zero `calls` rows.
+    """A bad approved_prompt_artifact_hash must leave zero `calls` rows.
 
     Regression for elspeth-a94e626a36: the hash anchor was inserted into `calls`
     before Call.__post_init__ validated it, so a non-LLM or malformed hash
@@ -3172,7 +3172,7 @@ class TestResolvedPromptTemplateHashAnchor:
                 CallType.HTTP,
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "hello"}),
-                resolved_prompt_template_hash="a" * 64,
+                approved_prompt_artifact_hash="a" * 64,
                 member_token=_leader_token(repo).membership,
                 work_item=_work_item_for_state(repo, state.state_id),
             )
@@ -3192,7 +3192,7 @@ class TestResolvedPromptTemplateHashAnchor:
                 CallType.LLM,
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "hello"}),
-                resolved_prompt_template_hash="not-a-valid-sha256",
+                approved_prompt_artifact_hash="not-a-valid-sha256",
                 member_token=_leader_token(repo).membership,
                 work_item=_work_item_for_state(repo, state.state_id),
             )
@@ -3208,7 +3208,7 @@ class TestResolvedPromptTemplateHashAnchor:
                 CallType.HTTP,
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "hello"}),
-                resolved_prompt_template_hash="a" * 64,
+                approved_prompt_artifact_hash="a" * 64,
                 coordination_token=_leader_token(repo),
             )
         assert self._calls_row_count(db) == 0
@@ -3223,7 +3223,7 @@ class TestResolvedPromptTemplateHashAnchor:
                 CallType.LLM,
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "hello"}),
-                resolved_prompt_template_hash="ABC",
+                approved_prompt_artifact_hash="ABC",
                 coordination_token=_leader_token(repo),
             )
         assert self._calls_row_count(db) == 0
@@ -3242,11 +3242,11 @@ class TestResolvedPromptTemplateHashAnchor:
             CallType.LLM,
             CallStatus.SUCCESS,
             RawCallPayload({"prompt": "hello"}),
-            resolved_prompt_template_hash="a" * 64,
+            approved_prompt_artifact_hash="a" * 64,
             member_token=_leader_token(repo).membership,
             work_item=_work_item_for_state(repo, state.state_id),
         )
-        assert call.resolved_prompt_template_hash == "a" * 64
+        assert call.approved_prompt_artifact_hash == "a" * 64
         assert self._calls_row_count(db) == 1
 
 

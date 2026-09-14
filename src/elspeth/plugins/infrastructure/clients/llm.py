@@ -418,7 +418,7 @@ class AuditedLLMClient(AuditedClientBase):
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Make chat completion call with automatic audit recording.
@@ -430,12 +430,12 @@ class AuditedLLMClient(AuditedClientBase):
                 projection.
             temperature: Sampling temperature (default: 0.0 for determinism)
             max_tokens: Maximum tokens to generate (optional)
-            resolved_prompt_template_hash: Phase 5b Task 9 cross-DB anchor.
+            approved_prompt_artifact_hash: Phase 5b Task 9 cross-DB anchor.
                 When the LLM transform is downstream of a resolved
                 interpretation event, the runtime reads the SHA-256 from
-                ``options.resolved_prompt_template_hash`` on the node config
+                ``options.approved_prompt_artifact_hash`` on the node config
                 and forwards it here. Persisted to
-                ``calls.resolved_prompt_template_hash`` on every call this
+                ``calls.approved_prompt_artifact_hash`` on every call this
                 method records (SUCCESS or ERROR), making the cross-DB
                 hash join discoverable from any LLM-call audit row.
                 ``None`` for non-interpretation LLM transforms.
@@ -501,7 +501,7 @@ class AuditedLLMClient(AuditedClientBase):
                     retryable=is_retryable,
                 ),
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=usage,
             )
 
@@ -569,7 +569,7 @@ class AuditedLLMClient(AuditedClientBase):
                     retryable=False,
                 ),
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=usage,
             )
             # Telemetry emitted AFTER successful Landscape recording — without
@@ -607,7 +607,7 @@ class AuditedLLMClient(AuditedClientBase):
                     retryable=False,
                 ),
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=usage,
             )
 
@@ -645,7 +645,7 @@ class AuditedLLMClient(AuditedClientBase):
                     retryable=False,
                 ),
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=usage,
             )
             # Telemetry emitted AFTER successful Landscape recording — keeps
@@ -688,7 +688,7 @@ class AuditedLLMClient(AuditedClientBase):
                     retryable=False,
                 ),
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=usage,
             )
             # Telemetry emitted AFTER successful Landscape recording -- keeps
@@ -729,7 +729,7 @@ class AuditedLLMClient(AuditedClientBase):
                         retryable=False,
                     ),
                     latency_ms=latency_ms,
-                    resolved_prompt_template_hash=resolved_prompt_template_hash,
+                    approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                     token_usage=usage,
                 )
                 # Telemetry emitted AFTER successful Landscape recording — keeps
@@ -769,7 +769,7 @@ class AuditedLLMClient(AuditedClientBase):
                     retryable=False,
                 ),
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=usage,
             )
 
@@ -809,7 +809,7 @@ class AuditedLLMClient(AuditedClientBase):
                     retryable=False,
                 ),
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=usage,
             )
             # Telemetry emitted AFTER successful Landscape recording — keeps
@@ -842,7 +842,7 @@ class AuditedLLMClient(AuditedClientBase):
             request_data=request_dto,
             response_data=response_dto,
             latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=usage,
         )
 

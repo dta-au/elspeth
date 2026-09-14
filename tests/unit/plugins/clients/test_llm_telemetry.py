@@ -139,7 +139,7 @@ class FakeCallRecorder:
         *,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
@@ -155,7 +155,7 @@ class FakeCallRecorder:
             "latency_ms": latency_ms,
             "request_ref": request_ref,
             "response_ref": response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
         }
         if self.record_call_observer is not None:
             self.record_call_observer(call_kwargs)
@@ -177,7 +177,7 @@ class FakeCallRecorder:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         coordination_token: CoordinationToken,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
@@ -193,7 +193,7 @@ class FakeCallRecorder:
             "latency_ms": latency_ms,
             "request_ref": request_ref,
             "response_ref": response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
         }
         if self.record_call_observer is not None:
             self.record_call_observer(call_kwargs)
@@ -214,7 +214,7 @@ class FakeCallRecorder:
             state_id=call_kwargs.get("state_id"),
             operation_id=call_kwargs.get("operation_id"),
             latency_ms=call_kwargs["latency_ms"],
-            resolved_prompt_template_hash=call_kwargs["resolved_prompt_template_hash"],
+            approved_prompt_artifact_hash=call_kwargs["approved_prompt_artifact_hash"],
         )
 
 

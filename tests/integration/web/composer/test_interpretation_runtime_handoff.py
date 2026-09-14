@@ -2,21 +2,21 @@
 
 Verifies the runtime-side half of the Option A hash-anchored cross-DB linkage:
 when an LLM transform that originated from a resolved interpretation event
-makes its LLM call at runtime, the Landscape ``calls.resolved_prompt_template_hash``
+makes its LLM call at runtime, the Landscape ``calls.approved_prompt_artifact_hash``
 column gets populated with the same SHA-256 that
-``interpretation_events.resolved_prompt_template_hash`` carries in the session
+``interpretation_events.approved_prompt_artifact_hash`` carries in the session
 DB.
 
 Test shape (per spec ``docs/composer/ux-redesign-2026-05/18a-phase-5b-backend.md``
 lines 2941-2982):
 
 1. Seed the session DB with a resolved interpretation event whose
-   ``resolved_prompt_template_hash`` we capture.
+   ``approved_prompt_artifact_hash`` we capture.
 2. Drive an audited LLM call against an in-memory Landscape DB, passing the
    same hash through the public hand-off kwarg. Azure uses
    ``AuditedLLMClient.chat_completion`` directly; OpenRouter records a logical
    ``CallType.LLM`` row around its HTTP transport.
-3. Read back ``calls.resolved_prompt_template_hash`` from the Landscape DB and
+3. Read back ``calls.approved_prompt_artifact_hash`` from the Landscape DB and
    assert byte equality with the session DB value.
 4. External-recompute step (spec step 9): compute
    ``stable_hash(resolved_template_str)`` over the prompt-template string
@@ -246,7 +246,7 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     # node carrying the placeholder, a pending interpretation event, and
     # resolve it. ``resolve_interpretation_event`` writes
     # ``options.prompt_template`` (patched) and
-    # ``options.resolved_prompt_template_hash`` into the new state row.
+    # ``options.approved_prompt_artifact_hash`` into the new state row.
     service, _ = _make_session_service()
     sid = uuid.uuid4()
     with service._engine.begin() as conn:
@@ -311,10 +311,10 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     )
 
     # Step 6 (spec): session-side read — non-NULL hash, capture for the join.
-    assert resolved.resolved_prompt_template_hash is not None, (
-        "resolve_interpretation_event MUST populate resolved_prompt_template_hash on the session-DB row at resolve time"
+    assert resolved.approved_prompt_artifact_hash is not None, (
+        "resolve_interpretation_event MUST populate approved_prompt_artifact_hash on the session-DB row at resolve time"
     )
-    session_hash: str = resolved.resolved_prompt_template_hash
+    session_hash: str = resolved.approved_prompt_artifact_hash
     assert len(session_hash) == 64
 
     # Round-trip + production-shape check: the resolved hash must land on
@@ -325,14 +325,14 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     assert cs.nodes, "Resolved state must contain the patched LLM node"
     patched_options = cs.nodes[0].options
     assert patched_options["prompt_template"] == resolved_template
-    assert patched_options["resolved_prompt_template_hash"] == session_hash
+    assert patched_options["approved_prompt_artifact_hash"] == session_hash
 
     # ── Landscape side: instantiate a real in-memory Landscape DB +
     # recorder, register a run/source/transform node + node_state, then
     # drive an audited LLM call carrying the same hash. This is the L3
     # plugin's hand-off point: the provider reads
-    # ``self._resolved_prompt_template_hash`` (snapshotted from
-    # ``LLMConfig.resolved_prompt_template_hash`` at transform construction)
+    # ``self._approved_prompt_artifact_hash`` (snapshotted from
+    # ``LLMConfig.approved_prompt_artifact_hash`` at transform construction)
     # and Azure passes it to ``client.chat_completion``.
     db = LandscapeDB.in_memory()
     factory = RecorderFactory(db)
@@ -408,16 +408,16 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     response = client.chat_completion(
         model="stub-model",
         messages=[ChatMessage(role="user", content=resolved_template)],
-        resolved_prompt_template_hash=session_hash,
+        approved_prompt_artifact_hash=session_hash,
     )
     assert response.content == "7 / 10"
 
     # Step 7 (spec): Landscape-side read — non-NULL hash on the LLM call row.
     with db.connection() as conn:
         landscape_row = conn.execute(select(calls_table).where(calls_table.c.state_id == node_state.state_id)).one()
-    landscape_hash = landscape_row.resolved_prompt_template_hash
+    landscape_hash = landscape_row.approved_prompt_artifact_hash
     assert landscape_hash is not None, (
-        "AuditedLLMClient.chat_completion MUST forward resolved_prompt_template_hash "
+        "AuditedLLMClient.chat_completion MUST forward approved_prompt_artifact_hash "
         f"to the Landscape calls row when non-None at the public API. "
         f"run_id={run.run_id} state_id={node_state.state_id} session_hash={session_hash}"
     )
@@ -433,14 +433,17 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
         f"  state_id:       {node_state.state_id}"
     )
 
-    # Step 9 (spec): external recompute — read the resolved prompt template
-    # string from composition_states.nodes JSON and hash it with the same
-    # stable_hash() the production code used. This is the external audit
-    # check that proves the stored hashes match the string actually embedded
-    # in the composition state, not a hash silently computed over different
-    # bytes somewhere in the chain.
+    # Independently reconstruct the versioned effective artifact from the
+    # persisted options so an incorrect production hash builder cannot make
+    # all three storage surfaces agree on an unused template.
     embedded_template = patched_options["prompt_template"]
-    recomputed_hash = stable_hash(embedded_template)
+    recomputed_hash = stable_hash(
+        {
+            "domain": "elspeth.approved-prompt-artifact.v1",
+            "system_prompt": None,
+            "queries": [(None, embedded_template)],
+        }
+    )
     assert recomputed_hash == session_hash == landscape_hash, (
         "External recompute fails — composition_states.nodes.options.prompt_template "
         "does not match either stored hash. The stored hashes drift from the "
@@ -455,7 +458,7 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
     """OpenRouter's HTTP transport must not carry the LLM prompt hash.
 
     Regression guard for the live execution crash where
-    ``resolved_prompt_template_hash`` leaked onto an ``http`` call row and
+    ``approved_prompt_artifact_hash`` leaked onto an ``http`` call row and
     tripped the ``Call`` invariant before the logical LLM audit row could be
     written.
     """
@@ -519,7 +522,7 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
         recorder=factory.execution,
         run_id=run.run_id,
         telemetry_emit=lambda event: None,
-        resolved_prompt_template_hash=session_hash,
+        approved_prompt_artifact_hash=session_hash,
     )
     monkeypatch.setattr("elspeth.plugins.infrastructure.clients.http.httpx.Client", _FakeHTTPXClient)
 
@@ -539,14 +542,14 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
     assert result.content == "7 / 10"
     with db.connection() as conn:
         rows = conn.execute(
-            select(calls_table.c.call_type, calls_table.c.resolved_prompt_template_hash)
+            select(calls_table.c.call_type, calls_table.c.approved_prompt_artifact_hash)
             .where(calls_table.c.state_id == node_state.state_id)
             .order_by(calls_table.c.call_index)
         ).all()
 
     assert [row.call_type for row in rows].count("http") == 1
-    assert [row.resolved_prompt_template_hash for row in rows if row.call_type == "http"] == [None]
-    assert [row.resolved_prompt_template_hash for row in rows if row.call_type == "llm"] == [session_hash]
+    assert [row.approved_prompt_artifact_hash for row in rows if row.call_type == "http"] == [None]
+    assert [row.approved_prompt_artifact_hash for row in rows if row.call_type == "llm"] == [session_hash]
 
 
 @pytest.mark.asyncio
@@ -636,7 +639,7 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
 
     with db.connection() as conn:
         landscape_row = conn.execute(select(calls_table).where(calls_table.c.state_id == node_state.state_id)).one()
-    assert landscape_row.resolved_prompt_template_hash is None
+    assert landscape_row.approved_prompt_artifact_hash is None
 
 
 @pytest.mark.asyncio
@@ -644,9 +647,9 @@ async def test_session_db_records_match_runtime_landscape_join() -> None:
     """Reverse-direction lookup: given a Landscape calls row, the hash
     points to exactly one interpretation_events row.
 
-    This is the auditor's traversal: ``calls.resolved_prompt_template_hash``
-    → ``interpretation_events WHERE resolved_prompt_template_hash = ?``.
-    Verifies the index ``ix_calls_resolved_prompt_template_hash`` and the
+    This is the auditor's traversal: ``calls.approved_prompt_artifact_hash``
+    → ``interpretation_events WHERE approved_prompt_artifact_hash = ?``.
+    Verifies the index ``ix_calls_approved_prompt_artifact_hash`` and the
     session-side column are populated consistently.
     """
     service, engine = _make_session_service()
@@ -705,14 +708,14 @@ async def test_session_db_records_match_runtime_landscape_join() -> None:
         runtime_model_identifier="anthropic/claude-opus-4-7",
         runtime_model_version="2026-05-01",
     )
-    target_hash = resolved.resolved_prompt_template_hash
+    target_hash = resolved.approved_prompt_artifact_hash
     assert target_hash is not None
 
     # Reverse query in the session DB: given a Landscape hash, find the
     # matching interpretation_events row.
     with engine.begin() as conn:
         matches = conn.execute(
-            select(interpretation_events_table).where(interpretation_events_table.c.resolved_prompt_template_hash == target_hash)
+            select(interpretation_events_table).where(interpretation_events_table.c.approved_prompt_artifact_hash == target_hash)
         ).all()
     assert len(matches) == 1, f"Cross-DB join must resolve to exactly one event; got {len(matches)} for hash {target_hash}"
     assert str(matches[0].id) == str(resolved.id)

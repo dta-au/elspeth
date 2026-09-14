@@ -813,7 +813,7 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                         ("hash_domain_version", inspect.Parameter.KEYWORD_ONLY, str),
                         ("runtime_model_identifier", inspect.Parameter.KEYWORD_ONLY, str | None),
                         ("runtime_model_version", inspect.Parameter.KEYWORD_ONLY, str | None),
-                        ("resolved_prompt_template_hash", inspect.Parameter.KEYWORD_ONLY, str | None),
+                        ("approved_prompt_artifact_hash", inspect.Parameter.KEYWORD_ONLY, str | None),
                     ),
                     type(None),
                 ),

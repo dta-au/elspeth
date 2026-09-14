@@ -202,7 +202,7 @@ class AuditedHTTPClient(AuditedClientBase):
         response_data: CallPayload | None = None,
         error: CallPayload | None = None,
         latency_ms: float | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Sanitize HTTP error URLs at the shared audit persistence boundary."""
@@ -220,7 +220,7 @@ class AuditedHTTPClient(AuditedClientBase):
             response_data=response_data,
             error=error,
             latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
         )
 

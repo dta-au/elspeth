@@ -1514,14 +1514,14 @@ def test_runtime_hash_remains_llm_only() -> None:
     assert (
         _runtime_owned_llm_option_error(
             "passthrough",
-            {"resolved_prompt_template_hash": _SENSITIVE_SENTINEL},
+            {"approved_prompt_artifact_hash": _SENSITIVE_SENTINEL},
             tool_name="upsert_node",
         )
         is None
     )
     error = _runtime_owned_llm_option_error(
         "llm",
-        {"resolved_prompt_template_hash": _SENSITIVE_SENTINEL},
+        {"approved_prompt_artifact_hash": _SENSITIVE_SENTINEL},
         tool_name="upsert_node",
     )
     assert error is not None

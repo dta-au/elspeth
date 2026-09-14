@@ -364,7 +364,7 @@ class TestGenerateYaml:
                     "prompt_template": "Rate resolved meaning: {{ row.text }}",
                     PROMPT_TEMPLATE_PARTS_KEY: [{"kind": "text", "text": "ignored"}],
                     INTERPRETATION_REQUIREMENTS_KEY: [],
-                    "resolved_prompt_template_hash": "sha256-rfc8785-v1:abc123",
+                    "approved_prompt_artifact_hash": "sha256-rfc8785-v1:abc123",
                 },
                 condition=None,
                 routes=None,
@@ -381,7 +381,7 @@ class TestGenerateYaml:
         assert PROMPT_TEMPLATE_PARTS_KEY not in options
         assert INTERPRETATION_REQUIREMENTS_KEY not in options
         assert options["prompt_template"] == "Rate resolved meaning: {{ row.text }}"
-        assert options["resolved_prompt_template_hash"] == "sha256-rfc8785-v1:abc123"
+        assert options["approved_prompt_artifact_hash"] == "sha256-rfc8785-v1:abc123"
 
     def test_generate_pipeline_dict_emits_sources_mapping_for_named_sources(self) -> None:
         state = _make_named_sources_pipeline()
@@ -1979,7 +1979,7 @@ class TestConditionalKeyGuards:
 
 
 class TestProfileLoweringProvenanceStrip:
-    """Scoped export strip for resolved_prompt_template_hash (elspeth-b73666ac82).
+    """Scoped export strip for approved_prompt_artifact_hash (elspeth-b73666ac82).
 
     The batch/CLI loader's profile-lowering pass rejects any llm component
     that both selects a ``profile`` and carries a private profile field, so a
@@ -2009,7 +2009,7 @@ class TestProfileLoweringProvenanceStrip:
                     options={
                         "profile": "standard",
                         "prompt_template": prompt,
-                        "resolved_prompt_template_hash": "a" * 64,
+                        "approved_prompt_artifact_hash": "a" * 64,
                     },
                     condition=None,
                     routes=None,
@@ -2028,7 +2028,7 @@ class TestProfileLoweringProvenanceStrip:
                     options={
                         "provider": "openrouter",
                         "prompt_template": prompt,
-                        "resolved_prompt_template_hash": "b" * 64,
+                        "approved_prompt_artifact_hash": "b" * 64,
                     },
                     condition=None,
                     routes=None,
@@ -2061,20 +2061,20 @@ class TestProfileLoweringProvenanceStrip:
     def test_profile_selecting_llm_node_exports_without_the_hash(self) -> None:
         doc = generate_pipeline_dict(self._state_with_llm_nodes())
         transforms = self._transforms_by_name(doc)
-        assert "resolved_prompt_template_hash" not in transforms["profiled"]["options"]
+        assert "approved_prompt_artifact_hash" not in transforms["profiled"]["options"]
         assert transforms["profiled"]["options"]["profile"] == "standard"
 
     def test_plain_provider_llm_node_keeps_the_hash(self) -> None:
         doc = generate_pipeline_dict(self._state_with_llm_nodes())
         transforms = self._transforms_by_name(doc)
-        assert transforms["plain"]["options"]["resolved_prompt_template_hash"] == "b" * 64
+        assert transforms["plain"]["options"]["approved_prompt_artifact_hash"] == "b" * 64
 
     def test_public_yaml_matches_the_scoped_strip(self) -> None:
         rendered = generate_public_yaml(self._state_with_llm_nodes())
         doc = yaml.safe_load(rendered)
         transforms = self._transforms_by_name(doc)
-        assert "resolved_prompt_template_hash" not in transforms["profiled"]["options"]
-        assert transforms["plain"]["options"]["resolved_prompt_template_hash"] == "b" * 64
+        assert "approved_prompt_artifact_hash" not in transforms["profiled"]["options"]
+        assert transforms["plain"]["options"]["approved_prompt_artifact_hash"] == "b" * 64
 
 
 class TestPublicExportRedactionMarker:

@@ -1052,7 +1052,7 @@ class SinkEffectLifecycle:
                 request_ref=None,
                 response_hash=response_hash,
                 response_ref=None,
-                resolved_prompt_template_hash=None,
+                approved_prompt_artifact_hash=None,
                 error_json=error_json,
                 latency_ms=latency_ms,
                 created_at=now(),

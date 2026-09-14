@@ -58,7 +58,7 @@ function makePendingEvent(overrides: Partial<InterpretationEvent> = {}): Interpr
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
     ...overrides,
   };
 }

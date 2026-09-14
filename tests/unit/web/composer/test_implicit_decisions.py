@@ -471,7 +471,7 @@ def test_server_stamped_source_metadata_attributes_to_the_server() -> None:
 
 
 def test_server_stamped_node_metadata_attributes_to_the_server() -> None:
-    """The node-side server-owned keys (``resolved_prompt_template_hash``,
+    """The node-side server-owned keys (``approved_prompt_artifact_hash``,
     ``prompt_template_parts``) attribute honestly too, and only when rooted at
     the TOP-LEVEL options segment."""
     state = CompositionState(
@@ -487,9 +487,9 @@ def test_server_stamped_node_metadata_attributes_to_the_server() -> None:
                 options=deep_freeze(
                     {
                         "prompt_template": "Tone: warm",
-                        "resolved_prompt_template_hash": "b" * 64,
+                        "approved_prompt_artifact_hash": "b" * 64,
                         "prompt_template_parts": [{"kind": "text", "text": "Tone: warm"}],
-                        "nested": {"resolved_prompt_template_hash": "not-server-owned"},
+                        "nested": {"approved_prompt_artifact_hash": "not-server-owned"},
                         "schema": {"mode": "observed"},
                     }
                 ),
@@ -509,9 +509,9 @@ def test_server_stamped_node_metadata_attributes_to_the_server() -> None:
     report = build_implicit_decisions_report(state)
     by_path = {str(entry["path"]): dict(entry) for entry in report["entries"]}
 
-    assert by_path["node.model.options.resolved_prompt_template_hash"]["provenance"] == "server_stamped"
+    assert by_path["node.model.options.approved_prompt_artifact_hash"]["provenance"] == "server_stamped"
     assert by_path["node.model.options.prompt_template_parts"]["provenance"] == "server_stamped"
     # A NESTED key that merely reuses a server-owned name is an ordinary
     # plugin option — the stamp applies to the top-level options segment only.
-    assert by_path["node.model.options.nested.resolved_prompt_template_hash"]["provenance"] == "composer_selected"
+    assert by_path["node.model.options.nested.approved_prompt_artifact_hash"]["provenance"] == "composer_selected"
     assert by_path["node.model.options.prompt_template"]["provenance"] == "composer_selected"

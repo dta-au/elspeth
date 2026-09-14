@@ -7336,7 +7336,27 @@ class TestStateRoutes:
 class TestGuidedBootstrapStateVersions:
     """Regression coverage for guided bootstrap not polluting state history."""
 
-    def test_get_guided_does_not_persist_empty_initial_state(self, tmp_path) -> None:
+    def test_freeform_guided_probe_is_successful_and_non_mutating(self, tmp_path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Freeform"}).json()["id"]
+        asyncio.run(
+            service.save_composition_state(
+                uuid.UUID(session_id),
+                CompositionStateData(is_valid=True, metadata_={"name": "Freeform", "description": ""}),
+                provenance="session_seed",
+            )
+        )
+        before = client.get(f"/api/sessions/{session_id}/state/versions").json()
+        strict = client.get(f"/api/sessions/{session_id}/guided")
+        assert strict.status_code == 400
+        probe = client.get(f"/api/sessions/{session_id}/guided?probe=true")
+        assert probe.status_code == 200
+        assert probe.json() is None
+        assert client.get(f"/api/sessions/{session_id}/state/versions").json() == before
+
+    @pytest.mark.parametrize("query", ["", "?probe=true"])
+    def test_get_guided_does_not_persist_empty_initial_state(self, tmp_path, query) -> None:
         """Auto-starting guided mode must not create an empty v1 graph.
 
         The frontend calls GET /guided automatically when a session is created
@@ -7354,7 +7374,7 @@ class TestGuidedBootstrapStateVersions:
         resp = client.post("/api/sessions", json={"title": "Guided"})
         session_id = resp.json()["id"]
 
-        guided_resp = client.get(f"/api/sessions/{session_id}/guided")
+        guided_resp = client.get(f"/api/sessions/{session_id}/guided{query}")
         assert guided_resp.status_code == 200
         guided_body = guided_resp.json()
         assert guided_body["next_turn"] is not None
@@ -7374,7 +7394,8 @@ class TestGuidedBootstrapStateVersions:
         assert versions_resp.status_code == 200
         assert versions_resp.json() == []
 
-    def test_get_guided_rejected_proposal_reference_fails_closed_without_mutation(self, tmp_path) -> None:
+    @pytest.mark.parametrize("query", ["", "?probe=true"])
+    def test_get_guided_rejected_proposal_reference_fails_closed_without_mutation(self, tmp_path, query) -> None:
         """elspeth-4dc78b3897: GET must not reconcile a rejected reference.
 
         A terminally rejected proposal row behind a still-active checkpoint
@@ -7401,7 +7422,7 @@ class TestGuidedBootstrapStateVersions:
 
         client = TestClient(app)
         with pytest.raises(AuditIntegrityError, match="unexpectedly terminal"):
-            client.get(f"/api/sessions/{session_id}/guided")
+            client.get(f"/api/sessions/{session_id}/guided{query}")
 
         after_versions = [record.id for record in asyncio.run(service.get_state_versions(session_id))]
         assert after_versions == before_versions, "GET must not allocate a composition state"

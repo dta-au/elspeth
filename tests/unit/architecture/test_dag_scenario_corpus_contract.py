@@ -683,7 +683,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # runtime counts and the separate frozen semantic snapshots remain unchanged.
 # Full audit projections also bind the changed exporter settings and manifest
 # record count; a controlled reversal reproduces every former material/hash.
-EXPECTED_CASE_REGISTRY_SHA256 = "0388f63e24167d1f01f09d8e766f8104285f1fe07af4743ec7241d7f15428c04"
+# Rotated for the approval-artifact audit field rename: canonical call material
+# now sorts approved_prompt_artifact_hash first. The terminal resume digest was
+# measured through the production harness; semantic oracle snapshots did not move.
+EXPECTED_CASE_REGISTRY_SHA256 = "8dce7592056dc5ff168f65c5c9df7084c1d2bedcd93fdeeb7350b1954b5b9aad"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

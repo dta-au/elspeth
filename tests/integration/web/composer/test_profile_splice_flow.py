@@ -310,16 +310,16 @@ def test_profile_splice_flow_is_valid_review_aware_and_private_binding_safe(
 
     # Round-trip contract (elspeth-b73666ac82): the sanctioned public export is
     # a re-runnable artifact. The AUTHORED state carries the server-written
-    # resolved_prompt_template_hash on the profile-selecting llm node; the
+    # approved_prompt_artifact_hash on the profile-selecting llm node; the
     # EXPORT must strip it (it is a private profile field the batch/CLI
     # loader rejects with ValueError('private_profile_option')), and the
     # exported document must load once the operator supplies the profile map.
     authored_llm = next(node for node in result.updated_state.nodes if node.plugin == "llm")
-    assert "resolved_prompt_template_hash" in authored_llm.options
+    assert "approved_prompt_artifact_hash" in authored_llm.options
     exported = yaml.safe_load(surfaces["yaml"])
     exported_llm = next(t for t in exported["transforms"] if t["plugin"] == "llm")
     assert exported_llm["options"]["profile"] == "llm-default"
-    assert "resolved_prompt_template_hash" not in exported_llm["options"]
+    assert "approved_prompt_artifact_hash" not in exported_llm["options"]
     exported["llm_profiles"] = {
         "llm-default": {
             "provider": "gateway",

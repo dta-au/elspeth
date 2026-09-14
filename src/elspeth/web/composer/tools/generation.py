@@ -1025,8 +1025,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"transform_missing_on_success|Transform '(.+)' is missing required field 'on_success'",
         "Every transform must route its successful rows somewhere.",
-        "Set the transform's on_success to the next connection or sink name; use on_error='discard' unless failed rows need a "
-        "quarantine sink. A transform on a fork branch that rejoins at a coalesce must publish the connection named by that "
+        "Set the transform's on_success to the next connection or sink name; preserve its separately chosen on_error policy. "
+        "A transform on a fork branch that rejoins at a coalesce must publish the connection named by that "
         "coalesce's branches value for its branch — not a sink.",
     ),
     (

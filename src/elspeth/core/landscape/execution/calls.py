@@ -20,7 +20,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import Call, CallStatus, CallType, FrameworkBugError
-from elspeth.contracts.audit import validate_resolved_prompt_template_hash
+from elspeth.contracts.audit import validate_approved_prompt_artifact_hash
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
@@ -432,7 +432,7 @@ class CallAuditRepository:
         work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record an external call for a node state.
@@ -452,11 +452,11 @@ class CallAuditRepository:
                 and Anthropic cache measures remain in response_data evidence.
             request_ref: Optional payload store reference for request
             response_ref: Optional payload store reference for response
-            resolved_prompt_template_hash: Cross-DB hash anchor (Phase 5b Task 9).
+            approved_prompt_artifact_hash: Cross-DB hash anchor (Phase 5b Task 9).
                 When this LLM-transform call is downstream of an interpretation
                 event the L3 plugin forwards the SHA-256 of the resolved prompt
                 template string here; the value MUST equal
-                ``interpretation_events.resolved_prompt_template_hash`` in the
+                ``interpretation_events.approved_prompt_artifact_hash`` in the
                 session audit DB for the same resolved string. ``None`` for
                 non-LLM calls or for LLM transforms not downstream of an
                 interpretation event.
@@ -477,7 +477,7 @@ class CallAuditRepository:
         # AFTER execute_insert — a bad hash would commit to `calls` and only then
         # raise. Checking here keeps the audit trail pristine (Tier 1): a bad
         # hash leaves zero rows (elspeth-a94e626a36).
-        validate_resolved_prompt_template_hash(call_type, resolved_prompt_template_hash)
+        validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
         if not isinstance(token_usage, TokenUsage):
             raise TypeError("token_usage must be TokenUsage")
 
@@ -502,7 +502,7 @@ class CallAuditRepository:
             "request_ref": prepared.request_ref,
             "response_hash": prepared.response_hash,
             "response_ref": prepared.response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "prompt_tokens": token_usage.prompt_tokens,
             "completion_tokens": token_usage.completion_tokens,
             "cached_prompt_tokens": token_usage.cached_prompt_tokens,
@@ -575,7 +575,7 @@ class CallAuditRepository:
             response_ref=response_ref,
             error_json=prepared.error_json,
             latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             prompt_tokens=token_usage.prompt_tokens,
             completion_tokens=token_usage.completion_tokens,
             cached_prompt_tokens=token_usage.cached_prompt_tokens,
@@ -596,7 +596,7 @@ class CallAuditRepository:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         """Record an external call made during an operation.
@@ -625,7 +625,7 @@ class CallAuditRepository:
         # state-parented record_call for rationale): a bad hash must leave zero
         # `calls` rows rather than commit and then raise from Call.__post_init__
         # (elspeth-a94e626a36).
-        validate_resolved_prompt_template_hash(call_type, resolved_prompt_template_hash)
+        validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
         if not isinstance(token_usage, TokenUsage):
             raise TypeError("token_usage must be TokenUsage")
 
@@ -652,7 +652,7 @@ class CallAuditRepository:
             "request_ref": prepared.request_ref,
             "response_hash": prepared.response_hash,
             "response_ref": prepared.response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "prompt_tokens": token_usage.prompt_tokens,
             "completion_tokens": token_usage.completion_tokens,
             "cached_prompt_tokens": token_usage.cached_prompt_tokens,
@@ -725,7 +725,7 @@ class CallAuditRepository:
             response_ref=response_ref,
             error_json=prepared.error_json,
             latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             prompt_tokens=token_usage.prompt_tokens,
             completion_tokens=token_usage.completion_tokens,
             cached_prompt_tokens=token_usage.cached_prompt_tokens,

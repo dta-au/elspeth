@@ -185,7 +185,7 @@ def test_exact_authoring_payload_validates_and_omits_server_owned_review_fields(
             _node(
                 options={
                     "model": model,
-                    "resolved_prompt_template_hash": "server-owned-node-hash",
+                    "approved_prompt_artifact_hash": "server-owned-node-hash",
                     INTERPRETATION_REQUIREMENTS_KEY: [resolved],
                     "schema": {"mode": "observed"},
                 }
@@ -201,7 +201,7 @@ def test_exact_authoring_payload_validates_and_omits_server_owned_review_fields(
     assert "version" not in result.data
     assert "inspection" not in result.data
     options = result.data["nodes"][0]["options"]
-    assert "resolved_prompt_template_hash" not in options
+    assert "approved_prompt_artifact_hash" not in options
     shell = options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert shell == {
         "kind": InterpretationKind.LLM_MODEL_CHOICE.value,

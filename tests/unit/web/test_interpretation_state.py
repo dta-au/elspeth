@@ -12,6 +12,7 @@ import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.hashing import stable_hash
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -21,6 +22,7 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_USER_TERM,
     SOURCE_AUTHORING_KEY,
     InterpretationReviewPending,
+    approved_prompt_artifact_hash_from_options,
     interpretation_sites,
     materialize_state_for_authoring,
     materialize_state_for_execution,
@@ -411,7 +413,9 @@ def test_resolved_requirement_materializes_prompt_and_hash() -> None:
     materialized_prompt = materialized.nodes[0].options["prompt_template"]
     assert materialized_prompt == prompt
     # Node-level hash remains the final-prompt-string hash (runtime reads it).
-    assert materialized.nodes[0].options["resolved_prompt_template_hash"] == stable_hash(prompt)
+    assert materialized.nodes[0].options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(
+        prompt_template=prompt, system_prompt=None
+    )
 
 
 def test_pending_invented_source_requirement_blocks_execution() -> None:
@@ -3297,9 +3301,8 @@ def test_multi_query_execution_guard_accepts_the_surface_anchor_and_keeps_the_ru
     materialized = materialize_state_for_execution(_state_with_llm(options))
 
     assert isinstance(materialized, CompositionState)
-    # The node-level runtime hash the plugin re-validates is still the text hash
-    # of prompt_template (LLMConfig demands exactly that); only the REVIEW anchor widened.
-    assert materialized.nodes[0].options["resolved_prompt_template_hash"] == stable_hash(options["prompt_template"])
+    # Runtime links attest the effective artifact independently of the review surface.
+    assert materialized.nodes[0].options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(options)
 
 
 def _node_template_anchored_multi_query_options(anchor_kind: str) -> dict[str, object]:

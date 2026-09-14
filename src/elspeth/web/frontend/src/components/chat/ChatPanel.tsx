@@ -31,6 +31,7 @@ import {
   toInlineSourceProvenance,
 } from "@/api/client";
 import { MessageBubble } from "./MessageBubble";
+import { PipelinePolicySummary } from "./PipelinePolicySummary";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
 import { dedupeGuidedUserMessages } from "./guidedReplay";
 import type { ChatTurn as GuidedWireChatTurn } from "@/types/guided";
@@ -164,10 +165,12 @@ const APPROVAL_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
 
 function InterpretationConfirmation({
   userTerm,
+  kind,
   affectedNodeId,
   resolvedAt,
 }: {
   userTerm: string;
+  kind: InterpretationEvent["kind"];
   affectedNodeId: string | null;
   resolvedAt: string | null;
 }) {
@@ -179,6 +182,13 @@ function InterpretationConfirmation({
     resolvedStamp !== null && !Number.isNaN(resolvedStamp.getTime())
       ? APPROVAL_TIME_FORMATTER.format(resolvedStamp)
       : null;
+  const approvalLabel = kind === null || kind === "vague_term" ? null : {
+    invented_source: "Approved the generated data",
+    llm_prompt_template: "Approved the prompts",
+    pipeline_decision: "Approved the pipeline decision",
+    llm_model_choice: "Approved the model selection",
+    source_data_contract: "Approved the input data requirements",
+  }[kind];
   return (
     <div
       className="message-row message-row--interpretation-approval interpretation-review-confirmation"
@@ -189,10 +199,12 @@ function InterpretationConfirmation({
         <span className="interpretation-approval-check" aria-hidden="true">
           ✓
         </span>{" "}
-        Got it — using your interpretation of{" "}
-        <em className="interpretation-review-confirmation-user-term">
-          {userTerm}
-        </em>
+        {approvalLabel ?? <>
+          Got it — using your interpretation of{" "}
+          <em className="interpretation-review-confirmation-user-term">
+            {userTerm}
+          </em>
+        </>}
         {affectedNodeId !== null && (
           <>
             {" "}
@@ -1731,6 +1743,7 @@ export function ChatPanel({
       {
         id: string;
         userTerm: string;
+        kind: InterpretationEvent["kind"];
         affectedNodeId: string | null;
         resolvedAt: string | null;
       }[]
@@ -1743,6 +1756,7 @@ export function ChatPanel({
       const approval = {
         id: event.id,
         userTerm,
+        kind: event.kind,
         affectedNodeId: event.affected_node_id,
         resolvedAt: event.resolved_at,
       };
@@ -1781,6 +1795,7 @@ export function ChatPanel({
     const tail: {
       id: string;
       userTerm: string;
+      kind: InterpretationEvent["kind"];
       affectedNodeId: string | null;
       resolvedAt: string | null;
     }[] = [];
@@ -1792,6 +1807,7 @@ export function ChatPanel({
       tail.push({
         id: event.id,
         userTerm,
+        kind: event.kind,
         affectedNodeId: event.affected_node_id,
         resolvedAt: event.resolved_at,
       });
@@ -2305,6 +2321,7 @@ export function ChatPanel({
       ) : (
         <>
           {revisionScope}
+          <PipelinePolicySummary state={compositionState} />
           <ChatInput
             onSend={onSend}
             // Upload handlers are wired only where an upload can mean
@@ -3433,6 +3450,7 @@ export function ChatPanel({
                       <InterpretationConfirmation
                         key={conf.id}
                         userTerm={conf.userTerm}
+                        kind={conf.kind}
                         affectedNodeId={conf.affectedNodeId}
                         resolvedAt={conf.resolvedAt}
                       />
@@ -3491,6 +3509,7 @@ export function ChatPanel({
                 <InterpretationConfirmation
                   key={conf.id}
                   userTerm={conf.userTerm}
+                  kind={conf.kind}
                   affectedNodeId={conf.affectedNodeId}
                   resolvedAt={conf.resolvedAt}
                 />
@@ -3591,6 +3610,7 @@ export function ChatPanel({
       </div>
 
       {/* Input */}
+      <PipelinePolicySummary state={compositionState} />
       <ChatInput
         onSend={handleSend}
         disabled={isComposing}

@@ -66,7 +66,7 @@ def _vague_term_event(*, composition_state_id: UUID, user_term: str, index: int)
         interpretation_source=InterpretationSource.USER_APPROVED,
         runtime_model_identifier_at_resolve=None,
         runtime_model_version_at_resolve=None,
-        resolved_prompt_template_hash=None,
+        approved_prompt_artifact_hash=None,
     )
 
 

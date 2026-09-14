@@ -503,7 +503,7 @@ class GatewayLLMProvider:
     Like OpenRouterLLMProvider, the underlying transport is HTTP, so
     ``AuditedHTTPClient`` records the raw transport row automatically; the
     semantic ``CallType.LLM`` row is recorded here so
-    ``calls.resolved_prompt_template_hash`` remains attached only to
+    ``calls.approved_prompt_artifact_hash`` remains attached only to
     ``CallType.LLM`` rows.
 
     ELSPETH owns all retry/pooling/row-level policy — this provider issues
@@ -522,7 +522,7 @@ class GatewayLLMProvider:
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
     ) -> None:
         # Re-validate defensively (mirrors OpenRouterLLMProvider): GatewayConfig
         # already enforces this shape at config-construction time, but this
@@ -545,7 +545,7 @@ class GatewayLLMProvider:
         self._run_id = run_id
         self._telemetry_emit = telemetry_emit
         self._limiter = limiter
-        self._resolved_prompt_template_hash = resolved_prompt_template_hash
+        self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
 
         # Client cache with reference counting for parallel multi-query safety
         # — same pattern as OpenRouterLLMProvider.
@@ -738,7 +738,7 @@ class GatewayLLMProvider:
             ),
             token_usage=usage,
             latency_ms=(time.perf_counter() - started_at) * 1000,
-            resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
         )
 
     def _record_logical_llm_error(
@@ -765,7 +765,7 @@ class GatewayLLMProvider:
                 retryable=exc.retryable,
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
-            resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
         )
 
     def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:

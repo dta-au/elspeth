@@ -78,6 +78,15 @@ def _bare_trusted_suffix(notice: str) -> str:
     return _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + notice
 
 
+_REVIEW_REPLY_UNAVAILABLE_NOTICE: Final = "The model's final reply is unavailable. Please retry your question."
+_REVIEW_REPLY_UNAVAILABLE_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_UNAVAILABLE_NOTICE)
+
+
+def compose_review_reply_unavailable_message(content: str) -> str:
+    """Keep a missing provider reply distinct from model-authored prose."""
+    return content + _REVIEW_REPLY_UNAVAILABLE_SUFFIX
+
+
 _EMPTY_STATE_NOTICE_HEADER: Final = "The pipeline is still empty — the composer did not complete a valid build this turn."
 _EMPTY_STATE_NOTICE_NEXT_STEP: Final = (
     "To continue: refine your request with more specifics, or reply telling the composer to retry with the plan it described above."
@@ -698,6 +707,16 @@ def _split_grounding_correction(suffix: str) -> tuple[VisibleMessageSegment, ...
 
 def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
     """Recognize the closed set of canonical composer synthesis suffixes."""
+    if suffix == _REVIEW_REPLY_UNAVAILABLE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE),)
+    if suffix.endswith(_REVIEW_REPLY_UNAVAILABLE_SUFFIX):
+        preceding = suffix[: -len(_REVIEW_REPLY_UNAVAILABLE_SUFFIX)]
+        if _REVIEW_REPLY_UNAVAILABLE_SUFFIX in preceding:
+            return None
+        segments = _canonical_trusted_suffix_segments(preceding)
+        if segments is not None:
+            return (*segments, TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE))
+        return None
     if suffix == _EMPTY_STATE_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_EMPTY_STATE_NOTICE_BODY),)
     empty_with_blocker = _split_wrapped_diagnostic(

@@ -1080,7 +1080,7 @@ def _interpretation_event_response(event: InterpretationEventRecord) -> Interpre
         hash_domain_version=event.hash_domain_version,
         runtime_model_identifier_at_resolve=event.runtime_model_identifier_at_resolve,
         runtime_model_version_at_resolve=event.runtime_model_version_at_resolve,
-        resolved_prompt_template_hash=event.resolved_prompt_template_hash,
+        approved_prompt_artifact_hash=event.approved_prompt_artifact_hash,
     )
 
 

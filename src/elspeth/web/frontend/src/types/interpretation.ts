@@ -201,9 +201,9 @@ export interface InterpretationEvent {
   // between surfacing and resolution).
   runtime_model_identifier_at_resolve: string | null;
   runtime_model_version_at_resolve: string | null;
-  // Cross-DB hash anchor (Option A): hex SHA-256 of the resolved
-  // prompt-template string.  Null until resolved; null for opt-out rows.
-  resolved_prompt_template_hash: string | null;
+  // Cross-DB hash anchor: SHA-256 of the versioned effective prompt artifact,
+  // including system text and ordered query names/templates.
+  approved_prompt_artifact_hash: string | null;
 }
 
 // ── Endpoint envelopes ───────────────────────────────────────────────────────

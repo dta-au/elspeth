@@ -168,7 +168,7 @@ function makePendingInterpretationEvent(id: string): InterpretationEvent {
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
   };
 }
 
@@ -3880,7 +3880,7 @@ describe("sessionStore", () => {
       await useSessionStore.getState().createSession();
 
       const state = useSessionStore.getState();
-      expect(apiClient.getGuided).toHaveBeenCalledWith("sess-goal");
+      expect(apiClient.getGuided).toHaveBeenCalledWith("sess-goal", undefined, true);
       expect(apiClient.convertToGuided).not.toHaveBeenCalled();
       expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
       expect(state.guidedSession).not.toBeNull();

@@ -92,7 +92,7 @@ class ChatCompletionCall:
     temperature: float
     max_tokens: int | None
     response_format: dict[str, Any] | None
-    resolved_prompt_template_hash: str | None
+    approved_prompt_artifact_hash: str | None
 
 
 @dataclass
@@ -109,7 +109,7 @@ class FakeLLMClient:
         temperature: float = 0.0,
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
     ) -> LLMResponse:
         self.calls.append(
             ChatCompletionCall(
@@ -118,7 +118,7 @@ class FakeLLMClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format=response_format,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             )
         )
         if self.error is not None:
@@ -540,6 +540,36 @@ class TestExecuteQuery:
 
 class TestClientCaching:
     """Tests for client creation and caching."""
+
+    def test_failed_call_preserves_approved_prompt_artifact(self) -> None:
+        recorder = FakeAuditRecorder()
+        provider = AzureLLMProvider(
+            endpoint="https://test.openai.azure.com/",
+            api_key="test-key",
+            api_version="2024-10-21",
+            deployment_name="gpt-4o",
+            recorder=recorder,
+            run_id="run-1",
+            telemetry_emit=FakeTelemetryEmit(),
+            approved_prompt_artifact_hash="a" * 64,
+        )
+
+        def fail_create(**kwargs: Any) -> None:
+            raise RuntimeError("provider failure")
+
+        provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fail_create)))
+        with pytest.raises(LLMClientError):
+            provider.execute_query(
+                messages=[ChatMessage(role="user", content="hi")],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-1", token_id="token-1"
+                ),
+            )
+        assert len(recorder.calls) == 1
+        assert recorder.calls[0]["approved_prompt_artifact_hash"] == "a" * 64
 
     def test_client_cached_per_state_id(
         self,

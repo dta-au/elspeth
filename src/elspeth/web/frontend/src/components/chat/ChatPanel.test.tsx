@@ -3391,7 +3391,7 @@ describe("ChatPanel mode discriminator", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
     };
     useInterpretationEventsStore.setState({
       pendingBySession: { "session-guided": { "card-1": pendingCard } },
@@ -3520,7 +3520,7 @@ describe("ChatPanel mode discriminator", () => {
         hash_domain_version: null,
         runtime_model_identifier_at_resolve: null,
         runtime_model_version_at_resolve: null,
-        resolved_prompt_template_hash: null,
+        approved_prompt_artifact_hash: null,
       };
     }
 
@@ -3801,7 +3801,7 @@ describe("ChatPanel mode discriminator", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
     };
   }
 
@@ -6342,7 +6342,7 @@ assistant_message_kind: "synthetic_failure",
             hash_domain_version: null,
             runtime_model_identifier_at_resolve: null,
             runtime_model_version_at_resolve: null,
-            resolved_prompt_template_hash: null,
+            approved_prompt_artifact_hash: null,
           },
         },
       },
@@ -8787,7 +8787,7 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
       ...overrides,
     };
   }
@@ -9485,6 +9485,35 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
   // The fix is the REGISTER: a labeled section plus a non-assistant row
   // style. Every test here fails against the pre-ruling implementation.
 
+  it.each([
+    ["invented_source", "Approved the generated data"],
+    ["llm_prompt_template", "Approved the prompts"],
+    ["pipeline_decision", "Approved the pipeline decision"],
+    ["llm_model_choice", "Approved the model selection"],
+    ["source_data_contract", "Approved the input data requirements"],
+  ] as const)("uses readable approval copy for %s without exposing its internal term", (kind, label) => {
+    useInterpretationEventsStore.setState({
+      resolvedBySession: {
+        [sessionFixture.id]: [makeInterpretationEvent({
+          id: `approval-${kind}`,
+          session_id: sessionFixture.id,
+          kind,
+          user_term: `${kind}:summarize`,
+          affected_node_id: "summarize",
+          choice: "accepted_as_drafted",
+          resolved_at: "2026-05-18T10:06:00Z",
+        })],
+      },
+    });
+    useSessionStore.setState({ activeSessionId: sessionFixture.id, sessions: [sessionFixture], messages: [] });
+    render(<ChatPanel />);
+    const confirmation = screen.getByTestId("interpretation-review-confirmation");
+    expect(confirmation.textContent).toContain(`${label} for summarize`);
+    expect(confirmation.textContent).not.toContain(`${kind}:summarize`);
+    expect(confirmation.querySelector("time")?.getAttribute("datetime")).toBe("2026-05-18T10:06:00Z");
+    expect(confirmation.className).not.toContain("message-row--assistant");
+  });
+
   it("routes a resolved backend-auto-surfaced confirmation into the labeled approvals section, off the assistant register", () => {
     act(() => {
       useInterpretationEventsStore.setState({
@@ -9519,7 +9548,8 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
     const confirmation = within(section).getByTestId(
       "interpretation-review-confirmation",
     );
-    expect(confirmation.textContent).toMatch(/llm_prompt_template:summarize/);
+    expect(confirmation.textContent).toMatch(/Approved the prompts for summarize/);
+    expect(confirmation.textContent).not.toMatch(/llm_prompt_template:summarize/);
     // The register IS the fix: the row must not assert assistant speech.
     expect(confirmation.className).not.toMatch(/message-row--assistant/);
     expect(confirmation.querySelector(".bubble-assistant")).toBeNull();
@@ -9694,6 +9724,7 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
           [sessionFixture.id]: [
             makeInterpretationEvent({
               id: "evt-stamped",
+              affected_node_id: "summarize",
               session_id: sessionFixture.id,
               tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}cc`,
               user_term: "llm_prompt_template:summarize",
@@ -9703,6 +9734,7 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
             }),
             makeInterpretationEvent({
               id: "evt-unstamped",
+              affected_node_id: "rate",
               session_id: sessionFixture.id,
               tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}dd`,
               user_term: "llm_prompt_template:rate",

@@ -426,9 +426,17 @@
         "type": "string"
       },
       "prompt_template": {
-        "description": "Jinja2 prompt template",
-        "title": "Prompt Template",
-        "type": "string"
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
+        "title": "Prompt Template"
       },
       "queries": {
         "anyOf": [
@@ -513,7 +521,6 @@
     },
     "required": [
       "profile",
-      "prompt_template",
       "schema"
     ],
     "type": "object"
@@ -552,11 +559,11 @@
         "type": "object"
       },
       {
-        "description": "Jinja2 prompt template",
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "name": "prompt_template",
-        "required": true,
+        "required": false,
         "tier": "common",
-        "type": "string"
+        "type": "object"
       },
       {
         "description": "Optional system prompt",

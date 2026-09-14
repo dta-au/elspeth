@@ -2168,7 +2168,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
 
     await useSessionStore.getState().enterGuided();
 
-    expect(getGuided).toHaveBeenCalledWith(RETRY_SESSION_ID);
+    expect(getGuided).toHaveBeenCalledWith(RETRY_SESSION_ID, undefined, true);
     // The two writing routes must BOTH stay untouched: convert persists a
     // rootless wizard, start persists a rooted one, and neither is authorised
     // by a user who has not yet said what they want.
@@ -2289,12 +2289,9 @@ describe("sessionStore — guided-mode fields and actions", () => {
     );
   });
 
-  it("enterGuided: converts a WORKED freeform session (GET 400) with the goal", async () => {
+  it("enterGuided: converts a WORKED freeform session (successful null probe) with the goal", async () => {
     const { getGuided, convertToGuided } = await import("@/api/client");
-    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
-      status: 400,
-      detail: "Session is not in guided mode.",
-    });
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
     (convertToGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
       sampleGetGuidedResponse,
     );
@@ -2321,10 +2318,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     // goal is typed), so this is the store's own guard: a dead button and a
     // server-rejected rootless convert are both worse than saying why.
     const { getGuided, convertToGuided } = await import("@/api/client");
-    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
-      status: 400,
-      detail: "Session is not in guided mode.",
-    });
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
 
     useSessionStore.setState({
       activeSessionId: RETRY_SESSION_ID,
@@ -2362,13 +2356,12 @@ describe("sessionStore — guided-mode fields and actions", () => {
     );
   });
 
-  it("enterGuided: surfaces a non-400 probe failure instead of converting on it", async () => {
-    // Only the documented 400 means "no guided_session here". A 500 on corrupt
-    // state or a 502 during a restart is a failure to report — converting on it
-    // would set the user's freeform pipeline aside on the strength of a blip.
+  it.each([400, 500, 502])("enterGuided: surfaces probe failure %s instead of converting on it", async (status) => {
+    // Only successful null proves freeform. An HTTP failure must not
+    // authorize setting the user's pipeline aside.
     const { getGuided, convertToGuided } = await import("@/api/client");
     (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
-      status: 500,
+      status,
       detail: "Guided state could not be read.",
     });
 
@@ -2568,7 +2561,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
       ...sampleCompositionState,
       version: 3,
     });
-    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({ status: 400 });
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
 
     // Pre-seed a live guided surface (as if we just converted to guided).
     useSessionStore.setState({
@@ -2601,7 +2594,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
       ...sampleCompositionState,
       version: 3,
     });
-    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({ status: 400 });
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
 
     await useSessionStore.getState().revertToVersion("state-with-review-debt");
@@ -2895,7 +2888,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(state.guidedNextTurn).toBeNull();
   });
 
-  it("selectSession: tolerates GET /guided's 400 for a plain freeform session (no error surfaced)", async () => {
+  it("selectSession: discovers plain freeform through a successful null probe", async () => {
     const {
       fetchMessages,
       fetchCompositionState,
@@ -2909,12 +2902,10 @@ describe("sessionStore — guided-mode fields and actions", () => {
     );
     (fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
     (fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
-    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
-      status: 400,
-      detail: "Session is not in guided mode. Use /api/sessions/{id}/messages.",
-    });
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
 
     await useSessionStore.getState().selectSession("sess-5");
+    expect(getGuided).toHaveBeenCalledWith("sess-5", undefined, true);
 
     const state = useSessionStore.getState();
     expect(state.guidedSession).toBeNull();
@@ -3219,7 +3210,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(state.guidedSession).toEqual(sampleGuidedSession);
     expect(state.guidedNextTurn).toEqual(sampleNextTurn);
     expect(state.guidedTerminal).toBeNull();
-    expect(getGuided).toHaveBeenCalledWith(childId);
+    expect(getGuided).toHaveBeenCalledWith(childId, undefined, true);
   });
 
   describe("chatGuided", () => {

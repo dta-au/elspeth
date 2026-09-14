@@ -378,11 +378,12 @@ class TestGetSchema:
             "deployment_name",
             "endpoint",
             "api_key",
-            "prompt_template",
         }
-        assert set(defs["OpenRouterConfig"]["required"]) >= {"model", "api_key", "prompt_template"}
-        assert set(defs["BedrockConfig"]["required"]) >= {"model", "prompt_template", "provider"}
-        assert set(defs["GatewayConfig"]["required"]) >= {"model", "endpoint", "api_key", "prompt_template"}
+        assert set(defs["OpenRouterConfig"]["required"]) >= {"model", "api_key"}
+        assert set(defs["BedrockConfig"]["required"]) >= {"model", "provider"}
+        assert set(defs["GatewayConfig"]["required"]) >= {"model", "endpoint", "api_key"}
+        for variant in ("AzureOpenAIConfig", "OpenRouterConfig", "BedrockConfig", "GatewayConfig"):
+            assert "prompt_template" not in defs[variant]["required"]
         assert "region_name" in defs["BedrockConfig"]["properties"]
         assert "api_key" not in defs["BedrockConfig"]["properties"]
 
@@ -473,9 +474,10 @@ class TestGetSchema:
         list_transforms()[llm].config_fields must surface provider-specific
         fields (deployment_name, endpoint, api_key, base_url, timeout_seconds,
         model, region_name) — not just the base LLMConfig fields.
-        Required-in-all-variants is the honest summary rule: prompt_template
-        appears in every provider's required set, while api_key does not because
-        Bedrock uses the AWS default credential chain. Provider-specific required
+        Required-in-all-variants is the honest summary rule: provider appears
+        in every variant's required set, while api_key does not because
+        Bedrock uses the AWS default credential chain. The prompt fallback is
+        optional when every query defines its own template. Provider-specific required
         fields are marked required=False because they are conditional on the
         discriminator value, and the full schema encodes that conditionality.
 
@@ -504,7 +506,7 @@ class TestGetSchema:
         required = {f.name for f in llm.config_fields if f.required}
         # Fields that are required in EVERY provider variant — honest intersection.
         assert "api_key" not in required
-        assert "prompt_template" in required
+        assert "prompt_template" not in required
         # Fields required only for some providers must not claim universal requiredness.
         assert "deployment_name" not in required
         assert "endpoint" not in required

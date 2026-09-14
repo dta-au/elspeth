@@ -23,6 +23,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
@@ -1241,7 +1242,7 @@ def _materialize_node_for_authoring(node: NodeSpec) -> NodeSpec:
         prompt = _render_prompt_parts(parts, _requirements_by_id(options), unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT)
         return _replace_prompt_if_changed(node, prompt, include_hash=False)
 
-    if "resolved_prompt_template_hash" in options:
+    if "approved_prompt_artifact_hash" in options:
         return node
 
     prompt_template = _node_str_option(node, "prompt_template")
@@ -1269,9 +1270,10 @@ def _materialize_node_for_execution(
     if parts is None:
         # Structured nodes render prompt_template from their parts, so only a
         # parts-free node can execute a non-text prompt_template.
-        _refuse_resolved_review_over_non_text(node, option_key="prompt_template", kind=InterpretationKind.LLM_PROMPT_TEMPLATE)
+        if multi_query_prompt_surface_from_options(node.options) is None:
+            _refuse_resolved_review_over_non_text(node, option_key="prompt_template", kind=InterpretationKind.LLM_PROMPT_TEMPLATE)
         prompt_template = _node_str_option(node, "prompt_template")
-        if prompt_template:
+        if prompt_template or multi_query_prompt_surface_from_options(node.options) is not None:
             requirement = _prompt_template_review_requirement(node.options)
             if requirement is not None:
                 _validate_prompt_template_review(node, prompt_template)
@@ -1308,22 +1310,22 @@ def _materialize_source_for_execution(source: SourceSpec, *, component_id: str) 
 
 def _replace_prompt_if_changed(node: NodeSpec, prompt: str, *, include_hash: bool) -> NodeSpec:
     current = node.options["prompt_template"] if "prompt_template" in node.options else None
-    current_hash = node.options["resolved_prompt_template_hash"] if "resolved_prompt_template_hash" in node.options else None
-    next_hash = stable_hash(prompt) if include_hash else current_hash
+    current_hash = node.options["approved_prompt_artifact_hash"] if "approved_prompt_artifact_hash" in node.options else None
+    next_hash = approved_prompt_artifact_hash_from_options({**node.options, "prompt_template": prompt}) if include_hash else current_hash
     if current == prompt and current_hash == next_hash:
         return node
     options = dict(node.options)
     options["prompt_template"] = prompt
     if include_hash:
-        options["resolved_prompt_template_hash"] = next_hash
+        options["approved_prompt_artifact_hash"] = next_hash
     return replace(node, options=options)
 
 
 def _ensure_prompt_template_hash(node: NodeSpec) -> NodeSpec:
-    prompt_template = _node_str_option(node, "prompt_template")
-    if not prompt_template:
+    artifact_hash = approved_prompt_artifact_hash_from_options(node.options)
+    if "approved_prompt_artifact_hash" in node.options and node.options["approved_prompt_artifact_hash"] == artifact_hash:
         return node
-    return _replace_prompt_if_changed(node, prompt_template, include_hash=True)
+    return replace(node, options={**node.options, "approved_prompt_artifact_hash": artifact_hash})
 
 
 def _pending_source_sites(source: SourceSpec, *, component_id: str) -> tuple[InterpretationReviewSite, ...]:
@@ -1632,7 +1634,7 @@ def _missing_prompt_template_review_sites(node: NodeSpec) -> tuple[Interpretatio
     if node.plugin != "llm":
         return ()
     prompt_template = _node_str_option(node, "prompt_template")
-    if not prompt_template:
+    if not prompt_template and multi_query_prompt_surface_from_options(node.options) is None:
         return ()
     requirement = _prompt_template_review_requirement(node.options)
     if requirement is None:
@@ -1895,7 +1897,7 @@ def _resolved_requirement_for_kind(
     return requirement
 
 
-def _validate_prompt_template_review(node: NodeSpec, prompt_template: str) -> None:
+def _validate_prompt_template_review(node: NodeSpec, prompt_template: str | None) -> None:
     requirements = _requirements(node.options)
     resolved = _resolved_requirement_for_kind(requirements, InterpretationKind.LLM_PROMPT_TEMPLATE)
     if resolved is None:
@@ -2369,7 +2371,7 @@ class MultiQueryPromptSurface:
     text — neither rendered nor a node-level-template user).
     """
 
-    node_prompt_template: str
+    node_prompt_template: str | None
     node_prompt_structure_hash: str | None
     system_prompt: str | None
     queries: tuple[tuple[str, str | InvalidQueryTemplate | None], ...]
@@ -2683,7 +2685,7 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
     """
     raw_queries = options["queries"] if "queries" in options else None
     prompt_template = options["prompt_template"] if "prompt_template" in options else None
-    if raw_queries is None or not isinstance(prompt_template, str):
+    if raw_queries is None or (prompt_template is not None and not isinstance(prompt_template, str)):
         return None
     entries = _well_formed_query_entries(raw_queries)
     if not entries:
@@ -2720,7 +2722,48 @@ def prompt_review_anchor_hash_from_options(options: Mapping[str, Any]) -> str | 
     surface = multi_query_prompt_surface_from_options(options)
     if surface is not None:
         return surface.anchor_hash()
-    return prompt_structure_hash_from_options(options)
+    structure = prompt_structure_hash_from_options(options)
+    system = options["system_prompt"] if "system_prompt" in options else None
+    if system is None:
+        return structure
+    prompt = options["prompt_template"] if "prompt_template" in options else None
+    return stable_hash(
+        {
+            "domain": "elspeth.single-prompt-review.v1",
+            "node_prompt": structure if structure is not None else stable_hash(prompt),
+            "system_prompt": system,
+        }
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source="Untrusted LLM-authored or YAML-imported prompt/query/system values in node options",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="rejects non-text prompt, system, or query templates with ValueError; requires an effective template for every query",
+    test_ref="tests/unit/web/test_prompt_artifact_boundary.py::test_prompt_artifact_rejects_malformed_options",
+    test_fingerprint="8fa66b482b95e4f28e3a87d6a002972ad57a000eadbd54b167f5d793a436cbbf",
+)
+def approved_prompt_artifact_hash_from_options(options: Mapping[str, Any]) -> str:
+    """Hash the resolved, effective artifact shared by session events and calls."""
+    prompt = options["prompt_template"] if "prompt_template" in options else None
+    system = options["system_prompt"] if "system_prompt" in options else None
+    if (prompt is not None and not isinstance(prompt, str)) or (system is not None and not isinstance(system, str)):
+        raise ValueError("Approved prompt artifact requires text prompt and system templates")
+    surface = multi_query_prompt_surface_from_options(options)
+    if surface is not None:
+        queries: list[tuple[str, str | None]] = []
+        for name, template in surface.queries:
+            if isinstance(template, InvalidQueryTemplate):
+                raise ValueError(f"Query {name!r} template is not text")
+            queries.append((name, template))
+        return approved_prompt_artifact_hash(
+            prompt_template=surface.node_prompt_template, system_prompt=surface.system_prompt, queries=tuple(queries)
+        )
+    if prompt is None:
+        raise ValueError("Approved prompt artifact requires an effective prompt template")
+    return approved_prompt_artifact_hash(prompt_template=prompt, system_prompt=system)
 
 
 @observation_boundary(
@@ -2755,15 +2798,22 @@ def prompt_review_draft_from_options(options: Mapping[str, Any]) -> str | None:
     prompt_template = options["prompt_template"] if "prompt_template" in options else None
     if not isinstance(prompt_template, str):
         return None
+    system_prompt = options["system_prompt"] if "system_prompt" in options else None
+    if isinstance(system_prompt, str):
+        frame = "System prompt:\n\n\nPrompt template:\n"
+        section_budget = (PROMPT_SURFACE_REVIEW_MAX_CHARS - len(frame)) // 2
+        system_display = _bounded_single_prompt_review_draft(system_prompt, max_chars=section_budget)
+        prompt_display = _bounded_single_prompt_review_draft(prompt_template, max_chars=section_budget)
+        return f"System prompt:\n{system_display}\n\nPrompt template:\n{prompt_display}"
     return _bounded_single_prompt_review_draft(prompt_template)
 
 
-def _bounded_single_prompt_review_draft(prompt_template: str) -> str:
-    if len(prompt_template) <= PROMPT_SURFACE_REVIEW_MAX_CHARS:
+def _bounded_single_prompt_review_draft(prompt_template: str, *, max_chars: int = PROMPT_SURFACE_REVIEW_MAX_CHARS) -> str:
+    if len(prompt_template) <= max_chars:
         return prompt_template
     # Size the marker with the whole length: the real cut is smaller, so its
     # digit count can only be equal or fewer and the result stays in bounds.
-    keep = PROMPT_SURFACE_REVIEW_MAX_CHARS - len(_PROMPT_REVIEW_SHORTENED_MARKER.format(cut=len(prompt_template)))
+    keep = max_chars - len(_PROMPT_REVIEW_SHORTENED_MARKER.format(cut=len(prompt_template)))
     return prompt_template[:keep] + _PROMPT_REVIEW_SHORTENED_MARKER.format(cut=len(prompt_template) - keep)
 
 
@@ -2905,8 +2955,8 @@ def _pending_authoring_shell(requirement: InterpretationRequirement) -> Interpre
 def serialize_authoring_review_options(options: Mapping[str, Any]) -> dict[str, Any]:
     """Return an audit-safe composer payload with only pending review shells."""
     serialized = dict(options)
-    if "resolved_prompt_template_hash" in serialized:
-        del serialized["resolved_prompt_template_hash"]
+    if "approved_prompt_artifact_hash" in serialized:
+        del serialized["approved_prompt_artifact_hash"]
     if SOURCE_AUTHORING_KEY in serialized:
         del serialized[SOURCE_AUTHORING_KEY]
     review_index = _validated_review_index(options)
@@ -3076,8 +3126,8 @@ def _reconcile_node_options(
     proposed_index = _validated_review_index(proposed.options)
     previous_index = _validated_review_index(previous.options) if previous is not None and previous.plugin == proposed.plugin else {}
     options = dict(proposed.options)
-    if "resolved_prompt_template_hash" in options:
-        del options["resolved_prompt_template_hash"]
+    if "approved_prompt_artifact_hash" in options:
+        del options["approved_prompt_artifact_hash"]
     reconciled: list[Mapping[str, Any]] = []
     carried_prompt_review = False
 
@@ -3149,10 +3199,7 @@ def _reconcile_node_options(
         )
         options["prompt_template"] = rendered
     if carried_prompt_review:
-        prompt_template = options["prompt_template"] if "prompt_template" in options else None
-        if type(prompt_template) is not str:
-            raise ValueError("carried prompt review has no rendered prompt_template")
-        options["resolved_prompt_template_hash"] = stable_hash(prompt_template)
+        options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(options)
     return options
 
 

@@ -365,7 +365,7 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("token_outcomes", "path"),
     # Phase 5b interpretation-review audit anchor — runtime LLM calls must
     # carry the resolved prompt hash used to join back to session DB events.
-    ("calls", "resolved_prompt_template_hash"),
+    ("calls", "approved_prompt_artifact_hash"),
     ("calls", "prompt_tokens"),
     ("calls", "completion_tokens"),
     ("calls", "cached_prompt_tokens"),
@@ -767,7 +767,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("run_attributions", "ix_run_attributions_user"),
     ("calls", "ix_calls_state_call_index_unique"),
     ("calls", "ix_calls_operation_call_index_unique"),
-    ("calls", "ix_calls_resolved_prompt_template_hash"),
+    ("calls", "ix_calls_approved_prompt_artifact_hash"),
     ("checkpoints", "ix_checkpoints_run_sequence_unique"),
     ("preflight_results", "ix_preflight_results_run"),
     ("token_outcomes", "ix_token_outcomes_terminal_unique"),

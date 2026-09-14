@@ -78,7 +78,7 @@ def _valid_event_kwargs() -> dict[str, object]:
         "hash_domain_version": "v2",
         "runtime_model_identifier_at_resolve": "anthropic/claude-opus-4-7",
         "runtime_model_version_at_resolve": "claude-opus-4-7-20260101",
-        "resolved_prompt_template_hash": "c" * 64,
+        "approved_prompt_artifact_hash": "c" * 64,
     }
 
 
@@ -131,7 +131,7 @@ class TestInterpretationEventResponse:
             hash_domain_version=None,
             runtime_model_identifier_at_resolve=None,
             runtime_model_version_at_resolve=None,
-            resolved_prompt_template_hash=None,
+            approved_prompt_artifact_hash=None,
             choice=InterpretationChoice.OPTED_OUT,
             interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
         )
@@ -183,7 +183,7 @@ class TestInterpretationEventResponse:
             ("hash_domain_version", 17),
             ("runtime_model_identifier_at_resolve", 257),
             ("runtime_model_version_at_resolve", 129),
-            ("resolved_prompt_template_hash", 65),
+            ("approved_prompt_artifact_hash", 65),
         ],
     )
     def test_max_length_caps_enforced(self, field: str, length: int) -> None:

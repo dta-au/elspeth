@@ -144,7 +144,7 @@ class TestCallRecordingRoutesToExecution:
             # event. The PluginAuditWriter adapter unconditionally forwards
             # the kwarg so the LLM transform plugin path can pass-through
             # without per-call-site adapter changes.
-            resolved_prompt_template_hash=None,
+            approved_prompt_artifact_hash=None,
             token_usage=UNKNOWN_TOKEN_USAGE,
         )
 
@@ -241,7 +241,7 @@ class TestOperationCallRoutesToExecution:
             coordination_token=_TOKEN,
             # Phase 5b Task 9: cross-DB hash anchor; None unless the caller
             # is an LLM operation downstream of a resolved interpretation.
-            resolved_prompt_template_hash=None,
+            approved_prompt_artifact_hash=None,
             token_usage=UNKNOWN_TOKEN_USAGE,
         )
 

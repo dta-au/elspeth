@@ -1945,10 +1945,10 @@ def _backend_surface_args_for_site(
     if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
         if not is_llm_transform:
             return None
-        prompt_template = options["prompt_template"] if "prompt_template" in options else None
-        if type(prompt_template) is not str or not prompt_template:
+        review_draft = prompt_review_draft_from_options(options)
+        if not review_draft:
             raise InvariantError(
-                "_auto_surface_prompt_template_reviews: prompt-template interpretation site lost its non-empty prompt_template"
+                "_auto_surface_prompt_template_reviews: prompt-template interpretation site lost its non-empty prompt surface"
             )
         # The writer requires exactly one matching pending requirement. A
         # requirement-free legacy site cannot become a resolvable card.
@@ -1959,11 +1959,6 @@ def _backend_surface_args_for_site(
         # shared with the auto-stager that drafted the requirement — returning
         # prompt_template here put the dead node-level template on every
         # multi-query card.
-        review_draft = prompt_review_draft_from_options(options)
-        if review_draft is None:
-            raise InvariantError(
-                "_auto_surface_prompt_template_reviews: prompt-template review draft vanished for a string prompt_template"
-            )
         return (node.id, site.user_term, review_draft)
     if site.kind is InterpretationKind.LLM_MODEL_CHOICE:
         if not is_llm_transform:
@@ -5482,7 +5477,8 @@ class ComposerServiceImpl:
             # the handoff may complete — the same gate the no-tool completion
             # claim consumes. A verified pure handoff, or a spent budget,
             # falls through to the handoff exactly as before, preserving the
-            # elspeth-e6ff1b8c13 no-extra-turns liveness bound. Wiredness
+            # elspeth-e6ff1b8c13 bound against another authoring turn. The
+            # terminal reply below cannot dispatch tools. Wiredness
             # (sources AND outputs — the cross-turn arm's applicability axis)
             # scopes the gate: an early-staged review over a half-built draft
             # is incomplete by nature, not damaged, and repair pressure there
@@ -5512,9 +5508,34 @@ class ComposerServiceImpl:
                 )
 
             if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
+                reply: _AdmittedAssistantMessage | None = None
+                remaining = deadline - asyncio.get_event_loop().time()
+                reply_messages = [
+                    *llm_messages,
+                    {
+                        "role": "system",
+                        "content": (
+                            "Review cards have been staged. This is a reply-only turn: tools are unavailable and the pipeline "
+                            "must not change. Answer the user's actual question directly using the accepted tool results above. "
+                            "Explain the design choices, actual model/profile and failure handling, including any dropped rows. "
+                            "Do not call reworded prompts verbatim. Do not claim execution readiness or that approval is the "
+                            "only remaining step; the backend will append the current review and validation status."
+                        ),
+                    },
+                ]
+                provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
+                if remaining > 0:
+                    try:
+                        completion = await self._call_llm_with_audit(reply_messages, [], timeout=remaining, recorder=recorder)
+                    except provider_failures:
+                        # The call audit retains the failure; a trusted notice
+                        # below reports the unavailable reply to the user.
+                        reply = None
+                    else:
+                        reply = completion.message
                 result = await self._surface_and_finalize_no_tools(
                     session_operation_context=session_operation_context,
-                    assistant_message=_AdmittedAssistantMessage(content=dispatch.raw_assistant_content or ""),
+                    assistant_message=reply if reply is not None else _AdmittedAssistantMessage(content=""),
                     state=state,
                     session_id=session_id,
                     current_state_id=persist.current_state_id,
@@ -5553,19 +5574,23 @@ class ComposerServiceImpl:
                 # cross-turn red arm — belongs to
                 # ``_announce_staged_review_handoff`` (elspeth-2ed41f0a4a R1).
                 handoff_result = (
-                    _announce_staged_review_handoff(result, dispatch.raw_assistant_content)
+                    _announce_staged_review_handoff(result, reply.content if reply is not None else "")
                     if (result.runtime_preflight is None or not _is_pending_interpretation_handoff(result.runtime_preflight))
                     else result
                 )
+                if reply is None:
+                    handoff_result = replace(
+                        handoff_result,
+                        message=_no_tool_policy.compose_review_reply_unavailable_message(handoff_result.message),
+                    )
                 threaded = replace(
                     handoff_result,
                     repair_turns_used=repair_turns_used,
                     persisted_assistant_message_id=persisted_assistant_message_id,
                     persisted_assistant_content=persisted_assistant_content,
                     persisted_tool_call_turn=persisted_tool_call_turn,
-                    # P4 owns whether the row was written from this dispatch;
-                    # row presence alone also includes advisor substitutions.
-                    persisted_assistant_matches_terminal_model_turn=persist.persisted_assistant_matches_current_dispatch,
+                    # The fresh reply is not P4's persisted tool-call narration.
+                    persisted_assistant_matches_terminal_model_turn=False,
                 )
                 return _ClassifyOutcome(
                     action="return",
@@ -7327,8 +7352,9 @@ class ComposerServiceImpl:
             kwargs: dict[str, Any] = {
                 "model": self._model,
                 "messages": messages,
-                "tools": tools,
             }
+            if tools:
+                kwargs["tools"] = tools
             if self._settings.composer_temperature is not None:
                 kwargs["temperature"] = self._settings.composer_temperature
             if self._settings.composer_seed is not None:
@@ -8601,6 +8627,11 @@ class ComposerServiceImpl:
                     response_metadata,
                     wrap_tool_batch_error=False,
                 )
+            if not tools and (completion.tool_batch.calls or not (completion.message.content or "").strip()):
+                raise _MalformedLLMResponseError(
+                    "Reply-only completion must contain text and no tool calls",
+                    provider_metadata=completion.provider_metadata,
+                )
             status = ComposerLLMCallStatus.SUCCESS
             return completion
         except TimeoutError:
@@ -8665,7 +8696,7 @@ class ComposerServiceImpl:
                     build_llm_call_record(
                         model_requested=self._model,
                         messages=messages,
-                        tools=tools,
+                        tools=tools or None,
                         status=status,
                         started_at=started_at,
                         started_ns=started_ns,

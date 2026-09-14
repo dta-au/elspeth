@@ -219,7 +219,7 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #   7 → ADR-019 Stage 2/3: token_outcomes stores the two-axis terminal model
 #        (`outcome`, `path`, `completed`) instead of the old single-axis outcome + is_terminal.
 #   8 → Phase 5b interpretation-review audit anchor:
-#        calls.resolved_prompt_template_hash records the runtime-side hash used
+#        calls.approved_prompt_artifact_hash records the runtime-side hash used
 #        to join Landscape LLM calls back to session interpretation_events.
 #   9 → Phase 4 hello-world tutorial audit-story fields:
 #        runs.llm_call_count, runs.seeded_from_cache, and runs.cache_key.
@@ -391,7 +391,9 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        do not perform a deployed cutover or assert complete token accounting.
 #        Pre-1.0 delete-and-recreate boundary; no migration,
 #        rollback_permitted: false. Preserve/export evidence before cutover.
-SQLITE_SCHEMA_EPOCH = 40
+#  41 → Approved prompt artifact anchor replaces the fallback-template digest.
+#        Covers system prompt and ordered effective queries; delete/recreate.
+SQLITE_SCHEMA_EPOCH = 41
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -2107,24 +2109,22 @@ calls_table = Table(
     Column("response_ref", String(256)),
     # Cross-DB hash anchor for interpretation events (Option A — Phase 5b).
     # Populated by the LLM-transform plugin at execution time when the runtime
-    # node config contains a ``resolved_prompt_template_hash`` sibling field
+    # node config contains an ``approved_prompt_artifact_hash`` sibling field
     # (written by ``resolve_interpretation_event`` at compose time and committed
     # into ``composition_states.nodes``). If the sibling field is absent (the
     # LLM transform is NOT downstream of an interpretation event), this column
     # is NULL.
     #
     # When non-NULL, this hash MUST equal the corresponding
-    # ``interpretation_events.resolved_prompt_template_hash`` in the session
-    # audit DB for the same resolved prompt string. An inequality indicates
+    # ``interpretation_events.approved_prompt_artifact_hash`` in the session
+    # audit DB for the same approved prompt artifact. An inequality indicates
     # tampering or a composition-to-execution coherence failure. Checked by the
     # audit-tooling layer; a mismatch is a Tier-1 crash-on-anomaly.
     #
-    # Hash scheme: SHA-256 over rfc8785 canonical JSON of the resolved
-    # prompt-template string, using ``CANONICAL_VERSION = "sha256-rfc8785-v1"``
-    # (contracts/hashing.py:CANONICAL_VERSION). Identical scheme used by both
-    # the session service (write at resolve time) and the runtime plugin (write
-    # at execution time), so the hashes are comparable byte-for-byte.
-    Column("resolved_prompt_template_hash", String(64), nullable=True),
+    # Hash domain: elspeth.approved-prompt-artifact.v1 in core/prompt_artifact.py.
+    # Includes the system prompt and ordered effective query names/templates.
+    # Actual per-query template_hash and rendered request evidence are separate.
+    Column("approved_prompt_artifact_hash", String(64), nullable=True),
     # Missing provider usage is unknown, never zero. Provider-specific totals
     # and Anthropic cache measures remain in the retained response payload.
     Column("prompt_tokens", BigInteger, nullable=True),
@@ -2388,13 +2388,13 @@ Index("ix_node_states_node", node_states_table.c.node_id)
 Index("ix_calls_state", calls_table.c.state_id)
 Index("ix_calls_operation", calls_table.c.operation_id)  # For operation call lookups
 # Phase 5b — supports the cross-DB anchor lookup: "given a session-side
-# interpretation_events.resolved_prompt_template_hash, find the matching
+# interpretation_events.approved_prompt_artifact_hash, find the matching
 # Landscape calls row". The index is sparse on NULL (SQLite excludes NULL
 # keys from B-tree indexes by default), so the storage cost is proportional
 # to the number of LLM-transform calls downstream of an interpretation event.
 Index(
-    "ix_calls_resolved_prompt_template_hash",
-    calls_table.c.resolved_prompt_template_hash,
+    "ix_calls_approved_prompt_artifact_hash",
+    calls_table.c.approved_prompt_artifact_hash,
 )
 Index("ix_operations_node_run", operations_table.c.node_id, operations_table.c.run_id)
 Index("ix_artifacts_run", artifacts_table.c.run_id)

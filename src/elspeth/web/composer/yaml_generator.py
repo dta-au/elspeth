@@ -128,7 +128,7 @@ def _strip_web_metadata(options: dict[str, Any], *, omit_source_paths: bool = Fa
 def _strip_profile_lowering_provenance(plugin: str, options: dict[str, Any]) -> dict[str, Any]:
     """Drop server-authored prompt provenance from profile-selecting llm nodes.
 
-    ``resolved_prompt_template_hash`` is in ``LLM_PROFILE_PRIVATE_FIELDS``, so
+    ``approved_prompt_artifact_hash`` is in ``LLM_PROFILE_PRIVATE_FIELDS``, so
     the batch/CLI loader's profile-lowering pass rejects any llm component
     that both selects a ``profile`` and carries the hash
     (``ValueError('private_profile_option')``) — exported YAML could never be
@@ -141,8 +141,8 @@ def _strip_profile_lowering_provenance(plugin: str, options: dict[str, Any]) -> 
     prompt provenance lives in the audit trail, not in plugin options
     (operator decision, 2026-08-09).
     """
-    if plugin == "llm" and "profile" in options and "resolved_prompt_template_hash" in options:
-        del options["resolved_prompt_template_hash"]
+    if plugin == "llm" and "profile" in options and "approved_prompt_artifact_hash" in options:
+        del options["approved_prompt_artifact_hash"]
     return options
 
 

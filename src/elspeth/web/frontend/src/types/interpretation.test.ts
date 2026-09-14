@@ -145,7 +145,7 @@ describe("interpretation protocol types", () => {
       | "hash_domain_version"
       | "runtime_model_identifier_at_resolve"
       | "runtime_model_version_at_resolve"
-      | "resolved_prompt_template_hash"
+      | "approved_prompt_artifact_hash"
     > = true;
     expect(_exact).toBe(true);
   });
@@ -176,7 +176,7 @@ describe("interpretation protocol types", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
     };
     expect(event.choice).toBe("pending");
     expect(event.accepted_value).toBeNull();
@@ -208,7 +208,7 @@ describe("interpretation protocol types", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
     };
     expect(event.composition_state_id).toBeNull();
     expect(event.interpretation_source).toBe("auto_interpreted_opt_out");
@@ -240,7 +240,7 @@ describe("interpretation protocol types", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
     };
     expect(event.interpretation_source).toBe("auto_interpreted_no_surfaces");
     expect(event.model_identifier).toBe("anthropic/claude-opus-4-7");

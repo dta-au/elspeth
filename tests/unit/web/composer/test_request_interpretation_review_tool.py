@@ -459,7 +459,7 @@ async def _fake_create_pending_interpretation_event(**kwargs: Any) -> Interpreta
         interpretation_source=InterpretationSource.USER_APPROVED,
         runtime_model_identifier_at_resolve=None,
         runtime_model_version_at_resolve=None,
-        resolved_prompt_template_hash=None,
+        approved_prompt_artifact_hash=None,
     )
 
 

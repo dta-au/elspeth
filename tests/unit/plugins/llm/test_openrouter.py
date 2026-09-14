@@ -52,7 +52,7 @@ class RecordedAuditCall:
     latency_ms: float | None = None
     request_ref: str | None = None
     response_ref: str | None = None
-    resolved_prompt_template_hash: str | None = None
+    approved_prompt_artifact_hash: str | None = None
     token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE
 
 
@@ -86,7 +86,7 @@ class InMemoryAuditWriter:
         work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> RecordedAuditCall:
         call = RecordedAuditCall(
@@ -101,7 +101,7 @@ class InMemoryAuditWriter:
             latency_ms=latency_ms,
             request_ref=request_ref,
             response_ref=response_ref,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
         )
         self.calls.append(call)
@@ -121,7 +121,7 @@ class InMemoryAuditWriter:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> RecordedAuditCall:
         if call_index is None:
@@ -138,7 +138,7 @@ class InMemoryAuditWriter:
             latency_ms=latency_ms,
             request_ref=request_ref,
             response_ref=response_ref,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
         )
         self.operation_calls.append(call)
@@ -638,6 +638,32 @@ class TestLLMTransformOpenRouterPipelining:
         assert result.reason is not None
         assert result.reason["reason"] == "template_rendering_failed"
         assert "template_hash" in result.reason
+
+    def test_approved_prompt_artifact_reaches_semantic_call(
+        self,
+        audit_writer: InMemoryAuditWriter,
+        ctx: PluginContext,
+        collector: CollectorOutputPort,
+        chaosllm_server,
+    ) -> None:
+        from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
+
+        artifact_hash = approved_prompt_artifact_hash(prompt_template="{{ row.text }}", system_prompt=None)
+        transform = LLMTransform(
+            _openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}", approved_prompt_artifact_hash=artifact_hash)
+        )
+        transform.on_start(make_context(**mock_audit_authority("test-run"), landscape=audit_writer))
+        transform.connect_output(collector, max_pending=10)
+        response = _create_mock_response(chaosllm_server, content="hello")
+        try:
+            with mock_httpx_client(chaosllm_server, response=response):
+                transform.accept(make_pipeline_row({"text": "hello"}), ctx)
+                transform.flush_batch_processing(timeout=10.0)
+            semantic_calls = [call for call in audit_writer.calls if call.call_type is CallType.LLM]
+            assert len(semantic_calls) == 1
+            assert semantic_calls[0].approved_prompt_artifact_hash == artifact_hash
+        finally:
+            transform.close()
 
     def test_http_error_400_returns_error_result(
         self, ctx: PluginContext, transform: LLMTransform, collector: CollectorOutputPort, chaosllm_server

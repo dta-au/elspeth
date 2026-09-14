@@ -14,8 +14,8 @@ derivation of the text an operator reviews for an LLM node's prompt:
   ``InterpretationEventResponse.llm_draft`` wire field caps at 8192, so the
   projection raised and ``GET /interpretations`` failed for the whole session.
 
-The anchor and the node-level ``resolved_prompt_template_hash`` always cover
-the complete text; only the displayed draft is bounded.
+The review anchor covers complete text; the node's approved artifact covers
+the system prompt and effective queries. Only the displayed draft is bounded.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from elspeth.web.composer.tools._common import _options_with_default_prompt_temp
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SURFACE_REVIEW_MAX_CHARS,
+    approved_prompt_artifact_hash_from_options,
     prompt_review_anchor_hash_from_options,
     prompt_review_draft_from_options,
 )
@@ -266,7 +267,7 @@ async def test_resolve_accepted_as_drafted_succeeds_for_a_multi_query_node(sessi
     node = _resolved_node(new_state.nodes)
     # accepted_value is never written into the prompt; the runtime hash covers the real template.
     assert node["options"]["prompt_template"] == options["prompt_template"]
-    assert node["options"]["resolved_prompt_template_hash"] == stable_hash(options["prompt_template"])
+    assert node["options"]["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(options)
     requirement = node["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
     assert requirement["status"] == "resolved"
     assert requirement["accepted_value"] == surface_draft
@@ -293,12 +294,12 @@ async def test_resolve_accepted_as_drafted_succeeds_for_a_long_single_prompt_nod
     node = _resolved_node(new_state.nodes)
     assert node["options"]["prompt_template"] == options["prompt_template"]
     full_template_hash = stable_hash(options["prompt_template"])
-    assert node["options"]["resolved_prompt_template_hash"] == full_template_hash
+    assert node["options"]["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(options)
     requirement = node["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
     assert requirement["accepted_value"] == bounded_draft
     # The anchor covers the complete template, never the shortened display.
     assert requirement["resolved_prompt_template_hash"] == full_template_hash
-    assert resolved.resolved_prompt_template_hash == full_template_hash
+    assert resolved.approved_prompt_artifact_hash == approved_prompt_artifact_hash_from_options(options)
 
 
 # --------------------------------------------------------------------------- #

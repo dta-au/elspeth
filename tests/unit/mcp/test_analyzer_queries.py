@@ -2641,7 +2641,7 @@ class TestListCollisions:
 
 
 class TestResolvedPromptTemplateHashAcrossReadSurfaces:
-    """elspeth-543ee35ed3: a recorded LLM-call resolved_prompt_template_hash must
+    """elspeth-543ee35ed3: a recorded LLM-call approved_prompt_artifact_hash must
     survive every audit read/export surface — the CallLoader, MCP get_calls,
     MCP get_operation_calls, and the JSONL export — for both state-parented and
     operation-parented calls. Otherwise audit tooling cannot join runtime LLM
@@ -2676,7 +2676,7 @@ class TestResolvedPromptTemplateHashAcrossReadSurfaces:
             CallStatus.SUCCESS,
             RawCallPayload({"prompt": "p"}),
             RawCallPayload({"response": "r"}),
-            resolved_prompt_template_hash=self.HASH,
+            approved_prompt_artifact_hash=self.HASH,
             member_token=audit_member,
             work_item=audit_item,
         )
@@ -2692,23 +2692,23 @@ class TestResolvedPromptTemplateHashAcrossReadSurfaces:
             CallType.LLM,
             CallStatus.SUCCESS,
             RawCallPayload({"prompt": "p2"}),
-            resolved_prompt_template_hash=self.HASH,
+            approved_prompt_artifact_hash=self.HASH,
             coordination_token=leader_coordination_token(factory, run_id),
         )
 
         # 1. Loader — repository getters reconstruct Call via CallLoader.
         state_calls = factory.query.get_calls(state_id)
-        assert state_calls[0].resolved_prompt_template_hash == self.HASH
+        assert state_calls[0].approved_prompt_artifact_hash == self.HASH
         loaded_op_calls = factory.execution.get_operation_calls(op.operation_id)
-        assert loaded_op_calls[0].resolved_prompt_template_hash == self.HASH
+        assert loaded_op_calls[0].approved_prompt_artifact_hash == self.HASH
 
         # 2. MCP get_calls (state) and get_operation_calls (operation).
         mcp_state = get_calls(db, factory, state_id)
-        assert mcp_state[0]["resolved_prompt_template_hash"] == self.HASH
+        assert mcp_state[0]["approved_prompt_artifact_hash"] == self.HASH
         mcp_op = get_operation_calls(db, factory, op.operation_id)
-        assert mcp_op[0]["resolved_prompt_template_hash"] == self.HASH
+        assert mcp_op[0]["approved_prompt_artifact_hash"] == self.HASH
 
         # 3. Export records — both the state call and the operation call.
         call_records = [r for r in LandscapeExporter(db).export_run(run_id) if r.get("record_type") == "call"]
-        exported_hashes = [r.get("resolved_prompt_template_hash") for r in call_records]
+        exported_hashes = [r.get("approved_prompt_artifact_hash") for r in call_records]
         assert exported_hashes.count(self.HASH) == 2

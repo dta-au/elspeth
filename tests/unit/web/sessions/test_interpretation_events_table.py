@@ -3,7 +3,7 @@
 Coverage includes the interpretation-event table,
 ``composition_states.provenance`` closed-enum extension,
 ``sessions.interpretation_review_disabled`` column, append-only UPDATE and
-DELETE triggers, ``calls.resolved_prompt_template_hash`` in the L1 Landscape,
+DELETE triggers, ``calls.approved_prompt_artifact_hash`` in the L1 Landscape,
 the partial unique index on pending tool calls, and the lookup index on
 ``composition_state_id``.
 
@@ -83,7 +83,7 @@ def _user_approved_row(
     accepted_value: str | None = None,
     hash_domain_version: str | None = None,
     arguments_hash: str | None = None,
-    resolved_prompt_template_hash: str | None = None,
+    approved_prompt_artifact_hash: str | None = None,
     runtime_model_identifier_at_resolve: str | None = None,
     runtime_model_version_at_resolve: str | None = None,
 ) -> dict:
@@ -110,7 +110,7 @@ def _user_approved_row(
         "interpretation_source": "user_approved",
         "runtime_model_identifier_at_resolve": runtime_model_identifier_at_resolve,
         "runtime_model_version_at_resolve": runtime_model_version_at_resolve,
-        "resolved_prompt_template_hash": resolved_prompt_template_hash,
+        "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
     }
 
 
@@ -138,7 +138,7 @@ def _opt_out_row(*, row_id: str, session_id: str, tool_call_id: str | None = Non
         "interpretation_source": "auto_interpreted_opt_out",
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
-        "resolved_prompt_template_hash": None,
+        "approved_prompt_artifact_hash": None,
     }
 
 
@@ -174,7 +174,7 @@ def _no_surfaces_row(
         "interpretation_source": "auto_interpreted_no_surfaces",
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
-        "resolved_prompt_template_hash": None,
+        "approved_prompt_artifact_hash": None,
     }
 
 
@@ -198,7 +198,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_56() -> None:
+def test_current_session_schema_epoch_is_57() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -226,7 +226,9 @@ def test_current_session_schema_epoch_is_56() -> None:
     # 55: ownership FKs, revocation provenance and permit admission evidence;
     # paired with Landscape40 in the identity residual schema window.
     # 56: sparse proposal arguments and structured validation errors.
-    assert SESSION_SCHEMA_EPOCH == 56
+    # 57: approved prompt artifact replaces the unused fallback hash anchor;
+    # paired with Landscape41. Existing approvals are not reinterpreted.
+    assert SESSION_SCHEMA_EPOCH == 57
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:
@@ -444,7 +446,7 @@ class TestSchema:
             "interpretation_source",
             "runtime_model_identifier_at_resolve",
             "runtime_model_version_at_resolve",
-            "resolved_prompt_template_hash",
+            "approved_prompt_artifact_hash",
         }
 
     def test_skill_markdown_history_columns(self, engine) -> None:
@@ -509,7 +511,7 @@ class TestStatusConsistencyCheck:
                             accepted_value=None,
                             hash_domain_version="v2",
                             arguments_hash="a" * 64,
-                            resolved_prompt_template_hash="b" * 64,
+                            approved_prompt_artifact_hash="b" * 64,
                             runtime_model_identifier_at_resolve="anthropic/claude-opus-4-7",
                             runtime_model_version_at_resolve="2026-05-01",
                         )
@@ -1134,23 +1136,26 @@ class TestSchemaValidatorCatchesMissingTrigger:
             initialize_session_schema(eng)
 
 
-# Cross-DB — Landscape calls.resolved_prompt_template_hash --------------------
+# Cross-DB — Landscape calls.approved_prompt_artifact_hash --------------------
 class TestLandscapeCallsColumn:
-    def test_resolved_prompt_template_hash_column_exists(self) -> None:
+    def test_approved_prompt_artifact_hash_column_exists(self) -> None:
         from elspeth.core.landscape.schema import calls_table
 
-        assert "resolved_prompt_template_hash" in calls_table.c
-        col = calls_table.c.resolved_prompt_template_hash
+        assert "approved_prompt_artifact_hash" in calls_table.c
+        assert "resolved_prompt_template_hash" not in calls_table.c
+        assert "approved_prompt_artifact_hash" in interpretation_events_table.c
+        assert "resolved_prompt_template_hash" not in interpretation_events_table.c
+        col = calls_table.c.approved_prompt_artifact_hash
         assert col.nullable is True
 
-    def test_index_on_resolved_prompt_template_hash_exists(self) -> None:
+    def test_index_on_approved_prompt_artifact_hash_exists(self) -> None:
         from elspeth.core.landscape.schema import calls_table
 
         index_names = {idx.name for idx in calls_table.indexes}
         # Sanity check via metadata.indexes too — Index() declared at module
         # scope is attached to the table.
-        assert any(name == "ix_calls_resolved_prompt_template_hash" for name in index_names) or _index_exists_in_metadata(
-            "ix_calls_resolved_prompt_template_hash"
+        assert any(name == "ix_calls_approved_prompt_artifact_hash" for name in index_names) or _index_exists_in_metadata(
+            "ix_calls_approved_prompt_artifact_hash"
         )
 
 

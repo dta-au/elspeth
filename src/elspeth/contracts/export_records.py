@@ -214,7 +214,7 @@ class CallExportRecord(TypedDict):
     status: str
     request_hash: str | None
     response_hash: str | None
-    resolved_prompt_template_hash: str | None
+    approved_prompt_artifact_hash: str | None
     prompt_tokens: int | None
     completion_tokens: int | None
     cached_prompt_tokens: int | None

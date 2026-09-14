@@ -15,8 +15,8 @@ from jinja2 import TemplateSyntaxError
 from jinja2 import nodes as jinja_nodes
 from pydantic import Field, field_validator, model_validator
 
-from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
@@ -187,7 +187,7 @@ class LLMConfig(TransformDataConfig):
     LLM-specific fields:
     - provider: LLM provider ("azure", "openrouter", "bedrock", or "gateway")
     - model: Model identifier (optional — Azure uses deployment_name instead)
-    - prompt_template: Jinja2 prompt template (required)
+    - prompt_template: Jinja2 fallback (required unless every query overrides it)
     - system_prompt: Optional system message
     - temperature: Sampling temperature (default 0.0 for determinism)
     - max_tokens: Maximum response tokens
@@ -208,7 +208,7 @@ class LLMConfig(TransformDataConfig):
     queries: list[QueryDefinition] | dict[str, QueryDefinition] | None = Field(
         None, description="Multi-query specs (None = single-query mode)"
     )
-    prompt_template: str = Field(..., description="Jinja2 prompt template")
+    prompt_template: str | None = Field(None, description="Jinja2 fallback prompt template; required unless every query has a template")
     system_prompt: str | None = Field(None, description="Optional system prompt")
     temperature: float = Field(
         0.0,
@@ -291,20 +291,13 @@ class LLMConfig(TransformDataConfig):
     lookup_source: str | None = Field(None, description="Lookup file path for audit (None if no lookup)")
     system_prompt_source: str | None = Field(None, description="System prompt file path for audit (None if inline)")
 
-    # Phase 5b Task 9 — cross-DB hash anchor for interpretation events.
-    # When this LLM transform is downstream of a resolved interpretation
-    # event, the session service writes ``stable_hash(resolved prompt
-    # template)`` here (via ``resolve_interpretation_event`` →
-    # ``_patch_llm_transform_prompt`` → ``composition_states.nodes[i].options``).
-    # The runtime reads this field and forwards it to every LLM call so the
-    # Landscape ``calls.resolved_prompt_template_hash`` column is populated
-    # — the cross-DB anchor an auditor uses to join a Landscape call back to
-    # the session-DB interpretation_events row. ``None`` is the legitimate
-    # value for non-interpretation LLM transforms (most LLM nodes never go
-    # through an interpretation surface).
-    resolved_prompt_template_hash: str | None = Field(
+    # Content identity shared by the resolved review event and every audited
+    # call from this node. It binds system text and named effective queries;
+    # individual rendered-template hashes remain query audit provenance.
+    # None means this node has no Composer approval artifact.
+    approved_prompt_artifact_hash: str | None = Field(
         None,
-        description="Cross-DB hash anchor for interpretation events (Phase 5b Task 9)",
+        description="Versioned approved effective prompt artifact hash",
         json_schema_extra={"composer_hidden": True},
     )
 
@@ -403,8 +396,10 @@ class LLMConfig(TransformDataConfig):
 
     @field_validator("prompt_template")
     @classmethod
-    def validate_prompt_template(cls, v: str) -> str:
+    def validate_prompt_template(cls, v: str | None) -> str | None:
         """Validate prompt_template is non-empty and syntactically valid."""
+        if v is None:
+            return None
         if not v or not v.strip():
             raise ValueError("prompt_template cannot be empty")
         # Validate template syntax at config time
@@ -415,18 +410,25 @@ class LLMConfig(TransformDataConfig):
         return v
 
     @model_validator(mode="after")
-    def _validate_resolved_prompt_template_hash_matches_template(self) -> LLMConfig:
+    def _validate_approved_prompt_artifact(self) -> LLMConfig:
         """Refuse runtime configs whose interpretation hash anchor drifted."""
-        if self.resolved_prompt_template_hash is None:
-            return self
-
-        expected_hash = stable_hash(self.prompt_template)
-        if self.resolved_prompt_template_hash != expected_hash:
+        queries = tuple((spec.name, spec.template) for spec in resolve_queries(self.queries)) if self.queries is not None else None
+        expected_hash = approved_prompt_artifact_hash(
+            prompt_template=self.prompt_template, system_prompt=self.system_prompt, queries=queries
+        )
+        if self.approved_prompt_artifact_hash is not None and self.approved_prompt_artifact_hash != expected_hash:
             raise ValueError(
-                "resolved_prompt_template_hash must equal stable_hash(prompt_template); "
-                f"expected {expected_hash!r}, got {self.resolved_prompt_template_hash!r}"
+                "approved_prompt_artifact_hash must match the effective prompt artifact; "
+                f"expected {expected_hash!r}, got {self.approved_prompt_artifact_hash!r}"
             )
         return self
+
+    def effective_template(self, override: str | None = None) -> str:
+        """Return a validated query template, or the required node fallback."""
+        template = override if override is not None else self.prompt_template
+        if template is None:
+            raise ValueError("Query requires prompt_template or its own template override")
+        return template
 
     @model_validator(mode="after")
     def _validate_cross_query_rules(self) -> LLMConfig:
@@ -512,7 +514,7 @@ class LLMConfig(TransformDataConfig):
 
     def _field_extraction_templates(self) -> tuple[tuple[str, str], ...]:
         """Return (label, template) for every LLM Jinja2 template that can interpolate row data."""
-        templates = [("prompt_template", self.prompt_template)]
+        templates = [("prompt_template", self.prompt_template)] if self.prompt_template is not None else []
         if self.queries is not None:
             for spec in resolve_queries(self.queries):
                 if spec.template:
@@ -596,11 +598,11 @@ class LLMConfig(TransformDataConfig):
                 extracted: set[str] = set()
                 for spec in resolve_queries(self.queries):
                     extracted.update(spec.input_fields.values())
-                    effective_template = spec.template if spec.template is not None else self.prompt_template
+                    effective_template = self.effective_template(spec.template)
                     extracted.update(multi_query_source_row_columns(effective_template))
             else:
                 # Single-query mode: detect row references in the template
-                extracted = set(extract_jinja2_fields(self.prompt_template))
+                extracted = set(extract_jinja2_fields(self.effective_template()))
 
             if extracted:
                 required_fields = sorted(extracted)
@@ -658,7 +660,7 @@ class LLMConfig(TransformDataConfig):
 
         from elspeth.core.templates import extract_jinja2_fields
 
-        template_fields = extract_jinja2_fields(self.prompt_template)
+        template_fields = extract_jinja2_fields(self.effective_template())
         if template_fields:
             return self
 
@@ -752,7 +754,7 @@ class LLMConfig(TransformDataConfig):
             return sorted(names - _PROMPT_CONTEXT_NAMES - _PROMPT_GLOBAL_NAMES)
 
         if self.queries is None:
-            unbound = unbound_top_level(self.prompt_template)
+            unbound = unbound_top_level(self.effective_template())
             if unbound:
                 names = ", ".join(f"'{name}'" for name in unbound)
                 raise ValueError(
@@ -764,7 +766,7 @@ class LLMConfig(TransformDataConfig):
                 )
             if self.required_input_fields:
                 undeclared = undeclared_row_fields(
-                    extract_jinja2_field_usage(self.prompt_template).fields,
+                    extract_jinja2_field_usage(self.effective_template()).fields,
                     self.required_input_fields,
                 )
                 if undeclared:
@@ -799,7 +801,7 @@ class LLMConfig(TransformDataConfig):
                         "input_fields first."
                     )
             else:
-                template = self.prompt_template
+                template = self.effective_template()
                 source_desc = "the node-level prompt_template"
                 node_template_specs.append(spec.name)
 
@@ -819,7 +821,7 @@ class LLMConfig(TransformDataConfig):
                 )
 
         if node_template_specs:
-            unbound = unbound_top_level(self.prompt_template)
+            unbound = unbound_top_level(self.effective_template())
             if unbound:
                 names = ", ".join(f"'{name}'" for name in unbound)
                 users = ", ".join(f"'{name}'" for name in node_template_specs)
@@ -845,7 +847,7 @@ class LLMConfig(TransformDataConfig):
         if self.required_input_fields:
             covering = self.declared_input_fields
             for spec in resolve_queries(self.queries):
-                effective_template = spec.template if spec.template is not None else self.prompt_template
+                effective_template = self.effective_template(spec.template)
                 columns = {*spec.input_fields.values(), *multi_query_source_row_columns(effective_template)}
                 undeclared_columns = undeclared_row_fields(columns, covering)
                 if undeclared_columns:

@@ -36,8 +36,10 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
     SOURCE_COMPONENT_ID,
+    approved_prompt_artifact_hash_from_options,
     current_source_data_contract_demand,
     model_choice_artifact_hash,
+    multi_query_prompt_surface_from_options,
     parse_interpretation_requirements,
     pipeline_decision_artifact_hash,
     prompt_review_anchor_hash_from_options,
@@ -177,6 +179,9 @@ def _find_llm_transform_node(
             node["options"] if "options" in node else None,
             message=f"{context}: node {affected_node_id!r} has no options mapping",
         )
+        if multi_query_prompt_surface_from_options(options) is not None:
+            approved_prompt_artifact_hash_from_options(options)
+            return node
         if "prompt_template" not in options or type(options["prompt_template"]) is not str:
             raise InterpretationPlaceholderConsumedError(f"{context}: node {affected_node_id!r} options.prompt_template is not a string")
         prompt_template = options["prompt_template"]
@@ -792,7 +797,6 @@ def _patch_structured_interpretation_prompt(
         )
 
     new_template = "".join(rendered)
-    resolved_prompt_template_hash = stable_hash(new_template)
     updated_requirement = dict(matching_requirement)
     updated_requirement["status"] = "resolved"
     if event_id is not None:
@@ -802,13 +806,13 @@ def _patch_structured_interpretation_prompt(
     # the full render: the render changes again when a sibling vague term
     # resolves, and reconciliation must be able to re-verify every resolved
     # requirement against state that survives those later resolutions. The
-    # full-render hash lives at node level (options.resolved_prompt_template_hash).
+    # full-render hash lives at node level (options.approved_prompt_artifact_hash).
     updated_requirement["resolved_prompt_template_hash"] = stable_hash(accepted_value)
     requirements[matching_index] = updated_requirement
 
     patched_options = dict(options)
     patched_options["prompt_template"] = new_template
-    patched_options["resolved_prompt_template_hash"] = resolved_prompt_template_hash
+    patched_options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(patched_options)
     patched_options[INTERPRETATION_REQUIREMENTS_KEY] = requirements
     return patched_options
 
@@ -982,9 +986,9 @@ def _patch_llm_transform_prompt(
         # ``NodeSpec.options`` after ``state_from_record`` and flows into the
         # runtime YAML emitted by ``generate_pipeline_dict``. The same helper
         # also writes the resolved-prompt-template hash into
-        # ``options.resolved_prompt_template_hash`` (the cross-DB anchor
+        # ``options.approved_prompt_artifact_hash`` (the cross-DB anchor
         # the LLM transform plugin reads at execution time to populate the
-        # Landscape ``calls.resolved_prompt_template_hash`` column).
+        # Landscape ``calls.approved_prompt_artifact_hash`` column).
         new_template = f"{template[: placeholder_match.start()]}{accepted_value}{template[placeholder_match.end() :]}"
         patched_node = dict(node)
         patched_options = dict(options)
@@ -1053,22 +1057,21 @@ def _resolve_vague_term(
         llm_draft=llm_draft,
     )
     patched_node = next(n for n in patched_nodes if n["id"] == affected_node_id)
-    resolved_template: str = patched_node["options"]["prompt_template"]
-    resolved_prompt_template_hash = stable_hash(resolved_template)
+    artifact_hash = approved_prompt_artifact_hash_from_options(patched_node["options"])
 
     final_nodes: list[Mapping[str, Any]] = []
     for n in patched_nodes:
         if n["id"] == affected_node_id:
             node_with_hash = dict(n)
             options_with_hash = dict(n["options"])
-            options_with_hash["resolved_prompt_template_hash"] = resolved_prompt_template_hash
+            options_with_hash["approved_prompt_artifact_hash"] = artifact_hash
             node_with_hash["options"] = options_with_hash
             final_nodes.append(node_with_hash)
         else:
             final_nodes.append(n)
     # Vague-term review patches only nodes; the sources map is carried forward
     # unchanged. The legacy singular ``source`` column is dead.
-    return state_record.sources, final_nodes, resolved_prompt_template_hash
+    return state_record.sources, final_nodes, artifact_hash
 
 
 @observation_boundary(
@@ -1166,8 +1169,8 @@ def _resolve_prompt_template_review(
         node["options"],
         message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
     )
-    prompt_template = options["prompt_template"]
-    if type(prompt_template) is not str:
+    prompt_template = options["prompt_template"] if "prompt_template" in options else None
+    if type(prompt_template) is not str and multi_query_prompt_surface_from_options(options) is None:
         raise InterpretationPlaceholderConsumedError(
             f"resolve_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
         )
@@ -1203,17 +1206,12 @@ def _resolve_prompt_template_review(
         user_term=user_term,
         context="resolve_interpretation_event",
     )
-    # Node-level / returned hash stays the final-prompt-string hash (the runtime
-    # LLM plugin reads options.resolved_prompt_template_hash to populate
-    # calls.resolved_prompt_template_hash). The REQUIREMENT-level attestation
-    # anchor, by contrast, is the prompt *skeleton* for structured nodes: the
-    # prompt-template review approves the LLM-authored structure, while the
-    # vague-term reviews approve the slot values. Anchoring the requirement to
-    # the skeleton keeps it invariant under vague-term resolution (which rewrites
-    # the rendered prompt) — see interpretation_state.prompt_structure_hash.
-    resolved_prompt_template_hash = stable_hash(prompt_template)
+    # The event and runtime node share the effective artifact identity. The
+    # requirement separately attests the authored surface/skeleton, so resolving
+    # a vague-term slot does not invalidate the approval of that skeleton.
+    artifact_hash = approved_prompt_artifact_hash_from_options(options)
     structure_hash = prompt_review_anchor_hash_from_options(options)
-    requirement_anchor_hash = structure_hash if structure_hash is not None else resolved_prompt_template_hash
+    requirement_anchor_hash = structure_hash if structure_hash is not None else stable_hash(prompt_template)
     requirement = dict(requirements[matching_index])
     requirement["status"] = "resolved"
     requirement["event_id"] = event_id
@@ -1226,7 +1224,7 @@ def _resolve_prompt_template_review(
         if current_node["id"] == affected_node_id:
             patched_node = dict(current_node)
             patched_options = dict(options)
-            patched_options["resolved_prompt_template_hash"] = resolved_prompt_template_hash
+            patched_options["approved_prompt_artifact_hash"] = artifact_hash
             patched_options[INTERPRETATION_REQUIREMENTS_KEY] = requirements
             patched_node["options"] = patched_options
             final_nodes.append(patched_node)
@@ -1234,7 +1232,7 @@ def _resolve_prompt_template_review(
             final_nodes.append(current_node)
     # Prompt-template review patches only node review metadata; the sources map
     # is carried forward unchanged. The legacy singular ``source`` column is dead.
-    return state_record.sources, final_nodes, resolved_prompt_template_hash
+    return state_record.sources, final_nodes, artifact_hash
 
 
 def _resolve_invented_source(
@@ -1916,7 +1914,7 @@ class _SessionPendingInterpretationPlanner:
                         )
             elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
                 prompt_template = options["prompt_template"] if "prompt_template" in options else None
-                if type(prompt_template) is not str:
+                if type(prompt_template) is not str and multi_query_prompt_surface_from_options(options) is None:
                     raise ValueError(
                         f"create_pending_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
                     )
@@ -2152,7 +2150,9 @@ class _SessionPendingInterpretationPlanner:
             arguments_hash=stable_hash(domain_dict),
             hash_domain_version="v2",
             interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
-            resolved_prompt_template_hash=(resolved_hash if kind is InterpretationKind.LLM_PROMPT_TEMPLATE else None),
+            approved_prompt_artifact_hash=(
+                resolved_hash if kind in (InterpretationKind.LLM_PROMPT_TEMPLATE, InterpretationKind.VAGUE_TERM) else None
+            ),
             ensure_opt_out_marker=True,
             appended_state=SessionCompositionStateCreation(
                 id=uuid.uuid4(),

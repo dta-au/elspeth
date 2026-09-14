@@ -70,6 +70,7 @@ from elspeth.web.interpretation_state import (
     PROMPT_SHIELD_USER_TERM,
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
+    approved_prompt_artifact_hash_from_options,
 )
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
@@ -9256,7 +9257,7 @@ def _llm_options_with_api_key(api_key: Any) -> dict[str, Any]:
 def _llm_options_with_user_supplied_runtime_hash(api_key: Any) -> dict[str, Any]:
     """Return valid LLM options with a forged runtime-owned audit hash."""
     options = _llm_options_with_api_key(api_key)
-    options["resolved_prompt_template_hash"] = stable_hash(options["prompt_template"])
+    options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(options)
     return options
 
 
@@ -9974,7 +9975,7 @@ class TestSetPipeline:
         assert result.success is False
         assert result.updated_state is state
         assert result.data is None
-        assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+        assert "approved_prompt_artifact_hash" in result.validation.errors[0].message
         assert "runtime-owned" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_output_interpretation_requirements_without_mutating_state(self) -> None:
@@ -10011,7 +10012,7 @@ class TestSetPipeline:
         assert result.success is False
         assert result.updated_state is state
         assert result.data is None
-        assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+        assert "approved_prompt_artifact_hash" in result.validation.errors[0].message
         assert "runtime-owned" in result.validation.errors[0].message
 
     def test_patch_node_options_rejects_user_supplied_llm_runtime_hash_without_mutating_state(self) -> None:
@@ -10038,7 +10039,7 @@ class TestSetPipeline:
             "patch_node_options",
             {
                 "node_id": "code_themes",
-                "patch": {"resolved_prompt_template_hash": stable_hash(prompt_template)},
+                "patch": {"approved_prompt_artifact_hash": stable_hash(prompt_template)},
             },
             created.updated_state,
             catalog,
@@ -10047,7 +10048,7 @@ class TestSetPipeline:
         assert result.success is False
         assert result.updated_state is created.updated_state
         assert result.data is None
-        assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+        assert "approved_prompt_artifact_hash" in result.validation.errors[0].message
         assert "runtime-owned" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_user_supplied_resolved_llm_reviews_without_mutating_state(self) -> None:
@@ -10156,7 +10157,7 @@ class TestSetPipeline:
         )
         assert created.success is True, created.data
         resolved_options = _llm_options_with_forged_resolved_reviews({"secret_ref": "OPENROUTER_API_KEY"})
-        resolved_options["resolved_prompt_template_hash"] = stable_hash(resolved_options["prompt_template"])
+        resolved_options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(resolved_options)
         resolved_node = replace(created.updated_state.nodes[0], options=resolved_options)
         resolved_state = created.updated_state.with_node(resolved_node)
 
@@ -10170,7 +10171,7 @@ class TestSetPipeline:
         assert result.success is True, result.data
         patched_options = result.updated_state.nodes[0].options
         assert patched_options["temperature"] == 0.1
-        assert patched_options["resolved_prompt_template_hash"] == stable_hash(patched_options["prompt_template"])
+        assert patched_options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash_from_options(patched_options)
         assert deep_thaw(patched_options[INTERPRETATION_REQUIREMENTS_KEY]) == resolved_options[INTERPRETATION_REQUIREMENTS_KEY]
 
     def test_set_pipeline_rejects_secret_ref_in_non_credential_field(self) -> None:
@@ -14180,7 +14181,6 @@ class TestPrevalidatePluginOptions:
         assert "deployment_name" in result
         assert "endpoint" in result
         assert "api_key" in result
-        assert "template" in result
 
     def test_llm_openrouter_missing_required_fields_surfaces_errors(self) -> None:
         """OpenRouter with missing required fields reports provider-specific missing fields."""
@@ -14194,7 +14194,6 @@ class TestPrevalidatePluginOptions:
         # OpenRouter-specific required fields — model is required (no deployment_name fallback)
         assert "model" in result
         assert "api_key" in result
-        assert "template" in result
 
     def test_llm_secret_ref_does_not_hide_prompt_field_declaration_error(self) -> None:
         """A deferred credential must not suppress unrelated model validation."""

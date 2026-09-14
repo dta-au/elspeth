@@ -330,7 +330,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        Pre-1.0 delete-and-recreate boundary; no migration,
 #        rollback_permitted: false (sessions.db only; auth.db is untouched).
 # Coupled cut: sparse proposal display and structured stored validation errors.
-SESSION_SCHEMA_EPOCH = 56
+# 57 → Approved prompt artifact anchor replaces the fallback-template digest.
+#      Pre-1.0 delete/recreate; old approvals must not be reinterpreted.
+SESSION_SCHEMA_EPOCH = 57
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1413,16 +1415,16 @@ interpretation_events_table = Table(
     # committed. NULL until resolved; NULL for session-level
     # auto_interpreted_opt_out marker rows and for non-prompt-template
     # surface opt-out rows. For user_approved rows and surface-specific
-    # auto_interpreted_opt_out rows that resolve an llm_prompt_template,
-    # this is SHA-256 over the rfc8785 canonical JSON of the
-    # resolved prompt-template string, using
-    # ``CANONICAL_VERSION = "sha256-rfc8785-v1"`` (contracts/hashing.py).
+    # auto_interpreted_opt_out rows that resolve an llm_prompt_template or
+    # a vague term embedded in that template,
+    # this is the versioned approved prompt surface hash from
+    # core/prompt_artifact.py: system prompt plus ordered effective queries.
     # NOT part of INTERPRETATION_HASH_DOMAIN_V2 — it covers a different
-    # input (the resolved prompt string) and serves as a cross-DB anchor
-    # only. Pair to ``calls.resolved_prompt_template_hash`` in the L1
+    # input (the approved prompt artifact) and serves as a cross-DB anchor
+    # only. Pair to ``calls.approved_prompt_artifact_hash`` in the L1
     # Landscape audit DB; equality across both DBs is the audit-tooling
     # cross-anchor invariant.
-    Column("resolved_prompt_template_hash", String(64), nullable=True),
+    Column("approved_prompt_artifact_hash", String(64), nullable=True),
     ForeignKeyConstraint(
         ["composition_state_id", "session_id"],
         ["composition_states.id", "composition_states.session_id"],

@@ -9,6 +9,7 @@ import { Button, Input } from "@/components/ui";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
 import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { modelDisplayName } from "@/components/chat/modelDisplayName";
+import { llmBindingLabel } from "@/lib/llmBindingLabel";
 import { componentPhrase } from "@/components/workspace/specRouting";
 import type {
   CompositionState,
@@ -91,44 +92,6 @@ function isLlmNode(node: NodeSpec): boolean {
     typeof node.options?.model === "string" ||
     (node.plugin ?? "").includes("llm")
   );
-}
-
-const SAFE_LLM_PROFILE_ALIAS = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/;
-const SAFE_LLM_MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,511}$/;
-
-function hasOwnOption(options: Record<string, unknown>, name: string): boolean {
-  return Object.prototype.hasOwnProperty.call(options, name);
-}
-
-/** Return only a safe, author-visible LLM binding label.
- *
- * Web profile lowering deliberately keeps the opaque authored `profile`
- * alias in composition state while provider, model, endpoint, and credential
- * bindings stay operator-private. If profile provenance is present but
- * malformed, fail closed to the generic label instead of falling through to
- * a possibly resolved private model. `profile_alias` and `resolved_model`
- * are executable/audit provenance, never consent-dialog display values.
- */
-function llmSourceBindingLabel(source: SourceSpec): string {
-  const { options } = source;
-  if (hasOwnOption(options, "profile")) {
-    const profile = options.profile;
-    if (typeof profile === "string" && SAFE_LLM_PROFILE_ALIAS.test(profile)) {
-      return `profile ${profile}`;
-    }
-    return "configured LLM";
-  }
-  if (
-    hasOwnOption(options, "profile_alias") ||
-    hasOwnOption(options, "resolved_model")
-  ) {
-    return "configured LLM";
-  }
-  const model = options.model;
-  if (typeof model === "string" && SAFE_LLM_MODEL_IDENTIFIER.test(model)) {
-    return `model ${model}`;
-  }
-  return "configured LLM";
 }
 
 function catalogFlagsLlmSource(
@@ -318,7 +281,7 @@ export function buildRunEgressSummary(
     (list) => `Reads source data: ${list}.`,
   );
 
-  // `llmSourceBindingLabel` is the same in BOTH registers by design: it
+  // `llmBindingLabel` is the same in BOTH registers by design: it
   // establishes egress SAFETY (provider, model, endpoint and credential
   // bindings stay operator-private), and the authored profile alias is the
   // one binding the user may see. Phrasing it would title-case an
@@ -328,7 +291,7 @@ export function buildRunEgressSummary(
     llmSourceEntries.map(([sourceName, source]) =>
       qualified(
         component(sourceComponentId(sourceName)),
-        bothRegisters(llmSourceBindingLabel(source)),
+        bothRegisters(llmBindingLabel(source.options)),
       ),
     ),
     (list) => `Sends one authored prompt to the configured LLM: ${list}.`,

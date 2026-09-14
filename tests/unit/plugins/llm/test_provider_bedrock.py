@@ -266,6 +266,20 @@ class TestBedrockAdapter:
 
 
 class TestBedrockProvider:
+    def test_call_preserves_approved_prompt_artifact(self) -> None:
+        recorder = FakeAuditRecorder()
+        provider = BedrockLLMProvider(
+            region_name=None,
+            recorder=recorder,
+            run_id="run-1",
+            telemetry_emit=FakeTelemetryEmit(),
+            approved_prompt_artifact_hash="b" * 64,
+        )
+        with patch("litellm.completion", return_value=_response()):
+            _execute(provider)
+        assert len(recorder.calls) == 1
+        assert recorder.calls[0]["approved_prompt_artifact_hash"] == "b" * 64
+
     def test_satisfies_llm_provider_protocol(self) -> None:
         assert isinstance(_provider(), LLMProvider)
 

@@ -1205,7 +1205,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:45cf69ab26b012aa"
+    source_file_hash: str | None = "sha256:af6f330640914b16"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1457,7 +1457,11 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # OpenRouterConfig requires model. So self._config.model is always non-empty.
         self._model = self._config.model
         self._template = PromptTemplate(
-            self._config.prompt_template,
+            self._config.effective_template(
+                resolve_queries(self._config.queries)[0].template
+                if self._config.prompt_template is None and self._config.queries is not None
+                else None
+            ),
             template_source=self._config.prompt_template_source,
             lookup_data=self._config.lookup,
             lookup_source=self._config.lookup_source,
@@ -1475,8 +1479,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # when the transform's prompt template carried a
         # ``{{interpretation:<term>}}`` placeholder the user resolved.
         # Forwarded to every audited LLM call so the Landscape
-        # ``calls.resolved_prompt_template_hash`` column populates.
-        self._resolved_prompt_template_hash = self._config.resolved_prompt_template_hash
+        # ``calls.approved_prompt_artifact_hash`` column populates.
+        self._approved_prompt_artifact_hash = self._config.approved_prompt_artifact_hash
 
         # Schema (input — same for both single and multi-query)
         schema_config = self._config.schema_config
@@ -1782,7 +1786,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
             )
         elif isinstance(self._config, OpenRouterConfig):
             return OpenRouterLLMProvider(
@@ -1793,7 +1797,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
             )
         elif isinstance(self._config, BedrockConfig):
             return BedrockLLMProvider(
@@ -1802,7 +1806,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
             )
         elif isinstance(self._config, GatewayConfig):
             # GatewayConfig.api_key already carries the resolved bearer value
@@ -1823,7 +1827,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
             )
         else:
             raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")

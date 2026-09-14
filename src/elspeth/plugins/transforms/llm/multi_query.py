@@ -59,7 +59,7 @@ class OutputFieldConfig(PluginConfig):
     # data-validation schema. Left as-is it lowers to a spurious editable
     # ``schema`` knob per output field in the composer catalog discovery. Override
     # the inherited field solely to mark it ``composer_hidden`` (mirroring
-    # ``LLMConfig.resolved_prompt_template_hash``) so ``_lower_nested_model``
+    # ``LLMConfig.approved_prompt_artifact_hash``) so ``_lower_nested_model``
     # skips it; the type/alias/default and the inherited ``_parse_schema_config``
     # validator (bound by field name) are preserved unchanged.
     schema_config: SchemaConfig | None = Field(

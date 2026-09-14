@@ -256,14 +256,14 @@ class TestSyncSchemaEpochDirectionalGuard:
 class TestSchemaCompatibilityGuards:
     """Coverage for fail-fast schema compatibility checks."""
 
-    def test_phase5b_resolved_prompt_template_hash_is_required_schema_contract(self) -> None:
+    def test_phase5b_approved_prompt_artifact_hash_is_required_schema_contract(self) -> None:
         """Phase 5b call-hash anchor must participate in stale-DB detection.
 
         The Landscape metadata alone is not enough: existing SQLite audit DBs
         are validated against these required lists before runtime writes begin.
         """
-        assert ("calls", "resolved_prompt_template_hash") in database_module._REQUIRED_COLUMNS
-        assert ("calls", "ix_calls_resolved_prompt_template_hash") in database_module._REQUIRED_INDEXES
+        assert ("calls", "approved_prompt_artifact_hash") in database_module._REQUIRED_COLUMNS
+        assert ("calls", "ix_calls_approved_prompt_artifact_hash") in database_module._REQUIRED_INDEXES
 
     def test_openrouter_catalog_source_check_is_required_schema_contract(self) -> None:
         """OpenRouter catalog source validity must participate in stale-DB detection."""

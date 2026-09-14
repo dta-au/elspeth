@@ -3880,3 +3880,39 @@ class TestSingleQueryStructuredOutputExecution:
         model_fields = transform.output_schema.model_fields
         assert "score" in model_fields
         assert "label" in model_fields
+
+
+@pytest.mark.parametrize("with_fallback", [False, True])
+def test_effective_query_templates_execute_and_keep_their_own_audit_identity(with_fallback: bool) -> None:
+    from hashlib import sha256
+
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    config = _make_config(
+        queries={
+            "own": {"input_fields": {"text_content": "text"}, "template": "Own {{ row.text_content }}"},
+            "second": {"input_fields": {"text_content": "text"}, "template": "Second {{ row.text_content }}"},
+        },
+    )
+    if with_fallback:
+        config["prompt_template"] = "Fallback {{ row.text_content }}"
+        del config["queries"]["second"]["template"]
+    else:
+        del config["prompt_template"]
+    transform = LLMTransform(config)
+    provider = Mock(spec=LLMProvider)
+    provider.execute_query.return_value = LLMQueryResult(
+        content="answer", usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+    )
+    transform._provider = provider
+    result = transform._process_row(_make_row(), _make_ctx())
+    assert result.status == "success"
+    assert [call.args[0] for call in provider.execute_query.call_args_list] == [
+        [ChatMessage(role="user", content="Own hello")],
+        [ChatMessage(role="user", content="Fallback hello" if with_fallback else "Second hello")],
+    ]
+    assert result.success_reason is not None
+    metadata = result.success_reason["metadata"]
+    assert metadata["own_llm_response_template_hash"] == sha256(b"Own {{ row.text_content }}").hexdigest()
+    second_template = "Fallback {{ row.text_content }}" if with_fallback else "Second {{ row.text_content }}"
+    assert metadata["second_llm_response_template_hash"] == sha256(second_template.encode()).hexdigest()

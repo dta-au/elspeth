@@ -322,7 +322,7 @@ class CallLoader:
             response_ref=row.response_ref,
             error_json=row.error_json,
             latency_ms=row.latency_ms,
-            resolved_prompt_template_hash=row.resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=row.approved_prompt_artifact_hash,
             prompt_tokens=row.prompt_tokens,
             completion_tokens=row.completion_tokens,
             cached_prompt_tokens=row.cached_prompt_tokens,

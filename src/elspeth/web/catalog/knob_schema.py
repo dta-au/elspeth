@@ -462,7 +462,7 @@ def lower_model_to_knob_schema(
 
     Fields whose ``json_schema_extra`` carries ``{"composer_hidden": True}``
     are skipped entirely. Use this for audit-anchor fields the runtime
-    writes (e.g. ``resolved_prompt_template_hash`` on ``LLMConfig``); they
+    writes (e.g. ``approved_prompt_artifact_hash`` on ``LLMConfig``); they
     are valid YAML inputs the composer service emits internally, but they
     must not appear as user-editable knobs because a user-set value would
     falsify the audit trail.

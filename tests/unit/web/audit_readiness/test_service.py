@@ -377,7 +377,7 @@ def _make_event(
             interpretation_source=interpretation_source,
             runtime_model_identifier_at_resolve=None,
             runtime_model_version_at_resolve=None,
-            resolved_prompt_template_hash=None,
+            approved_prompt_artifact_hash=None,
         )
     if interpretation_source is InterpretationSource.AUTO_INTERPRETED_NO_SURFACES:
         return InterpretationEventRecord(
@@ -403,7 +403,7 @@ def _make_event(
             interpretation_source=interpretation_source,
             runtime_model_identifier_at_resolve=None,
             runtime_model_version_at_resolve=None,
-            resolved_prompt_template_hash=None,
+            approved_prompt_artifact_hash=None,
         )
     # USER_APPROVED row
     resolved = choice is not InterpretationChoice.PENDING
@@ -436,7 +436,7 @@ def _make_event(
         runtime_model_version_at_resolve=(
             ("2026-01-01" if resolved else None) if runtime_model_version_at_resolve is _UNSET else runtime_model_version_at_resolve  # type: ignore[return-value]
         ),
-        resolved_prompt_template_hash="b" * 64 if resolved else None,
+        approved_prompt_artifact_hash="b" * 64 if resolved else None,
     )
 
 

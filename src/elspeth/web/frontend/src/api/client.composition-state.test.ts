@@ -111,9 +111,13 @@ describe("composition state HTTP admission", () => {
     useSessionStore.setState({ activeSessionId: "00000000-0000-4000-8000-000000000001", compositionState: null, error: null });
     vi.mocked(fetch)
       .mockResolvedValueOnce(new Response(JSON.stringify(current)))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: "No guided state" }), { status: 400 }))
+      .mockResolvedValueOnce(new Response("null", { status: 200 }))
       .mockImplementation(async () => new Response(JSON.stringify({ events: [] })));
     await useSessionStore.getState().revertToVersion("state-1");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/sessions/00000000-0000-4000-8000-000000000001/guided?probe=true",
+      expect.objectContaining({ method: "GET" }),
+    );
     expect(useSessionStore.getState().compositionState).toEqual(current);
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(stateWithErrors(["legacy"]))));
     await useSessionStore.getState().revertToVersion("state-2");

@@ -68,7 +68,7 @@ class _ExecutionRepositoryDouble:
         work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         call_kwargs = {
@@ -82,7 +82,7 @@ class _ExecutionRepositoryDouble:
             "latency_ms": latency_ms,
             "request_ref": request_ref,
             "response_ref": response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "token_usage": token_usage,
         }
         self.recorded_calls.append(call_kwargs)
@@ -102,7 +102,7 @@ class _ExecutionRepositoryDouble:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         actual_call_index = (
@@ -121,7 +121,7 @@ class _ExecutionRepositoryDouble:
             "latency_ms": latency_ms,
             "request_ref": request_ref,
             "response_ref": response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "token_usage": token_usage,
         }
         self.recorded_calls.append(call_kwargs)
@@ -141,7 +141,7 @@ class _ExecutionRepositoryDouble:
             request_ref=call_kwargs["request_ref"] or "request_payload_ref",
             response_ref=call_kwargs["response_ref"] or ("response_payload_ref" if call_kwargs["response_data"] is not None else None),
             latency_ms=call_kwargs["latency_ms"],
-            resolved_prompt_template_hash=call_kwargs["resolved_prompt_template_hash"],
+            approved_prompt_artifact_hash=call_kwargs["approved_prompt_artifact_hash"],
             prompt_tokens=call_kwargs["token_usage"].prompt_tokens,
             completion_tokens=call_kwargs["token_usage"].completion_tokens,
             cached_prompt_tokens=call_kwargs["token_usage"].cached_prompt_tokens,

@@ -50,7 +50,7 @@ def _resolved_record_kwargs() -> dict[str, object]:
         "interpretation_source": InterpretationSource.USER_APPROVED,
         "runtime_model_identifier_at_resolve": "anthropic/claude-opus-4-7",
         "runtime_model_version_at_resolve": "2026-01-15",
-        "resolved_prompt_template_hash": "c" * 64,
+        "approved_prompt_artifact_hash": "c" * 64,
     }
 
 
@@ -79,7 +79,7 @@ def _opted_out_record_kwargs() -> dict[str, object]:
         "interpretation_source": InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
-        "resolved_prompt_template_hash": None,
+        "approved_prompt_artifact_hash": None,
     }
 
 
@@ -108,7 +108,7 @@ def _no_surfaces_record_kwargs() -> dict[str, object]:
         "interpretation_source": InterpretationSource.AUTO_INTERPRETED_NO_SURFACES,
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
-        "resolved_prompt_template_hash": None,
+        "approved_prompt_artifact_hash": None,
     }
 
 
@@ -126,7 +126,7 @@ def _surface_opt_out_record_kwargs() -> dict[str, object]:
         "hash_domain_version": "v2",
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
-        "resolved_prompt_template_hash": None,
+        "approved_prompt_artifact_hash": None,
     }
 
 
@@ -255,7 +255,7 @@ def test_opted_out_record_constructs_successfully() -> None:
     assert record.hash_domain_version is None
     assert record.runtime_model_identifier_at_resolve is None
     assert record.runtime_model_version_at_resolve is None
-    assert record.resolved_prompt_template_hash is None
+    assert record.approved_prompt_artifact_hash is None
 
 
 def test_opted_out_record_roundtrips_through_asdict() -> None:
@@ -284,7 +284,7 @@ def test_opted_out_record_roundtrips_through_asdict() -> None:
         "hash_domain_version",
         "runtime_model_identifier_at_resolve",
         "runtime_model_version_at_resolve",
-        "resolved_prompt_template_hash",
+        "approved_prompt_artifact_hash",
     ):
         assert snapshot[nullable] is None
 
@@ -424,7 +424,7 @@ def test_record_validates_choice_resolved_at_coupling(
         kwargs["hash_domain_version"] = None
         kwargs["runtime_model_identifier_at_resolve"] = None
         kwargs["runtime_model_version_at_resolve"] = None
-        kwargs["resolved_prompt_template_hash"] = None
+        kwargs["approved_prompt_artifact_hash"] = None
     with pytest.raises(ValueError, match="resolved_at"):
         InterpretationEventRecord(**kwargs)  # type: ignore[arg-type]
 

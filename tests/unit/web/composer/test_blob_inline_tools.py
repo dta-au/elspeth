@@ -630,7 +630,7 @@ class TestWireBlobInlineRef:
         result = execute_tool(
             "wire_blob_inline_ref",
             {
-                "field_path": "node:classify.options.resolved_prompt_template_hash",
+                "field_path": "node:classify.options.approved_prompt_artifact_hash",
                 "blob_id": blob.data["blob_id"],
             },
             state,
@@ -644,7 +644,7 @@ class TestWireBlobInlineRef:
 
         assert result.success is False
         assert result.updated_state is state
-        assert "resolved_prompt_template_hash" in result.validation.errors[0].message
+        assert "approved_prompt_artifact_hash" in result.validation.errors[0].message
         assert "runtime-owned" in result.validation.errors[0].message
         assert "field_path" in result.validation.errors[0].message
         assert "patch_node_options" in result.validation.errors[0].message

@@ -74,7 +74,7 @@ class PluginAuditWriterAdapter:
         work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         return self._execution.record_call(
@@ -90,7 +90,7 @@ class PluginAuditWriterAdapter:
             work_item=work_item,
             request_ref=request_ref,
             response_ref=response_ref,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
         )
 
@@ -108,7 +108,7 @@ class PluginAuditWriterAdapter:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
     ) -> Call:
         return self._execution.record_operation_call(
@@ -123,7 +123,7 @@ class PluginAuditWriterAdapter:
             call_index=call_index,
             request_ref=request_ref,
             response_ref=response_ref,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
         )
 

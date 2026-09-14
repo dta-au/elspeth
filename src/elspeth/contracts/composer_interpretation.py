@@ -251,11 +251,11 @@ class InterpretationEventRecord:
     runtime_model_identifier_at_resolve: str | None
     runtime_model_version_at_resolve: str | None
     # Cross-DB hash anchor (Option A). NULL until resolved; NULL for
-    # auto_interpreted_opt_out rows (no prompt template is patched). For
-    # resolved user_approved rows, this is the SHA-256 of the resolved
-    # prompt-template string, computed at resolve time using stable_hash()
-    # from contracts/hashing.py. NOT part of INTERPRETATION_HASH_DOMAIN_V2.
-    resolved_prompt_template_hash: str | None
+    # opt-out marker rows (no prompt template is patched). For
+    # resolved prompt reviews, this identifies the versioned approved prompt
+    # artifact: system prompt plus ordered effective query names/templates.
+    # NOT part of INTERPRETATION_HASH_DOMAIN_V2 or the requirement drift hash.
+    approved_prompt_artifact_hash: str | None
 
     def __post_init__(self) -> None:
         """Validate Tier-1 row-shape invariants at construction time."""

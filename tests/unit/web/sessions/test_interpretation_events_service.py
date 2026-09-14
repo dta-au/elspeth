@@ -44,6 +44,7 @@ from elspeth.contracts.composer_interpretation import (
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import (
     CompositionState,
@@ -944,8 +945,8 @@ async def test_03_resolve_accepted_as_drafted_uses_llm_draft(service) -> None:
     assert resolved.hash_domain_version == "v2"
     assert resolved.arguments_hash is not None
     assert len(resolved.arguments_hash) == 64
-    assert resolved.resolved_prompt_template_hash is not None
-    assert len(resolved.resolved_prompt_template_hash) == 64
+    assert resolved.approved_prompt_artifact_hash is not None
+    assert len(resolved.approved_prompt_artifact_hash) == 64
 
     # A new composition state row exists at version+1 with interpretation_resolve provenance.
     assert new_state.version == state.version + 1
@@ -956,7 +957,7 @@ async def test_03_resolve_accepted_as_drafted_uses_llm_draft(service) -> None:
     patched_template = patched["options"]["prompt_template"]
     assert "{{interpretation:cool}}" not in patched_template
     assert "Innovative and creative" in patched_template
-    assert patched["options"]["resolved_prompt_template_hash"] == resolved.resolved_prompt_template_hash
+    assert patched["options"]["approved_prompt_artifact_hash"] == resolved.approved_prompt_artifact_hash
 
     # Verify provenance in DB.
     with service._engine.begin() as conn:
@@ -1338,11 +1339,7 @@ async def test_opt_out_auto_resolve_persists_runtime_preflight_verdict(engine) -
         ),
         (
             None,
-            (
-                CompositionValidationError(
-                    message="/home/operator/private.csv token=VALIDATION-CREDENTIAL-CANARY", error_code=None, component="node"
-                ),
-            ),
+            (CompositionValidationError(message="/srv/private.csv token=VALIDATION-CREDENTIAL-CANARY", error_code=None, component="node"),),
         ),
     ],
     ids=("guided-closes-validator-text", "freeform-preserves-validator-text"),
@@ -1381,7 +1378,7 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
         ),
         provenance="session_seed",
     )
-    canary = "/home/operator/private.csv token=VALIDATION-CREDENTIAL-CANARY"
+    canary = "/srv/private.csv token=VALIDATION-CREDENTIAL-CANARY"
     monkeypatch.setattr(
         service,
         "_validate_patched_composition_state",
@@ -1456,10 +1453,12 @@ async def test_resolve_prompt_template_review_records_hash_without_rewriting_tem
     assert resolved.kind is InterpretationKind.LLM_PROMPT_TEMPLATE
     assert resolved.hash_domain_version == "v2"
     assert resolved.accepted_value == event.llm_draft
-    assert resolved.resolved_prompt_template_hash == stable_hash(event.llm_draft)
+    assert resolved.approved_prompt_artifact_hash == approved_prompt_artifact_hash(prompt_template=event.llm_draft, system_prompt=None)
     node = next(node for node in new_state.nodes if node["id"] == "identify_colour")
     assert node["options"]["prompt_template"] == event.llm_draft
-    assert node["options"]["resolved_prompt_template_hash"] == stable_hash(event.llm_draft)
+    assert node["options"]["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(
+        prompt_template=event.llm_draft, system_prompt=None
+    )
     requirement = node["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
     assert requirement["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value
     assert requirement["status"] == "resolved"
@@ -2411,9 +2410,13 @@ async def test_create_pending_after_session_opt_out_writes_surface_specific_audi
         assert event.arguments_hash is not None
         assert event.hash_domain_version == "v2"
         if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-            assert event.resolved_prompt_template_hash == stable_hash(llm_draft)
+            assert event.approved_prompt_artifact_hash == approved_prompt_artifact_hash(prompt_template=llm_draft, system_prompt=None)
+        elif kind is InterpretationKind.VAGUE_TERM:
+            assert event.approved_prompt_artifact_hash == approved_prompt_artifact_hash(
+                prompt_template=f"Rate how {llm_draft} this is.", system_prompt=None
+            )
         else:
-            assert event.resolved_prompt_template_hash is None
+            assert event.approved_prompt_artifact_hash is None
 
     pending_rows = await service.list_interpretation_events(session_id, status="pending")
     all_rows = await service.list_interpretation_events(session_id, status="all")
@@ -2452,7 +2455,9 @@ async def test_create_pending_after_session_opt_out_writes_surface_specific_audi
     prompt_requirement = prompt_node.options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert prompt_requirement["status"] == "resolved"
     assert prompt_requirement["accepted_value"] == "Read {{ row.html }} and return JSON."
-    assert prompt_node.options["resolved_prompt_template_hash"] == stable_hash("Read {{ row.html }} and return JSON.")
+    assert prompt_node.options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(
+        prompt_template="Read {{ row.html }} and return JSON.", system_prompt=None
+    )
 
     cleanup_node = next(node for node in latest_state.nodes if node.id == "drop_raw_html")
     cleanup_requirement = cleanup_node.options[INTERPRETATION_REQUIREMENTS_KEY][0]
@@ -2600,7 +2605,7 @@ async def test_resolve_pipeline_decision_rejects_custom_raw_field_preservation(s
                 interpretation_source=InterpretationSource.USER_APPROVED.value,
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=None,
+                approved_prompt_artifact_hash=None,
             )
         )
 
@@ -2929,7 +2934,7 @@ def _interpretation_row(**overrides: object) -> SimpleNamespace:
         "interpretation_source": "user_approved",
         "runtime_model_identifier_at_resolve": "anthropic/claude-opus-4-7",
         "runtime_model_version_at_resolve": "2026-05-01",
-        "resolved_prompt_template_hash": "c" * 64,
+        "approved_prompt_artifact_hash": "c" * 64,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -3113,7 +3118,7 @@ def test_patch_helper_sequential_vague_resolutions_keep_per_requirement_value_ha
 
     Each resolved requirement's ``resolved_prompt_template_hash`` attests its
     own accepted value (sibling-resolution invariant), while the node-level
-    ``options.resolved_prompt_template_hash`` tracks the full rendered prompt.
+    ``options.approved_prompt_artifact_hash`` tracks the full rendered prompt.
     Storing the full-render hash on the requirement froze the first-resolved
     requirement at a partial render, so reconciliation flagged permanent
     hash-drift once any second term resolved.
@@ -3155,7 +3160,9 @@ def test_patch_helper_sequential_vague_resolutions_keep_per_requirement_value_ha
     options = next(iter(second_pass))["options"]
     requirements = {requirement["id"]: requirement for requirement in options[INTERPRETATION_REQUIREMENTS_KEY]}
     assert options["prompt_template"] == "Rate modern and quick this is."
-    assert options["resolved_prompt_template_hash"] == stable_hash("Rate modern and quick this is.")
+    assert options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(
+        prompt_template="Rate modern and quick this is.", system_prompt=None
+    )
     assert requirements["cool"]["resolved_prompt_template_hash"] == stable_hash("modern")
     assert requirements["fast"]["resolved_prompt_template_hash"] == stable_hash("quick")
 
@@ -3466,12 +3473,12 @@ async def test_resolve_round_trips_through_state_from_record_and_yaml(service) -
     assert node.id == "llm_transform_1"
     assert "{{interpretation:cool}}" not in node.options["prompt_template"]
     assert "modern design + clear purpose" in node.options["prompt_template"]
-    assert node.options["resolved_prompt_template_hash"] == resolved.resolved_prompt_template_hash
+    assert node.options["approved_prompt_artifact_hash"] == resolved.approved_prompt_artifact_hash
 
     # Generated YAML must carry both fields under transforms[0].options.
     yaml_str = generate_yaml(cs)
     assert "prompt_template: Rate how modern design + clear purpose this is." in yaml_str
-    assert f"resolved_prompt_template_hash: {resolved.resolved_prompt_template_hash}" in yaml_str
+    assert f"approved_prompt_artifact_hash: {resolved.approved_prompt_artifact_hash}" in yaml_str
     # Negative assertion: the placeholder must not survive into the YAML.
     assert "{{interpretation:cool}}" not in yaml_str
 
@@ -3515,7 +3522,7 @@ async def test_resolve_structured_requirement_round_trips_without_authoring_meta
     node = cs.nodes[0]
     requirement = node.options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert node.options["prompt_template"] == "Rate modern and clear this is."
-    assert node.options["resolved_prompt_template_hash"] == resolved.resolved_prompt_template_hash
+    assert node.options["approved_prompt_artifact_hash"] == resolved.approved_prompt_artifact_hash
     assert requirement["status"] == "resolved"
     assert requirement["accepted_value"] == "modern and clear"
     # Requirement-level hash attests the accepted value; the node-level hash

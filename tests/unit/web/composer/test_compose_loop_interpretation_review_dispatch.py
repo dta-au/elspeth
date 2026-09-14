@@ -33,6 +33,7 @@ uses.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -212,9 +213,11 @@ class _ScriptedLLM:
     def __init__(self, responses: list[Any]) -> None:
         self._responses = list(responses)
         self.messages: list[list[dict[str, Any]]] = []
+        self.tools: list[Any] = []
 
     async def __call__(self, _messages: list[dict[str, Any]], _tools: Any) -> Any:
         self.messages.append(_messages)
+        self.tools.append(_tools)
         if not self._responses:
             return _fake_text_response("Done.")
         return self._responses.pop(0)
@@ -1073,7 +1076,7 @@ async def test_fresh_session_set_pipeline_then_request_interpretation_review_per
 
 
 @pytest.mark.asyncio
-async def test_successful_interpretation_review_returns_user_handoff_without_extra_model_turns(
+async def test_successful_interpretation_review_rejects_reply_tool_calls_without_dispatch(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
 ) -> None:
@@ -1084,7 +1087,8 @@ async def test_successful_interpretation_review_returns_user_handoff_without_ext
     result, asked the model for another turn, and the model kept re-surfacing
     reviews until the request hit the wall-clock timeout. A pending review is
     already a user-action boundary; the loop should return a recoverable
-    ComposerResult before consuming another LLM/tool turn.
+    ComposerResult after at most one reply-only call, even if the provider
+    ignores the absence of advertised tools.
     """
 
     composer = _build_composer(tmp_path, sessions_service)
@@ -1144,9 +1148,17 @@ async def test_successful_interpretation_review_returns_user_handoff_without_ext
         "set_pipeline",
         "request_interpretation_review",
     ]
-    assert result.assistant_message.startswith("Surfacing the review card now.")
+    assert "final reply is unavailable" in result.assistant_message
     assert "Interpretation review cards are ready" in result.assistant_message
-    assert result.raw_assistant_content == "Surfacing the review card now."
+    assert "Surfacing the review card now." not in result.assistant_message
+    assert result.raw_assistant_content == ""
+    from elspeth.web.composer.no_tool_policy import TrustedSystemNoticeSegment, visible_message_segments
+
+    segments = visible_message_segments(content=result.assistant_message, raw_content=result.raw_assistant_content)
+    assert isinstance(segments[-1], TrustedSystemNoticeSegment)
+    assert "final reply is unavailable" in segments[-1].content
+    assert len(llm.messages) == 3
+    assert llm.tools[-1] == []
     assert "review" in result.assistant_message.lower()
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     vague_events = [e for e in events if e.kind is InterpretationKind.VAGUE_TERM]
@@ -1389,7 +1401,7 @@ async def test_staged_review_over_masked_invalid_wired_state_spends_a_repair_tur
 
 
 @pytest.mark.asyncio
-async def test_staged_review_over_unwired_draft_keeps_no_extra_turns_contract(
+async def test_staged_review_over_unwired_draft_adds_only_reply_turn(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
     monkeypatch: pytest.MonkeyPatch,
@@ -1437,7 +1449,7 @@ async def test_staged_review_over_unwired_draft_keeps_no_extra_turns_contract(
         message="create a workflow that rates how cool pages are",
     )
 
-    assert len(llm.messages) == 2, [len(m) for m in llm.messages]
+    assert len(llm.messages) == 3, [len(m) for m in llm.messages]
     for call_messages in llm.messages:
         assert not any(
             "Pre-finalisation runtime preflight" in m.get("content", "") for m in call_messages if isinstance(m.get("content"), str)
@@ -1479,7 +1491,7 @@ async def test_staged_review_with_spent_budget_completes_with_qualified_disclosu
         message="create a workflow that rates how cool pages are",
     )
 
-    assert len(llm.messages) == 2, [len(m) for m in llm.messages]
+    assert len(llm.messages) == 3, [len(m) for m in llm.messages]
     assert _HANDOFF_SUFFIX in result.assistant_message
     assert "must be fixed before this pipeline can run" in result.assistant_message
     assert "producer emits 'Any'" in result.assistant_message
@@ -4130,40 +4142,33 @@ async def test_repair_pass_with_nothing_to_repair_acquires_no_writer_lease(
 
 
 _REVIEW_TURN_PROSE = "Surfacing the review card now."
-# Distinctive text on a scripted response the loop should NEVER reach. If a
-# second generation produced the duplicate, the loop would have consumed this.
-_UNREACHED_THIRD_TURN_PROSE = "A THIRD PROVIDER TURN WAS REQUESTED."
+# Distinctive final prose must come from the reply-only provider call.
+_FINAL_REPLY_PROSE = "A fork suits independent personas; distinct answer columns preserve both results."
 
 
 @pytest.mark.asyncio
-async def test_review_handoff_prose_is_generated_once_and_already_persisted(
+@pytest.mark.parametrize("narration", [_REVIEW_TURN_PROSE, None])
+async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+    narration: str | None,
 ) -> None:
-    """Decide between the two proposed mechanisms for the msg4/msg5 duplication.
-
-    Session 891b7b1e persisted the planner's prose twice 99ms apart, the second
-    copy carrying a ``trusted_system_notice``. Two mechanisms were proposed and
-    this test discriminates them:
-
-    * **Double generation** — the backend makes a SECOND provider call that
-      re-renders the same prose. The scripted LLM holds a third response with
-      distinctive text; a second generation consumes it. Refuted when the
-      provider-call count stays at 2 and that text appears nowhere.
-    * **Server re-emission** — ONE provider call renders the prose, the compose
-      loop persists it mid-loop alongside its ``tool_calls``, and the turn-end
-      writer then persists the SAME prose again with the handoff suffix
-      appended. Confirmed by the assertions below.
-
-    The staged-handoff branch terminates the batch at the successful review
-    call, so the model's LAST prose IS the tool-call turn's prose — which the
-    compose loop has already committed. ``result.assistant_message`` re-carries
-    it because ``_append_interpretation_review_handoff_message`` augments the
-    model's rendered text rather than emitting the notice alone.
-    """
+    """A staged review gets a fresh visible answer without repeating tool narration."""
+    from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.models import chat_messages_table
+    from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
 
     composer = _build_composer(tmp_path, sessions_service)
+    completed_results: list[ComposerResult] = []
+    original_loop = composer._compose_loop
+
+    async def capture_result(*args: Any, **kwargs: Any) -> ComposerResult:
+        completed = await original_loop(*args, **kwargs)
+        completed_results.append(completed)
+        return completed
+
+    monkeypatch.setattr(composer, "_compose_loop", capture_result)
     session_id = uuid4()
     with sessions_service._engine.begin() as conn:
         conn.execute(
@@ -4187,7 +4192,7 @@ async def test_review_handoff_prose_is_generated_once_and_already_persisted(
             _fake_response_with_tool_call(
                 tool_call_id="call_review",
                 tool_name="request_interpretation_review",
-                content=_REVIEW_TURN_PROSE,
+                content=narration,
                 arguments={
                     "affected_node_id": "rate_node",
                     "kind": "vague_term",
@@ -4195,7 +4200,7 @@ async def test_review_handoff_prose_is_generated_once_and_already_persisted(
                     "llm_draft": "modern, useful, engaging, and clear for the public.",
                 },
             ),
-            _fake_text_response(_UNREACHED_THIRD_TURN_PROSE),
+            _fake_text_response(_FINAL_REPLY_PROSE),
         ]
     )
 
@@ -4213,13 +4218,13 @@ async def test_review_handoff_prose_is_generated_once_and_already_persisted(
         "request_interpretation_review",
     ]
 
-    # --- Double generation is REFUTED -------------------------------------
-    # One provider call per loop iteration and no more. The third scripted
-    # response was never requested, so nothing re-rendered the review prose.
-    assert len(llm.messages) == 2
-    assert _UNREACHED_THIRD_TURN_PROSE not in result.assistant_message
+    # Two authoring calls and exactly one reply-only call.
+    assert len(llm.messages) == 3
+    assert _FINAL_REPLY_PROSE in result.assistant_message
+    assert llm.tools[-1] == []
+    assert llm.tools[0]
 
-    # --- Server re-emission is CONFIRMED ----------------------------------
+    # Tool narration remains recorded once, distinct from the fresh reply.
     with sessions_service._engine.begin() as conn:
         assistant_rows = [
             row
@@ -4230,16 +4235,23 @@ async def test_review_handoff_prose_is_generated_once_and_already_persisted(
     # The compose loop already committed the model's prose for this turn, with
     # the tool_calls envelope that produced the review card.
     carrying_prose = [row for row in assistant_rows if row["content"] == _REVIEW_TURN_PROSE]
-    assert len(carrying_prose) == 1, [row["content"] for row in assistant_rows]
-    assert carrying_prose[0]["tool_calls"], "the mid-loop row must carry its tool_calls envelope"
-    assert carrying_prose[0]["writer_principal"] == "compose_loop"
+    assert len(carrying_prose) == (1 if narration else 0), [row["content"] for row in assistant_rows]
+    if narration:
+        assert carrying_prose[0]["tool_calls"], "the mid-loop row must carry its tool_calls envelope"
+        assert carrying_prose[0]["writer_principal"] == "compose_loop"
 
-    # And the turn-end writer is handed that same prose back with the notice
-    # appended — persisting ``assistant_message`` verbatim is what produced the
-    # second copy in session 891b7b1e.
-    assert result.raw_assistant_content == _REVIEW_TURN_PROSE
-    assert result.assistant_message.startswith(_REVIEW_TURN_PROSE)
+    # The route receives fresh prose and the canonical backend notice.
+    assert result.raw_assistant_content == _FINAL_REPLY_PROSE
+    assert result.assistant_message.startswith(_FINAL_REPLY_PROSE)
+    assert not result.persisted_assistant_matches_terminal_model_turn
     assert result.assistant_message != _REVIEW_TURN_PROSE
+    # Both HTTP routes use this writer. The real loop result must survive
+    # its duplicate-narration suppression boundary as a genuine reply.
+    assert len(completed_results) == 1
+    draft = composer_turn_end_assistant_row(completed_results[0])
+    assert draft.raw_content == _FINAL_REPLY_PROSE
+    assert draft.content.startswith(_FINAL_REPLY_PROSE)
+    assert _REVIEW_TURN_PROSE not in draft.content
 
 
 @pytest.mark.asyncio
@@ -4328,8 +4340,8 @@ async def test_staged_handoff_threads_the_persisted_row_content_to_the_route(
     # subtracts exactly these to keep only the backend-authored suffix.
     assert result.persisted_assistant_content == assistant_rows[-1]["content"]
     assert result.persisted_assistant_content == _REVIEW_TURN_PROSE
-    assert result.assistant_message.startswith(result.persisted_assistant_content)
-    assert result.persisted_assistant_matches_terminal_model_turn is True
+    assert not result.assistant_message.startswith(result.persisted_assistant_content)
+    assert result.persisted_assistant_matches_terminal_model_turn is False
 
 
 @pytest.mark.asyncio
@@ -4383,7 +4395,7 @@ async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matc
         message="create a workflow that rates how cool pages are",
     )
 
-    assert len(llm.messages) == 2
+    assert len(llm.messages) == 3
     assert result.persisted_assistant_content == ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
     assert result.persisted_assistant_content != _REVIEW_TURN_PROSE
     assert result.persisted_assistant_matches_terminal_model_turn is False
@@ -4461,3 +4473,100 @@ async def test_staged_handoff_without_current_persist_keeps_same_turn_identity_f
     assert persist_calls == 2
     assert result.persisted_assistant_content is None
     assert result.persisted_assistant_matches_terminal_model_turn is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["text", "empty", "tools", "timeout", "api_error", "cancel", "expired"])
+async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    from litellm.exceptions import APIError
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+    from elspeth.web.composer.audit import BufferingRecorder
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = await _seed_bare_session(sessions_service, "Bounded review reply")
+    recorded: list[BufferingRecorder] = []
+    original_audited_call = composer._call_llm_with_audit
+
+    async def capture_audit(*args: Any, **kwargs: Any) -> Any:
+        recorded.append(kwargs["recorder"])
+        return await original_audited_call(*args, **kwargs)
+
+    monkeypatch.setattr(composer, "_call_llm_with_audit", capture_audit)
+    if mode == "expired":
+        original_classify = composer._classify_and_budget_turn
+
+        async def expired_classify(**kwargs: Any) -> Any:
+            kwargs["deadline"] = asyncio.get_running_loop().time() - 1
+            return await original_classify(**kwargs)
+
+        monkeypatch.setattr(composer, "_classify_and_budget_turn", expired_classify)
+
+    prefix = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content="Narration must not become the answer.",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+        ]
+    )
+    reply_calls = 0
+
+    async def reply(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+        nonlocal reply_calls
+        if tools:
+            return await prefix(messages, tools)
+        reply_calls += 1
+        if mode == "timeout":
+            raise TimeoutError
+        if mode == "api_error":
+            raise APIError(status_code=503, message="unavailable", llm_provider="test", model="test")
+        if mode == "cancel":
+            raise asyncio.CancelledError
+        if mode == "tools":
+            return _fake_response_with_tool_call(tool_call_id="forbidden", tool_name="set_pipeline", arguments={})
+        return _fake_text_response("A fork preserves both answers." if mode == "text" else "  ")
+
+    if mode == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await composer._run_one_turn_for_test(llm=reply, session_id=str(session_id), message="Should we use a fork?")
+    else:
+        result = await composer._run_one_turn_for_test(llm=reply, session_id=str(session_id), message="Should we use a fork?")
+        if mode == "text":
+            assert result.raw_assistant_content == "A fork preserves both answers."
+        else:
+            assert result.raw_assistant_content == ""
+            assert "final reply is unavailable" in result.assistant_message
+        assert [inv.tool_name for inv in result.tool_invocations] == ["set_pipeline", "request_interpretation_review"]
+        assert "Narration must not become the answer." not in result.assistant_message
+    assert reply_calls == (0 if mode == "expired" else 1)
+    recorder = recorded[-1]
+    assert len(recorder.llm_calls) == (2 if mode == "expired" else 3)
+    if mode != "expired":
+        assert recorder.llm_calls[-1].tools_spec_hash is None
+        expected = {
+            "text": ComposerLLMCallStatus.SUCCESS,
+            "empty": ComposerLLMCallStatus.MALFORMED_RESPONSE,
+            "tools": ComposerLLMCallStatus.MALFORMED_RESPONSE,
+            "timeout": ComposerLLMCallStatus.TIMEOUT,
+            "api_error": ComposerLLMCallStatus.API_ERROR,
+            "cancel": ComposerLLMCallStatus.CANCELLED,
+        }
+        assert recorder.llm_calls[-1].status == expected[mode]

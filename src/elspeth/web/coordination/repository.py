@@ -964,7 +964,7 @@ class _RepositoryInterpretationMutations:
             interpretation_source=InterpretationSource(row.interpretation_source),
             runtime_model_identifier_at_resolve=row.runtime_model_identifier_at_resolve,
             runtime_model_version_at_resolve=row.runtime_model_version_at_resolve,
-            resolved_prompt_template_hash=row.resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=row.approved_prompt_artifact_hash,
         )
 
     def create_or_reconcile_pending(
@@ -1130,7 +1130,7 @@ class _RepositoryInterpretationMutations:
                 or decision.resolved_at is not None
                 or decision.arguments_hash is not None
                 or decision.hash_domain_version is not None
-                or decision.resolved_prompt_template_hash is not None
+                or decision.approved_prompt_artifact_hash is not None
                 or decision.ensure_opt_out_marker
                 or appended_state is not None
             ):
@@ -1147,10 +1147,10 @@ class _RepositoryInterpretationMutations:
                 or appended_state is None
             ):
                 raise SessionDerivedCustodyError
-            if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-                if not is_lower_sha256_hex(decision.resolved_prompt_template_hash):
+            if command.kind in {InterpretationKind.LLM_PROMPT_TEMPLATE, InterpretationKind.VAGUE_TERM}:
+                if not is_lower_sha256_hex(decision.approved_prompt_artifact_hash):
                     raise SessionDerivedCustodyError
-            elif decision.resolved_prompt_template_hash is not None:
+            elif decision.approved_prompt_artifact_hash is not None:
                 raise SessionDerivedCustodyError
             if (
                 appended_state.derived_from_state_id != snapshot.live_state.id
@@ -1189,7 +1189,7 @@ class _RepositoryInterpretationMutations:
                     interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value,
                     runtime_model_identifier_at_resolve=None,
                     runtime_model_version_at_resolve=None,
-                    resolved_prompt_template_hash=None,
+                    approved_prompt_artifact_hash=None,
                 )
             )
         connection.execute(
@@ -1216,7 +1216,7 @@ class _RepositoryInterpretationMutations:
                 interpretation_source=decision.interpretation_source.value,
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=decision.resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=decision.approved_prompt_artifact_hash,
             )
         )
         if appended_state is not None:
@@ -1336,7 +1336,7 @@ class _RepositoryInterpretationMutations:
                 interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value,
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=None,
+                approved_prompt_artifact_hash=None,
             )
         )
         result = connection.execute(
@@ -1394,7 +1394,7 @@ class _RepositoryInterpretationMutations:
                 interpretation_source=InterpretationSource.AUTO_INTERPRETED_NO_SURFACES.value,
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=None,
+                approved_prompt_artifact_hash=None,
             )
         )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(event_id))).one()
@@ -1412,7 +1412,7 @@ class _RepositoryInterpretationMutations:
         hash_domain_version: str,
         runtime_model_identifier: str | None,
         runtime_model_version: str | None,
-        resolved_prompt_template_hash: str | None,
+        approved_prompt_artifact_hash: str | None,
     ) -> None:
         """Settle one pending interpretation event under exact COMPOSE custody (P4-D6 family A2b).
 
@@ -1441,7 +1441,7 @@ class _RepositoryInterpretationMutations:
                 hash_domain_version=hash_domain_version,
                 runtime_model_identifier_at_resolve=runtime_model_identifier,
                 runtime_model_version_at_resolve=runtime_model_version,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             )
         )
         if result.rowcount != 1:

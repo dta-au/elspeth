@@ -13,8 +13,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.multi_query import QueryDefinition
 
@@ -99,7 +99,7 @@ class TestLLMConfigBase:
         )
         assert config.queries is None
 
-    def test_resolved_prompt_template_hash_must_match_prompt_template(self) -> None:
+    def test_approved_prompt_artifact_hash_must_match_prompt_template(self) -> None:
         """Phase 5b runtime anchor refuses prompt/hash drift at config load."""
         resolved_template = "Rate how innovative this is."
         config = LLMConfig(
@@ -107,17 +107,17 @@ class TestLLMConfigBase:
             prompt_template=resolved_template,
             schema_config=_OBSERVED_SCHEMA,
             required_input_fields=[],
-            resolved_prompt_template_hash=stable_hash(resolved_template),
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash(prompt_template=resolved_template, system_prompt=None),
         )
-        assert config.resolved_prompt_template_hash == stable_hash(resolved_template)
+        assert config.approved_prompt_artifact_hash == approved_prompt_artifact_hash(prompt_template=resolved_template, system_prompt=None)
 
-        with pytest.raises(ValidationError, match="resolved_prompt_template_hash"):
+        with pytest.raises(ValidationError, match="approved_prompt_artifact_hash"):
             LLMConfig(
                 provider="azure",
                 prompt_template="Rate how boring this is.",
                 schema_config=_OBSERVED_SCHEMA,
                 required_input_fields=[],
-                resolved_prompt_template_hash=stable_hash(resolved_template),
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash(prompt_template=resolved_template, system_prompt=None),
             )
 
     def test_missing_required_input_fields_error_names_composer_options_repair(self) -> None:
