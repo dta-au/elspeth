@@ -15,26 +15,23 @@ lines above several Python anchors; find each site by the quoted anchor text.
 
 Decisions this task owns:
 
-1. **The spec needs five backend pieces that no ancestor block produces.**
+1. **The spec needs four backend pieces that no ancestor block produces.**
    I9 adds each one, with a route test on I8's `closed_local_app`:
    a. `RepositoryApprovalAuthority.mark_decision_seen` in I3's
       `approval_authority.py`: the `seen` route's conditional UPDATE. It
       writes no audit row, and an undecided or already-seen request is not a
       refusal (spec :1416).
-   b. `ApprovalTransactionAuthority.eligible_inbox` in the same module. Spec
-      :1205-1207 lists open requests "addressed to me first, then any other
-      open request I am eligible to decide"; I3's `_INBOX` is addressed-only.
-   c. `GET /api/workflow/mailbox/approvers`: the approver picker, with the
+   b. `GET /api/workflow/mailbox/approvers`: the approver picker, with the
       requester's active `approver` edges as the default suggestion (spec
       :1416). A requester cannot read `GET /api/auth/admin/roles`, which is
       admin-only (identity_admin_routes.py:568).
-   d. `RepositoryQuotaPolicyAuthority` and `storage_bytes_used_on_connection`
+   c. `RepositoryQuotaPolicyAuthority` and `storage_bytes_used_on_connection`
       in I1's `quota_authority.py`, plus a quota router (spec :1199-1203).
       HEAD has no quota read route and no quota write route: `IdentityView`
       (identity_admin_routes.py:161-187) has no quota field, and
       `quota_policies` is written only by activation
       (identity_authority.py:1534).
-   e. `AuthAuditWriter.record_quota_set`: the editor's R4 audit row. HEAD's
+   d. `AuthAuditWriter.record_quota_set`: the editor's R4 audit row. HEAD's
       two `quota_set` writes (audit.py:686 and :1021) belong to activation.
 2. **The surfaces are dialogs, not hash routes.** `useHashRouter.ts:74`
    matches `^#\/([^/]+?)(?:\/([a-z]+))?$`, so a `#/mailbox` route would be read
@@ -56,14 +53,32 @@ Decisions this task owns:
    A `superseded` request is ended by the requester's own next state. A
    requester withdrawal is `revoked` with `revocation_actor_kind="identity"`
    and `revoked_by_identity_id` = the caller (I3's `withdraw`). Neither counts.
-   Review requests have no seen column and I0 is closed, so the Sent folder
-   lists approvals only.
+   Review requests have no seen column and I0 is closed, so a review outcome is
+   never unread: `decisions_unseen` counts approvals only. The Sent folder still
+   lists both kinds (spec :1228-1229, "my own requests with their state, the
+   decider, the decision note, and when"). `/sent` returns the caller's
+   approvals and, through I4's `RepositoryReviewAuthority.sent_for` (I4 Step 3,
+   decision 8), the caller's review requests, each with its attributed
+   attestations (reviewer, verdict, note, `attested_at`). A sent review row is
+   display-only: there is no seen stamp to set, and I7's inspect route 404s
+   the requester. I7's audit view is no substitute: it 404s a caller without
+   a live `approver` grant, and `AuditViewAttestation` carries no note.
 6. **The readiness approval row is a separate component.** `ReadinessRowId`
    is closed three times: in `types/api.ts`, in `READINESS_ROW_IDS`
    (api/auditReadiness.ts:28) and in the two `never` arms of
    AuditReadinessPanel.tsx. No backend row exists to widen it for.
    `ApprovalReadinessRow` renders after the six rows' `</ul>`
-   (AuditReadinessPanel.tsx:633).
+   (AuditReadinessPanel.tsx:633). The row shows the newest request for the
+   exact state, chosen by a stated total order: the later `requested_at`
+   instant (parsed; PostgreSQL sends microseconds and SQLite whole seconds, so
+   the strings do not sort), then the greater `approval_id` (SQLite's
+   one-second clock ties requests). The pick never depends on the order of
+   Sent. One state can carry several decided requests (I3 decision 8). The row
+   shows the newest REQUEST, not R2's verdict. R2 admits on any approved row
+   whose binding equals the compiled one, so a newer open or rejected request
+   after an approval shows as waiting or rejected while execute still admits:
+   the row under-reports, never over-reports, what multiplicity authorises.
+   The execute-time refusal (`pendingApproval`) still overrides the row.
 7. **A pending row shows its subject and organisation only.**
    `_identity_view` (identity_admin_routes.py:253-287) blanks `username`,
    `display_name` and `email` on a pending row that was never admitted. The
@@ -103,9 +118,29 @@ Decisions this task owns:
     `executionStore.error`, which `SideRailValidationBanner.tsx:190`
     renders, and as `executionStore.pendingApproval`, which the approval row
     renders.
+13. **The inbox, inspect and decide admit the same approver, and a decision
+    follows the inspection of that exact state.** The mailbox approval folder
+    and the badge's `approvals_to_decide` are I3's
+    `ApprovalTransactionAuthority.inbox` (`approver_identity_id = caller AND
+    decision IS NULL`). It cannot list the caller's own request, because
+    `ck_approvals_author_is_not_approver` (models.py:3647-3650) forbids a
+    requester addressing themselves. That is the approver I7's inspect admits
+    (`_OPEN_APPROVAL_ADDRESSED_TO_CALLER`) and the only approver I3's `decide`
+    admits (I3 decision 7). Spec :1205-1207 lists "any other open request I am
+    eligible to decide" after the addressed ones; under addressed-only
+    eligibility that set is empty, so there is no second inbox query. If the
+    operator rules eligibility role-based (the I7 item in the master's
+    Self-review notes), the inbox, inspect and decide widen together. In the
+    frontend, `InspectPane` tags each settled inspection with the request id,
+    `session_id` and `state_id` it was fetched for. Approve, Reject, Sign off
+    and Request changes are enabled only when a loaded inspection carries the
+    shown request's tag. While it is loading, after it fails (including a
+    404, a server error, or an echoed `session_id`/`state_id` that differs
+    from the request's), and whenever the settled inspection belongs to a
+    different target, every decision button is disabled.
 
 **Files:**
-- Modify: `src/elspeth/web/coordination/approval_authority.py` (I3's module): the `from sqlalchemy import bindparam, insert, select, update` import gains `case`; `_ELIGIBLE_INBOX` goes directly after the `_SENT: Final = (` constant; `mark_decision_seen` goes directly after `RepositoryApprovalAuthority.read`; `eligible_inbox` goes directly after `ApprovalTransactionAuthority.sent`
+- Modify: `src/elspeth/web/coordination/approval_authority.py` (I3's module): `mark_decision_seen` goes directly after `RepositoryApprovalAuthority.read`
 - Modify: `src/elspeth/web/coordination/quota_authority.py` (I1's module): the import block, and the I9 section appended after `RepositoryQuotaAuthority.active_policy`
 - Modify: `src/elspeth/web/auth/audit.py:255` (`AdminActivationCause = Literal[`, the Protocol member goes directly above it), `:290` (`def _bounded_text(`, the enum member goes directly above it), `:1180` (`class _AdminProvenanceMetadata(TypedDict):`, the recorder method goes directly above it), and the `if TYPE_CHECKING:` import I1 added
 - Create: `src/elspeth/web/sessions/routes/workflow/mailbox.py`, `src/elspeth/web/sessions/routes/workflow/quota.py`
@@ -122,30 +157,30 @@ Decisions this task owns:
 - Consumes:
   - I8: `WebSettings.workflow_governance: Literal["off", "on"] = "off"`; fixtures `closed_local_settings` and `closed_local_app` in `tests/unit/web/conftest.py`, with `client.app.state.phase3_engine`, `client.app.state.phase3_sessions_service`, `client.app.state.settings`, `quota_default_tokens_per_day=100_000`, `quota_default_storage_bytes=1_000_000` and `get_current_user` overridden to `alice`.
   - I1: `QuotaPolicyRow(policy_id, tokens_per_day, storage_bytes)`; `RepositoryQuotaAuthority.daily_token_total(connection_token, *, identity_id, day_start_utc) -> int | None`; `utc_day_start(now) -> datetime`; the `if TYPE_CHECKING:` block in `audit.py` that imports `QuotaExceeded`; `fenced_session` (`engine`, `connection_token`, `identity_id` = `"alice"`, `session_id: str`) from `tests/unit/web/coordination/conftest.py`.
-  - I3: `ApprovalRecord` (every field listed in I3's Interfaces), `ApprovalNotFound(approval_id)` (message `approval {approval_id} not found`), `ApprovalBinding` and `.as_json()`, `build_approval_binding(*, evidence, config_hash, canonical_version, openrouter_catalog_sha256, runtime_val_manifest_sha256)`, `RepositoryApprovalAuthority.request` / `.decide` / `.withdraw` (keyword signatures in I3's Interfaces), `_APPROVAL_BY_ID`, `_SENT`, `_record(conn, row)`; `ApprovalTransactionAuthority(engine)` with `.run(session_id, mutation)`, `.session_id_of(approval_id)`, `.sent(*, requested_by_identity_id)`; `ApprovalView` and `_view(record)` in `routes/workflow/approvals.py`; `tests/unit/web/workflow/__init__.py`; the routes `POST /api/sessions/{session_id}/approvals`, `POST /api/approvals/{approval_id}/decide`, `POST /api/approvals/{approval_id}/withdraw`; the error codes `approval_already_decided` (+ `current_state`), `approval_note_required`, `approval_open_request_exists`, `workflow_governance_off`.
-  - I4: `RepositoryReviewAuthority(engine)` with `.request(*, session_id, state_id, requested_by, reviewer, note, record)` and `.open_for(*, reviewer)`; `ReviewRequestView` and `_request_view(record)` in `routes/workflow/reviews.py`; `ReviewAttestationView` fields; `app.state.review_authority`; the routes `POST /api/sessions/{session_id}/reviews` (body `{state_id, reviewer_identity_id, note}`) and `POST /api/reviews/{request_id}/attest` (body `{verdict, note}`); the error code `changes_requested_needs_note`; the frontend accessible name `Share inspect link`.
+  - I3: `ApprovalRecord` (every field listed in I3's Interfaces), `ApprovalNotFound(approval_id)` (message `approval {approval_id} not found`), `ApprovalBinding` and `.as_json()`, `build_approval_binding(*, evidence, config_hash, canonical_version, openrouter_catalog_sha256, runtime_val_manifest_sha256)`, `RepositoryApprovalAuthority.request` / `.decide` / `.withdraw` (keyword signatures in I3's Interfaces), `_APPROVAL_BY_ID`, `_SENT`, `_record(conn, row)`; `ApprovalTransactionAuthority(engine)` with `.run(session_id, mutation)`, `.session_id_of(approval_id)`, `.sent(*, requested_by_identity_id)`, `.inbox(*, approver_identity_id)` (addressed-only: `approver_identity_id = caller AND decision IS NULL`; decision 13); `create_approvals_router() -> APIRouter`, which reads `app.state.approval_authority` and calls `app.state.auth_audit_recorder.record_approval_decided(request, *, provider, approval, actor_identity_id)`; `decide`'s addressed-only rule (I3 decision 7: a caller who is neither the addressed approver nor the requester gets `ApprovalNotFound` before any lock; the requester gets `ApprovalAuthorIsApprover`); `ApprovalView` and `_view(record)` in `routes/workflow/approvals.py`; `tests/unit/web/workflow/__init__.py`; the routes `POST /api/sessions/{session_id}/approvals`, `POST /api/approvals/{approval_id}/decide`, `POST /api/approvals/{approval_id}/withdraw`; the error codes `approval_already_decided` (+ `current_state`), `approval_author_is_approver`, `approval_not_found` (404), `approval_note_required`, `approval_open_request_exists`, `workflow_governance_off`.
+  - I4: `RepositoryReviewAuthority(engine)` with `.request(*, session_id, state_id, requested_by, reviewer, note, record)`, `.open_for(*, reviewer)`, `.attest(*, session_id, state_id, payload_digest, reviewer, verdict, note, record)` and `.sent_for(*, requested_by) -> tuple[ReviewSentRecord, ...]`; `ReviewSentRecord(request: ReviewRequestRecord, attestations: tuple[ReviewAttestationRecord, ...])`; `ReviewRequestView`, `_request_view(record)`, `ReviewAttestationView` (its fields) and `_attestation_view(record)` in `routes/workflow/reviews.py`; `app.state.review_authority`; the routes `POST /api/sessions/{session_id}/reviews` (body `{state_id, reviewer_identity_id, note}`) and `POST /api/reviews/{request_id}/attest` (body `{verdict, note}`); the error code `changes_requested_needs_note`; the frontend accessible name `Share inspect link`.
   - I5: `GET /api/library?view=accepted`, returning `{view, entries: LibraryEntryView[]}` with the field list in I5's Interfaces; `POST /api/library/{entry_id}/fork`, returning 201 `{session_id, state_id}`; the error code `workflow_governance_off`.
   - I6: `AuthAuditRecorder._auth_audit(db)`. Every recorder method writes through `self._auth_audit(db).record_auth_event`, which stamps `compartment_id`.
-  - I7: `GET /api/workflow/inspect/{session_id}/{state_id}`, returning `{session_id, state_id, access_log_id, composition_snapshot, yaml, attestations}`, with 404 on any denial; the `app.include_router(create_workflow_audit_view_router())` line and its import in `web/app.py`.
+  - I7: `GET /api/workflow/inspect/{session_id}/{state_id}`, returning `{session_id, state_id, access_log_id, composition_snapshot, yaml, attestations}`, with 404 on any denial and an approver arm that admits only the addressed approver; `create_workflow_inspect_router() -> APIRouter` in `sessions/routes/workflow/inspect.py` (reads `app.state.audit_access_log_authority`, `app.state.session_service` and `app.state.review_authority`); `RepositoryAuditAccessLogAuthority(engine)` in `coordination/audit_access_log_authority.py`, writing one `audit_access_log` row (`requesting_principal` = caller) per admitted read and none per denial; the `app.include_router(create_workflow_audit_view_router())` line and its import in `web/app.py`.
   - I2: the 413 body pinned in decision 9.
   - HEAD: `RepositoryIdentityAuthority.active_roles(*, identity_id) -> tuple[RoleGrant, ...]` (identity_authority.py:1277), `holds_active_role` (:1285), `list_roles(*, identity_id, include_revoked, limit, offset)` (:1305), `list_relationships(*, identity_id, include_revoked, limit, offset)` (:1320), `read_identity_summary(*, identity_id)` (:1258), `_require_limit` with a cap of `_LIST_LIMIT_MAX` (:668); `RoleGrant` and `IdentitySummary` (:299-331); `IdentityListResponse.active_human_admin_count` (identity_admin_routes.py:198); the identity-admin routes under `/api/auth/admin` (:402-701) with bodies `EnableIdentityRequest(note)`, `DisableIdentityRequest(reason)`, `GrantRoleRequest(identity_id, role, note)`, `RevokeRequest(note)` and `AssertRelationshipRequest(from_identity_id, to_identity_id, relationship_type, note)` (:110-158); `_admin_provenance(request, *, actor_identity_id, on_behalf_of, console_request_id)` (audit.py:1206); `database_now(conn)` (coordination/database_clock.py:54); `_register_mutation_connection` / `_unregister_mutation_connection` (mutation_connection_registry.py:22, :44); `run_sync_in_worker` (async_workers.py:179); `ensure_test_identity(conn, *, identity_id, provider="local")` (tests/fixtures/identities.py:10); `_make_session(conn, *, session_id, user_id="test_user", auth_provider_type="local", title="test session", created_at=None, updated_at=None)` (tests/unit/web/conftest.py:73, importable as `from tests.unit.web.conftest import _make_session`); `engine` (tests/unit/web/conftest.py:63); `external_deployment_postgres_url` (tests/testcontainer/web/conftest.py:40); frontend `authHeaders` / `parseResponse` (client.ts:96, :211), `Button` / `Input` (components/ui/index.ts), `useFocusTrap(ref, active)` (hooks/useFocusTrap.ts), `resetStore` (test/store-helpers.ts), `makeComposition(version, overrides)` (test/composerFixtures.ts:120), `useSessionStore` `loadSessions` / `selectSession` (sessionStore.ts:1236, :1238).
 - Produces:
-  - `approval_authority.py`: `RepositoryApprovalAuthority.mark_decision_seen(connection_token: str, *, approval_id: str, requested_by: str, now: datetime) -> ApprovalRecord` (raises `ApprovalNotFound` when the row is absent or the caller is not its requester); `ApprovalTransactionAuthority.eligible_inbox(self, *, approver_identity_id: str) -> tuple[ApprovalRecord, ...]`; module constant `_ELIGIBLE_INBOX`.
+  - `approval_authority.py`: `RepositoryApprovalAuthority.mark_decision_seen(connection_token: str, *, approval_id: str, requested_by: str, now: datetime) -> ApprovalRecord` (raises `ApprovalNotFound` when the row is absent or the caller is not its requester).
   - `quota_authority.py`: `QuotaDimension = Literal["tokens", "storage"]`; `MAX_QUOTA_VALUE: Final = 2_147_483_647`; `storage_bytes_used_on_connection(connection: Connection, *, identity_id: str) -> int`; `IdentityQuotaStatus(identity_id: str, identity_policy: QuotaPolicyRow | None, container_policy: QuotaPolicyRow | None, tokens_used_today: int | None, storage_bytes_used: int)`; `QuotaPolicySet(identity_id: str, actor_identity_id: str, dimension: QuotaDimension, policy: QuotaPolicyRow, previous: QuotaPolicyRow | None)`; `QuotaPolicyRefusal(RuntimeError)` and its closed subclasses `QuotaSetterNotAdmin`, `QuotaTargetNotFound`, `QuotaTargetNotActive`, `QuotaDefaultMissing`, `QuotaValueOutOfRange`; `RepositoryQuotaPolicyAuthority(engine: Engine)` with `.status(*, identity_id: str) -> IdentityQuotaStatus` and `.set_identity_policy(*, actor_identity_id: str, identity_id: str, dimension: QuotaDimension, value: int, default_tokens_per_day: int | None, default_storage_bytes: int | None, record: Callable[[QuotaPolicySet], None]) -> QuotaPolicySet`. Mounted as `app.state.quota_policy_authority`.
   - `audit.py`: `AuthAuditWriter.record_quota_set(self, request: Request | None, *, provider: AuthProviderType, change: QuotaPolicySet) -> None`; `AuthAuditOperation.QUOTA_SET = "quota_set"`. Each row has `event_type="quota_set"`, `outcome="success"` and `identity_id=change.identity_id`. Its metadata is the admin provenance keys plus `source="admin"`, `dimension`, `cap`, `previous_cap`, `tokens_per_day`, `storage_bytes`, `policy_id` and `revoked_policy_id`.
-  - `routes/workflow/mailbox.py`: `create_mailbox_router() -> APIRouter`; `MAILBOX_ROLES`; `decision_is_unseen(record: ApprovalRecord, *, caller: str) -> bool`; routes:
+  - `routes/workflow/mailbox.py`: `create_mailbox_router() -> APIRouter`; `MAILBOX_ROLES`; `decision_is_unseen(record: ApprovalRecord, *, caller: str) -> bool`; `ReviewSentView(request: ReviewRequestView, attestations: list[ReviewAttestationView])`; routes:
     - `GET /api/workflow/mailbox/summary` returns `MailboxSummaryResponse(governance: Literal["on","off"], roles: list[IdentityRole], approvals_to_decide: int, reviews_to_attest: int, decisions_unseen: int)`.
-    - `GET /api/workflow/mailbox/inbox` returns `MailboxInboxResponse(approvals: list[ApprovalView], reviews: list[ReviewRequestView])`.
-    - `GET /api/workflow/mailbox/sent` returns `MailboxSentResponse(approvals: list[ApprovalView])`.
+    - `GET /api/workflow/mailbox/inbox` returns `MailboxInboxResponse(approvals: list[ApprovalView], reviews: list[ReviewRequestView])`; `approvals` is I3's addressed-only `inbox` (decision 13), and `summary.approvals_to_decide` is its length.
+    - `GET /api/workflow/mailbox/sent` returns `MailboxSentResponse(approvals: list[ApprovalView], reviews: list[ReviewSentView])`; both lists are empty while governance is off, and `reviews` never feeds `decisions_unseen`.
     - `POST /api/workflow/mailbox/{approval_id}/seen` returns `ApprovalView`, 404 `approval_not_found`, or 409 `workflow_governance_off`.
     - `GET /api/workflow/mailbox/approvers` returns `ApproverDirectoryResponse(approvers: list[ApproverEntry(identity_id, username)], suggested_identity_ids: list[str])`.
   - `routes/workflow/quota.py`: `create_quota_router() -> APIRouter`; `IdentityQuotaView(identity_id, tokens_per_day: int | None, storage_bytes: int | None, container_tokens_per_day: int | None, container_storage_bytes: int | None, tokens_used_today: int | None, storage_bytes_used: int)`; `SetQuotaBody(dimension: Literal["tokens","storage"], value: int)`; routes:
     - `GET /api/workflow/quota/me` (any signed-in identity).
     - `GET /api/workflow/quota/identities/{identity_id}` (admin; a hidden 404 for anyone else).
     - `POST /api/workflow/quota/identities/{identity_id}` (admin). Refusals: 404 `quota_target_not_found`; 409 `quota_target_not_active`, `quota_default_missing`, `quota_value_out_of_range`.
-  - Frontend: `types/workflow.ts` (every wire type below); `api/workflow.ts` fetchers; `ApiError.current_state?: string` and `ApiError.storage_quota?: StorageQuotaRefusal`; `useMailboxStore` with `summary`, `inbox`, `sent`, `error`, `refreshSummary`, `loadInbox`, `loadSent`, `openSent`, `decide`, `attest`, `startPolling`, `reset`, plus the exports `MAILBOX_POLL_INTERVAL_MS`, `badgeCount(summary)` and `approvalForState(sent, sessionId, stateId)`; `ExecutionState.pendingApproval: PendingApproval | null`; `formatBytes(bytes: number): string` and `storageQuotaMessage(refusal: StorageQuotaRefusal): string` in `utils/bytes.ts`; the components listed under Files. I10 consumes the routes, not the components.
+  - Frontend: `types/workflow.ts` (every wire type below); `api/workflow.ts` fetchers; `ApiError.current_state?: string` and `ApiError.storage_quota?: StorageQuotaRefusal`; `useMailboxStore` with `summary`, `inbox`, `sent`, `sentReviews`, `error`, `refreshSummary`, `loadInbox`, `loadSent`, `openSent`, `decide`, `attest`, `startPolling`, `reset`, plus the exports `MAILBOX_POLL_INTERVAL_MS`, `badgeCount(summary)` and `approvalForState(sent, sessionId, stateId)` (the newest request for the exact state by `requested_at` instant, then `approval_id`; decision 6); `ExecutionState.pendingApproval: PendingApproval | null`; `formatBytes(bytes: number): string` and `storageQuotaMessage(refusal: StorageQuotaRefusal): string` in `utils/bytes.ts`; the components listed under Files. I10 consumes the routes, not the components.
 
-- [ ] **Step 1: Write the failing approval-authority tests (seen stamp and eligible inbox order).**
+- [ ] **Step 1: Write the failing approval-authority tests (the seen stamp).**
 
 Create `tests/unit/web/coordination/test_approval_mailbox.py`:
 
@@ -154,10 +189,10 @@ Create `tests/unit/web/coordination/test_approval_mailbox.py`:
 
 ``mark_decision_seen`` is a UI convenience (spec :1416): it never refuses an
 undecided or already-seen request, and it hides a request the caller did not
-raise. ``_ELIGIBLE_INBOX`` orders the requests addressed to the caller first
-(spec :1205-1207) and never lists the caller's own. The inbox statement is read
-through the fixture's token connection, not ``engine.connect()``, because the
-fixture's transaction is uncommitted.
+raise. The mailbox approval folder is I3's addressed-only ``inbox`` (decision
+13); its agreement with inspect and decide for an author, the addressed
+approver and another approver is pinned in
+tests/unit/web/workflow/test_mailbox_routes.py.
 """
 
 from __future__ import annotations
@@ -171,7 +206,6 @@ from sqlalchemy import insert
 from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
-from elspeth.web.coordination import approval_authority as module
 from elspeth.web.coordination.approval_authority import (
     ApprovalBinding,
     ApprovalNotFound,
@@ -180,7 +214,7 @@ from elspeth.web.coordination.approval_authority import (
     build_approval_binding,
 )
 from elspeth.web.coordination.mutation_connection_registry import _resolve_mutation_connection
-from elspeth.web.sessions.models import identity_roles_table, sessions_table
+from elspeth.web.sessions.models import identity_roles_table
 
 NOW = datetime(2026, 9, 14, 9, 0, tzinfo=UTC)
 
@@ -213,28 +247,16 @@ def _ignore(_record: Any) -> None:
 
 
 def _seed(fenced_session: Any) -> None:
-    """``bob`` and ``carol`` approve; ``dave`` owns a second session."""
+    """``bob`` approves."""
     conn = _resolve_mutation_connection(fenced_session.connection_token)
-    for identity_id in ("bob", "carol", "dave"):
-        ensure_test_identity(conn, identity_id=identity_id)
-    for identity_id in ("bob", "carol"):
-        conn.execute(
-            insert(identity_roles_table).values(
-                role_id=f"{identity_id}-approver",
-                identity_id=identity_id,
-                role="approver",
-                granted_at=NOW - timedelta(days=1),
-                granted_by_identity_id=identity_id,
-            )
-        )
+    ensure_test_identity(conn, identity_id="bob")
     conn.execute(
-        insert(sessions_table).values(
-            id="session-dave",
-            user_id="dave",
-            auth_provider_type="local",
-            title="dave's pipeline",
-            created_at=NOW,
-            updated_at=NOW,
+        insert(identity_roles_table).values(
+            role_id="bob-approver",
+            identity_id="bob",
+            role="approver",
+            granted_at=NOW - timedelta(days=1),
+            granted_by_identity_id="bob",
         )
     )
 
@@ -263,11 +285,6 @@ def _decide(fenced_session: Any, approval_id: str, *, decided_by: str, at: datet
         now=at,
         record=_ignore,
     )
-
-
-def _inbox(fenced_session: Any, identity_id: str) -> list[str]:
-    conn = _resolve_mutation_connection(fenced_session.connection_token)
-    return [row.approval_id for row in conn.execute(module._ELIGIBLE_INBOX, {"identity_id": identity_id}).all()]
 
 
 def test_mark_decision_seen_stamps_a_decided_request_exactly_once(fenced_session: Any) -> None:
@@ -317,22 +334,6 @@ def test_mark_decision_seen_hides_a_request_the_caller_did_not_raise(fenced_sess
     assert unseen.decision_seen_at is None
 
 
-def test_eligible_inbox_lists_addressed_requests_first_and_never_the_callers_own(fenced_session: Any) -> None:
-    _seed(fenced_session)
-    to_carol = _request(fenced_session, session_id="session-dave", requested_by="dave", approver="carol", at=NOW)
-    to_bob = _request(fenced_session, session_id=fenced_session.session_id, requested_by="alice", approver="bob", at=NOW + timedelta(minutes=5))
-    # carol: her addressed request first, although it is the OLDER one.
-    assert _inbox(fenced_session, "carol") == [to_carol.approval_id, to_bob.approval_id]
-    assert _inbox(fenced_session, "bob") == [to_bob.approval_id, to_carol.approval_id]
-    # The requester never sees their own request.
-    assert _inbox(fenced_session, "alice") == [to_carol.approval_id]
-    assert _inbox(fenced_session, "dave") == [to_bob.approval_id]
-    # Mutation-derivation: deciding the row, not the query, removes it from every inbox.
-    _decide(fenced_session, to_bob.approval_id, decided_by="carol", at=NOW + timedelta(minutes=6))
-    assert _inbox(fenced_session, "carol") == [to_carol.approval_id]
-    assert _inbox(fenced_session, "bob") == [to_carol.approval_id]
-
-
 def test_approval_record_field_set_is_the_one_the_mailbox_renders() -> None:
     assert "decision_seen_at" in {field.name for field in dataclasses.fields(ApprovalRecord)}
 ```
@@ -340,45 +341,14 @@ def test_approval_record_field_set_is_the_one_the_mailbox_renders() -> None:
 - [ ] **Step 2: Run the approval-authority tests to verify they fail.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/web/coordination/test_approval_mailbox.py -n 0 > /tmp/i9-lane-approval-red.log 2>&1; echo exit=$?`
-Expected: `exit=1`. The log shows `AttributeError: type object 'RepositoryApprovalAuthority' has no attribute 'mark_decision_seen'` for the three seen tests and `AttributeError: module 'elspeth.web.coordination.approval_authority' has no attribute '_ELIGIBLE_INBOX'` for the inbox test; `test_approval_record_field_set_is_the_one_the_mailbox_renders` passes.
+Expected: `exit=1`. The log shows `AttributeError: type object 'RepositoryApprovalAuthority' has no attribute 'mark_decision_seen'` for the three seen tests; `test_approval_record_field_set_is_the_one_the_mailbox_renders` passes.
 
-- [ ] **Step 3: Add the eligible-inbox statement, the seen stamp and the inbox read to `approval_authority.py`.**
+- [ ] **Step 3: Add the seen stamp to `approval_authority.py`.**
 
-In `src/elspeth/web/coordination/approval_authority.py`, replace the import line
-
-```python
-from sqlalchemy import bindparam, insert, select, update
-```
-
-with
+In `src/elspeth/web/coordination/approval_authority.py`, directly after `RepositoryApprovalAuthority.read` (the static method that ends `return _record(conn, row)`) and before `@final` / `class ApprovalTransactionAuthority:`, add:
 
 ```python
-from sqlalchemy import bindparam, case, insert, select, update
-```
 
-Directly after the `_SENT: Final = (` constant (which ends `.order_by(approvals_table.c.requested_at.desc())` / `)`), add:
-
-```python
-# Task I9, the mailbox inbox (spec :1205-1207): every open request the caller
-# did not raise, the ones addressed to the caller first. The caller's live
-# approver grant is checked by the route per request, and ``decide`` re-proves
-# eligibility inside its own transaction.
-_ELIGIBLE_INBOX: Final = (
-    select(approvals_table)
-    .where(
-        approvals_table.c.decision.is_(None),
-        approvals_table.c.requested_by_identity_id != bindparam("identity_id"),
-    )
-    .order_by(
-        case((approvals_table.c.approver_identity_id == bindparam("identity_id"), 0), else_=1),
-        approvals_table.c.requested_at.desc(),
-    )
-)
-```
-
-Directly after `RepositoryApprovalAuthority.read` (the static method that ends `return _record(conn, row)`) and before `@final` / `class ApprovalTransactionAuthority:`, add:
-
-```python
     @staticmethod
     def mark_decision_seen(connection_token: str, *, approval_id: str, requested_by: str, now: datetime) -> ApprovalRecord:
         """Stamp ``decision_seen_at`` when the requester opens a decided request (spec :1229).
@@ -405,19 +375,10 @@ Directly after `RepositoryApprovalAuthority.read` (the static method that ends `
         return _record(conn, conn.execute(_APPROVAL_BY_ID, {"approval_id": approval_id}).one())
 ```
 
-Directly after `ApprovalTransactionAuthority.sent` (the last method of the class), add:
-
-```python
-    def eligible_inbox(self, *, approver_identity_id: str) -> tuple[ApprovalRecord, ...]:
-        """The mailbox's approval folder: addressed-first, never the caller's own (``_ELIGIBLE_INBOX``)."""
-        with self._engine.connect() as conn:
-            return tuple(_record(conn, row) for row in conn.execute(_ELIGIBLE_INBOX, {"identity_id": approver_identity_id}).all())
-```
-
 - [ ] **Step 4: Run the approval-authority tests and I3's authority suite to verify they pass.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/web/coordination/test_approval_mailbox.py tests/unit/web/coordination/test_approval_authority.py -n 0 > /tmp/i9-lane-approval-green.log 2>&1; echo exit=$?`
-Expected: `exit=0`; `test_approval_mailbox.py` contributes `5 passed`.
+Expected: `exit=0`; `test_approval_mailbox.py` contributes `4 passed`.
 
 - [ ] **Step 5: Write the failing quota-policy authority tests.**
 
@@ -1143,13 +1104,14 @@ the rows that authorise it.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 import pytest
-from sqlalchemy import insert, update
+from fastapi import Request
+from sqlalchemy import insert, select, update
 from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -1162,11 +1124,14 @@ from elspeth.web.coordination.approval_authority import (
     RepositoryApprovalAuthority,
 )
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.review_authority import RepositoryReviewAuthority
-from elspeth.web.sessions.models import identity_relationships_table, identity_roles_table
+from elspeth.web.sessions.models import approvals_table, audit_access_log_table, identity_relationships_table, identity_roles_table
 from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.routes.workflow.approvals import create_approvals_router
+from elspeth.web.sessions.routes.workflow.inspect import create_workflow_inspect_router
 from elspeth.web.sessions.routes.workflow.mailbox import create_mailbox_router, decision_is_unseen
 
 BINDING = ApprovalBinding(
@@ -1242,7 +1207,15 @@ def _save_state(client: Any, session_id: str) -> str:
         async with lease:
             record = await service.save_composition_state(
                 UUID(session_id),
-                CompositionStateData(sources={}, nodes=[], edges=[], outputs=[], metadata_={}, is_valid=False, validation_errors=None),
+                CompositionStateData(
+                    sources={},
+                    nodes=[],
+                    edges=[],
+                    outputs=[],
+                    metadata_={"name": "demo", "description": ""},
+                    is_valid=False,
+                    validation_errors=None,
+                ),
                 provenance="session_seed",
                 session_operation_context=lease.context,
             )
@@ -1309,10 +1282,11 @@ def test_summary_counts_each_folder_and_reports_live_roles(app: Any) -> None:
     app.app.state.review_authority.request(
         session_id=alice_session[0], state_id=alice_session[1], requested_by="alice", reviewer=None, note="look", record=_ignore
     )
+    # dave's request is addressed to carol, so bob counts only alice's (decision 13).
     assert _summary(app, "bob") == {
         "governance": "on",
         "roles": ["approver"],
-        "approvals_to_decide": 2,
+        "approvals_to_decide": 1,
         "reviews_to_attest": 0,
         "decisions_unseen": 0,
     }
@@ -1326,20 +1300,27 @@ def test_summary_counts_each_folder_and_reports_live_roles(app: Any) -> None:
     assert _summary(app, "bob")["roles"] == []
 
 
-def test_inbox_orders_addressed_requests_first_and_excludes_the_callers_own(app: Any) -> None:
+def test_inbox_lists_only_requests_addressed_to_the_caller(app: Any) -> None:
     alice_to_bob = _approval(app, _session(app, "alice"), requested_by="alice", approver="bob")
     dave_to_carol = _approval(app, _session(app, "dave"), requested_by="dave", approver="carol")
     bob_to_carol = _approval(app, _session(app, "bob"), requested_by="bob", approver="carol")
     _as(app, "bob")
     bob_inbox = app.get("/api/workflow/mailbox/inbox").json()
-    assert [row["approval_id"] for row in bob_inbox["approvals"]] == [alice_to_bob, dave_to_carol]
+    assert [row["approval_id"] for row in bob_inbox["approvals"]] == [alice_to_bob], "never dave's request, never his own"
     assert bob_inbox["reviews"] == []
     _as(app, "carol")
     carol_ids = [row["approval_id"] for row in app.get("/api/workflow/mailbox/inbox").json()["approvals"]]
-    assert set(carol_ids[:2]) == {dave_to_carol, bob_to_carol}
-    assert carol_ids[2:] == [alice_to_bob]
+    assert sorted(carol_ids) == sorted([dave_to_carol, bob_to_carol]), "never alice's request to bob"
     _as(app, "dave")
     assert app.get("/api/workflow/mailbox/inbox").json() == {"approvals": [], "reviews": []}, "dave holds no approver role"
+    # Mutation-derivation: re-address alice's ROW to carol and it moves from bob's folder to carol's.
+    with app.app.state.phase3_engine.begin() as conn:
+        conn.execute(update(approvals_table).where(approvals_table.c.approval_id == alice_to_bob).values(approver_identity_id="carol"))
+    _as(app, "bob")
+    assert app.get("/api/workflow/mailbox/inbox").json()["approvals"] == []
+    _as(app, "carol")
+    moved = [row["approval_id"] for row in app.get("/api/workflow/mailbox/inbox").json()["approvals"]]
+    assert sorted(moved) == sorted([alice_to_bob, dave_to_carol, bob_to_carol])
 
 
 def test_inbox_reviews_are_listed_for_a_live_reviewer_only(app: Any) -> None:
@@ -1397,6 +1378,50 @@ def test_withdrawn_and_superseded_requests_are_not_unseen_news(app: Any) -> None
     sent = app.get("/api/workflow/mailbox/sent").json()["approvals"]
     assert sorted(row["decision"] for row in sent) == ["revoked", "superseded"]
     assert _summary(app, "alice")["decisions_unseen"] == 0
+
+
+def test_sent_lists_the_callers_review_requests_with_each_attestation_and_never_counts_them_unseen(app: Any) -> None:
+    session_id, state_id = _session(app, "alice")
+    reviews = app.app.state.review_authority
+    requested = reviews.request(
+        session_id=session_id, state_id=state_id, requested_by="alice", reviewer=None, note="check the joins", record=_ignore
+    )
+    _as(app, "alice")
+    (waiting,) = app.get("/api/workflow/mailbox/sent").json()["reviews"]
+    assert waiting["request"]["request_id"] == requested.request_id
+    assert waiting["request"]["open"] is True
+    assert waiting["attestations"] == []
+    reviews.attest(
+        session_id=session_id,
+        state_id=state_id,
+        payload_digest="sha256:" + "ab" * 32,
+        reviewer="erin",
+        verdict="changes_requested",
+        note="rename the sink",
+        record=_ignore,
+    )
+    _as(app, "alice")
+    sent = app.get("/api/workflow/mailbox/sent")
+    assert sent.status_code == 200, sent.text
+    assert sent.headers["Cache-Control"] == "no-store"
+    body = sent.json()
+    assert body["approvals"] == []
+    (reviewed,) = body["reviews"]
+    assert reviewed["request"]["request_note"] == "check the joins"
+    assert reviewed["request"]["open"] is False
+    assert [(row["reviewer_identity_id"], row["verdict"], row["note"]) for row in reviewed["attestations"]] == [
+        ("erin", "changes_requested", "rename the sink")
+    ]
+    # No seen column: a review outcome is shown, never counted as unread news.
+    assert _summary(app, "alice")["decisions_unseen"] == 0
+    # Requester-owned: the reviewer and a bystander read none of it.
+    for other in ("erin", "bob"):
+        _as(app, other)
+        assert app.get("/api/workflow/mailbox/sent").json()["reviews"] == []
+    # Mutation-derivation: the switch, not an empty table, empties the folder.
+    _governance(app, "off")
+    _as(app, "alice")
+    assert app.get("/api/workflow/mailbox/sent").json() == {"approvals": [], "reviews": []}
 
 
 def test_decision_is_unseen_counts_only_news_the_requester_did_not_cause() -> None:
@@ -1461,13 +1486,86 @@ def test_governance_off_zeroes_the_counts_empties_the_folders_and_refuses_seen(a
     assert app.get("/api/workflow/mailbox/inbox").json() == {"approvals": [], "reviews": []}
     assert app.get("/api/workflow/mailbox/approvers").json() == {"approvers": [], "suggested_identity_ids": []}
     _as(app, "alice")
-    assert app.get("/api/workflow/mailbox/sent").json() == {"approvals": []}
+    assert app.get("/api/workflow/mailbox/sent").json() == {"approvals": [], "reviews": []}
     refused = app.post(f"/api/workflow/mailbox/{approval_id}/seen")
     assert refused.status_code == 409
     assert refused.json()["detail"]["error_type"] == "workflow_governance_off"
     # Mutation-derivation: the switch, not the fixture, zeroes the count.
     _governance(app, "on")
     assert _summary(app, "bob")["approvals_to_decide"] == 1
+
+
+@dataclass
+class _DecisionRecorder:
+    """The approvals router's audit seam: records who decided, so a refused decide is provably silent."""
+
+    actors: list[str] = field(default_factory=list)
+
+    def record_approval_decided(self, request: Request | None, **kwargs: Any) -> None:
+        assert request is not None, "the decide route records against the live request"
+        self.actors.append(kwargs["actor_identity_id"])
+
+
+@pytest.fixture
+def three_party_app(app: Any) -> Any:
+    """``app`` plus I7's inspect router and I3's approvals router: every surface an approver meets."""
+    state = app.app.state
+    state.audit_access_log_authority = RepositoryAuditAccessLogAuthority(state.phase3_engine)
+    state.auth_audit_recorder = _DecisionRecorder()
+    app.app.include_router(create_workflow_inspect_router())
+    app.app.include_router(create_approvals_router())
+    return app
+
+
+def test_alice_bob_and_carol_meet_one_rule_at_inbox_inspect_and_decide(three_party_app: Any) -> None:
+    """B2: the approver the inbox lists is the one inspect admits and the one decide admits; nobody else gets in."""
+    app = three_party_app
+    session = _session(app, "alice")
+    approval_id = _approval(app, session, requested_by="alice", approver="bob")
+    inspect_url = f"/api/workflow/inspect/{session[0]}/{session[1]}"
+    decide_url = f"/api/approvals/{approval_id}/decide"
+    approve = {"decision": "approved", "note": None}
+
+    def inbox_ids(identity_id: str) -> list[str]:
+        _as(app, identity_id)
+        return [row["approval_id"] for row in app.get("/api/workflow/mailbox/inbox").json()["approvals"]]
+
+    # Bob, the addressed approver: listed, and his inspect is admitted.
+    assert inbox_ids("bob") == [approval_id]
+    assert app.get(inspect_url).status_code == 200
+    # Carol, a live approver the request is not addressed to: not listed, and hidden at inspect and decide.
+    assert inbox_ids("carol") == []
+    assert _summary(app, "carol")["approvals_to_decide"] == 0
+    _as(app, "carol")
+    assert app.get(inspect_url).status_code == 404
+    carol = app.post(decide_url, json=approve)
+    assert carol.status_code == 404, carol.text
+    assert carol.json()["detail"] == {"error_type": "approval_not_found", "detail": f"approval {approval_id} not found"}
+    # Alice, the author: not listed, hidden at inspect, refused as the author at decide.
+    assert inbox_ids("alice") == []
+    assert app.get(inspect_url).status_code == 404
+    alice = app.post(decide_url, json=approve)
+    assert alice.status_code == 409, alice.text
+    assert alice.json()["detail"]["error_type"] == "approval_author_is_approver"
+    assert app.app.state.auth_audit_recorder.actors == [], "no refused decide reached the audit seam"
+    # Mutation-derivation: re-address the ROW to carol. All three surfaces follow the column, not the grant.
+    with app.app.state.phase3_engine.begin() as conn:
+        conn.execute(update(approvals_table).where(approvals_table.c.approval_id == approval_id).values(approver_identity_id="carol"))
+    assert inbox_ids("bob") == []
+    assert app.get(inspect_url).status_code == 404
+    assert app.post(decide_url, json=approve).status_code == 404
+    assert inbox_ids("carol") == [approval_id]
+    assert app.get(inspect_url).status_code == 200
+    decided = app.post(decide_url, json=approve)
+    assert decided.status_code == 200, decided.text
+    assert decided.json()["decided_by_identity_id"] == "carol"
+    assert app.app.state.auth_audit_recorder.actors == ["carol"]
+    # A decision ends access at every surface, the decider's included.
+    assert inbox_ids("carol") == []
+    assert app.get(inspect_url).status_code == 404
+    with app.app.state.phase3_engine.connect() as conn:
+        readers = [row.requesting_principal for row in conn.execute(select(audit_access_log_table)).all()]
+    assert sorted(readers) == ["bob", "carol"], "only the two admitted inspects wrote an access row"
 ```
 
 Create `tests/unit/web/workflow/test_quota_routes.py`:
@@ -1657,10 +1755,13 @@ Create `src/elspeth/web/sessions/routes/workflow/mailbox.py`:
 
 ``GET /api/workflow/mailbox/summary`` feeds the navigation badge on the
 frontend's single timer. ``/inbox`` lists approvals awaiting the caller's
-decision and review requests the caller may attest. Approvals addressed to the
-caller come first, then every other open request the caller is eligible to
-decide; eligibility is role-based (spec :1416). ``/sent`` lists the caller's own
-approval requests. ``POST /{approval_id}/seen`` stamps ``decision_seen_at``, a
+decision and review requests the caller may attest. The approval folder is I3's
+addressed-only ``inbox``: the approver I7's inspect admits and the only one I3's
+``decide`` admits (I9 decision 13). ``/sent`` lists the caller's own
+approval requests, and the caller's own review requests each with the
+attestations I4's ``sent_for`` (I4 Step 3) attributes to it; a review outcome has no seen
+column, so it is shown and never counted in ``decisions_unseen``.
+``POST /{approval_id}/seen`` stamps ``decision_seen_at``, a
 UI convenience that is never a control. ``/approvers`` is the approval picker:
 live approvers other than the caller, with the caller's active ``approver``
 edges as the default suggestion.
@@ -1691,11 +1792,10 @@ from elspeth.web.coordination.approval_authority import (
     RepositoryApprovalAuthority,
 )
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
-from elspeth.web.coordination.review_authority import RepositoryReviewAuthority
+from elspeth.web.coordination.review_authority import RepositoryReviewAuthority, ReviewSentRecord
 from elspeth.web.sessions.routes.workflow.approvals import ApprovalView
 from elspeth.web.sessions.routes.workflow.approvals import _view as _approval_view
-from elspeth.web.sessions.routes.workflow.reviews import ReviewRequestView
-from elspeth.web.sessions.routes.workflow.reviews import _request_view
+from elspeth.web.sessions.routes.workflow.reviews import ReviewAttestationView, ReviewRequestView, _attestation_view, _request_view
 
 MAILBOX_ROLES: Final[tuple[IdentityRole, ...]] = ("admin", "approver", "reviewer", "curator", "oversight")
 """The roles the frontend branches on, in the order the summary reports them."""
@@ -1721,10 +1821,20 @@ class MailboxInboxResponse(BaseModel):
     reviews: list[ReviewRequestView]
 
 
+class ReviewSentView(BaseModel):
+    """One of the caller's review requests with the attestations I4's ``sent_for`` attributed to it."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    request: ReviewRequestView
+    attestations: list[ReviewAttestationView]
+
+
 class MailboxSentResponse(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     approvals: list[ApprovalView]
+    reviews: list[ReviewSentView]
 
 
 class ApproverEntry(BaseModel):
@@ -1789,6 +1899,13 @@ def _not_found(approval_id: str) -> HTTPException:
     return HTTPException(status_code=404, detail={"error_type": "approval_not_found", "detail": f"approval {approval_id} not found"})
 
 
+def _review_sent_view(record: ReviewSentRecord) -> ReviewSentView:
+    return ReviewSentView(
+        request=_request_view(record.request),
+        attestations=[_attestation_view(attestation) for attestation in record.attestations],
+    )
+
+
 def _held_roles(authority: RepositoryIdentityAuthority, identity_id: str) -> list[IdentityRole]:
     """Live, deployment-wide grants at database time (``active_roles`` filters revoked and expired rows)."""
     held = {grant.role for grant in authority.active_roles(identity_id=identity_id) if grant.scope is None}
@@ -1844,7 +1961,7 @@ def create_mailbox_router() -> APIRouter:
             return MailboxSummaryResponse(governance="off", roles=roles, approvals_to_decide=0, reviews_to_attest=0, decisions_unseen=0)
         approvals: tuple[ApprovalRecord, ...] = ()
         if "approver" in roles:
-            approvals = await run_sync_in_worker(_approval_authority(request).eligible_inbox, approver_identity_id=user.user_id)
+            approvals = await run_sync_in_worker(_approval_authority(request).inbox, approver_identity_id=user.user_id)
         reviews_to_attest = 0
         if "reviewer" in roles:
             reviews_to_attest = len(await run_sync_in_worker(_review_authority(request).open_for, reviewer=user.user_id))
@@ -1869,7 +1986,7 @@ def create_mailbox_router() -> APIRouter:
         roles = await run_sync_in_worker(_held_roles, _identity_authority(request), user.user_id)
         approvals: list[ApprovalView] = []
         if "approver" in roles:
-            records = await run_sync_in_worker(_approval_authority(request).eligible_inbox, approver_identity_id=user.user_id)
+            records = await run_sync_in_worker(_approval_authority(request).inbox, approver_identity_id=user.user_id)
             approvals = [_approval_view(record) for record in records]
         reviews: list[ReviewRequestView] = []
         if "reviewer" in roles:
@@ -1885,9 +2002,13 @@ def create_mailbox_router() -> APIRouter:
     ) -> MailboxSentResponse:
         _uncacheable(response)
         if not _governance_on(request):
-            return MailboxSentResponse(approvals=[])
+            return MailboxSentResponse(approvals=[], reviews=[])
         records = await run_sync_in_worker(_approval_authority(request).sent, requested_by_identity_id=user.user_id)
-        return MailboxSentResponse(approvals=[_approval_view(record) for record in records])
+        reviews = await run_sync_in_worker(_review_authority(request).sent_for, requested_by=user.user_id)
+        return MailboxSentResponse(
+            approvals=[_approval_view(record) for record in records],
+            reviews=[_review_sent_view(record) for record in reviews],
+        )
 
     @router.get("/api/workflow/mailbox/approvers", response_model=ApproverDirectoryResponse)
     async def mailbox_approvers(
@@ -1933,7 +2054,7 @@ def create_mailbox_router() -> APIRouter:
     return router
 ```
 
-The two private imports (`_view`, `_request_view`) are deliberate: the mailbox must render exactly the view I3 and I4 render, and a second projection would drift from them.
+The three private imports (`_view`, `_request_view`, `_attestation_view`) are deliberate: the mailbox must render exactly the views I3 and I4 render, and a second projection would drift from them.
 
 Create `src/elspeth/web/sessions/routes/workflow/quota.py`:
 
@@ -2134,7 +2255,7 @@ from elspeth.web.coordination.quota_authority import RepositoryQuotaPolicyAuthor
 - [ ] **Step 16: Run the route tests, the app-wiring suite and the neighbouring workflow suites to verify they pass.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/web/workflow tests/unit/web/test_app.py tests/unit/web/coordination/test_approval_mailbox.py tests/unit/web/coordination/test_quota_policy_authority.py -n 0 > /tmp/i9-lane-routes-green.log 2>&1; echo exit=$?`
-Expected: `exit=0`. `test_mailbox_routes.py` contributes `8 passed` and `test_quota_routes.py` `9 passed` (five functions, the strict-body test parametrised four times).
+Expected: `exit=0`. `test_mailbox_routes.py` contributes `10 passed` and `test_quota_routes.py` `9 passed` (five functions, the strict-body test parametrised four times).
 
 - [ ] **Step 17: Admit the new writers and connections to the Sessions mutation-authority manifest.**
 
@@ -2145,7 +2266,7 @@ Expected: `exit=0` and `1 xfailed`. The reason text lists one `describe()` line 
 - under `Unexpected/unreviewed`: `src/elspeth/web/coordination/approval_authority.py:<line> RepositoryApprovalAuthority.mark_decision_seen update approvals` (authority `ApprovalAuthority`, through I3's class-prefix binding), `src/elspeth/web/coordination/quota_authority.py:<line> RepositoryQuotaPolicyAuthority.set_identity_policy update quota_policies` and `src/elspeth/web/coordination/quota_authority.py:<line> RepositoryQuotaPolicyAuthority.set_identity_policy insert quota_policies` (the scanner's own line text, with `UNCLASSIFIED` until the binding below lands);
 - under `Connections outside exact contained authority`: `quota_authority.py:<line> RepositoryQuotaPolicyAuthority.set_identity_policy write_connection <sessions-write-connection>` and `quota_authority.py:<line> RepositoryQuotaPolicyAuthority.status write_connection <sessions-write-connection>`.
 
-The log also lists pairs under `Stale reviewed` with a twin under `Unexpected/unreviewed`, because `line` is part of the identity key: every reviewed `approval_authority.py` row below `_ELIGIBLE_INBOX` (the I3 `request`, `decide`, `withdraw`, `supersede_open_approvals` and `ApprovalTransactionAuthority.run` rows) and I1's `record_token_usage_on_connection insert token_usage_ledger` row, which moves because Step 7 added import lines. For each pair, update only `line=`. If a twin's fingerprint differs, that method was edited by mistake: revert the edit rather than re-pin it. An `Unresolved write executions` count above the baseline I1 recorded (44) means an execute is not a statement the scanner resolves; fix the module, not the manifest.
+The log also lists pairs of a reviewed row and its live twin, because `line` is part of the identity key. Every reviewed `approval_authority.py` row below `mark_decision_seen` moves. I3 Step 10 places `class ApprovalTransactionAuthority` directly after `RepositoryApprovalAuthority.read`, and Step 3 of this task inserts `mark_decision_seen` between the two, so every `ApprovalTransactionAuthority` row sits below the insertion and moves. That is four rows: I3's four `_REVIEWED_READ_CONNECTIONS` rows `ApprovalTransactionAuthority.session_id_of`, `ApprovalTransactionAuthority.approved_bindings`, `ApprovalTransactionAuthority.inbox` and `ApprovalTransactionAuthority.sent` (each `write_connection <sessions-write-connection>`, authority `None`). I1's `record_token_usage_on_connection insert token_usage_ledger` row also moves, because Step 7 added import lines. A moved `_REVIEWED_WRITERS` row prints under `Stale reviewed`, with its twin under `Unexpected/unreviewed`. A moved read-connection row prints under `Stale reviewed read connections`, with its twin under both `Unexpected/unreviewed` and `Connections outside exact contained authority`: I3 Step 12 binds no `ApprovalTransactionAuthority` symbol in `_NAMED_AUTHORITY_SYMBOLS` and adds no `_CONTAINED_CONNECTION_AUTHORITIES` entry, so the four reads stay unbound and uncontained. For each pair, update only `line=`. If a twin's fingerprint differs, that method was edited by mistake: revert the edit rather than re-pin it. The `Unresolved write executions` section is not I1's baseline here. The count this plan gives for it, 45, is derived, not measured: it is I1 Step 15's measured 44 plus the one `src/elspeth/web/coordination/review_authority.py:<line> RepositoryReviewAuthority._lock_then_read_clock unknown_execute <unresolved-session-write>` line that I4 Step 9's drift read states it adds ("`Unresolved write executions` is 1 above the baseline (44)") and accepts as a module shape (its `conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE)` runs a constant imported from `identity_authority`). No tree after I4 existed when this plan was written, so re-measure it: read the count from `/tmp/i9-lane-manifest-drift.log` and confirm it equals the `Unresolved write executions` count in I4 Step 9's green log (`/tmp/i4-manifest-green.log`, or a gate re-run on the tree before this task's edits), and that the only line beyond I1 Step 15's 44 is that `_lock_then_read_clock` line. If I4 was changed to call I3's `lock_admin_population(conn)` instead of executing the imported constant, the measured count is 44, and 44 replaces 45 everywhere in this paragraph. This task adds no line to the section, so expect the re-measured count (45 on I4 as written) and no line naming `approval_authority.py` or `quota_authority.py`. A count above the re-measured one, or any line naming either module, means an execute is not a statement the scanner resolves: fix the module, not the manifest.
 
 Then edit `tests/unit/architecture/test_session_db_mutation_authority.py`:
 
@@ -2257,12 +2378,15 @@ and directly after I1's `record_token_usage_on_connection` `insert token_usage_l
     ),
 ```
 
-In every `FP_FROM_LOG` / `LINE_FROM_LOG` slot, write the fingerprint, ordinal and line for that exact symbol and operation, copied from `/tmp/i9-lane-manifest-drift.log`. The fingerprint is an AST hash of the method as written on your branch; this plan cannot know it. If the drift log lists `ApprovalTransactionAuthority.eligible_inbox` under `Connections outside exact contained authority`, add its row to `_REVIEWED_READ_CONNECTIONS` in the same shape (authority `None`), directly after the `status` row.
+In every `FP_FROM_LOG` / `LINE_FROM_LOG` slot, write the fingerprint, ordinal and line for that exact symbol and operation, copied from `/tmp/i9-lane-manifest-drift.log`. The fingerprint is an AST hash of the method as written on your branch; this plan cannot know it.
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py -n 0 -v -rx > /tmp/i9-lane-manifest-green.log 2>&1; echo exit=$?`
-Expected: `exit=0`, and the short summary lists no `XFAIL test_all_production_sessions_writers_are_reviewed_typed_authorities`.
+Expected: `exit=0`, no `failed`, and exactly `1 xfailed`, `test_all_production_sessions_writers_are_reviewed_typed_authorities`: the gate already XFAILs on a clean HEAD (I1 Step 15 records the baseline counts; I7 Step 28 cites the measurement on a `git archive` export of 46219b2b7, `1 xfailed in 100.99s`), so this task cannot bring it to a pass. Read the XFAIL text instead. No section may name a site this task adds or moves.
 
-Control the instrument: change one hex character of the `mark_decision_seen` fingerprint and re-run the gate id with `-rx` to `/tmp/i9-lane-manifest-control.log`. Confirm `1 xfailed` returns with `Stale reviewed (1)` naming that row. Restore the character and re-run the green command to `exit=0`.
+Run: `grep -c 'mark_decision_seen\|set_identity_policy\|RepositoryQuotaPolicyAuthority' /tmp/i9-lane-manifest-green.log; grep -c 'Stale reviewed (0):' /tmp/i9-lane-manifest-green.log; grep -c 'Stale reviewed read connections (0):' /tmp/i9-lane-manifest-green.log`
+Expected: `0`, then at least `1`, then at least `1`. The first count proves every new writer, write connection and read connection is reviewed: no test function in the gate file names any of the three symbols, so a `-v` progress line cannot match. The second proves every line-only re-pin above was applied (the `record_token_usage_on_connection` row), because a missed one prints as a `Stale reviewed` row. The third proves the `RepositoryQuotaPolicyAuthority.status` read-connection row matches the live site and that the four `ApprovalTransactionAuthority` read-connection re-pins above were applied, because a missed one prints as a `Stale reviewed read connections` row.
+
+Control the instrument: change one hex character of the `mark_decision_seen` fingerprint and re-run the gate id with `-rx` to `/tmp/i9-lane-manifest-control.log`. Confirm the log shows `Stale reviewed (1):` naming that row, and that `grep -c 'mark_decision_seen' /tmp/i9-lane-manifest-control.log` prints at least `1`. Then restore the character, re-run the green command, and confirm the three counts above return to `0`, at least `1`, at least `1`. The exit code does not discriminate here: it is `exit=0` with `1 xfailed` both before and after the mutation.
 
 - [ ] **Step 18: Write and run the PostgreSQL proofs (real `FOR UPDATE`, real partial unique index).**
 
@@ -2704,7 +2828,7 @@ import {
   badgeCount,
   useMailboxStore,
 } from "./mailboxStore";
-import type { ApprovalView, MailboxSummary } from "@/types/workflow";
+import type { ApprovalView, MailboxSummary, ReviewSentView } from "@/types/workflow";
 
 vi.mock("@/api/workflow", () => ({
   fetchMailboxSummary: vi.fn(),
@@ -2719,6 +2843,7 @@ const fetchMailboxSummary = vi.mocked(workflow.fetchMailboxSummary);
 const fetchMailboxInbox = vi.mocked(workflow.fetchMailboxInbox);
 const markApprovalSeen = vi.mocked(workflow.markApprovalSeen);
 const decideApproval = vi.mocked(workflow.decideApproval);
+const fetchMailboxSent = vi.mocked(workflow.fetchMailboxSent);
 
 const SUMMARY: MailboxSummary = {
   governance: "on",
@@ -2833,6 +2958,43 @@ describe("mailboxStore (Task I9)", () => {
     expect(approvalForState([older, newer, otherState], "s-1", "t-1")?.approval_id).toBe("new");
     expect(approvalForState([older], "s-1", "t-9")).toBeNull();
     expect(approvalForState(null, "s-1", "t-1")).toBeNull();
+  });
+
+  it("loads the sent approvals and the sent review outcomes from one response", async () => {
+    const outcome: ReviewSentView = {
+      request: {
+        request_id: "r-1",
+        session_id: "s-2",
+        state_id: "t-2",
+        requested_by_identity_id: "alice",
+        reviewer_identity_id: null,
+        requested_at: "2026-09-14T09:30:00Z",
+        cancelled_at: null,
+        request_note: "have a look",
+        open: false,
+      },
+      attestations: [
+        {
+          attestation_id: "at-1",
+          session_id: "s-2",
+          state_id: "t-2",
+          payload_digest: "sha256:abc",
+          reviewer_identity_id: "erin",
+          author_identity_id: "alice",
+          attested_at: "2026-09-14T10:00:00Z",
+          verdict: "changes_requested",
+          note: "rename the sink",
+        },
+      ],
+    };
+    fetchMailboxSent.mockResolvedValue({ approvals: [approval()], reviews: [outcome] });
+    await useMailboxStore.getState().loadSent();
+    expect(useMailboxStore.getState().sent).toEqual([approval()]);
+    expect(useMailboxStore.getState().sentReviews).toEqual([outcome]);
+    // A review outcome is never unread: loading it stamps nothing.
+    expect(markApprovalSeen).not.toHaveBeenCalled();
+    useMailboxStore.getState().reset();
+    expect(useMailboxStore.getState().sentReviews).toBeNull();
   });
 });
 ```
@@ -2990,8 +3152,15 @@ export interface MailboxInbox {
   reviews: ReviewRequestView[];
 }
 
+/** One of the caller's review requests with the attestations attributed to it (mailbox.py `ReviewSentView`). */
+export interface ReviewSentView {
+  request: ReviewRequestView;
+  attestations: ReviewAttestationView[];
+}
+
 export interface MailboxSent {
   approvals: ApprovalView[];
+  reviews: ReviewSentView[];
 }
 
 export interface ApproverEntry {
@@ -3404,7 +3573,7 @@ import { create } from "zustand";
 
 import * as workflow from "@/api/workflow";
 import type { ApiError } from "@/types/index";
-import type { ApprovalView, MailboxInbox, MailboxSummary, ReviewVerdict } from "@/types/workflow";
+import type { ApprovalView, MailboxInbox, MailboxSummary, ReviewSentView, ReviewVerdict } from "@/types/workflow";
 
 export const MAILBOX_POLL_INTERVAL_MS = 30_000;
 
@@ -3422,7 +3591,21 @@ export function badgeCount(summary: MailboxSummary | null): number {
   return summary.approvals_to_decide + summary.reviews_to_attest + summary.decisions_unseen;
 }
 
-/** The newest approval request for exactly this composition state, or null. */
+/** A wire timestamp as an instant: PostgreSQL sends microseconds and SQLite whole seconds, so the strings do not sort. */
+function requestedInstant(approval: ApprovalView): number {
+  const parsed = Date.parse(approval.requested_at);
+  if (Number.isNaN(parsed)) throw new Error(`unparseable approval requested_at: ${approval.requested_at}`);
+  return parsed;
+}
+
+/**
+ * The newest approval request for exactly this composition state, or null (decision 6).
+ *
+ * "Newest" is a total order: the later `requested_at` instant, then the greater
+ * `approval_id`. One state can carry several decided requests (Task I3 decision 8)
+ * and SQLite's one-second clock ties them, so the pick never depends on the order
+ * of `sent`.
+ */
 export function approvalForState(
   sent: ApprovalView[] | null,
   sessionId: string,
@@ -3432,7 +3615,12 @@ export function approvalForState(
   let newest: ApprovalView | null = null;
   for (const candidate of sent) {
     if (candidate.session_id !== sessionId || candidate.state_id !== stateId) continue;
-    if (newest === null || candidate.requested_at > newest.requested_at) newest = candidate;
+    if (newest === null) {
+      newest = candidate;
+      continue;
+    }
+    const difference = requestedInstant(candidate) - requestedInstant(newest);
+    if (difference > 0 || (difference === 0 && candidate.approval_id > newest.approval_id)) newest = candidate;
   }
   return newest;
 }
@@ -3460,6 +3648,8 @@ interface MailboxState {
   summary: MailboxSummary | null;
   inbox: MailboxInbox | null;
   sent: ApprovalView[] | null;
+  /** The caller's review requests with their attested outcomes; shown, never unread (no seen column). */
+  sentReviews: ReviewSentView[] | null;
   error: string | null;
   refreshSummary: () => Promise<void>;
   loadInbox: () => Promise<void>;
@@ -3475,6 +3665,7 @@ export const useMailboxStore = create<MailboxState>((set, get) => ({
   summary: null,
   inbox: null,
   sent: null,
+  sentReviews: null,
   error: null,
 
   async refreshSummary() {
@@ -3498,7 +3689,7 @@ export const useMailboxStore = create<MailboxState>((set, get) => ({
   async loadSent() {
     try {
       const sent = await workflow.fetchMailboxSent();
-      set({ sent: sent.approvals, error: null });
+      set({ sent: sent.approvals, sentReviews: sent.reviews, error: null });
     } catch (error) {
       set({ error: workflowErrorMessage(error) });
     }
@@ -3555,7 +3746,7 @@ export const useMailboxStore = create<MailboxState>((set, get) => ({
 
   reset() {
     stopPolling();
-    set({ summary: null, inbox: null, sent: null, error: null });
+    set({ summary: null, inbox: null, sent: null, sentReviews: null, error: null });
   },
 }));
 ```
@@ -3563,7 +3754,7 @@ export const useMailboxStore = create<MailboxState>((set, get) => ({
 - [ ] **Step 22: Run the core frontend tests and the existing client suites to verify they pass.**
 
 Run: `cd "$(git rev-parse --show-toplevel)/src/elspeth/web/frontend" && npx vitest run src/api/client.workflow-errors.test.ts src/api/workflow.test.ts src/utils/bytes.test.ts src/stores/mailboxStore.test.ts src/api/client.execution-errors.test.ts src/api/client.auth.test.ts > /tmp/i9-lane-fe-core-green.log 2>&1; echo exit=$?`
-Expected: `exit=0`; the four new files contribute `5`, `7`, `3` and `6` passes.
+Expected: `exit=0`; the four new files contribute `5`, `7`, `3` and `7` passes.
 
 - [ ] **Step 23: Write the failing mailbox UI tests.**
 
@@ -3619,12 +3810,14 @@ Create `src/components/workflow/MailboxDialog.test.tsx`:
 
 ```tsx
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MailboxDialog } from "./MailboxDialog";
+import type { InboxItem } from "./InboxList";
+import { InspectPane } from "./InspectPane";
 import * as workflow from "@/api/workflow";
 import { useMailboxStore } from "@/stores/mailboxStore";
-import type { ApprovalView, ReviewRequestView } from "@/types/workflow";
+import type { ApprovalView, ReviewRequestView, WorkflowInspect } from "@/types/workflow";
 
 vi.mock("@/api/workflow", () => ({
   fetchMailboxSummary: vi.fn(),
@@ -3688,7 +3881,7 @@ describe("MailboxDialog (Task I9)", () => {
     vi.clearAllMocks();
     useMailboxStore.getState().reset();
     api.fetchMailboxInbox.mockResolvedValue({ approvals: [approval()], reviews: [REVIEW] });
-    api.fetchMailboxSent.mockResolvedValue({ approvals: [] });
+    api.fetchMailboxSent.mockResolvedValue({ approvals: [], reviews: [] });
     api.fetchMailboxSummary.mockResolvedValue({
       governance: "on",
       roles: ["approver", "reviewer"],
@@ -3696,7 +3889,10 @@ describe("MailboxDialog (Task I9)", () => {
       reviews_to_attest: 1,
       decisions_unseen: 0,
     });
-    api.fetchWorkflowInspect.mockResolvedValue(INSPECT);
+    // The server echoes the ids it inspected; InspectPane enables a decision only for its own request's state.
+    api.fetchWorkflowInspect.mockImplementation((sessionId: string, stateId: string) =>
+      Promise.resolve(Object.assign({}, INSPECT, { session_id: sessionId, state_id: stateId })),
+    );
   });
 
   it("opens an inbox approval into the frozen inspect view with the requester's note, and approves it", async () => {
@@ -3716,7 +3912,8 @@ describe("MailboxDialog (Task I9)", () => {
     api.decideApproval.mockResolvedValue(approval({ decision: "rejected" }));
     render(<MailboxDialog onClose={vi.fn()} />);
     await userEvent.click(await screen.findByRole("button", { name: /Approval requested by alice/ }));
-    const reject = await screen.findByRole("button", { name: "Reject" });
+    await screen.findByTestId("mailbox-inspect-yaml");
+    const reject = screen.getByRole("button", { name: "Reject" });
     expect(reject).toBeDisabled();
     await userEvent.type(screen.getByLabelText("Note"), "missing an owner");
     expect(reject).toBeEnabled();
@@ -3741,7 +3938,8 @@ describe("MailboxDialog (Task I9)", () => {
     });
     render(<MailboxDialog onClose={vi.fn()} />);
     await userEvent.click(await screen.findByRole("button", { name: /Approval requested by alice/ }));
-    await userEvent.click(await screen.findByRole("button", { name: "Approve" }));
+    await screen.findByTestId("mailbox-inspect-yaml");
+    await userEvent.click(screen.getByRole("button", { name: "Approve" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("This request was already approved.");
   });
 
@@ -3759,16 +3957,21 @@ describe("MailboxDialog (Task I9)", () => {
     });
     render(<MailboxDialog onClose={vi.fn()} />);
     await userEvent.click(await screen.findByRole("button", { name: /Review requested by alice/ }));
-    expect(await screen.findByRole("button", { name: "Request changes" })).toBeDisabled();
+    await screen.findByTestId("mailbox-inspect-yaml");
+    expect(screen.getByRole("button", { name: "Request changes" })).toBeDisabled();
     await userEvent.click(screen.getByRole("button", { name: "Sign off" }));
     await waitFor(() => expect(api.attestReview).toHaveBeenCalledWith("r-1", "signed_off", ""));
   });
 
-  it("says an inspect 404 means the request is no longer open", async () => {
+  it("says an inspect 404 means the request is no longer open, and leaves nothing to decide", async () => {
     api.fetchWorkflowInspect.mockRejectedValue({ status: 404, detail: "Not found" });
     render(<MailboxDialog onClose={vi.fn()} />);
     await userEvent.click(await screen.findByRole("button", { name: /Approval requested by alice/ }));
     expect(await screen.findByRole("alert")).toHaveTextContent("This request is no longer open for inspection.");
+    await userEvent.type(screen.getByLabelText("Note"), "missing an owner");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+    expect(api.decideApproval).not.toHaveBeenCalled();
   });
 
   it("lists sent requests with the decider and note, marks unread, and stamps one when opened", async () => {
@@ -3778,7 +3981,7 @@ describe("MailboxDialog (Task I9)", () => {
       decided_by_identity_id: "bob",
       decision_note: "missing an owner",
     });
-    api.fetchMailboxSent.mockResolvedValue({ approvals: [decided] });
+    api.fetchMailboxSent.mockResolvedValue({ approvals: [decided], reviews: [] });
     api.markApprovalSeen.mockResolvedValue(Object.assign({}, decided, { decision_seen_at: "2026-09-14T11:00:00Z" }));
     render(<MailboxDialog onClose={vi.fn()} />);
     await userEvent.click(screen.getByRole("button", { name: "Sent" }));
@@ -3801,6 +4004,7 @@ describe("MailboxDialog (Task I9)", () => {
           revocation_actor_kind: "identity",
         }),
       ],
+      reviews: [],
     });
     render(<MailboxDialog onClose={vi.fn()} />);
     await userEvent.click(screen.getByRole("button", { name: "Sent" }));
@@ -3809,12 +4013,173 @@ describe("MailboxDialog (Task I9)", () => {
     expect(row).not.toHaveTextContent("New");
   });
 
+  it("lists sent review requests with each reviewer's verdict and note, display-only and never unread", async () => {
+    api.fetchMailboxSent.mockResolvedValue({
+      approvals: [],
+      reviews: [
+        {
+          request: Object.assign({}, REVIEW, { request_note: "check the joins", open: false }),
+          attestations: [
+            {
+              attestation_id: "at-9",
+              session_id: "s-2",
+              state_id: "t-2",
+              payload_digest: "sha256:abc",
+              reviewer_identity_id: "erin",
+              author_identity_id: "alice",
+              attested_at: "2026-09-14T10:00:00Z",
+              verdict: "changes_requested",
+              note: "rename the sink",
+            },
+          ],
+        },
+      ],
+    });
+    render(<MailboxDialog onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Sent" }));
+    const row = await screen.findByTestId("mailbox-sent-review");
+    expect(row).toHaveTextContent("Review request to any reviewer: Reviewed");
+    expect(row).toHaveTextContent("Changes requested by erin");
+    expect(row).toHaveTextContent("rename the sink");
+    expect(row).not.toHaveTextContent("New");
+    expect(row.querySelector("button")).toBeNull();
+    expect(screen.queryByText("You have not sent a request.")).toBeNull();
+    expect(api.markApprovalSeen).not.toHaveBeenCalled();
+  });
+
   it("closes on Escape", async () => {
     const onClose = vi.fn();
     render(<MailboxDialog onClose={onClose} />);
     await screen.findByRole("button", { name: /Approval requested by alice/ });
     await userEvent.keyboard("{Escape}");
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason: unknown) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  let reject: (reason: unknown) => void = () => undefined;
+  const promise = new Promise<T>((settle, fail) => {
+    resolve = settle;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+function inspectionOf(sessionId: string, stateId: string, yaml: string): WorkflowInspect {
+  return Object.assign({}, INSPECT, { session_id: sessionId, state_id: stateId, yaml });
+}
+
+const FIRST_ITEM: InboxItem = { kind: "approval", approval: approval() };
+const SECOND_ITEM: InboxItem = { kind: "approval", approval: approval({ approval_id: "a-2", session_id: "s-3", state_id: "t-3" }) };
+const REVIEW_ITEM: InboxItem = { kind: "review", review: REVIEW };
+
+describe("InspectPane decision gating (Task I9, decision 13)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useMailboxStore.getState().reset();
+    api.fetchMailboxInbox.mockResolvedValue({ approvals: [], reviews: [] });
+    api.fetchMailboxSummary.mockResolvedValue({
+      governance: "on",
+      roles: ["approver", "reviewer"],
+      approvals_to_decide: 0,
+      reviews_to_attest: 0,
+      decisions_unseen: 0,
+    });
+  });
+
+  it("keeps Approve and Reject disabled while the frozen pipeline is loading, then enables them", async () => {
+    const pending = deferred<WorkflowInspect>();
+    api.fetchWorkflowInspect.mockReturnValueOnce(pending.promise);
+    render(<InspectPane item={FIRST_ITEM} onBack={vi.fn()} onDone={vi.fn()} />);
+    expect(screen.getByText("Loading the frozen pipeline")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Note"), "missing an owner");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+    // Mutation-derivation: the loaded inspection, not the note or the passage of time, enables the decision.
+    await act(async () => {
+      pending.resolve(inspectionOf("s-1", "t-1", "first: pipeline\n"));
+    });
+    expect(screen.getByTestId("mailbox-inspect-yaml")).toHaveTextContent("first: pipeline");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeEnabled();
+    expect(api.decideApproval).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a 404", { status: 404, detail: "Not found" }, "This request is no longer open for inspection."],
+    ["a server error", { status: 500, detail: "inspect failed" }, "inspect failed"],
+  ])("keeps the decision disabled after %s from the inspection", async (_label, failure, message) => {
+    api.fetchWorkflowInspect.mockRejectedValueOnce(failure);
+    render(<InspectPane item={FIRST_ITEM} onBack={vi.fn()} onDone={vi.fn()} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(message);
+    await userEvent.type(screen.getByLabelText("Note"), "missing an owner");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+    expect(screen.queryByTestId("mailbox-inspect-yaml")).toBeNull();
+  });
+
+  it("disables the decision the moment the target changes, until the new target's inspection loads", async () => {
+    const second = deferred<WorkflowInspect>();
+    api.fetchWorkflowInspect
+      .mockResolvedValueOnce(inspectionOf("s-1", "t-1", "first: pipeline\n"))
+      .mockReturnValueOnce(second.promise);
+    const { rerender } = render(<InspectPane item={FIRST_ITEM} onBack={vi.fn()} onDone={vi.fn()} />);
+    expect(await screen.findByTestId("mailbox-inspect-yaml")).toHaveTextContent("first: pipeline");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+    rerender(<InspectPane item={SECOND_ITEM} onBack={vi.fn()} onDone={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.queryByTestId("mailbox-inspect-yaml")).toBeNull();
+    expect(api.fetchWorkflowInspect).toHaveBeenLastCalledWith("s-3", "t-3");
+    await act(async () => {
+      second.resolve(inspectionOf("s-3", "t-3", "second: pipeline\n"));
+    });
+    expect(screen.getByTestId("mailbox-inspect-yaml")).toHaveTextContent("second: pipeline");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+  });
+
+  it("ignores a late inspection of the previous target", async () => {
+    const first = deferred<WorkflowInspect>();
+    const second = deferred<WorkflowInspect>();
+    api.fetchWorkflowInspect.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const { rerender } = render(<InspectPane item={FIRST_ITEM} onBack={vi.fn()} onDone={vi.fn()} />);
+    rerender(<InspectPane item={SECOND_ITEM} onBack={vi.fn()} onDone={vi.fn()} />);
+    await act(async () => {
+      first.resolve(inspectionOf("s-1", "t-1", "first: pipeline\n"));
+    });
+    expect(screen.getByText("Loading the frozen pipeline")).toBeInTheDocument();
+    expect(screen.queryByTestId("mailbox-inspect-yaml")).toBeNull();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    await act(async () => {
+      second.resolve(inspectionOf("s-3", "t-3", "second: pipeline\n"));
+    });
+    expect(screen.getByTestId("mailbox-inspect-yaml")).toHaveTextContent("second: pipeline");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+  });
+
+  it("never enables the decision on an inspection of a different state", async () => {
+    api.fetchWorkflowInspect.mockResolvedValueOnce(inspectionOf("s-1", "t-other", "other: pipeline\n"));
+    render(<InspectPane item={FIRST_ITEM} onBack={vi.fn()} onDone={vi.fn()} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("The loaded pipeline is not the version this request names.");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+    expect(screen.queryByTestId("mailbox-inspect-yaml")).toBeNull();
+  });
+
+  it("gates Sign off and Request changes on the review's inspection the same way", async () => {
+    const pending = deferred<WorkflowInspect>();
+    api.fetchWorkflowInspect.mockReturnValueOnce(pending.promise);
+    render(<InspectPane item={REVIEW_ITEM} onBack={vi.fn()} onDone={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText("Note"), "one more pass");
+    expect(screen.getByRole("button", { name: "Sign off" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Request changes" })).toBeDisabled();
+    await act(async () => {
+      pending.reject({ status: 404, detail: "Not found" });
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("This request is no longer open for inspection.");
+    expect(screen.getByRole("button", { name: "Sign off" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Request changes" })).toBeDisabled();
+    expect(api.attestReview).not.toHaveBeenCalled();
   });
 });
 ```
@@ -3843,7 +4208,7 @@ describe("WorkflowRequestDialog (Task I9)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useMailboxStore.getState().reset();
-    api.fetchMailboxSent.mockResolvedValue({ approvals: [] });
+    api.fetchMailboxSent.mockResolvedValue({ approvals: [], reviews: [] });
     api.fetchMailboxSummary.mockResolvedValue({
       governance: "on",
       roles: [],
@@ -4005,10 +4370,11 @@ Create `src/components/workflow/SentList.tsx`:
 
 ```tsx
 import { Button } from "@/components/ui";
-import type { ApprovalView } from "@/types/workflow";
+import type { ApprovalView, ReviewAttestationView, ReviewSentView } from "@/types/workflow";
 
 interface SentListProps {
   sent: ApprovalView[] | null;
+  reviews: ReviewSentView[] | null;
   onOpen: (approvalId: string) => void;
 }
 
@@ -4044,12 +4410,43 @@ function statusText(approval: ApprovalView): string {
   }
 }
 
-export function SentList({ sent, onOpen }: SentListProps): JSX.Element {
-  if (sent === null) {
+function reviewStatusText(item: ReviewSentView): string {
+  if (item.request.cancelled_at !== null) return "Cancelled";
+  if (item.request.open) {
+    return item.request.reviewer_identity_id === null
+      ? "Waiting for any reviewer"
+      : `Waiting for ${item.request.reviewer_identity_id}`;
+  }
+  return "Reviewed";
+}
+
+function verdictText(attestation: ReviewAttestationView): string {
+  switch (attestation.verdict) {
+    case "signed_off":
+      return `Signed off by ${attestation.reviewer_identity_id}`;
+    case "changes_requested":
+      return `Changes requested by ${attestation.reviewer_identity_id}`;
+    case "withdrawn":
+      return `Withdrawn by ${attestation.reviewer_identity_id}`;
+    default: {
+      const exhaustive: never = attestation.verdict;
+      throw new Error(`unknown review verdict: ${String(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * Sent folder (spec :1228-1229): the caller's approval requests, then the
+ * caller's review requests with every attestation I4's `sent_for` attributes
+ * to each. A review row is display-only: review requests have no seen column,
+ * so it is never "New", and I7's inspect route 404s the requester.
+ */
+export function SentList({ sent, reviews, onOpen }: SentListProps): JSX.Element {
+  if (sent === null || reviews === null) {
     return <p className="mailbox-empty">Loading sent requests</p>;
   }
-  if (sent.length === 0) {
-    return <p className="mailbox-empty">You have not requested an approval.</p>;
+  if (sent.length === 0 && reviews.length === 0) {
+    return <p className="mailbox-empty">You have not sent a request.</p>;
   }
   return (
     <ul className="mailbox-list">
@@ -4064,6 +4461,22 @@ export function SentList({ sent, onOpen }: SentListProps): JSX.Element {
           {approval.decided_at !== null && (
             <span className="mailbox-row-meta">{new Date(approval.decided_at).toLocaleString()}</span>
           )}
+        </li>
+      ))}
+      {reviews.map((item) => (
+        <li key={item.request.request_id} className="mailbox-row" data-testid="mailbox-sent-review">
+          <span className="mailbox-row-meta">
+            Review request to {item.request.reviewer_identity_id ?? "any reviewer"}: {reviewStatusText(item)}
+          </span>
+          {item.request.request_note !== null && <p className="mailbox-note">{item.request.request_note}</p>}
+          {item.attestations.map((attestation) => (
+            <div key={attestation.attestation_id}>
+              <span className="mailbox-row-meta">
+                {verdictText(attestation)}, {new Date(attestation.attested_at).toLocaleString()}
+              </span>
+              {attestation.note !== null && <p className="mailbox-note">{attestation.note}</p>}
+            </div>
+          ))}
         </li>
       ))}
     </ul>
@@ -4089,40 +4502,73 @@ interface InspectPaneProps {
   onDone: () => void;
 }
 
+/** A settled inspection, tagged with the exact request and state it was fetched for. */
+type SettledInspection =
+  | { target: string; status: "loaded"; inspect: WorkflowInspect }
+  | { target: string; status: "failed"; message: string };
+
+const DECIDE_AFTER_INSPECTION = "Decide once the frozen pipeline for this request has loaded.";
+const WRONG_STATE = "The loaded pipeline is not the version this request names.";
+
+/** The request id and the (session, state) pair its decision binds: the one inspection a decision may follow. */
+function inspectionTarget(item: InboxItem): string {
+  return item.kind === "approval"
+    ? `approval/${item.approval.approval_id}/${item.approval.session_id}/${item.approval.state_id}`
+    : `review/${item.review.request_id}/${item.review.session_id}/${item.review.state_id}`;
+}
+
 /**
  * The frozen read-only inspect view (I7 route) with the requester's note and
  * the decision form. Every note is rendered as text: React escapes it, and no
  * markup path exists here (spec :1416, "rendered as text, never as markup").
+ *
+ * A decision follows the inspection of exactly this request's state
+ * (decision 13). Every decision button stays disabled while that inspection is
+ * loading, after it failed, and whenever the settled inspection was fetched
+ * for a different target than the one shown now.
  */
 export function InspectPane({ item, onBack, onDone }: InspectPaneProps): JSX.Element {
   const target = item.kind === "approval" ? item.approval : item.review;
+  const targetKey = inspectionTarget(item);
   const decide = useMailboxStore((state) => state.decide);
   const attest = useMailboxStore((state) => state.attest);
-  const [inspect, setInspect] = useState<WorkflowInspect | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [settled, setSettled] = useState<SettledInspection | null>(null);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     let live = true;
+    const sessionId = target.session_id;
+    const stateId = target.state_id;
     workflow
-      .fetchWorkflowInspect(target.session_id, target.state_id)
+      .fetchWorkflowInspect(sessionId, stateId)
       .then((result) => {
-        if (live) setInspect(result);
+        if (!live) return;
+        setSettled(
+          result.session_id === sessionId && result.state_id === stateId
+            ? { target: targetKey, status: "loaded", inspect: result }
+            : { target: targetKey, status: "failed", message: WRONG_STATE },
+        );
       })
       .catch((error: unknown) => {
         if (!live) return;
-        setLoadError(
-          (error as Partial<ApiError>).status === 404
-            ? "This request is no longer open for inspection."
-            : workflowErrorMessage(error),
-        );
+        setSettled({
+          target: targetKey,
+          status: "failed",
+          message:
+            (error as Partial<ApiError>).status === 404
+              ? "This request is no longer open for inspection."
+              : workflowErrorMessage(error),
+        });
       });
     return () => {
       live = false;
     };
-  }, [target.session_id, target.state_id]);
+  }, [targetKey, target.session_id, target.state_id]);
 
+  // A settled inspection of another target is stale: for the target shown now it is still loading.
+  const current = settled !== null && settled.target === targetKey ? settled : null;
+  const inspected = current !== null && current.status === "loaded";
   const noteBlank = note.trim() === "";
 
   async function act(run: () => Promise<boolean>): Promise<void> {
@@ -4141,15 +4587,15 @@ export function InspectPane({ item, onBack, onDone }: InspectPaneProps): JSX.Ele
         {item.kind === "approval" ? "Approval request" : "Review request"} from {target.requested_by_identity_id}
       </h3>
       {target.request_note !== null && <p className="mailbox-note">{target.request_note}</p>}
-      {loadError !== null ? (
-        <p role="alert" className="mailbox-error">
-          {loadError}
-        </p>
-      ) : inspect === null ? (
+      {current === null ? (
         <p className="mailbox-empty">Loading the frozen pipeline</p>
+      ) : current.status === "failed" ? (
+        <p role="alert" className="mailbox-error">
+          {current.message}
+        </p>
       ) : (
         <pre className="mailbox-inspect-yaml" data-testid="mailbox-inspect-yaml">
-          {inspect.yaml}
+          {current.inspect.yaml}
         </pre>
       )}
       <label className="field-label" htmlFor="mailbox-decision-note">
@@ -4165,13 +4611,18 @@ export function InspectPane({ item, onBack, onDone }: InspectPaneProps): JSX.Ele
       <div className="mailbox-decision-actions">
         {item.kind === "approval" ? (
           <>
-            <Button variant="primary" disabled={busy} onClick={() => void act(() => decide(item.approval.approval_id, "approved", note))}>
+            <Button
+              variant="primary"
+              disabled={busy || !inspected}
+              title={inspected ? undefined : DECIDE_AFTER_INSPECTION}
+              onClick={() => void act(() => decide(item.approval.approval_id, "approved", note))}
+            >
               Approve
             </Button>
             <Button
               variant="danger"
-              disabled={busy || noteBlank}
-              title={noteBlank ? "A rejection needs a note." : undefined}
+              disabled={busy || !inspected || noteBlank}
+              title={!inspected ? DECIDE_AFTER_INSPECTION : noteBlank ? "A rejection needs a note." : undefined}
               onClick={() => void act(() => decide(item.approval.approval_id, "rejected", note))}
             >
               Reject
@@ -4179,13 +4630,18 @@ export function InspectPane({ item, onBack, onDone }: InspectPaneProps): JSX.Ele
           </>
         ) : (
           <>
-            <Button variant="primary" disabled={busy} onClick={() => void act(() => attest(item.review.request_id, "signed_off", note))}>
+            <Button
+              variant="primary"
+              disabled={busy || !inspected}
+              title={inspected ? undefined : DECIDE_AFTER_INSPECTION}
+              onClick={() => void act(() => attest(item.review.request_id, "signed_off", note))}
+            >
               Sign off
             </Button>
             <Button
               variant="danger"
-              disabled={busy || noteBlank}
-              title={noteBlank ? "Requesting changes needs a note." : undefined}
+              disabled={busy || !inspected || noteBlank}
+              title={!inspected ? DECIDE_AFTER_INSPECTION : noteBlank ? "Requesting changes needs a note." : undefined}
               onClick={() => void act(() => attest(item.review.request_id, "changes_requested", note))}
             >
               Request changes
@@ -4224,6 +4680,7 @@ export function MailboxDialog({ onClose }: MailboxDialogProps): JSX.Element {
   useFocusTrap(modalRef, true);
   const inbox = useMailboxStore((state) => state.inbox);
   const sent = useMailboxStore((state) => state.sent);
+  const sentReviews = useMailboxStore((state) => state.sentReviews);
   const error = useMailboxStore((state) => state.error);
   const loadInbox = useMailboxStore((state) => state.loadInbox);
   const loadSent = useMailboxStore((state) => state.loadSent);
@@ -4297,7 +4754,7 @@ export function MailboxDialog({ onClose }: MailboxDialogProps): JSX.Element {
           ) : folder === "inbox" ? (
             <InboxList inbox={inbox} onOpen={setSelected} />
           ) : (
-            <SentList sent={sent} onOpen={(approvalId) => void openSent(approvalId)} />
+            <SentList sent={sent} reviews={sentReviews} onOpen={(approvalId) => void openSent(approvalId)} />
           )}
         </div>
       </div>
@@ -4646,7 +5103,7 @@ In `src/styles/index.css`, directly after `@import "../components/settings/setti
 - [ ] **Step 26: Run the mailbox UI tests and the tree-wide census gates to verify they pass.**
 
 Run: `cd "$(git rev-parse --show-toplevel)/src/elspeth/web/frontend" && npx vitest run src/components/workflow/MailboxBadge.test.tsx src/components/workflow/MailboxDialog.test.tsx src/components/workflow/WorkflowRequestDialog.test.tsx src/styles/classNames.test.ts src/styles/tokenReferences.test.ts src/components/ui/primitiveCensus.test.ts > /tmp/i9-lane-fe-mailbox-green.log 2>&1; echo exit=$?`
-Expected: `exit=0`; the three new files contribute `3`, `9` and `4` passes.
+Expected: `exit=0`; the three new files contribute `3`, `17` and `4` passes.
 
 Run: `cd "$(git rev-parse --show-toplevel)/src/elspeth/web/frontend" && npm run lint:css > /tmp/i9-lane-fe-stylelint-1.log 2>&1; echo exit=$?`
 Expected: `exit=0`.
@@ -4712,7 +5169,7 @@ describe("ApprovalReadinessRow (Task I9)", () => {
     vi.clearAllMocks();
     useMailboxStore.getState().reset();
     useExecutionStore.getState().reset();
-    api.fetchMailboxSent.mockResolvedValue({ approvals: [] });
+    api.fetchMailboxSent.mockResolvedValue({ approvals: [], reviews: [] });
     api.fetchMailboxSummary.mockResolvedValue(ON);
     api.fetchApproverDirectory.mockResolvedValue({ approvers: [{ identity_id: "bob", username: "bob" }], suggested_identity_ids: [] });
   });
@@ -4776,6 +5233,56 @@ describe("ApprovalReadinessRow (Task I9)", () => {
       useExecutionStore.setState({ pendingApproval: { sessionId: "s-9", errorType: "approval_binding_mismatch" } });
     });
     expect(screen.queryByTestId("audit-readiness-approval")).toBeNull();
+  });
+
+  // Task I3 decision 8: one state can carry several decided requests. The row keys on the newest by a
+  // stated total order (requested_at as an instant, then approval_id), never on the order Sent arrives in.
+  it.each([
+    ["an equal binding", "2"],
+    ["a changed binding", "9"],
+  ])("shows the newest approval when one state was approved twice, with %s", (_label, olderCatalogDigit) => {
+    const older = approval({
+      approval_id: "a-1",
+      binding: { openrouter_catalog_sha256: olderCatalogDigit.repeat(64) },
+      requested_at: "2026-09-14T09:00:00Z",
+      decision: "approved",
+      decided_at: "2026-09-14T09:30:00Z",
+      decided_by_identity_id: "bob",
+    });
+    const newer = approval({
+      approval_id: "a-2",
+      binding: { openrouter_catalog_sha256: "2".repeat(64) },
+      requested_at: "2026-09-14T11:00:00Z",
+      decision: "approved",
+      decided_at: "2026-09-14T11:30:00Z",
+      decided_by_identity_id: "carol",
+    });
+    for (const sent of [[older, newer], [newer, older]]) {
+      useMailboxStore.setState({ summary: ON, sent });
+      const { unmount } = render(<ApprovalReadinessRow sessionId="s-1" stateId="t-1" />);
+      const row = screen.getByTestId("audit-readiness-approval");
+      expect(row).toHaveAttribute("data-status", "ok");
+      expect(row).toHaveTextContent("Approved by carol.");
+      expect(screen.queryByRole("button", { name: "Request approval" })).toBeNull();
+      unmount();
+    }
+  });
+
+  it("breaks a tied requested_at on approval_id and compares instants, not strings", () => {
+    const rejected = approval({ approval_id: "a-1", decision: "rejected", decided_at: "2026-09-14T09:00:05Z", decided_by_identity_id: "bob" });
+    const approved = approval({ approval_id: "a-2", decision: "approved", decided_at: "2026-09-14T09:00:05Z", decided_by_identity_id: "carol" });
+    // Both carry the helper's requested_at, so only approval_id can order them.
+    for (const sent of [[rejected, approved], [approved, rejected]]) {
+      useMailboxStore.setState({ summary: ON, sent });
+      const { unmount } = render(<ApprovalReadinessRow sessionId="s-1" stateId="t-1" />);
+      expect(screen.getByTestId("audit-readiness-approval")).toHaveTextContent("Approved by carol.");
+      unmount();
+    }
+    // PostgreSQL sends microseconds and SQLite whole seconds: as strings "...09:00:00.500000Z" sorts BEFORE "...09:00:00Z".
+    const later = approval({ approval_id: "a-0", requested_at: "2026-09-14T09:00:00.500000Z", approver_identity_id: "dave" });
+    useMailboxStore.setState({ summary: ON, sent: [approved, later] });
+    render(<ApprovalReadinessRow sessionId="s-1" stateId="t-1" />);
+    expect(screen.getByTestId("audit-readiness-approval")).toHaveTextContent("Waiting for dave to decide.");
   });
 });
 ```
@@ -5146,7 +5653,7 @@ Append to `src/components/workflow/workflow.css`:
 - [ ] **Step 30: Run the approval-row, executionStore and readiness-panel suites and the census gates to verify they pass.**
 
 Run: `cd "$(git rev-parse --show-toplevel)/src/elspeth/web/frontend" && npx vitest run src/components/workflow/ApprovalReadinessRow.test.tsx src/stores/executionStore.approval.test.ts src/stores/executionStore.test.ts src/components/audit/AuditReadinessPanel.test.tsx src/styles/classNames.test.ts src/styles/tokenReferences.test.ts > /tmp/i9-lane-fe-approval-green.log 2>&1; echo exit=$?`
-Expected: `exit=0`; the two new files contribute `6` and `4` passes. AuditReadinessPanel.test.tsx is unchanged and green: it never seeds a mailbox summary, so the approval row renders nothing.
+Expected: `exit=0`; the two new files contribute `9` and `4` passes (`ApprovalReadinessRow.test.tsx` has eight test blocks, and the multiplicity `it.each` runs twice). AuditReadinessPanel.test.tsx is unchanged and green: it never seeds a mailbox summary, so the approval row renders nothing.
 
 - [ ] **Step 31: Write the failing identity-administration UI tests.**
 
@@ -7161,7 +7668,7 @@ vi.mock("./api/workflow", () => ({
     decisions_unseen: 0,
   }),
   fetchMailboxInbox: vi.fn().mockResolvedValue({ approvals: [], reviews: [] }),
-  fetchMailboxSent: vi.fn().mockResolvedValue({ approvals: [] }),
+  fetchMailboxSent: vi.fn().mockResolvedValue({ approvals: [], reviews: [] }),
   fetchIdentities: vi.fn().mockResolvedValue({
     identities: [],
     access_state: "pending",
@@ -7302,8 +7809,10 @@ In `CHANGELOG.md`, under `## 0.8.1 - 2026-09-10`, directly after I7's `- **Scope
 - **Workflow mailbox, identity administration and quota status.** Every
   active identity has a mailbox. The Inbox holds the approvals and review
   requests awaiting them; Sent holds their own approval requests with the
-  decision, the decider and the note. One unread badge refreshes every 30
-  seconds, and opening a decided request clears it. Administrators get an
+  decision, the decider and the note, and their own review requests with each
+  reviewer's verdict, note and time. One unread badge refreshes every 30
+  seconds, and opening a decided approval request clears it; review outcomes
+  are shown but never counted as unread. Administrators get an
   identities list with disable and enable, roles, the approver org chart and
   a quota editor that sets either daily tokens or storage bytes, recording a
   `quota_set` authentication event. The list warns when only one active human

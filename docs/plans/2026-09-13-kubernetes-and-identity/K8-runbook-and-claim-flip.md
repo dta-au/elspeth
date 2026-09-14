@@ -773,7 +773,10 @@ kubectl -n "$NAMESPACE" logs job/elspeth-provision-storage | tee "$OPERATOR_DIR/
 group has no group segment: `v1_configmap_elspeth-web-config.yaml`,
 `apps_v1_deployment_elspeth-web.yaml`); applying by file is what orders
 storage, schema and runtime proof before traffic, because `kubectl apply -k`
-would start the Deployment at once. The overlay names the base by a path
+would create both Jobs and the Deployment in one request: waiting for the Jobs
+afterwards does not order their starts, and a schema-init Job that starts
+before the provisioner has created `data`, `data/blobs` and `payloads` fails
+its directory checks for good (`backoffLimit: 0`). The overlay names the base by a path
 relative to the overlay directory (`BASE_RELATIVE`, computed in the
 prerequisites): kustomize refuses an absolute path under `resources:` with
 `new root '<path>' cannot be absolute`, whatever the load restrictor. If the
@@ -1022,6 +1025,18 @@ The web process validates both schemas at startup and never creates them
 (`ExternalStateSchemaNotReadyError` in the pod log). This is the expected
 state if the Deployment was applied before step 6 completed; finish steps 6
 and 7 and the next restart becomes ready.
+
+### `elspeth-schema-init` failed with `data_dir_writable`
+
+The schema Job started before step 5's provisioner had created `data`,
+`data/blobs` and `payloads`: it was applied before step 5's `wait` succeeded.
+Its log reads `FAIL data_dir_writable: data_dir directory validation failed
+(FileNotFoundError)` and the doctor initialized nothing. The Job has
+`backoffLimit: 0`, and re-applying the same file reports `unchanged` while the
+failed Job exists, so delete it with
+`kubectl -n "$NAMESPACE" delete job elspeth-schema-init --wait=true`, finish
+step 5 until its `wait` succeeds and its log lists the three directories, then
+rerun step 6.
 
 ### The claim stays `Pending`
 

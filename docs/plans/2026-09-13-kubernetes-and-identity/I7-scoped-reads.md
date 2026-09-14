@@ -44,7 +44,16 @@ Decisions this task owns:
    and not requested by the caller. Roles never cross arms. A decided,
    superseded, cancelled or attested row ends inspect access. Failing any
    check raises `WorkflowInspectDenied`, and no row is written. The row means
-   "a read happened". It is not a record of attempts.
+   "a read happened". It is not a record of attempts. The approver arm is the
+   eligibility rule the other two approval surfaces use: I9's mailbox inbox
+   is I3's addressed-only `inbox`, and I3's `decide` admits only the addressed
+   approver (I3 decision 7). The approver who sees a request in the inbox is
+   the one who can inspect it and the one who can decide it; a live approver
+   the request was not addressed to gets an empty inbox and a hidden 404 at
+   both inspect and decide. The spec's role-based reading
+   (sso-design.md:1205-1215, :1416) is the open operator decision listed under
+   I7 in the master's Self-review notes; ruling it role-based widens this arm,
+   I9's inbox and I3's `decide` in one change.
 2. **The privacy gate above `audit_access_log_table` (models.py:3220-3242) is
    met by construction.** Its three items are handled as follows. (1) The
    query-arg allowlist for this writer is EMPTY. The method takes no
@@ -91,9 +100,25 @@ Decisions this task owns:
    `RepositoryIdentityAuthority.grant_curator_as_approver`. Inside its own
    transaction it proves the actor is active, holds a live deployment-wide
    `approver` grant, and has an ACTIVE `approver` edge to the target (a direct
-   edge: the transitive audit-view scope confers no appointment). It checks
-   the edge BEFORE it reads the target row, so a caller without oversight
-   learns nothing about the target. It then applies the same R8,
+   edge: the transitive audit-view scope confers no appointment). It follows
+   LOCK, THEN CLOCK (review B7), the convention I4 decision 1 states, in the
+   approval_lifecycle_authority.py:3-8 order. First comes the admin
+   population, when either participant holds an unscoped `admin` row, live
+   or dead (decided without a clock or a revocation filter, the predicate of
+   HEAD's `_ADMIN_HOLDER_ROWS`, identity_authority.py:774-786, whose lock
+   `disable_identity` :2511 and `revoke_role` :2662 take first; I3 decision 4
+   probes the same rows). Then both `identities` rows `FOR UPDATE` in
+   stable id order. Then, by id through `_ROLE_BY_ID_FOR_UPDATE`
+   (identity_authority.py:750), the actor's `approver` rows and the target's
+   `curator` rows: the lock `revoke_role` takes at :2666. Then the
+   actor-to-target edge by id through `_RELATIONSHIP_BY_ID_FOR_UPDATE`
+   (:751-755): the lock `revoke_relationship` takes at :2816. Only then does
+   it read the database clock, once. Every predicate is judged on those
+   locked rows against that clock. A grant or edge that expires or is revoked
+   while the call waits is refused, and a revocation that arrives while the
+   grant is in flight waits for it to commit. It judges the edge BEFORE it
+   judges the target row, so a caller without oversight learns nothing about
+   the target from the answer. It then applies the same R8,
    service-kind, already-held and expired-occupant rules `grant_role`
    applies. `grant_role` is not edited, so its three manifest rows
    (test_session_db_mutation_authority.py:3064-3081 and :3216-3224) keep their
@@ -127,18 +152,18 @@ Decisions this task owns:
 - Modify: `src/elspeth/web/app.py:107` (`from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority`; the reader import follows), `:164` (`from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router`; the two router imports go beside I5's workflow import), `:1585-1586` (`audit_access_log_authority = RepositoryAuditAccessLogAuthority(session_engine)` / `app.state.audit_access_log_authority = audit_access_log_authority`; the reader follows :1586), `:1791` (`app.include_router(create_shareable_reviews_router())`; I5's `app.include_router(create_library_router())` follows it on your branch, and the two I7 lines follow that)
 - Modify: `tests/unit/architecture/test_session_db_mutation_authority.py:429-433` (`_NAMED_AUTHORITY_SYMBOLS` entry `RepositoryAuditAccessLogAuthority.record_audit_grade_view`), `:868-872` (`_NAMED_AUTHORITY_SYMBOLS` entry `RepositoryIdentityAuthority.revoke_role`, the identity block's last), `:1032-1036` and `:1181-1185` (the same two entries in `_CONTAINED_CONNECTION_AUTHORITIES`), `:2053-2062` (`_REVIEWED_WRITERS` row for `record_audit_grade_view`), `:3145-3154` (`_REVIEWED_WRITERS` row `RepositoryIdentityAuthority.revoke_role` `identity_roles` `update`, `line=2681`), `:3954` (`_REVIEWED_READ_CONNECTIONS`), `:11023-11040` (`test_audit_access_log_writer_is_exactly_bound_to_its_handle_free_authority`, which asserts `len(live) == len(reviewed) == 1` today)
 - Modify: `tests/unit/web/sessions/test_protocol.py:248-265` (`test_audit_access_log_authority_is_handle_free_and_pins_server_owned_fields`; the new test follows it)
-- Modify: `tests/unit/web/auth/test_identity_admin_routes.py:28` (`from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority`) and `:570-579` (`test_bodies_are_strict`, the file's last test; the new tests are appended after it)
+- Modify: `tests/unit/web/auth/test_identity_admin_routes.py:21` (`from sqlalchemy import Engine, update`), `:28` (`from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority`) and `:570-579` (`test_bodies_are_strict`, the file's last test; the new tests are appended after it)
 - Modify: `CHANGELOG.md:35-38` (the `**Authentication events in signed exports.**` bullet under `## 0.8.1 - 2026-09-10`; the I7 bullet goes after the I8/I3/I4/I5/I6 bullets already there)
 - Test (new): `tests/unit/web/coordination/test_workflow_inspect_authority.py`, `tests/unit/web/coordination/test_workflow_scope_reader.py`, `tests/unit/web/workflow/test_workflow_inspect_routes.py`, `tests/unit/web/workflow/test_workflow_audit_view_routes.py`, `tests/testcontainer/web/test_workflow_inspect_postgres.py`
 
 **Interfaces:**
 - Consumes:
   - I8: `WebSettings.workflow_governance: Literal["off", "on"] = "off"` (read as `settings.workflow_governance == "on"`); fixtures `closed_local_settings(tmp_path) -> WebSettings` (`data_dir=tmp_path`, `auth_provider="local"`, `registration_mode="closed"`, `workflow_governance="on"`, `compartment_id="test-compartment"`) and `closed_local_app(tmp_path, closed_local_settings) -> SyncASGITestClient` in `tests/unit/web/conftest.py` (`get_current_user` overridden to `alice`, `app.state.session_service` a `DualFencedSessionServiceHarness`, `app.state.settings`, `client.app.state.phase3_engine`, and the `AuditAccessLogWriteError` → 500 handler).
-  - I3: the `approvals` open/addressed semantics that `RepositoryApprovalAuthority` writes (`decision IS NULL` = open; `_INBOX` = `approver_identity_id == caller AND decision IS NULL`); the package `src/elspeth/web/sessions/routes/workflow/__init__.py`; `tests/unit/web/workflow/__init__.py`.
+  - I3: the `approvals` open/addressed semantics that `RepositoryApprovalAuthority` writes (`decision IS NULL` = open; `_INBOX` = `approver_identity_id == caller AND decision IS NULL`; `decide` admits only the addressed approver, I3 decision 7); the package `src/elspeth/web/sessions/routes/workflow/__init__.py`; `tests/unit/web/workflow/__init__.py`.
   - I4: `RepositoryReviewAuthority(engine: Engine)` with `attestations_for(*, session_id: str, state_id: str) -> tuple[ReviewAttestationRecord, ...]`; `ReviewAttestationRecord(attestation_id, session_id, state_id, payload_digest, reviewer_identity_id, author_identity_id, attested_at, verdict, note)`; `ReviewAttestationView` (pydantic, the same fields) in `src/elspeth/web/sessions/routes/workflow/reviews.py`; `app.state.review_authority`; the open-request predicate (`cancelled_at IS NULL` and NOT EXISTS an attestation on the pair with `attested_at >= requested_at`; addressed to the reviewer or `reviewer_identity_id IS NULL`).
   - I5: the `app.include_router(create_library_router())` line in `web/app.py` (registration anchor only).
   - I6: ordering only.
-  - HEAD: `RepositoryAuditAccessLogAuthority` and its `_database_now(conn)` (audit_access_log_authority.py:23-36, :39-115); `locked_session_transaction(engine, session_id)` (sessions/locking.py:280); `AuditAccessLogRecord` (sessions/protocol.py:2942-2961); `audit_access_log_table` (models.py:3248-3270), `sessions_table` (:428), `composition_states_table` (:729), `identities_table` (:3328), `identity_roles_table` (:3406), `identity_relationships_table` (:3467), `approvals_table` (:3588), `review_requests_table` (:3701), `review_attestations_table` (:3737); `database_now(conn)` (coordination/database_clock.py:54); identity_authority.py `_IDENTITY_BY_ID` / `_IDENTITY_BY_ID_FOR_UPDATE` (:735-736), `_ROLES_OF_IDENTITY` (:745), `_ACTIVE_INCOMING_EDGES` (:757), `_is_active` (:889), `_active_grants` (:895), `_refuse_role_conflict` (:1075), `_unrevoked_grant_row` (:1044), `_new_role_grant` (:1116), `_role_values` (:1139), `_parsed_kind` (:533), `_require_nonblank` (:266), `_require_optional_text` (:271), `_require_optional_datetime` (:725), `_ensure_utc` and `_database_clock_value` (imported at :63), `AdminAuthorityRequired` (:137), `IdentityNotFound` (:142), `IdentityNotActive` (:167), `RoleAlreadyHeld` (:199), `RoleChanged` (:490), `RoleGrant` (:323), `holds_active_role` (:1285), `list_roles` (:1305); identity_admin_routes.py `_authority` (:322), `_recorder` (:327), `_provider` (:332), `_hidden` (:337), `_actor` (:354), `_refused` (:371), `_uncacheable` (:387), `_role_view` (:289), `_record_role_change` (:766); `get_current_user` (auth/middleware.py); `run_sync_in_worker` (async_workers.py:179); `state_from_record` (sessions/converters.py:29); `SessionServiceProtocol.get_state_in_session(state_id: UUID, session_id: UUID)` (sessions/protocol.py:4620; impl service.py:10346); `generate_public_composition_dict` (composer/yaml_generator.py:696), `generate_public_yaml` (:852); `shareable_reviews.models.CompositionStateResponse` (:185); `LandscapeDB.from_url(url, *, passphrase, create_tables, read_only)` (core/landscape/database.py:1877) and `.read_only_connection()`; `run_attributions_table` (core/landscape/schema.py:522), `runs_table` (:445), `auth_events_table` (:2542); `RecorderFactory(db).run_lifecycle.begin_run(config, canonical_version, *, run_id, initiated_by_user_id, auth_provider_type, openrouter_catalog_sha256, openrouter_catalog_source)` (run_lifecycle_repository.py:293) and `RecorderFactory(db).auth_audit.record_auth_event(*, event_type, outcome, provider, user_id, username, failure_category, request_id, client_host, user_agent, metadata, identity_id=None)` (auth_audit_repository.py:156); `_sqlite_database_file_missing(landscape_url)` (execution/discard_summary.py:242); `AuditIntegrityError` (contracts/errors.py:966); test helpers `engine` (tests/unit/web/conftest.py:63), `_make_session(conn, *, session_id, user_id="test_user", auth_provider_type="local")` (:73), `ensure_test_identity(conn, *, identity_id, provider="local")` (tests/fixtures/identities.py:10), `external_deployment_postgres_url` (tests/testcontainer/web/conftest.py:40), and in test_identity_admin_routes.py `_Harness` (:104), `_build` (:118), `_client` (:161), `_bearer` (:165), `_active` (:187), `harness` (:202-204).
+  - HEAD: `RepositoryAuditAccessLogAuthority` and its `_database_now(conn)` (audit_access_log_authority.py:23-36, :39-115); `locked_session_transaction(engine, session_id)` (sessions/locking.py:280); `AuditAccessLogRecord` (sessions/protocol.py:2942-2961); `audit_access_log_table` (models.py:3248-3270), `sessions_table` (:428), `composition_states_table` (:729), `identities_table` (:3328), `identity_roles_table` (:3406), `identity_relationships_table` (:3467), `approvals_table` (:3588), `review_requests_table` (:3701), `review_attestations_table` (:3737); `database_now(conn)` (coordination/database_clock.py:54); identity_authority.py `_IDENTITY_BY_ID_FOR_UPDATE` (:736), `_ROLES_OF_IDENTITY` (:745), `_ROLE_BY_ID_FOR_UPDATE` (:750), `_RELATIONSHIP_BY_ID_FOR_UPDATE` (:751-755), `_ACTIVE_INCIDENT_EDGES` (:763-773), `_ADMIN_HOLDER_ROWS_FOR_UPDATE` (:797), `_is_active` (:889), `_active_grants` (:895), `_refuse_role_conflict` (:1075), `_unrevoked_grant_row` (:1044), `_new_role_grant` (:1116), `_role_values` (:1139), `_parsed_kind` (:533), `_require_nonblank` (:266), `_require_optional_text` (:271), `_require_optional_datetime` (:725), `_ensure_utc` and `_database_clock_value` (imported at :63), `AdminAuthorityRequired` (:137), `IdentityNotFound` (:142), `IdentityNotActive` (:167), `RoleAlreadyHeld` (:199), `RoleChanged` (:490), `RoleGrant` (:323), `holds_active_role` (:1285), `list_roles` (:1305); identity_admin_routes.py `_authority` (:322), `_recorder` (:327), `_provider` (:332), `_hidden` (:337), `_actor` (:354), `_refused` (:371), `_uncacheable` (:387), `_role_view` (:289), `_record_role_change` (:766); `get_current_user` (auth/middleware.py); `run_sync_in_worker` (async_workers.py:179); `state_from_record` (sessions/converters.py:29); `SessionServiceProtocol.get_state_in_session(state_id: UUID, session_id: UUID)` (sessions/protocol.py:4620; impl service.py:10346); `generate_public_composition_dict` (composer/yaml_generator.py:696), `generate_public_yaml` (:852); `shareable_reviews.models.CompositionStateResponse` (:185); `LandscapeDB.from_url(url, *, passphrase, create_tables, read_only)` (core/landscape/database.py:1877) and `.read_only_connection()`; `run_attributions_table` (core/landscape/schema.py:522), `runs_table` (:445), `auth_events_table` (:2542); `RecorderFactory(db).run_lifecycle.begin_run(config, canonical_version, *, run_id, initiated_by_user_id, auth_provider_type, openrouter_catalog_sha256, openrouter_catalog_source)` (run_lifecycle_repository.py:293) and `RecorderFactory(db).auth_audit.record_auth_event(*, event_type, outcome, provider, user_id, username, failure_category, request_id, client_host, user_agent, metadata, identity_id=None)` (auth_audit_repository.py:156); `_sqlite_database_file_missing(landscape_url)` (execution/discard_summary.py:242); `AuditIntegrityError` (contracts/errors.py:966); test helpers `engine` (tests/unit/web/conftest.py:63), `_make_session(conn, *, session_id, user_id="test_user", auth_provider_type="local")` (:73), `ensure_test_identity(conn, *, identity_id, provider="local")` (tests/fixtures/identities.py:10), `external_deployment_postgres_url` (tests/testcontainer/web/conftest.py:40); for the curator-grant PostgreSQL proofs, `RepositoryIdentityAuthority(engine, *, lifecycle_effect)` (identity_authority.py:1226) with `bootstrap_admin(*, claims, note, quota_tokens_per_day, quota_storage_bytes, record)` (:1995), `grant_role` (:2573), `revoke_role` (:2648), `assert_relationship` (:2695), `revoke_relationship` (:2800), `IdentityAdminActor(identity_id, on_behalf_of, console_request_id)` (:278), `IdentityClaims(provider, subject, username, display_name=None, email=None, organisation_id=None)` (auth/models.py:105), `RepositoryApprovalLifecycleAuthority().apply` (coordination/approval_lifecycle_authority.py:21); and in test_identity_admin_routes.py `_Harness` (:104), `_build` (:118), `_client` (:161), `_bearer` (:165), `_active` (:187), `harness` (:202-204).
 - Produces:
   - `src/elspeth/web/sessions/protocol.py`: `WORKFLOW_INSPECT_WRITER_PRINCIPAL: Literal["workflow_inspect"] = "workflow_inspect"`; `WORKFLOW_INSPECT_REQUEST_PATH_TEMPLATE: str = "/api/workflow/inspect/{session_id}/{state_id}"`; `class WorkflowInspectDenied(RuntimeError)` (not a subclass of `AuditAccessLogWriteError`); `AuditAccessLogAuthority.record_workflow_inspect(self, *, session_id: str, state_id: str, requesting_principal: str, ip_address: str | None) -> AuditAccessLogRecord`.
   - `src/elspeth/web/coordination/audit_access_log_authority.py`: `RepositoryAuditAccessLogAuthority.record_workflow_inspect` with that signature; it raises `WorkflowInspectDenied` with one of the messages `"session is not live"`, `"state is not a composition state of the session"`, `"caller is not an active identity"`, `"no live approval or review request authorises this read"`.
@@ -633,7 +658,8 @@ _CALLER_WORKFLOW_GRANTS: Final = select(identity_roles_table.c.role, identity_ro
     identity_roles_table.c.scope.is_(None),
     identity_roles_table.c.revoked_at.is_(None),
 )
-# The approver arm: the open request the caller's inbox shows (I3's _INBOX).
+# The approver arm: the open request the caller's mailbox inbox shows (I3's
+# _INBOX), addressed to the caller, who is the only approver I3's decide admits.
 _OPEN_APPROVAL_ADDRESSED_TO_CALLER: Final = select(approvals_table.c.approval_id).where(
     approvals_table.c.session_id == bindparam("session_id"),
     approvals_table.c.state_id == bindparam("state_id"),
@@ -1186,7 +1212,8 @@ Expected: `exit=0`.
 
 - [ ] **Step 14: Write the failing delegated-administration route tests.**
 
-In `tests/unit/web/auth/test_identity_admin_routes.py`, extend the identity-authority import at :28 to
+In `tests/unit/web/auth/test_identity_admin_routes.py`, extend the SQLAlchemy import at :21 to
+`from sqlalchemy import Engine, event, update` and the identity-authority import at :28 to
 `from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, RoleGrant`,
 then append after `test_bodies_are_strict` (:570-579, the file's last test):
 
@@ -1365,6 +1392,78 @@ async def test_an_approver_cannot_appoint_themselves(harness: _Harness) -> None:
 
     assert response.status_code == 404, response.text
     assert _curator_grants(harness, bob_id) == []
+
+
+async def test_the_curator_grant_reads_the_clock_once_after_every_identity_read(harness: _Harness) -> None:
+    """LOCK, THEN CLOCK (review B7): one database-clock read, and no identities, identity_roles or identity_relationships read after it."""
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+    seen: list[str] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        seen.append(statement)
+
+    event.listen(harness.engine, "before_cursor_execute", capture)
+    try:
+        grant = harness.authority.grant_curator_as_approver(
+            actor_identity_id=bob_id, identity_id=carol_id, expires_at=None, note=None, record=lambda _event: None
+        )
+    finally:
+        event.remove(harness.engine, "before_cursor_execute", capture)
+
+    assert (grant.role, grant.granted_by_identity_id) == ("curator", bob_id)
+    selects = [(index, statement) for index, statement in enumerate(seen) if statement.lstrip().upper().startswith("SELECT")]
+    clocks = [index for index, statement in selects if "CURRENT_TIMESTAMP" in statement]
+    assert len(clocks) == 1, seen
+    identity_reads = [
+        index
+        for index, statement in selects
+        if any(f"FROM {table}" in statement for table in ("identities", "identity_roles", "identity_relationships"))
+    ]
+    assert identity_reads, seen
+    assert max(identity_reads) < clocks[0], seen
+
+
+async def test_a_revoked_only_admin_row_on_the_curator_target_still_takes_the_population_lock_first(harness: _Harness) -> None:
+    """The population probe reads no revocation: ``_ADMIN_HOLDER_ROWS`` (identity_authority.py:777-786) filters neither ``revoked_at`` nor ``expires_at``.
+
+    So ``disable_identity`` (:2511) and ``revoke_role`` (:2662) lock carol's
+    ``identities`` row through the population first, and the grant must take the
+    population before any ``identities`` row. R8 judges only LIVE grants, so a
+    revoked admin row does not bar the curator grant.
+    """
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        granted = await client.post("/api/auth/admin/roles", headers=root, json={"identity_id": carol_id, "role": "admin"})
+        assert granted.status_code == 201, granted.text
+        revoked = await client.post(f"/api/auth/admin/roles/{granted.json()['role_id']}/revoke", headers=root, json={})
+        assert revoked.status_code == 200, revoked.text
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+    seen: list[str] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        seen.append(statement)
+
+    event.listen(harness.engine, "before_cursor_execute", capture)
+    try:
+        grant = harness.authority.grant_curator_as_approver(
+            actor_identity_id=bob_id, identity_id=carol_id, expires_at=None, note=None, record=lambda _event: None
+        )
+    finally:
+        event.remove(harness.engine, "before_cursor_execute", capture)
+
+    assert (grant.role, grant.granted_by_identity_id) == ("curator", bob_id)
+    population = next((index for index, statement in enumerate(seen) if "FROM identity_roles JOIN identities" in statement), None)
+    assert population is not None, "carol's only admin row is revoked and the grant skipped the population lock"
+    first_identity_row = next(index for index, statement in enumerate(seen) if "FROM identities" in statement and "JOIN" not in statement)
+    assert population < first_identity_row, seen
 ```
 
 `dave` needs no password: `_active` (:187) calls `ensure_identity` directly, and dave never logs in.
@@ -1372,7 +1471,7 @@ async def test_an_approver_cannot_appoint_themselves(harness: _Harness) -> None:
 - [ ] **Step 15: Run the delegated tests to verify they fail.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/web/auth/test_identity_admin_routes.py -n 0 -k "curator or delegated or appoint" > /tmp/i7-lane-delegated-red.log 2>&1; echo exit=$?`
-Expected: `exit=1`. `test_an_approver_appoints_a_curator_over_an_identity_they_oversee` fails `assert 404 == 201` (`_require_identity_admin` hides the route from bob), and the governance-off test fails `assert 404 == 409`. The tests that expect 404 already pass for the wrong reason, which is why the 201 derivations are in the same tests. `test_a_caller_holding_neither_role_sees_404_even_with_a_malformed_body` passes on HEAD and must still pass after Step 17: it goes red (422) if the role check moves into the handler body.
+Expected: `exit=1`. `test_an_approver_appoints_a_curator_over_an_identity_they_oversee` fails `assert 404 == 201` (`_require_identity_admin` hides the route from bob), and the governance-off test fails `assert 404 == 409`. The tests that expect 404 already pass for the wrong reason, which is why the 201 derivations are in the same tests. `test_a_caller_holding_neither_role_sees_404_even_with_a_malformed_body` passes on HEAD and must still pass after Step 17: it goes red (422) if the role check moves into the handler body. `test_the_curator_grant_reads_the_clock_once_after_every_identity_read` and `test_a_revoked_only_admin_row_on_the_curator_target_still_takes_the_population_lock_first` each fail with `AttributeError: 'RepositoryIdentityAuthority' object has no attribute 'grant_curator_as_approver'`.
 
 - [ ] **Step 16: Add `grant_curator_as_approver` to the identity authority.**
 
@@ -1390,36 +1489,109 @@ In `src/elspeth/web/coordination/identity_authority.py`, between `            re
     ) -> RoleGrant:
         """Delegated administration (sso-design.md:1367): an approver appoints a ``curator``.
 
-        The route admits the call, and this transaction arbitrates it. On the
-        rows as they stand now, it proves the actor is an ``active`` identity
-        holding a live deployment-wide ``approver`` grant, and that an ACTIVE
-        ``approver`` edge runs from the actor to the target. It must be a
-        direct edge: the audit view's transitive scope confers no appointment.
-        Anything short of that is ``AdminAuthorityRequired``, which the route
-        hides as 404. It is raised BEFORE the target row is read, so a caller
-        without oversight learns nothing about the target.
-        ``effective_from`` / ``effective_until`` are annotations only
+        The route admits the call, and this transaction arbitrates it. It
+        proves the actor is an ``active`` identity holding a live
+        deployment-wide ``approver`` grant, and that an ACTIVE ``approver`` edge
+        runs from the actor to the target. It must be a direct edge: the audit
+        view's transitive scope confers no appointment. Anything short of that
+        is ``AdminAuthorityRequired``, which the route hides as 404. That is
+        judged BEFORE the target row's existence or state is judged, so a
+        caller without oversight learns nothing about the target from the
+        answer. ``effective_from`` / ``effective_until`` are annotations only
         (sessions/models.py) and are not read. After that, R8, the service-kind
         rule, already-held and the expired-occupant bookkeeping apply exactly
         as ``grant_role`` applies them. There is no console provenance: this arm
         is a human approver acting for themselves.
+
+        LOCK, THEN CLOCK (review B7). Every lock comes first, in the order
+        approval_lifecycle_authority.py:3-8 fixes. Then the database clock is
+        read once. Then every predicate is judged on the locked rows against
+        that clock.
+
+        1. R5's admin population (``_ADMIN_HOLDER_ROWS_FOR_UPDATE``) when either
+           participant holds a deployment-wide ``admin`` row, live or dead. The
+           probe reads no clock and no revocation, the predicate of
+           ``_ADMIN_HOLDER_ROWS``, so an expired or revoked row still takes the
+           lock: an unneeded lock only waits, a skipped one can deadlock a
+           concurrent disable or revoke that locked this participant's row
+           through the population.
+        2. Both ``identities`` rows ``FOR UPDATE``, stable id order. This
+           serialises ``disable_identity`` of either participant and
+           ``grant_role`` onto either.
+        3. By id, ``_ROLE_BY_ID_FOR_UPDATE``: the actor's unrevoked unscoped
+           ``approver`` rows and the target's unrevoked unscoped ``curator``
+           rows, in the same identity order, discovered AFTER step 2 so a grant
+           written during that wait is seen. ``revoke_role`` locks the same row.
+           Either it commits first, and the lock returns the row with
+           ``revoked_at`` set, or it waits for this transaction.
+        4. By id, ``_RELATIONSHIP_BY_ID_FOR_UPDATE``: the actor-to-target
+           ``approver`` edge. ``revoke_relationship`` locks the same row, with the
+           same two outcomes.
+        5. The clock, read once. A ``clock_timestamp()`` read after the last
+           lock is later than the commit of everything this transaction waited
+           on, so a grant or edge that expired during a wait is judged expired.
         """
         _require_nonblank(actor_identity_id, "actor_identity_id")
         _require_nonblank(identity_id, "identity_id")
         _require_optional_text(note, "note")
         _require_optional_datetime(expires_at, "expires_at")
+        participants = tuple(sorted({actor_identity_id, identity_id}))
         with self._engine.begin() as conn:
+            # (1) R5's population first, decided without a clock or a revocation
+            # filter: the unscoped admin rows _ADMIN_HOLDER_ROWS locks, live or dead.
+            # A plain loop, not ``any(... for ...)``: the mutation-authority scanner
+            # refuses a connection captured by a comprehension or generator
+            # (test_session_db_mutation_authority.py ``_NESTED_SCOPES``).
+            admin_row_holder = False
+            for participant in participants:
+                for candidate in conn.execute(_ROLES_OF_IDENTITY, {"identity_id": participant}).all():
+                    if candidate.role == "admin" and candidate.scope is None:
+                        admin_row_holder = True
+            if admin_row_holder:
+                conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
+            # (2) Both identities rows, stable id order.
+            identity_rows: dict[str, Any] = {}
+            for participant in participants:
+                identity_rows[participant] = conn.execute(_IDENTITY_BY_ID_FOR_UPDATE, {"identity_id": participant}).one_or_none()
+            # (3) The grant rows a predicate reads, locked by id, same identity order.
+            target_role_rows: list[Any] = []
+            locked_approver_rows: list[Any] = []
+            locked_curator_rows: list[Any] = []
+            for participant in participants:
+                role_rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": participant}).all()
+                if participant == identity_id:
+                    target_role_rows = list(role_rows)
+                for candidate in role_rows:
+                    if candidate.scope is not None or candidate.revoked_at is not None:
+                        continue
+                    if participant == actor_identity_id and candidate.role == "approver":
+                        destination = locked_approver_rows
+                    elif participant == identity_id and candidate.role == "curator":
+                        destination = locked_curator_rows
+                    else:
+                        continue
+                    locked = conn.execute(_ROLE_BY_ID_FOR_UPDATE, {"role_id": candidate.role_id}).one_or_none()
+                    if locked is not None:
+                        destination.append(locked)
+            # (4) The actor-to-target approver edge, locked by id.
+            locked_edges: list[Any] = []
+            for candidate in conn.execute(_ACTIVE_INCIDENT_EDGES, {"identity_id": identity_id}).all():
+                if (candidate.from_identity_id, candidate.to_identity_id, candidate.relationship_type) != (actor_identity_id, identity_id, "approver"):
+                    continue
+                locked_edge = conn.execute(_RELATIONSHIP_BY_ID_FOR_UPDATE, {"relationship_id": candidate.relationship_id}).one_or_none()
+                if locked_edge is not None:
+                    locked_edges.append(locked_edge)
+            # (5) The clock, once, after the last lock.
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
-            actor_row = conn.execute(_IDENTITY_BY_ID, {"identity_id": actor_identity_id}).one_or_none()
+            # (6) Every predicate, on the locked rows, against that clock.
+            actor_row = identity_rows[actor_identity_id]
             if actor_row is None or actor_row.access_state != "active":
                 raise AdminAuthorityRequired()
-            actor_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": actor_identity_id}).all(), now)
-            if not any(grant.role == "approver" and grant.scope is None for grant in actor_grants):
+            if not any(_is_active(grant.expires_at, grant.revoked_at, now) for grant in locked_approver_rows):
                 raise AdminAuthorityRequired()
-            overseers = conn.execute(_ACTIVE_INCOMING_EDGES, {"to_identity_id": identity_id, "relationship_type": "approver"}).scalars().all()
-            if actor_identity_id not in overseers:
+            if not any(edge.revoked_at is None for edge in locked_edges):
                 raise AdminAuthorityRequired()
-            row = conn.execute(_IDENTITY_BY_ID_FOR_UPDATE, {"identity_id": identity_id}).one_or_none()
+            row = identity_rows[identity_id]
             if row is None:
                 raise IdentityNotFound()
             if row.access_state != "active":
@@ -1427,9 +1599,8 @@ In `src/elspeth/web/coordination/identity_authority.py`, between `            re
             if expires_at is not None and _ensure_utc(expires_at) <= now:
                 raise ValueError("expires_at must be in the future")
             kind = _parsed_kind(row.kind, identity_id=identity_id)
-            role_rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
-            _refuse_role_conflict(kind=kind, role="curator", held=_active_grants(role_rows, now))
-            occupant = _unrevoked_grant_row(role_rows, role="curator", scope=None)
+            _refuse_role_conflict(kind=kind, role="curator", held=_active_grants(target_role_rows, now))
+            occupant = _unrevoked_grant_row(locked_curator_rows, role="curator", scope=None)
             if occupant is not None:
                 if _is_active(occupant.expires_at, occupant.revoked_at, now):
                     raise RoleAlreadyHeld()
@@ -1456,6 +1627,29 @@ In `src/elspeth/web/coordination/identity_authority.py`, between `            re
             )
             return grant
 ```
+
+The lock order adds one cycle with the HEAD identity mutations, and it is
+HEAD's argument-order locking in `assert_relationship`, described at the end
+of this paragraph. Against the others it adds none.
+`revoke_role` and `disable_identity` take the admin population first
+(identity_authority.py:2662, :2511); this method takes it first or not at
+all, and it takes it whenever either participant has any unscoped admin row,
+revoked or expired included, because those are the rows HEAD's population
+statement locks (:777-786). `disable_identity` and `grant_role` lock an `identities` row before any
+role or edge row they write (:2517 before :2541; :2595 before :2625); this
+method locks both `identities` rows before any role or edge row.
+`revoke_role` and `revoke_relationship` hold one role or edge row (:2666,
+:2816) and take nothing after it. The one cycle: `assert_relationship` locks
+its two `identities` rows in argument order (:2731-2732), not id order, and
+this method now locks two `identities` rows in id order. So
+`assert_relationship(from=carol, to=bob)` racing this grant for bob over carol
+can deadlock, and PostgreSQL aborts one of the two with `40P01`. The unlocked
+population probe also leaves a window. If `grant_role(x, admin)` commits for a
+participant x between the probe and the `identities` locks, this method runs
+without the population lock, and a concurrent `disable_identity` or
+`revoke_role` can then close a cycle the same way. Both failures are
+detected aborts, and neither breaks an invariant. Step 29 proves the
+serialisation this order buys.
 
 - [ ] **Step 17: Route `POST /roles` through both arms.**
 
@@ -2364,9 +2558,9 @@ Expected: `exit=0` and `1 xfailed`. The reason text lists, one `describe()` line
 `src/elspeth/web/coordination/audit_access_log_authority.py:<line> RepositoryAuditAccessLogAuthority.record_workflow_inspect insert audit_access_log`;
 `src/elspeth/web/coordination/identity_authority.py:<line> RepositoryIdentityAuthority.grant_curator_as_approver insert identity_roles`, the same symbol with `update identity_roles`, and the same symbol with `write_connection <sessions-write-connection>`;
 `src/elspeth/web/coordination/workflow_scope_reader.py:<line> RepositoryWorkflowScopeReader.read_audit_scope write_connection <sessions-write-connection>` under "Connections outside exact contained authority".
-An `Unresolved write executions` count above zero means an execute on a contained connection is not a module-level statement the scanner resolves. Fix the module, not the manifest.
+The `Unresolved write executions` section already lists I1 Step 15's baseline lines plus the `RepositoryReviewAuthority._lock_then_read_clock` line I4 Step 9 leaves; a line in it naming `audit_access_log_authority.py`, `workflow_scope_reader.py` or `grant_curator_as_approver` means an execute on a contained connection is not a module-level statement the scanner resolves. Fix the module, not the manifest.
 
-The log will ALSO list existing rows under `Stale reviewed`, each with its twin under `Unexpected/unreviewed`: `line` is part of the identity key (`_identity_key`, :10512-10523), so every reviewed row below an insert point in the same file moves. That means the `record_audit_grade_view` row (`line=102`), because Step 8 lengthens the module head above it, and every `RepositoryIdentityAuthority` row whose `line=` is greater than 2646 in `identity_authority.py` (`revoke_role`, `assert_relationship`, `revoke_relationship`, `purge_stale_pending_identities` and the rest). For each such pair, update only the `line=` value from the log. The fingerprint must be unchanged; if it differs, you edited that method, so revert the edit.
+The log will ALSO list existing rows under `Stale reviewed`, each with its twin under `Unexpected/unreviewed`: `line` is part of the identity key (`_identity_key`, :10512-10523), so every reviewed row below an insert point in the same file moves. That means the `record_audit_grade_view` row (`line=102`), because Step 8 lengthens the module head above it, and every `RepositoryIdentityAuthority` row whose `line=` lies below the end of `grant_role` in `identity_authority.py` (HEAD :2646, but :2659 once I3's 13-line `lock_admin_population` insert has landed: read the boundary from the file, not from this number) (`revoke_role`, `assert_relationship`, `revoke_relationship`, `purge_stale_pending_identities` and the rest). For each such pair, update only the `line=` value from the log. The fingerprint must be unchanged; if it differs, you edited that method, so revert the edit.
 
 Measured on HEAD: neither `_REVIEWED_NON_SESSION_CONNECTIONS` (:4663) nor `test_web_landscape_mutation_fencing.py` names `sessions/routes/runs.py` or `execution/accounting.py`, the two web modules that already open the Landscape with `read_only=True`, so a read-only Landscape open in a web module is not inventoried today. If the drift log nevertheless lists `src/elspeth/web/sessions/routes/workflow/audit_view.py:<line> _read_landscape_half write_connection <non-session-write-connection>`, add that row to `_REVIEWED_NON_SESSION_CONNECTIONS` in the shape of its `RunLifecycleRepository.begin_run` row (:4666-4676), copying `fingerprint`, `line` and `connection_escape` from the log, and raise the count pin `assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 56` (:18037) to 57 in the same edit.
 
@@ -2497,31 +2691,60 @@ def test_audit_access_log_writer_is_exactly_bound_to_its_handle_free_authority()
 Never widen a `TablePolicy`: `audit_access_log` → `AuditAccessLogAuthority` (:122) and `identity_roles` → `IdentityAuthority` (:112) already name these owners. `test_named_authority_registry_is_explicit_extensible_and_exact` (:10938-11021) pins no count of `_NAMED_AUTHORITY_SYMBOLS`; its last assertion only requires every bound authority to appear in `_TABLE_POLICIES`, which both new bindings satisfy.
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py -n 0 -v -rx > /tmp/i7-lane-manifest-green.log 2>&1; echo exit=$?`
-Expected: `exit=0`, and the short summary lists no `XFAIL test_all_production_sessions_writers_are_reviewed_typed_authorities`. Control the instrument: change one character of the `record_workflow_inspect` fingerprint and re-run the gate id with `-rx`. Confirm `1 xfailed` returns with `Stale reviewed (1)` naming that row, then restore the character and re-run to `exit=0`.
+Expected: `exit=0`, no `failed`, and exactly `1 xfailed`, `test_all_production_sessions_writers_are_reviewed_typed_authorities`: the gate already XFAILs on a clean HEAD (measured 2026-09-15 on a `git archive` export of 46219b2b7, `1 xfailed in 100.99s`, with I1 Step 15's baseline counts), so this task cannot bring it to a pass. Read the XFAIL text instead. No section may name a site this task adds or moves.
+
+Run: `grep -c 'record_workflow_inspect\|read_audit_scope\|grant_curator_as_approver' /tmp/i7-lane-manifest-green.log; grep -c 'Stale reviewed (0):' /tmp/i7-lane-manifest-green.log; grep -c 'Stale reviewed read connections (0):' /tmp/i7-lane-manifest-green.log`
+Expected: `0`, then at least `1`, then at least `1`. The first count proves every new writer, write connection and read connection is reviewed. The other two prove every line-only re-pin above was applied, because a missed one prints as a `Stale reviewed` row.
+Control the instrument: change one character of the `record_workflow_inspect` fingerprint and re-run the gate id with `-rx` to `/tmp/i7-lane-manifest-control.log`. Confirm the log shows `Stale reviewed (1):` naming that row, and that `grep -c 'record_workflow_inspect' /tmp/i7-lane-manifest-control.log` prints at least `1`. Then restore the character, re-run the green command, and confirm the three counts above return to `0`, at least `1`, at least `1`.
 
 - [ ] **Step 29: Run the PostgreSQL proofs.**
 
 Create `tests/testcontainer/web/test_workflow_inspect_postgres.py`:
 
 ```python
-"""PostgreSQL proofs for I7's workflow_inspect writer and audit-scope reader.
+"""PostgreSQL proofs for I7's workflow_inspect writer, audit-scope reader and delegated curator grant.
 
 SQLite drops FOR UPDATE and serialises writers. These prove, on the dialect
 production runs, the session-row lock path, the correlated NOT EXISTS over
-timestamptz, the expanding IN, and the closed writer_principal CHECK.
+timestamptz, the expanding IN, and the closed writer_principal CHECK. They also
+prove that ``grant_curator_as_approver`` follows LOCK, THEN CLOCK (review B7):
+an approver grant that expires, or an edge revoked, while the grant waits on a
+participant lock is refused, and ``revoke_role`` / ``revoke_relationship`` on
+the authorising grant or edge wait for a grant in flight instead of committing
+under it. A target whose only admin row is REVOKED still takes the admin
+population lock first, the rows ``_ADMIN_HOLDER_ROWS`` locks, so a concurrent
+``disable_identity`` of the actor cannot close a ``40P01`` cycle with the grant.
+A holder transaction or the grant's own ``record`` callback (after its
+insert, before its COMMIT) is the pause; ``pg_stat_activity`` is the witness.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Event
+from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Engine, insert, select
-from sqlalchemy.engine import make_url
+from sqlalchemy import Engine, func, insert, select, text, update
+from sqlalchemy.engine import Connection, make_url
+from sqlalchemy.exc import DBAPIError
 
+from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+from elspeth.web.coordination.identity_authority import (
+    _ADMIN_HOLDER_ROWS_FOR_UPDATE,
+    AdminAuthorityRequired,
+    IdentityAdminActor,
+    RepositoryIdentityAuthority,
+    RoleChanged,
+    RoleGrant,
+)
 from elspeth.web.coordination.workflow_scope_reader import RepositoryWorkflowScopeReader
 from elspeth.web.sessions import models
 from elspeth.web.sessions.engine import create_session_engine
@@ -2530,6 +2753,9 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
 
 pytestmark = pytest.mark.testcontainer
+
+_DEADLINE_SECONDS = 30.0
+_POLL_SECONDS = 0.01
 
 T0 = datetime(2026, 9, 14, 9, 0, tzinfo=UTC)
 SESSION = "11111111-1111-4111-8111-111111111111"
@@ -2657,10 +2883,334 @@ def test_the_audit_scope_reader_walks_a_seeded_cycle_on_postgres(workflow_engine
 
     assert scope.identity_ids == ("carol", "dave")
     assert [row.approval_id for row in scope.approvals] == ["ap-dave"]
+
+
+# ── delegated curator grant: LOCK, THEN CLOCK (review B7) ─────────────────
+
+
+@pytest.fixture
+def curator_engine(external_deployment_postgres_url: str) -> Iterator[Engine]:
+    database = f"curator_grant_{uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+    engine = create_session_engine(make_url(external_deployment_postgres_url).set(database=database).render_as_string(hide_password=False))
+    try:
+        initialize_session_schema(engine)
+        yield engine
+    finally:
+        engine.dispose()
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        control.dispose()
+
+
+@dataclass(frozen=True)
+class _Oversight:
+    identities: RepositoryIdentityAuthority
+    root: IdentityAdminActor
+    approver_role_id: str
+    edge_id: str
+
+
+def _noop(*_args: object) -> None:
+    return None
+
+
+def _oversight(engine: Engine) -> _Oversight:
+    """root bootstraps; bob holds approver and an ACTIVE approver edge to carol. Every write goes through the real authority."""
+    identities = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+    bootstrapped = identities.bootstrap_admin(
+        claims=IdentityClaims(provider="local", subject="root", username="root"),
+        note="first admin",
+        quota_tokens_per_day=None,
+        quota_storage_bytes=None,
+        record=_noop,
+    )
+    with engine.begin() as conn:
+        for identity_id in ("bob", "carol"):
+            ensure_test_identity(conn, identity_id=identity_id)
+    root = IdentityAdminActor(identity_id=bootstrapped.record.identity_id, on_behalf_of=None, console_request_id=None)
+    approver = identities.grant_role(actor=root, identity_id="bob", role="approver", scope=None, expires_at=None, note=None, record=_noop)
+    edge = identities.assert_relationship(
+        actor=root,
+        from_identity_id="bob",
+        to_identity_id="carol",
+        relationship_type="approver",
+        effective_from=None,
+        effective_until=None,
+        note=None,
+        record=_noop,
+    )
+    return _Oversight(identities=identities, root=root, approver_role_id=approver.role_id, edge_id=edge.relationship_id)
+
+
+def _sibling(engine: Engine) -> Engine:
+    """A second engine on the same database, with its own pool, so a holder never borrows the call's connection."""
+    return create_session_engine(engine.url.render_as_string(hide_password=False))
+
+
+def _backend_pid(conn: Connection) -> int:
+    return int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+
+
+def _lock_wait_seen(observer: Engine, waiter: Future[Any], *, blocker_pid: int | None = None, relation: str | None = None) -> bool:
+    """True once a backend is in a ``Lock`` wait (blocked by ``blocker_pid``, or running a query naming ``relation``); False if ``waiter`` finished first."""
+    if (blocker_pid is None) == (relation is None):
+        raise ValueError("name exactly one of blocker_pid and relation")
+    if blocker_pid is not None:
+        probe = text(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND CAST(:blocker AS integer) = ANY(pg_blocking_pids(pid))"
+        ).bindparams(blocker=blocker_pid)
+    else:
+        probe = text(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query ILIKE :pattern AND pid <> pg_backend_pid() AND datname = current_database()"
+        ).bindparams(pattern=f"%{relation}%")
+    deadline = time.monotonic() + _DEADLINE_SECONDS
+    while time.monotonic() < deadline:
+        if waiter.done():
+            return False
+        # A fresh connection per poll: pg_stat_activity is snapshotted once per transaction.
+        with observer.connect() as conn:
+            if int(conn.execute(probe).scalar_one()) >= 1:
+                return True
+        time.sleep(_POLL_SECONDS)
+    raise AssertionError("the call neither finished nor entered a lock wait")
+
+
+def _appoint(identities: RepositoryIdentityAuthority) -> str:
+    try:
+        identities.grant_curator_as_approver(actor_identity_id="bob", identity_id="carol", expires_at=None, note=None, record=_noop)
+    except AdminAuthorityRequired:
+        return "refused"
+    return "granted"
+
+
+def _curator_rows(engine: Engine) -> list[str]:
+    with engine.connect() as conn:
+        rows = conn.execute(select(models.identity_roles_table).where(models.identity_roles_table.c.role == "curator")).all()
+    return [row.role_id for row in rows]
+
+
+def _change_while_the_grant_waits(engine: Engine, oversight: _Oversight, change: Callable[[Connection], None]) -> str:
+    """Hold carol's identities row, start the grant, and once it waits on that row commit ``change``, then release."""
+    holder_engine, observer = _sibling(engine), _sibling(engine)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool, holder_engine.connect() as holder:
+            with holder.begin():
+                holder.execute(
+                    select(models.identities_table.c.identity_id).where(models.identities_table.c.identity_id == "carol").with_for_update()
+                ).one()
+                holder_pid = _backend_pid(holder)
+                attempt = pool.submit(_appoint, oversight.identities)
+                assert _lock_wait_seen(observer, attempt, blocker_pid=holder_pid) is True, "the grant never waited on carol's row"
+                with engine.begin() as conn:
+                    change(conn)
+            return attempt.result(timeout=_DEADLINE_SECONDS)
+    finally:
+        holder_engine.dispose()
+        observer.dispose()
+
+
+def _revoke_during_a_paused_grant(
+    engine: Engine, oversight: _Oversight, relation: str, revoke: Callable[[RepositoryIdentityAuthority], object]
+) -> tuple[bool, RoleGrant]:
+    """Pause the grant in its audit callback (after its writes, before COMMIT), run ``revoke`` on a second engine, and report whether it waited on a lock."""
+    revoker_engine, observer = _sibling(engine), _sibling(engine)
+    revoker = RepositoryIdentityAuthority(revoker_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+    arrived, release = Event(), Event()
+
+    def pause(_event: RoleChanged) -> None:
+        arrived.set()
+        if not release.wait(timeout=_DEADLINE_SECONDS):
+            raise AssertionError("the test never released the paused grant")
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            grant = pool.submit(
+                oversight.identities.grant_curator_as_approver,
+                actor_identity_id="bob",
+                identity_id="carol",
+                expires_at=None,
+                note=None,
+                record=pause,
+            )
+            assert arrived.wait(timeout=_DEADLINE_SECONDS), "the grant never reached its audit callback"
+            revocation = pool.submit(revoke, revoker)
+            try:
+                waited = _lock_wait_seen(observer, revocation, relation=relation)
+            finally:
+                release.set()
+            granted = grant.result(timeout=_DEADLINE_SECONDS)
+            revocation.result(timeout=_DEADLINE_SECONDS)
+    finally:
+        revoker_engine.dispose()
+        observer.dispose()
+    return waited, granted
+
+
+def test_an_approver_grant_that_expires_while_the_curator_grant_waits_is_refused(curator_engine: Engine) -> None:
+    oversight = _oversight(curator_engine)
+
+    def expire(conn: Connection) -> None:
+        conn.execute(
+            update(models.identity_roles_table)
+            .where(models.identity_roles_table.c.role_id == oversight.approver_role_id)
+            .values(expires_at=func.clock_timestamp())
+        )
+
+    assert _change_while_the_grant_waits(curator_engine, oversight, expire) == "refused"
+    assert _curator_rows(curator_engine) == []
+
+
+def test_an_edge_revoked_while_the_curator_grant_waits_is_refused(curator_engine: Engine) -> None:
+    oversight = _oversight(curator_engine)
+
+    def revoke(conn: Connection) -> None:
+        conn.execute(
+            update(models.identity_relationships_table)
+            .where(models.identity_relationships_table.c.relationship_id == oversight.edge_id)
+            .values(revoked_at=func.clock_timestamp(), revoked_by_identity_id=oversight.root.identity_id)
+        )
+
+    assert _change_while_the_grant_waits(curator_engine, oversight, revoke) == "refused"
+    assert _curator_rows(curator_engine) == []
+
+
+def test_revoke_role_on_the_authorising_approver_grant_waits_for_the_curator_grant(curator_engine: Engine) -> None:
+    oversight = _oversight(curator_engine)
+
+    def revoke(revoker: RepositoryIdentityAuthority) -> object:
+        return revoker.revoke_role(actor=oversight.root, role_id=oversight.approver_role_id, note=None, record=_noop)
+
+    waited, granted = _revoke_during_a_paused_grant(curator_engine, oversight, "identity_roles", revoke)
+    assert waited is True, "revoke_role committed while the curator grant that read bob's approver grant was still open"
+    assert (granted.role, granted.granted_by_identity_id) == ("curator", "bob")
+    assert oversight.identities.holds_active_role(identity_id="bob", role="approver") is False
+
+
+def test_revoke_relationship_on_the_authorising_edge_waits_for_the_curator_grant(curator_engine: Engine) -> None:
+    oversight = _oversight(curator_engine)
+
+    def revoke(revoker: RepositoryIdentityAuthority) -> object:
+        return revoker.revoke_relationship(actor=oversight.root, relationship_id=oversight.edge_id, note=None, record=_noop)
+
+    waited, granted = _revoke_during_a_paused_grant(curator_engine, oversight, "identity_relationships", revoke)
+    assert waited is True, "revoke_relationship committed while the curator grant that read the bob-to-carol edge was still open"
+    assert (granted.role, granted.granted_by_identity_id) == ("curator", "bob")
+    with curator_engine.connect() as conn:
+        edge = conn.execute(
+            select(models.identity_relationships_table).where(models.identity_relationships_table.c.relationship_id == oversight.edge_id)
+        ).one()
+    assert edge.revoked_at is not None
+
+
+def _appoint_unless_deadlocked(identities: RepositoryIdentityAuthority) -> str:
+    try:
+        identities.grant_curator_as_approver(actor_identity_id="bob", identity_id="carol", expires_at=None, note=None, record=_noop)
+    except DBAPIError as exc:
+        if "deadlock detected" in str(exc):
+            return "deadlock"
+        raise
+    return "granted"
+
+
+def test_a_target_whose_only_admin_row_is_revoked_takes_the_population_lock_before_any_identities_row(curator_engine: Engine) -> None:
+    """``_ADMIN_HOLDER_ROWS`` (identity_authority.py:777-786) filters no revocation, so its lock covers carol's row.
+
+    The holder stands in for ``disable_identity(bob)``: the population lock
+    first (:2511), which locks carol's ``identities`` row through the join, then
+    bob's row, its target (:2517). A grant that skipped the population for carol
+    would hold bob's row (ids sort ``bob`` < ``carol``) while it waits for
+    carol's, and the holder's lock on bob would close a cycle PostgreSQL aborts
+    with ``40P01``. Probing carol's revoked row sends the grant to wait on the
+    population instead, holding nothing the holder needs.
+    """
+    oversight = _oversight(curator_engine)
+    admin = oversight.identities.grant_role(
+        actor=oversight.root, identity_id="carol", role="admin", scope=None, expires_at=None, note=None, record=_noop
+    )
+    oversight.identities.revoke_role(actor=oversight.root, role_id=admin.role_id, note=None, record=_noop)
+    holder_engine, observer = _sibling(curator_engine), _sibling(curator_engine)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool, holder_engine.connect() as holder:
+            with holder.begin():
+                population = {row.identity_id for row in holder.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()}
+                assert "carol" in population, population
+                holder_pid = _backend_pid(holder)
+                attempt = pool.submit(_appoint_unless_deadlocked, oversight.identities)
+                assert _lock_wait_seen(observer, attempt, blocker_pid=holder_pid) is True, "the grant never waited on the population holder"
+                try:
+                    holder.execute(
+                        select(models.identities_table.c.identity_id).where(models.identities_table.c.identity_id == "bob").with_for_update()
+                    ).one()
+                except DBAPIError as exc:
+                    raise AssertionError(f"the grant locked bob's row before the population: {exc}") from exc
+            outcome = attempt.result(timeout=_DEADLINE_SECONDS)
+    finally:
+        holder_engine.dispose()
+        observer.dispose()
+    assert outcome == "granted"
+    assert len(_curator_rows(curator_engine)) == 1
 ```
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_workflow_inspect_postgres.py tests/testcontainer/web/test_identity_owner_schema_postgres.py tests/testcontainer/web/test_session_derived_mutations_postgres.py -m testcontainer -n 0 > /tmp/i7-lane-pg.log 2>&1; echo exit=$?`
 Expected: `exit=0` (needs Docker). Without `-m testcontainer` the selection is empty and pytest exits 5. The two existing files are the PostgreSQL suites that already import `RepositoryAuditAccessLogAuthority`. They must stay green after the import and constant additions to its module.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_workflow_inspect_postgres.py -m testcontainer -n 0 > /tmp/i7-lane-pg-curator.log 2>&1; echo exit=$?`
+Expected: `exit=0`, `8 passed`.
+
+Control the instrument: each curator-grant proof must go red when the property it names is removed. Make each mutant with the Edit tool inside `grant_curator_as_approver` in `src/elspeth/web/coordination/identity_authority.py`, run it, then undo it exactly.
+
+Mutant A (clock before the locks): delete the line `            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())` under `# (5) The clock, once, after the last lock.` and insert the same line directly after that method's `        with self._engine.begin() as conn:`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest "tests/unit/web/auth/test_identity_admin_routes.py::test_the_curator_grant_reads_the_clock_once_after_every_identity_read" -n 0 > /tmp/i7-lane-mutant-clock-unit.log 2>&1; echo exit=$?`
+Expected: `exit=1`, `1 failed`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_workflow_inspect_postgres.py -m testcontainer -n 0 > /tmp/i7-lane-mutant-clock-pg.log 2>&1; echo exit=$?`
+Expected: `exit=1`, `1 failed, 7 passed`, and the failure is exactly `test_an_approver_grant_that_expires_while_the_curator_grant_waits_is_refused` (`assert 'granted' == 'refused'`). Undo the edit.
+
+Mutant B (role rows read without a lock): replace `locked = conn.execute(_ROLE_BY_ID_FOR_UPDATE, {"role_id": candidate.role_id}).one_or_none()` with `locked = candidate`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_workflow_inspect_postgres.py -m testcontainer -n 0 > /tmp/i7-lane-mutant-role-pg.log 2>&1; echo exit=$?`
+Expected: `exit=1`, `1 failed, 7 passed`, and the failure is exactly `test_revoke_role_on_the_authorising_approver_grant_waits_for_the_curator_grant` (`revoke_role committed while the curator grant that read bob's approver grant was still open`). Undo the edit.
+
+Mutant C (edge read without a lock): replace `locked_edge = conn.execute(_RELATIONSHIP_BY_ID_FOR_UPDATE, {"relationship_id": candidate.relationship_id}).one_or_none()` with `locked_edge = candidate`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && grep -c "locked = candidate\|locked_edge = candidate" src/elspeth/web/coordination/identity_authority.py; echo exit=$?`
+Expected: `1` and `exit=0`: the grep sees the mutant, which is its positive control.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_workflow_inspect_postgres.py -m testcontainer -n 0 > /tmp/i7-lane-mutant-edge-pg.log 2>&1; echo exit=$?`
+Expected: `exit=1`, `1 failed, 7 passed`, and the failure is exactly `test_revoke_relationship_on_the_authorising_edge_waits_for_the_curator_grant` (`revoke_relationship committed while the curator grant that read the bob-to-carol edge was still open`). Undo the edit.
+
+Mutant D (the probe skips revoked admin rows): replace `                    if candidate.role == "admin" and candidate.scope is None:` with `                    if candidate.role == "admin" and candidate.scope is None and candidate.revoked_at is None:  # mutant D`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && grep -c "# mutant D$" src/elspeth/web/coordination/identity_authority.py; echo exit=$?`
+Expected: `1` and `exit=0`: the grep sees the mutant, which is its positive control.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest "tests/unit/web/auth/test_identity_admin_routes.py::test_a_revoked_only_admin_row_on_the_curator_target_still_takes_the_population_lock_first" -n 0 > /tmp/i7-lane-mutant-probe-unit.log 2>&1; echo exit=$?`
+Expected: `exit=1`, `1 failed`, with `carol's only admin row is revoked and the grant skipped the population lock`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_workflow_inspect_postgres.py -m testcontainer -n 0 > /tmp/i7-lane-mutant-probe-pg.log 2>&1; echo exit=$?`
+Expected: `exit=1`, `1 failed, 7 passed`, and the failure is exactly `test_a_target_whose_only_admin_row_is_revoked_takes_the_population_lock_before_any_identities_row`. PostgreSQL picks which transaction to abort, so it fails either as `assert 'deadlock' == 'granted'` or as `the grant locked bob's row before the population`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && grep -c "deadlock" /tmp/i7-lane-mutant-probe-pg.log; echo exit=$?`
+Expected: a count of at least `1` and `exit=0`. Undo the edit.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && grep -c "locked = candidate\|locked_edge = candidate\|# mutant D$" src/elspeth/web/coordination/identity_authority.py; echo exit=$?`
+Expected: `0` and `exit=1`: Mutants B, C and D are undone.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/web/auth/test_identity_admin_routes.py -n 0 > /tmp/i7-lane-delegated-regreen.log 2>&1; echo exit=$?`
+Expected: `exit=0`. This proves Mutant A is undone: `test_the_curator_grant_reads_the_clock_once_after_every_identity_read` passes again.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_workflow_inspect_postgres.py -m testcontainer -n 0 > /tmp/i7-lane-pg-curator-regreen.log 2>&1; echo exit=$?`
+Expected: `exit=0`, `8 passed`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py -n 0 -v -rx > /tmp/i7-lane-manifest-regreen.log 2>&1; echo exit=$?`
+Expected: `exit=0`, no `failed`, and exactly `1 xfailed`, `test_all_production_sessions_writers_are_reviewed_typed_authorities`: the gate XFAILs on a clean HEAD (Step 28), so a pass is not the signal. Read the XFAIL text.
+
+Run: `grep -c 'grant_curator_as_approver' /tmp/i7-lane-manifest-regreen.log; grep -c 'Stale reviewed (0):' /tmp/i7-lane-manifest-regreen.log`
+Expected: `0`, then at least `1`. The reviewed writer fingerprints are taken from `grant_curator_as_approver` as written, so a mutant left in that method re-fingerprints its rows: they print under `Stale reviewed` and `Unexpected/unreviewed`, and the first count is no longer `0`.
 
 - [ ] **Step 30: Run the neighbouring whole-tree gates, lint, type-check and the corpus diff.**
 

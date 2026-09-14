@@ -9,7 +9,7 @@
 - Modify: `src/elspeth/web/sessions/routes/composer/state.py:805-917` (`import_state_yaml`: decorator :805, `def` :809, `finally: await lease.close()` :916-917; extract its body into `seed_state_from_runtime_yaml` so the fork route re-imports through the same validators)
 - Modify: `src/elspeth/web/auth/audit.py:238-252` (`AuthAuditWriter.record_relationship_changed`, the Protocol's last method) and `:268-287` (`AuthAuditOperation`, last member `RELATIONSHIP_CHANGED` at :287) and `:1140-1183` (`AuthAuditRecorder.record_relationship_changed`, the recorder's last method): five new writers `record_library_published` / `_accepted` / `_rejected` / `_deprecated` / `_recalled`
 - Modify: `src/elspeth/web/app.py:640` (`app.state.payload_store = payload_store`, inside `_service_lifespan` :527 — the store does not exist in `_create_app`, so the library authority is built here, not beside `identity_authority` at :1522) and `:1791` (`app.include_router(create_shareable_reviews_router())`, the last registration)
-- Modify: `tests/unit/architecture/test_session_db_mutation_authority.py:262-908` (`_NAMED_AUTHORITY_SYMBOLS`), `:914-1197` (`_CONTAINED_CONNECTION_AUTHORITIES`), `:1198` (`_REVIEWED_WRITERS`), `:3954` (`_REVIEWED_READ_CONNECTIONS`)
+- Modify: `tests/unit/architecture/test_session_db_mutation_authority.py:262-908` (`_NAMED_AUTHORITY_SYMBOLS`), `:914-1193` (`_CONTAINED_CONNECTION_AUTHORITIES`), `:1198` (`_REVIEWED_WRITERS`), `:3954` (`_REVIEWED_READ_CONNECTIONS`)
 - Test: `tests/unit/web/coordination/test_library_authority.py` (new), `tests/unit/web/composer/test_yaml_generator.py` (append two tests), `tests/unit/web/auth/test_audit.py` (append one test; helpers `_durable_recorder` :631, `_durable_rows` :634, `_metadata` :644, `_request` :131 already exist), `tests/integration/web/workflow/test_library.py` (new), `tests/testcontainer/web/test_library_postgres.py` (new)
 
 **Interfaces:**
@@ -2196,20 +2196,64 @@ def test_concurrent_accept_has_exactly_one_winner(library_engine: Engine, tmp_pa
     assert row.curated_by_identity_id == winners[0] and row.accepted_at is not None
 ```
 
-- [ ] **Step 10: Admit the new writers to the mutation-authority manifest.**
+- [ ] **Step 10: Admit the new writers and connections to the Sessions mutation-authority manifest.**
 
-Run the gate first; it is fail-closed and prints every unreviewed site:
+The manifest is fail-closed, but the gate reports drift through `pytest.xfail` (`tests/unit/architecture/test_session_db_mutation_authority.py:18351`, HEAD) and already XFAILs on a clean HEAD, so its exit code is `0` with `1 xfailed` both before and after this step. The signal is the XFAIL reason text, which `-rx` prints. First read the drift report:
 
-Run: `cd "$(git rev-parse --show-toplevel)" && pytest tests/unit/architecture/test_session_db_mutation_authority.py -n 0 > /tmp/i5-manifest-red.log 2>&1; echo exit=$?`
-Expected: `exit=1`; the assertion message lists, one `describe()` line each, the five `library_entries` writes (`publish` insert, `accept`/`reject`/`deprecate`/`recall` update) as `authority=UNCLASSIFIED`, their five `write_connection` sites, and the `engine.connect()` reads of `read`/`browse`/`curation_queue`/`published_by`. Each line has the shape `src/elspeth/web/coordination/library_authority.py:<line> RepositoryLibraryAuthority.<method> <op> <table> fp=<16 hex>#<ordinal> authority=<name or UNCLASSIFIED> connection_escape=False`.
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py::test_all_production_sessions_writers_are_reviewed_typed_authorities -n 0 -v -rx > /tmp/i5-manifest-red.log 2>&1; echo exit=$?`
+Expected: `exit=0` and `1 xfailed`. The reason text begins `Sessions mutation authority inventory drift.` and lists one `describe()` line per site, in the form `<path>:<line> <symbol> <operation> <table> fp=<16 hex>#<ordinal> authority=<name or UNCLASSIFIED> connection_escape=False`. Compared with the counts the same gate printed on the tree before this task, exactly three sections grow:
+- `Unexpected/unreviewed`: 14 above, the 14 sites listed below.
+- `Connections outside exact contained authority`: 9 above, the five `engine.begin()` connections of `publish`/`accept`/`reject`/`deprecate`/`recall` and the four `engine.connect()` reads of `read`/`browse`/`curation_queue`/`published_by`.
+- `Writers without a named authority`: 5 above, the five `library_entries` writes.
 
-Then edit `tests/unit/architecture/test_session_db_mutation_authority.py`:
+Every other section keeps its pre-task count. `Unresolved write executions` names no `library_authority.py` line, because every `conn.execute` in the module runs a statement the scanner resolves. `Stale reviewed` and `Stale reviewed read connections` stay `(0)`: no `_REVIEWED_WRITERS` or `_REVIEWED_READ_CONNECTIONS` row names `yaml_generator.py`, `sessions/routes/composer/state.py`, `auth/audit.py` or `app.py` (measured on HEAD: `grep -c` of each quoted path in the gate file prints `0`, while `identity_authority.py` prints `81`), so this task moves no reviewed row. The pre-task counts are I1 Step 15's baseline when I5 lands directly after I3, and I4 Step 9's green-run counts when I4 landed first.
+
+Measured 2026-09-15 on a `git archive` export of 46219b2b7 with Step 4's module pasted verbatim: `1 xfailed in 103.29s`. The nine section counts went from I1 Step 15's baseline (67, 0, 16, 44, 7, 0, 0, 0, 0) to (81, 0, 25, 44, 12, 0, 0, 0, 0), and the 14 new sites were:
+
+```text
+src/elspeth/web/coordination/library_authority.py:222 <module> update library_entries fp=9e5f9796f7291412#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:227 <module> update library_entries fp=a344eef1e9ad568c#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:236 <module> update library_entries fp=8e247ffde92273d1#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:246 <module> update library_entries fp=3963f4a1b9b21ae0#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:410 RepositoryLibraryAuthority.publish insert library_entries fp=a7fe5fe90f1113ff#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:397 RepositoryLibraryAuthority.publish write_connection <sessions-write-connection> fp=b99e4775a7964aca#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:439 RepositoryLibraryAuthority.accept write_connection <sessions-write-connection> fp=7869c3bf021e648f#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:463 RepositoryLibraryAuthority.reject write_connection <sessions-write-connection> fp=4ac067ac8b49654a#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:488 RepositoryLibraryAuthority.deprecate write_connection <sessions-write-connection> fp=d7c0ff9f68292f97#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:513 RepositoryLibraryAuthority.recall write_connection <sessions-write-connection> fp=c4174561aded5211#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:333 RepositoryLibraryAuthority.read write_connection <sessions-write-connection> fp=77be48d4595cea35#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:341 RepositoryLibraryAuthority.browse write_connection <sessions-write-connection> fp=4920d07b588aa7ca#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:346 RepositoryLibraryAuthority.curation_queue write_connection <sessions-write-connection> fp=312dd68e5ad28ba2#1 authority=UNCLASSIFIED connection_escape=False
+src/elspeth/web/coordination/library_authority.py:352 RepositoryLibraryAuthority.published_by write_connection <sessions-write-connection> fp=5df578dd6aecec07#1 authority=UNCLASSIFIED connection_escape=False
+```
+
+The four curation `UPDATE` statements are the module-level constants `_ACCEPT`, `_REJECT`, `_DEPRECATE` and `_RECALL`. The scanner attributes them to the symbol `<module>` at the line of each constant, not to the method that executes them. That is why the manifest binds `<module>` below: a `_REVIEWED_WRITERS` row that names `RepositoryLibraryAuthority.accept` for an `update` never matches a live site. `Unexpected/unreviewed` prints at most 80 lines (`unexpected[:80]`, :18356), so when the section count is above 80 a new site can be cut from it. Read the five writes from `Writers without a named authority` and the nine connections from `Connections outside exact contained authority`, which list every one of them.
+
+Then edit `tests/unit/architecture/test_session_db_mutation_authority.py`. Each fingerprint and `line=` below is the value measured on Step 4's module as written. If `/tmp/i5-manifest-red.log` prints a different value for a site, the module differs from Step 4's fence. Diff the two and fix the module; copy the printed value only when the difference is a deliberate change to Step 4.
 
 1. In `_NAMED_AUTHORITY_SYMBOLS` (:262-908), before the closing `)` at :908:
 
 ```python
-    # ── shared library (Task I5): RepositoryLibraryAuthority, method-exact;
-    # global scope, engine-owning, every acquisition inside its method ──────
+    # ── shared library (Task I5): RepositoryLibraryAuthority is the sole writer
+    # of library_entries (TablePolicy :113, global scope, engine-owning). The
+    # five mutations bind method-exact, so the four read methods and any future
+    # method stay unbound. `<module>` binds the four curation UPDATE constants,
+    # which the scanner attributes to module scope; `_authority_for` (:5632)
+    # matches `<module>` exactly, so it covers module-scope sites of this one
+    # file and nothing else ──────────────────────────────────────────────────────
+    AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.publish", "LibraryAuthority"),
+    AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.accept", "LibraryAuthority"),
+    AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.reject", "LibraryAuthority"),
+    AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.deprecate", "LibraryAuthority"),
+    AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.recall", "LibraryAuthority"),
+    AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "<module>", "LibraryAuthority"),
+```
+
+2. In `_CONTAINED_CONNECTION_AUTHORITIES` (:914-1193), directly above its closing `)` at :1193 (two lines above the comment `# Literal identities for writers that sit behind an exact named authority.`, :1195). `connection_authority_violations` (:10608) requires every `write_connection` site's contained authority (`_contained_connection_authority_for`, :5639, exact symbol match) to equal the authority its symbol binds:
+
+```python
+    # Task I5: each library mutation opens, uses and closes its own
+    # engine.begin() connection inside the method.
     AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.publish", "LibraryAuthority"),
     AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.accept", "LibraryAuthority"),
     AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.reject", "LibraryAuthority"),
@@ -2217,30 +2261,180 @@ Then edit `tests/unit/architecture/test_session_db_mutation_authority.py`:
     AuthoritySymbol("src/elspeth/web/coordination/library_authority.py", "RepositoryLibraryAuthority.recall", "LibraryAuthority"),
 ```
 
-2. The same five `AuthoritySymbol(path, symbol, "LibraryAuthority")` lines in `_CONTAINED_CONNECTION_AUTHORITIES` (:914-1197), before its closing `)` — `connection_authority_violations` (:5632 region) requires every `write_connection` site's contained authority to equal its policy authority.
-
-3. In `_REVIEWED_WRITERS` (:1198): one `WriterIdentity(path, symbol, table, operation, fingerprint, ordinal, authority, line=N)` per printed write site, copying `fp`, `#ordinal` and `:line` from the gate's own output. The fingerprint is an AST hash the scanner computes from the implemented method body, which is why it is the one value in this task measured at execution rather than written here; a re-edit of a method changes it and the gate goes red again by design.
+3. In `_REVIEWED_WRITERS` (:1198), directly after its opening line `_REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (`:
 
 ```python
-    # ── shared library (Task I5) ─────────────────────────────────────────────
+    # ── shared library (Task I5): publish's insert, the four module-level
+    # curation UPDATE constants, and the five contained write connections ────
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "<module>",
+        "library_entries",
+        "update",
+        "9e5f9796f7291412",
+        1,
+        "LibraryAuthority",
+        line=222,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "<module>",
+        "library_entries",
+        "update",
+        "a344eef1e9ad568c",
+        1,
+        "LibraryAuthority",
+        line=227,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "<module>",
+        "library_entries",
+        "update",
+        "8e247ffde92273d1",
+        1,
+        "LibraryAuthority",
+        line=236,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "<module>",
+        "library_entries",
+        "update",
+        "3963f4a1b9b21ae0",
+        1,
+        "LibraryAuthority",
+        line=246,
+    ),
     WriterIdentity(
         "src/elspeth/web/coordination/library_authority.py",
         "RepositoryLibraryAuthority.publish",
         "library_entries",
         "insert",
-        "<fp from the gate output>",
+        "a7fe5fe90f1113ff",
         1,
         "LibraryAuthority",
-        line=0,  # replace with the :line the gate printed
+        line=410,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.publish",
+        "<sessions-write-connection>",
+        "write_connection",
+        "b99e4775a7964aca",
+        1,
+        "LibraryAuthority",
+        line=397,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.accept",
+        "<sessions-write-connection>",
+        "write_connection",
+        "7869c3bf021e648f",
+        1,
+        "LibraryAuthority",
+        line=439,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.reject",
+        "<sessions-write-connection>",
+        "write_connection",
+        "4ac067ac8b49654a",
+        1,
+        "LibraryAuthority",
+        line=463,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.deprecate",
+        "<sessions-write-connection>",
+        "write_connection",
+        "d7c0ff9f68292f97",
+        1,
+        "LibraryAuthority",
+        line=488,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.recall",
+        "<sessions-write-connection>",
+        "write_connection",
+        "c4174561aded5211",
+        1,
+        "LibraryAuthority",
+        line=513,
     ),
 ```
 
-and likewise for `accept` / `reject` / `deprecate` / `recall` with operation `"update"`, plus one `write_connection` row per method with table `"<sessions-write-connection>"` and authority `"LibraryAuthority"`, exactly the shape of the `RepositoryIdentityAuthority` rows already in the tuple.
+4. In `_REVIEWED_READ_CONNECTIONS` (:3954), directly after its opening line `_REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (`. These are the shape of the `RepositoryIdentityAuthority.configured_admin_seed_consumed` row at :3957-3966: authority `None`, because the read methods are not bound.
 
-4. In `_REVIEWED_READ_CONNECTIONS` (:3954): one row per printed `engine.connect()` read (`read`, `browse`, `curation_queue`, `published_by`), table `"<sessions-write-connection>"`, operation `"write_connection"`, authority `None`, the shape of `RepositoryIdentityAuthority.configured_admin_seed_consumed` at :3957-3966.
+```python
+    # Task I5: the library reads are SELECT-only engine.connect() blocks; the
+    # connection never leaves the method.
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.read",
+        "<sessions-write-connection>",
+        "write_connection",
+        "77be48d4595cea35",
+        1,
+        None,
+        line=333,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.browse",
+        "<sessions-write-connection>",
+        "write_connection",
+        "4920d07b588aa7ca",
+        1,
+        None,
+        line=341,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.curation_queue",
+        "<sessions-write-connection>",
+        "write_connection",
+        "312dd68e5ad28ba2",
+        1,
+        None,
+        line=346,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/library_authority.py",
+        "RepositoryLibraryAuthority.published_by",
+        "<sessions-write-connection>",
+        "write_connection",
+        "5df578dd6aecec07",
+        1,
+        None,
+        line=352,
+    ),
+```
 
-Run: `cd "$(git rev-parse --show-toplevel)" && pytest tests/unit/architecture/test_session_db_mutation_authority.py -n 0 > /tmp/i5-manifest.log 2>&1; echo exit=$?`
-Expected: `exit=0`. A `stale` entry in the message means a fingerprint or line was mistyped; copy it again from `/tmp/i5-manifest-red.log`.
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py -n 0 -v -rx > /tmp/i5-manifest-green.log 2>&1; echo exit=$?`
+Expected: `exit=0`, no `failed`, and exactly `1 xfailed`, `test_all_production_sessions_writers_are_reviewed_typed_authorities`. The gate already XFAILs on a clean HEAD (I1 Step 15 records the baseline counts), so this task cannot bring it to a pass. Read the XFAIL text instead. Its nine section counts equal the red run's counts, minus 14 for `Unexpected/unreviewed`, 9 for `Connections outside exact contained authority` and 5 for `Writers without a named authority`, which is back to the pre-task counts. Measured on the same export with this step applied: `265 passed, 1 xfailed in 197.62s`, counts (67, 0, 16, 44, 7, 0, 0, 0, 0). If any other test in the file fails, a row above was typed with the wrong authority or table; compare it against the red log.
+
+Run: `grep -c 'library_authority.py' /tmp/i5-manifest-green.log; grep -c 'library_authority.py' /tmp/i5-manifest-red.log; grep -c 'Stale reviewed (0):' /tmp/i5-manifest-green.log; grep -c 'Stale reviewed read connections (0):' /tmp/i5-manifest-green.log`
+Expected: `0`, then at least `1`, then at least `1`, then at least `1` (measured: `0`, `28`, `1`, `1`). The first count proves every one of the 14 sites is reviewed, `<module>` rows included: every `describe()` line carries the path, and no test function or file-level text in the gate file names `library_authority.py` (measured `0` on the HEAD file), so a `-v` progress line cannot match. The second is the positive control: the same grep matches the red log, so the `0` does not come from a pattern that matches nothing. The third proves no writer row was mistyped. The fourth proves no read-connection row was mistyped. A read row with a wrong `line=` prints under `Stale reviewed read connections`, which the third grep cannot see, because `Stale reviewed (0):` is not a substring of `Stale reviewed read connections (0):`.
+
+Control the instrument twice. The exit code does not discriminate here: it is `exit=0` with `1 xfailed` before and after each mutation.
+
+First, change the last hex character of the `RepositoryLibraryAuthority.publish` `insert` row's fingerprint from `f` to `e` (`"a7fe5fe90f1113ff"` becomes `"a7fe5fe90f1113fe"`).
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py::test_all_production_sessions_writers_are_reviewed_typed_authorities -n 0 -v -rx > /tmp/i5-manifest-control-fp.log 2>&1; echo exit=$?; grep -c 'Stale reviewed (1):' /tmp/i5-manifest-control-fp.log; grep -c 'Stale reviewed (0):' /tmp/i5-manifest-control-fp.log; grep -c 'library_authority.py' /tmp/i5-manifest-control-fp.log`
+Expected: `exit=0` and `1 xfailed`, then `1`, `0`, `2`. `Unexpected/unreviewed` is 1 above the green count and names the live `publish insert library_entries fp=a7fe5fe90f1113ff` site; `Stale reviewed (1):` names the mutated `fp=a7fe5fe90f1113fe` row. All other counts equal the green run. Restore the `f`.
+
+Second, change the `RepositoryLibraryAuthority.browse` read row's `line=341` to `line=342`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py::test_all_production_sessions_writers_are_reviewed_typed_authorities -n 0 -v -rx > /tmp/i5-manifest-control-read.log 2>&1; echo exit=$?; grep -c 'Stale reviewed (0):' /tmp/i5-manifest-control-read.log; grep -c 'Stale reviewed read connections (0):' /tmp/i5-manifest-control-read.log; grep -c 'library_authority.py' /tmp/i5-manifest-control-read.log`
+Expected: `exit=0` and `1 xfailed`, then `1`, `0`, `3`. `Stale reviewed read connections (1):` names the `browse` row at `:342`, and the live `:341` site appears under both `Unexpected/unreviewed` and `Connections outside exact contained authority`, each 1 above the green count. `Stale reviewed (0):` still matches, which is the reason the fourth grep above exists. Measured on the export: both controls gave exactly these values (`Unexpected/unreviewed (68)`, and `Connections outside exact contained authority (17)` for the second). Restore `line=341`.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py -n 0 -v -rx > /tmp/i5-manifest-green.log 2>&1; echo exit=$?; grep -c 'library_authority.py' /tmp/i5-manifest-green.log; grep -c 'Stale reviewed (0):' /tmp/i5-manifest-green.log; grep -c 'Stale reviewed read connections (0):' /tmp/i5-manifest-green.log`
+Expected: `exit=0`, no `failed`, exactly `1 xfailed`, then `0`, at least `1`, at least `1`: both mutations are restored.
 
 - [ ] **Step 11: Run the integration and route suites.**
 
@@ -2257,7 +2451,7 @@ Expected: `exit=0` (needs Docker; `-m testcontainer` is required or the selectio
 
 - [ ] **Step 13: Lint and commit.**
 
-Run: `cd "$(git rev-parse --show-toplevel)" && ruff check src/elspeth/web/coordination/library_authority.py src/elspeth/web/sessions/routes/workflow/library.py src/elspeth/web/composer/yaml_generator.py src/elspeth/web/sessions/routes/composer/state.py src/elspeth/web/auth/audit.py src/elspeth/web/app.py tests/unit/web/coordination/test_library_authority.py tests/integration/web/workflow/test_library.py tests/testcontainer/web/test_library_postgres.py > /tmp/i5-ruff.log 2>&1; echo exit=$?` → `exit=0`, then `scripts/branch-safety-check.sh --intent commit`.
+Run: `cd "$(git rev-parse --show-toplevel)" && ruff check src/elspeth/web/coordination/library_authority.py src/elspeth/web/sessions/routes/workflow/library.py src/elspeth/web/composer/yaml_generator.py src/elspeth/web/sessions/routes/composer/state.py src/elspeth/web/auth/audit.py src/elspeth/web/app.py tests/unit/web/coordination/test_library_authority.py tests/integration/web/workflow/test_library.py tests/testcontainer/web/test_library_postgres.py > /tmp/i5-ruff.log 2>&1; echo exit=$?` → `exit=0`.
 
 This task creates five files, which are untracked. A commit pathspec that names an untracked path is refused, so mark exactly those five as intent-to-add first. This records only that the paths exist; nothing else enters the index:
 
@@ -2267,6 +2461,14 @@ cd "$(git rev-parse --show-toplevel)" && git add -N src/elspeth/web/coordination
 
 Expected: `exit=0`.
 
+Run: `cd "$(git rev-parse --show-toplevel)" && git status --short > /tmp/i5-lane-status.log 2>&1; scripts/branch-safety-check.sh --intent commit > /tmp/i5-lane-branch-safety.log 2>&1; echo exit=$?`
+Expected: `exit=0` with no `[FAIL]` line in the safety log (exit 1 on any FAIL: stop before the commit and fix the reported check). The status log shows the five created paths above as ` A` (intent-to-add) and the seven modified paths named in the commit below as ` M`. Any other path it lists belongs to a sibling lane and must not be named in the commit.
+
 ```bash
-cd "$(git rev-parse --show-toplevel)" && git commit -m "feat(identity): shared library publish, curate, browse and fork" -- src/elspeth/web/coordination/library_authority.py src/elspeth/web/sessions/routes/workflow/library.py src/elspeth/web/composer/yaml_generator.py src/elspeth/web/sessions/routes/composer/state.py src/elspeth/web/auth/audit.py src/elspeth/web/app.py tests/unit/architecture/test_session_db_mutation_authority.py tests/unit/web/coordination/test_library_authority.py tests/unit/web/composer/test_yaml_generator.py tests/unit/web/auth/test_audit.py tests/integration/web/workflow/test_library.py tests/testcontainer/web/test_library_postgres.py
+cd "$(git rev-parse --show-toplevel)" && git commit -m "feat(identity): shared library publish, curate, browse and fork" -- src/elspeth/web/coordination/library_authority.py src/elspeth/web/sessions/routes/workflow/library.py src/elspeth/web/composer/yaml_generator.py src/elspeth/web/sessions/routes/composer/state.py src/elspeth/web/auth/audit.py src/elspeth/web/app.py tests/unit/architecture/test_session_db_mutation_authority.py tests/unit/web/coordination/test_library_authority.py tests/unit/web/composer/test_yaml_generator.py tests/unit/web/auth/test_audit.py tests/integration/web/workflow/test_library.py tests/testcontainer/web/test_library_postgres.py; echo exit=$?
 ```
+
+Expected: `exit=0` (the pre-commit hooks pass).
+
+Run: `cd "$(git rev-parse --show-toplevel)" && git show --stat HEAD > /tmp/i5-lane-commit-stat.log 2>&1; echo exit=$?`
+Expected: `exit=0`; the stat lists exactly those 12 files (5 created: `library_authority.py`, `routes/workflow/library.py`, `test_library_authority.py`, `integration/web/workflow/test_library.py`, `test_library_postgres.py`; 7 modified: `yaml_generator.py`, `routes/composer/state.py`, `auth/audit.py`, `web/app.py`, `test_session_db_mutation_authority.py`, `test_yaml_generator.py`, `test_audit.py`), and the summary line reads `12 files changed`. Any other count means a sibling lane staged into the shared index: undo with `git reset --mixed HEAD~1` (never `checkout`, `restore` or `clean`). That reset also drops the five intent-to-add entries, so re-run the `git add -N` block above, then commit again with the same 12-path pathspec. `web/app.py`, `auth/audit.py`, `tests/unit/web/auth/test_audit.py` and `tests/unit/architecture/test_session_db_mutation_authority.py` are also touched by I3 and I4. The second lane to land rebases, and every collision is an adjacent-line append.

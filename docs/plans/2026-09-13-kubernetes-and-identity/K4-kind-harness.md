@@ -7,12 +7,19 @@ shipped base on a real API server: a kind cluster with the tree under test
 built and loaded as an image, a hostPath `ReadWriteMany` PersistentVolume,
 PostgreSQL 16 carrying both databases and the schema-owner/runtime roles, the
 two Secrets the base references, and the `kind-test` overlay (one Deployment,
-`replicas: 2`, NodePort 30451). Three proofs run against it: both replicas
+`replicas: 2`, NodePort 30451). Every install in the lane goes through one
+ordered path, `KindCluster.install`: render the overlay once, apply the
+ConfigMap, the claim and `elspeth-provision-storage` and wait for it, then
+`elspeth-schema-init` and wait for it, then the Service and the Deployment.
+Four proofs run against it: both replicas
 register distinct `web_instances` members under ONE generation with both
 rollout placeholders replaced; a second `kubectl apply -k` succeeds while a
 finished Job still exists (and recreates any Job the 600 s TTL already reaped); and a provider-free CSV run started through one pod
 has its sink artefacts served by the OTHER pod off the shared volume and the
-shared Landscape. A registered `kind` marker keeps the lane out of the default
+shared Landscape; and a cold install on a fresh volume, with the provisioner
+deliberately held back, never creates the schema-init Job before provisioning
+has completed. A clusterless test controls the phase partition itself. A
+registered `kind` marker keeps the lane out of the default
 and Testcontainer selections; one smoke script is the single code path for the
 desk and the `kubernetes-kind` CI job, which `ci-success` gates by name.
 
@@ -92,7 +99,16 @@ Measured on HEAD 072141b75 (2026-09-13):
   least 32 bytes (`config.py:594-598`, :802-806); authenticated TLS is
   required only for `aws-ecs` (:369-376). The deployment doctor probes the
   runtime directories with a temp-file write (`web/doctor.py:57-108`), so the
-  schema-init Job needs the share provisioned before it runs.
+  schema-init Job needs the share provisioned before it runs. It must not
+  even EXIST before then: one `kubectl apply -k` creates both Jobs in one
+  request, and waiting for them in order afterwards does not order their
+  starts. The schema-init image is preloaded by `kind load` while busybox is
+  pulled from docker.io, so schema-init starts first; `lstat` on the missing
+  `/mnt/elspeth/data` fails `data_dir_writable` (`web/doctor.py:57-72`,
+  called at `:557-563`), the doctor refuses to initialise (`:624-632`) and
+  exits 1 (`cli.py:205-206`), and `backoffLimit: 0` / `restartPolicy: Never`
+  make that failure final. Hence `KindCluster.install` (Step 3) and the
+  delayed-provisioner proof (Step 1).
 - The harness PostgreSQL image is K0's facts document §1.3
   `HARNESS_POSTGRES_IMAGE=postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94`
   (the index digest of `postgres:16`, recorded by K0 for this manifest; psql 16,
@@ -125,13 +141,37 @@ Measured on HEAD 072141b75 (2026-09-13):
   database URL literal that embeds a user and password, so no harness file carries a URL or a
   password; the fixture mints every credential per session and builds URLs
   with `sqlalchemy.engine.URL.create`.
+- pytest 9.0.3 (`uv.lock:3626-3627`). Measured 2026-09-15 in a throwaway
+  project outside the tree, with this repository's venv: a
+  `@pytest.hookimpl(wrapper=True)` `pytest_runtest_makereport` in a directory
+  conftest receives the failed `call` report of a test and the failed `setup`
+  report of a test whose module-scoped fixture (layered on a session fixture)
+  raised; `report.sections.append((name, text))` prints as a `---- name ----`
+  block in the FAILURES output under `-q`; skip and xfail reports are not
+  `failed`; a config-stash list capped at two captured exactly two of three
+  failures under `-n 0` (under xdist each worker has its own config, so the
+  cap is per process, and this lane refuses xdist); `exc.add_note(text)` in a
+  session fixture's `except` before re-raising prints under the `E` lines;
+  and an explicit test path whose name does not match `test_*.py` is NOT
+  collected when its directory is passed as well. For the session's last
+  item, pytest runs the module finalizers and then every session finalizer
+  before it builds that item's teardown report (`teardown_exact` in
+  `_pytest/runner.py`). A failing module-fixture teardown there found the
+  stash entry a session fixture's `finally` had removed (`live=False`), while
+  an entry removed by a `request.config.add_cleanup` callback was still
+  present (`live=True`), and that callback ran after the terminal summary
+  line. A session fixture that raises before `yield` is re-raised, note
+  included, for every test that requests it (three errored tests, three
+  notes), so the fixture removes its stash entry before re-raising.
 - `.gitignore:67` ignores `.claude/lanes/`, where the smoke script keeps the
   pinned tools and its logs.
 
 **Files:**
 - Create: `deploy/kubernetes/overlays/kind-test/kustomization.yaml`
-- Create: `tests/testcontainer/deployment/kubernetes/kind-config.yaml`, `tests/testcontainer/deployment/kubernetes/pv-rwx-hostpath.yaml`, `tests/testcontainer/deployment/kubernetes/postgresql.yaml`, `tests/testcontainer/deployment/kubernetes/01-databases.sql`, `tests/testcontainer/deployment/kubernetes/02-roles.sql`
+- Create: `tests/testcontainer/deployment/kubernetes/kind-config.yaml`, `tests/testcontainer/deployment/kubernetes/pv-rwx-hostpath.yaml`, `tests/testcontainer/deployment/kubernetes/postgresql.yaml`, `tests/testcontainer/deployment/kubernetes/01-databases.sql`, `tests/testcontainer/deployment/kubernetes/02-roles.sql`, `tests/testcontainer/deployment/kubernetes/cold-install-overlay/kustomization.yaml`, `tests/testcontainer/deployment/kubernetes/cold-install-overlay/pv-rwx-hostpath.yaml`
 - Create: `tests/testcontainer/deployment/kind_harness.py`, `tests/testcontainer/deployment/conftest.py`, `tests/testcontainer/deployment/test_kubernetes_kind.py`
+- Create: `tests/unit/deployment/test_kind_diagnostics.py` (default selection: diagnostics redaction and bounding, and a diagnostics read that never raises)
+- Transient, never staged: Step 6 writes the deliberately failing control `tests/testcontainer/deployment/test_zz_kind_diagnostics_control.py` and deletes it in the same step
 - Create: `scripts/cicd/kubernetes-kind-smoke.sh` (mode 0755)
 - Modify: `pyproject.toml:454` (the default `-m` expression gains `and not kind`), `pyproject.toml:467-479` (register the `kind` marker)
 - Modify: `.github/workflows/ci.yaml:938-942` (testcontainer selection becomes `-m "testcontainer and not kind"`); new job `kubernetes-kind` inserted directly after K3's `kubernetes-render` job (K3 places it before `supply-chain-audit:`, HEAD :1093); `ci.yaml:1335-1344` (`ci-success.needs`) and the `Check all jobs passed` script (:1347-1385)
@@ -146,10 +186,11 @@ Measured on HEAD 072141b75 (2026-09-13):
   - K3's `tests/unit/deployment/test_kubernetes_bundle.py`: `REPO_ROOT`, `CI_WORKFLOW`, `PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-13-kubernetes-platform-facts.md"`, `KUBECTL_VERSION`, `KUBECTL_SHA256`, `RESULT_GATED_JOBS: tuple[str, ...]`, `_ci_workflow() -> dict`, `_run_text(job: dict) -> str`, `_assert_render_gate(workflow: dict) -> None` (iterates `RESULT_GATED_JOBS`), and the job id `kubernetes-render`. K3's `KUBECTL_PINNED_JOBS` is NOT extended: the kind lane installs kubectl inside the smoke script, and the pin test below binds the script's `KUBECTL_VERSION=`/`KUBECTL_SHA256=` lines to K3's constants instead.
   - K0's facts document `docs/plans/2026-09-13-kubernetes-platform-facts.md`: §1.1 `KIND_VERSION=0.33.0`, `KIND_SHA256=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d`, `KIND_URL=https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64` (plus the `KUBECTL_*` pair K3 already carries); §1.2 `KIND_NODE_IMAGE=kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5`; §1.3 `HARNESS_POSTGRES_IMAGE=postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94`.
 - Produces:
-  - `tests/testcontainer/deployment/conftest.py`: session fixture `kind_cluster -> KindCluster`; `tests/testcontainer/deployment/kind_harness.py`: the `KindCluster` frozen dataclass with `KindCluster.kubectl(*args: str) -> str`, `KindCluster.kubeconfig: Path` (the cluster's kubeconfig file, constructed by the session fixture and consumed by K5), `KindCluster.node_port(service: str) -> int`, `KindCluster.pod_url(pod: str) -> str` (a per-pod `kubectl port-forward`, bypassing the Service's ClientIP affinity), `KindCluster.database_url(role: str, database: str) -> str` (host-side, NodePort 30432) and `KindCluster.cluster_database_url(role: str, database: str) -> str` (in-cluster host `postgres.default.svc.cluster.local:5432`), `KindCluster.passwords: Mapping[str, str]` keyed by role; module constants `IMAGE = "elspeth-web-test:kind"`, `REPO_ROOT`, `HERE` (the `kubernetes/` manifest directory), `BASE_ROLES_SQL: Path` (`deploy/kubernetes/base/bootstrap-roles.sql`), `ACCEPTANCE_ROLES_SQL: Path` (`deploy/kubernetes/base/bootstrap-acceptance-roles.sql`), `PASSWORD_ENV`, `RUNTIME_SECRETS`; helper `write_env_file(directory: Path, name: str, values: Mapping[str, str]) -> Path`. Test modules import from `tests.testcontainer.deployment.kind_harness` (never from the conftest). K5 and K7 reuse the fixture.
+  - `tests/testcontainer/deployment/conftest.py`: session fixture `kind_cluster -> KindCluster` and the hook wrapper `pytest_runtest_makereport(item: pytest.Item) -> Generator[None, pytest.TestReport, pytest.TestReport]`, which appends a `kind cluster diagnostics (<when>)` section (`KindCluster.diagnostics`) to the failed setup, call or teardown report of any test function that uses `kind_cluster` while the cluster exists (a module-fixture teardown failure on the session's last item included), for the first `DIAGNOSTICS_MAX_COLLECTIONS` failures of the session (later ones get a one-line notice); a harness step that fails before the fixture's `yield` carries the same diagnostics as a note on its exception, and the tests that re-raise it add no section; `_delete_cluster(config: pytest.Config, cluster: KindCluster, env: Mapping[str, str]) -> None`, which the fixture registers with `request.config.add_cleanup` right after `kind create`, closes the port-forwards and deletes the cluster after the session's last report (the fixture has no `finally`); `tests/testcontainer/deployment/kind_harness.py`: the `KindCluster` frozen dataclass with `KindCluster.kubectl(*args: str) -> str`, `KindCluster.kubeconfig: Path` (the cluster's kubeconfig file, constructed by the session fixture and consumed by K5), `KindCluster.install(overlay: Path, *, timeout: float = 600.0) -> None` (renders the overlay once with `kubectl kustomize <overlay> -o <tmp>` and applies it in the order `INSTALL_PHASES`, each phase's Jobs waited to their `Complete` condition before the next phase is created; callers own `rollout status`), `KindCluster.wait_job(name: str, *, namespace: str = "default", timeout: float = 600.0) -> None` (returns on `Complete`; on the first failed pod raises `AssertionError` `job/<name> failed:` followed by the Job log with database URLs filtered), `KindCluster.install_phases(rendered: list[tuple[Path, dict]]) -> dict[str, list[tuple[Path, dict]]]` (staticmethod; places `Job/elspeth-schema-init` in `schema`, every `Deployment`, `Service` and `Ingress` in `workload`, everything else in `prerequisites`, and raises `AssertionError` `<Kind>/<name> owns pods but has no place in the cold-install order` for any other pod owner), `KindCluster.job_times(name: str, *, namespace: str = "default") -> JobTimes` (frozen dataclass `JobTimes(created: datetime, started: datetime, completed: datetime)`), `KindCluster.copy_secret(name: str, *, namespace: str, directory: Path) -> None` (copies one Secret from `default` through a 0600 file, never argv), `KindCluster.node_port(service: str) -> int`, `KindCluster.pod_url(pod: str) -> str` (a per-pod `kubectl port-forward`, bypassing the Service's ClientIP affinity), `KindCluster.database_url(role: str, database: str) -> str` (host-side, NodePort 30432) and `KindCluster.cluster_database_url(role: str, database: str) -> str` (in-cluster host `postgres.default.svc.cluster.local:5432`), `KindCluster.passwords: Mapping[str, str]` keyed by role (`repr=False`: a failing test's traceback prints its `kind_cluster` argument), `KindCluster.secret_values: tuple[str, ...]` (keyword field, default `()`, `repr=False`: the session's shared `ELSPETH_WEB__SECRET_KEY` and `ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY`), `KindCluster.diagnostics(reason: str) -> str` (bounded and redacted: object state and events, then per pod `describe` and container log tails, plus the previous container's tail when one restarted; never reads a Secret or a resolved environment; never raises on a kubectl failure or timeout); module constants `INSTALL_PHASES: tuple[str, ...] = ("prerequisites", "schema", "workload")`, `PROVISION_STORAGE_JOB = "elspeth-provision-storage"`, `SCHEMA_INIT_JOB = "elspeth-schema-init"`, `WORKLOAD_KINDS: frozenset[str]` (`Deployment`, `Service`, `Ingress`), `POD_OWNER_KINDS: frozenset[str]` (`Pod`, `ReplicaSet`, `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`), `IMAGE = "elspeth-web-test:kind"`, `REPO_ROOT`, `HERE` (the `kubernetes/` manifest directory), `BASE_ROLES_SQL: Path` (`deploy/kubernetes/base/bootstrap-roles.sql`), `ACCEPTANCE_ROLES_SQL: Path` (`deploy/kubernetes/base/bootstrap-acceptance-roles.sql`), `PASSWORD_ENV`, `RUNTIME_SECRETS`; helper `write_env_file(directory: Path, name: str, values: Mapping[str, str]) -> Path`; `redact_and_bound(text: str, secret_values: Iterable[str], *, max_lines: int = DIAGNOSTICS_MAX_LINES) -> str` (every given value becomes `REDACTED`, a line carrying a PostgreSQL URL is replaced whole, only the last `max_lines` lines are kept); diagnostics constants `REDACTED = "<redacted>"`, `DIAGNOSTICS_SECTION = "kind cluster diagnostics"`, `DIAGNOSTICS_MAX_COLLECTIONS = 3`, `DIAGNOSTICS_MAX_LINES = 120`, `DIAGNOSTICS_MAX_PODS = 12`, `DIAGNOSTICS_MAX_CHARS = 65536`, `DIAGNOSTICS_COMMAND_TIMEOUT = 20.0`, `DIAGNOSTICS_BUDGET_SECONDS = 120.0`; stash keys `CLUSTER_KEY: pytest.StashKey[KindCluster]` (set after `kind create`, removed before `kind delete`) and `DIAGNOSTICS_KEY: pytest.StashKey[list[str]]` (node ids already given a full read). Test modules import from `tests.testcontainer.deployment.kind_harness` (never from the conftest). K5 and K7 reuse the fixture and `KindCluster.install`.
   - Cluster objects the fixture creates before any test runs: Secrets `kind-postgres-credentials`, `elspeth-web-secrets` (role `elspeth_runtime`), `elspeth-web-secrets-a` (`elspeth_runtime_a`), `elspeth-web-secrets-b` (`elspeth_runtime_b`) — all four runtime Secrets share one `ELSPETH_WEB__SECRET_KEY` and one `ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY` so a token minted by any replica validates on every replica — and `elspeth-schema-owner-secrets` (`elspeth_schema_owner`); ConfigMap `kind-postgres-init` (keys `01-databases.sql`, `02-roles.sql`, `bootstrap-roles.sql`, `bootstrap-acceptance-roles.sql`; PostgreSQL init creates all five roles in `PASSWORD_ENV`, `elspeth_runtime_a`/`elspeth_runtime_b` included, with the passwords held in `KindCluster.passwords`); PersistentVolume `elspeth-state-rwx` bound to PVC `elspeth-state`; StatefulSet/Service `postgres` (pod `postgres-0`, NodePort 30432). kind maps host ports 30451 (K4 Service), 30452/30453 (K5's `elspeth-web-a`/`elspeth-web-b`) and 30432.
   - `deploy/kubernetes/overlays/kind-test/` — the shared-state overlay (`sha-kindtest` revision, release `0.8.1+kindtest`, NodePort 30451). K5's `kind-acceptance` overlay is a sibling and consumes the same fixture and Secrets.
-  - `scripts/cicd/kubernetes-kind-smoke.sh [extra pytest args]` — installs the pinned kubectl/kind into `${ELSPETH_K8S_TOOLS:-.claude/lanes/k8s/bin}`, exports `ELSPETH_KIND_CLUSTER_NAME` and `KUBECONFIG`, runs `uv run --frozen pytest -q -n 0 -m kind tests/testcontainer/deployment`, writes `${ELSPETH_KIND_LOG_DIR:-.claude/lanes/k8s/logs}/kind-smoke-<timestamp>.log`, prints `exit=<n> wall=<s>s`, dumps cluster state on failure and always deletes the cluster. K5 Step 13 and Step 15 and K7 Step 4 run it.
+  - `tests/testcontainer/deployment/kubernetes/cold-install-overlay/` (test-only; `kustomization.yaml` and `pv-rwx-hostpath.yaml`): `kind-test` without its Deployment and Service, in namespace `elspeth-cold`, its claim bound to PersistentVolume `elspeth-state-rwx-cold` (hostPath `/var/elspeth-state-cold`), both Jobs without `ttlSecondsAfterFinished`, and `elspeth-provision-storage` held back 45 s by an init container. Read only by `test_cold_install_never_creates_schema_init_before_storage_is_provisioned`. The lane's K4 test ids become five: the three proofs above, that test, and `test_install_phases_put_schema_init_after_provisioning_and_refuse_unplaced_pod_owners` (clusterless).
+  - `scripts/cicd/kubernetes-kind-smoke.sh [extra pytest args]` — installs the pinned kubectl/kind into `${ELSPETH_K8S_TOOLS:-.claude/lanes/k8s/bin}`, exports `ELSPETH_KIND_CLUSTER_NAME` and `KUBECONFIG`, runs `uv run --frozen pytest -q -n 0 -m kind tests/testcontainer/deployment`, writes `${ELSPETH_KIND_LOG_DIR:-.claude/lanes/k8s/logs}/kind-smoke-<timestamp>.log`, prints `exit=<n> wall=<s>s log=<path>`; the log is pytest's own output, so every failure's `kind cluster diagnostics` section (read by the fixture while the cluster was alive) is in it; the EXIT trap runs no kubectl reads and only deletes the named cluster if pytest died before its config cleanup could, then removes the kubeconfig. K5 Step 13 and Step 15 and K7 Step 4 run it.
   - pytest marker `kind` (excluded by the default and Testcontainer selections; selected only by the script); env switch `ELSPETH_CI_KIND_REQUIRED` (missing `kind`/`kubectl`/`docker` → `pytest.fail` instead of `pytest.skip`).
   - CI job id `kubernetes-kind` (`runs-on: ubuntu-24.04`, `timeout-minutes: 60`, no `needs`), gated by name in `ci-success`; module constants `KIND_VERSION`, `KIND_SHA256`, `KIND_SMOKE`, `KIND_CONFIG` in `test_kubernetes_bundle.py`.
 
@@ -191,6 +232,13 @@ JOBS = ("elspeth-provision-storage", "elspeth-schema-init")
 WEB_PODS = ("-l", "app.kubernetes.io/name=elspeth-web", "--field-selector", "status.phase=Running")
 TERMINAL = {"completed", "completed_with_failures", "failed", "empty", "cancelled"}  # sessions/protocol.py:221
 HIGH_VALUE_NAMES = {"Bob", "Diana", "Frank", "Henry"}  # examples/threshold_gate/input.csv rows with amount > 1000
+# The cold-install ordering proof: a namespace and a hostPath volume no other
+# test touches, and a provisioner the overlay holds back this long (its
+# hold-provisioning init container sleeps the same 45 s).
+COLD_INSTALL_OVERLAY = REPO_ROOT / "tests" / "testcontainer" / "deployment" / "kubernetes" / "cold-install-overlay"
+COLD_NAMESPACE = "elspeth-cold"
+COLD_VOLUME = "elspeth-state-rwx-cold"
+COLD_PROVISION_DELAY_SECONDS = 45
 
 
 def _wait_ready(url: str, *, timeout: float = 300.0) -> None:
@@ -208,21 +256,6 @@ def _wait_ready(url: str, *, timeout: float = 300.0) -> None:
     raise AssertionError(f"{url} never reported ready within {timeout}s; last answer: {last}")
 
 
-def _wait_job(cluster: KindCluster, name: str, *, timeout: float = 600.0) -> None:
-    """Complete, or fail NOW with the Job's logs — never sit on a failed Job until the timeout."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        status = json.loads(cluster.kubectl("get", "job", name, "-o", "json"))["status"]
-        if status.get("succeeded", 0) >= 1:
-            return
-        if status.get("failed", 0) >= 1:
-            logs = cluster.kubectl("logs", f"job/{name}", "--all-containers", "--tail=100")
-            safe = "\n".join(line for line in logs.splitlines() if "postgresql+psycopg://" not in line)
-            raise AssertionError(f"job/{name} failed:\n{safe}")
-        time.sleep(3)
-    raise AssertionError(f"job/{name} did not complete within {timeout}s")
-
-
 def _running_web_pods(cluster: KindCluster) -> list[str]:
     items = json.loads(cluster.kubectl("get", "pods", *WEB_PODS, "-o", "json"))["items"]
     return sorted(item["metadata"]["name"] for item in items)
@@ -232,11 +265,12 @@ def test_two_replicas_register_distinct_members_under_one_generation(kind_cluste
     # Server-side admission of the whole rendered set (base + overlay): the kind
     # API server is the only place this plan has one (no clusterless dry-run).
     kind_cluster.kubectl("apply", "--dry-run=server", "-k", str(OVERLAY))
-    kind_cluster.kubectl("apply", "-k", str(OVERLAY))
-    # provision-storage first: the schema-init doctor probes the share with a
-    # temp-file write (web/doctor.py:57-108) and the Job has backoffLimit 0.
-    _wait_job(kind_cluster, "elspeth-provision-storage")
-    _wait_job(kind_cluster, "elspeth-schema-init")
+    # Cold install in order (KindCluster.install): ConfigMap, claim and the
+    # provisioner, waited; then schema-init, waited; then Service and
+    # Deployment. One `apply -k` would create both Jobs in one request, and a
+    # schema-init that starts before the provisioner fails its directory
+    # checks (web/doctor.py:57-72) for good under backoffLimit 0.
+    kind_cluster.install(OVERLAY)
     kind_cluster.kubectl("rollout", "status", "deployment/elspeth-web", "--timeout=600s")
     _wait_ready(f"http://127.0.0.1:{kind_cluster.node_port('elspeth-web')}/api/ready")
 
@@ -319,7 +353,7 @@ def test_reapplying_the_overlay_succeeds_while_the_finished_jobs_still_exist(kin
                 assert f"job.batch/{name} created" in out, out
                 created.append(name)
         for name in created:
-            _wait_job(kind_cluster, name)
+            kind_cluster.wait_job(name)
         if unchanged:
             break
     assert unchanged, (
@@ -415,6 +449,141 @@ def test_provider_free_run_completes_and_its_outputs_are_served_by_the_other_rep
         assert content.headers["X-Elspeth-Instance"] != owner_instance
         names = {line.split(",")[1] for line in content.text.strip().splitlines()[1:]}
         assert names == HIGH_VALUE_NAMES, content.text
+
+
+def test_install_phases_put_schema_init_after_provisioning_and_refuse_unplaced_pod_owners() -> None:
+    # Clusterless control for the partition KindCluster.install applies: the
+    # base's objects plus a K7-style Secret land in the order a cold install
+    # needs, and a pod owner the order does not name is refused rather than
+    # guessed into prerequisites, where it would start before schema-init.
+    def rendered(kind: str, name: str) -> tuple[Path, dict]:
+        return Path(f"{kind.lower()}_{name}.yaml"), {"kind": kind, "metadata": {"name": name}}
+
+    objects = [
+        rendered("ConfigMap", "elspeth-web-config"),
+        rendered("PersistentVolumeClaim", "elspeth-state"),
+        rendered("Service", "elspeth-web"),
+        rendered("Deployment", "elspeth-web"),
+        rendered("Job", "elspeth-provision-storage"),
+        rendered("Job", "elspeth-schema-init"),
+        rendered("Secret", "elspeth-web-composer-stall"),
+    ]
+    placed = {
+        phase: sorted(f"{document['kind']}/{document['metadata']['name']}" for _path, document in entries)
+        for phase, entries in KindCluster.install_phases(objects).items()
+    }
+    assert placed == {
+        "prerequisites": [
+            "ConfigMap/elspeth-web-config",
+            "Job/elspeth-provision-storage",
+            "PersistentVolumeClaim/elspeth-state",
+            "Secret/elspeth-web-composer-stall",
+        ],
+        "schema": ["Job/elspeth-schema-init"],
+        "workload": ["Deployment/elspeth-web", "Service/elspeth-web"],
+    }, placed
+    for kind, name in (("Job", "elspeth-doctor-runtime"), ("StatefulSet", "elspeth-web")):
+        with pytest.raises(AssertionError, match=f"{kind}/{name} owns pods but has no place in the cold-install order"):
+            KindCluster.install_phases([*objects, rendered(kind, name)])
+
+
+def test_cold_install_never_creates_schema_init_before_storage_is_provisioned(kind_cluster: KindCluster, tmp_path: Path) -> None:
+    # A namespace and a hostPath volume no other test touches, so /mnt/elspeth
+    # holds no data, data/blobs or payloads until the provisioner makes them.
+    # The overlay is kind-test's ConfigMap, claim and two Jobs only (NodePort
+    # 30451 stays with K4's Service), and it holds the provisioner's own
+    # container back COLD_PROVISION_DELAY_SECONDS behind an init container. A
+    # schema-init created alongside it would start inside that window (its
+    # image is preloaded) and fail data_dir_writable for good; Step 6 of this
+    # task proves exactly that by swapping install() for one `apply -k`.
+    kind_cluster.kubectl("create", "namespace", COLD_NAMESPACE)
+    try:
+        for secret in ("elspeth-web-secrets", "elspeth-schema-owner-secrets"):
+            kind_cluster.copy_secret(secret, namespace=COLD_NAMESPACE, directory=tmp_path)
+        kind_cluster.install(COLD_INSTALL_OVERLAY)  # raises with the Job log if either Job fails
+
+        provision = kind_cluster.job_times("elspeth-provision-storage", namespace=COLD_NAMESPACE)
+        schema_init = kind_cluster.job_times("elspeth-schema-init", namespace=COLD_NAMESPACE)
+        # The window was really open: provisioning took at least the hold.
+        assert (provision.completed - provision.started).total_seconds() >= COLD_PROVISION_DELAY_SECONDS, provision
+        # And schema-init did not exist until provisioning had completed.
+        assert schema_init.created >= provision.completed, (provision, schema_init)
+    finally:
+        kind_cluster.kubectl("delete", "namespace", COLD_NAMESPACE, "--ignore-not-found=true", "--wait=true")
+        kind_cluster.kubectl("delete", "persistentvolume", COLD_VOLUME, "--ignore-not-found=true", "--wait=true")
+```
+
+The diagnostics a failing kind proof must carry are unit-tested without a cluster; the live proof is Step 6's deliberately failing control.
+
+```python
+# tests/unit/deployment/test_kind_diagnostics.py
+"""The kind lane's failure diagnostics: redaction, bounding, and a read that never raises.
+
+Default selection (no marker): these run without kind, kubectl or Docker. The
+live proof that a failing kind test carries the diagnostics into the retained
+smoke log is K4 Step 6's deliberately failing control.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from tests.testcontainer.deployment.kind_harness import (
+    DIAGNOSTICS_MAX_CHARS,
+    REDACTED,
+    KindCluster,
+    redact_and_bound,
+)
+
+VALUE_A = "minted-a-7Qx"
+VALUE_B = "minted-b-9Zk"
+
+
+def test_minted_values_are_redacted_and_other_lines_survive() -> None:
+    text = f"ready\npassword is {VALUE_A} here\nkey {VALUE_B}\n"
+    assert redact_and_bound(text, [VALUE_A, VALUE_B]).splitlines() == ["ready", f"password is {REDACTED} here", f"key {REDACTED}"]
+
+
+def test_a_value_the_caller_did_not_name_survives() -> None:
+    # Control: the helper redacts only what it is given, so the pass above is not vacuous.
+    assert VALUE_A in redact_and_bound(f"value {VALUE_A}", [VALUE_B])
+
+
+@pytest.mark.parametrize("scheme", ["postgresql+psycopg", "postgresql", "postgres", "POSTGRESQL+PSYCOPG"])
+def test_a_database_url_line_is_replaced_whole(scheme: str) -> None:
+    url_line = "connecting to " + scheme + "://someone@db:5432/elspeth_sessions"
+    out = redact_and_bound(f"before\n{url_line}\nafter", [])
+    assert out.splitlines() == ["before", f"{REDACTED} (line carried a database URL)", "after"]
+    assert "://" not in out
+
+
+def test_a_longer_value_is_redacted_before_a_value_it_contains() -> None:
+    assert redact_and_bound(f"x {VALUE_A}-long y", [VALUE_A, f"{VALUE_A}-long"]) == f"x {REDACTED} y"
+
+
+def test_an_empty_value_is_ignored() -> None:
+    assert redact_and_bound("plain", ["", VALUE_A]) == "plain"
+
+
+def test_only_the_last_lines_are_kept_with_a_count_of_what_was_cut() -> None:
+    out = redact_and_bound("\n".join(f"line {n}" for n in range(10)), [], max_lines=3)
+    assert out.splitlines() == ["[7 earlier lines omitted]", "line 7", "line 8", "line 9"]
+
+
+def test_diagnostics_never_raise_when_kubectl_cannot_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))  # no kubectl on PATH: every read fails to start
+    cluster = KindCluster(
+        cluster_name="unit",
+        kubeconfig=tmp_path / "kubeconfig",
+        passwords={"postgres": VALUE_A},
+        secret_values=(VALUE_B,),
+    )
+    out = cluster.diagnostics(f"unit failure {VALUE_A} {VALUE_B}")
+    assert f"reason: unit failure {REDACTED} {REDACTED}" in out
+    assert "could not run" in out
+    assert VALUE_A not in out and VALUE_B not in out
+    assert len(out) <= DIAGNOSTICS_MAX_CHARS
 ```
 
 - [ ] **Step 2: Register the marker, exclude it from the default selection, and run the new file to verify it fails for the right reason.**
@@ -430,10 +599,13 @@ def test_provider_free_run_completes_and_its_outputs_are_served_by_the_other_rep
 ```
 
 Run: `cd "$(git rev-parse --show-toplevel)" && pytest tests/testcontainer/deployment --collect-only -q -n 0 > /tmp/klane-k4-step2-default.log 2>&1; echo exit=$?; tail -3 /tmp/klane-k4-step2-default.log`
-Expected: the last line reads `3 deselected` and no test id is listed (the default `-m` excludes the marker).
+Expected: the last line reads `5 deselected` and no test id is listed (the default `-m` excludes the marker).
 
 Run: `cd "$(git rev-parse --show-toplevel)" && pytest tests/testcontainer/deployment -m kind -n 0 > /tmp/klane-k4-step2-kind.log 2>&1; echo exit=$?; tail -5 /tmp/klane-k4-step2-kind.log`
 Expected: exit 2 (collection interrupted): `ModuleNotFoundError: No module named 'tests.testcontainer.deployment.kind_harness'` — the harness module and the conftest do not exist yet. (`tests/__init__.py` makes `tests` a regular package and PEP 420 makes `tests.testcontainer.deployment` an importable namespace portion beneath it, the same path `tests/testcontainer/web/conftest.py:16` takes for `tests.helpers.postgres_target`; measured: `import tests.testcontainer.web.conftest` resolves from the repo root.)
+
+Run: `cd "$(git rev-parse --show-toplevel)" && pytest tests/unit/deployment/test_kind_diagnostics.py -n 0 > /tmp/klane-k4-step2-diagnostics.log 2>&1; echo exit=$?; tail -5 /tmp/klane-k4-step2-diagnostics.log`
+Expected: exit 2 (collection interrupted): `ModuleNotFoundError: No module named 'tests.testcontainer.deployment.kind_harness'`, the same missing module as above; the unit file imports `redact_and_bound`, `REDACTED`, `DIAGNOSTICS_MAX_CHARS` and `KindCluster` from it.
 
 - [ ] **Step 3: Write the harness module and the session fixture.**
 
@@ -445,24 +617,32 @@ name; the conftest holds only the fixture and the lane's admission rule.
 """The handle the ``kind``-marked deployment proofs hold on their cluster.
 
 ``KindCluster`` is constructed once per session by ``conftest.kind_cluster``
-and does three things for the tests: runs ``kubectl`` against the session's
+and does four things for the tests: runs ``kubectl`` against the session's
 kubeconfig, builds database URLs for the roles the fixture minted (with
-``sqlalchemy.engine.URL.create`` — no credential-shaped literal anywhere), and
+``sqlalchemy.engine.URL.create`` — no credential-shaped literal anywhere),
 addresses one pod directly through a ``kubectl port-forward`` so a test can
-choose which replica answers despite the Service's ClientIP affinity.
+choose which replica answers despite the Service's ClientIP affinity, and
+reads bounded, redacted failure diagnostics off the live cluster
+(``KindCluster.diagnostics``), which the conftest attaches to a failing report
+before the session's cleanup deletes the cluster.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
+import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import httpx
+import pytest
+import yaml
 from sqlalchemy.engine import URL
 
 HERE = Path(__file__).parent / "kubernetes"
@@ -490,6 +670,31 @@ RUNTIME_SECRETS: Mapping[str, str] = {
     "elspeth-web-secrets-a": "elspeth_runtime_a",
     "elspeth-web-secrets-b": "elspeth_runtime_b",
 }
+# The cold-install order. prerequisites: every object a pod needs before it
+# starts (ConfigMap, claim, a harness PersistentVolume or Secret) plus the root
+# provisioner Job; schema: the schema-owner doctor Job; workload: what serves
+# traffic. K1's base ships exactly these two Jobs (its inventory test pins
+# them), so any other pod owner is refused, never guessed into a phase.
+INSTALL_PHASES: tuple[str, ...] = ("prerequisites", "schema", "workload")
+PROVISION_STORAGE_JOB = "elspeth-provision-storage"
+SCHEMA_INIT_JOB = "elspeth-schema-init"
+WORKLOAD_KINDS = frozenset({"Deployment", "Service", "Ingress"})
+POD_OWNER_KINDS = frozenset({"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"})
+# Failure diagnostics (conftest.pytest_runtest_makereport and the fixture's
+# setup-failure note). Bounded so a failure cascade cannot flood the retained
+# smoke log; redacted so that log can be uploaded.
+REDACTED = "<redacted>"
+DIAGNOSTICS_SECTION = "kind cluster diagnostics"
+DIAGNOSTICS_MAX_COLLECTIONS = 3  # per session; the lane refuses xdist, so one process holds the count
+DIAGNOSTICS_MAX_LINES = 120  # per kubectl read; the tail is kept
+DIAGNOSTICS_MAX_PODS = 12
+DIAGNOSTICS_MAX_CHARS = 65536  # per collection
+DIAGNOSTICS_COMMAND_TIMEOUT = 20.0
+DIAGNOSTICS_BUDGET_SECONDS = 120.0  # per collection: a hung API server cannot stall the session
+# Any PostgreSQL URL scheme, driver suffix included, in any case. A line that
+# carries one may embed a password this process never minted, so the whole
+# line is replaced.
+_DATABASE_URL = re.compile(r"postgres(?:ql)?(?:\+\w+)?://", re.IGNORECASE)
 
 
 def free_port() -> int:
@@ -506,13 +711,48 @@ def write_env_file(directory: Path, name: str, values: Mapping[str, str]) -> Pat
     return path
 
 
+def redact_and_bound(text: str, secret_values: Iterable[str], *, max_lines: int = DIAGNOSTICS_MAX_LINES) -> str:
+    """The last ``max_lines`` lines of ``text``, every given value replaced by ``REDACTED``.
+
+    A line carrying a PostgreSQL URL is replaced whole. Longer values are
+    replaced first, so a value that contains another is never half-redacted.
+    Lines are dropped whole, so the cut never splits a value.
+    """
+    values = sorted({value for value in secret_values if value}, key=len, reverse=True)
+    lines = text.splitlines()
+    omitted = max(0, len(lines) - max_lines)
+    kept = [f"[{omitted} earlier lines omitted]"] if omitted else []
+    for line in lines[omitted:]:
+        if _DATABASE_URL.search(line):
+            kept.append(f"{REDACTED} (line carried a database URL)")
+            continue
+        for value in values:
+            line = line.replace(value, REDACTED)
+        kept.append(line)
+    return "\n".join(kept)
+
+
+@dataclass(frozen=True)
+class JobTimes:
+    """The lifecycle stamps of a completed Job, as the API server records them."""
+
+    created: datetime
+    started: datetime
+    completed: datetime
+
+
 @dataclass(frozen=True)
 class KindCluster:
     """Handle on the session's cluster; ``conftest.kind_cluster`` constructs it."""
 
     cluster_name: str
     kubeconfig: Path
-    passwords: Mapping[str, str]
+    # repr=False: pytest prints a failing test's arguments with repr(), and the
+    # smoke log that output lands in is uploaded, so no minted value may be in it.
+    passwords: Mapping[str, str] = field(repr=False)
+    # Minted values that are not role passwords (the shared SECRET_KEY and the
+    # link-signing key): redacted from diagnostics with every ``passwords`` value.
+    secret_values: tuple[str, ...] = field(default=(), repr=False, compare=False)
     _forwards: dict[str, tuple[subprocess.Popen[bytes], int]] = field(default_factory=dict, repr=False, compare=False)
 
     def kubectl(self, *args: str) -> str:
@@ -524,6 +764,100 @@ class KindCluster:
         )
         assert result.returncode == 0, f"kubectl {' '.join(args)} failed (exit={result.returncode}):\n{result.stderr}"
         return result.stdout
+
+    @staticmethod
+    def install_phases(rendered: list[tuple[Path, dict]]) -> dict[str, list[tuple[Path, dict]]]:
+        """Place each rendered object in the cold-install order, or refuse it.
+
+        ``Job/elspeth-schema-init`` is ``schema``; every Deployment, Service and
+        Ingress is ``workload``; everything else, the provisioner Job included,
+        is ``prerequisites``. Any other object that owns pods (a new Job, a
+        StatefulSet) raises with its kind and name: guessed into
+        ``prerequisites`` it would start before the schema exists.
+        """
+        phases: dict[str, list[tuple[Path, dict]]] = {phase: [] for phase in INSTALL_PHASES}
+        for path, document in rendered:
+            kind, name = document["kind"], document["metadata"]["name"]
+            if kind == "Job" and name == SCHEMA_INIT_JOB:
+                phases["schema"].append((path, document))
+            elif kind in WORKLOAD_KINDS:
+                phases["workload"].append((path, document))
+            elif kind in POD_OWNER_KINDS and not (kind == "Job" and name == PROVISION_STORAGE_JOB):
+                raise AssertionError(f"{kind}/{name} owns pods but has no place in the cold-install order {INSTALL_PHASES}")
+            else:
+                phases["prerequisites"].append((path, document))
+        return phases
+
+    def install(self, overlay: Path, *, timeout: float = 600.0) -> None:
+        """Apply ``overlay`` phase by phase; return once every Job it carries is ``Complete``.
+
+        The overlay is rendered once (``kubectl kustomize -o <dir>`` writes one
+        file per object, measured in Task K8) and each phase's files are applied
+        only after the previous phase's Jobs completed, so schema-init is never
+        created before the share is provisioned and no Deployment exists before
+        the schema. The rendered bytes are applied as kustomize wrote them; the
+        YAML is parsed only to classify. Deployments are not waited here: the
+        caller owns ``rollout status``. On a warm cluster the same call leaves
+        unchanged objects unchanged and recreates and waits any Job the 600 s TTL
+        reaped.
+        """
+        with tempfile.TemporaryDirectory(prefix="kind-install-") as scratch:
+            render = Path(scratch)
+            self.kubectl("kustomize", str(overlay), "-o", str(render))
+            rendered = [(path, yaml.safe_load(path.read_text(encoding="utf-8"))) for path in sorted(render.glob("*.yaml"))]
+            phases = self.install_phases(rendered)
+            for phase in INSTALL_PHASES:
+                if not phases[phase]:
+                    continue
+                self.kubectl("apply", *[argument for path, _document in phases[phase] for argument in ("-f", str(path))])
+                for _path, document in phases[phase]:
+                    if document["kind"] == "Job":
+                        namespace = document["metadata"].get("namespace", "default")
+                        self.wait_job(document["metadata"]["name"], namespace=namespace, timeout=timeout)
+
+    def wait_job(self, name: str, *, namespace: str = "default", timeout: float = 600.0) -> None:
+        """Wait for the ``Complete`` condition, or fail NOW with the Job's logs — never sit on a failed Job until the timeout.
+
+        ``Complete`` rather than ``status.succeeded``: the Job controller stamps
+        ``status.completionTime`` together with that condition, so an object
+        created after this returns is provably created after the Job completed.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = json.loads(self.kubectl("get", "job", name, "-n", namespace, "-o", "json"))["status"]
+            conditions = {condition["type"]: condition["status"] for condition in status.get("conditions", [])}
+            if conditions.get("Complete") == "True":
+                return
+            if status.get("failed", 0) >= 1 or conditions.get("Failed") == "True":
+                logs = self.kubectl("logs", f"job/{name}", "-n", namespace, "--all-containers", "--tail=100")
+                safe = "\n".join(line for line in logs.splitlines() if "postgresql+psycopg://" not in line)
+                raise AssertionError(f"job/{name} failed:\n{safe}")
+            time.sleep(3)
+        raise AssertionError(f"job/{name} did not complete within {timeout}s")
+
+    def job_times(self, name: str, *, namespace: str = "default") -> JobTimes:
+        """Creation, start and completion of a completed Job (``KeyError`` on one that has not completed)."""
+        job = json.loads(self.kubectl("get", "job", name, "-n", namespace, "-o", "json"))
+        return JobTimes(
+            created=datetime.fromisoformat(job["metadata"]["creationTimestamp"]),
+            started=datetime.fromisoformat(job["status"]["startTime"]),
+            completed=datetime.fromisoformat(job["status"]["completionTime"]),
+        )
+
+    def copy_secret(self, name: str, *, namespace: str, directory: Path) -> None:
+        """Copy one fixture Secret from ``default`` into ``namespace`` through a 0600 file, never argv."""
+        source = json.loads(self.kubectl("get", "secret", name, "-o", "json"))
+        copy = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": source["type"],
+            "metadata": {"name": name, "namespace": namespace},
+            "data": source["data"],
+        }
+        path = directory / f"{namespace}-{name}.json"
+        path.touch(mode=0o600)
+        path.write_text(json.dumps(copy), encoding="utf-8")
+        self.kubectl("apply", "-f", str(path))
 
     def node_port(self, service: str) -> int:
         return int(json.loads(self.kubectl("get", "svc", service, "-o", "json"))["spec"]["ports"][0]["nodePort"])
@@ -570,11 +904,80 @@ class KindCluster:
         for proc, _port in self._forwards.values():
             proc.terminate()
         self._forwards.clear()
+
+    def _capture(self, args: tuple[str, ...], *, deadline: float) -> tuple[bool, str]:
+        """One diagnostic kubectl read as ``(ok, text)``: a failure, timeout or spent budget is text, never an exception."""
+        command = f"kubectl {' '.join(args)}"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, f"({command} skipped: the {DIAGNOSTICS_BUDGET_SECONDS:.0f}s diagnostics budget is spent)"
+        timeout = min(DIAGNOSTICS_COMMAND_TIMEOUT, remaining)
+        try:
+            result = subprocess.run(
+                ["kubectl", "--kubeconfig", str(self.kubeconfig), f"--request-timeout={max(1, int(timeout))}s", *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"({command} timed out after {timeout:.0f}s)"
+        except OSError as exc:
+            return False, f"({command} could not run: {exc!r})"
+        if result.returncode != 0:
+            return False, f"({command} exit={result.returncode})\n{result.stderr}"
+        return True, result.stdout
+
+    def diagnostics(self, reason: str) -> str:
+        """Bounded, redacted state of the live cluster, for a failure report.
+
+        Reads, in the default namespace: the workload objects, the events,
+        then for each pod (at most ``DIAGNOSTICS_MAX_PODS``) ``describe`` and
+        the log tail of every container, plus the previous container's tail
+        when one restarted. It never reads a Secret, a resolved environment or
+        an ``-o yaml``/``-o json`` dump, and every block passes through
+        ``redact_and_bound`` with every value this session minted. It never
+        raises on a kubectl failure: a dead API server yields the error text.
+        """
+        minted = (*self.passwords.values(), *self.secret_values)
+        deadline = time.monotonic() + DIAGNOSTICS_BUDGET_SECONDS
+        blocks = [redact_and_bound(f"reason: {reason}", minted)]
+        listed, names = self._capture(("get", "pods", "-o", "jsonpath={.items[*].metadata.name}"), deadline=deadline)
+        if not listed:
+            blocks.append(f"$ kubectl get pods (names)\n{redact_and_bound(names, minted)}")
+        pods = names.split()[:DIAGNOSTICS_MAX_PODS] if listed else []
+        reads: list[tuple[str, ...]] = [
+            ("get", "pods,jobs,deployments,statefulsets,services,pvc", "-o", "wide"),
+            ("get", "events", "--sort-by=.metadata.creationTimestamp"),
+        ]
+        for pod in pods:
+            reads.append(("describe", f"pod/{pod}"))
+            reads.append(("logs", f"pod/{pod}", "--all-containers", f"--tail={DIAGNOSTICS_MAX_LINES}"))
+        for args in reads:
+            _ok, text = self._capture(args, deadline=deadline)
+            blocks.append(f"$ kubectl {' '.join(args)}\n{redact_and_bound(text, minted)}")
+        for pod in pods:
+            args = ("logs", f"pod/{pod}", "--all-containers", "--previous", f"--tail={DIAGNOSTICS_MAX_LINES}")
+            restarted, text = self._capture(args, deadline=deadline)
+            if restarted and text.strip():
+                blocks.append(f"$ kubectl {' '.join(args)}\n{redact_and_bound(text, minted)}")
+        report = "\n\n".join(blocks)
+        if len(report) > DIAGNOSTICS_MAX_CHARS:
+            notice = f"\n[diagnostics cut at {DIAGNOSTICS_MAX_CHARS} characters]"
+            report = report[: DIAGNOSTICS_MAX_CHARS - len(notice)] + notice
+        return report
+
+
+# The live cluster while the session fixture holds it (set after `kind create`,
+# removed before `kind delete`), and the node ids already given a full read
+# this session. Only conftest's report hook and the fixture use them.
+CLUSTER_KEY: pytest.StashKey[KindCluster] = pytest.StashKey()
+DIAGNOSTICS_KEY: pytest.StashKey[list[str]] = pytest.StashKey()
 ```
 
 ```python
 # tests/testcontainer/deployment/conftest.py
-"""One kind cluster per pytest session for the ``kind``-marked deployment proofs.
+r"""One kind cluster per pytest session for the ``kind``-marked deployment proofs.
 
 The fixture owns the whole harness so the tests only apply overlays and talk
 HTTP and SQL: tool presence (skip locally, fail under ELSPETH_CI_KIND_REQUIRED),
@@ -584,35 +987,55 @@ ReadWriteMany PersistentVolume, PostgreSQL 16 with the two databases and the
 five roles the base and the acceptance overlay bind to
 (``kubernetes/02-roles.sql`` runs ``deploy/kubernetes/base/bootstrap-acceptance-roles.sql``,
 which ``\ir``-includes ``bootstrap-roles.sql``), the runtime and schema-owner
-Secrets, and teardown. Every credential is minted per session: nothing
-credential-shaped lives in a tracked file.
+Secrets, failure diagnostics, and teardown. Every credential is minted per
+session: nothing credential-shaped lives in a tracked file.
+
+Failure diagnostics are read off the LIVE cluster at the moment of failure,
+never afterwards: ``pytest_runtest_makereport`` attaches them to the failing
+setup, call or teardown report (pytest prints that section into the same
+output the smoke script retains), and a harness step that fails before
+``yield`` attaches them to its exception. The cluster is deleted by a
+``config.add_cleanup`` callback, which pytest runs after the last report of
+the session is built. A fixture ``finally`` would run too early: the last
+item's teardown runs every session finalizer before that item's teardown
+report exists, so a failing module-fixture teardown on the last item (K5's
+probe lane in the full run) would find the cluster gone. Later tests may
+replace the failed workload (K5's probe lane deletes K4's Deployment) and the
+cluster is gone once pytest exits, so nothing outside this process can read
+what the failure saw.
 """
 
 from __future__ import annotations
 
 import base64
+import functools
 import os
 import secrets
 import shutil
 import subprocess
+import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator, Mapping
 from pathlib import Path
 
 import pytest
-from xdist import is_xdist_worker
-
 from tests.testcontainer.deployment.kind_harness import (
     ACCEPTANCE_ROLES_SQL,
     BASE_ROLES_SQL,
+    CLUSTER_KEY,
+    DIAGNOSTICS_KEY,
+    DIAGNOSTICS_MAX_COLLECTIONS,
+    DIAGNOSTICS_SECTION,
     HERE,
     IMAGE,
     PASSWORD_ENV,
     REPO_ROOT,
     RUNTIME_SECRETS,
     KindCluster,
+    redact_and_bound,
     write_env_file,
 )
+from xdist import is_xdist_worker
 
 _SEQUENTIAL_COMMAND = "scripts/cicd/kubernetes-kind-smoke.sh (uv run --frozen pytest -q -n 0 -m kind tests/testcontainer/deployment)"
 
@@ -629,25 +1052,88 @@ def _require_kind_lane(request: pytest.FixtureRequest) -> None:
         pytest.skip(f"{tool} is not installed: the kind lane cannot run here ({_SEQUENTIAL_COMMAND} installs the pinned tools)")
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item: pytest.Item) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    """Attach live-cluster diagnostics to a failed report while the cluster still exists.
+
+    Fires for setup, call and teardown failures of any test function under
+    this directory that uses ``kind_cluster`` (K4's proofs, K5's probe lane,
+    K7's overlay tests), including a failure in a fixture layered on it and a
+    module-fixture teardown failure on the session's last item: the cluster is
+    deleted by ``_delete_cluster``, a ``config.add_cleanup`` callback that
+    pytest runs after every report. Skips and xfails are not failures. The
+    first ``DIAGNOSTICS_MAX_COLLECTIONS`` failures of the session get a full
+    read; later ones get a one-line notice. When ``kind_cluster`` itself failed
+    before ``yield``, its exception carries the diagnostics as a note and the
+    fixture has already removed the stash entry, so the tests that re-raise it
+    add no section. Never raises: a collector defect becomes the section text.
+    """
+    report = yield
+    if not report.failed or not isinstance(item, pytest.Function) or "kind_cluster" not in item.fixturenames:
+        return report
+    cluster = item.config.stash.get(CLUSTER_KEY, None)
+    if cluster is None:
+        return report
+    captured = item.config.stash.setdefault(DIAGNOSTICS_KEY, [])
+    if len(captured) >= DIAGNOSTICS_MAX_COLLECTIONS:
+        text = f"not collected: the first {DIAGNOSTICS_MAX_COLLECTIONS} failures of this session already carry cluster diagnostics ({', '.join(captured)})"
+    else:
+        captured.append(item.nodeid)
+        try:
+            text = cluster.diagnostics(f"{item.nodeid} failed during {report.when}")
+        except Exception as exc:  # the failure report must survive a defect in the collector
+            text = redact_and_bound(f"diagnostics collection failed: {exc!r}", (*cluster.passwords.values(), *cluster.secret_values))
+    report.sections.append((f"{DIAGNOSTICS_SECTION} ({report.when})", text))
+    return report
+
+
+def _delete_cluster(config: pytest.Config, cluster: KindCluster, env: Mapping[str, str]) -> None:
+    """Delete the session's cluster. ``kind_cluster`` registers this with ``config.add_cleanup``.
+
+    pytest runs config cleanups after the session's last report, so every
+    failure report, the last item's teardown report included, was built while
+    the cluster existed. The stash entry is already gone when the fixture's
+    own setup failed. ``kind delete`` output stays out of the retained log
+    unless the delete fails.
+    """
+    if CLUSTER_KEY in config.stash:
+        del config.stash[CLUSTER_KEY]
+    cluster.close_forwards()
+    result = subprocess.run(
+        ["kind", "delete", "cluster", "--name", cluster.cluster_name],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        print(f"kind delete cluster --name {cluster.cluster_name} failed (exit={result.returncode}):\n{result.stderr}", file=sys.stderr)
+
+
 @pytest.fixture(scope="session")
 def kind_cluster(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> Iterator[KindCluster]:
     _require_kind_lane(request)
     work = tmp_path_factory.mktemp("kind")
-    # The smoke script exports both so its failure trap can inspect and delete
-    # the cluster; a bare pytest run gets a throwaway name and kubeconfig.
+    # The smoke script exports both so its EXIT trap can delete a cluster that
+    # outlived pytest; a bare pytest run gets a throwaway name and kubeconfig.
+    # Either way this process deletes the cluster it created (``_delete_cluster``),
+    # after every failure diagnostic of the session has been read.
     name = os.environ.get("ELSPETH_KIND_CLUSTER_NAME") or f"elspeth-{uuid.uuid4().hex[:8]}"
     kubeconfig = Path(os.environ.get("KUBECONFIG") or work / "kubeconfig")
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     passwords = {role: secrets.token_urlsafe(24) for role in PASSWORD_ENV}
     secret_key = secrets.token_hex(32)  # 64 chars: above the 32-byte floor for non-local hosts (config.py:46)
     signing_key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")  # the `openssl rand -base64 32` recipe (config.py:594)
-    cluster = KindCluster(cluster_name=name, kubeconfig=kubeconfig, passwords=passwords)
+    cluster = KindCluster(cluster_name=name, kubeconfig=kubeconfig, passwords=passwords, secret_values=(secret_key, signing_key))
 
     subprocess.run(
         ["kind", "create", "cluster", "--name", name, "--config", str(HERE / "kind-config.yaml"), "--wait", "120s"],
         check=True,
         env=env,
     )
+    request.config.stash[CLUSTER_KEY] = cluster
+    # Deleted at config cleanup, not in a ``finally``: see ``_delete_cluster``.
+    request.config.add_cleanup(functools.partial(_delete_cluster, request.config, cluster, env))
     try:
         subprocess.run(["docker", "build", "-t", IMAGE, str(REPO_ROOT)], check=True)
         subprocess.run(["kind", "load", "docker-image", IMAGE, "--name", name], check=True, env=env)
@@ -658,7 +1144,9 @@ def kind_cluster(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPa
         # bootstrap-roles.sql: all five roles the base and the kind-acceptance
         # overlay bind to (postgresql.yaml mounts the two shipped files under elspeth/).
         cluster.kubectl(
-            "create", "configmap", "kind-postgres-init",
+            "create",
+            "configmap",
+            "kind-postgres-init",
             f"--from-file=01-databases.sql={HERE / '01-databases.sql'}",
             f"--from-file=02-roles.sql={HERE / '02-roles.sql'}",
             f"--from-file=bootstrap-roles.sql={BASE_ROLES_SQL}",
@@ -679,7 +1167,10 @@ def kind_cluster(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPa
             "ELSPETH_WEB__LANDSCAPE_URL": cluster.cluster_database_url("elspeth_schema_owner", "elspeth_landscape"),
         }
         cluster.kubectl(
-            "create", "secret", "generic", "elspeth-schema-owner-secrets",
+            "create",
+            "secret",
+            "generic",
+            "elspeth-schema-owner-secrets",
             f"--from-env-file={write_env_file(work, 'elspeth-schema-owner-secrets', owner)}",
         )
 
@@ -688,11 +1179,31 @@ def kind_cluster(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPa
         # TCP pg_isready, and the entrypoint's init-time server listens on the
         # unix socket alone.
         cluster.kubectl("rollout", "status", "statefulset/postgres", "--timeout=300s")
-        yield cluster
-    finally:
-        cluster.close_forwards()
-        subprocess.run(["kind", "delete", "cluster", "--name", name], check=False, env=env)
+    except Exception as exc:
+        # A harness step failed before any test ran. Read the live cluster now
+        # and attach the diagnostics to the error, then drop the stash entry:
+        # every test that requests the fixture re-raises this same exception,
+        # note included, so the report hook must not spend the session's
+        # diagnostics cap re-reading the same failure.
+        try:
+            collected = cluster.diagnostics(f"kind_cluster setup failed: {exc!r}")
+        except Exception as defect:  # the setup error must survive a defect in the collector
+            collected = redact_and_bound(f"diagnostics collection failed: {defect!r}", (*passwords.values(), secret_key, signing_key))
+        exc.add_note(f"{DIAGNOSTICS_SECTION} (kind_cluster setup)\n{collected}")
+        del request.config.stash[CLUSTER_KEY]
+        raise
+    yield cluster
 ```
+
+Run the diagnostics unit tests now that the helper exists (no kind, kubectl or Docker needed):
+
+Run: `cd "$(git rev-parse --show-toplevel)" && pytest tests/unit/deployment/test_kind_diagnostics.py -n 0 > /tmp/klane-k4-step3-diagnostics.log 2>&1; echo exit=$?; tail -3 /tmp/klane-k4-step3-diagnostics.log`
+Expected: exit 0, `10 passed`. A red `test_a_value_the_caller_did_not_name_survives` means `redact_and_bound` redacts values it was not given; a `FileNotFoundError` out of `test_diagnostics_never_raise_when_kubectl_cannot_run` means `KindCluster._capture` lost its `OSError` arm.
+
+Import the conftest once to prove the hook and the fixture compile against the harness names:
+
+Run: `cd "$(git rev-parse --show-toplevel)" && python -c "import tests.testcontainer.deployment.conftest as c; print(c.pytest_runtest_makereport.__name__, c.kind_cluster.__name__)" > /tmp/klane-k4-step3-import.log 2>&1; echo exit=$?; cat /tmp/klane-k4-step3-import.log`
+Expected: exit 0 and `pytest_runtest_makereport kind_cluster`.
 
 - [ ] **Step 4: Write the harness manifests and the kind-test overlay.**
 
@@ -905,6 +1416,99 @@ Prove the overlay renders offline the way K3's render job will render it:
 Run: `cd "$(git rev-parse --show-toplevel)" && PATH="$PWD/.claude/lanes/k8s/bin:$PATH" kubectl kustomize deploy/kubernetes/overlays/kind-test > /tmp/klane-k4-step4-render.log 2>&1; echo exit=$?; grep -c '^kind:' /tmp/klane-k4-step4-render.log; grep -n 'REPLACE_PER_ROLLOUT\|sha-kindtest\|0.8.1+kindtest\|nodePort\|elspeth-web-test:kind' /tmp/klane-k4-step4-render.log`
 Expected: exit 0; `6` objects (ConfigMap, Deployment, Job, Job, PersistentVolumeClaim, Service); no `REPLACE_PER_ROLLOUT` line; one `sha-kindtest`, one `0.8.1+kindtest`, one `nodePort: 30451`, and every `image:` line for the application reads `elspeth-web-test:kind`. (The pinned kubectl is not on PATH until the smoke script in the next step has installed it once; run that step's install first if `kubectl` is missing.)
 
+The cold-install ordering proof needs a volume no earlier test has provisioned and a
+provisioner slow enough that a schema-init created beside it would start first. It gets
+both from a test-only overlay on `kind-test`, in its own namespace:
+
+```yaml
+# tests/testcontainer/deployment/kubernetes/cold-install-overlay/kustomization.yaml
+# K4 cold-install ordering proof. kind-test's ConfigMap, claim and two Jobs
+# only, in their own namespace on their own fresh hostPath volume, with the
+# provisioner held back so that a schema-init created beside it would start
+# first. Test-only: never a deployment target, never referenced from deploy/,
+# and not rendered by the kubernetes-render job (which walks deploy/kubernetes).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: elspeth-cold
+resources:
+  - ../../../../../deploy/kubernetes/overlays/kind-test
+  - pv-rwx-hostpath.yaml
+patches:
+  # The workload stays in K4's namespace: kind-test's Service claims NodePort
+  # 30451, which is cluster-wide.
+  - target:
+      kind: Deployment
+      name: elspeth-web
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: elspeth-web
+  - target:
+      kind: Service
+      name: elspeth-web
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: elspeth-web
+  - target:
+      kind: PersistentVolumeClaim
+      name: elspeth-state
+    patch: |-
+      - op: replace
+        path: /spec/volumeName
+        value: elspeth-state-rwx-cold
+  # Keep both completed Jobs until the test deletes the namespace, so their
+  # timestamps stay readable however long schema-init takes.
+  - target:
+      kind: Job
+    patch: |-
+      - op: remove
+        path: /spec/ttlSecondsAfterFinished
+  # COLD_PROVISION_DELAY_SECONDS in test_kubernetes_kind.py: the init container
+  # runs to completion before the provisioner's own container starts. Same
+  # busybox digest as K1's job-provision-storage.yaml (K0 §1.3).
+  - target:
+      kind: Job
+      name: elspeth-provision-storage
+    patch: |-
+      - op: add
+        path: /spec/template/spec/initContainers
+        value:
+          - name: hold-provisioning
+            image: docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+            command: ["sleep", "45"]
+```
+
+```yaml
+# tests/testcontainer/deployment/kubernetes/cold-install-overlay/pv-rwx-hostpath.yaml
+# A second single-node hostPath volume for the cold-install proof: a directory
+# no earlier test has provisioned. Same shape as ../pv-rwx-hostpath.yaml,
+# pre-bound to the claim in namespace elspeth-cold; the test deletes it.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: elspeth-state-rwx-cold
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: ""
+  claimRef:
+    name: elspeth-state
+    namespace: elspeth-cold
+  hostPath:
+    path: /var/elspeth-state-cold
+    type: DirectoryOrCreate
+```
+
+Run: `cd "$(git rev-parse --show-toplevel)" && PATH="$PWD/.claude/lanes/k8s/bin:$PATH" kubectl kustomize tests/testcontainer/deployment/kubernetes/cold-install-overlay > /tmp/klane-k4-step4-cold.log 2>&1; echo exit=$?; grep -c '^kind:' /tmp/klane-k4-step4-cold.log; grep -n '^kind:\|^  namespace:\|volumeName:\|ttlSecondsAfterFinished\|hold-provisioning\|nodePort' /tmp/klane-k4-step4-cold.log`
+Expected: exit 0; `5` objects; the `kind:` lines name ConfigMap, PersistentVolume, PersistentVolumeClaim, Job and Job; four `  namespace: elspeth-cold` lines (the ConfigMap, the claim and both Jobs; the PersistentVolume is cluster-scoped, and its `claimRef` namespace is indented deeper than the pattern); one `volumeName: elspeth-state-rwx-cold`; one `name: hold-provisioning`; no `ttlSecondsAfterFinished` line and no `nodePort` line. Any other count means a patch did not match (a `$patch: delete` that missed leaves a Deployment or Service in the render, and `KindCluster.install` would then claim NodePort 30451 a second time).
+
 - [ ] **Step 5: Write the smoke script (one code path for CI and the desk).**
 
 ```bash
@@ -918,9 +1522,13 @@ Expected: exit 0; `6` objects (ConfigMap, Deployment, Job, Job, PersistentVolume
 # tests/testcontainer/deployment/conftest.py builds and loads the image,
 # creates the cluster, PostgreSQL and the Secrets, and deletes the cluster at
 # teardown. The kubernetes-kind CI job calls exactly this script, so a green
-# desk run and a green CI run are the same run. On failure the trap dumps
-# pod state and the web logs (database URLs filtered) and deletes the cluster
-# if the fixture could not.
+# desk run and a green CI run are the same run. Failure diagnostics (object
+# state, events, describe output and container log tails, bounded and
+# redacted) are read by that fixture while the cluster is still alive and
+# printed in pytest's own failure output, which this script writes to the
+# retained log. The EXIT trap runs no kubectl reads (by the time it runs
+# pytest's cleanup has deleted the cluster); it only deletes a cluster that
+# outlived pytest and removes the kubeconfig.
 #
 # Usage: scripts/cicd/kubernetes-kind-smoke.sh [extra pytest args]
 #   ELSPETH_K8S_TOOLS    where the pinned binaries live  (default .claude/lanes/k8s/bin, gitignored)
@@ -957,19 +1565,13 @@ kubectl version --client
 kind version
 docker version --format 'docker {{.Server.Version}}'
 
-# Exported for the fixture, so this trap can find what it created.
+# Exported for the fixture, so this trap can delete what it created if pytest
+# died before its config cleanup could.
 export ELSPETH_KIND_CLUSTER_NAME="elspeth-kind-$(date +%s)-$$"
 export KUBECONFIG="$LOG_DIR/kubeconfig-$ELSPETH_KIND_CLUSTER_NAME"
 
 cleanup() {
     local status=$?
-    if [[ $status -ne 0 ]]; then
-        echo "kind smoke failed (exit=$status); cluster state follows" >&2
-        kubectl get pods -o wide >&2 || true
-        kubectl describe deployment/elspeth-web >&2 || true
-        kubectl logs -l app.kubernetes.io/name=elspeth-web --all-containers --tail=200 2>&1 \
-            | grep -v -i 'postgresql+psycopg://' >&2 || true
-    fi
     kind delete cluster --name "$ELSPETH_KIND_CLUSTER_NAME" >/dev/null 2>&1 || true
     rm -f "$KUBECONFIG"
     exit "$status"
@@ -999,11 +1601,134 @@ facts document together.
 - [ ] **Step 6: Run the smoke twice and record the wall time.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && scripts/cicd/kubernetes-kind-smoke.sh > /tmp/klane-k4-step6-run1.log 2>&1; echo exit=$?; grep -E '^exit=|passed|failed|error' /tmp/klane-k4-step6-run1.log; PATH="$PWD/.claude/lanes/k8s/bin:$PATH" kind get clusters`
-Expected: `exit=0 wall=<n>s`, `3 passed`, and `kind get clusters` prints nothing (the cluster is gone).
+Expected: `exit=0 wall=<n>s`, `5 passed`, and `kind get clusters` prints nothing (the cluster is gone).
 
 Run it a second time with the same command into `/tmp/klane-k4-step6-run2.log` and expect the same three lines: the harness is repeatable from a clean box (the second run reuses the checksum-verified tools and the Docker layer cache, so its wall time is the steady-state number).
 
-If the first test fails in `_wait_job(kind_cluster, "elspeth-schema-init")` with the doctor reporting a red `data_dir`/`blob`/`payload_store` directory check while `elspeth-provision-storage` is still pulling `busybox`, that is a K1 ordering defect (both Jobs are created by one `kubectl apply -k` and the schema-init doctor probes the share); report it against K1 rather than patching the overlay.
+Control the ordering proof before trusting it: it must go red when the order is taken away. In `tests/testcontainer/deployment/test_kubernetes_kind.py`, temporarily replace the line `        kind_cluster.install(COLD_INSTALL_OVERLAY)  # raises with the Job log if either Job fails` with the sequence this task used before the fix (one `apply -k`, then the two waits in order):
+
+```text
+        kind_cluster.kubectl("apply", "-k", str(COLD_INSTALL_OVERLAY))
+        kind_cluster.wait_job("elspeth-provision-storage", namespace=COLD_NAMESPACE)
+        kind_cluster.wait_job("elspeth-schema-init", namespace=COLD_NAMESPACE)
+```
+
+Run: `cd "$(git rev-parse --show-toplevel)" && scripts/cicd/kubernetes-kind-smoke.sh -k cold_install > /tmp/klane-k4-step6-order-control.log 2>&1; echo exit=$?; grep -E '^exit=|passed|failed|job/elspeth-schema-init failed|FAIL (data_dir|payload_store|blob)_writable|FAIL session_schema' /tmp/klane-k4-step6-order-control.log`
+Expected: `exit=1`; `1 failed, 4 deselected`; `AssertionError: job/elspeth-schema-init failed:` followed by the doctor's text report (the Job runs without `--json`, `cli.py:200-204`), which includes `FAIL data_dir_writable: data_dir directory validation failed (FileNotFoundError)`, `FAIL payload_store_writable: payload_store directory validation failed (FileNotFoundError)`, `FAIL blob_writable: blob directory validation failed (FileNotFoundError)` and, because no other test initialized the schemas in this session, `FAIL session_schema: not initialized because the complete preflight failed` (`web/doctor.py:59`, `:72`, `:626`). A pass here means the hold did not open a window (check the render for `hold-provisioning`) and the proof above is not evidence.
+
+Restore the line, run the same command into `/tmp/klane-k4-step6-order-control-restored.log`, and expect `exit=0` and `1 passed, 4 deselected`. Both runs come before this step writes the deliberately failing diagnostics control below, so the deselected ids are K4's other four tests. `-k cold_install` selects only `test_cold_install_never_creates_schema_init_before_storage_is_provisioned`; `test_install_phases_put_schema_init_after_provisioning_and_refuse_unplaced_pod_owners` does not contain `cold_install`.
+
+Then prove that a failing kind proof leaves the live cluster's diagnostics in the retained smoke log, the file the `kubernetes-kind` job uploads. Write this deliberately failing control as an UNTRACKED file. Its name must match `test_*.py`, because the script passes the directory and an explicitly named non-matching path beside it is not collected (measured, see the pytest bullet above); `zz` sorts it after `test_kubernetes_kind.py`, so K4's five tests run first (the cold-install ordering proof deletes its own `elspeth-cold` namespace and volume, so `default` still holds only K4's workload) and both web pods are live, and it makes this module the session's last, which is what its second test needs; and it carries the `kind` marker that `_kind_sources()` pins. It is deleted at the end of this step and never staged.
+
+```python
+# tests/testcontainer/deployment/test_zz_kind_diagnostics_control.py (UNTRACKED: written and deleted in K4 Step 6, never staged)
+"""Deliberately failing control: a failed kind proof must carry the live cluster's diagnostics.
+
+The pod below prints a computed marker, a minted password and a PostgreSQL
+URL, then exits 3. The first test asserts the pod succeeded, so it fails
+while the cluster is alive. The second test is the session's last item and
+its module fixture fails at teardown, which pytest reports only after every
+session finalizer has run. The retained smoke log must then show one
+``kind cluster diagnostics (call)`` and one ``kind cluster diagnostics (teardown)``
+section, each carrying ``control-marker 42`` (computed inside the container,
+so only ``kubectl logs`` against the live pod can produce it; ``describe``
+prints the program text ``6 * 7``) and ``control-secret <redacted>``, and no
+URL anywhere.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+import yaml
+from tests.testcontainer.deployment.kind_harness import IMAGE, KindCluster
+
+pytestmark = pytest.mark.kind
+
+CONTROL_POD = "kind-diagnostics-control"
+PROGRAM = "; ".join(
+    (
+        "import os",
+        "print('control-marker', 6 * 7)",
+        "print('control-secret', os.environ['ELSPETH_RUNTIME_PASSWORD'])",
+        "print('control-url', 'postgresql+psycopg' + '://control@db/x')",
+        "raise SystemExit(3)",
+    )
+)
+POD = {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": {"name": CONTROL_POD},
+    "spec": {
+        "restartPolicy": "Never",
+        "containers": [
+            {
+                "name": "control",
+                "image": IMAGE,
+                "imagePullPolicy": "Never",
+                "command": ["/opt/venv/bin/python", "-c", PROGRAM],
+                # kind-postgres-credentials carries ELSPETH_RUNTIME_PASSWORD, a value KindCluster.passwords holds.
+                "envFrom": [{"secretRef": {"name": "kind-postgres-credentials"}}],
+            }
+        ],
+    },
+}
+
+
+def test_a_failed_proof_carries_the_live_pods_diagnostics(kind_cluster: KindCluster, tmp_path: Path) -> None:
+    manifest = tmp_path / "control-pod.yaml"
+    manifest.write_text(yaml.safe_dump(POD, sort_keys=False), encoding="utf-8")
+    kind_cluster.kubectl("apply", "-f", str(manifest))
+    phase = "Pending"
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        phase = json.loads(kind_cluster.kubectl("get", "pod", CONTROL_POD, "-o", "json"))["status"]["phase"]
+        if phase in {"Succeeded", "Failed"}:
+            break
+        time.sleep(2)
+    # Deliberate: the program exits 3, so the pod ends Failed and this assertion fails.
+    assert phase == "Succeeded", f"control pod ended {phase}; its log tail must appear in the diagnostics section below"
+
+
+@pytest.fixture(scope="module")
+def failing_module_teardown(kind_cluster: KindCluster) -> Iterator[None]:
+    yield
+    # Deliberate: the session's last item. pytest runs this finalizer, then every
+    # session finalizer, and only then builds the teardown report.
+    raise AssertionError("deliberate module-fixture teardown failure on the session's last item")
+
+
+def test_a_last_item_teardown_failure_is_reported_while_the_cluster_lives(kind_cluster: KindCluster, failing_module_teardown: None) -> None:
+    assert kind_cluster.kubectl("get", "pod", CONTROL_POD, "-o", "name").strip() == f"pod/{CONTROL_POD}"
+```
+
+Run: `cd "$(git rev-parse --show-toplevel)" && scripts/cicd/kubernetes-kind-smoke.sh > /tmp/klane-k4-step6-control.log 2>&1; echo exit=$?; log=$(sed -n 's/^exit=[0-9]* wall=[0-9]*s log=//p' /tmp/klane-k4-step6-control.log); echo "log=$log"; grep -E '[0-9]+ failed, [0-9]+ passed' "$log"; grep -c -F 'kind cluster diagnostics (call)' "$log"; grep -c -F 'kind cluster diagnostics (teardown)' "$log"; grep -c -F 'control-marker 42' "$log"; grep -c -F 'control-secret <redacted>' "$log"; grep -c -i -E 'postgres(ql)?(\+[a-z]+)?://' "$log"; grep -c -E '^\$ kubectl logs pod/elspeth-web-[^ ]* --all-containers --tail=' "$log"; grep -c -E '^\(kubectl logs pod/elspeth-web-[^ ]* --all-containers --tail=[0-9]+ (exit=|timed out|could not run|skipped)' "$log"; grep -c -F 'passwords={' "$log"; PATH="$PWD/.claude/lanes/k8s/bin:$PATH" kind get clusters 2>&1`
+Expected: `exit=1`; a `log=` line naming `kind-smoke-<timestamp>.log`; the summary `1 failed, 6 passed, 1 error`; then the eight counts, in order:
+- `1`: one diagnostics section on the first control test's call failure.
+- `1`: one diagnostics section on the last item's teardown failure. pytest built that report after every session finalizer had run, so the cluster was still alive only because `_delete_cluster` runs at config cleanup.
+- `2`: `control-marker 42`, once per section. Only `kubectl logs` against the live pod can print it.
+- `2`: the minted password replaced on each `control-secret` line.
+- `0`: no PostgreSQL URL anywhere in the retained log.
+- `4`: both web pods were listed for a current log tail, in each of the two sections. A `--previous` tail for a restarted container is a separate header that this count excludes.
+- `0`: none of those four listed reads failed, timed out, could not start or was skipped for budget. With the count before it, this is what "both web pods' tails were read in both sections" means. `KindCluster._capture` still writes a header for a failed read, so the header count alone would pass a failed read.
+- `0`: no failing test's `kind_cluster = KindCluster(...)` argument line shows a `passwords` mapping.
+
+Last, `kind get clusters` lists no `elspeth-kind-` cluster: it prints `No kind clusters found.`, or lists only clusters with other names that already existed on the box. The config cleanup deleted the cluster after both reads.
+
+How to read a red:
+- `0` in the second count, or `1` in the third: the last item's teardown report was built after the cluster was deleted.
+- `0` in the third count: the diagnostics were read after deletion or never reached the log.
+- A `control-secret` line carrying anything but `<redacted>`: `KindCluster.passwords` is not reaching `redact_and_bound`.
+- Non-zero in the seventh count: a listed web-pod read failed. Its text follows its `$ kubectl logs` header.
+
+Stop and fix the harness before recording wall times. This control run's `wall=` figure is not a wall-time measurement: the two slots below take the figures from run 1 and run 2 above.
+
+Run: `cd "$(git rev-parse --show-toplevel)" && rm tests/testcontainer/deployment/test_zz_kind_diagnostics_control.py && git status --short --untracked-files=all tests/testcontainer/deployment; echo exit=$?`
+Expected: `exit=0` and no `test_zz_kind_diagnostics_control.py` line (the status lists only this task's own new, not yet staged, files).
 
 Write the measured wall times into the two slots K0 reserved in the facts document (do not add a new section):
 
@@ -1342,7 +2067,7 @@ At `:268` replace `assert "-m testcontainer" in commands` with
 
 - [ ] **Step 10: Run the pin suites and the render check.**
 
-Run: `cd "$(git rev-parse --show-toplevel)" && PATH="$PWD/.claude/lanes/k8s/bin:$PATH" ELSPETH_CI_KUBECTL_REQUIRED=1 pytest tests/unit/deployment/test_kubernetes_bundle.py tests/unit/cicd/test_state_engine_ci_selection.py tests/unit/deployment/test_azure_container_apps_bundle.py -n 0 > /tmp/klane-k4-step10.log 2>&1; echo exit=$?; tail -3 /tmp/klane-k4-step10.log`
+Run: `cd "$(git rev-parse --show-toplevel)" && PATH="$PWD/.claude/lanes/k8s/bin:$PATH" ELSPETH_CI_KUBECTL_REQUIRED=1 pytest tests/unit/deployment/test_kubernetes_bundle.py tests/unit/deployment/test_kind_diagnostics.py tests/unit/cicd/test_state_engine_ci_selection.py tests/unit/deployment/test_azure_container_apps_bundle.py -n 0 > /tmp/klane-k4-step10.log 2>&1; echo exit=$?; tail -3 /tmp/klane-k4-step10.log`
 Expected: exit 0 (the ACA bundle tests skip if `bicep` is absent locally; they are listed because they share `ci-success` assertions).
 
 Run: `cd "$(git rev-parse --show-toplevel)" && actionlint .github/workflows/ci.yaml > /tmp/klane-k4-step10-actionlint.log 2>&1; echo exit=$?` — expected exit 0 when `actionlint` is installed; if it is not, say so in the handoff rather than skipping the mention.
@@ -1353,18 +2078,18 @@ Expected: the kind-lane ids appear only in the `deselected` count; every `test_k
 
 - [ ] **Step 11: Commit.**
 
-Stage first, then run the safety check, then commit: `scripts/branch-safety-check.sh` inspects the STAGED set. The ten created files get `git add -N` because a commit pathspec only selects paths the index knows; then all fifteen paths are staged by name (file paths only, never a directory), the check runs, and the message goes before `--`.
+Stage first, then run the safety check, then commit: `scripts/branch-safety-check.sh` inspects the STAGED set. The thirteen created files get `git add -N` because a commit pathspec only selects paths the index knows; then all eighteen paths are staged by name (file paths only, never a directory), the check runs, and the message goes before `--`.
 
 ```bash
-cd "$(git rev-parse --show-toplevel)" && git add -N deploy/kubernetes/overlays/kind-test/kustomization.yaml tests/testcontainer/deployment/kubernetes/kind-config.yaml tests/testcontainer/deployment/kubernetes/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kubernetes/postgresql.yaml tests/testcontainer/deployment/kubernetes/01-databases.sql tests/testcontainer/deployment/kubernetes/02-roles.sql tests/testcontainer/deployment/kind_harness.py tests/testcontainer/deployment/conftest.py tests/testcontainer/deployment/test_kubernetes_kind.py scripts/cicd/kubernetes-kind-smoke.sh
-git add -- deploy/kubernetes/overlays/kind-test/kustomization.yaml tests/testcontainer/deployment/kubernetes/kind-config.yaml tests/testcontainer/deployment/kubernetes/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kubernetes/postgresql.yaml tests/testcontainer/deployment/kubernetes/01-databases.sql tests/testcontainer/deployment/kubernetes/02-roles.sql tests/testcontainer/deployment/kind_harness.py tests/testcontainer/deployment/conftest.py tests/testcontainer/deployment/test_kubernetes_kind.py scripts/cicd/kubernetes-kind-smoke.sh pyproject.toml .github/workflows/ci.yaml tests/unit/deployment/test_kubernetes_bundle.py tests/unit/cicd/test_state_engine_ci_selection.py docs/plans/2026-09-13-kubernetes-platform-facts.md
+cd "$(git rev-parse --show-toplevel)" && git add -N deploy/kubernetes/overlays/kind-test/kustomization.yaml tests/testcontainer/deployment/kubernetes/kind-config.yaml tests/testcontainer/deployment/kubernetes/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kubernetes/postgresql.yaml tests/testcontainer/deployment/kubernetes/01-databases.sql tests/testcontainer/deployment/kubernetes/02-roles.sql tests/testcontainer/deployment/kubernetes/cold-install-overlay/kustomization.yaml tests/testcontainer/deployment/kubernetes/cold-install-overlay/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kind_harness.py tests/testcontainer/deployment/conftest.py tests/testcontainer/deployment/test_kubernetes_kind.py tests/unit/deployment/test_kind_diagnostics.py scripts/cicd/kubernetes-kind-smoke.sh
+git add -- deploy/kubernetes/overlays/kind-test/kustomization.yaml tests/testcontainer/deployment/kubernetes/kind-config.yaml tests/testcontainer/deployment/kubernetes/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kubernetes/postgresql.yaml tests/testcontainer/deployment/kubernetes/01-databases.sql tests/testcontainer/deployment/kubernetes/02-roles.sql tests/testcontainer/deployment/kubernetes/cold-install-overlay/kustomization.yaml tests/testcontainer/deployment/kubernetes/cold-install-overlay/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kind_harness.py tests/testcontainer/deployment/conftest.py tests/testcontainer/deployment/test_kubernetes_kind.py tests/unit/deployment/test_kind_diagnostics.py scripts/cicd/kubernetes-kind-smoke.sh pyproject.toml .github/workflows/ci.yaml tests/unit/deployment/test_kubernetes_bundle.py tests/unit/cicd/test_state_engine_ci_selection.py docs/plans/2026-09-13-kubernetes-platform-facts.md
 git status --short
 scripts/branch-safety-check.sh --intent commit
-git commit -m "test(deploy): prove two-replica Kubernetes startup and shared state in kind" -- deploy/kubernetes/overlays/kind-test/kustomization.yaml tests/testcontainer/deployment/kubernetes/kind-config.yaml tests/testcontainer/deployment/kubernetes/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kubernetes/postgresql.yaml tests/testcontainer/deployment/kubernetes/01-databases.sql tests/testcontainer/deployment/kubernetes/02-roles.sql tests/testcontainer/deployment/kind_harness.py tests/testcontainer/deployment/conftest.py tests/testcontainer/deployment/test_kubernetes_kind.py scripts/cicd/kubernetes-kind-smoke.sh pyproject.toml .github/workflows/ci.yaml tests/unit/deployment/test_kubernetes_bundle.py tests/unit/cicd/test_state_engine_ci_selection.py docs/plans/2026-09-13-kubernetes-platform-facts.md
+git commit -m "test(deploy): prove two-replica Kubernetes startup and shared state in kind" -- deploy/kubernetes/overlays/kind-test/kustomization.yaml tests/testcontainer/deployment/kubernetes/kind-config.yaml tests/testcontainer/deployment/kubernetes/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kubernetes/postgresql.yaml tests/testcontainer/deployment/kubernetes/01-databases.sql tests/testcontainer/deployment/kubernetes/02-roles.sql tests/testcontainer/deployment/kubernetes/cold-install-overlay/kustomization.yaml tests/testcontainer/deployment/kubernetes/cold-install-overlay/pv-rwx-hostpath.yaml tests/testcontainer/deployment/kind_harness.py tests/testcontainer/deployment/conftest.py tests/testcontainer/deployment/test_kubernetes_kind.py tests/unit/deployment/test_kind_diagnostics.py scripts/cicd/kubernetes-kind-smoke.sh pyproject.toml .github/workflows/ci.yaml tests/unit/deployment/test_kubernetes_bundle.py tests/unit/cicd/test_state_engine_ci_selection.py docs/plans/2026-09-13-kubernetes-platform-facts.md
 git show --stat HEAD
 ```
 
-Expected: `git status --short` shows the ten created paths as `A ` and the five modified paths as `M `; the safety check prints no `[FAIL]` line and exits 0 (on a FAIL, stop before the commit); `git show --stat HEAD` ends with `15 files changed`. Any other count means a sibling lane staged into the shared index: `git reset --mixed HEAD~1`, restage only the 15 paths above, and commit again.
+Expected: `git status --short` shows the thirteen created paths as `A ` and the five modified paths as `M ` (and no `test_zz_kind_diagnostics_control.py`, which Step 6 deleted); the safety check prints no `[FAIL]` line and exits 0 (on a FAIL, stop before the commit); `git show --stat HEAD` ends with `18 files changed`. Any other count means a sibling lane staged into the shared index: `git reset --mixed HEAD~1`, restage only the 18 paths above, and commit again.
 
 The pre-commit secret scanner rescans every staged line; nothing here carries
 a URL with a password or a quoted 30+ character secret, so it should pass

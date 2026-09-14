@@ -61,12 +61,55 @@ Decisions this task owns:
    decision value: the CHECK at :3581 is closed and I0 is over.
 4. **Lock order** (`approval_lifecycle_authority.py:3-8`):
    the session lock (`locked_session_transaction`, sessions/locking.py:280),
-   then — only when the requester holds deployment-wide `admin` — the admin
+   then — only when either participant has an unscoped `admin` row — the admin
    population lock (`_ADMIN_HOLDER_ROWS_FOR_UPDATE`, identity_authority.py:797,
    exposed here as `lock_admin_population(conn)`), then both participating
    `identities` rows `FOR UPDATE` in stable identity-id order, then the
-   approvals rows. R8 (:1089) bars an admin approver, so only the requester
-   side can hold admin.
+   approvals rows.
+   **The population probe reads no clock and no revocation**
+   (`_UNSCOPED_ADMIN_ROW`). `_ADMIN_HOLDER_ROWS` (identity_authority.py:774-786,
+   "Expiry and revocation are evaluated in Python against database time")
+   filters neither `revoked_at` nor `expires_at`. So a concurrent
+   `disable_identity` (:2511) or `revoke_role` (:2662) locks the `identities`
+   row of every active human with any unscoped admin row, live or dead, before
+   its own target. A call that skipped the population for such a participant
+   would lock that row outside the population order and can deadlock against
+   them (PostgreSQL aborts one with `40P01`). An unneeded population lock only
+   waits. Both participants are probed: R8 (`_refuse_role_conflict`,
+   identity_authority.py:1075-1083) judges `_active_grants`, so it bars a LIVE
+   admin approver only, and an approver can carry an expired or revoked admin
+   row. The probe is an unlocked read, so an admin grant that commits between
+   the probe and the `identities` locks leaves the fail-safe `40P01` window
+   review B7 records for I4 and I7. The probe is the one I4 and I7 use (review
+   B7).
+   **The clock does not follow the locks: I3 is exempt from LOCK, THEN CLOCK
+   (review B7).** `ApprovalTransactionAuthority.run` reads `database_now` once,
+   directly after the session lock and before `_lock_participants`. `request`,
+   `decide` and `withdraw` judge the approver grant and stamp `requested_at` /
+   `decided_at` with that value. The residual, stated exactly:
+   - An approver grant whose `expires_at` falls inside a wait on the admin
+     population or a participant `identities` row is admitted, and the row it
+     writes can carry a timestamp earlier than the commit of a transaction the
+     call waited on.
+   - The approver's grant rows are read unlocked, after the `identities` locks.
+     A disablement or revocation that committed during the wait is refused:
+     `access_state` is judged on the locked row, and READ COMMITTED re-reads
+     the grant rows. `revoke_role` locks the admin population first and then
+     the role row (identity_authority.py:2662-2666). The population lock is a
+     join `FOR UPDATE` (:777-797), so it also locks `identities` rows, but only
+     those of active humans holding an unscoped `admin` row, live or dead. When
+     either participant holds such a row, the call takes the same population
+     lock first, and a `revoke_role` serialises against it. When neither does,
+     the call skips the population lock and `revoke_role` locks neither
+     participant's `identities` row. A `revoke_role` that commits after the
+     grant read is then not serialised against the call.
+   It is narrower than the I4 case B7 fixed. `run` takes the session lock
+   first, so every approval mutation on one session is serialised before its
+   clock read. No I3 predicate compares timestamps written by different
+   transactions: open and closed is the written `decision IS NULL`, and the
+   order `approved_bindings` returns is not the R2 verdict (decision 8). B7's
+   broken-closure case therefore has no I3 analogue. Adopting the convention
+   changes signatures I9 consumes, so it is open question 5.
 5. **R2 lives in `_assess`** (run_start_permit_authority.py:37), which
    already locks the run row (:42) and therefore has `runs.state_id`; the
    caller passes `approval: ApprovalGateInputs | None` and
@@ -76,10 +119,73 @@ Decisions this task owns:
    so the user-facing refusal and the durable refusal cannot disagree.
 6. **The manifest** (`tests/unit/architecture/test_session_db_mutation_authority.py`)
    already declares `approvals` and `approval_decisions` as `ApprovalAuthority`
-   (:99-109). This task binds the new symbols (:262) and reviews every new
-   write and re-fingerprinted write (:1198); the gate reports drift as an
-   XFAIL whose text lists each site's `fp=` (:18343-18370), and the task is
-   done only when that test reports PASSED.
+   (:99-109). This task binds the new symbols (:262), reviews every new
+   write and re-fingerprinted write (:1198), admits the four
+   `ApprovalTransactionAuthority` reads as read connections (:3954), and
+   re-pins the `line=` of every `identity_authority.py` row that Step 10's
+   `lock_admin_population` insert moves. The gate reports drift as an XFAIL
+   whose text lists each site's `fp=` (:18343-18370). It already XFAILs on a
+   clean HEAD, so the task is done when the XFAIL text shows I1 Step 15's
+   baseline counts and names no site this task touches (Step 12, Step 35).
+7. **Decide is addressed-only.** `decide` admits only the approver the
+   request names (`approvals.approver_identity_id`, NOT NULL,
+   models.py:3614-3619). A caller who is neither that approver nor the
+   requester is refused with `ApprovalNotFound` (404 `approval_not_found`),
+   whatever grant they hold. The check reads the unlocked row directly after
+   the not-found check. That is before the note is validated, before
+   `_lock_participants` takes the admin-population lock or any `identities`
+   row, and before the approval row is locked. `request`'s INSERT is the only
+   writer of `approver_identity_id`, so the unlocked read cannot race a
+   change. A caller who was not asked therefore gets the body an unknown id
+   gets. They learn nothing about the requester's access state or the
+   request's decision state, and they lock nothing on that request beyond the
+   session lock the route's transaction takes for every decide, the same lock
+   I7's inspect takes before a denial. The author passes the check, so
+   `_lock_participants` still refuses them with `ApprovalAuthorIsApprover`.
+   An addressed approver whose grant lapsed after the request still gets
+   `ApproverRoleRequired`. This is the rule
+   I7's inspect predicate (`_OPEN_APPROVAL_ADDRESSED_TO_CALLER`) and I9's
+   mailbox inbox (this task's `_INBOX`) apply, so the three surfaces agree: the
+   approver who sees a request in the inbox is exactly the one who can inspect
+   its frozen state and the one who can decide it. The spec reads role-based
+   (sso-design.md:1416 "Approver eligibility is role-based [rev2.2]", and
+   :1205-1215 for the inbox and inspect), which gives leave cover without
+   re-addressing. Under this rule leave cover means re-addressing. In I9's UI
+   the requester saves a new composition state, which supersedes the open
+   request, and requests again from the covering approver: I9 renders no
+   Withdraw action, and re-requesting the same state while it is open is
+   `ApprovalOpenRequestExists`. Through the API the requester can
+   `POST /api/approvals/{approval_id}/withdraw` and then re-request the same
+   state. Which reading holds is the open
+   I7 operator decision (open question 4). The concurrent-decide guard stays:
+   the addressed approver can still decide twice at once, from two tabs or two
+   replicas.
+8. **Approved-row multiplicity (plan review B3).** `uq_approvals_open_per_state`
+   (models.py:3656-3663) is predicated `decision IS NULL`: it bounds OPEN
+   requests only, and `supersede_open_approvals` and
+   `RepositoryApprovalLifecycleAuthority.apply` (approval_lifecycle_authority.py:21-39)
+   touch `decision IS NULL` rows only. Request → approve → request → approve on
+   one `(session_id, state_id)` therefore leaves several `approved` rows — with
+   equal bindings (a repeated round trip) or different ones (re-approval after
+   an operator moved the catalog snapshot, the policy or a profile binding with
+   no composition edit). R2 reads EVERY approved row. `approved_bindings`
+   returns their bindings in `(decided_at, approval_id)` order, a total order:
+   an approved row always carries `decided_at`, `approval_id` is the primary
+   key, and the tie-break is load-bearing because SQLite's `CURRENT_TIMESTAMP`
+   (`database_now`, database_clock.py:54-87) has one-second resolution.
+   `evaluate_approval_gate` admits when any one of them equals the ENTIRE
+   compiled binding, refuses `APPROVAL_BINDING_MISMATCH` when approved rows
+   exist and none equals it, and refuses `APPROVAL_REQUIRED` when there are
+   none. The verdict is a membership test, so it cannot depend on the order
+   and no row is chosen; the order fixes the returned tuple and, on
+   PostgreSQL, the order in which the `FOR UPDATE` read takes its row locks.
+   Earlier approvals are not retired here: retiring an approved row would be
+   a new supersede transition, and how supersession is audited is open
+   question 1; this rule holds under either ruling, because supersession only
+   ever removes rows from the set R2 reads. No schema change. I9's readiness
+   approval row shows the newest REQUEST for the state, not this verdict (I9
+   decision 6): a newer open or rejected request after an approval shows as
+   waiting or rejected while execute still admits.
 
 **Files:**
 - Create: `src/elspeth/web/coordination/approval_authority.py`
@@ -95,7 +201,7 @@ Decisions this task owns:
 - Modify: `src/elspeth/web/execution/routes.py:1128-1136` (the `except ExecutionSecretApprovalRequired` arm of `execute_pipeline`; the new arm goes directly before it)
 - Modify: `src/elspeth/web/auth/audit.py:45` (`AuthAuditWriter` Protocol; last member `record_relationship_changed`), `:268-287` (`AuthAuditOperation`), `:1140-1180` (after `AuthAuditRecorder.record_relationship_changed`)
 - Modify: `src/elspeth/web/app.py:584-597` (`execution_service = ExecutionServiceImpl(` inside `lifespan` :509; the `approval_authority=` kwarg goes after `principal_is_active=app.state.principal_is_active,` :597), `:1521-1522` (`identity_authority` wiring inside `create_app` :1132; the approval authority goes after it), `:164` (`from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router`; the approvals-router import goes beside it) and `:1782` (`app.include_router(create_identity_admin_router())`; the approvals router is registered on the next line, which is the line I4 anchors its reviews router after)
-- Modify: `tests/unit/architecture/test_session_db_mutation_authority.py:262` (`_NAMED_AUTHORITY_SYMBOLS`), `:1198` (`_REVIEWED_WRITERS`; rows to re-fingerprint: `RepositoryRunStartPermitAuthority._assess` ×3 at :1213-1246, `SessionServiceImpl._insert_composition_state` composition_states insert at :2203-2212, `_RepositoryCompositionStateMutations.append_state` at :2213-2222, `_RepositoryInterpretationMutations.create_or_reconcile_pending` composition_states insert at :2278-2287)
+- Modify: `tests/unit/architecture/test_session_db_mutation_authority.py:262` (`_NAMED_AUTHORITY_SYMBOLS`), `:1198` (`_REVIEWED_WRITERS`; five new `approval_authority.py` write rows; rows to re-fingerprint: `RepositoryRunStartPermitAuthority._assess` ×3 at :1213-1246, `SessionServiceImpl._insert_composition_state` composition_states insert at :2203-2212, `_RepositoryCompositionStateMutations.append_state` at :2213-2222, `_RepositoryInterpretationMutations.create_or_reconcile_pending` composition_states insert at :2278-2287; line-only re-pins, each `line=` plus 13, of the 42 `identity_authority.py` rows at :2905-3330) and `:3954` (`_REVIEWED_READ_CONNECTIONS`; four `ApprovalTransactionAuthority` read rows directly after the `_SessionOperationAuthorityRepository._session_exists` row at :4272-4285; line-only re-pins, each `line=` plus 13, of the ten `identity_authority.py` read rows at :3957-3966 and :4182-4271)
 - Modify: `tests/unit/web/sessions/test_operation_fence_wiring.py:476-490` (the facet-signature pin for `assess_start_admission` / `issue_start_permit`)
 - Modify: `tests/unit/web/execution/test_service.py:751-776` (the two permit fakes on `mock_session_service`)
 - Modify: `tests/unit/web/auth/test_identity_admin_routes.py:50-95` (`_RecordingAuditWriter`, "every `AuthAuditWriter` member, explicit")
@@ -103,7 +209,7 @@ Decisions this task owns:
 - Modify: `tests/unit/web/auth/test_audit.py` (append after `_metadata` :645; helpers `_durable_recorder` :630, `_durable_rows` :634)
 - Modify: `CHANGELOG.md:35-38` (the `**Authentication events in signed exports.**` bullet under `## 0.8.1 - 2026-09-10`; the I3 bullet goes directly after it)
 - Modify: `config/cicd/soft-mapping-census.yaml` (re-pinned by `scripts.check_contracts --write-census`: `ApprovalBinding.from_json(value: Mapping[str, object])` is one new soft parameter)
-- Test (new): `tests/unit/web/coordination/test_approval_authority.py`, `tests/unit/web/coordination/test_r2_execute_gate.py`, `tests/unit/web/coordination/test_state_writers_supersede_approvals.py`, `tests/unit/web/execution/test_approval_gate_wiring.py`, `tests/unit/web/workflow/__init__.py`, `tests/unit/web/workflow/test_approval_routes.py`, `tests/integration/web/workflow/__init__.py`, `tests/integration/web/workflow/test_approvals.py`, `tests/testcontainer/web/test_approval_decide_race_postgres.py`
+- Test (new): `tests/unit/web/coordination/test_approval_authority.py`, `tests/unit/web/coordination/test_r2_execute_gate.py`, `tests/unit/web/coordination/test_state_writers_supersede_approvals.py`, `tests/unit/web/execution/test_approval_gate_wiring.py`, `tests/unit/web/workflow/__init__.py`, `tests/unit/web/workflow/test_approval_routes.py`, `tests/integration/web/workflow/__init__.py`, `tests/integration/web/workflow/test_approvals.py`, `tests/testcontainer/web/test_approval_decide_race_postgres.py`, `tests/testcontainer/web/test_approval_repeat_postgres.py`
 
 **Interfaces:**
 - Consumes:
@@ -118,18 +224,18 @@ Decisions this task owns:
     - `BOUND_EVIDENCE_FIELDS: tuple[str, ...] = ("binding_generation_fingerprint", "policy_hash")` and `EXCLUDED_EVIDENCE_FIELDS: Mapping[str, str]` (field → reason) — the closed decision over `WebPluginPolicyEvidence` fields, pinned by `test_binding_fields_are_a_closed_decision_over_web_plugin_policy_evidence`.
     - `ApprovalGateInputs(evidence: WebPluginPolicyEvidence, config_hash: str, canonical_version: str, openrouter_catalog_sha256: str, runtime_val_manifest_sha256: str)` frozen dataclass with `binding` property.
     - `runtime_val_manifest_sha256() -> str` (calls `prepare_for_run()` then hashes the manifest).
-    - `evaluate_approval_gate(*, approved: ApprovalBinding | None, compiled: ApprovalBinding) -> AdmissionRefusalReason | None` (`None` → `APPROVAL_REQUIRED`; any field differs → `APPROVAL_BINDING_MISMATCH`; equal → `None`).
+    - `evaluate_approval_gate(*, approved: tuple[ApprovalBinding, ...], compiled: ApprovalBinding) -> AdmissionRefusalReason | None` (`approved` is every approved row's binding for the state, as `approved_bindings` returns it; empty → `APPROVAL_REQUIRED`; some entry equals the entire `compiled` binding → `None`; entries exist and none equals it → `APPROVAL_BINDING_MISMATCH`; a non-tuple `approved`, a non-`ApprovalBinding` entry or a non-`ApprovalBinding` `compiled` raises `TypeError`; decision 8).
     - `ApprovalRecord(approval_id, session_id, state_id, binding: ApprovalBinding, requested_by_identity_id, approver_identity_id, requested_at, decided_at, decision: Literal["approved","rejected","revoked","superseded"] | None, request_note, decision_seen_at, decided_by_identity_id, decision_note, revoked_by_identity_id, revocation_actor_kind, revocation_event_id)` frozen dataclass.
     - Refusals (all subclass `ApprovalRefusal(RuntimeError)`): `ApprovalNotFound`, `ApprovalAlreadyDecided(current_state: str)`, `ApprovalAuthorIsApprover`, `ApproverRoleRequired`, `ApprovalParticipantNotActive(identity_id)`, `ApprovalOpenRequestExists`, `ApprovalNoteRequired`, `ApprovalNoteTooLong`, `ApprovalWithdrawRequiresRequester`.
     - `RepositoryApprovalAuthority` (static, token-based, runs inside the caller's transaction):
       - `request(connection_token, *, session_id: str, state_id: str, binding: ApprovalBinding, requested_by: str, approver: str, note: str | None, now: datetime, record: Callable[[ApprovalRecord], None]) -> ApprovalRecord`
-      - `decide(connection_token, *, approval_id: str, decided_by: str, decision: Literal["approved", "rejected"], note: str | None, now: datetime, record: Callable[[ApprovalRecord], None]) -> ApprovalRecord`
+      - `decide(connection_token, *, approval_id: str, decided_by: str, decision: Literal["approved", "rejected"], note: str | None, now: datetime, record: Callable[[ApprovalRecord], None]) -> ApprovalRecord` — admits only `decided_by == approver_identity_id` (decision 7). A caller who is neither that approver nor the requester gets `ApprovalNotFound`, from the unlocked row, before note validation and before any lock. The requester gets `ApprovalAuthorIsApprover`. An addressed approver without a live grant gets `ApproverRoleRequired`.
       - `withdraw(connection_token, *, approval_id: str, requested_by: str, now: datetime, record: Callable[[ApprovalRecord], None]) -> ApprovalRecord` — a superset of the earlier working signature `withdraw(connection_token, *, approval_id, requested_by)`: `now` and `record` follow the `request`/`decide` shape because decision 1 above requires every audited authority mutation to take a required `record` callback (see open question 3).
       - `supersede_open(connection_token, *, session_id: str, now: datetime) -> tuple[str, ...]` (the superseded approval ids)
-      - `approved_binding(connection_token, *, session_id: str, state_id: str) -> ApprovalBinding | None` (locks the row `FOR UPDATE`)
+      - `approved_bindings(connection_token, *, session_id: str, state_id: str) -> tuple[ApprovalBinding, ...]` (every `decision='approved'` row for the exact state, ordered `(decided_at, approval_id)`, locked `FOR UPDATE`; `()` when none; decision 8)
       - `read(connection_token, *, approval_id: str) -> ApprovalRecord`
     - `supersede_open_approvals(connection: Connection, *, session_id: str, now: datetime) -> tuple[str, ...]` — the ONLY statement that writes `decision='superseded'`; the token form above delegates to it; the four composition-state head writers call it on their own connection, mirroring `supersede_dead_site_pending_interpretation_events` (dead_site_supersession.py:55).
-    - `ApprovalTransactionAuthority(engine)`: `run[T](session_id: str, mutation: Callable[[str, datetime], T]) -> T` (opens `locked_session_transaction`, reads `database_now`, mints a token, calls `mutation(token, now)`, unregisters); reads `session_id_of(approval_id) -> str | None`, `approved_binding(*, session_id, state_id) -> ApprovalBinding | None`, `inbox(*, approver_identity_id) -> tuple[ApprovalRecord, ...]`, `sent(*, requested_by_identity_id) -> tuple[ApprovalRecord, ...]`. Mounted as `app.state.approval_authority`.
+    - `ApprovalTransactionAuthority(engine)`: `run[T](session_id: str, mutation: Callable[[str, datetime], T]) -> T` (opens `locked_session_transaction`, reads `database_now`, mints a token, calls `mutation(token, now)`, unregisters); reads `session_id_of(approval_id) -> str | None`, `approved_bindings(*, session_id, state_id) -> tuple[ApprovalBinding, ...]` (unlocked; same statement and order as the locked read), `inbox(*, approver_identity_id) -> tuple[ApprovalRecord, ...]`, `sent(*, requested_by_identity_id) -> tuple[ApprovalRecord, ...]`. Mounted as `app.state.approval_authority`.
   - `src/elspeth/contracts/chargeable_admission.py`: `AdmissionRefusalReason.APPROVAL_REQUIRED = "approval_required"`, `AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH = "approval_binding_mismatch"`, both mapped to `QuotaDisposition.NOT_ASSESSED`.
   - `src/elspeth/web/coordination/identity_authority.py`: `lock_admin_population(conn: Connection) -> None`.
   - Widened permit path: `RepositoryRunStartPermitAuthority.assess(connection_token, *, run_id, context, now, policy, approval: ApprovalGateInputs | None)` and `issue(...)` (same widening); `SessionOperationRunMutations.assess_start_admission(*, run_id: UUID, policy: ChargeableAdmissionPolicy, approval: ApprovalGateInputs | None = None)` and `issue_start_permit(...)`; `SessionServiceProtocol.assess_run_start_admission(run_id, *, session_operation_context, approval: ApprovalGateInputs | None = None)` and `issue_run_start_permit(...)`.
@@ -466,7 +572,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import delete, insert, select, update
 from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason
@@ -478,6 +584,7 @@ from elspeth.web.coordination.approval_authority import (
     ApprovalAlreadyDecided,
     ApprovalAuthorIsApprover,
     ApprovalBinding,
+    ApprovalNotFound,
     ApprovalNoteRequired,
     ApprovalNoteTooLong,
     ApprovalOpenRequestExists,
@@ -610,10 +717,22 @@ def test_build_approval_binding_reads_exactly_the_bound_fields() -> None:
 def test_r2_derives_from_every_binding_field(field: str) -> None:
     """Mutation-derivation: flip ONE field of the approved row and the gate refuses; restore it and the gate admits."""
     compiled = _binding()
-    assert evaluate_approval_gate(approved=None, compiled=compiled) is AdmissionRefusalReason.APPROVAL_REQUIRED
-    assert evaluate_approval_gate(approved=compiled, compiled=compiled) is None
+    assert evaluate_approval_gate(approved=(), compiled=compiled) is AdmissionRefusalReason.APPROVAL_REQUIRED
+    assert evaluate_approval_gate(approved=(compiled,), compiled=compiled) is None
     flipped = dataclasses.replace(compiled, **{field: "9" * 64})
-    assert evaluate_approval_gate(approved=flipped, compiled=compiled) is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+    assert evaluate_approval_gate(approved=(flipped,), compiled=compiled) is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+    # Decision 8: several approved rows admit when ANY equals the ENTIRE binding, in
+    # either order; rows that all differ are a mismatch, never "required".
+    assert evaluate_approval_gate(approved=(flipped, compiled), compiled=compiled) is None
+    assert evaluate_approval_gate(approved=(compiled, flipped), compiled=compiled) is None
+    assert evaluate_approval_gate(approved=(flipped, flipped), compiled=compiled) is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+
+
+@pytest.mark.parametrize("approved", [None, _binding(), [_binding()]], ids=["none", "bare-binding", "list"])
+def test_r2_gate_refuses_a_non_tuple_approved_argument(approved: Any) -> None:
+    """The single-row form must crash, never read as 'no approval' (``None``) or 'one approval' (a bare binding)."""
+    with pytest.raises(TypeError, match="tuple"):
+        evaluate_approval_gate(approved=approved, compiled=_binding())
 
 
 # ── request ───────────────────────────────────────────────────────────────────
@@ -720,6 +839,42 @@ def test_request_by_a_non_admin_requester_skips_the_population_lock(fenced_sessi
     assert order == []
 
 
+@pytest.mark.parametrize("dead", ["expired", "revoked"])
+@pytest.mark.parametrize("holder", ["requester", "approver"])
+def test_a_dead_admin_row_on_either_participant_still_takes_the_population_lock(
+    fenced_session: Any, monkeypatch: pytest.MonkeyPatch, holder: str, dead: str
+) -> None:
+    """Decision 4: the probe reads no clock and no revocation, the rows HEAD's population lock covers.
+
+    ``_ADMIN_HOLDER_ROWS`` (identity_authority.py:777-786) filters neither ``expires_at`` nor
+    ``revoked_at``, so a concurrent disable locks this participant's ``identities`` row through
+    the population. R8 bars only a LIVE admin approver, so the approver side is probed too.
+    """
+    _seed_approver(fenced_session)
+    identity_id = fenced_session.identity_id if holder == "requester" else "approver"
+    conn = _resolve_mutation_connection(fenced_session.connection_token)
+    conn.execute(
+        insert(identity_roles_table).values(
+            role_id="dead-admin",
+            identity_id=identity_id,
+            role="admin",
+            granted_at=NOW - timedelta(days=2),
+            granted_by_identity_id=identity_id,
+            expires_at=NOW - timedelta(hours=1) if dead == "expired" else None,
+            revoked_at=NOW - timedelta(hours=1) if dead == "revoked" else None,
+        )
+    )
+    order: list[str] = []
+    monkeypatch.setattr(module, "lock_admin_population", lambda conn: order.append("population"))
+    _request(fenced_session)
+    assert order == ["population"]
+    # Mutation-derivation: delete the dead ROW and the next request skips the population lock.
+    conn.execute(delete(identity_roles_table).where(identity_roles_table.c.role_id == "dead-admin"))
+    order.clear()
+    _request(fenced_session, state_id="state-2")
+    assert order == []
+
+
 # ── decide ────────────────────────────────────────────────────────────────────
 
 
@@ -751,22 +906,43 @@ def test_decide_writes_the_decision_row_and_the_approval_in_one_call(fenced_sess
     assert [(r.decided_by_identity_id, r.decision, r.note) for r in rows] == [("approver", "approved", "looks fine")]
 
 
-def test_any_active_approver_who_is_not_the_author_may_decide(fenced_session: Any) -> None:
-    """Spec :1416: eligibility is role-based; ``approver_identity_id`` is the picker's suggestion, not a lock."""
+def test_only_the_addressed_approver_may_decide(fenced_session: Any) -> None:
+    """Decision 7: a live approver the request is not addressed to is hidden as not found and writes nothing."""
     _seed_approver(fenced_session)
     _seed_approver(fenced_session, "leave-cover")
     open_record = _request(fenced_session)
+    seen: list[Any] = []
+    with pytest.raises(ApprovalNotFound, match=f"approval {open_record.approval_id} not found"):
+        _decide(fenced_session, open_record.approval_id, decided_by="leave-cover", record=seen.append)
+    # The body is not validated for a caller the request was not addressed to: a blank rejection is hidden the same way.
+    with pytest.raises(ApprovalNotFound, match=f"approval {open_record.approval_id} not found"):
+        _decide(fenced_session, open_record.approval_id, decided_by="leave-cover", decision="rejected", note="   ", record=seen.append)
+    assert seen == []
+    conn = _resolve_mutation_connection(fenced_session.connection_token)
+    assert conn.execute(select(approval_decisions_table)).all() == []
+    assert RepositoryApprovalAuthority.read(fenced_session.connection_token, approval_id=open_record.approval_id).decision is None
+    # Mutation-derivation: the same caller with the same grant is admitted once the ROW names them.
+    conn.execute(
+        update(approvals_table).where(approvals_table.c.approval_id == open_record.approval_id).values(approver_identity_id="leave-cover")
+    )
     decided = _decide(fenced_session, open_record.approval_id, decided_by="leave-cover")
     assert decided.decided_by_identity_id == "leave-cover"
-    assert decided.approver_identity_id == "approver"
+    assert decided.approver_identity_id == "leave-cover"
 
 
 def test_decide_requires_active_approver_role(fenced_session: Any) -> None:
-    _seed_approver(fenced_session)
-    _seed_approver(fenced_session, "bystander", role="user")
-    open_record = _request(fenced_session)
+    """Decision 7: a lapsed addressed approver is refused by role; an unaddressed role-less caller is hidden first."""
+    _seed_approver(fenced_session, "bystander")
+    _seed_approver(fenced_session, "passer-by", role="user")
+    open_record = _request(fenced_session, approver="bystander")
+    with pytest.raises(ApprovalNotFound, match=f"approval {open_record.approval_id} not found"):
+        _decide(fenced_session, open_record.approval_id, decided_by="passer-by")
+    conn = _resolve_mutation_connection(fenced_session.connection_token)
+    # Mutation-derivation: the same addressed caller is refused once the ROLE ROW is revoked.
+    conn.execute(update(identity_roles_table).where(identity_roles_table.c.identity_id == "bystander").values(revoked_at=NOW))
     with pytest.raises(ApproverRoleRequired, match="bystander"):
         _decide(fenced_session, open_record.approval_id, decided_by="bystander")
+    assert conn.execute(select(approval_decisions_table)).all() == []
 
 
 def test_decide_refuses_the_author_even_with_an_approver_role(fenced_session: Any) -> None:
@@ -788,11 +964,10 @@ def test_reject_requires_a_nonblank_note(fenced_session: Any) -> None:
 
 def test_second_decision_gets_the_current_state_not_a_second_row(fenced_session: Any) -> None:
     _seed_approver(fenced_session)
-    _seed_approver(fenced_session, "leave-cover")
     open_record = _request(fenced_session)
     _decide(fenced_session, open_record.approval_id, decision="rejected", note="no")
     with pytest.raises(ApprovalAlreadyDecided, match="rejected") as excinfo:
-        _decide(fenced_session, open_record.approval_id, decided_by="leave-cover")
+        _decide(fenced_session, open_record.approval_id)
     assert excinfo.value.current_state == "rejected"
     conn = _resolve_mutation_connection(fenced_session.connection_token)
     assert len(conn.execute(select(approval_decisions_table)).all()) == 1
@@ -853,7 +1028,7 @@ def test_withdraw_after_decision_reports_the_current_state(fenced_session: Any) 
         )
 
 
-# ── supersede and approved_binding ────────────────────────────────────────────
+# ── supersede and approved_bindings ───────────────────────────────────────────
 
 
 def test_supersede_open_marks_only_this_sessions_open_requests(fenced_session: Any) -> None:
@@ -870,19 +1045,76 @@ def test_supersede_open_marks_only_this_sessions_open_requests(fenced_session: A
     assert RepositoryApprovalAuthority.supersede_open(fenced_session.connection_token, session_id=fenced_session.session_id, now=NOW) == ()
 
 
-def test_approved_binding_returns_only_an_approved_row_for_the_exact_state(fenced_session: Any) -> None:
+def test_approved_bindings_returns_only_approved_rows_for_the_exact_state(fenced_session: Any) -> None:
     _seed_approver(fenced_session)
     token = fenced_session.connection_token
-    assert RepositoryApprovalAuthority.approved_binding(token, session_id=fenced_session.session_id, state_id="state-1") is None
+    assert RepositoryApprovalAuthority.approved_bindings(token, session_id=fenced_session.session_id, state_id="state-1") == ()
     open_record = _request(fenced_session)
-    assert RepositoryApprovalAuthority.approved_binding(token, session_id=fenced_session.session_id, state_id="state-1") is None
+    assert RepositoryApprovalAuthority.approved_bindings(token, session_id=fenced_session.session_id, state_id="state-1") == ()
     _decide(fenced_session, open_record.approval_id)
-    assert RepositoryApprovalAuthority.approved_binding(token, session_id=fenced_session.session_id, state_id="state-1") == _binding()
-    assert RepositoryApprovalAuthority.approved_binding(token, session_id=fenced_session.session_id, state_id="state-2") is None
+    assert RepositoryApprovalAuthority.approved_bindings(token, session_id=fenced_session.session_id, state_id="state-1") == (_binding(),)
+    assert RepositoryApprovalAuthority.approved_bindings(token, session_id=fenced_session.session_id, state_id="state-2") == ()
     RepositoryApprovalAuthority.supersede_open(token, session_id=fenced_session.session_id, now=NOW)
-    assert RepositoryApprovalAuthority.approved_binding(token, session_id=fenced_session.session_id, state_id="state-1") == _binding(), (
+    survivors = RepositoryApprovalAuthority.approved_bindings(token, session_id=fenced_session.session_id, state_id="state-1")
+    assert survivors == (_binding(),), (
         "supersede touches OPEN rows only; an approved row survives until a NEW state is written and a new request is made"
     )
+
+
+def test_a_decided_state_is_requested_and_approved_again_with_an_equal_and_a_changed_binding(fenced_session: Any) -> None:
+    """Decision 8 (review B3): the open-only unique index admits every re-request, and the read returns every approval."""
+    _seed_approver(fenced_session)
+    token = fenced_session.connection_token
+    changed = _binding(openrouter_catalog_sha256="9" * 64)
+    first = _request(fenced_session, now=NOW)
+    _decide(fenced_session, first.approval_id, now=NOW + timedelta(minutes=1))
+    equal = _request(fenced_session, now=NOW + timedelta(minutes=2))
+    _decide(fenced_session, equal.approval_id, now=NOW + timedelta(minutes=3))
+    both_equal = RepositoryApprovalAuthority.approved_bindings(token, session_id=fenced_session.session_id, state_id="state-1")
+    assert both_equal == (_binding(), _binding())
+    assert evaluate_approval_gate(approved=both_equal, compiled=_binding()) is None
+    assert evaluate_approval_gate(approved=both_equal, compiled=changed) is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+    reapproved = _request(fenced_session, binding=changed, now=NOW + timedelta(minutes=4))
+    _decide(fenced_session, reapproved.approval_id, now=NOW + timedelta(minutes=5))
+    all_three = RepositoryApprovalAuthority.approved_bindings(token, session_id=fenced_session.session_id, state_id="state-1")
+    assert all_three == (_binding(), _binding(), changed)
+    assert evaluate_approval_gate(approved=all_three, compiled=changed) is None
+    assert evaluate_approval_gate(approved=all_three, compiled=_binding()) is None
+    other = _binding(policy_hash="8" * 64)
+    assert evaluate_approval_gate(approved=all_three, compiled=other) is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+
+
+def test_approved_bindings_are_ordered_by_decided_at_then_approval_id(fenced_session: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stated total order (decision 8): earlier decision first; equal decision times fall back to the primary key.
+
+    The generated ids are fixed so that, for the two rows decided at the same instant, primary-key order
+    (``a…`` before ``b…``) is the REVERSE of insertion order: an implementation ordering by ``decided_at``
+    alone returns the tied rows in insertion order on SQLite and fails here.
+    """
+    import types
+
+    _seed_approver(fenced_session)
+    generated = iter(
+        [
+            "c0000000-0000-4000-8000-000000000000",
+            "d0000000-0000-4000-8000-000000000000",
+            "b0000000-0000-4000-8000-000000000000",
+            "d0000000-0000-4000-8000-000000000001",
+            "a0000000-0000-4000-8000-000000000000",
+            "d0000000-0000-4000-8000-000000000002",
+        ]
+    )
+    # request draws the approval id, decide draws the decision id: six draws in that order.
+    monkeypatch.setattr(module, "uuid", types.SimpleNamespace(uuid4=lambda: next(generated)))
+    seven = _binding(openrouter_catalog_sha256="7" * 64)
+    eight = _binding(openrouter_catalog_sha256="8" * 64)
+    nine = _binding(openrouter_catalog_sha256="9" * 64)
+    for binding, requested_minutes, decided_minutes in ((seven, 0, 5), (eight, 6, 10), (nine, 7, 10)):
+        opened = _request(fenced_session, binding=binding, now=NOW + timedelta(minutes=requested_minutes))
+        _decide(fenced_session, opened.approval_id, now=NOW + timedelta(minutes=decided_minutes))
+    assert RepositoryApprovalAuthority.approved_bindings(
+        fenced_session.connection_token, session_id=fenced_session.session_id, state_id="state-1"
+    ) == (seven, nine, eight)
 ```
 
 - [ ] **Step 9: Run the authority tests to verify they fail.**
@@ -906,7 +1138,14 @@ def lock_admin_population(conn: Connection) -> None:
     only; the manifest's write scan does not see it.
     """
     conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
+
+
 ```
+
+The block is 13 lines: two blank lines open it and two close it. HEAD :798 (`# Retained grants and their RESTRICT owner FK preserve seed consumption.`) moves to :811, and every line after :797 moves down by exactly 13. `ruff format` requires the two closing blank lines before the next top-level statement. Without them, Step 34's format pass adds them after Step 12 has pinned the rows, which moves every row 2 more lines. Confirm the module is already formatted before Step 12 measures:
+
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && ruff format --check src/elspeth/web/coordination/identity_authority.py > /tmp/i3-lane-identity-format.log 2>&1; echo exit=$?`
+Expected: `exit=0` and `1 file already formatted`. A non-zero exit means the block lost its blank lines: restore them to the 13 lines above rather than running `ruff format`, so the shift Step 12 applies stays 13.
 
 Then create `src/elspeth/web/coordination/approval_authority.py`:
 
@@ -924,10 +1163,17 @@ no Landscape row of its own; the transition is recorded on the sessions row.
 
 LOCK ORDER (``approval_lifecycle_authority.py:3-8``).  The caller holds the
 session lock (``ApprovalTransactionAuthority.run`` or the operation fence).
-Inside it: if the REQUESTER holds deployment-wide ``admin`` (R8 bars an admin
-approver), take identity authority's admin-population lock first; then both
-participating ``identities`` rows ``FOR UPDATE`` in stable identity-id order;
-then the approval rows.  Non-admin participants use stable id order alone.
+Inside it: if EITHER participant has an unscoped ``admin`` row -- live,
+expired or revoked, the rows identity authority's population lock covers --
+take that admin-population lock first; then both participating
+``identities`` rows ``FOR UPDATE`` in stable identity-id order; then the
+approval rows.  The probe reads no clock.  Participants with no admin row use
+stable id order alone.
+
+CLOCK.  ``now`` is read by the caller after the session lock and BEFORE the
+locks above: plan decision 4 records this exemption from LOCK, THEN CLOCK and
+its residual (a grant that expires while a call waits on those locks is
+judged live), and open question 5 asks whether to adopt the convention.
 
 CONDITIONAL WRITES.  ``decide`` and ``withdraw`` update
 ``WHERE decision IS NULL`` — never ``decided_at IS NULL`` — because
@@ -1102,11 +1348,23 @@ class ApprovalGateInputs:
         )
 
 
-def evaluate_approval_gate(*, approved: ApprovalBinding | None, compiled: ApprovalBinding) -> AdmissionRefusalReason | None:
-    """R2 (spec :1060): no approved row → APPROVAL_REQUIRED; a differing row → APPROVAL_BINDING_MISMATCH."""
-    if approved is None:
+def evaluate_approval_gate(*, approved: tuple[ApprovalBinding, ...], compiled: ApprovalBinding) -> AdmissionRefusalReason | None:
+    """R2 (spec :1060) over EVERY approved row for the state (decision 8).
+
+    ``approved`` is ``approved_bindings(...)``: one binding per ``decision='approved'``
+    row for the exact ``(session_id, state_id)``. No row → APPROVAL_REQUIRED; some
+    row equals the ENTIRE compiled binding → admitted; rows exist and none equals it
+    → APPROVAL_BINDING_MISMATCH. A membership test: the verdict cannot depend on the
+    order of ``approved`` and no row is chosen. The single-row form (``None`` or a bare
+    binding) is refused loudly rather than read as "no approval" or "one approval".
+    """
+    if type(approved) is not tuple or any(type(binding) is not ApprovalBinding for binding in approved):
+        raise TypeError("approved must be a tuple of exact ApprovalBinding values")
+    if type(compiled) is not ApprovalBinding:
+        raise TypeError("compiled must be an exact ApprovalBinding")
+    if not approved:
         return AdmissionRefusalReason.APPROVAL_REQUIRED
-    if approved != compiled:
+    if compiled not in approved:
         return AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
     return None
 
@@ -1193,22 +1451,29 @@ class ApprovalWithdrawRequiresRequester(ApprovalRefusal):
 
 _IDENTITY_FOR_UPDATE: Final = select(identities_table).where(identities_table.c.identity_id == bindparam("identity_id")).with_for_update()
 _ROLES_OF_IDENTITY: Final = select(identity_roles_table).where(identity_roles_table.c.identity_id == bindparam("identity_id"))
+# The population-lock probe (plan decision 4). No clock and no revocation filter:
+# the unscoped admin rows _ADMIN_HOLDER_ROWS (identity_authority.py:777-786) locks.
+_UNSCOPED_ADMIN_ROW: Final = select(identity_roles_table.c.role_id).where(
+    identity_roles_table.c.identity_id == bindparam("identity_id"),
+    identity_roles_table.c.role == "admin",
+    identity_roles_table.c.scope.is_(None),
+)
 _APPROVAL_BY_ID: Final = select(approvals_table).where(approvals_table.c.approval_id == bindparam("approval_id"))
 _APPROVAL_BY_ID_FOR_UPDATE: Final = _APPROVAL_BY_ID.with_for_update()
-_APPROVED_FOR_STATE_FOR_UPDATE: Final = (
+_APPROVED_FOR_STATE: Final = (
     select(approvals_table)
     .where(
         approvals_table.c.session_id == bindparam("session_id"),
         approvals_table.c.state_id == bindparam("state_id"),
         approvals_table.c.decision == "approved",
     )
-    .with_for_update()
+    # Decision 8: one state may carry several approved rows (only OPEN rows are
+    # unique). The total order fixes the tuple R2 reads and, under FOR UPDATE on
+    # PostgreSQL, the order its row locks are taken in; approval_id breaks the
+    # ties SQLite's one-second CURRENT_TIMESTAMP produces.
+    .order_by(approvals_table.c.decided_at, approvals_table.c.approval_id)
 )
-_APPROVED_FOR_STATE: Final = select(approvals_table).where(
-    approvals_table.c.session_id == bindparam("session_id"),
-    approvals_table.c.state_id == bindparam("state_id"),
-    approvals_table.c.decision == "approved",
-)
+_APPROVED_FOR_STATE_FOR_UPDATE: Final = _APPROVED_FOR_STATE.with_for_update()
 _OPEN_FOR_SESSION: Final = select(approvals_table.c.approval_id).where(
     approvals_table.c.session_id == bindparam("session_id"),
     approvals_table.c.decision.is_(None),
@@ -1289,12 +1554,28 @@ def _record(conn: Connection, row: Row[Any]) -> ApprovalRecord:
 
 
 def _lock_participants(conn: Connection, *, requester: str, approver: str, now: datetime) -> None:
-    """Population lock first when the requester holds admin; then the two rows in stable id order."""
+    """Population lock first when either participant has an unscoped admin row; then the two rows in stable id order.
+
+    The population decision reads no clock and no revocation: ``_ADMIN_HOLDER_ROWS``
+    (identity_authority.py:777-786) locks the ``identities`` row of every active
+    human with an unscoped admin row, live or dead, so such a participant is
+    already in the set a concurrent disable or revoke locks first. An unneeded
+    population lock only waits; a skipped one can deadlock. ``now`` is the
+    caller's pre-lock clock (plan decision 4's exemption) and judges only the
+    approver grant.
+    """
     if requester == approver:
         raise ApprovalAuthorIsApprover(requester)
-    if _holds(_active_grants(conn, requester, now), "admin"):
+    participants = sorted((requester, approver))
+    # A plain loop keeps ``conn`` out of a generator closure.
+    admin_row_holder = False
+    for identity_id in participants:
+        if conn.execute(_UNSCOPED_ADMIN_ROW, {"identity_id": identity_id}).first() is not None:
+            admin_row_holder = True
+            break
+    if admin_row_holder:
         lock_admin_population(conn)
-    for identity_id in sorted((requester, approver)):
+    for identity_id in participants:
         _lock_identity_row(conn, identity_id)
     if not _holds(_active_grants(conn, approver, now), "approver"):
         raise ApproverRoleRequired(approver)
@@ -1376,12 +1657,21 @@ class RepositoryApprovalAuthority:
         conn = _resolve_mutation_connection(connection_token)
         if decision not in ("approved", "rejected"):
             raise ValueError(f"decision must be approved or rejected, not {decision!r}")
-        bounded_note = _bounded_note(note)
-        if decision == "rejected" and (bounded_note is None or not bounded_note.strip()):
-            raise ApprovalNoteRequired(decision)
         row = conn.execute(_APPROVAL_BY_ID, {"approval_id": approval_id}).one_or_none()
         if row is None:
             raise ApprovalNotFound(approval_id)
+        # Decision 7: only the addressed approver decides, the rule I7's inspect and
+        # I9's inbox apply. Read from the unlocked row (request's INSERT is the only
+        # writer of approver_identity_id), before the note is validated and before
+        # _lock_participants locks the admin population or any identities row, so a
+        # caller who is neither addressed nor the author gets the unknown-id 404
+        # whatever grant they hold and whatever body they send. The author passes
+        # through to _lock_participants' ApprovalAuthorIsApprover.
+        if row.approver_identity_id != decided_by and row.requested_by_identity_id != decided_by:
+            raise ApprovalNotFound(approval_id)
+        bounded_note = _bounded_note(note)
+        if decision == "rejected" and (bounded_note is None or not bounded_note.strip()):
+            raise ApprovalNoteRequired(decision)
         _lock_participants(conn, requester=row.requested_by_identity_id, approver=decided_by, now=now)
         locked = conn.execute(_APPROVAL_BY_ID_FOR_UPDATE, {"approval_id": approval_id}).one()
         if locked.decision is not None:
@@ -1454,11 +1744,16 @@ class RepositoryApprovalAuthority:
         return supersede_open_approvals(_resolve_mutation_connection(connection_token), session_id=session_id, now=now)
 
     @staticmethod
-    def approved_binding(connection_token: str, *, session_id: str, state_id: str) -> ApprovalBinding | None:
-        """The approved row for this exact state, locked so a concurrent withdrawal waits for the permit decision."""
+    def approved_bindings(connection_token: str, *, session_id: str, state_id: str) -> tuple[ApprovalBinding, ...]:
+        """Every approved row's binding for this exact state, in ``(decided_at, approval_id)`` order (decision 8).
+
+        Locked ``FOR UPDATE`` so a concurrent write to any of those rows waits for the
+        permit decision. ``()`` when none is approved; several is normal for a state
+        that was requested again after an approval.
+        """
         conn = _resolve_mutation_connection(connection_token)
-        row = conn.execute(_APPROVED_FOR_STATE_FOR_UPDATE, {"session_id": session_id, "state_id": state_id}).one_or_none()
-        return None if row is None else ApprovalBinding.from_json(row.binding_json)
+        rows = conn.execute(_APPROVED_FOR_STATE_FOR_UPDATE, {"session_id": session_id, "state_id": state_id}).all()
+        return tuple(ApprovalBinding.from_json(row.binding_json) for row in rows)
 
     @staticmethod
     def read(connection_token: str, *, approval_id: str) -> ApprovalRecord:
@@ -1499,10 +1794,11 @@ class ApprovalTransactionAuthority:
             row = conn.execute(select(approvals_table.c.session_id).where(approvals_table.c.approval_id == approval_id)).one_or_none()
         return None if row is None else row.session_id
 
-    def approved_binding(self, *, session_id: str, state_id: str) -> ApprovalBinding | None:
+    def approved_bindings(self, *, session_id: str, state_id: str) -> tuple[ApprovalBinding, ...]:
+        """The HTTP pre-flight's unlocked read: same statement, same order; the permit path's locked read stays authoritative."""
         with self._engine.connect() as conn:
-            row = conn.execute(_APPROVED_FOR_STATE, {"session_id": session_id, "state_id": state_id}).one_or_none()
-        return None if row is None else ApprovalBinding.from_json(row.binding_json)
+            rows = conn.execute(_APPROVED_FOR_STATE, {"session_id": session_id, "state_id": state_id}).all()
+        return tuple(ApprovalBinding.from_json(row.binding_json) for row in rows)
 
     def inbox(self, *, approver_identity_id: str) -> tuple[ApprovalRecord, ...]:
         with self._engine.connect() as conn:
@@ -1524,9 +1820,13 @@ In `tests/unit/architecture/test_session_db_mutation_authority.py`, `_NAMED_AUTH
 
 ```python
     # Task I3: the approval product. Class-prefix binding covers request /
-    # decide / withdraw / supersede_open / approved_binding / read; the
+    # decide / withdraw / supersede_open / approved_bindings / read; the
     # module-level supersede writer is the shared retirement every
     # composition-state head writer calls (dead_site_supersession shape).
+    # ApprovalTransactionAuthority takes no binding: run acquires through the
+    # imported locked_session_transaction wrapper, for which the scanner
+    # reports no acquisition row, and its four SELECT-only reads are admitted
+    # in _REVIEWED_READ_CONNECTIONS.
     AuthoritySymbol(
         "src/elspeth/web/coordination/approval_authority.py",
         "RepositoryApprovalAuthority",
@@ -1537,20 +1837,24 @@ In `tests/unit/architecture/test_session_db_mutation_authority.py`, `_NAMED_AUTH
         "supersede_open_approvals",
         "ApprovalAuthority",
     ),
-    AuthoritySymbol(
-        "src/elspeth/web/coordination/approval_authority.py",
-        "ApprovalTransactionAuthority.run",
-        "ApprovalAuthority",
-    ),
 ```
 
 Then run the gate and read its XFAIL text:
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py::test_all_production_sessions_writers_are_reviewed_typed_authorities -n 0 -rx > /tmp/i3-lane-manifest-1.log 2>&1; echo exit=$?`
-Expected: `exit=0` but the log shows `XFAIL` with `Unexpected/unreviewed (6):` listing, each with its `fp=<16 hex>#<ordinal>` and `line=`:
-`approval_authority.py:<line> supersede_open_approvals update approvals`, `RepositoryApprovalAuthority.request insert approvals`, `RepositoryApprovalAuthority.decide insert approval_decisions`, `RepositoryApprovalAuthority.decide update approvals`, `RepositoryApprovalAuthority.withdraw update approvals`, `ApprovalTransactionAuthority.run write_connection <sessions-write-connection>`; and `Stale reviewed (0)`.
+Expected: `exit=0` and `1 xfailed`. The gate already XFAILs on a clean HEAD, so read its reason text against the baseline counts I1 Step 15 records. Each new `approval_authority.py` site prints in the form `src/elspeth/web/coordination/approval_authority.py:<line> <symbol> <operation> <table> fp=<16 hex>#1 authority=<authority> connection_escape=False`. The counts below were measured by running HEAD's `scan_production_writers` and the gate's own subtraction functions over Step 10's module text and over `identity_authority.py` with Step 10's helper inserted:
+- `Unexpected/unreviewed` is 61 above the baseline:
+  - the five writes, each `authority=ApprovalAuthority`: `supersede_open_approvals update approvals`, `RepositoryApprovalAuthority.request insert approvals`, `RepositoryApprovalAuthority.decide insert approval_decisions`, `RepositoryApprovalAuthority.decide update approvals` and `RepositoryApprovalAuthority.withdraw update approvals`;
+  - four `write_connection <sessions-write-connection>` sites with `authority=UNCLASSIFIED`, one for each `with self._engine.connect() as conn:` block: `ApprovalTransactionAuthority.session_id_of`, `ApprovalTransactionAuthority.approved_bindings`, `ApprovalTransactionAuthority.inbox` and `ApprovalTransactionAuthority.sent`;
+  - 52 `src/elspeth/web/coordination/identity_authority.py` twins, 42 writer sites and ten `write_connection` read sites. Each prints exactly 13 lines below its reviewed row, because Step 10 inserted the 13-line `lock_admin_population` block at :797 and `line` is part of the identity key.
+- `Stale reviewed` is 42 above the baseline and lists the 42 `identity_authority.py` rows of `_REVIEWED_WRITERS` (:2905-3330) at their old lines.
+- `Connections outside exact contained authority` is 14 above the baseline and lists the four `ApprovalTransactionAuthority` reads and the ten `identity_authority.py` read twins.
+- `Stale reviewed read connections` is 10 above the baseline and lists the ten `identity_authority.py` rows of `_REVIEWED_READ_CONNECTIONS` (:3957-3966 and :4182-4271) at their old lines.
+- Every other section equals the baseline.
 
-Add one `WriterIdentity(...)` per listed site to `_REVIEWED_WRITERS` (:1198), directly after the `RepositoryApprovalLifecycleAuthority.apply` row (:1245-1254), copying `path`, `symbol`, `table`, `operation`, the printed fingerprint, ordinal and line, with authority `"ApprovalAuthority"`:
+No `ApprovalTransactionAuthority.run` line appears. `run` acquires its connection through `locked_session_transaction`, an imported wrapper, and the scanner reports no acquisition row for such a block (the composer blob tool handlers note in `_NAMED_AUTHORITY_SYMBOLS`, :779-784; HEAD's `audit_access_log_authority.py:78` and `run_diagnostics_authority.py:86` report none either). A `run` line, a `connection_escape=True`, or an `Unresolved write executions` line naming `approval_authority.py` means the module differs from Step 10: fix the module, not the manifest.
+
+Add one `WriterIdentity` row per write listed above to `_REVIEWED_WRITERS` (:1198), directly after the `RepositoryApprovalLifecycleAuthority.apply` row (:1245-1254). Copy the fingerprint, the `#ordinal` and the `line` VERBATIM from the drift log into the `FP_FROM_LOG` / `LINE_FROM_LOG` slots below:
 
 ```python
     # Task I3: the approval product (sso-design.md:1416-1417). request INSERTs
@@ -1562,64 +1866,103 @@ Add one `WriterIdentity(...)` per listed site to `_REVIEWED_WRITERS` (:1198), di
         "supersede_open_approvals",
         "approvals",
         "update",
-        "<fp from the log>",
+        "FP_FROM_LOG",
         1,
         "ApprovalAuthority",
-        line=<line from the log>,
+        line=LINE_FROM_LOG,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
         "RepositoryApprovalAuthority.request",
         "approvals",
         "insert",
-        "<fp from the log>",
+        "FP_FROM_LOG",
         1,
         "ApprovalAuthority",
-        line=<line from the log>,
+        line=LINE_FROM_LOG,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
         "RepositoryApprovalAuthority.decide",
         "approval_decisions",
         "insert",
-        "<fp from the log>",
+        "FP_FROM_LOG",
         1,
         "ApprovalAuthority",
-        line=<line from the log>,
+        line=LINE_FROM_LOG,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
         "RepositoryApprovalAuthority.decide",
         "approvals",
         "update",
-        "<fp from the log>",
+        "FP_FROM_LOG",
         1,
         "ApprovalAuthority",
-        line=<line from the log>,
+        line=LINE_FROM_LOG,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
         "RepositoryApprovalAuthority.withdraw",
         "approvals",
         "update",
-        "<fp from the log>",
+        "FP_FROM_LOG",
         1,
         "ApprovalAuthority",
-        line=<line from the log>,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/approval_authority.py",
-        "ApprovalTransactionAuthority.run",
-        "<sessions-write-connection>",
-        "write_connection",
-        "<fp from the log>",
-        1,
-        "ApprovalAuthority",
-        line=<line from the log>,
+        line=LINE_FROM_LOG,
     ),
 ```
 
-The `<fp from the log>` and `<line from the log>` placeholders are filled from the XFAIL text, never typed from memory: the fingerprint is the AST of the enclosing function and any later edit to that function (Steps 15 and 19 do not touch this file) would print a new one. Re-run the same command with its log path changed to `/tmp/i3-lane-manifest-2.log`; expected: `exit=0` and `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed` or `Stale reviewed` row may name a site this task touches (`grep -c 'ApprovalAuthority' /tmp/i3-lane-manifest-2.log` prints `0`). A `Stale reviewed` line means a copied fingerprint or line is wrong.
+Then append the four reads to `_REVIEWED_READ_CONNECTIONS` (:3954), directly after the `_SessionOperationAuthorityRepository._session_exists` row (:4272-4285). `session_id_of`, `approved_bindings`, `inbox` and `sent` each open `self._engine.connect()`, execute only SELECT statements (`_record(conn, row)` executes only `_DECISION_ROW`), and return values, never the connection. The authority is `None`, because a read acquires no authority; this is the shape of the `RepositoryIdentityAuthority` reads in the same tuple. Copy the fingerprint, ordinal and line from the `write_connection` line the drift log prints for each symbol:
+
+```python
+    # Task I3: SELECT-only approval reads behind the HTTP pre-flight, the
+    # approvals routes and I9's mailbox; the connection never leaves the method.
+    WriterIdentity(
+        "src/elspeth/web/coordination/approval_authority.py",
+        "ApprovalTransactionAuthority.session_id_of",
+        "<sessions-write-connection>",
+        "write_connection",
+        "FP_FROM_LOG",
+        1,
+        None,
+        line=LINE_FROM_LOG,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/approval_authority.py",
+        "ApprovalTransactionAuthority.approved_bindings",
+        "<sessions-write-connection>",
+        "write_connection",
+        "FP_FROM_LOG",
+        1,
+        None,
+        line=LINE_FROM_LOG,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/approval_authority.py",
+        "ApprovalTransactionAuthority.inbox",
+        "<sessions-write-connection>",
+        "write_connection",
+        "FP_FROM_LOG",
+        1,
+        None,
+        line=LINE_FROM_LOG,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/approval_authority.py",
+        "ApprovalTransactionAuthority.sent",
+        "<sessions-write-connection>",
+        "write_connection",
+        "FP_FROM_LOG",
+        1,
+        None,
+        line=LINE_FROM_LOG,
+    ),
+```
+
+Then re-pin the 52 moved `identity_authority.py` rows: the 42 in `_REVIEWED_WRITERS` (:2905-3330) and the ten in `_REVIEWED_READ_CONNECTIONS` (:3957-3966 and :4182-4271). Each stale row has a twin under `Unexpected/unreviewed` with the same symbol, table, operation, fingerprint and ordinal. For each pair, update only `line=` to the twin's line, which is the old line plus 13. The XFAIL text prints at most 80 `Unexpected/unreviewed` lines and 40 `Stale reviewed` lines (gate :18355-18357), in sorted path order, and 49 baseline lines sort ahead of both modules (measured on HEAD 46219b2b7). So all nine `approval_authority.py` sites print, but only part of the 52 twins and 40 of the 42 stale writer rows do. Re-pin all 52 rows in the ranges above by adding 13 to each `line=`, not only the printed ones, and let the re-run prove it. If a twin's fingerprint differs, Step 10 edited that function by mistake, and that row stays under `Unexpected/unreviewed` in the re-run: revert the edit rather than re-pin it. `test_configured_bootstrap_read_does_not_admit_an_identity_write` (:10691) also compares the `RepositoryIdentityAuthority.configured_admin_seed_consumed` read row by line, so Step 35's whole-file run fails until this re-pin lands. The `_CONTAINED_CONNECTION_AUTHORITIES` entries for `identity_authority.py` (:1121-1185) carry no line and do not change.
+
+The `FP_FROM_LOG` and `LINE_FROM_LOG` slots are filled from the XFAIL text, never typed from memory: the fingerprint is the AST of the enclosing function, and any later edit to that function (Steps 15 and 19 do not touch either module) would print a new one. Re-run the same command with its log path changed to `/tmp/i3-lane-manifest-2.log`; expected: `exit=0` and `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no line may name either module (`grep -c 'approval_authority.py\|identity_authority.py' /tmp/i3-lane-manifest-2.log` prints `0`). A `Stale reviewed` or `Stale reviewed read connections` line means a copied fingerprint or line is wrong. Control the instrument: temporarily change one character of the `fp` in the `ApprovalTransactionAuthority.sent` read row and re-run with the log path `/tmp/i3-lane-manifest-2c.log`. Confirm that `grep -c 'approval_authority.py\|identity_authority.py' /tmp/i3-lane-manifest-2c.log` prints `3`: the row under `Stale reviewed read connections`, and the live `sent` site under both `Unexpected/unreviewed` and `Connections outside exact contained authority`. Then restore the character.
 
 - [ ] **Step 13: Write the failing R2 permit-path tests.**
 
@@ -1634,7 +1977,7 @@ execution service will:
 from __future__ import annotations
 
 import dataclasses
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -1736,7 +2079,7 @@ def _admission(engine: Any) -> tuple[Any, Any, Any, Any]:
     return authority, context, run, state_id
 
 
-def _approve(engine: Any, run: Any, state_id: Any, binding: Any) -> str:
+def _approve(engine: Any, run: Any, state_id: Any, binding: Any, *, decided_at: datetime = NOW) -> str:
     approval_id = str(uuid4())
     with engine.begin() as conn:
         conn.execute(
@@ -1748,7 +2091,7 @@ def _approve(engine: Any, run: Any, state_id: Any, binding: Any) -> str:
                 requested_by_identity_id="alice",
                 approver_identity_id="approver",
                 requested_at=NOW,
-                decided_at=NOW,
+                decided_at=decided_at,
                 decision="approved",
             )
         )
@@ -1832,6 +2175,60 @@ def test_recovery_reassessment_refuses_a_permit_whose_approval_was_withdrawn(eng
     assert reassessed.execution_refusal.refusal_reason is AdmissionRefusalReason.APPROVAL_REQUIRED
 
 
+def test_execute_permits_when_one_state_carries_two_equal_approvals(engine: Any) -> None:
+    """Decision 8 (review B3): request → approve → request → approve with one binding leaves two rows, and R2 admits."""
+    authority, context, run, state_id = _admission(engine)
+    _approve(engine, run, state_id, _gate().binding, decided_at=NOW)
+    _approve(engine, run, state_id, _gate().binding, decided_at=NOW + timedelta(minutes=1))
+    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY, approval=_gate()))
+    assert permit.state is StartPermitState.START_PERMITTED
+    assert permit.admission_decision is not None and permit.admission_decision.allowed
+
+
+@pytest.mark.parametrize("stale_decided_first", [True, False], ids=["stale-older", "stale-newer"])
+def test_execute_permits_on_re_approval_after_the_binding_changed(engine: Any, stale_decided_first: bool) -> None:
+    """A stale approved row and a matching one on ONE state admit whichever was decided last: R2 is any row, not the latest row."""
+    authority, context, run, state_id = _admission(engine)
+    stale = dataclasses.replace(_gate().binding, openrouter_catalog_sha256="9" * 64)
+    older, newer = (stale, _gate().binding) if stale_decided_first else (_gate().binding, stale)
+    _approve(engine, run, state_id, older, decided_at=NOW)
+    _approve(engine, run, state_id, newer, decided_at=NOW + timedelta(minutes=1))
+    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY, approval=_gate()))
+    assert permit.state is StartPermitState.START_PERMITTED
+
+
+def test_execute_refuses_mismatch_when_every_approved_row_differs(engine: Any) -> None:
+    """Rows exist and none equals the entire compiled binding: APPROVAL_BINDING_MISMATCH, neither a crash nor APPROVAL_REQUIRED."""
+    authority, context, run, state_id = _admission(engine)
+    _approve(engine, run, state_id, dataclasses.replace(_gate().binding, openrouter_catalog_sha256="9" * 64), decided_at=NOW)
+    _approve(engine, run, state_id, dataclasses.replace(_gate().binding, policy_hash="9" * 64), decided_at=NOW + timedelta(minutes=1))
+    permit = authority.mutate(context, lambda tx: tx.runs.assess_start_admission(run_id=run.id, policy=NO_QUOTA_POLICY, approval=_gate()))
+    assert permit.state is StartPermitState.REFUSED
+    assert permit.admission_decision is not None
+    assert permit.admission_decision.refusal_reason is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+
+
+def test_recovery_reassessment_reads_every_approved_row(engine: Any) -> None:
+    """R2's second clause over several rows: revoking the MATCHING approval refuses on re-assessment; the stale row never admits."""
+    from sqlalchemy import update
+
+    authority, context, run, state_id = _admission(engine)
+    _approve(engine, run, state_id, dataclasses.replace(_gate().binding, policy_hash="9" * 64), decided_at=NOW)
+    matching = _approve(engine, run, state_id, _gate().binding, decided_at=NOW + timedelta(minutes=1))
+    issued = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY, approval=_gate()))
+    assert issued.state is StartPermitState.START_PERMITTED
+    with engine.begin() as conn:
+        conn.execute(
+            update(approvals_table)
+            .where(approvals_table.c.approval_id == matching)
+            .values(decision="revoked", revocation_actor_kind="identity", revoked_by_identity_id="alice", revocation_event_id="e-2")
+        )
+    reassessed = authority.mutate(context, lambda tx: tx.runs.assess_start_admission(run_id=run.id, policy=NO_QUOTA_POLICY, approval=_gate()))
+    assert reassessed.state is StartPermitState.START_PERMITTED, "the historical allowance is preserved"
+    assert reassessed.execution_refusal is not None
+    assert reassessed.execution_refusal.refusal_reason is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+
+
 def test_quota_refusal_wins_over_the_approval_gate(engine: Any) -> None:
     """Order inside _assess: chargeable admission first (:41), R2 only on an allowed decision."""
     from sqlalchemy import update
@@ -1876,12 +2273,13 @@ Expected: `exit=1`; every `approval=` test fails with `TypeError: _RepositoryRun
         if run.session_id != context.fence.session_id:
             raise AuditIntegrityError("Run permit session custody mismatch")
         if decision.allowed and approval is not None:
-            # R2 (sso-design.md:1060): only an ``approved`` row for THIS state whose
-            # binding equals the compiled one admits the run. ``None`` means the
+            # R2 (sso-design.md:1060): the run is admitted only when SOME ``approved``
+            # row for THIS state carries a binding equal to the compiled one; every
+            # approved row is read (decision 8). ``None`` means the
             # deployment runs with workflow_governance="off" and the gate is
             # never consulted. Evaluated on every assessment, so a permit whose
             # approval was withdrawn afterwards refuses on recovery (:1061).
-            approved = RepositoryApprovalAuthority.approved_binding(connection_token, session_id=run.session_id, state_id=run.state_id)
+            approved = RepositoryApprovalAuthority.approved_bindings(connection_token, session_id=run.session_id, state_id=run.state_id)
             refusal = evaluate_approval_gate(approved=approved, compiled=approval.binding)
             if refusal is not None:
                 decision = ChargeableAdmissionDecision(
@@ -2577,10 +2975,10 @@ class _PreparedRunSettings:
             if self._approval_authority is None:
                 raise RuntimeError("workflow governance requires the approval authority")
             compiled = self._approval_binding_for(prepared)
-            # approved_binding opens a sessions connection: keep it off the event
+            # approved_bindings opens a sessions connection: keep it off the event
             # loop like every other sync store touch in this method (:1869).
             approved = await run_sync_in_worker(
-                self._approval_authority.approved_binding, session_id=str(session_id), state_id=str(state_record.id)
+                self._approval_authority.approved_bindings, session_id=str(session_id), state_id=str(state_record.id)
             )
             reason = evaluate_approval_gate(approved=approved, compiled=compiled)
             if reason is not None:
@@ -2891,6 +3289,32 @@ def test_second_open_request_for_the_same_state_is_409(app: Any) -> None:
     assert _error(second) == "approval_open_request_exists"
 
 
+def test_a_decided_state_can_be_requested_and_approved_again(app: Any) -> None:
+    """Decision 8 (review B3): once the first request is decided the open-only unique index admits a second; both approvals stay."""
+    session_id, state_id = _session_with_state(app)
+    first = _request(app, session_id)
+    assert first.status_code == 201, first.text
+    _as(app, "bob")
+    approved_first = app.post(f"/api/approvals/{first.json()['approval_id']}/decide", json={"decision": "approved", "note": None})
+    assert approved_first.status_code == 200, approved_first.text
+    second = _request(app, session_id, note="again")
+    assert second.status_code == 201, second.text
+    assert second.json()["state_id"] == state_id
+    _as(app, "bob")
+    approved_second = app.post(f"/api/approvals/{second.json()['approval_id']}/decide", json={"decision": "approved", "note": None})
+    assert approved_second.status_code == 200, approved_second.text
+    assert app.app.state.approval_authority.approved_bindings(session_id=session_id, state_id=state_id) == (BINDING, BINDING)
+    _as(app, "alice")
+    sent = app.get("/api/approvals/sent").json()["approvals"]
+    assert sorted((row["state_id"], row["decision"]) for row in sent) == [(state_id, "approved"), (state_id, "approved")]
+    assert app.app.state.auth_audit_recorder.methods() == [
+        "record_approval_requested",
+        "record_approval_decided",
+        "record_approval_requested",
+        "record_approval_decided",
+    ]
+
+
 # ── inbox and sent ───────────────────────────────────────────────────────
 
 
@@ -2925,18 +3349,22 @@ def test_sent_shows_a_new_state_superseding_the_open_request(app: Any) -> None:
 # ── decide and withdraw ──────────────────────────────────────────────────
 
 
-def test_any_live_approver_decides_once_and_the_second_decider_gets_the_current_state(app: Any) -> None:
+def test_only_the_addressed_approver_decides_and_a_repeat_decision_gets_the_current_state(app: Any) -> None:
     session_id, _state_id = _session_with_state(app)
     approval_id = _request(app, session_id).json()["approval_id"]
     _as(app, "carol")
+    hidden = app.post(f"/api/approvals/{approval_id}/decide", json={"decision": "approved", "note": None})
+    assert hidden.status_code == 404, hidden.text
+    assert hidden.json()["detail"] == {"error_type": "approval_not_found", "detail": f"approval {approval_id} not found"}
+    assert app.app.state.auth_audit_recorder.methods() == ["record_approval_requested"], "a hidden decide records nothing"
+    _as(app, "bob")
     decided = app.post(f"/api/approvals/{approval_id}/decide", json={"decision": "approved", "note": None})
     assert decided.status_code == 200, decided.text
     assert decided.json()["decision"] == "approved"
-    assert decided.json()["decided_by_identity_id"] == "carol"
+    assert decided.json()["decided_by_identity_id"] == "bob"
     call = app.app.state.auth_audit_recorder.calls[-1]
     assert call.method == "record_approval_decided"
-    assert call.kwargs["actor_identity_id"] == "carol"
-    _as(app, "bob")
+    assert call.kwargs["actor_identity_id"] == "bob"
     again = app.post(f"/api/approvals/{approval_id}/decide", json={"decision": "rejected", "note": "too late"})
     assert again.status_code == 409
     assert again.json()["detail"] == {
@@ -3409,7 +3837,7 @@ beside `from elspeth.web.shareable_reviews.routes import create_shareable_review
 - [ ] **Step 28: Run the route tests and the app-wiring suite to verify they pass.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/web/workflow/test_approval_routes.py tests/unit/web/test_app.py tests/unit/web/auth/test_identity_admin_routes.py -n 0 > /tmp/i3-lane-routes-green.log 2>&1; echo exit=$?`
-Expected: `exit=0`; `test_approval_routes.py` contributes `13 passed` (12 test functions, `test_request_refusals_are_409_with_the_closed_code` parametrised twice).
+Expected: `exit=0`; `test_approval_routes.py` contributes `14 passed` (13 test functions, `test_request_refusals_are_409_with_the_closed_code` parametrised twice).
 
 - [ ] **Step 29: Write the integration test: R2 through the real binding tuple, the Landscape rows, and the R4 rollback.**
 
@@ -3430,6 +3858,10 @@ What only this module proves:
   ``auth_events`` table (read here from the Landscape database, not the
   sessions database), and ``superseded`` writes none;
 * a failed audit write rolls the approval row back (R4).
+* request → approve → request → approve on ONE state, with an equal and with
+  a changed binding, leaves two approved rows and execute still runs through
+  both R2 evaluation points; the stale-only state refuses
+  ``approval_binding_mismatch`` (decision 8).
 """
 
 from __future__ import annotations
@@ -3627,6 +4059,147 @@ async def test_r2_through_the_real_binding_tuple(tmp_path: Path) -> None:
     assert _auth_event_types(landscape_url) == ["approval_requested", "approval_decided", "approval_requested"]
 
 
+def _governed_app(tmp_path: Path) -> tuple[Any, str]:
+    """``create_app`` with workflow governance on; ``alice`` (author) and ``bob`` (approver) active with passwords."""
+    from elspeth.web.app import create_app
+    from elspeth.web.config import WebSettings
+
+    for directory in ("blobs", "outputs", "runs"):
+        (tmp_path / directory).mkdir()
+    (tmp_path / "payloads").mkdir(mode=0o700)
+    landscape_url = f"sqlite:///{tmp_path}/runs/audit.db"
+    settings = WebSettings(
+        data_dir=tmp_path,
+        landscape_url=landscape_url,
+        payload_store_path=tmp_path / "payloads",
+        registration_mode="closed",
+        workflow_governance="on",
+        compartment_id="test-compartment",
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
+    app = create_app(settings=settings)
+    now = datetime.now(UTC)
+    with app.state.session_engine.begin() as conn:
+        for identity_id in ("alice", "bob"):
+            ensure_test_identity(conn, identity_id=identity_id)
+        conn.execute(
+            insert(identity_roles_table).values(
+                role_id="role-bob-approver", identity_id="bob", role="approver", granted_at=now, granted_by_identity_id="alice"
+            )
+        )
+    app.state.auth_provider.create_user("alice", "alicepass123", display_name="Alice")
+    app.state.auth_provider.create_user("bob", "bobpass1234", display_name="Bob")
+    return app, landscape_url
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_repeat_approval_of_one_state_through_the_public_routes(tmp_path: Path) -> None:
+    """Decision 8 (review B3) end to end: repeat approval with an equal binding, then re-approval after the binding changed.
+
+    ``uq_approvals_open_per_state`` bounds OPEN requests only, so both sequences
+    leave two ``approved`` rows on one ``(session_id, state_id)``. The execute
+    pre-flight and the permit path each read every row: the equal pair runs, the
+    stale-only state refuses ``approval_binding_mismatch`` (not a 500 and not
+    ``approval_required``), and the re-approved state runs. SQLite's decision
+    clock has one-second resolution, so row order is compared as a set here; the
+    order itself is pinned in test_approval_authority.py.
+    """
+    from asgi_lifespan import LifespanManager
+    from sqlalchemy import update
+
+    app, landscape_url = _governed_app(tmp_path)
+    async with LifespanManager(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        alice = await _login(client, "alice", "alicepass123")
+        bob = await _login(client, "bob", "bobpass1234")
+        session_service = app.state.session_service
+
+        async def governed_session(title: str) -> tuple[str, str]:
+            created = await client.post("/api/sessions", headers=alice, json={"title": title})
+            assert created.status_code == 201, created.text
+            session_id = str(created.json()["id"])
+            state = await _save_composition_state_with_compose_authority(
+                session_service, UUID(session_id), _state_data(tmp_path, session_id), provenance="session_seed"
+            )
+            return session_id, str(state.id)
+
+        async def request_and_approve(session_id: str) -> dict[str, Any]:
+            requested = await client.post(
+                f"/api/sessions/{session_id}/approvals", headers=alice, json={"state_id": None, "approver_identity_id": "bob", "note": None}
+            )
+            assert requested.status_code == 201, requested.text
+            decided = await client.post(
+                f"/api/approvals/{requested.json()['approval_id']}/decide", headers=bob, json={"decision": "approved", "note": None}
+            )
+            assert decided.status_code == 200, decided.text
+            body: dict[str, Any] = decided.json()
+            return body
+
+        def approved_rows(session_id: str) -> list[Any]:
+            with app.state.session_engine.connect() as conn:
+                return list(
+                    conn.execute(
+                        select(approvals_table).where(approvals_table.c.session_id == session_id, approvals_table.c.decision == "approved")
+                    ).all()
+                )
+
+        async def execute_to_completion(session_id: str) -> None:
+            started = await client.post(f"/api/sessions/{session_id}/execute", headers=alice)
+            assert started.status_code == 202, started.text
+            status = await _wait_for_terminal(client, started.json()["run_id"], alice)
+            assert status["status"] == "completed", status
+
+        # 1. Equal binding: the second request on a decided state is admitted and both approvals stay.
+        equal_session, equal_state = await governed_session("repeat approval, equal binding")
+        first = await request_and_approve(equal_session)
+        second = await request_and_approve(equal_session)
+        assert first["state_id"] == second["state_id"] == equal_state
+        assert first["binding"] == second["binding"]
+        rows = approved_rows(equal_session)
+        assert {row.approval_id for row in rows} == {first["approval_id"], second["approval_id"]}
+        assert {row.state_id for row in rows} == {equal_state}
+        # ApprovalTransactionAuthority.sent, the authority read behind I9's readiness approval row
+        # (I9 serves it at /api/workflow/mailbox/sent), lists both approvals of the one state.
+        sent = (await client.get("/api/approvals/sent", headers=alice)).json()["approvals"]
+        listed = sorted(row["approval_id"] for row in sent if row["state_id"] == equal_state and row["decision"] == "approved")
+        assert listed == sorted([first["approval_id"], second["approval_id"]])
+        await execute_to_completion(equal_session)
+
+        # 2. Changed binding. The first approval is made stale by rewriting its row's binding;
+        #    the state is untouched, so this is exactly "the compiled binding moved away from
+        #    the approved one" without depending on how an operator moves it.
+        changed_session, changed_state = await governed_session("re-approval, changed binding")
+        stale = await request_and_approve(changed_session)
+        stale_binding = {**stale["binding"], "openrouter_catalog_sha256": "9" * 64}
+        assert stale_binding != stale["binding"], "control: the deployment's catalog sha is not the stale value"
+        with app.state.session_engine.begin() as conn:
+            conn.execute(
+                update(approvals_table).where(approvals_table.c.approval_id == stale["approval_id"]).values(binding_json=stale_binding)
+            )
+        mismatch = await client.post(f"/api/sessions/{changed_session}/execute", headers=alice)
+        assert mismatch.status_code == 409, mismatch.text
+        assert mismatch.json()["detail"]["error_type"] == "approval_binding_mismatch"
+        compiled = mismatch.json()["detail"]["binding"]
+        assert compiled == stale["binding"]
+        fresh = await request_and_approve(changed_session)
+        assert fresh["state_id"] == changed_state
+        assert fresh["binding"] == compiled
+        catalog_shas = sorted(row.binding_json["openrouter_catalog_sha256"] for row in approved_rows(changed_session))
+        assert catalog_shas == sorted([compiled["openrouter_catalog_sha256"], "9" * 64])
+        sent = (await client.get("/api/approvals/sent", headers=alice)).json()["approvals"]
+        listed_bindings = {
+            row["approval_id"]: row["binding"] for row in sent if row["state_id"] == changed_state and row["decision"] == "approved"
+        }
+        assert listed_bindings == {stale["approval_id"]: stale_binding, fresh["approval_id"]: compiled}
+        await execute_to_completion(changed_session)
+
+    assert _auth_event_types(landscape_url) == ["approval_requested", "approval_decided"] * 4
+
+
 def _seeded_engine(tmp_path: Path) -> tuple[Any, str]:
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
@@ -3704,22 +4277,24 @@ def test_a_failed_audit_write_rolls_the_approval_row_back(tmp_path: Path) -> Non
 - [ ] **Step 30: Run the integration tests.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/integration/web/workflow/test_approvals.py -n 0 > /tmp/i3-lane-integration.log 2>&1; echo exit=$?`
-Expected: `exit=0`, `2 passed`. A failure at step 2 (`requested.json()["binding"] == execute_binding`) means `compile_approval_binding` and `execute_pipeline` hash different `audit_safe_config` values: diff the two dicts (log `deep_thaw(prepared.frozen_run_settings.audit_safe_config)` in both paths) before touching the test — that is the defect decision 2 exists to prevent. A run that ends `failed` with `Run admission refused: approval_binding_mismatch` means the envelope-derived binding in `_approval_gate_inputs_for_run` disagrees with the pre-flight's; same diagnosis, on `envelope.audit_safe_config`.
+Expected: `exit=0`, `3 passed`. A failure at step 2 (`requested.json()["binding"] == execute_binding`) means `compile_approval_binding` and `execute_pipeline` hash different `audit_safe_config` values: diff the two dicts (log `deep_thaw(prepared.frozen_run_settings.audit_safe_config)` in both paths) before touching the test — that is the defect decision 2 exists to prevent. A run that ends `failed` with `Run admission refused: approval_binding_mismatch` means the envelope-derived binding in `_approval_gate_inputs_for_run` disagrees with the pre-flight's; same diagnosis, on `envelope.audit_safe_config`.
 
-- [ ] **Step 31: Write the PostgreSQL concurrent-decide loser test.**
+- [ ] **Step 31: Write the PostgreSQL concurrent-decide loser test and the repeat-approval proofs.**
 
 Create `tests/testcontainer/web/test_approval_decide_race_postgres.py`:
 
 ```python
 """PostgreSQL proof of the LOSING half of the concurrent-decide guard (spec §Testing :1276-1310).
 
-Two approvers decide the same open request at the same moment on two
-connections. The winner's ``decide`` locks both participant ``identities``
-rows ``FOR UPDATE`` (stable id order), writes the decision row and the
-conditional UPDATE, and reaches its ``record`` callback — inside its
-transaction, before COMMIT. That callback is the rendezvous: it does not
-return until ``pg_stat_activity`` shows the loser blocked on the shared
-requester's ``identities`` row lock. Once the winner commits, the loser
+The addressed approver decides the same open request twice at the same
+moment on two connections (two browser tabs, or the same identity on two
+replicas); decision 7 admits no other decider. The winner's ``decide`` locks
+both participant ``identities`` rows ``FOR UPDATE`` (stable id order), writes
+the decision row and the conditional UPDATE, and reaches its ``record``
+callback — inside its transaction, before COMMIT. That callback is the
+rendezvous: it does not return until ``pg_stat_activity`` shows the loser
+blocked on the first ``identities`` row both deciders lock. Once the winner
+commits, the loser
 re-reads the approval ``FOR UPDATE``, sees ``decision='approved'`` and raises
 ``ApprovalAlreadyDecided`` carrying the current state — no second
 ``approval_decisions`` row, no audit callback.
@@ -3780,14 +4355,13 @@ def engines(external_deployment_postgres_url: str) -> Iterator[tuple[Engine, Eng
         initialize_session_schema(winner_engine)
         now = datetime.now(UTC)
         with winner_engine.begin() as conn:
-            for identity_id in ("author", "approver", "cover"):
+            for identity_id in ("author", "approver"):
                 ensure_test_identity(conn, identity_id=identity_id)
-            for identity_id in ("approver", "cover"):
-                conn.execute(
-                    insert(identity_roles_table).values(
-                        role_id=f"{identity_id}-role", identity_id=identity_id, role="approver", granted_at=now, granted_by_identity_id="author"
-                    )
+            conn.execute(
+                insert(identity_roles_table).values(
+                    role_id="approver-role", identity_id="approver", role="approver", granted_at=now, granted_by_identity_id="author"
                 )
+            )
             conn.execute(insert(sessions_table).values(id="session", user_id="author", title="race", created_at=now, updated_at=now))
             conn.execute(
                 insert(approvals_table).values(
@@ -3866,7 +4440,7 @@ def test_the_losing_concurrent_decider_gets_the_current_state_and_writes_nothing
         winner = pool.submit(_decide, winner_engine, decided_by="approver", decision="approved", record=winner_record)
         try:
             assert winner_ready.wait(10), "winner never reached its audit callback"
-            loser = pool.submit(_decide, loser_engine, decided_by="cover", decision=loser_decision, record=loser_records.append)
+            loser = pool.submit(_decide, loser_engine, decided_by="approver", decision=loser_decision, record=loser_records.append)
             _wait_for_identity_lock(observer, "approval_loser")
         finally:
             release_winner.set()
@@ -3882,14 +4456,287 @@ def test_the_losing_concurrent_decider_gets_the_current_state_and_writes_nothing
     assert approval.decision == "approved"
 ```
 
+Then create `tests/testcontainer/web/test_approval_repeat_postgres.py`. It proves
+decision 8 on PostgreSQL through the two production readers R2 uses: the permit
+path's locked `approved_bindings` inside `_assess`, reached through
+`PostgresSessionOperationRepository.mutate` (the facet `execute_pipeline`,
+`_run_pipeline` and `recover_run` reach), and the pre-flight's unlocked
+`ApprovalTransactionAuthority.approved_bindings`. It also proves that
+`ApprovalTransactionAuthority.sent` lists every approval of the state; that is
+the read behind I9's readiness approval row. Every approval is written by
+`RepositoryApprovalAuthority.request` / `decide` under
+`ApprovalTransactionAuthority.run`, so the decision clock is PostgreSQL's
+`clock_timestamp()`. The public execute route itself is proven on SQLite in
+Step 29: no PostgreSQL testcontainer module at HEAD drives `/execute`
+(`git grep -l -F "/execute" HEAD -- tests/testcontainer/` exits 1, while the
+same command over `tests/integration/web/` lists `test_execute_pipeline.py`).
+
+```python
+"""PostgreSQL proofs for approved-row multiplicity (Task I3 decision 8, plan review B3).
+
+``uq_approvals_open_per_state`` bounds OPEN requests only, so request → approve →
+request → approve on one ``(session_id, state_id)`` leaves several ``approved``
+rows. R2 reads all of them: ``approved_bindings`` returns them in
+``(decided_at, approval_id)`` order (``ORDER BY ... FOR UPDATE`` inside the permit
+transaction), and the gate admits when any equals the entire compiled binding.
+Every approval here is written by the real authority under
+``ApprovalTransactionAuthority.run``; every verdict is the durable permit that
+``_assess`` writes. The database is this module's own: the container is shared.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import Engine, insert, update
+from sqlalchemy.engine import make_url
+from tests.fixtures.identities import ensure_test_identity
+
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy
+from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.web.coordination.approval_authority import (
+    ApprovalBinding,
+    ApprovalGateInputs,
+    ApprovalRecord,
+    ApprovalTransactionAuthority,
+    RepositoryApprovalAuthority,
+)
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind, StartPermitState
+from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+from elspeth.web.execution.envelope import RunExecutionInput
+from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import approvals_table, composition_states_table, identity_roles_table
+from elspeth.web.sessions.protocol import RunRecord
+from elspeth.web.sessions.schema import initialize_session_schema
+
+pytestmark = pytest.mark.testcontainer
+
+_POLICY = ChargeableAdmissionPolicy(secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
+_GRANTED_AT = datetime(2026, 9, 1, tzinfo=UTC)
+
+
+def _gate() -> ApprovalGateInputs:
+    return ApprovalGateInputs(
+        evidence=WebPluginPolicyEvidence(
+            schema_version=1,
+            policy_hash="a" * 64,
+            snapshot_hash="b" * 64,
+            authorized_plugin_ids=("sink:csv", "source:csv"),
+            available_plugin_ids=("sink:csv", "source:csv"),
+            control_modes=(),
+            selected_implementations=(),
+            selected_profile_aliases=(),
+            plugin_code_identities=(),
+            binding_generation_fingerprint="c" * 64,
+            decision_codes=("policy_allowed",),
+        ),
+        config_hash="1" * 64,
+        canonical_version="sha256-rfc8785-v1",
+        openrouter_catalog_sha256="2" * 64,
+        runtime_val_manifest_sha256="3" * 64,
+    )
+
+
+@pytest.fixture
+def approval_engine(external_deployment_postgres_url: str) -> Iterator[Engine]:
+    database = f"approval_repeat_{uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+    engine = create_session_engine(make_url(external_deployment_postgres_url).set(database=database).render_as_string(hide_password=False))
+    try:
+        initialize_session_schema(engine)
+        with engine.begin() as conn:
+            for identity_id in ("alice", "approver"):
+                ensure_test_identity(conn, identity_id=identity_id)
+            conn.execute(
+                insert(identity_roles_table).values(
+                    role_id="approver-role", identity_id="approver", role="approver", granted_at=_GRANTED_AT, granted_by_identity_id="alice"
+                )
+            )
+        yield engine
+    finally:
+        engine.dispose()
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        control.dispose()
+
+
+def _admit(engine: Engine) -> tuple[PostgresSessionOperationRepository, SessionOperationContext, RunRecord]:
+    """A fresh session owned by ``alice``, one composition state, and one pending run under an EXECUTE lease."""
+    authority = PostgresSessionOperationRepository(engine)
+    session = authority.create_session_with_initial_fence(
+        user_id="alice", title="repeat approval", auth_provider_type="local", owner_instance_id="owner", lease_seconds=120
+    )
+    context = authority.acquire(
+        session_id=session.id, operation_kind=SessionOperationKind.EXECUTE, owner_instance_id="owner", lease_seconds=120
+    )
+    state_id = uuid4()
+    with engine.begin() as conn:
+        conn.execute(
+            insert(composition_states_table).values(
+                id=str(state_id),
+                session_id=str(session.id),
+                version=1,
+                provenance="session_seed",
+                created_at=datetime.now(UTC),
+            )
+        )
+    envelope = RunExecutionInput(
+        schema_version=1,
+        envelope_json="{}",
+        canonical_input_digest="a" * 64,
+        topology_digest="b" * 64,
+        source_manifest_digest="c" * 64,
+        application_fingerprint="d" * 64,
+        plugin_registry_fingerprint="e" * 64,
+        configuration_fingerprint="f" * 64,
+        graph_fingerprint="a" * 64,
+        runtime_fingerprint="b" * 64,
+        implementation_fingerprint="c" * 64,
+        deployment_generation="test",
+        session_epoch=1,
+        landscape_epoch=1,
+        coordination_protocol=1,
+        automatic_recovery_eligible=True,
+    )
+    run = authority.mutate(
+        context,
+        lambda tx: tx.runs.create_pending_run(
+            run_id=uuid4(),
+            state_id=state_id,
+            pipeline_yaml=None,
+            started_at=datetime.now(UTC),
+            execution_input=envelope,
+        ),
+    )
+    return authority, context, run
+
+
+def _ignore(_record: ApprovalRecord) -> None:
+    return None
+
+
+def _approve(engine: Engine, run: RunRecord, binding: ApprovalBinding) -> ApprovalRecord:
+    """Request, then approve, through the real authority, each in its own locked session transaction."""
+    transactions = ApprovalTransactionAuthority(engine)
+    session_id = str(run.session_id)
+    state_id = str(run.state_id)
+    requested = transactions.run(
+        session_id,
+        lambda token, now: RepositoryApprovalAuthority.request(
+            token,
+            session_id=session_id,
+            state_id=state_id,
+            binding=binding,
+            requested_by="alice",
+            approver="approver",
+            note=None,
+            now=now,
+            record=_ignore,
+        ),
+    )
+    return transactions.run(
+        session_id,
+        lambda token, now: RepositoryApprovalAuthority.decide(
+            token,
+            approval_id=requested.approval_id,
+            decided_by="approver",
+            decision="approved",
+            note=None,
+            now=now,
+            record=_ignore,
+        ),
+    )
+
+
+def _in_total_order(records: list[ApprovalRecord]) -> tuple[ApprovalBinding, ...]:
+    """The bindings in decision 8's order, computed from the records the authority returned."""
+    keyed: list[tuple[datetime, str, ApprovalBinding]] = []
+    for record in records:
+        assert record.decided_at is not None
+        keyed.append((record.decided_at, record.approval_id, record.binding))
+    return tuple(binding for _decided_at, _approval_id, binding in sorted(keyed, key=lambda item: (item[0], item[1])))
+
+
+def _unlocked_read(engine: Engine, run: RunRecord) -> tuple[ApprovalBinding, ...]:
+    return ApprovalTransactionAuthority(engine).approved_bindings(session_id=str(run.session_id), state_id=str(run.state_id))
+
+
+def test_repeat_approval_with_an_equal_binding_is_admitted_on_postgres(approval_engine: Engine) -> None:
+    authority, context, run = _admit(approval_engine)
+    records = [_approve(approval_engine, run, _gate().binding), _approve(approval_engine, run, _gate().binding)]
+    assert _unlocked_read(approval_engine, run) == _in_total_order(records) == (_gate().binding, _gate().binding)
+    # ApprovalTransactionAuthority.sent, the authority read behind I9's readiness approval row, lists both approvals.
+    listed = ApprovalTransactionAuthority(approval_engine).sent(requested_by_identity_id="alice")
+    approved_ids = sorted(record.approval_id for record in listed if record.state_id == str(run.state_id) and record.decision == "approved")
+    assert approved_ids == sorted(record.approval_id for record in records)
+    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=_POLICY, approval=_gate()))
+    assert permit.state is StartPermitState.START_PERMITTED
+    assert permit.admission_decision is not None and permit.admission_decision.allowed
+
+
+def test_re_approval_after_the_binding_changed_is_admitted_on_postgres(approval_engine: Engine) -> None:
+    stale = dataclasses.replace(_gate().binding, openrouter_catalog_sha256="9" * 64)
+    # Negative control: the stale approval alone refuses, with the mismatch reason.
+    stale_authority, stale_context, stale_run = _admit(approval_engine)
+    _approve(approval_engine, stale_run, stale)
+    refused = stale_authority.mutate(
+        stale_context, lambda tx: tx.runs.assess_start_admission(run_id=stale_run.id, policy=_POLICY, approval=_gate())
+    )
+    assert refused.state is StartPermitState.REFUSED
+    assert refused.admission_decision is not None
+    assert refused.admission_decision.refusal_reason is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+    # The re-approved state: the stale approval first, the matching one second, on ONE state.
+    authority, context, run = _admit(approval_engine)
+    records = [_approve(approval_engine, run, stale), _approve(approval_engine, run, _gate().binding)]
+    assert _unlocked_read(approval_engine, run) == _in_total_order(records)
+    assert set(_in_total_order(records)) == {stale, _gate().binding}
+    permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=_POLICY, approval=_gate()))
+    assert permit.state is StartPermitState.START_PERMITTED
+
+
+def test_every_approved_row_differing_refuses_mismatch_on_postgres(approval_engine: Engine) -> None:
+    authority, context, run = _admit(approval_engine)
+    _approve(approval_engine, run, dataclasses.replace(_gate().binding, openrouter_catalog_sha256="9" * 64))
+    _approve(approval_engine, run, dataclasses.replace(_gate().binding, policy_hash="9" * 64))
+    permit = authority.mutate(context, lambda tx: tx.runs.assess_start_admission(run_id=run.id, policy=_POLICY, approval=_gate()))
+    assert permit.state is StartPermitState.REFUSED
+    assert permit.admission_decision is not None
+    assert permit.admission_decision.refusal_reason is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+
+
+def test_revoking_the_matching_approval_refuses_on_reassessment_on_postgres(approval_engine: Engine) -> None:
+    authority, context, run = _admit(approval_engine)
+    _approve(approval_engine, run, dataclasses.replace(_gate().binding, policy_hash="9" * 64))
+    matching = _approve(approval_engine, run, _gate().binding)
+    issued = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=_POLICY, approval=_gate()))
+    assert issued.state is StartPermitState.START_PERMITTED
+    with approval_engine.begin() as conn:
+        conn.execute(
+            update(approvals_table)
+            .where(approvals_table.c.approval_id == matching.approval_id)
+            .values(decision="revoked", revocation_actor_kind="identity", revoked_by_identity_id="alice", revocation_event_id=str(uuid4()))
+        )
+    reassessed = authority.mutate(context, lambda tx: tx.runs.assess_start_admission(run_id=run.id, policy=_POLICY, approval=_gate()))
+    assert reassessed.state is StartPermitState.START_PERMITTED, "the historical allowance is preserved"
+    assert reassessed.execution_refusal is not None
+    assert reassessed.execution_refusal.refusal_reason is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+```
+
 - [ ] **Step 32: Run the PostgreSQL suites.**
 
 This task writes sessions tables, widens the run-permit path and takes new
 row locks, so the testcontainer selection runs. Docker is required; `-m
 testcontainer` is required or the selection is empty and pytest exits 5.
 
-Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_approval_lifecycle_postgres.py tests/testcontainer/web/test_approval_decide_race_postgres.py -m testcontainer -n 0 > /tmp/i3-lane-pg-approvals.log 2>&1; echo exit=$?`
-Expected: `exit=0`; the log shows the 12 existing `test_approval_consumer_identity_lock_serializes_with_disable` cases and the 2 new `test_the_losing_concurrent_decider_gets_the_current_state_and_writes_nothing` cases passed.
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_approval_lifecycle_postgres.py tests/testcontainer/web/test_approval_decide_race_postgres.py tests/testcontainer/web/test_approval_repeat_postgres.py -m testcontainer -n 0 > /tmp/i3-lane-pg-approvals.log 2>&1; echo exit=$?`
+Expected: `exit=0`; the log shows the 12 existing `test_approval_consumer_identity_lock_serializes_with_disable` cases and the 2 new `test_the_losing_concurrent_decider_gets_the_current_state_and_writes_nothing` cases and the 4 new `test_approval_repeat_postgres.py` tests (`test_repeat_approval_with_an_equal_binding_is_admitted_on_postgres`, `test_re_approval_after_the_binding_changed_is_admitted_on_postgres`, `test_every_approved_row_differing_refuses_mismatch_on_postgres`, `test_revoking_the_matching_approval_refuses_on_reassessment_on_postgres`) passed.
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/testcontainer/web/test_chargeable_admission_postgres.py tests/testcontainer/web/test_run_admission_custody_lock_postgres.py tests/testcontainer/web/test_session_derived_mutations_postgres.py -m testcontainer -n 0 > /tmp/i3-lane-pg-neighbours.log 2>&1; echo exit=$?`
 Expected: `exit=0` (the permit path `_assess` and the composition-state head writers this task edited, on PostgreSQL).
@@ -3919,7 +4766,7 @@ this entry belongs to is a decision to check, not an inference.
 
 - [ ] **Step 34: Lint and type-check every touched Python file.**
 
-Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && ruff check src/elspeth/web/coordination/approval_authority.py src/elspeth/web/sessions/routes/workflow/__init__.py src/elspeth/web/sessions/routes/workflow/approvals.py src/elspeth/contracts/chargeable_admission.py src/elspeth/web/coordination/identity_authority.py src/elspeth/web/coordination/run_start_permit_authority.py src/elspeth/web/coordination/repository.py src/elspeth/web/sessions/protocol.py src/elspeth/web/sessions/service.py src/elspeth/web/execution/service.py src/elspeth/web/execution/protocol.py src/elspeth/web/execution/routes.py src/elspeth/web/auth/audit.py src/elspeth/web/app.py tests/unit/architecture/test_session_db_mutation_authority.py tests/unit/web/sessions/test_operation_fence_wiring.py tests/unit/web/execution/test_service.py tests/unit/web/auth/test_identity_admin_routes.py tests/unit/web/composer/test_chargeable_admission.py tests/unit/web/auth/test_audit.py tests/unit/web/coordination/test_approval_authority.py tests/unit/web/coordination/test_r2_execute_gate.py tests/unit/web/coordination/test_state_writers_supersede_approvals.py tests/unit/web/execution/test_approval_gate_wiring.py tests/unit/web/workflow/__init__.py tests/unit/web/workflow/test_approval_routes.py tests/integration/web/workflow/__init__.py tests/integration/web/workflow/test_approvals.py tests/testcontainer/web/test_approval_decide_race_postgres.py > /tmp/i3-lane-ruff.log 2>&1; echo exit=$?`
+Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && ruff check src/elspeth/web/coordination/approval_authority.py src/elspeth/web/sessions/routes/workflow/__init__.py src/elspeth/web/sessions/routes/workflow/approvals.py src/elspeth/contracts/chargeable_admission.py src/elspeth/web/coordination/identity_authority.py src/elspeth/web/coordination/run_start_permit_authority.py src/elspeth/web/coordination/repository.py src/elspeth/web/sessions/protocol.py src/elspeth/web/sessions/service.py src/elspeth/web/execution/service.py src/elspeth/web/execution/protocol.py src/elspeth/web/execution/routes.py src/elspeth/web/auth/audit.py src/elspeth/web/app.py tests/unit/architecture/test_session_db_mutation_authority.py tests/unit/web/sessions/test_operation_fence_wiring.py tests/unit/web/execution/test_service.py tests/unit/web/auth/test_identity_admin_routes.py tests/unit/web/composer/test_chargeable_admission.py tests/unit/web/auth/test_audit.py tests/unit/web/coordination/test_approval_authority.py tests/unit/web/coordination/test_r2_execute_gate.py tests/unit/web/coordination/test_state_writers_supersede_approvals.py tests/unit/web/execution/test_approval_gate_wiring.py tests/unit/web/workflow/__init__.py tests/unit/web/workflow/test_approval_routes.py tests/integration/web/workflow/__init__.py tests/integration/web/workflow/test_approvals.py tests/testcontainer/web/test_approval_decide_race_postgres.py tests/testcontainer/web/test_approval_repeat_postgres.py > /tmp/i3-lane-ruff.log 2>&1; echo exit=$?`
 Expected: `exit=0`.
 
 Run the same file list through `ruff format --check` writing `/tmp/i3-lane-ruff-format.log`; expected `exit=0` (on a non-zero exit run `ruff format` over exactly those files and re-run the check).
@@ -3932,7 +4779,7 @@ Expected: `exit=0`. Never add `# type: ignore` or `# noqa` to get there (AGENTS.
 1. Sessions database mutation authority (the whole file, not only the manifest id):
 
    Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py -n 0 -rx > /tmp/i3-lane-gate-manifest.log 2>&1; echo exit=$?`
-   Expected: `exit=0`, and the `-rx` summary shows that gate as `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed` or `Stale reviewed` row may name a site this task touches. No step after Step 20 edits a Sessions writer function, so no row should move; an `Unexpected/unreviewed` line here means a writer function changed after its row was derived (typically a step redone after review) — re-derive that one row from the XFAIL text exactly as Step 12 did.
+   Expected: `exit=0`, and the `-rx` summary shows that gate as `1 xfailed`: the gate already XFAILs on a clean HEAD (measured 2026-09-14 on a `git archive` export of 818d04577, `1 xfailed in 115.45s`), so this task cannot bring it to a pass. Read the XFAIL text instead: its counts must equal I1 Step 15's recorded baseline, and no `Unexpected/unreviewed`, `Stale reviewed`, `Connections outside exact contained authority` or `Stale reviewed read connections` row may name a site this task touches (`grep -c 'approval_authority.py\|identity_authority.py\|_assess\|_insert_composition_state\|append_state\|create_or_reconcile_pending' /tmp/i3-lane-gate-manifest.log` prints `0`). No step after Step 12 edits `approval_authority.py` or `identity_authority.py`, and no step after Step 20 edits a Sessions writer function, so no row should move; an `Unexpected/unreviewed` line here means a writer function changed after its row was derived (typically a step redone after review) — re-derive that one row from the XFAIL text exactly as Step 12 did.
 
 2. Attribute contracts (`src/elspeth/web/sessions` gained `routes/workflow/` and edits to `service.py` / `protocol.py`; none may add a `getattr`/`hasattr`):
 
@@ -4026,20 +4873,20 @@ cd "$(git rev-parse --show-toplevel)" && scripts/branch-safety-check.sh --intent
 
 Expected: no `[FAIL]` line (exit 0). `[WARN]` lines are read and accepted knowingly.
 
-The twelve created files are untracked, and a commit pathspec that names an untracked path is refused, so mark exactly those twelve intent-to-add first (this records only that the paths exist; nothing else enters the index):
+The thirteen created files are untracked, and a commit pathspec that names an untracked path is refused, so mark exactly those thirteen intent-to-add first (this records only that the paths exist; nothing else enters the index):
 
 ```bash
-cd "$(git rev-parse --show-toplevel)" && git add -N src/elspeth/web/coordination/approval_authority.py src/elspeth/web/sessions/routes/workflow/__init__.py src/elspeth/web/sessions/routes/workflow/approvals.py tests/unit/web/coordination/test_approval_authority.py tests/unit/web/coordination/test_r2_execute_gate.py tests/unit/web/coordination/test_state_writers_supersede_approvals.py tests/unit/web/execution/test_approval_gate_wiring.py tests/unit/web/workflow/__init__.py tests/unit/web/workflow/test_approval_routes.py tests/integration/web/workflow/__init__.py tests/integration/web/workflow/test_approvals.py tests/testcontainer/web/test_approval_decide_race_postgres.py; echo exit=$?
+cd "$(git rev-parse --show-toplevel)" && git add -N src/elspeth/web/coordination/approval_authority.py src/elspeth/web/sessions/routes/workflow/__init__.py src/elspeth/web/sessions/routes/workflow/approvals.py tests/unit/web/coordination/test_approval_authority.py tests/unit/web/coordination/test_r2_execute_gate.py tests/unit/web/coordination/test_state_writers_supersede_approvals.py tests/unit/web/execution/test_approval_gate_wiring.py tests/unit/web/workflow/__init__.py tests/unit/web/workflow/test_approval_routes.py tests/integration/web/workflow/__init__.py tests/integration/web/workflow/test_approvals.py tests/testcontainer/web/test_approval_decide_race_postgres.py tests/testcontainer/web/test_approval_repeat_postgres.py; echo exit=$?
 ```
 
 Expected: `exit=0`.
 
 ```bash
-cd "$(git rev-parse --show-toplevel)" && git commit -m "feat(identity): approvals with the R2 execute gate" -- src/elspeth/web/coordination/approval_authority.py src/elspeth/web/sessions/routes/workflow/__init__.py src/elspeth/web/sessions/routes/workflow/approvals.py src/elspeth/contracts/chargeable_admission.py src/elspeth/web/coordination/identity_authority.py src/elspeth/web/coordination/run_start_permit_authority.py src/elspeth/web/coordination/repository.py src/elspeth/web/sessions/protocol.py src/elspeth/web/sessions/service.py src/elspeth/web/execution/service.py src/elspeth/web/execution/protocol.py src/elspeth/web/execution/routes.py src/elspeth/web/auth/audit.py src/elspeth/web/app.py tests/unit/architecture/test_session_db_mutation_authority.py tests/unit/web/sessions/test_operation_fence_wiring.py tests/unit/web/execution/test_service.py tests/unit/web/auth/test_identity_admin_routes.py tests/unit/web/composer/test_chargeable_admission.py tests/unit/web/auth/test_audit.py tests/unit/web/coordination/test_approval_authority.py tests/unit/web/coordination/test_r2_execute_gate.py tests/unit/web/coordination/test_state_writers_supersede_approvals.py tests/unit/web/execution/test_approval_gate_wiring.py tests/unit/web/workflow/__init__.py tests/unit/web/workflow/test_approval_routes.py tests/integration/web/workflow/__init__.py tests/integration/web/workflow/test_approvals.py tests/testcontainer/web/test_approval_decide_race_postgres.py CHANGELOG.md config/cicd/soft-mapping-census.yaml
+cd "$(git rev-parse --show-toplevel)" && git commit -m "feat(identity): approvals with the R2 execute gate" -- src/elspeth/web/coordination/approval_authority.py src/elspeth/web/sessions/routes/workflow/__init__.py src/elspeth/web/sessions/routes/workflow/approvals.py src/elspeth/contracts/chargeable_admission.py src/elspeth/web/coordination/identity_authority.py src/elspeth/web/coordination/run_start_permit_authority.py src/elspeth/web/coordination/repository.py src/elspeth/web/sessions/protocol.py src/elspeth/web/sessions/service.py src/elspeth/web/execution/service.py src/elspeth/web/execution/protocol.py src/elspeth/web/execution/routes.py src/elspeth/web/auth/audit.py src/elspeth/web/app.py tests/unit/architecture/test_session_db_mutation_authority.py tests/unit/web/sessions/test_operation_fence_wiring.py tests/unit/web/execution/test_service.py tests/unit/web/auth/test_identity_admin_routes.py tests/unit/web/composer/test_chargeable_admission.py tests/unit/web/auth/test_audit.py tests/unit/web/coordination/test_approval_authority.py tests/unit/web/coordination/test_r2_execute_gate.py tests/unit/web/coordination/test_state_writers_supersede_approvals.py tests/unit/web/execution/test_approval_gate_wiring.py tests/unit/web/workflow/__init__.py tests/unit/web/workflow/test_approval_routes.py tests/integration/web/workflow/__init__.py tests/integration/web/workflow/test_approvals.py tests/testcontainer/web/test_approval_decide_race_postgres.py tests/testcontainer/web/test_approval_repeat_postgres.py CHANGELOG.md config/cicd/soft-mapping-census.yaml
 ```
 
 Run: `cd "$(git rev-parse --show-toplevel)" && git show --stat HEAD > /tmp/i3-lane-commit-stat.log 2>&1; echo exit=$?`
-Expected: `exit=0`; the stat lists exactly those 31 files (12 created, 19 modified) and the summary line reads `31 files changed`. `web/app.py`, `auth/audit.py`, `tests/unit/web/auth/test_audit.py`, `tests/unit/web/auth/test_identity_admin_routes.py`, `tests/unit/architecture/test_session_db_mutation_authority.py`, `config/cicd/soft-mapping-census.yaml` and `CHANGELOG.md` are also touched by I4/I5: the second lane to land rebases, and every collision is an adjacent-line append or a census re-pin.
+Expected: `exit=0`; the stat lists exactly those 32 files (13 created, 19 modified) and the summary line reads `32 files changed`. `web/app.py`, `auth/audit.py`, `tests/unit/web/auth/test_audit.py`, `tests/unit/web/auth/test_identity_admin_routes.py`, `tests/unit/architecture/test_session_db_mutation_authority.py`, `config/cicd/soft-mapping-census.yaml` and `CHANGELOG.md` are also touched by I4/I5: the second lane to land rebases, and every collision is an adjacent-line append or a census re-pin.
 
 **Open questions (operator rulings needed before execution):**
 
@@ -4067,3 +4914,103 @@ Expected: `exit=0`; the stat lists exactly those 31 files (12 created, 19 modifi
    `withdraw(connection_token, *, approval_id, requested_by)` omitted, because
    decision 1 requires every audited authority mutation to take a required
    `record` callback. Confirm both deviations.
+4. **Who may decide an approval?** Decision 7 admits only the addressed
+   approver, matching I7's inspect predicate and I9's mailbox inbox. Spec
+   :1416 reads role-based: any active non-author approver may decide, which
+   gives leave cover. Under decision 7, leave cover means re-addressing. In
+   I9's UI that is a new composition state (which supersedes the open request)
+   and a new request, because I9 renders no Withdraw action and
+   re-requesting an open state is `ApprovalOpenRequestExists`. Through the
+   API it is `POST .../withdraw` and then a re-request. This is the I7 item in
+   the master's Self-review notes. If it is ruled role-based, make these
+   changes together:
+   - In `decide`, remove the addressed-or-author check and its comment. The
+     note validation may stay below the row read.
+   - Restore `test_any_active_approver_who_is_not_the_author_may_decide` (a
+     second approver decides).
+   - In `test_decide_requires_active_approver_role`, the first arm becomes
+     `ApproverRoleRequired` for the role-less `passer-by`.
+   - Restore `carol` as the route test's first decider (bob becomes the 409
+     second decider again).
+   - Restore a second approver, `cover`, as the PostgreSQL race loser.
+   - Widen I7's approver arm and I9's inbox in the same change.
+   - In I9, rewrite decision 13 and the Interfaces line that calls `approvals`
+     "I3's addressed-only `inbox`". Rewrite
+     `test_inbox_lists_only_requests_addressed_to_the_caller` (every live
+     non-author approver is listed) and
+     `test_alice_bob_and_carol_meet_one_rule_at_inbox_inspect_and_decide`
+     (carol, a live approver the request is not addressed to, is listed,
+     admitted at inspect and admitted at decide). Re-derive the
+     `approvals_to_decide` counts that a non-addressed approver changes:
+     `assert _summary(app, "bob") == {` in
+     `test_summary_counts_each_folder_and_reports_live_roles` goes from `1` to
+     `2`, because dave's request to carol counts for bob too, and
+     `assert _summary(app, "carol")["approvals_to_decide"] == 0` in the
+     three-party test goes to `1`. The counts after bob's role row is revoked,
+     alice's "holds no approver role" count and the governance-off test's
+     single request to bob are the same under either rule.
+   - In I10, rename the ids its Consumes list names
+     (`test_only_the_addressed_approver_may_decide`,
+     `test_only_the_addressed_approver_decides_and_a_repeat_decision_gets_the_current_state`)
+     to the restored I3 ids. Reword its Consumes entry for the 404
+     `approval_not_found` envelope, which says `decide` returns it to a caller
+     who is neither the addressed approver nor the requester: under this
+     ruling `decide` returns it for an unknown approval id only. Re-pin the two
+     `GOVERNANCE_SUITE` Pins that name those ids: the "concurrent decide: the
+     losing decider gets the current state" fire pin and the "separation:
+     author = approver" mutation pin. In
+     `test_round_trip_request_decide_see_and_the_badge_clears`, carol is a
+     seeded approver, so her decide after bob's rejection becomes a 409
+     `approval_already_decided` with `current_state` `rejected` instead of the
+     hidden 404. Reword the comments that call it hidden; the R4 audit-row list
+     is unchanged, because a 409 writes no row.
+   - In I11, rewrite the two sentences that pin the addressed-only rule. No
+     I11 test, `_RULES` entry or `Expected:` count names the rule, so no count
+     changes.
+     - The Interfaces Consumes I3 bullet. It reads "`decide` admits only the
+       approver the request names (`approvals.approver_identity_id`, I3
+       decision 7): a live approver the request was not addressed to gets
+       `ApprovalNotFound` (404 `approval_not_found`), the author gets
+       `ApprovalAuthorIsApprover`". It becomes: `decide` admits any identity
+       holding a live `approver` grant who is not the author; a caller with no
+       live grant gets `ApproverRoleRequired`, the author gets
+       `ApprovalAuthorIsApprover`, and `ApprovalNotFound` (404
+       `approval_not_found`) is for an unknown approval id only. Keep the
+       `approval_required` sentence before it and the closing "no approval
+       check reads `identity_relationships`" unchanged.
+     - Re-admission step 4. It reads "Who may decide an approval is not read
+       from them: `decide` admits only the approver the request names." It
+       becomes: "Who may decide an approval is not read from them: `decide`
+       reads no edges, and any live approver who is not the author may
+       decide." The three uses of the edges the step goes on to list (curator
+       appointment, `GET /api/workflow/audit-view` and the approver picker's
+       default suggestion) and the recreate instruction are the same under
+       either rule.
+     - Re-admission step 5's "Until an approver who is not the author can decide" and the
+       operator notice hold under either rule and stay as written.
+   - In the master, the Self-review I7 item names inspect only. Widen it to
+     decide and the mailbox inbox before the operator rules.
+
+5. **Should I3 adopt LOCK, THEN CLOCK?** Decision 4 records I3's exemption and
+   its residual. An approver grant that expires while a call waits on the
+   population or a participant row is admitted. Rows are stamped with the
+   pre-lock clock. The approver's grant rows are not locked. I4 and I7 follow
+   the convention (review B7). Adopting it here is not local to this file:
+   - `request`, `decide` and `withdraw` lose `now`. Each reads `database_now`
+     once, after `_lock_participants`, and judges and stamps with that value.
+     `_lock_participants` also locks the approver's unrevoked unscoped
+     `approver` rows `FOR UPDATE`, the row `revoke_role` locks
+     (identity_authority.py:2666).
+   - `ApprovalTransactionAuthority.run`'s `mutation(token, now)` contract
+     changes shape, or keeps `now` only for `supersede_open` and I9's
+     `mark_decision_seen`. The route mutations in Step 27, the
+     `lambda token, now:` hand-offs in Steps 29 and 31, and Step 31's
+     `_decide` helper change with it.
+   - I9 changes in the same pass: its Consumes list, and the mailbox test
+     helpers that call `request`, `decide` and `withdraw` with `now=`.
+   - The Step 8 tests that pass `now=NOW + timedelta(...)` need a scripted
+     clock (a monkeypatched `module.database_now`). They pass explicit times
+     because SQLite's `CURRENT_TIMESTAMP` has one-second resolution, and
+     decision 8's order test depends on them.
+   Ruling needed: accept the exemption, or adopt the convention across I3 and
+   I9 together.

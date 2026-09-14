@@ -123,9 +123,10 @@ Measured 2026-09-14 on the checkout at `818d04577` (its only delta from
   objects (ConfigMap, Service ×2, PersistentVolumeClaim, Deployment ×2, Job
   ×2); each child directory also renders on its own (exit 0), which K3's
   render loop (`find deploy/kubernetes -name kustomization.yaml`) requires.
-  `kubectl apply -k` on a missing directory fails before contacting a server
+  `kubectl kustomize <dir>`, the first command K4's `KindCluster.install` runs,
+  fails on a missing directory before contacting a server
   with `error: must build at directory: not a valid directory: evalsymlink failure on '<dir>' : lstat <abs dir>: no such file or directory`
-  (exit 1).
+  (exit 1; K1 Step 2 records the same stderr for its missing base).
 
 Controller shape: an earlier form of this task named `deployments={"a": "elspeth-web-a", "b": "elspeth-web-b"}`;
 a controller also needs each replica's origin and runtime role, so the
@@ -150,17 +151,17 @@ deployment names are exactly those two. **Open question (listed under K5 in the 
   - From HEAD, `_acceptance_common/replica_probes.py`: `ReplicaAddress(name: str, origin: str)`, `ReplicaController`, `EvidenceObserver`, `MembershipRow`, `ReplicaProbeDriver`, `ProbeRequest`, `DEFAULT_TRIALS = 20`, `decide_fence_conflict`, `decide_run_start`, `decide_lease_takeover`, `decide_cross_replica_progress`, `record_owner_affine_progress`; `_acceptance_common/http_client.py`: `AcceptanceCredentials(mode="bearer", bearer_token: str)`, `AcceptanceHttpClient(*, origin, credentials)`; `_acceptance_common/errors.py`: `AcceptanceCheckError(check)`, `AcceptanceInputError(message)`; `azure_container_apps_observations.py`: `Capture(directory)`, `Polling(interval, timeout)`, `PhysicalSinkOracle(path, key_field)`, `collect_takeover(*, owner, survivor, session_id, sessions, observer, partition, sink, capture, polling)`, `collect_progress(*, owner, reader, session_id, capture, polling)`, `observation_document(observation)`; `_azure_container_apps_acceptance/evidence.py`: `lease_takeover_observation(payload: object)` (`:557`), `cross_replica_progress_observation(payload: object)` (`:612`).
   - From K1: Deployment `elspeth-web` (pod labels `app.kubernetes.io/name: elspeth-web`, `app.kubernetes.io/component: web`; `envFrom[0]` ConfigMap `elspeth-web-config`, `envFrom[1]` Secret `elspeth-web-secrets`), Service `elspeth-web` (one port `http`), ConfigMap `ELSPETH_WEB__DATA_DIR: /mnt/elspeth/data`, Jobs `elspeth-provision-storage`, `elspeth-schema-init`.
   - From K2: `GET /api/system/status` reports `deployment_target == "kubernetes"` and `deployment_replica == $ELSPETH_K8S_POD_NAME`.
-  - From K4: `deploy/kubernetes/overlays/kind-test/` (image `elspeth-web-test:kind`, revision `sha-kindtest`, release `0.8.1+kindtest`, PVC bound to PV `elspeth-state-rwx`); the session fixture `kind_cluster -> KindCluster` (`tests/testcontainer/deployment/conftest.py`); `tests.testcontainer.deployment.kind_harness`: `REPO_ROOT`, `HERE`, `KindCluster.kubectl(*args: str) -> str` (asserts exit 0 with message `kubectl <args> failed (exit=<n>):\n<stderr>`), `KindCluster.kubeconfig: Path`, `KindCluster.database_url(role: str, database: str) -> str` (host NodePort 30432; roles `postgres`, `elspeth_schema_owner`, `elspeth_runtime`, `elspeth_runtime_a`, `elspeth_runtime_b`); the PostgreSQL roles `elspeth_runtime_a` and `elspeth_runtime_b`, created at init by K4's ConfigMap `kind-postgres-init` (`02-roles.sql` runs K1's `deploy/kubernetes/base/bootstrap-acceptance-roles.sql`, which `\ir`-includes `bootstrap-roles.sql`), with passwords in `KindCluster.passwords`; Secrets `elspeth-web-secrets-a` (`elspeth_runtime_a`) and `elspeth-web-secrets-b` (`elspeth_runtime_b`); kind host ports 30452/30453; marker `kind`; `scripts/cicd/kubernetes-kind-smoke.sh [extra pytest args]` (prints `exit=<n> wall=<s>s log=<path>`); K4's CI pin `_kind_sources()` requires `pytestmark = pytest.mark.kind` in every `tests/testcontainer/deployment/test_*.py`.
+  - From K4: `deploy/kubernetes/overlays/kind-test/` (image `elspeth-web-test:kind`, revision `sha-kindtest`, release `0.8.1+kindtest`, PVC bound to PV `elspeth-state-rwx`); the session fixture `kind_cluster -> KindCluster` (`tests/testcontainer/deployment/conftest.py`); `tests.testcontainer.deployment.kind_harness`: `REPO_ROOT`, `HERE`, `KindCluster.kubectl(*args: str) -> str` (asserts exit 0 with message `kubectl <args> failed (exit=<n>):\n<stderr>`), `KindCluster.kubeconfig: Path`, `KindCluster.install(overlay: Path, *, timeout: float = 600.0) -> None` (renders the overlay once, applies the prerequisites and `elspeth-provision-storage` and waits for its `Complete` condition, then `elspeth-schema-init` and waits, then the Services and Deployments; the caller owns `rollout status`; its first command is `kubectl kustomize <overlay> -o <tmp>`), `KindCluster.database_url(role: str, database: str) -> str` (host NodePort 30432; roles `postgres`, `elspeth_schema_owner`, `elspeth_runtime`, `elspeth_runtime_a`, `elspeth_runtime_b`); the PostgreSQL roles `elspeth_runtime_a` and `elspeth_runtime_b`, created at init by K4's ConfigMap `kind-postgres-init` (`02-roles.sql` runs K1's `deploy/kubernetes/base/bootstrap-acceptance-roles.sql`, which `\ir`-includes `bootstrap-roles.sql`), with passwords in `KindCluster.passwords`; Secrets `elspeth-web-secrets-a` (`elspeth_runtime_a`) and `elspeth-web-secrets-b` (`elspeth_runtime_b`); kind host ports 30452/30453; marker `kind`; `scripts/cicd/kubernetes-kind-smoke.sh [extra pytest args]` (prints `exit=<n> wall=<s>s log=<path>`); K4's CI pin `_kind_sources()` requires `pytestmark = pytest.mark.kind` in every `tests/testcontainer/deployment/test_*.py`.
 - Produces:
   - `elspeth.web._acceptance_common.postgres_observer`: `BACKEND_PID_SQL`, `TERMINATE_OWN_ROLE_BACKENDS_SQL`, `FENCE_EPOCH_SQL`, `FENCE_OWNER_SQL`, `DATABASE_NOW_SQL`, `GUIDED_OPERATIONS_SINCE_SQL`, `RUN_IDS_SQL`, `LANDSCAPE_RUN_IDS_OF_SESSION_SQL`, `LANDSCAPE_RUN_EXISTS_SQL`, `MEMBERSHIP_ROW_SQL` (all `Final[str]`); `require_runtime_role(role: str) -> str`; `nologin_sql(role: str) -> str`; `login_sql(role: str) -> str`; `class SqlSession(ABC)` (`execute_scalar(statement: str) -> object`, `close() -> None`); `SessionFactory = Callable[[], SqlSession]`; `class SqlReader(ABC)` (`scalar(statement: str, **parameters: object) -> object`, `rows(statement: str, **parameters: object) -> tuple[tuple[object, ...], ...]`); `PartitionRecord(role: str, own_backend_pid: int, terminated_backends: int)`; `RoleRevocationPartition(*, admin: SessionFactory, roles: Mapping[str, SessionFactory])` with `partition(role: str) -> PartitionRecord` and `restore(role: str) -> None`; `PostgresEvidenceObserver(*, sessions: SqlReader, landscape: SqlReader)` implementing `EvidenceObserver`. The Container Apps controller re-exports every one of these names (same objects).
   - `elspeth.web._kubernetes_acceptance.controller`: `KUBECTL_COMMAND_TIMEOUT_SECONDS: Final = 360.0`; `class KubectlCommands(ABC)` with `run(argv: Sequence[str]) -> bytes`; `KubectlSubprocess(*, kubeconfig: Path | None = None)` implementing it (argv[0] must be `kubectl`; failure → `AcceptanceCheckError("platform_command")`); `ProbePod(address: ReplicaAddress, deployment: str, role: str)` (frozen, slots); `KubernetesReplicaController(*, namespace: str, replicas: tuple[ProbePod, ProbePod], partition: RoleRevocationPartition, platform: KubectlCommands)` implementing `ReplicaController`: `replicas() -> tuple[ReplicaAddress, ReplicaAddress]`; `partition_owner(replica)` → `partition.partition(<role>)`; `stop_owner(replica)` → `kubectl -n <ns> delete pod -l app.kubernetes.io/instance=<deployment> --grace-period=0 --force --wait=false`; `restore_owner(replica)` → `partition.restore(<role>)` then `kubectl -n <ns> rollout status deployment/<deployment> --timeout=300s`.
   - `deploy/kubernetes/overlays/kind-acceptance/`: Deployments `elspeth-web-a` / `elspeth-web-b` (`replicas: 1`, labels and selector gain `app.kubernetes.io/instance: elspeth-web-a|b`, `envFrom[1]` Secret `elspeth-web-secrets-a|b`, `envFrom[2]` optional Secret `elspeth-kind-composer`), NodePort Services `elspeth-web-a` (30452) / `elspeth-web-b` (30453) selecting on the instance label; the shared ConfigMap, PVC and both Jobs from `kind-test`.
-  - `tests/testcontainer/deployment/test_kubernetes_replica_probes.py`: module fixture `lane -> ProbeLane`, env switch `ELSPETH_KIND_COMPOSER_ENV_FILE`, and the six test ids defined in Step 12 (K8 cites the file and the four probe ids). Ordering: pytest collects `test_kubernetes_kind.py` (K4's proofs, then K7's section once K7 has appended it, whose `no_affinity_rollout` teardown re-applies `kind-test`) before this module in the same session, so this module runs after K4's tests (and after K7's, once they exist) and hands the cluster to no later task. Its setup deletes K4's `elspeth-web` Deployment and Service itself; its teardown deletes its own two Deployments and Services, so the session ends with no web Deployment.
+  - `tests/testcontainer/deployment/test_kubernetes_replica_probes.py`: module fixture `lane -> ProbeLane`, env switch `ELSPETH_KIND_COMPOSER_ENV_FILE`, and the six test ids defined in Step 12 (K8 cites the file and the four probe ids). Ordering: pytest collects `test_kubernetes_kind.py` (K4's proofs, then K7's section once K7 has appended it, whose `no_affinity_rollout` teardown re-applies `kind-test`) before this module in the same session, so this module runs after K4's tests (and after K7's, once they exist) and hands the cluster to no later task. Its setup deletes K4's `elspeth-web` Deployment and Service itself and installs `kind-acceptance` through `KindCluster.install`, so the module is equally correct alone on a fresh cluster (`-k replica_probes`, where that call is the cold install; Step 15 runs it); its teardown deletes its own two Deployments and Services, so the session ends with no web Deployment.
 
 - [ ] **Step 1: Record the gate baselines this task must not move.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && mkdir -p .claude/lanes/k5 && .venv/bin/python -m pytest tests/unit/architecture/test_session_db_mutation_authority.py -k "all_production_sessions_writers or probe_seam or aca_shared_surfaces" -n 0 -q -rx > /tmp/klane-k5-authority-before.log 2>&1; echo exit=$?; grep -c acceptance /tmp/klane-k5-authority-before.log; tail -1 /tmp/klane-k5-authority-before.log`
-Expected: `exit=0`; `0`; `2 passed, 263 deselected, 1 xfailed in <n>s` (the xfail is the pre-existing Landscape inventory drift; record its `Unexpected/unreviewed (<n>)` count from the log).
+Expected: `exit=0`; `0`; `2 passed, 263 deselected, 1 xfailed in <n>s` (the xfail is the pre-existing sessions mutation-authority drift; record its `Unexpected/unreviewed (<n>)` count from the log).
 
 Run: `cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m scripts.check_contracts > /tmp/klane-k5-contracts-before.log 2>&1; echo exit=$?; grep -c "_acceptance_common\|_kubernetes_acceptance\|_azure_container_apps_acceptance" /tmp/klane-k5-contracts-before.log`
 Expected: the exit code this working tree already has (1 on the measured tree, for `web/interpretation_state.py`), and `0`.
@@ -1296,7 +1297,6 @@ DEPLOYMENT_B = "elspeth-web-b"
 ROLE_A = "elspeth_runtime_a"  # collect_takeover partitions this literal role (azure_container_apps_observations.py:529)
 ROLE_B = "elspeth_runtime_b"
 RUNTIME_ROLES = ("elspeth_runtime", ROLE_A, ROLE_B)
-JOBS = ("elspeth-provision-storage", "elspeth-schema-init")
 SHARE_OUTPUTS = Path("/mnt/elspeth/data/outputs")  # ELSPETH_WEB__DATA_DIR (K1 ConfigMap) + outputs/<session> (paths.py:108-135)
 TAKEOVER_ROWS = 200_000
 COMPOSER_ENV_FILE = "ELSPETH_KIND_COMPOSER_ENV_FILE"
@@ -1394,20 +1394,6 @@ class _PodSinkOracle(PhysicalSinkOracle):
 # --------------------------------------------------------------------------- cluster helpers
 
 
-def _wait_job(cluster: KindCluster, name: str, *, timeout: float = 600.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        status = json.loads(cluster.kubectl("get", "job", name, "-o", "json"))["status"]
-        if status.get("succeeded", 0) >= 1:
-            return
-        if status.get("failed", 0) >= 1:
-            logs = cluster.kubectl("logs", f"job/{name}", "--all-containers", "--tail=100")
-            safe = "\n".join(line for line in logs.splitlines() if "postgresql+psycopg://" not in line)
-            raise AssertionError(f"job/{name} failed:\n{safe}")
-        time.sleep(3)
-    raise AssertionError(f"job/{name} did not complete within {timeout}s")
-
-
 def _wait_web_pods_gone(cluster: KindCluster, *, timeout: float = 180.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1476,9 +1462,12 @@ def lane(kind_cluster: KindCluster) -> Iterator[ProbeLane]:
     composer_env = os.environ.get(COMPOSER_ENV_FILE)
     if composer_env:
         kind_cluster.kubectl("create", "secret", "generic", COMPOSER_SECRET, f"--from-env-file={composer_env}")
-    kind_cluster.kubectl("apply", "-k", str(OVERLAY))
-    for job in JOBS:
-        _wait_job(kind_cluster, job)
+    # Cold-install order (K4's KindCluster.install): ConfigMap, claim and the
+    # provisioner, waited; then schema-init, waited; then both Services and
+    # Deployments. Run alone (`-k replica_probes`) this IS the cold install:
+    # one `apply -k` would start schema-init beside the provisioner, and its
+    # doctor fails the missing share directories for good (backoffLimit 0).
+    kind_cluster.install(OVERLAY)
     for deployment, origin in ((DEPLOYMENT_A, ORIGIN_A), (DEPLOYMENT_B, ORIGIN_B)):
         kind_cluster.kubectl("rollout", "status", f"deployment/{deployment}", "--timeout=600s")
         _wait_ready(origin)
@@ -1755,7 +1744,7 @@ Run: `cd "$(git rev-parse --show-toplevel)" && .venv/bin/ruff check tests/testco
 Expected: `exit=0` twice. If `ruff format --check` lists the module, run `ruff format` on it and rerun (K4's `conftest.py` and `kind_harness.py` are not touched by this task).
 
 Run: `cd "$(git rev-parse --show-toplevel)" && scripts/cicd/kubernetes-kind-smoke.sh -k replica_probes > /tmp/klane-k5-step13.log 2>&1; echo exit=$?; grep -E '^exit=|passed|error|must build at directory' /tmp/klane-k5-step13.log`
-Expected: `exit=1`; the smoke line `exit=1 wall=<n>s log=<path>`; five ERRORs at setup of `lane` with `AssertionError: kubectl apply -k <repo>/deploy/kubernetes/overlays/kind-acceptance failed (exit=1):` followed by `error: must build at directory: not a valid directory: evalsymlink failure on '<repo>/deploy/kubernetes/overlays/kind-acceptance' : lstat <repo>/deploy/kubernetes/overlays/kind-acceptance: no such file or directory`; summary `1 passed, 5 errors` (P4b needs no cluster).
+Expected: `exit=1`; the smoke line `exit=1 wall=<n>s log=<path>`; five ERRORs at setup of `lane` with `AssertionError: kubectl kustomize <repo>/deploy/kubernetes/overlays/kind-acceptance -o <tmp>/kind-install-<suffix> failed (exit=1):` (the first command of K4's `KindCluster.install`) followed by `error: must build at directory: not a valid directory: evalsymlink failure on '<repo>/deploy/kubernetes/overlays/kind-acceptance' : lstat <repo>/deploy/kubernetes/overlays/kind-acceptance: no such file or directory`; summary `1 passed, 5 errors` (P4b needs no cluster).
 
 - [ ] **Step 14: Write the kind-acceptance overlay and render it offline.**
 
@@ -1955,7 +1944,12 @@ Expected (measured with kubectl v1.37.0 over K1's base and K4's kind-test): `exi
 This is the F7 run for K5: the moved probe SQL and the role partition execute against PostgreSQL 16 only here (no `tests/testcontainer/web` test imports `RoleRevocationPartition` or `PostgresEvidenceObserver`, measured with `grep -rln` over `tests/testcontainer` and `tests/integration`). The `-m testcontainer` selection is unaffected by this task and is run by Step 16's gate.
 
 Run: `cd "$(git rev-parse --show-toplevel)" && scripts/cicd/kubernetes-kind-smoke.sh -rs > /tmp/klane-k5-step15.log 2>&1; echo exit=$?; grep -E '^exit=|passed|failed|error|SKIPPED' /tmp/klane-k5-step15.log; PATH="$PWD/.claude/lanes/k8s/bin:$PATH" kind get clusters`
-Expected: `exit=0`; the smoke line `exit=0 wall=<n>s log=<path>`; `8 passed, 1 skipped` (K4's three proofs plus P1, P2, P4b, P3 and the stop/restore test; the skip is P4a with the reason `P4a measures composer message visibility and needs a composer provider in the pods; set ELSPETH_KIND_COMPOSER_ENV_FILE to an env file of composer settings (open question on Task K5)`); `kind get clusters` prints nothing. The printed wall time must stay under 30 minutes (half of the `kubernetes-kind` job's `timeout-minutes: 60`); if it does not, report the figure rather than raising the timeout.
+Expected: `exit=0`; the smoke line `exit=0 wall=<n>s log=<path>`; `10 passed, 1 skipped` (K4's three proofs, its cold-install ordering proof and its clusterless install-phase control, plus P1, P2, P4b, P3 and the stop/restore test; the skip is P4a with the reason `P4a measures composer message visibility and needs a composer provider in the pods; set ELSPETH_KIND_COMPOSER_ENV_FILE to an env file of composer settings (open question on Task K5)`); `kind get clusters` prints nothing. The printed wall time must stay under 30 minutes (half of the `kubernetes-kind` job's `timeout-minutes: 60`); if it does not, report the figure rather than raising the timeout.
+
+Then run K5 alone on a fresh cluster, where the `lane` fixture's `KindCluster.install(OVERLAY)` is the cold install (no K4 test has provisioned the share or initialized the schemas in that session):
+
+Run: `cd "$(git rev-parse --show-toplevel)" && scripts/cicd/kubernetes-kind-smoke.sh -k replica_probes -rs > /tmp/klane-k5-step15-alone.log 2>&1; echo exit=$?; grep -E '^exit=|passed|failed|error|SKIPPED' /tmp/klane-k5-step15-alone.log; PATH="$PWD/.claude/lanes/k8s/bin:$PATH" kind get clusters`
+Expected: `exit=0`; the smoke line `exit=0 wall=<n>s log=<path>`; `5 passed, 1 skipped, 5 deselected` (P1, P2, P4b, P3 and the stop/restore test pass; the skip is P4a with the reason above; the five deselected ids are K4's); `kind get clusters` prints nothing. An ERROR at setup of `lane` reading `job/elspeth-schema-init failed:` with `FAIL data_dir_writable` means the fixture is not installing through `KindCluster.install`.
 
 If P3 fails with `probe_before_expiry_window_missed`, the takeover pipeline finished before the partition: raise `TAKEOVER_ROWS` (the blob route admits 100 MiB, `config.py:440`) and rerun; do not shorten a lease. If P1 fails with `winners_not_distinct_across_run` or a `dispatch_spread_ms` reason, rerun once with `-k test_p1` to separate a scheduling artefact from a fence defect, and report both runs.
 
