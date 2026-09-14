@@ -66,7 +66,7 @@ The decisions those findings forced are listed under Self-review notes.
 - Workflow-governance tests run against a closed local deployment (`registration_mode` not `open`) with `workflow_governance="on"` (Task I8) because R11 refuses enforcement otherwise; I8 therefore precedes every task that reads the switch.
 - Run every suite to a file and read the exit code (`AGENTS.md` § Test Verification Policy); use `scripts/full-suite-gate.sh --execute --detach` before merging a task branch.
 - Commit by file pathspec with the message BEFORE the separator: `git commit -m "<msg>" -- <file> <file>` (shared checkout rule; `git commit -- <files> -m ...` aborts because everything after `--` is a pathspec, and a directory pathspec sweeps a sibling lane's edits in).
-- K and I share exactly two files: `CHANGELOG.md` (each workstream appends its own lines under the `## 0.8.1` heading and rebases) and `docs/runbooks/staging-session-db-recreation.md` (I11 creates the `### Cutover by deployment shape` table; K8 appends its Kubernetes row, so K8 runs after I11). Which release section receives them is a decision to confirm with the operator before the first commit (the top heading is `## 0.8.1 - 2026-09-10` and no 0.8.1 tag exists).
+- K and I share exactly two files: `CHANGELOG.md` (each workstream appends its own lines under the `## 0.8.1` heading and rebases) and `docs/runbooks/staging-session-db-recreation.md` (I11 creates the `### Cutover by deployment shape` table; K8 appends its Kubernetes row, so K8 runs after I11). Which release section receives them is a decision to confirm with the operator before the first commit (the top heading is `## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)` and no 0.8.1 tag exists).
 - Line citations were measured on 072141b75 and 818d04577. Five files they cite had uncommitted edits from a concurrent session when the plan was written: `src/elspeth/web/app.py`, `src/elspeth/web/sessions/service.py`, `src/elspeth/web/execution/service.py`, `src/elspeth/web/execution/routes.py` and `tests/unit/architecture/test_session_db_mutation_authority.py`. Re-measure every `path:line` into those files, and the mutation-authority gate's XFAIL counts, before executing I1, I2 or I3.
 - Kubernetes tool binaries: `kubectl` and `kind` are absent on the development box and on the CI `test` runner. Tests that need `kubectl` use the `_require_kubectl` skip-locally/fail-in-CI pattern (`ELSPETH_CI_KUBECTL_REQUIRED`); tests that need a cluster carry the `kind` marker, which the default and Testcontainer selections exclude and only the `kubernetes-kind` job selects.
 
@@ -101,9 +101,9 @@ preamble under each task heading and changed K0's two references to the old path
 otherwise unchanged. The subagent-driven-development `task-brief` script only extracts numeric task
 headings (`Task 3`), so dispatch with the task file path instead.
 
-References such as "DECISIONS K12" or "DECISIONS I3" name entries in the working decisions note
-used while the plan was written. That note is not published: each task restates the decision it
-relies on, and says so in place where it departs from one.
+Decisions taken while the plan was written are stated in the task text that relies on them. Where
+a task mentions an "earlier working decision" or an "earlier form", it describes that form in place;
+the working note itself is not published.
 
 Rows are in execution order within each workstream.
 

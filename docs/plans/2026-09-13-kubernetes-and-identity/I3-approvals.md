@@ -12,7 +12,7 @@ concurrent-decide guard"). Every `path:line` below was measured on HEAD
 072141b75; I0, I8 and I1 add lines above some of them, so re-measure with the
 anchor text quoted beside each line before editing.
 
-Decisions this task owns (DECISIONS.md I3, I8–I12):
+Decisions this task owns:
 
 1. **`auth_events` is a Landscape table** (`core/landscape/schema.py:2542`;
    `ck_auth_events_event_type` :2566-2578 already admits `approval_requested`
@@ -27,8 +27,9 @@ Decisions this task owns (DECISIONS.md I3, I8–I12):
    (`approval_lifecycle_authority.py:21`) already writes `revoked` rows with
    no Landscape row of its own. The superseded transition is recorded on the
    sessions row (`decision='superseded'`, `decided_at`). This DEPARTS from
-   DECISIONS.md I3, which lists `superseded` in `record_approval_decided`'s
-   decision set; it needs an operator ruling before execution (thread a
+   the earlier working decision, which listed `superseded` among
+   `record_approval_decided`'s decisions (approved, rejected, revoked,
+   superseded); it needs an operator ruling before execution (thread a
    `record` callback through the composition-state writers, or rule that
    `superseded` is not audited). See open question 1.
 2. **The binding.** `build_approval_binding(*, evidence, config_hash,
@@ -55,10 +56,10 @@ Decisions this task owns (DECISIONS.md I3, I8–I12):
    NOT the Landscape `runs.config_hash` (`stable_hash(config.config)`,
    run_lifecycle_repository.py:372, which only exists once the worker thread
    has loaded settings). See open question 2.
-3. **Withdraw maps onto `revoked`** with identity provenance (DECISIONS I11;
-   `ck_approvals_revocation_provenance`, models.py:3639-3645). No new
+3. **Withdraw maps onto `revoked`** with identity provenance
+   (`ck_approvals_revocation_provenance`, models.py:3639-3645). No new
    decision value: the CHECK at :3581 is closed and I0 is over.
-4. **Lock order** (DECISIONS I10, `approval_lifecycle_authority.py:3-8`):
+4. **Lock order** (`approval_lifecycle_authority.py:3-8`):
    the session lock (`locked_session_transaction`, sessions/locking.py:280),
    then — only when the requester holds deployment-wide `admin` — the admin
    population lock (`_ADMIN_HOLDER_ROWS_FOR_UPDATE`, identity_authority.py:797,
@@ -68,7 +69,7 @@ Decisions this task owns (DECISIONS.md I3, I8–I12):
    side can hold admin.
 5. **R2 lives in `_assess`** (run_start_permit_authority.py:37), which
    already locks the run row (:42) and therefore has `runs.state_id`; the
-   caller passes `approval: ApprovalGateInputs | None` (DECISIONS I8) and
+   caller passes `approval: ApprovalGateInputs | None` and
    `None` means the deployment has `workflow_governance="off"`. The HTTP 409
    is raised by a pre-flight in `execute_pipeline` (execution/service.py:1862-1870,
    before `create_run`) through the same `evaluate_approval_gate` function,
@@ -107,7 +108,7 @@ Decisions this task owns (DECISIONS.md I3, I8–I12):
 **Interfaces:**
 - Consumes:
   - I8: `WebSettings.workflow_governance: Literal["off", "on"] = "off"` (read as `settings.workflow_governance == "on"`, never ANDed with the R11 predicate); fixtures `closed_local_settings(tmp_path)` and `closed_local_app(tmp_path, closed_local_settings) -> SyncASGITestClient` in `tests/unit/web/conftest.py` (`auth_provider="local"`, `registration_mode="closed"`, `workflow_governance="on"`, `compartment_id="test-compartment"`, `get_current_user` overridden to `alice`, `client.app.state.phase3_engine` / `phase3_sessions_service` exposed).
-  - I1: `tests/unit/web/coordination/conftest.py::fenced_session` — attributes `engine`, `connection_token` (a registered mutation-connection token whose `engine.begin()` transaction stays open for the test, so `begin_nested()` savepoints work), `identity_id` (an active identity that owns the session), `session_id`. I3 does NOT consume `pg_fenced`: a concurrent-decide race needs two independent transactions on committed rows, which one open fixture token cannot give, so the PostgreSQL loser test builds its own database on `external_deployment_postgres_url` (tests/testcontainer/web/conftest.py:40) the way `tests/testcontainer/web/test_approval_lifecycle_postgres.py:31-79` does. This departs from DECISIONS I6 ("I3 reuses the same names"), which needs amending to match (see open question 3). I1's `AdmissionPolicyEvidence` (`schema_version: Literal[2]`) and `AdmissionRefusalReason.QUOTA_EXCEEDED` are already present.
+  - I1: `tests/unit/web/coordination/conftest.py::fenced_session` — attributes `engine`, `connection_token` (a registered mutation-connection token whose `engine.begin()` transaction stays open for the test, so `begin_nested()` savepoints work), `identity_id` (an active identity that owns the session), `session_id`. I3 does NOT consume `pg_fenced`: a concurrent-decide race needs two independent transactions on committed rows, which one open fixture token cannot give, so the PostgreSQL loser test builds its own database on `external_deployment_postgres_url` (tests/testcontainer/web/conftest.py:40) the way `tests/testcontainer/web/test_approval_lifecycle_postgres.py:31-79` does. The earlier working decision had I3 reuse I1's fixture names, `pg_fenced` included; this task departs from it for the reason above (see open question 3). I1's `AdmissionPolicyEvidence` (`schema_version: Literal[2]`) and `AdmissionRefusalReason.QUOTA_EXCEEDED` are already present.
   - HEAD (routes and integration): `SessionServiceProtocol.get_current_state(session_id)` (sessions/protocol.py:4613) and `get_state(state_id)` (:4618); `RepositoryIdentityAuthority.holds_active_role(*, identity_id, role)` (identity_authority.py:1285); `SessionOperationLease.acquire(...)` (coordination/lifecycle.py:326), `.context` (:598), `.close()` (:1035); `run_sync_in_worker(func, *args, **kwargs)` (web/async_workers.py:179); `SessionOperationKind.BLOB_READ` / `COMPOSE` (contracts/session_operation.py:10-18); `_save_composition_state_with_compose_authority(service, session_id, state, *, provenance)` (tests/integration/web/conftest.py:86); `LandscapeDB.from_url(...).read_only_connection()` and `auth_events_table` (the read `tests/unit/web/auth/test_audit.py:634-641` uses); `AuthAuditRecorder(landscape_url=, landscape_passphrase=, create_tables=)` (auth/audit.py:431; `close()` :459 makes every later write raise `RuntimeError("Auth audit recorder is closed")` :448-449).
   - HEAD: `_resolve_mutation_connection` / `_register_mutation_connection` / `_unregister_mutation_connection` (mutation_connection_registry.py:22-46); `locked_session_transaction(engine, session_id)` (sessions/locking.py:280); `database_now(conn)` (coordination/database_clock.py:54); `_ADMIN_HOLDER_ROWS_FOR_UPDATE` (identity_authority.py:797); `RepositoryChargeableAdmissionAuthority.assess` (run_start_permit_authority.py:41); `read_cancelled_execution_envelope` (envelope.py:156, returns `CancelledExecutionEnvelope(audit_safe_config, plugin_snapshot, user_id, auth_provider_type, openrouter_catalog_sha256, openrouter_catalog_source, web_plugin_policy_evidence)`); `_build_web_plugin_policy_evidence(snapshot=, policy=)` (execution/service.py:404); `SessionOperationLease.acquire` with `SessionOperationKind.BLOB_READ` (execution/routes.py:955-961); `_verify_session_ownership(session_id, user, request)` (sessions/routes/_helpers.py:2527); `request.app.state.auth_audit_recorder` (identity_admin_routes.py:328); `_admin_provenance(request, *, actor_identity_id, on_behalf_of, console_request_id)` (audit.py:1206); `ensure_test_identity` (tests/fixtures/identities.py:10); `SQLiteLocalSessionOperationAuthority` (coordination/sqlite_authority.py:18) with `create_session_with_initial_fence(user_id=, title=, auth_provider_type=, owner_instance_id=, lease_seconds=)` (repository.py:4538), `acquire(session_id=, operation_kind=, owner_instance_id=, lease_seconds=)` (:4623), `mutate(context, mutation)` (:5121).
 - Produces:
@@ -123,7 +124,7 @@ Decisions this task owns (DECISIONS.md I3, I8–I12):
     - `RepositoryApprovalAuthority` (static, token-based, runs inside the caller's transaction):
       - `request(connection_token, *, session_id: str, state_id: str, binding: ApprovalBinding, requested_by: str, approver: str, note: str | None, now: datetime, record: Callable[[ApprovalRecord], None]) -> ApprovalRecord`
       - `decide(connection_token, *, approval_id: str, decided_by: str, decision: Literal["approved", "rejected"], note: str | None, now: datetime, record: Callable[[ApprovalRecord], None]) -> ApprovalRecord`
-      - `withdraw(connection_token, *, approval_id: str, requested_by: str, now: datetime, record: Callable[[ApprovalRecord], None]) -> ApprovalRecord` — a superset of the DECISIONS I11 signature `withdraw(connection_token, *, approval_id, requested_by)`: `now` and `record` follow the `request`/`decide` shape because DECISIONS I3 requires every audited authority mutation to take a required `record` callback. DECISIONS I11 needs amending to match (see open question 3).
+      - `withdraw(connection_token, *, approval_id: str, requested_by: str, now: datetime, record: Callable[[ApprovalRecord], None]) -> ApprovalRecord` — a superset of the earlier working signature `withdraw(connection_token, *, approval_id, requested_by)`: `now` and `record` follow the `request`/`decide` shape because decision 1 above requires every audited authority mutation to take a required `record` callback (see open question 3).
       - `supersede_open(connection_token, *, session_id: str, now: datetime) -> tuple[str, ...]` (the superseded approval ids)
       - `approved_binding(connection_token, *, session_id: str, state_id: str) -> ApprovalBinding | None` (locks the row `FOR UPDATE`)
       - `read(connection_token, *, approval_id: str) -> ApprovalRecord`
@@ -3912,7 +3913,9 @@ snapshot is invented from current rows.`), add:
   `auth_events` table.
 ```
 
-Confirm the section with the operator before the first commit (DECISIONS I19).
+Confirm the section with the operator before the first commit: the 0.8.1
+section of `CHANGELOG.md` is dated but has no release tag, so which release
+this entry belongs to is a decision to check, not an inference.
 
 - [ ] **Step 34: Lint and type-check every touched Python file.**
 
@@ -4040,8 +4043,8 @@ Expected: `exit=0`; the stat lists exactly those 31 files (12 created, 19 modifi
 
 **Open questions (operator rulings needed before execution):**
 
-1. **Is `superseded` audited?** DECISIONS I3 lists `superseded` in
-   `record_approval_decided`'s decision set. This block writes no
+1. **Is `superseded` audited?** The earlier working decision listed
+   `superseded` in `record_approval_decided`'s decision set. This block writes no
    `auth_events` row for it: `supersede_open_approvals` runs inside the
    composition-state head writers (`append_state`, `create_or_reconcile_pending`,
    `_insert_composition_state`), which sit below the audit seam and take no
@@ -4055,7 +4058,12 @@ Expected: `exit=0`; the stat lists exactly those 31 files (12 created, 19 modifi
    `stable_hash(deep_thaw(audit_safe_config))` from the execution envelope,
    not the Landscape `runs.config_hash`, because the latter exists only after
    the worker thread has loaded settings. Confirm that choice.
-3. **DECISIONS I6 and I11 wording.** This block does not consume `pg_fenced`
-   (DECISIONS I6 says I3 reuses the names) and `withdraw` takes `now` and
-   `record` (DECISIONS I11's signature omits them, while DECISIONS I3 requires
-   the callback). Confirm both deviations from the working decisions.
+3. **Two deviations from earlier working forms.** This block does not consume
+   `pg_fenced`, the PostgreSQL fixture on the shared testcontainer that an
+   earlier working decision had I3 reuse along with I1's other fixture names:
+   the concurrent-decide race needs two independent transactions on committed
+   rows, so the PostgreSQL loser test builds its own database. And `withdraw`
+   takes `now` and `record`, which the earlier signature
+   `withdraw(connection_token, *, approval_id, requested_by)` omitted, because
+   decision 1 requires every audited authority mutation to take a required
+   `record` callback. Confirm both deviations.

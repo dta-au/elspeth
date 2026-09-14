@@ -5,7 +5,7 @@
 Ordered after I0 (the nullable ledger measures and `SESSION_SCHEMA_EPOCH` 57)
 and I8 (the governance switch; I1 reads none of it). I2 follows because it
 consumes `RepositoryQuotaAuthority.active_policy` and `record_quota_exceeded`;
-I3 follows because it consumes the `fenced_session` / `pg_fenced` fixtures and the
+I3 follows because it consumes the `fenced_session` fixture and the
 schema-version-2 admission contract. Spec: R14 (`docs/specs/2026-09-02-pluggable-sso-design.md:1161-1186`),
 the `quota_exceeded` metadata rule (:834-835), the `calls` "missing measures
 remain NULL" rule (:849-856), the `token_usage_ledger` row (:1422), §Testing →
@@ -85,8 +85,8 @@ Decisions this task owns:
    `tests/unit/web/coordination/test_durable_run_admission.py`), and all of them
    pass unchanged in Step 4. A stored version-1 payload is refused on decode,
    never silently upgraded (Step 1 pins that).
-8. **Manifest binding.** DECISIONS I4 names the class `RepositoryQuotaAuthority`
-   with `record_token_usage` and `daily_token_total`; those exist.
+8. **Manifest binding.** The ledger's class is `RepositoryQuotaAuthority`, with
+   `record_token_usage` and `daily_token_total`, but it is not the bound symbol.
    `_NAMED_AUTHORITY_SYMBOLS` binds the symbol whose body executes the INSERT, which
    is the module function `record_token_usage_on_connection`: both the class
    method and the four adapters reach the ledger through it. It is bound to the
@@ -4310,7 +4310,7 @@ cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tes
 
 Expected: `exit=0`, `1412 passed`.
 
-- [ ] **Step 15: Bind the ledger writer in the mutation-authority manifest and re-pin the measured churn.** DECISIONS I4. The manifest is fail-closed and measured, not typed from memory. On HEAD the gate XFAILs with this baseline (measured on a pristine HEAD export): `Unexpected/unreviewed (67)`, `Stale reviewed (0)`, `Connections outside exact contained authority (16)`, `Unresolved write executions (44)`, `Writers without a named authority (7)`, `Writers under the wrong table authority (0)`, `Stale reviewed read connections (0)`, `Stale non-Sessions connection classifications (0)`, `Invalid reviewed read connections (0)`. Before this step the same gate reports `Unexpected/unreviewed (93)`, `Stale reviewed (45)` and `Stale reviewed read connections (23)`.
+- [ ] **Step 15: Bind the ledger writer in the mutation-authority manifest and re-pin the measured churn.** The manifest is fail-closed and measured, not typed from memory. On HEAD the gate XFAILs with this baseline (measured on a pristine HEAD export): `Unexpected/unreviewed (67)`, `Stale reviewed (0)`, `Connections outside exact contained authority (16)`, `Unresolved write executions (44)`, `Writers without a named authority (7)`, `Writers under the wrong table authority (0)`, `Stale reviewed read connections (0)`, `Stale non-Sessions connection classifications (0)`, `Invalid reviewed read connections (0)`. Before this step the same gate reports `Unexpected/unreviewed (93)`, `Stale reviewed (45)` and `Stale reviewed read connections (23)`.
 
 Structural edits in `tests/unit/architecture/test_session_db_mutation_authority.py`: bind `record_token_usage_on_connection` in `_NAMED_AUTHORITY_SYMBOLS` (:262), add its writer row to `_REVIEWED_WRITERS` (:1198), and give the two run-diagnostics rows their new fingerprint and lines. The fingerprint is the AST of the enclosing function; it matches only when `quota_authority.py` and `run_diagnostics_authority.py` are exactly the Step 7 and Step 13 text.
 

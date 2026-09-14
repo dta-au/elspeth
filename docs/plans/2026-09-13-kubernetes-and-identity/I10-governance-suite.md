@@ -91,7 +91,7 @@ Four decisions taken against the shorthand:
 - Create: `tests/unit/web/workflow/test_governance_suite_inventory.py` (the inventory; the package `tests/unit/web/workflow/__init__.py` is I3's)
 - Create: `tests/unit/web/workflow/test_governance_schema_violations.py` (author = approver as a CHECK violation, on I8's `closed_local_app`)
 - Create: `tests/integration/web/workflow/test_governance_refusals.py` (the gap tests on `create_app`; the package `tests/integration/web/workflow/__init__.py` is I3's)
-- No edit: `tests/unit/web/conftest.py` (I8 owns `closed_local_app`); `tests/unit/architecture/test_session_db_mutation_authority.py` (no production writer is added — DECISIONS I4 does not apply; Steps 1 and 11 prove the gate does not move); `CHANGELOG.md` (test-only change, nothing user-visible)
+- No edit: `tests/unit/web/conftest.py` (I8 owns `closed_local_app`); `tests/unit/architecture/test_session_db_mutation_authority.py` (no production writer is added, so no writer row or authority binding is needed; Steps 1 and 11 prove the gate does not move); `CHANGELOG.md` (test-only change, nothing user-visible)
 - Not committed (lane-private positive controls, Step 7): `/tmp/i10-mutants/i10_mutant_r7.py`, `/tmp/i10-mutants/i10_mutant_r8.py`
 
 **Interfaces:**
@@ -114,7 +114,7 @@ Four decisions taken against the shorthand:
 
 - [ ] **Step 1: Record the mutation-authority manifest gate before any file exists.**
 
-This task adds no production writer, so DECISIONS I4's manifest edit does not
+This task adds no production writer, so the manifest's writer-row edit does not
 apply. Record the gate's summary now so Step 11 can prove the task did not
 move it. Measure, do not remember: ancestors disagree on what this gate
 reports at rest (the gate XFAILs on a clean HEAD, measured 2026-09-14 on 818d04577; I1 Step 15 records that baseline and I3 Step 35 now expects the same XFAIL), so the only honest comparison is before against after on this tree.

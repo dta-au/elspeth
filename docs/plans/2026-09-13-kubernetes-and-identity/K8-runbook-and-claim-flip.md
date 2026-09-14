@@ -14,7 +14,7 @@ Ordered after I11 (and so last overall): Step 6 appends a Kubernetes row to the 
 - Modify: `docs/repository-structure.md:26` (Deployment row of the top-level table), `:56-61` (the `deploy/` bullet ending "Kubernetes remains BYO and has no shipped directory in this release"), `:110-116` (Deployment spread paragraph)
 - Modify: `README.md:1073-1076` (the sentence "for the maintained Compose, AWS ECS, and native Linux paths plus the explicit Azure VM and Kubernetes boundaries"), `:1168` (doc-index row description "deferred platform boundaries"); insert one row after `:1172`
 - Modify: `ARCHITECTURE.md:731-732` (the "maintained deployment set" sentence; only the Kubernetes clause)
-- Modify: `docs/specs/2026-07-26-finish-deferred-deployment-platforms-design.md:928-952` (`## Kubernetes Bundle`, through "Harness PostgreSQL never appears in the shipped base.") and `:1564-1565` (the multiple-steady-state-replicas Non-Goals bullet) — DECISIONS K16 places the spec rewrite here, not in K1
+- Modify: `docs/specs/2026-07-26-finish-deferred-deployment-platforms-design.md:928-952` (`## Kubernetes Bundle`, through "Harness PostgreSQL never appears in the shipped base.") and `:1564-1565` (the multiple-steady-state-replicas Non-Goals bullet) — this task, not K1, rewrites both spec passages (K1 leaves the spec untouched)
 - Modify: `tests/unit/docs/test_deployment_platform_docs.py:18` (add four path constants after `CHANGELOG = REPO_ROOT / "CHANGELOG.md"`), and replace three whole functions, named here without line ranges because K1's edit of the `absent_bundle` loop (6 lines → 8) shifts everything below it: `test_support_matrix_links_only_shipped_deployment_artifacts` (K1 already removed `"kubernetes"` from its absent-bundle tuple), `test_kubernetes_is_an_explicit_byo_zero_overlap_contract`, `test_navigation_and_repository_structure_are_honest`
 - Modify: `src/elspeth/web/deployment_profiles.py:29-35` (module docstring "**Identity.**" paragraph: add the Kubernetes downward-API sentence)
 - Modify: `CHANGELOG.md` under `## 0.8.1 - 2026-09-10` — insert one bullet after `:62` (`  for the Single/sticky configuration and operating limitations.`, the last line of the "Azure Container Apps deployment" bullet), keeping the blank `:63` before the `---` at `:64`. Confirm the section with the operator before the first commit: the heading is dated, no 0.8.1 tag exists, and `tests/unit/website/test_release_site_contract.py:55-61` pins `## {CURRENT_VERSION} - `.
@@ -375,7 +375,7 @@ def test_rollback_is_conditional_on_the_previous_image_understanding_the_schemas
     rollback = _section(_text(), "## Rollback", "## Scale and drain")
     for phrase in ("PREVIOUS_IMAGE", "rollout undo", "repair forward", "elspeth-doctor-previous", "never pass `--init-schema`"):
         assert phrase in rollback, phrase
-    # There is no acceptance receipt on this target (no receipt store, DECISIONS K12).
+    # There is no acceptance receipt on this target (no receipt store; the kind-lane pytest result is the evidence).
     assert "compatibility record" not in rollback
     assert "receipt" not in rollback
 

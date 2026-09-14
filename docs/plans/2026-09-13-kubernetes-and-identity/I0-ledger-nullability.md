@@ -30,7 +30,7 @@ measures NULL, and Task I1's `daily_token_total` returns `None` when any row of
 the day is NULL so R14 keeps refusing with `token_accounting_unavailable` rather
 than admitting on a fabricated zero.
 
-DECISIONS I1 counts "exactly two changes" (the two columns and the epoch). The
+An earlier decision counted "exactly two changes" (the two columns and the epoch). The
 measured count is three source edits: `src/elspeth/web/sessions/schema.py:36`
 holds `_COORDINATION_HARD_CUT_EPOCH = 56`, compared to `SESSION_SCHEMA_EPOCH` by
 exact equality at `schema.py:531` inside `_validate_coordination_hard_cut_metadata`,
@@ -144,7 +144,7 @@ with
     Column("completion_tokens", Integer, nullable=True),
 ```
 
-Do not add a CHECK constraint, an index, or any other column: DECISIONS I1 limits the schema change to these two columns.
+Do not add a CHECK constraint, an index, or any other column: the ledger's other columns, its `ck_token_usage_ledger_source` CHECK and its `ix_token_usage_ledger_identity_recorded` index are already on HEAD (`models.py:3893-3927`), so the schema change is limited to these two columns.
 
 - [ ] **Step 4: Bump `SESSION_SCHEMA_EPOCH` with a numbered history entry.** In `src/elspeth/web/sessions/models.py` the last history line (`:332`) is the unnumbered `# Coupled cut: sparse proposal display and structured stored validation errors.` followed by `SESSION_SCHEMA_EPOCH = 56` (`:333`). Insert the epoch-57 entry between them in the `#   NN -> ` form the earlier entries use (`:299`, `:312`, `:314`), and change the constant:
 

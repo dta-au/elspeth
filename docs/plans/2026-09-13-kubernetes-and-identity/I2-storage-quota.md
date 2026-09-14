@@ -10,7 +10,7 @@ This block was executed end to end in a scratch export of HEAD with I0's two sou
 
 Decisions this task owns:
 
-1. **The spec's four sites are five entry points and seven admission points, plus replacement.** The per-session check exists in two families, and R13 rides directly behind every member. DECISIONS I7's call graph is corrected here by measurement.
+1. **The spec's four sites are five entry points and seven admission points, plus replacement.** The per-session check exists in two families, and R13 rides directly behind every member. An earlier working call graph routed upload and run-output finalize through `_reserve_pending_blob` and admitted only after the three `_enforce_session_blob_quota` calls in `_reserve_pending_blob`, `persist_inline_custody_blob_on_connection` and `copy_blobs_for_fork`; measurement corrects it as follows.
    - **Upload.** `create_blob` (`blobs/service.py:2644`; the multipart route `blobs/routes.py:245` and the inline route `:308`) → `_persist_fenced_blob_record` (:2715) → facet `reserve_blob` (`coordination/repository.py:2575`, per-session check :2658). Composer inline custody `reserve_inline_custody` (:2833) and the composer `create_blob` tool (`composer/tools/blobs.py:1342`) reach the same facet, because `_persist_blob_content` delegates to `_persist_fenced_blob_record` whenever a session-operation context is given (:1616-1633). None of them reaches `_reserve_pending_blob`.
    - **Guided-full inline custody.** `SessionServiceImpl` (after I1 :11712) → `finalize_pipeline_custody_on_connection` (`composer/pipeline_custody.py:278`) → `persist_inline_custody_blob_on_connection` (`blobs/service.py:2018`, check :2070).
    - **Run-output finalize.** `finalize_run_output_blobs` (:3554) → `_finalize_one_output_blob` (:3687) → `_mark_run_output_ready` (:3803) → facet `mark_run_output_blob_ready` (`repository.py:3580`, check :3612). The facet `finalize_pending_output_blob` (:2497, check :2544) has no production caller on HEAD; the only hit is a docstring at `composer/tools/blobs.py:404`. It is admitted as well, so the facet protocol keeps no unguarded byte path, and it is not deleted.
@@ -2382,7 +2382,7 @@ cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tes
 
 Expected: `exit=0`, `204 passed`.
 
-- [ ] **Step 16: Re-pin the mutation-authority manifest (DECISIONS I4).** The manifest is fail-closed and measured. On the tree after I1 the gate XFAILs with this baseline: `Unexpected/unreviewed (67)`, `Stale reviewed (0)`, `Connections outside exact contained authority (16)`, `Unresolved write executions (44)`, `Writers without a named authority (7)`, `Writers under the wrong table authority (0)`, `Stale reviewed read connections (0)`, `Stale non-Sessions connection classifications (0)`, `Invalid reviewed read connections (0)`.
+- [ ] **Step 16: Re-pin the mutation-authority manifest.** The manifest is fail-closed and measured. On the tree after I1 the gate XFAILs with this baseline: `Unexpected/unreviewed (67)`, `Stale reviewed (0)`, `Connections outside exact contained authority (16)`, `Unresolved write executions (44)`, `Writers without a named authority (7)`, `Writers under the wrong table authority (0)`, `Stale reviewed read connections (0)`, `Stale non-Sessions connection classifications (0)`, `Invalid reviewed read connections (0)`.
 
 Run the gate before re-pinning:
 

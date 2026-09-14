@@ -55,7 +55,7 @@ Decisions this task owns:
 5. **Unread means decided, not yet seen, and not caused by the requester.**
    A `superseded` request is ended by the requester's own next state. A
    requester withdrawal is `revoked` with `revocation_actor_kind="identity"`
-   and `revoked_by_identity_id` = the caller (DECISIONS I11). Neither counts.
+   and `revoked_by_identity_id` = the caller (I3's `withdraw`). Neither counts.
    Review requests have no seen column and I0 is closed, so the Sent folder
    lists approvals only.
 6. **The readiness approval row is a separate component.** `ReadinessRowId`
@@ -2138,7 +2138,7 @@ Expected: `exit=0`. `test_mailbox_routes.py` contributes `8 passed` and `test_qu
 
 - [ ] **Step 17: Admit the new writers and connections to the Sessions mutation-authority manifest.**
 
-DECISIONS I4. The manifest is fail-closed. First read the drift report; the gate XFAILs on drift rather than failing:
+The manifest is fail-closed. First read the drift report; the gate XFAILs on drift rather than failing:
 
 Run: `cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && pytest tests/unit/architecture/test_session_db_mutation_authority.py::test_all_production_sessions_writers_are_reviewed_typed_authorities -n 0 -v -rx > /tmp/i9-lane-manifest-drift.log 2>&1; echo exit=$?`
 Expected: `exit=0` and `1 xfailed`. The reason text lists one `describe()` line per site, in the form `<path>:<line> <symbol> <operation> <table> fp=<16 hex>#<ordinal> authority=<name or UNCLASSIFIED> connection_escape=False`. The new sites are:

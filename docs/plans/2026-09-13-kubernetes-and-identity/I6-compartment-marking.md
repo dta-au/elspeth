@@ -10,7 +10,7 @@ and "On the five stampings" (:1465-1477, rev2.12), §Workflow tables row
 072141b75; earlier tasks add lines above some of them, so every edit below is
 anchored on the quoted text, not on the number.
 
-What the spec asks for and what this task delivers (DECISIONS I14):
+What the spec asks for and what this task delivers:
 
 1. **Setting shape.** `compartment_id` already exists (`config.py:545`) with
    the blank check (`_reject_blank_auth_fields`, `"compartment_id",` at
@@ -97,7 +97,7 @@ What the spec asks for and what this task delivers (DECISIONS I14):
    window (elspeth-ff89d2bea0); this task does not make it, says so in the
    changelog and docs, and raises it as an open question.
 
-The sessions DB mutation-authority manifest (DECISIONS I4) gains no writer:
+The sessions DB mutation-authority manifest gains no writer:
 every composition-state insert still goes through the reviewed
 `SessionServiceImpl._insert_composition_state`. One existing row moves by line
 only (`ShareableReviewService._latest_mark_ready_event`, Step 22).

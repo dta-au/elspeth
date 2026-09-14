@@ -7,12 +7,12 @@ provider-neutral replica probes (P1 `session_operation_fence`, P2
 `session_operation_fence_execute`, P3 `role_revocation_lease_expiry`, P4a
 `postgresql_and_nfs`, P4b `owner_affine` = `cannot_pass`) against two
 one-replica Deployments on the K4 kind cluster, and asserts each probe as a
-pytest outcome in the `kubernetes-kind` lane. It builds exactly three things
-(DECISIONS K12): (a) the PostgreSQL half of the probes moves out of the
+pytest outcome in the `kubernetes-kind` lane. It builds exactly three things:
+(a) the PostgreSQL half of the probes moves out of the
 Container Apps package into `_acceptance_common/postgres_observer.py`, with the
 Container Apps controller re-exporting it; (b) a Kubernetes `ReplicaController`;
-(c) the kind-lane probe module plus the `kind-acceptance` overlay it applies
-(DECISIONS K13). There is NO `receipt_contracts.py`, NO `kubernetes_acceptance.py`
+(c) the kind-lane probe module plus the `kind-acceptance` overlay it applies.
+There is NO `receipt_contracts.py`, NO `kubernetes_acceptance.py`
 facade, NO `CLOUD_PROVIDERS` change and NO receipt store: the evidence is the
 kind-lane pytest result, and the receipt-v3 trigger recorded in
 `src/elspeth/web/_azure_container_apps_acceptance/README.md:21-24,35-36`
@@ -127,12 +127,12 @@ Measured 2026-09-14 on the checkout at `818d04577` (its only delta from
   with `error: must build at directory: not a valid directory: evalsymlink failure on '<dir>' : lstat <abs dir>: no such file or directory`
   (exit 1).
 
-Controller shape: DECISIONS K12 names `deployments={"a": "elspeth-web-a", "b": "elspeth-web-b"}`;
+Controller shape: an earlier form of this task named `deployments={"a": "elspeth-web-a", "b": "elspeth-web-b"}`;
 a controller also needs each replica's origin and runtime role, so the
 signature takes `replicas: tuple[ProbePod, ProbePod]` with
 `ProbePod(address, deployment, role)` — the same shape as the Container Apps
 `ProbeReplica(address, revision, role)` (`controller.py:185-197`) — and the
-deployment names are exactly those two. **Open question (listed under K5 in the master's Self-review notes):** this constructor departs from the working decisions' form (`deployments={...}` → `replicas: tuple[ProbePod, ProbePod]`); either confirm the `ProbePod` shape or rule that K5 must take `deployments=` and derive origin and role another way. Until ruled, the `ProbePod` shape is what this block builds.
+deployment names are exactly those two. **Open question (listed under K5 in the master's Self-review notes):** this constructor departs from that earlier `deployments={...}` form (`deployments={...}` → `replicas: tuple[ProbePod, ProbePod]`); either confirm the `ProbePod` shape or rule that K5 must take `deployments=` and derive origin and role another way. Until ruled, the `ProbePod` shape is what this block builds.
 
 **Files:**
 - Create: `src/elspeth/web/_acceptance_common/postgres_observer.py`
@@ -155,7 +155,7 @@ deployment names are exactly those two. **Open question (listed under K5 in the 
   - `elspeth.web._acceptance_common.postgres_observer`: `BACKEND_PID_SQL`, `TERMINATE_OWN_ROLE_BACKENDS_SQL`, `FENCE_EPOCH_SQL`, `FENCE_OWNER_SQL`, `DATABASE_NOW_SQL`, `GUIDED_OPERATIONS_SINCE_SQL`, `RUN_IDS_SQL`, `LANDSCAPE_RUN_IDS_OF_SESSION_SQL`, `LANDSCAPE_RUN_EXISTS_SQL`, `MEMBERSHIP_ROW_SQL` (all `Final[str]`); `require_runtime_role(role: str) -> str`; `nologin_sql(role: str) -> str`; `login_sql(role: str) -> str`; `class SqlSession(ABC)` (`execute_scalar(statement: str) -> object`, `close() -> None`); `SessionFactory = Callable[[], SqlSession]`; `class SqlReader(ABC)` (`scalar(statement: str, **parameters: object) -> object`, `rows(statement: str, **parameters: object) -> tuple[tuple[object, ...], ...]`); `PartitionRecord(role: str, own_backend_pid: int, terminated_backends: int)`; `RoleRevocationPartition(*, admin: SessionFactory, roles: Mapping[str, SessionFactory])` with `partition(role: str) -> PartitionRecord` and `restore(role: str) -> None`; `PostgresEvidenceObserver(*, sessions: SqlReader, landscape: SqlReader)` implementing `EvidenceObserver`. The Container Apps controller re-exports every one of these names (same objects).
   - `elspeth.web._kubernetes_acceptance.controller`: `KUBECTL_COMMAND_TIMEOUT_SECONDS: Final = 360.0`; `class KubectlCommands(ABC)` with `run(argv: Sequence[str]) -> bytes`; `KubectlSubprocess(*, kubeconfig: Path | None = None)` implementing it (argv[0] must be `kubectl`; failure → `AcceptanceCheckError("platform_command")`); `ProbePod(address: ReplicaAddress, deployment: str, role: str)` (frozen, slots); `KubernetesReplicaController(*, namespace: str, replicas: tuple[ProbePod, ProbePod], partition: RoleRevocationPartition, platform: KubectlCommands)` implementing `ReplicaController`: `replicas() -> tuple[ReplicaAddress, ReplicaAddress]`; `partition_owner(replica)` → `partition.partition(<role>)`; `stop_owner(replica)` → `kubectl -n <ns> delete pod -l app.kubernetes.io/instance=<deployment> --grace-period=0 --force --wait=false`; `restore_owner(replica)` → `partition.restore(<role>)` then `kubectl -n <ns> rollout status deployment/<deployment> --timeout=300s`.
   - `deploy/kubernetes/overlays/kind-acceptance/`: Deployments `elspeth-web-a` / `elspeth-web-b` (`replicas: 1`, labels and selector gain `app.kubernetes.io/instance: elspeth-web-a|b`, `envFrom[1]` Secret `elspeth-web-secrets-a|b`, `envFrom[2]` optional Secret `elspeth-kind-composer`), NodePort Services `elspeth-web-a` (30452) / `elspeth-web-b` (30453) selecting on the instance label; the shared ConfigMap, PVC and both Jobs from `kind-test`.
-  - `tests/testcontainer/deployment/test_kubernetes_replica_probes.py`: module fixture `lane -> ProbeLane`, env switch `ELSPETH_KIND_COMPOSER_ENV_FILE`, and the six test ids defined in Step 12 (K8 cites the file and the four probe ids). Ordering: pytest collects `test_kubernetes_kind.py` (K4's proofs, then K7's appended section, whose `no_affinity_rollout` teardown re-applies `kind-test`) before this module in the same session, so this module runs after both K4's and K7's tests and hands the cluster to no later task. Its setup deletes K4's `elspeth-web` Deployment and Service itself; its teardown deletes its own two Deployments and Services, so the session ends with no web Deployment.
+  - `tests/testcontainer/deployment/test_kubernetes_replica_probes.py`: module fixture `lane -> ProbeLane`, env switch `ELSPETH_KIND_COMPOSER_ENV_FILE`, and the six test ids defined in Step 12 (K8 cites the file and the four probe ids). Ordering: pytest collects `test_kubernetes_kind.py` (K4's proofs, then K7's section once K7 has appended it, whose `no_affinity_rollout` teardown re-applies `kind-test`) before this module in the same session, so this module runs after K4's tests (and after K7's, once they exist) and hands the cluster to no later task. Its setup deletes K4's `elspeth-web` Deployment and Service itself; its teardown deletes its own two Deployments and Services, so the session ends with no web Deployment.
 
 - [ ] **Step 1: Record the gate baselines this task must not move.**
 
@@ -714,7 +714,7 @@ Expected: `exit=0` twice. If `ruff check` reports only `I001` or `RUF022` orderi
 Run: `cd "$(git rev-parse --show-toplevel)" && .venv/bin/mypy src/elspeth/web/_acceptance_common/postgres_observer.py src/elspeth/web/_azure_container_apps_acceptance/controller.py src/elspeth/web/azure_container_apps_acceptance.py src/elspeth/web/azure_container_apps_observations.py > /tmp/klane-k5-step6-mypy.log 2>&1; echo exit=$?; tail -1 /tmp/klane-k5-step6-mypy.log`
 Expected: `exit=0`, `Success: no issues found in 4 source files` (strict mode; `__all__` is what makes the re-exported names explicit exports for the two importing modules).
 
-- [ ] **Step 7: Mutation-authority manifest (DECISIONS I4), census and trust-tier corpus — prove the move needs no manifest edit.**
+- [ ] **Step 7: Mutation-authority manifest, census and trust-tier corpus — prove the move needs no manifest edit.**
 
 K5 adds no Sessions writer and moves no seam class: the manifest (`_TABLE_POLICIES` `:99-121`, `_REVIEWED_WRITERS`, `_NAMED_AUTHORITY_SYMBOLS` `:262`, `_PROBE_SEAM_PROTOCOLS` `:5395-5400`) stays byte-unedited. Prove both halves: the gate selection is unchanged from Step 1, and the instrument that would have caught a changed import still fires.
 
@@ -1761,7 +1761,7 @@ Expected: `exit=1`; the smoke line `exit=1 wall=<n>s log=<path>`; five ERRORs at
 
 ```yaml
 # deploy/kubernetes/overlays/kind-acceptance/kustomization.yaml
-# K5 replica-probe topology on kind (DECISIONS K13): two one-replica
+# K5 replica-probe topology on kind: two one-replica
 # Deployments, each on its own PostgreSQL runtime role and its own NodePort
 # Service, sharing the RWX share, the ConfigMap and both databases. A Service
 # per Deployment is the Kubernetes analogue of a Container Apps revision label

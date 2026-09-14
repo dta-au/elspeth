@@ -77,7 +77,7 @@ Decisions this task owns:
    models.py:3577-3581 rule that a CHECK cannot express a byte length
    portably); the route bounds characters first, the authority bounds bytes.
 7. **Copy rename.** "Save for review" becomes "Share inspect link" on the
-   completion bar and everywhere that string is pinned (DECISIONS I13);
+   completion bar and everywhere that string is pinned;
    `data-testid` values and the e2e page-object method name stay, only the
    accessible name changes.
 
@@ -2105,7 +2105,7 @@ add:
   it. The "Save for review" gesture is renamed "Share inspect link".
 ```
 
-Confirm the section with the operator before the first commit (DECISIONS I19).
+Confirm the section with the operator before the first commit (see Global Constraints).
 
 - [ ] **Step 17: Lint, type-check and run the scoped suites once more.**
 

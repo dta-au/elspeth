@@ -35,7 +35,7 @@ Measured on HEAD 072141b75 (2026-09-13):
 - `kubectl apply --dry-run=client` performs REST-mapper discovery and exits 1
   with `dial tcp 127.0.0.1:8080: connect: connection refused` without an API
   server (verified with v1.37.0, no kubeconfig). The render job therefore has
-  NO dry-run step (DECISIONS K6); server admission is proven by K4's
+  NO dry-run step; server admission is proven by K4's
   `kubectl apply -k` in kind.
 - The `kubectl` pin: `https://dl.k8s.io/release/stable.txt` → `v1.37.0` on
   2026-09-13; `https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl.sha256`
@@ -67,7 +67,7 @@ Measured on HEAD 072141b75 (2026-09-13):
 
 **Interfaces:**
 - Consumes:
-  - `REPO_ROOT: Path`, `CI_WORKFLOW: Path`, `PLATFORM_FACTS: Path`, `KUBECTL_VERSION: str = "1.37.0"`, `KUBECTL_SHA256: str` and `_require_kubectl(reason: str) -> None` from K1's `tests/unit/deployment/test_kubernetes_bundle.py` (K1 defines them; K3 extends rather than redefines them; the switch `_require_kubectl` honours is `ELSPETH_CI_KUBECTL_REQUIRED`, DECISIONS K7).
+  - `REPO_ROOT: Path`, `CI_WORKFLOW: Path`, `PLATFORM_FACTS: Path`, `KUBECTL_VERSION: str = "1.37.0"`, `KUBECTL_SHA256: str` and `_require_kubectl(reason: str) -> None` from K1's `tests/unit/deployment/test_kubernetes_bundle.py` (K1 defines them; K3 extends rather than redefines them; the switch `_require_kubectl` honours is `ELSPETH_CI_KUBECTL_REQUIRED`).
   - K1's `test_ci_test_job_installs_the_pinned_kubectl` in the same module. Its name contains `_ci_`, so K3's `-k "_ci_ or _red_"` selection runs it too; it checks only the `test` job, so it passes before and after this task.
   - The `Install kubectl (Kubernetes bundle contract tests)` step K1 adds to the `test` job after the Bicep step (`ci.yaml:738-752`), carrying `KUBECTL_VERSION=1.37.0` and `KUBECTL_SHA256=6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f`. K1 owns that step because K1's `_require_kubectl` `pytest.fail`s under `GITHUB_ACTIONS`, so K1's own commit would red the `test` job without it; K3 only pins it.
   - `deploy/kubernetes/base/` (K1) rendering to exactly six objects (`ConfigMap`, `Deployment`, `Job`, `Job`, `PersistentVolumeClaim`, `Service`).

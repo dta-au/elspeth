@@ -79,7 +79,7 @@ Measured on HEAD 072141b75 (2026-09-13):
   fixed schema, one gate, two csv sinks, no LLM, `landscape:` block) and
   `examples/threshold_gate/input.csv` (8 rows; `amount > 1000` for Bob 1500,
   Diana 3000, Frank 2000, Henry 5000). `grep -L llm examples/*/settings.yaml`
-  lists it; `examples/hello_world` does not exist. DECISIONS K11 says to mount
+  lists it; `examples/hello_world` does not exist. An earlier plan mounted
   the example's files through the test ConfigMap; the import route refuses a
   source path outside the session's blob/output directories (measured above),
   so the example's CSV bytes enter through the upload route instead and the
@@ -108,7 +108,7 @@ Measured on HEAD 072141b75 (2026-09-13):
   `elspeth_schema_owner` and `elspeth_runtime`, and
   `deploy/kubernetes/base/bootstrap-acceptance-roles.sql` runs
   `\ir bootstrap-roles.sql` and then creates `elspeth_runtime_a` and
-  `elspeth_runtime_b` (DECISIONS K2). The harness must therefore run the
+  `elspeth_runtime_b`. The harness must therefore run the
   acceptance file, or the `elspeth-web-secrets-a|b` URLs this fixture mints
   name roles that do not exist and K5's two acceptance pods fail to boot.
 - The postgres image entrypoint (measured 2026-09-14 on the pinned
@@ -1019,7 +1019,7 @@ Measured on the development box on the day the lane landed
 | first (cold tools, cold layers) | no | WALL_FROM_RUN_1 |
 | second (warm) | yes | WALL_FROM_RUN_2 |
 
-`kubernetes-kind` runs with `timeout-minutes: 60` (DECISIONS K9); revisit the
+`kubernetes-kind` runs with `timeout-minutes: 60`; revisit the
 budget if a hosted-runner run exceeds half of it.
 ```
 
@@ -1244,7 +1244,7 @@ Insert the job directly after K3's `kubernetes-render` job (before `supply-chain
   # image, and pytest runs `-m kind -n 0`. Always GitHub-hosted, like
   # testcontainer: the self-hosted jobs are `container:` jobs with no Docker
   # daemon. No `needs: [static-analysis]` (operator ruling 2026-09-05,
-  # elspeth-d8749aeaa3). timeout-minutes is the DECISIONS K9 budget; the
+  # elspeth-d8749aeaa3). timeout-minutes is the lane's 60-minute budget; the
   # measured wall time is recorded in
   # docs/plans/2026-09-13-kubernetes-platform-facts.md §5.1 Kind lane wall time.
   # ===========================================================================

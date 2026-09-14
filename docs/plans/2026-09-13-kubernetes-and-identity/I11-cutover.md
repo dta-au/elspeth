@@ -90,8 +90,8 @@ Measured on HEAD 072141b75 so the executor knows what is already there:
   and may shift these lines by one; anchor on that whole closing sentence,
   not the number — its last line alone, `drained and repair this release
   forward.`, also occurs at :554 in the 0.8.0 section (measured; the whole
-  sentence occurs once). The section is the one I0 confirmed with the
-  operator (DECISIONS I19).
+  sentence occurs once). As I0 says, confirm the section with the operator
+  before the first commit (see Global Constraints).
 - Test: `tests/unit/docs/test_staging_session_recreation_policy.py` (71
   lines on HEAD; 3 tests, `exit=0` measured 2026-09-13; the new tests append
   after :71). One test file: it already owns the cutover contract and reads
@@ -114,7 +114,7 @@ Measured on HEAD 072141b75 so the executor knows what is already there:
   - I3: execute refuses HTTP 409 `error_type="approval_required"` unless an
     `approved` row matches the compiled binding; the approver is any identity
     holding an active `approver` role who is not the author.
-  - I1 / I5: `AdmissionRefusalReason.QUOTA_EXCEEDED = "quota_exceeded"`
+  - I1: `AdmissionRefusalReason.QUOTA_EXCEEDED = "quota_exceeded"`
     (`contracts/chargeable_admission.py`), the ledger's "NULL means unknown,
     never zero" rule and "a day with no rows measures zero"; on HEAD the enum
     (:19-25) carries `quota_policy_missing` and `token_accounting_unavailable`.
@@ -392,8 +392,8 @@ contract module moved and the Consumes block above is stale.
 - [ ] **Step 3: Confirm the refusal vocabulary the token-admission paragraph will cite against the landed contract.**
 
 The paragraph in Step 4 names three refusals. Two are on HEAD; the third,
-`quota_exceeded`, is I1's (DECISIONS I5). Prove all three exist before
-writing them into an operator document:
+`quota_exceeded`, is I1's `AdmissionRefusalReason.QUOTA_EXCEEDED`. Prove all
+three exist before writing them into an operator document:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)" && source .venv/bin/activate && python - <<'PY'

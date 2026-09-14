@@ -13,7 +13,7 @@ does not exist, and `WebSettings` is `extra="forbid"` (config.py:184), so no
 downstream task can construct a governance-on settings object until this
 task lands.
 
-Two decisions this task owns (from DECISIONS.md I2):
+Two decisions this task owns:
 
 1. The refusal is a **readiness failure, not a config-time validator.** R11
    says "a readiness failure naming both settings, not enforcement quietly
