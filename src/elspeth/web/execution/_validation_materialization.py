@@ -6,22 +6,24 @@ owner of check ordering and ledger mutation.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 from uuid import UUID
 
 import yaml
 
 from elspeth.contracts.blobs import BlobRecord
-from elspeth.contracts.blobs_inline import BlobInlineValidationViolation
+from elspeth.contracts.blobs_inline import BlobInlineRef, BlobInlineValidationViolation
+from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import PipelineLoweringError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
+    _discover_blob_content_refs,
     _substitute_blob_content_refs_for_validation,
     _validate_blob_content_refs_sync,
 )
@@ -175,6 +177,95 @@ def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> V
     )
 
 
+_LLM_PROMPT_SURFACE_OPTION_ROOTS: Final[frozenset[str]] = frozenset({"prompt_template", "system_prompt", "model"})
+
+
+def llm_prompt_surface_field(field_path: str) -> tuple[str, str] | None:
+    """Return ``(node_name, option_path)`` when an inline-ref path is an ``llm`` prompt surface or model.
+
+    The one definition of the domain every LLM-authored inline-blob refusal
+    guards: ``wire_blob_inline_ref`` and the node-option authoring tools, the
+    /validate materialization phase, and run admission. ``field_path`` is the
+    canonical ``node:<name>.options.<key>[.<key>...]`` form
+    ``_discover_blob_content_refs`` produces. The guarded options are
+    ``prompt_template``, ``system_prompt`` and ``model`` (and anything beneath
+    them), and ``queries`` as a whole value, a whole ``queries.<name>`` value,
+    or that query's ``template``: every value that is, or would carry, a query
+    template. Other options, including a query's ``input_fields``, are not
+    guarded. Whether ``<name>`` is an ``llm`` node is the caller's decision,
+    made from the representation it holds.
+    """
+    prefix, separator, option_path = field_path.partition(".options.")
+    if separator == "" or not prefix.startswith("node:"):
+        return None
+    keys = option_path.split(".")
+    root = keys[0]
+    is_query_prompt = root == "queries" and (len(keys) <= 2 or keys[2] == "template")
+    if root not in _LLM_PROMPT_SURFACE_OPTION_ROOTS and not is_query_prompt:
+        return None
+    return prefix.removeprefix("node:"), option_path
+
+
+def is_llm_authored_prompt_surface_binding(
+    field_path: str,
+    *,
+    llm_node_names: Collection[str],
+    creation_modality: CreationModality,
+) -> bool:
+    """Whether binding a blob of ``creation_modality`` at ``field_path`` is refused.
+
+    ADR-034 admits ``inline_content`` markers in prompt fields so a USER-uploaded
+    prompt artifact can back an ``llm`` node. The ``llm_prompt_template`` and
+    ``llm_model_choice`` reviews read those options as strings, and the run
+    substitutes blob bytes afterwards, so an LLM-authored blob there would become
+    the executed prompt or model with no operator review. Only user-verbatim blob
+    content may stand in for that text.
+    """
+    surface = llm_prompt_surface_field(field_path)
+    return surface is not None and surface[0] in llm_node_names and is_llm_authored_creation_modality(creation_modality)
+
+
+def _llm_authored_prompt_surface_refs(
+    refs: list[BlobInlineRef],
+    records_by_blob_id: Mapping[UUID, BlobRecord],
+    *,
+    llm_node_names: Collection[str],
+) -> list[BlobInlineRef]:
+    """Inline refs that bind an LLM-authored blob into an ``llm`` prompt surface or model.
+
+    Called only after the metadata validation found no violation, so every ref
+    is well formed and its blob resolved: ``records_by_blob_id`` holds the
+    record that validation read for each one, and no metadata is read again.
+    """
+    refused: list[BlobInlineRef] = []
+    for ref in refs:
+        record = records_by_blob_id[ref.blob_id]
+        if is_llm_authored_prompt_surface_binding(
+            ref.field_path,
+            llm_node_names=llm_node_names,
+            creation_modality=record.creation_modality,
+        ):
+            refused.append(ref)
+    return refused
+
+
+def _llm_authored_prompt_surface_error(ref: BlobInlineRef) -> ValidationError:
+    return ValidationError(
+        component_id=_blob_inline_component_id(ref.field_path),
+        component_type=_blob_inline_component_type(ref.field_path),
+        message=(
+            f"Inline content blob reference at {ref.field_path} is llm_authored: blob {ref.blob_id} was written by "
+            "the composer, and an llm node's prompt template, system prompt, query template or model admits only "
+            "user-uploaded blob content, because the prompt-template and model-choice reviews cover those fields"
+        ),
+        suggestion=(
+            "Write the text directly into the option with patch_node_options or upsert_node so its review is "
+            "staged, or bind a user-uploaded blob instead."
+        ),
+        error_code="llm_authored_inline_blob_content",
+    )
+
+
 def materialize_validation_yaml(
     interpretation: InterpretationValidatedState,
     *,
@@ -230,8 +321,18 @@ def materialize_validation_yaml(
         if type(loaded) is not dict:
             raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
         config_dict = cast(dict[str, object], loaded)
+        # The modality refusal below reuses the records this validation reads,
+        # so each ref's metadata is fetched once and both checks judge one record.
+        resolved_records: dict[UUID, BlobRecord] = {}
+
+        def _recorded_blob_metadata(blob_id: UUID) -> BlobRecord | None:
+            record = blob_get_metadata(blob_id)
+            if record is not None:
+                resolved_records[blob_id] = record
+            return record
+
         blob_violations = _validate_blob_content_refs_sync(
-            blob_get_metadata,
+            _recorded_blob_metadata,
             config_dict,
             per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
             aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
@@ -248,6 +349,31 @@ def materialize_validation_yaml(
                     outcome_code=None,
                 ),
                 errors=tuple(_blob_inline_validation_error(violation) for violation in blob_violations),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        # Readiness parity with run admission (InlineBlobPromptSurfaceAdmissionError):
+        # the same predicate refuses an LLM-authored blob in an llm prompt surface
+        # or model here, so /validate is not ready for exactly the pipelines whose
+        # run would be refused after creation. The runtime YAML names each node by
+        # its composer id (collectors, named by scope, cannot carry the llm plugin).
+        llm_authored_refs = _llm_authored_prompt_surface_refs(
+            _discover_blob_content_refs(config_dict),
+            resolved_records,
+            llm_node_names=frozenset(node.id for node in interpretation.materialized_state.nodes if node.plugin == "llm"),
+        )
+        if llm_authored_refs:
+            detail = "; ".join(f"{ref.field_path}: llm_authored" for ref in llm_authored_refs)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS,
+                    passed=False,
+                    detail=detail,
+                    affected_nodes=(),
+                    outcome_code=None,
+                ),
+                errors=tuple(_llm_authored_prompt_surface_error(ref) for ref in llm_authored_refs),
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )

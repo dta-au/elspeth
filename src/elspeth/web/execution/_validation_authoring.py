@@ -386,10 +386,11 @@ def validate_path_policy(
     # ``node.plugin is None`` rather than a node-kind set: only a node that
     # hosts a plugin can have that plugin act on the path, and this adds no
     # fifth restatement of the node-kind vocabulary (elspeth-b3117ec3ac).
-    # Structural kinds CAN carry an inert ``provider_config`` today
-    # (gate/queue/coalesce accept it; only row_union rejects non-empty
-    # options), so skipping them is deliberate: gating an option nothing
-    # reads would reject a harmless composition that passes today.
+    # Structural kinds already refuse a stray ``provider_config`` at composer
+    # validation (gate_config_invalid, coalesce_config_invalid, the queue
+    # option allowlist, row_union's empty-options rule), so skipping them here
+    # is deliberate: this gate would only restate that refusal for an option
+    # no plugin reads.
     #
     # The gate fires on the RESOLVED PATH, not on the option's presence — an
     # in-subtree persist_directory passes on every node kind — so widening

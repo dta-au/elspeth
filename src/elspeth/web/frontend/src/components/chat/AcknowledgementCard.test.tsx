@@ -1169,6 +1169,83 @@ describe("AcknowledgementCard — resolved-prompt rendering", () => {
     expect(slotText("resolved")).toBe("accepted value: concise and neutral");
     expect(slotText("pending")).toBeNull();
   });
+
+  it("multi-query card: renders every query and the live node-level template, in a scrolling region", async () => {
+    // The bounded staging-time draft omits queries the review anchor covers;
+    // the card must show the live, complete surface instead.
+    const user = userEvent.setup();
+    const queries: Record<string, unknown> = {};
+    for (let index = 0; index < 40; index += 1) {
+      queries[`q_${index}`] = {
+        template: `Template ${index}: ${"words ".repeat(50)}done ${index}.`,
+      };
+    }
+    queries.shared = {};
+    const frozenDraft =
+      "Multi-query LLM node: for every row the model receives one call per query below.\n\nQueries not listed in this draft: the last 18 of 41; the review attests their names and templates in full.";
+    const state: CompositionState = {
+      ...makeCompositionState(7),
+      nodes: [
+        {
+          id: "node-1",
+          node_type: "transform",
+          plugin: "llm",
+          input: "rows",
+          on_success: null,
+          on_error: null,
+          options: {
+            prompt_template: "Summarise concise and neutral.",
+            prompt_template_parts: [
+              { kind: "text", text: "Summarise " },
+              { kind: "interpretation_ref", requirement_id: "req-1" },
+              { kind: "text", text: "." },
+            ],
+            interpretation_requirements: [RESOLVED_REQUIREMENT],
+            system_prompt: "Reply briefly.",
+            queries,
+          },
+        },
+      ],
+    };
+    renderCard(
+      makeEvent({ kind: "llm_prompt_template", llm_draft: frozenDraft }),
+      { showAmend: false, compositionState: state },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    const region = screen.getByRole("region", {
+      name: /prompt template review/i,
+    });
+    // A long surface scrolls inside the region rather than growing the card.
+    expect(region.style.maxHeight).toBe("16rem");
+    expect(region.style.overflow).toBe("auto");
+    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
+    const text = primaryPre?.textContent ?? "";
+    expect(text).toContain("System prompt (sent with every query):\nReply briefly.\n");
+    for (let index = 0; index < 40; index += 1) {
+      expect(text).toContain(
+        `Query 'q_${index}':\nTemplate ${index}: ${"words ".repeat(50)}done ${index}.\n`,
+      );
+    }
+    expect(text).toContain(
+      "Query 'shared': uses the node-level prompt_template (below).",
+    );
+    expect(text).toContain(
+      "Node-level prompt_template, used by queries without their own template: shared\nSummarise accepted value: concise and neutral.",
+    );
+    expect(text).not.toContain("not listed");
+    // Slot highlighting still works inside the node-level template.
+    const mark = region.querySelector("mark.ack-card-prompt-slot--resolved");
+    expect(mark?.textContent).toBe("accepted value: concise and neutral");
+    expect(screen.getByText("Accepted value")).toBeTruthy();
+    // Every part rendered from live options: no stored-template notice.
+    expect(screen.queryByText(/showing the stored prompt template/i)).toBeNull();
+    // The frozen draft stays reachable only behind the secondary disclosure.
+    const disclosure = screen.getByText("View original template");
+    expect(disclosure.closest("details")?.textContent).toContain(
+      "Queries not listed in this draft",
+    );
+  });
 });
 
 // ── Accessibility / focus ────────────────────────────────────────────────────

@@ -531,6 +531,7 @@ async function fulfillWorkspaceRoute(
         json: {
           composer_available: installed.noticeMode === "recoverable-backend",
           composer_model: "deterministic-e2e-model",
+          composer_advisor_model: "deterministic-e2e-advisor",
           composer_provider: "playwright-route",
           composer_reason:
             installed.noticeMode === "long-content"

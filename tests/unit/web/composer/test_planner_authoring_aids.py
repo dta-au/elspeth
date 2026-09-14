@@ -2772,3 +2772,17 @@ class TestLlmOnErrorRuleGating:
         rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
 
         assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE in rules
+
+
+def test_llm_output_contract_rules_teach_row_prefixed_per_query_variables() -> None:
+    """Session 94f6f00c: the rule taught per-query templates to "reference plain
+    query variables only" while ``LLMConfig._validate_template_variable_bindings``
+    rejects a bare ``{{ colour }}`` and demands ``{{ row.colour }}`` (measured both
+    ways). The planner's first ``set_pipeline`` followed the teaching and was
+    rejected. The teaching must match the validator."""
+    rules = "\n".join(planner_authoring_aids._LLM_OUTPUT_CONTRACT_RULES)
+
+    assert "plain query variables" not in rules
+    assert "{{ row.<variable> }}" in rules
+    assert "input_fields" in rules
+    assert "bare {{ <variable> }} is rejected" in rules

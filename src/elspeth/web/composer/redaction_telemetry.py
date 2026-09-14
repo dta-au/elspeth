@@ -33,6 +33,11 @@ _SUMMARIZER_ERROR_COUNTER = _meter.create_counter(
     description="Count of summarizer failures (exception OR non-string return) immediately before AuditIntegrityError raise.",
 )
 
+_RESPONSE_PROJECTION_LIMIT_COUNTER = _meter.create_counter(
+    "composer.redaction.response_projection_limit",
+    description="Count of response projection-budget substitutions (scope=key: one top-level value; scope=row: the whole row).",
+)
+
 
 class RedactionTelemetry(Protocol):
     def unknown_tool_redacted(self) -> None: ...
@@ -44,6 +49,12 @@ class RedactionTelemetry(Protocol):
         path. (Rev-2 M_telemetry_implementation / M.8)"""
         ...
 
+    def response_projection_limit(self, *, tool_name: str, scope: str) -> None:
+        """Incremented when the response projection budget replaces data:
+        ``scope="key"`` for one over-budget top-level value, ``scope="row"``
+        for the whole-row ``response_projection_limit`` stub."""
+        ...
+
 
 class NoopRedactionTelemetry:
     """In-memory test impl. Records every call; assertable."""
@@ -53,6 +64,7 @@ class NoopRedactionTelemetry:
         self.unknown_response_key_calls: list[dict[str, str]] = []
         self.manifest_dispatch_calls: list[dict[str, str]] = []
         self.summarizer_error_calls: list[dict[str, str]] = []
+        self.response_projection_limit_calls: list[dict[str, str]] = []
 
     def unknown_tool_redacted(self) -> None:
         self.unknown_tool_redacted_count += 1
@@ -65,6 +77,9 @@ class NoopRedactionTelemetry:
 
     def summarizer_error(self, *, tool_name: str) -> None:
         self.summarizer_error_calls.append({"tool_name": tool_name})
+
+    def response_projection_limit(self, *, tool_name: str, scope: str) -> None:
+        self.response_projection_limit_calls.append({"tool_name": tool_name, "scope": scope})
 
 
 class OtelRedactionTelemetry:
@@ -81,3 +96,6 @@ class OtelRedactionTelemetry:
 
     def summarizer_error(self, *, tool_name: str) -> None:
         _SUMMARIZER_ERROR_COUNTER.add(1, {"tool_name": tool_name})
+
+    def response_projection_limit(self, *, tool_name: str, scope: str) -> None:
+        _RESPONSE_PROJECTION_LIMIT_COUNTER.add(1, {"tool_name": tool_name, "scope": scope})

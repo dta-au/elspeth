@@ -2116,6 +2116,15 @@ def _create_app(
         return {
             "composer_available": composer.available,
             "composer_model": composer.model,
+            # The advisor model that gates completion, beside the planner
+            # model above and with the same (unauthenticated) disclosure
+            # posture. Always a non-null string: WebSettings has no
+            # advisor-disabled state (composer_advisor_model is a required
+            # ``str`` with a code default), so there is no null to publish.
+            # Read from settings directly — the same value the service hands
+            # the advisor call — because the boot availability snapshot does
+            # not carry it.
+            "composer_advisor_model": settings.composer_advisor_model,
             "composer_provider": composer.provider,
             "composer_reason": composer.reason,
             "composer_missing_keys": list(composer.missing_keys),

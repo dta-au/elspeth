@@ -375,9 +375,15 @@ async def test_legacy_persistence_bounds_deep_response_before_recursive_projecti
     )
 
     message = service.messages[0]
-    expected = {"_redaction_status": "response_projection_limit"}
+    # upsert_node declares ``data`` known, so the over-depth value degrades to
+    # the per-key sentinel and the envelope framing survives; the canary is
+    # never walked into the persisted row or the invocation projection.
+    expected = {**result, "data": "<redacted-response-projection-limit>"}
+    persisted_result = message.kwargs["tool_calls"][0]["invocation"]["result_canonical"]
     assert json.loads(message.content) == expected
-    assert json.loads(message.kwargs["tool_calls"][0]["invocation"]["result_canonical"]) == expected
+    assert json.loads(persisted_result) == expected
+    assert "RAW_DEEP_PERSISTENCE_CANARY" not in message.content
+    assert "RAW_DEEP_PERSISTENCE_CANARY" not in persisted_result
 
 
 @pytest.mark.asyncio

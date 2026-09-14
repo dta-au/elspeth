@@ -40,7 +40,7 @@ from elspeth.web.composer.guided.stage_subjects import (
     StatedGateRoutingConstraint,
     SubjectPresenceConstraint,
 )
-from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 from elspeth.web.composer.pipeline_proposal import PipelineProposal
 from elspeth.web.plugin_policy.models import PluginAvailability, PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.sessions._guided_step_chat import (
@@ -637,12 +637,88 @@ def test_wire_confirmation_refuses_to_complete_with_an_uncovered_deferred_intent
     )
 
     assert rejected.status_code == 409, rejected.json()
-    assert rejected.json()["detail"] == "Guided wiring still has unresolved retained instructions."
+    # F1 finding #23: the refusal names the blocking instruction and the only
+    # commands that clear it; the intent id reaches no other client wire.
+    assert rejected.json()["detail"] == (
+        "Guided wiring still has unresolved retained instructions. "
+        f"Instruction {retained.intent_id} blocks wiring: in the guided chat, send "
+        f"'Edit exact intent {retained.intent_id}: <corrected instruction>' to change it, "
+        f"or 'Cancel exact intent {retained.intent_id}.' to drop it."
+    )
     assert _respond_operation_count(client, session_id) == operations_before
     current = client.get(f"/api/sessions/{session_id}/guided").json()
     assert current["terminal"] is None
     assert current["next_turn"]["type"] == "confirm_wiring"
     assert _guided(client, session_id).deferred_intents == (retained,)
+
+
+def test_wire_confirmation_refusal_names_every_blocking_intent_in_returned_order(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding #23: with several blocking instructions, the 409 names each one.
+
+    ``verified_remaining_deferred_intents`` returns every deferred intent the
+    proposal does not cover, so the refusal must carry the id and the clearing
+    commands of all of them, in the order the verifier returned them.
+    """
+    client = composer_test_client
+    session_id, retained, _staged = _stage_schema8_topology_intent_proposal(client, monkeypatch)
+    reviewed = _review_wiring(client, session_id)
+    turn = reviewed["next_turn"]
+    assert isinstance(retained, DeferredStageIntent)
+    second = replace(retained, intent_id="00000000-0000-4000-8000-000000000000")
+    remaining = (retained, second)
+    # The returned order is deliberately not the sorted order, so a mutant
+    # that sorts (or reverses) the intents cannot reproduce the detail.
+    assert [intent.intent_id for intent in remaining] != sorted(intent.intent_id for intent in remaining)
+
+    from elspeth.web.composer.guided import planning as guided_planning
+
+    monkeypatch.setattr(
+        guided_planning,
+        "verified_remaining_deferred_intents",
+        lambda **_kwargs: remaining,
+    )
+    from elspeth.web.composer import pipeline_commit
+
+    async def unexpected_prepare(**_kwargs: object) -> None:
+        raise AssertionError("unresolved retained intent reached commit preparation")
+
+    service = client.app.state.session_service
+
+    async def unexpected_dispatch(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("unresolved retained intent reached pipeline dispatch")
+
+    monkeypatch.setattr(pipeline_commit, "prepare_pipeline_proposal_commit", unexpected_prepare)
+    monkeypatch.setattr(service, "record_guided_pipeline_dispatch", unexpected_dispatch)
+    operations_before = _respond_operation_count(client, session_id)
+
+    rejected = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json={
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        },
+    )
+
+    assert rejected.status_code == 409, rejected.json()
+    assert rejected.json()["detail"] == (
+        "Guided wiring still has unresolved retained instructions. "
+        f"Instruction {retained.intent_id} blocks wiring: in the guided chat, send "
+        f"'Edit exact intent {retained.intent_id}: <corrected instruction>' to change it, "
+        f"or 'Cancel exact intent {retained.intent_id}.' to drop it. "
+        f"Instruction {second.intent_id} blocks wiring: in the guided chat, send "
+        f"'Edit exact intent {second.intent_id}: <corrected instruction>' to change it, "
+        f"or 'Cancel exact intent {second.intent_id}.' to drop it."
+    )
+    assert _respond_operation_count(client, session_id) == operations_before
+    current = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert current["terminal"] is None
+    assert current["next_turn"]["type"] == "confirm_wiring"
 
 
 def test_unique_future_catalog_intent_is_private_atomic_retryable_and_restart_durable(
@@ -2269,12 +2345,6 @@ def test_real_route_malformed_future_action_degrades_to_durable_clarification_re
     before = client.get(f"/api/sessions/{session_id}/guided").json()
     assert before["guided_session"]["step"] == ("step_1_source" if stage == "source" else "step_2_sink")
     private_message = f"Later route the private customer-secret-needle through a transform from {stage}."
-    clarification_message = (
-        "I kept that future-stage instruction, but I couldn't verify its structure "
-        "yet. Tell me the target stage and the concrete structural requirement — "
-        "for example the plugin it must add or the connection it must produce — "
-        "and I'll firm it up."
-    )
     provider_calls = 0
 
     async def malformed_completion(**_kwargs: object) -> SimpleNamespace:
@@ -2305,6 +2375,21 @@ def test_real_route_malformed_future_action_degrades_to_durable_clarification_re
     # turn before the failure is terminal; an un-threadable reply (non-string
     # arguments) stays single-shot.
     assert provider_calls == (2 if isinstance(arguments, str) else 1)
+    guided_after_response = _guided(client, session_id)
+    (retained_intent,) = guided_after_response.deferred_intents
+    minted_intent_id = retained_intent.intent_id
+    # F1 finding #23: the constraint-free intent this degrade path mints is
+    # permanently unclaimable and blocks wire confirmation, so the copy must
+    # name its own UUID and the exact Cancel/Edit recourse commands.
+    clarification_message = (
+        "I kept that future-stage instruction, but I couldn't verify its structure "
+        "yet. Tell me the target stage and the concrete structural requirement — "
+        "for example the plugin it must add or the connection it must produce — "
+        "and I'll firm it up. "
+        f"It is saved as instruction {minted_intent_id} with no structural constraint, and wiring cannot be confirmed while it stands: "
+        f"send 'Edit exact intent {minted_intent_id}: <corrected instruction>' to firm it up, "
+        f"or 'Cancel exact intent {minted_intent_id}.' to drop it."
+    )
     assert response_json["assistant_message"] == clarification_message
     assert response_json["assistant_message_kind"] == "assistant"
     if before["composition_state"] is None:

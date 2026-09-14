@@ -1587,3 +1587,82 @@ def test_queue_upsert_preserves_canonical_unknown_option_error_after_review_admi
     assert result.success is False
     assert result.updated_state is state
     assert "unknown option" in result.validation.errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# Prompt-template review auto-stager on a multi-query node (session 94f6f00c):
+# the staged draft is the rendered prompt SURFACE, and a query-template or
+# system-prompt edit re-stages the review while an identical mutation does not.
+# ---------------------------------------------------------------------------
+
+_MULTI_QUERY_OPTIONS: Final[dict[str, Any]] = {
+    "prompt_template": "Answer the question about the colour {{ row.colour }} in one short reply.",
+    "system_prompt": "Reply with only the value asked for and nothing else.",
+    "queries": {
+        "good_pair": {
+            "input_fields": {"colour": "colour"},
+            "template": "What is a good colour pair for {{ row.colour }}? Reply with the single colour name only.",
+        },
+    },
+    "required_input_fields": ["colour"],
+}
+
+
+def _staged_prompt_review(options: Any) -> dict[str, Any]:
+    requirements = options["interpretation_requirements"]
+    matches = [dict(entry) for entry in requirements if entry["kind"] == "llm_prompt_template"]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_prompt_review_auto_stager_drafts_the_multi_query_prompt_surface() -> None:
+    from elspeth.web.interpretation_state import prompt_review_draft_from_options
+
+    staged = common_tools._options_with_default_prompt_template_review(
+        node_id="colour_questions", plugin="llm", options=_MULTI_QUERY_OPTIONS
+    )
+    requirement = _staged_prompt_review(staged)
+
+    assert requirement["status"] == "pending"
+    assert requirement["draft"] == prompt_review_draft_from_options(_MULTI_QUERY_OPTIONS)
+    assert "Query 'good_pair':" in requirement["draft"]
+    assert "System prompt (sent with every query):" in requirement["draft"]
+    assert "not used (every query supplies its own template)" in requirement["draft"]
+    # Single-prompt nodes keep drafting the prompt_template itself.
+    single = common_tools._options_with_default_prompt_template_review(
+        node_id="rate", plugin="llm", options={"prompt_template": "Rate {{ row.text }}."}
+    )
+    assert _staged_prompt_review(single)["draft"] == "Rate {{ row.text }}."
+
+
+def test_prompt_review_auto_stager_restages_on_a_query_template_edit_but_not_on_a_replay() -> None:
+    first = common_tools._options_with_default_prompt_template_review(
+        node_id="colour_questions", plugin="llm", options=_MULTI_QUERY_OPTIONS
+    )
+    first_requirement = _staged_prompt_review(first)
+
+    replay = common_tools._options_with_default_prompt_template_review(
+        node_id="colour_questions", plugin="llm", options=dict(first), existing_options=first
+    )
+    assert _staged_prompt_review(replay) == first_requirement
+
+    edited = deepcopy(dict(first))
+    edited["queries"]["good_pair"]["template"] = "Name a colour that pairs with {{ row.colour }}. One word."
+    restaged = common_tools._options_with_default_prompt_template_review(
+        node_id="colour_questions", plugin="llm", options=edited, existing_options=first
+    )
+    restaged_requirement = _staged_prompt_review(restaged)
+    assert restaged_requirement["draft"] != first_requirement["draft"]
+    assert "Name a colour that pairs with {{ row.colour }}. One word." in restaged_requirement["draft"]
+    assert restaged_requirement["status"] == "pending"
+
+    system_edit = deepcopy(dict(first))
+    system_edit["system_prompt"] = "Be terse."
+    assert (
+        _staged_prompt_review(
+            common_tools._options_with_default_prompt_template_review(
+                node_id="colour_questions", plugin="llm", options=system_edit, existing_options=first
+            )
+        )["draft"]
+        != first_requirement["draft"]
+    )

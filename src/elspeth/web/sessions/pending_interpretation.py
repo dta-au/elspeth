@@ -40,6 +40,8 @@ from elspeth.web.interpretation_state import (
     model_choice_artifact_hash,
     parse_interpretation_requirements,
     pipeline_decision_artifact_hash,
+    prompt_review_anchor_hash_from_options,
+    prompt_review_draft_from_options,
     prompt_structure_hash_from_options,
     source_name_from_component_id,
     validate_pipeline_decision_node_semantics,
@@ -540,7 +542,7 @@ def _reviewed_content_identity(
         context=context,
     )
     if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-        structure_hash = prompt_structure_hash_from_options(options)
+        structure_hash = prompt_review_anchor_hash_from_options(options)
         if structure_hash is None:
             prompt_template = options["prompt_template"] if "prompt_template" in options else None
             if type(prompt_template) is not str:
@@ -1130,7 +1132,7 @@ def _surfacing_prompt_structure_hash(
             # Options absent or not a mapping
             return None
         try:
-            return prompt_structure_hash_from_options(options)
+            return prompt_review_anchor_hash_from_options(options)
         except (TypeError, KeyError, ValueError):
             # Malformed ``prompt_template_parts`` is exactly the "prompt parts
             # unavailable" case this function's docstring and its
@@ -1180,15 +1182,20 @@ def _resolve_prompt_template_review(
     # equal the post-bake template). A genuine prompt edit changes the skeleton
     # and is still rejected as stale. Legacy no-parts nodes have no skeleton;
     # they fall back to the original rendered-text equality.
-    live_structure_hash = prompt_structure_hash_from_options(options)
+    live_structure_hash = prompt_review_anchor_hash_from_options(options)
     if live_structure_hash is not None or surfacing_structure_hash is not None:
         if live_structure_hash != surfacing_structure_hash:
             raise InterpretationPlaceholderConsumedError(
                 "resolve_interpretation_event: llm_prompt_template prompt skeleton no longer matches the structure the review approved"
             )
-    elif accepted_value != prompt_template:
+    elif accepted_value != prompt_review_draft_from_options(options):
+        # Unstructured single-prompt node: accepted_as_drafted carries the event's
+        # review draft, which is the one derivation
+        # (``prompt_review_draft_from_options``) — ``prompt_template`` itself
+        # up to the review bound, its shortened display beyond it. The
+        # accepted value is never written into the prompt.
         raise InterpretationPlaceholderConsumedError(
-            "resolve_interpretation_event: llm_prompt_template accepted value must equal current options.prompt_template"
+            "resolve_interpretation_event: llm_prompt_template accepted value must equal the current prompt review draft"
         )
     requirements, matching_index = _matching_pending_requirement_index(
         options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None,
@@ -1205,7 +1212,7 @@ def _resolve_prompt_template_review(
     # the skeleton keeps it invariant under vague-term resolution (which rewrites
     # the rendered prompt) — see interpretation_state.prompt_structure_hash.
     resolved_prompt_template_hash = stable_hash(prompt_template)
-    structure_hash = prompt_structure_hash_from_options(options)
+    structure_hash = prompt_review_anchor_hash_from_options(options)
     requirement_anchor_hash = structure_hash if structure_hash is not None else resolved_prompt_template_hash
     requirement = dict(requirements[matching_index])
     requirement["status"] = "resolved"
@@ -1913,9 +1920,13 @@ class _SessionPendingInterpretationPlanner:
                     raise ValueError(
                         f"create_pending_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
                     )
-                if llm_draft != prompt_template:
+                # The review draft is the one derivation the auto-stager uses:
+                # the prompt SURFACE for a multi-query node (the node-level
+                # template alone may never be sent), ``prompt_template``
+                # bounded for display otherwise.
+                if llm_draft != prompt_review_draft_from_options(options):
                     raise InterpretationDraftMismatchError(
-                        "create_pending_interpretation_event: llm_prompt_template event draft must match current options.prompt_template"
+                        "create_pending_interpretation_event: llm_prompt_template event draft must match the current prompt review draft"
                     )
                 try:
                     _matching_pending_requirement_index(

@@ -16543,11 +16543,9 @@ class TestInspectSourceTool:
         with (
             pytest.raises(
                 ToolArgumentError,
-                match=(
-                    r"^'inspect_source arguments' must be object conforming to InspectSourceArgumentsModel\. "
-                    r"Match the tool's declared JSON types\. Supply object and array fields as actual JSON objects and arrays, "
-                    r"not strings containing JSON\., got ValidationError$"
-                ),
+                # A missing field is not a JSON-type fault, so the type
+                # guidance is not appended (only *_type/json_* causes get it).
+                match=(r"^'inspect_source arguments' must be object conforming to InspectSourceArgumentsModel, got ValidationError$"),
             ) as exc_info,
             _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
         ):

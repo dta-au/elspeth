@@ -5592,7 +5592,9 @@ def test_planner_rejects_excessive_tool_call_container_before_argument_parsing()
     with pytest.raises(PipelinePlannerError, match="tool call") as caught:
         _parse_response_tool_calls(response, max_tool_calls=3)
 
-    assert caught.value.code == "MALFORMED_RESPONSE"
+    # The cap is the per-turn tool-call budget, not a malformed response
+    # (see test_pipeline_planner_protocol_rejections.py for the loop path).
+    assert caught.value.code == "TOOL_CALLS_EXHAUSTED"
 
 
 def test_planner_rejects_duplicate_provider_tool_call_ids() -> None:
@@ -6611,7 +6613,10 @@ async def test_settlement_cancellation_after_success_carries_both_planner_eviden
             usage=_planner_usage(),
         ),
         _response(("emit_pipeline_proposal", {"pipeline": {}}), ("emit_pipeline_proposal", {"pipeline": {}})),
-        _response(("emit_pipeline_proposal", {"pipeline": {}}), ("list_sources", {})),
+        # NOTE: the terminal-sibling shape (emit_pipeline_proposal batched with
+        # a discovery call) left this matrix when it became a repairable
+        # protocol rejection — see
+        # test_pipeline_planner_protocol_rejections.py::test_terminal_batched_with_discovery_*.
     ],
     ids=[
         "choices",
@@ -6622,7 +6627,6 @@ async def test_settlement_cancellation_after_success_carries_both_planner_eviden
         "arguments-json",
         "arguments-object",
         "multiple-terminal",
-        "terminal-sibling",
     ],
 )
 async def test_malformed_provider_tool_call_matrix_fails_without_dispatch(

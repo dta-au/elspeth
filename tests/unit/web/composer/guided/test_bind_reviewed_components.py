@@ -1508,7 +1508,7 @@ def _correction_predecessor() -> CompositionState:
                 input="amount_gate",
                 on_success=None,
                 on_error=None,
-                options={"schema": {"mode": "observed"}},
+                options={},
                 condition="row['amount'] > 500",
                 routes={"true": "high_value", "false": "standard"},
                 fork_to=None,
@@ -1838,7 +1838,7 @@ def test_bind_does_not_accept_planner_override_of_unselected_withheld_fields() -
     rebound_gate = bound["nodes"][0]
     assert rebound_gate["condition"] == "row['amount'] > 500"
     assert rebound_gate["routes"] == {"true": "high_value", "false": "standard"}
-    assert rebound_gate["options"] == {"schema": {"mode": "observed"}}
+    assert rebound_gate["options"] == {}
     assert bound["nodes"][1]["options"]["prompt_template"] == "Summarize {row[amount]} without changing the amount."
 
 
@@ -1929,7 +1929,7 @@ def _coalesce_correction_predecessor() -> CompositionState:
                 input="rows",
                 on_success=None,
                 on_error=None,
-                options={"schema": {"mode": "observed"}},
+                options={},
                 condition="True",
                 routes={"true": "fork", "false": "fork"},
                 fork_to=("branch_a", "branch_b"),
@@ -3204,7 +3204,7 @@ def _boundary_valid_correction_predecessor() -> CompositionState:
                 input="amount_gate",
                 on_success=None,
                 on_error=None,
-                options={"schema": {"mode": "fixed", "fields": ["amount: int"]}},
+                options={},
                 condition="row['amount'] > 500",
                 routes={"true": "high_value", "false": "high_value"},
                 fork_to=None,

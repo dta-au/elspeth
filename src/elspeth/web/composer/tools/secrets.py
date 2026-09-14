@@ -22,16 +22,19 @@ from elspeth.web.composer.tools._common import (
     EmptyToolArgumentsModel,
     ToolContext,
     ToolResult,
+    _composition_canonical_interpretation_requirement_error,
     _discovery_result,
     _failure_result,
     _mutation_result,
     _secret_ref_placement_error,
     _validate_mutation_arguments,
+    review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
+from elspeth.web.interpretation_state import reconcile_authoritative_reviews
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.secrets.wiring_policy import secret_wiring_authorization_error
 
@@ -269,6 +272,40 @@ _VALIDATE_SECRET_REF_DECLARATION = ToolDeclaration(
 )
 
 
+def _reconciled_secret_wire_result(
+    state: CompositionState,
+    new_state: CompositionState,
+    affected: tuple[str, ...],
+) -> ToolResult:
+    """Publish a secret wire only after authoritative review reconciliation.
+
+    The wire rewrites a component's options in place, so it owes the same
+    post-mutation invariant as splice_transform and the option patchers: a
+    resolved review whose evidence no longer matches the component reopens,
+    or the edit is refused here with ``review_reconciliation_failed`` instead
+    of being accepted and failing at Execute with a bare drift ValueError.
+    """
+    try:
+        reconciled = reconcile_authoritative_reviews(state, new_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        reconciled,
+        tool_name="wire_secret_ref",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
+    return _mutation_result(reconciled, affected)
+
+
 def _execute_wire_secret_ref(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -330,7 +367,7 @@ def _execute_wire_secret_ref(
         new_source = replace(source, options=patched_options)
         new_state = state.with_named_source(source_name, new_source)
         affected = "source" if source_name == "source" else f"source:{source_name}"
-        return _mutation_result(new_state, (affected,))
+        return _reconciled_secret_wire_result(state, new_state, (affected,))
 
     elif target == "node":
         if target_id is None:
@@ -362,7 +399,7 @@ def _execute_wire_secret_ref(
             return _failure_result(state, placement_error)
         new_node = replace(node, options=patched_options)
         new_state = state.with_node(new_node)
-        return _mutation_result(new_state, (target_id,))
+        return _reconciled_secret_wire_result(state, new_state, (target_id,))
 
     else:
         # ``target == "output"`` — Pydantic ``Literal["source", "node", "output"]``
@@ -392,7 +429,7 @@ def _execute_wire_secret_ref(
             return _failure_result(state, placement_error)
         new_output = replace(output, options=patched_options)
         new_state = state.with_output(new_output)
-        return _mutation_result(new_state, (target_id,))
+        return _reconciled_secret_wire_result(state, new_state, (target_id,))
 
 
 _WIRE_SECRET_REF_DECLARATION = ToolDeclaration(

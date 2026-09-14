@@ -50,6 +50,7 @@ from elspeth.web.composer.no_tool_policy import (
 )
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import (
+    _ADVISOR_MALFORMED_USER_DETAIL,
     _ADVISOR_UNAVAILABLE_USER_DETAIL,
     AdvisorCheckpointVerdict,
     ComposerServiceImpl,
@@ -1675,6 +1676,21 @@ async def test_run_advisor_checkpoint_clean_verdict(make_service, simple_state):
         ("Here is my review.\n\nCLEAN — intent satisfied, contracts consistent.", False),
         ("FLAGGED — the sink drops the rating field; otherwise this would be CLEAN.", True),
         ("CLEAN — nothing to flag here.", False),
+        # An en/em dash closes the token with or without surrounding spaces;
+        # only the ASCII hyphen needs whitespace after it (it also joins
+        # compound words such as "Clean-up").
+        ("CLEAN—intent satisfied", False),
+        ("CLEAN - intent satisfied", False),
+        ("CLEAN -", False),
+        # FLAGGED matching is unchanged by the CLEAN tightening: a hyphen
+        # compound and a lowercase code span still block (fail-closed side).
+        ("Flagged-up: the sink drops the rating field", True),
+        ("`flagged`: the sink drops the rating field", True),
+        # Double-backtick spans: an uppercase token is still unwrapped and
+        # accepted, and a lowercase flagged still blocks.
+        ("``CLEAN``: intent satisfied", False),
+        ("`` CLEAN ``", False),
+        ("``flagged``: the sink drops the rating field", True),
     ],
 )
 def test_parse_advisor_verdict_tolerates_real_model_formatting(guidance: str, expected_blocking: bool) -> None:
@@ -1907,6 +1923,29 @@ def test_parse_advisor_verdict_anchored_lowercase_arm_survives_tightening(guidan
         "flagged records are routed to the reject sink",
         # Same register, no terminator, no accompanying verdict -> re-prompt.
         "clean enough for me",
+        # Finding #2 (fail-OPEN): the ASCII hyphen inside a compound word is
+        # not a verdict terminator, so a reply that opens with "Clean-up" or
+        # "Clean-room" describes a defect rather than signing the build off.
+        "Clean-up needed: the LLM prompt interpolates no row fields",
+        "Clean-room reimplementation needed; the sink is wrong.",
+        "clean-room rewrite of the sink drops the rating field",
+        "Verdict: CLEAN-up of the sink mapping is still needed",
+        # Finding #2 (fail-OPEN): a lowercase code span is a quoted identifier
+        # (a field literally named ``clean``), not a verdict token. Stripping
+        # its backticks used to turn it into the bare ``clean:`` form.
+        "`clean`: requested as a boolean output field, but no node emits it",
+        "`Clean`: requested as a boolean output field, but no node emits it",
+        # A double-backtick code span quotes the same identifier: its closing
+        # run must equal its opening run. Pairing single backticks instead
+        # read the empty gap between two adjacent backticks as an uppercase
+        # span, stripped it, and turned the double-backtick-quoted name back
+        # into the bare ``clean:`` form.
+        "``clean``: requested as a boolean output field, but no node emits it",
+        "`` clean ``: requested as a boolean output field, but no node emits it",
+        # An unbalanced backtick is a literal character (CommonMark), not
+        # emphasis: it is kept, so the reply is re-prompted rather than
+        # unwrapped into the bare ``clean:`` verdict form.
+        "`clean: requested as a boolean output field, but no node emits it",
     ],
 )
 def test_parse_advisor_verdict_still_declares_malformed(guidance: str) -> None:
@@ -2749,8 +2788,15 @@ async def test_end_gate_unavailable_fails_closed(make_service, clean_runnable_st
 @pytest.mark.asyncio
 async def test_end_gate_signoff_pending_note_is_not_the_preflight_header(make_service, clean_runnable_state):
     """R2-F14: with validation green, the system note must NOT claim runtime
-    preflight failed — it says the build passed and only sign-off is pending."""
-    from elspeth.web.composer.no_tool_policy import _ADVISOR_SIGNOFF_PENDING_NOTICE, _PREFLIGHT_NOTICE_HEADER
+    preflight failed — it says the build passed and only sign-off is pending.
+
+    Finding #4: an UNRENDERED verdict (here unavailable) now publishes the
+    could-not-be-obtained sibling rather than the did-not-clear notice."""
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_PENDING_NOTICE,
+        _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE,
+        _PREFLIGHT_NOTICE_HEADER,
+    )
 
     service = make_service()
     service._run_advisor_checkpoint = _AsyncRecorder(
@@ -2761,9 +2807,100 @@ async def test_end_gate_signoff_pending_note_is_not_the_preflight_header(make_se
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
 
     message = outcome.result.message
-    assert _ADVISOR_SIGNOFF_PENDING_NOTICE in message
+    assert _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE in message
+    assert _ADVISOR_SIGNOFF_PENDING_NOTICE not in message
     assert _PREFLIGHT_NOTICE_HEADER not in message
     assert message.startswith(outcome.result.raw_assistant_content or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_class", "user_detail", "class_phrase"),
+    [
+        ("unavailable", _ADVISOR_UNAVAILABLE_USER_DETAIL, "advisor model was unavailable"),
+        ("malformed", _ADVISOR_MALFORMED_USER_DETAIL, "no usable verdict"),
+    ],
+)
+@pytest.mark.parametrize("preflight_shape", ["green", "absent"])
+async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
+    make_service,
+    clean_runnable_state,
+    failure_class: str,
+    user_detail: str,
+    class_phrase: str,
+    preflight_shape: str,
+):
+    """Finding #4: on a green or absent preflight the chat copy follows the verdict class.
+
+    The red shape already split did-not-clear (a rendered FLAG) from
+    could-not-be-obtained (unavailable/malformed, elspeth-b61894d93d). The
+    green and absent shapes did not: an advisor outage on a validated build
+    told the user the review "did not clear" and to "Review the pipeline" —
+    a pipeline with nothing wrong — while the actual remedy (retry, or check
+    the advisor model configuration) reached no surface at all on green.
+    """
+    from elspeth.web.composer.no_tool_policy import (
+        _PREFLIGHT_NOTICE_HEADER,
+        TrustedSystemNoticeSegment,
+        visible_message_segments,
+    )
+    from elspeth.web.composer.service import _ADVISOR_FINDINGS_UNTRUSTED_BEGIN
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=user_detail, failure_class=failure_class)
+    )
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        runtime_preflight_absent=preflight_shape == "absent",
+    )
+
+    assert outcome.action == "return"
+    message = outcome.result.message
+    assert "could not be obtained" in message
+    assert class_phrase in message
+    assert "retry the request, or check the advisor model configuration" in message.lower()
+    assert "did not clear" not in message
+    assert "Review the pipeline" not in message
+    assert _PREFLIGHT_NOTICE_HEADER not in message
+    assert _ADVISOR_FINDINGS_UNTRUSTED_BEGIN not in message
+    if preflight_shape == "absent":
+        assert "not re-verified this turn" in message
+    else:
+        assert "not re-verified" not in message
+    # Fixed backend copy only: the whole suffix is one trusted notice.
+    raw = outcome.result.raw_assistant_content or ""
+    segments = visible_message_segments(content=message, raw_content=raw)
+    assert len(segments) == 1
+    assert type(segments[0]) is TrustedSystemNoticeSegment
+    # The fail-closed structure is unchanged: completion stays withheld.
+    assert outcome.result.runtime_preflight.readiness.completion_ready is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preflight_shape", ["green", "absent"])
+async def test_end_gate_flagged_verdict_keeps_did_not_clear_chat(make_service, clean_runnable_state, preflight_shape: str):
+    """Finding #4 control: a rendered FLAG keeps the did-not-clear notices byte for byte."""
+    from elspeth.web.composer.no_tool_policy import _ADVISOR_SIGNOFF_PENDING_NOTICE, _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: MODEL_FINDING_CANARY")
+    )
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        # advisor_checkpoint_passes_used=1 -> this pass is the last (default max=2).
+        advisor_checkpoint_passes_used=1,
+        runtime_preflight_absent=preflight_shape == "absent",
+    )
+
+    assert outcome.action == "return"
+    expected = _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE if preflight_shape == "absent" else _ADVISOR_SIGNOFF_PENDING_NOTICE
+    assert outcome.result.message.endswith(expected)
+    assert "MODEL_FINDING_CANARY" not in outcome.result.message
 
 
 def test_signoff_pending_note_mints_trusted_chrome() -> None:
@@ -2793,9 +2930,14 @@ async def test_end_gate_absent_preflight_publishes_unverified_notice(make_servic
     was green. The honest shape keeps fail-closed STRUCTURE (every readiness
     axis withheld, elspeth-88592f5be7) with unverified WORDING: the advisory
     review did not clear, completion is withheld, readiness was not
-    re-verified this turn."""
+    re-verified this turn.
+
+    Finding #4: an UNRENDERED verdict (here unavailable) publishes the
+    could-not-be-obtained absent sibling; the did-not-clear unverified notice
+    stays for a rendered FLAG."""
     from elspeth.web.composer.no_tool_policy import (
         _ADVISOR_SIGNOFF_PENDING_NOTICE,
+        _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_NOTICE,
         _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
         _PREFLIGHT_NOTICE_HEADER,
     )
@@ -2815,7 +2957,8 @@ async def test_end_gate_absent_preflight_publishes_unverified_notice(make_servic
 
     assert outcome.action == "return"
     message = outcome.result.message
-    assert _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE in message
+    assert _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_NOTICE in message
+    assert _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE not in message
     assert _PREFLIGHT_NOTICE_HEADER not in message
     assert _ADVISOR_SIGNOFF_PENDING_NOTICE not in message
     # Fail-closed structure is UNCHANGED: unknown readiness advances nothing.
@@ -5145,6 +5288,38 @@ def test_summarize_marks_node_prompt_template_in_use_by_queries_without_override
     assert "queries.hex_code.template_untrusted_json=" in line
 
 
+def test_summarize_marks_a_non_string_query_template_invalid_not_a_node_template_user(simple_state):
+    """A present non-string ``template`` gets a structural fact marker and is
+    never counted as rendering the node-level prompt (the review surface in
+    interpretation_state says the same)."""
+    from elspeth.web.composer.service import _advisor_query_option_values, _summarize_pipeline_for_advisor
+
+    queries = {
+        "good_pair": _COLOUR_QUESTIONS_OPTIONS["queries"]["good_pair"],
+        "hex_code": {"input_fields": {"colour": "colour"}, "template": ["not", "text"]},
+    }
+    node = _multi_query_llm_node(queries=queries)
+    line = _node_line(_summarize_pipeline_for_advisor(simple_state.with_node(node)), "colour_questions")
+
+    assert "queries.hex_code.template=(template value is not text; plugin validation rejects this node)" in line
+    assert "queries.hex_code.template_untrusted_json=" not in line
+    assert "prompt_template_in_use=not used (no query falls back to it)" in line
+    assert "queries without their own template" not in line
+
+    triples = _advisor_query_option_values(node.options)
+    assert ("queries.hex_code.template", "(template value is not text; plugin validation rejects this node)", False) in triples
+
+    beside_fallback = {
+        "good_pair": {"input_fields": {"colour": "colour"}},
+        "hex_code": {"input_fields": {"colour": "colour"}, "template": 7},
+    }
+    fallback_line = _node_line(
+        _summarize_pipeline_for_advisor(simple_state.with_node(_multi_query_llm_node(queries=beside_fallback))), "colour_questions"
+    )
+    assert "prompt_template_in_use=queries without their own template: good_pair" in fallback_line
+    assert "queries without their own template: good_pair, hex_code" not in fallback_line
+
+
 def test_summarize_single_prompt_llm_node_carries_no_prompt_in_use_marker(simple_state):
     """Single-prompt mode is unchanged: no marker, no queries segment."""
     from elspeth.web.composer.service import _summarize_pipeline_for_advisor
@@ -5344,3 +5519,84 @@ def test_summarize_llm_queries_without_node_prompt_template_stay_name_only(simpl
     assert "prompt_template_in_use" not in line
     # The degeneracy signal still reads the effective (override) templates.
     assert "interpolates row fields: [colour]" in line
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint summary bound: the EARLY/END path bypasses the tool-path argument
+# validator, so the published excerpt needs its own whole-line ceiling.
+# ---------------------------------------------------------------------------
+
+
+def _pathological_multi_query_state(simple_state: CompositionState, node_count: int = 12) -> CompositionState:
+    state = simple_state
+    for index in range(node_count):
+        queries = {
+            f"q{n:02d}": {"input_fields": {"colour": "colour"}, "template": f"Question {n} " + "x" * 900 + " {{ row.colour }}"}
+            for n in range(8)
+        }
+        state = state.with_node(_multi_query_llm_node(node_id=f"node_{index:02d}", queries=queries))
+    return state
+
+
+def test_checkpoint_excerpt_is_bounded_by_whole_lines_with_a_withheld_count(make_service, simple_state):
+    """A pipeline of near-cap multi-query nodes yields an excerpt at or under the
+    budget, made of exact summary lines plus one rubric-legible withheld marker."""
+    from elspeth.web.composer.service import _ADVISOR_CHARS_PER_TOKEN, _summarize_pipeline_for_advisor
+
+    service = make_service()
+    state = _pathological_multi_query_state(simple_state)
+    full_summary = _summarize_pipeline_for_advisor(state)
+    char_cap = service._settings.composer_advisor_max_prompt_tokens * _ADVISOR_CHARS_PER_TOKEN
+    assert len(full_summary) > char_cap, "fixture must exceed the budget or the test proves nothing"
+
+    for phase in ("early", "end"):
+        excerpt = service._build_checkpoint_arguments(phase=phase, state=state)["schema_excerpt"]
+        assert len(excerpt) <= char_cap
+        *kept, marker = excerpt.split("\n")
+        full_lines = full_summary.split("\n")
+        # Kept lines are an exact prefix of the full summary — never a sliced line.
+        assert kept == full_lines[: len(kept)]
+        assert len(kept) < len(full_lines)
+        assert marker.startswith(f"additional_evidence_lines_withheld={len(full_lines) - len(kept)} ")
+        assert f"advisor budget of {char_cap} chars" in marker
+
+
+def test_checkpoint_excerpt_is_byte_identical_when_within_budget(make_service, simple_state):
+    """Positive control: the bound is inert on an ordinary pipeline."""
+    from elspeth.web.composer.service import _summarize_pipeline_for_advisor
+
+    service = make_service()
+    state = simple_state.with_node(_multi_query_llm_node())
+    full_summary = _summarize_pipeline_for_advisor(state)
+
+    for phase in ("early", "end"):
+        assert service._build_checkpoint_arguments(phase=phase, state=state)["schema_excerpt"] == full_summary
+    assert "additional_evidence_lines_withheld" not in full_summary
+
+
+def test_checkpoint_evidence_identity_hashes_the_unbounded_summary(make_service, simple_state):
+    """The pass-context evidence identity must hash the COMPLETE summary, so a
+    repair landing in a withheld line still changes the identity the
+    stalled-repair check compares."""
+    from elspeth.web.composer.service import _AdvisorReviewState, _summarize_pipeline_for_advisor
+
+    service = make_service()
+    state = _pathological_multi_query_state(simple_state)
+    full_summary = _summarize_pipeline_for_advisor(state)
+    review_state = _AdvisorReviewState(completed_passes=1, previous_findings=("FLAGGED: prior",), previous_evidence_hash="prior")
+    arguments = service._build_checkpoint_arguments(phase="end", state=state, advisor_review_state=review_state)
+
+    assert f"Current evidence identity: {stable_hash({'advisor_evidence': full_summary})}." in arguments["problem_summary"]
+    assert arguments["schema_excerpt"] != full_summary
+
+
+def test_bound_advisor_pipeline_summary_publishes_marker_alone_when_no_line_fits():
+    """Fail closed toward 'withheld', never toward a partial line."""
+    from elspeth.web.composer.service import _bound_advisor_pipeline_summary
+
+    summary = "\n".join(["a" * 300, "b" * 300])
+    bounded = _bound_advisor_pipeline_summary(summary, 200)
+
+    assert bounded.startswith("additional_evidence_lines_withheld=2 ")
+    assert "a" * 10 not in bounded
+    assert len(bounded) <= 200

@@ -218,7 +218,11 @@ def test_shared_redaction_model_omission_is_not_supplied_null(model, arguments, 
 def test_structural_feedback_teaches_actual_json_types(tool, arguments) -> None:
     with pytest.raises(ToolArgumentError) as caught:
         execute_tool(tool, arguments, _empty_state(), _mock_catalog(), validate_arguments=True, raise_schema_argument_errors=True)
-    assert "actual JSON objects and arrays" in caught.value.expected
-    assert "actual JSON objects and arrays" in arg_error_payload(caught.value, tool)["error"]
+    # The JSON-type repair guidance is only for type faults. The
+    # get_plugin_schema case is an enum violation (a well-typed string outside
+    # the declared values), so the guidance would name a fault it does not have.
+    type_fault = tool != "get_plugin_schema"
+    assert ("actual JSON objects and arrays" in caught.value.expected) is type_fault
+    assert ("actual JSON objects and arrays" in arg_error_payload(caught.value, tool)["error"]) is type_fault
     assert "invalid-secret-value" not in str(caught.value)
     assert "do-not-echo" not in str(caught.value)

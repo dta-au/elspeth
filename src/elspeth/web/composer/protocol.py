@@ -14,6 +14,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NotRequired, Protocol, TypedDict, final
 from uuid import UUID
 
+from pydantic import ValidationError as PydanticValidationError
+
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
@@ -69,6 +71,14 @@ if frozenset(REQUEST_INTERPRETATION_REVIEW_KINDS) & _BACKEND_ONLY_INTERPRETATION
     raise RuntimeError("every InterpretationKind must be classified as requestable or backend-only")
 REQUEST_INTERPRETATION_REVIEW_KIND_VALUES: Final[tuple[str, ...]] = tuple(kind.value for kind in REQUEST_INTERPRETATION_REVIEW_KINDS)
 REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION: Final[str] = ", ".join(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)
+# A stale ``llm_prompt_template`` review draft is compared against the text the
+# model receives (``prompt_review_draft_from_options``), not against
+# ``options.prompt_template`` alone. The producer and the secret-safe
+# ToolArgumentError projector share this exact operator-owned string.
+LLM_PROMPT_REVIEW_DRAFT_EXPECTATION: Final[str] = (
+    "the current prompt review draft for the node: the rendered multi-query prompt surface on a "
+    "multi-query LLM node, otherwise options.prompt_template"
+)
 
 # Source-data-contract repair vocabulary. Producers and the secret-safe
 # ToolArgumentError projector share these exact operator-owned strings so the
@@ -85,6 +95,25 @@ SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION: Final[str] = (
 )
 SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE: Final[str] = "caller-supplied draft that does not match the server-computed data contract"
 SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE: Final[str] = "missing source component"
+
+# Interpretation-review rate-cap repair vocabulary (ADR-037). The caps are
+# coherent only because the planner has a fallback: write a direct
+# interpretation into the prompt template instead of asking again. Producers
+# and the secret-safe ToolArgumentError projector share these exact,
+# value-free strings so the fallback survives canonicalization and reaches the
+# planner instead of collapsing to a bare "limit" diagnostic.
+INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION: Final[str] = (
+    "within the per-term interpretation request limit — reviews for this term are exhausted in this composition, "
+    "so use a direct interpretation in the prompt template instead: write the interpretation into "
+    "options.prompt_template and remove the pending vague_term requirement and its prompt wiring rather than "
+    "requesting the review again"
+)
+INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION: Final[str] = (
+    "within the per session per UTC day interpretation request limit — no more reviews are available today, "
+    "so use a direct interpretation in the prompt template instead: write the interpretation into "
+    "options.prompt_template and remove the pending vague_term requirement and its prompt wiring rather than "
+    "requesting the review again"
+)
 
 
 class ComposerHistoryMessage(TypedDict):
@@ -813,6 +842,41 @@ _TOOL_ARGUMENT_JSON_TYPE_GUIDANCE = (
     ". Match the tool's declared JSON types. Supply object and array fields as actual JSON objects and arrays, not strings containing JSON."
 )
 
+# Pydantic error types outside the ``*_type`` / ``json_*`` families that still
+# mean the value had the wrong JSON type: text sent where a number or boolean
+# is declared. Value, length, pattern, enum, missing-field and extra-field
+# failures are not type faults, so the JSON-type guidance would name a fault
+# the call does not have.
+_EXTRA_TYPE_SHAPE_PYDANTIC_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {"is_instance_of", "int_parsing", "float_parsing", "bool_parsing", "decimal_parsing"}
+)
+# redaction._reject_coerced_integer (the ``_JsonInteger`` fields) rejects text
+# and booleans with a plain ValueError, which Pydantic reports as
+# ``value_error`` under this fixed operator-authored message.
+_JSON_INTEGER_VALUE_ERROR_MESSAGE: Final[str] = "Value error, expected a JSON integer"
+
+
+def _is_type_shape_pydantic_error(error_type: str, message: str) -> bool:
+    if error_type.endswith("_type") or error_type.startswith("json_") or error_type in _EXTRA_TYPE_SHAPE_PYDANTIC_ERROR_TYPES:
+        return True
+    return error_type == "value_error" and message == _JSON_INTEGER_VALUE_ERROR_MESSAGE
+
+
+def _cause_rules_out_json_type_guidance(cause: BaseException | None) -> bool:
+    """True when a chained Pydantic cause carries no type-shape error at all.
+
+    Only each error's ``type`` token is inspected, plus an exact comparison of
+    its message against one fixed operator-authored string; rejected input,
+    context and URLs are never materialized and nothing is retained.
+    """
+    if not isinstance(cause, PydanticValidationError):
+        return False
+    return not any(
+        _is_type_shape_pydantic_error(error["type"], error["msg"])
+        for error in cause.errors(include_url=False, include_context=False, include_input=False)
+    )
+
+
 _SAFE_TOOL_ARGUMENT_EXPECTATIONS = (
     frozenset(
         {
@@ -858,8 +922,9 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = (
             "prompt_template_parts interpretation_ref or placeholder wiring",
             "the current non-empty options.model",
             "the current non-empty options.prompt_template",
-            "within the per session per UTC day interpretation request limit",
-            "within the per-term interpretation request limit",
+            LLM_PROMPT_REVIEW_DRAFT_EXPECTATION,
+            INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
+            INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
         }
     )
     | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
@@ -954,13 +1019,19 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
             if argument in _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS
             else "an object conforming to the declared argument schema"
         )
+        # The JSON-schema producer (tools/_dispatch.py) appends a
+        # parenthesised one-error summary; only a ``type`` violation there is
+        # a type fault. Pydantic producers carry no summary and are
+        # classified from the chained cause when read (``expected``).
+        if "(" in value and "must be of type" not in lowered:
+            return schema_expectation
         return schema_expectation + _TOOL_ARGUMENT_JSON_TYPE_GUIDANCE
     if value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
         return value
     if "per session per utc day" in lowered:
-        return "within the per session per UTC day interpretation request limit"
+        return INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION
     if "per term" in lowered and ("at most" in lowered or "limit" in lowered):
-        return "within the per-term interpretation request limit"
+        return INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION
     if "prompt_template_parts" in lowered or "interpretation_ref" in lowered:
         return "prompt_template_parts interpretation_ref or placeholder wiring"
     if "preserves raw html/fingerprint field" in lowered:
@@ -1190,11 +1261,14 @@ class ToolArgumentError(Exception):
             value = BaseException.__getattribute__(self, "_safe_expected")
         except AttributeError:
             return "a valid value"
-        return (
-            value
-            if type(value) is str and len(value) <= _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS and value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS
-            else "a valid value"
-        )
+        if type(value) is not str or len(value) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS or value not in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
+            return "a valid value"
+        # ``raise ... from exc`` binds the Pydantic cause after construction,
+        # so the type-shape decision is made on read. The cause can only
+        # choose between two operator-owned strings, both in the closed set.
+        if value.endswith(_TOOL_ARGUMENT_JSON_TYPE_GUIDANCE) and _cause_rules_out_json_type_guidance(self.__cause__):
+            return value[: -len(_TOOL_ARGUMENT_JSON_TYPE_GUIDANCE)]
+        return value
 
     @expected.setter
     def expected(self, value: object) -> None:

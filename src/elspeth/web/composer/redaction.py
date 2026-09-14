@@ -137,6 +137,10 @@ _REDACTED_PLUGIN_CRASH_CLASS = "<redacted-plugin-crash-class>"
 _REDACTED_FAILURE_MESSAGE = "<redacted-failure-message>"
 _ARG_ERROR_REDACTION_STATUS = "arg_error"
 _RESPONSE_PROJECTION_LIMIT = MappingProxyType({"_redaction_status": "response_projection_limit"})
+# Per-key twin of the whole-row stub: one top-level response value exceeded the
+# projection budget, so only that key is replaced and the envelope framing
+# (success / validation / version) survives.
+_REDACTED_RESPONSE_PROJECTION_LIMIT = "<redacted-response-projection-limit>"
 
 RESPONSE_PROJECTION_MAX_DEPTH = 32
 RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH = 64
@@ -244,6 +248,7 @@ _STABLE_RESPONSE_SENTINELS = frozenset(
     {
         REDACTED_SENSITIVE_NO_SUMMARIZER,
         REDACTED_UNKNOWN_RESPONSE_KEY,
+        _REDACTED_RESPONSE_PROJECTION_LIMIT,
         _REDACTED_RESPONSE_TEXT,
         _REDACTED_RESPONSE_INTEGER,
         _REDACTED_RESPONSE_NUMBER,
@@ -269,9 +274,14 @@ _STABLE_RESPONSE_SENTINELS = frozenset(
         "container width exceeds the fixed projection budget; True otherwise"
     ),
 )
-def _response_within_projection_budget(value: object) -> bool:
-    """Iteratively reject response structures that exceed persistence budgets."""
-    stack: list[tuple[object, int]] = [(value, 0)]
+def _response_within_projection_budget(value: object, *, depth: int) -> bool:
+    """Iteratively reject response structures that exceed persistence budgets.
+
+    ``depth`` is the depth of ``value`` inside the response: the redactor
+    bounds each top-level value separately and passes ``depth=1`` so the depth
+    limit keeps meaning "levels below the response root".
+    """
+    stack: list[tuple[object, int]] = [(value, depth)]
     nodes = 0
     while stack:
         current, depth = stack.pop()
@@ -289,10 +299,16 @@ def _response_within_projection_budget(value: object) -> bool:
     return True
 
 
-def _bounded_projection_result(result: Mapping[str, object]) -> dict[str, object]:
+def _bounded_projection_result(
+    result: Mapping[str, object],
+    *,
+    tool_name: str,
+    telemetry: RedactionTelemetry,
+) -> dict[str, object]:
     projected = dict(result)
     encoded = json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) > RESPONSE_PROJECTION_MAX_OUTPUT_BYTES:
+        telemetry.response_projection_limit(tool_name=tool_name, scope="row")
         return dict(_RESPONSE_PROJECTION_LIMIT)
     return projected
 
@@ -2585,7 +2601,11 @@ def redact_tool_call_arguments(
 # entries (Pydantic models walked via ``walk_model_schema``).  Declarative
 # entries express their argument surface through ``sensitive_argument_keys``;
 # all _DISCOVERY_TOOLS take only scalar string arguments (or no arguments
-# at all), so ``sensitive_argument_keys`` is empty for every entry here.
+# at all), so ``sensitive_argument_keys`` is empty for every entry here —
+# except ``explain_validation_error``: its scalar ``error_text`` carries
+# validator message text, which echoes authored option values, so that one
+# entry declares the argument sensitive (``handles_no_sensitive_data=False``)
+# and summarises it with ``_summarize_explain_validation_error_text``.
 # ---------------------------------------------------------------------------
 
 
@@ -2676,19 +2696,37 @@ _GET_EXPRESSION_GRAMMAR_REASON = HandlesNoSensitiveDataReason(
 )
 
 
-_EXPLAIN_VALIDATION_ERROR_REASON = HandlesNoSensitiveDataReason(
-    sensitive_data_locations=("validation-error explainer — text-pattern lookup against canned guidance strings",),
-    why_arguments_safe=(
-        "explain_validation_error accepts a single error_text scalar string the LLM "
-        "echoes back from a previous validator response; that text was itself emitted "
-        "by the validator and contains no operator-supplied row content or credentials."
+@trust_boundary(
+    tier=3,
+    source="LLM-supplied explain_validation_error.error_text argument (raw; the declarative policy path runs no argument model)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; returns the value only when it is exactly a closed validation error_code, otherwise a "
+        "length-only sentinel for text or a fixed value-free shape sentinel for any other type"
     ),
-    why_responses_safe=(
-        "Response is canned guidance text plus the matched error category; it is a "
-        "lookup against module-level guidance tables and contains no session state, "
-        "no plugin option values, and no row payload — only fix-it explanations."
-    ),
+    non_raising=True,
 )
+def _summarize_explain_validation_error_text(value: object) -> str:
+    """Summarizer for ``explain_validation_error.error_text``.
+
+    The tool description tells the planner to pass a validation entry's
+    ``message``, and validator messages quote authored option values (for
+    example ``Invalid schema mode '<value>'``) — the same text the response
+    side summarises in ``validation.errors[].message``. A string that is
+    exactly a closed ``error_code`` is a public catalogue constant and is kept
+    so the audit row still says which code was looked up; any other string
+    keeps only its length. Exact membership only: a code buried in free text
+    does not make the surrounding bytes safe.
+    """
+    # Function-local import: tools.generation imports this module at load time.
+    from elspeth.web.composer.tools.generation import explain_validation_code
+
+    if isinstance(value, str):
+        if explain_validation_code(value) is not None:
+            return value
+        return f"<redacted-validation-error-text:{len(value)}-chars>"
+    return _summarize_external_response_value(value)
 
 
 _GET_PLUGIN_ASSISTANCE_REASON = HandlesNoSensitiveDataReason(
@@ -3663,8 +3701,14 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
         "explain_validation_error": ToolRedaction(
             policy=ToolRedactionPolicy(
                 known_argument_keys=("error_text",),
-                handles_no_sensitive_data=True,
-                handles_no_sensitive_data_reason_struct=_EXPLAIN_VALIDATION_ERROR_REASON,
+                sensitive_argument_keys=("error_text",),
+                argument_summarizers={"error_text": _summarize_explain_validation_error_text},
+                handles_no_sensitive_data=False,
+                # The dispatch envelope only — the keys that were already
+                # implicitly known. ``data`` (which echoes error_text) and the
+                # optional augmentation keys stay undeclared and fail closed,
+                # so the persisted response is byte-identical to before.
+                known_response_keys=_TOOL_RESULT_REQUIRED_RESPONSE_KEYS,
             )
         ),
         "get_plugin_assistance": ToolRedaction(
@@ -4063,6 +4107,22 @@ def redact_tool_call_response(
         - In neither → aggregate under ``REDACTED_UNKNOWN_RESPONSE_FIELD``
           with ``REDACTED_UNKNOWN_RESPONSE_KEY`` (fail-closed; counter fires).
 
+    **Projection budget (per top-level key):**
+      The depth / width / node budget bounds each top-level value on its own,
+      before any model validation of that value, so one oversized subtree
+      costs only its own key. A known key whose value is over budget becomes
+      ``_REDACTED_RESPONSE_PROJECTION_LIMIT`` and the envelope framing
+      survives. Unknown and sensitive declarative keys are never walked (they
+      become fixed sentinels regardless of size). The whole-row
+      ``_RESPONSE_PROJECTION_LIMIT`` stub remains for: more top-level keys
+      than the container width; a type-driven over-budget value whose field
+      is required or undeclared (a required typed field has no per-key
+      substitute before validation); and a projected row above the output
+      byte budget. Every substitution fires
+      ``telemetry.response_projection_limit(tool_name=..., scope=...)`` with
+      ``scope="key"`` for a per-key sentinel and ``scope="row"`` for the
+      whole-row stub.
+
     **Failure modes (all raise AuditIntegrityError):**
       - Manifest entry missing for ``tool_name`` (registry-consistency invariant).
       - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)`` BEFORE
@@ -4088,7 +4148,12 @@ def redact_tool_call_response(
     )
     if response == _RESPONSE_PROJECTION_LIMIT:
         return dict(_RESPONSE_PROJECTION_LIMIT)
-    if not _response_within_projection_budget(response):
+    # Only the top-level key COUNT is bounded across the whole row; every
+    # top-level value is bounded separately below, so one wide subtree (the
+    # unfiltered list_models call's 87-entry ``data.providers``) no longer
+    # erases the success / validation / version framing.
+    if len(response) > RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH:
+        telemetry.response_projection_limit(tool_name=tool_name, scope="row")
         return dict(_RESPONSE_PROJECTION_LIMIT)
 
     # --- Type-driven path ---
@@ -4100,11 +4165,25 @@ def redact_tool_call_response(
             raise AuditIntegrityError(
                 f"Type-driven redaction entry {tool_name!r} has no response_model; refusing to persist an undeclared response surface."
             )
+        # Every top-level key reaches model_validate (an undeclared key is
+        # rejected by the model itself), so every value is budget-walked first:
+        # the bound must precede validation to keep pydantic from amplifying
+        # an oversized structure.
+        over_budget = frozenset(key for key, value in response.items() if not _response_within_projection_budget(value, depth=1))
+        response_fields = entry.response_model.model_fields
+        if any(key not in response_fields or response_fields[key].is_required() for key in over_budget):
+            # A required typed field (validation / affected_nodes on the shared
+            # ToolResult shadow) cannot take a string sentinel before
+            # validation, and an undeclared key has no field to degrade.
+            telemetry.response_projection_limit(tool_name=tool_name, scope="row")
+            return dict(_RESPONSE_PROJECTION_LIMIT)
         # Walk the response via its Pydantic model schema.
         # model_validate coerces the raw response dict to the declared shape;
         # unknown keys raise ValidationError if extra="forbid" is set on the
         # model, but that is a model-design choice, not enforced here.
-        validated = entry.response_model.model_validate(response)
+        # Over-budget optional values are withheld from validation and replaced
+        # by the per-key sentinel in the projection below.
+        validated = entry.response_model.model_validate({key: value for key, value in response.items() if key not in over_budget})
         schema_redacted = _redact_via_schema(
             tool_name,
             validated,
@@ -4113,7 +4192,14 @@ def redact_tool_call_response(
         )
         projected = _project_validated_response_scalars(schema_redacted)
         assert type(projected) is dict
-        return _bounded_projection_result({key: projected[key] for key in response})
+        for key in response:
+            if key in over_budget:
+                telemetry.response_projection_limit(tool_name=tool_name, scope="key")
+        return _bounded_projection_result(
+            {key: _REDACTED_RESPONSE_PROJECTION_LIMIT if key in over_budget else projected[key] for key in response},
+            tool_name=tool_name,
+            telemetry=telemetry,
+        )
 
     # --- Declarative path ---
     # entry.policy is not None (ToolRedaction.__post_init__ guarantees exactly
@@ -4138,19 +4224,24 @@ def redact_tool_call_response(
             # never tool payload, and sentinel-ing them leaves audit rows
             # blind to every tool outcome.  ``data`` and all other keys stay
             # policy-declared / fail-closed.
-            redacted[key] = _redact_declarative_known_response_value(
-                value,
-                field_name=key,
-                tool_name=tool_name,
-                telemetry=telemetry,
-            )
+            if not _response_within_projection_budget(value, depth=1):
+                # Over-budget known value: degrade this key only, never the row.
+                telemetry.response_projection_limit(tool_name=tool_name, scope="key")
+                redacted[key] = _REDACTED_RESPONSE_PROJECTION_LIMIT
+            else:
+                redacted[key] = _redact_declarative_known_response_value(
+                    value,
+                    field_name=key,
+                    tool_name=tool_name,
+                    telemetry=telemetry,
+                )
         else:
             # Unknown key: aggregate under a fixed field so externally supplied
             # key names cannot become a second response-value channel.
             redacted[REDACTED_UNKNOWN_RESPONSE_FIELD] = REDACTED_UNKNOWN_RESPONSE_KEY
             telemetry.unknown_response_key_redacted(tool_name=tool_name)
 
-    return _bounded_projection_result(redacted)
+    return _bounded_projection_result(redacted, tool_name=tool_name, telemetry=telemetry)
 
 
 def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:

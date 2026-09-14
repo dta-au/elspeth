@@ -431,6 +431,40 @@ describe("executionStore.execute", () => {
     expect(state.error).toBeNull();
     expect(state.isExecuting).toBe(false);
   });
+
+  it("shows the backend's fixed drift copy for an interpretation_review_drift 409", async () => {
+    const { executePipeline } = await import("@/api/client");
+    const driftDetail =
+      "The approved llm_prompt_template review for transform 'rate_coolness' " +
+      "no longer matches the current pipeline, so the run was not started.";
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValue({
+      status: 409,
+      detail: driftDetail,
+      error_type: "interpretation_review_drift",
+    });
+
+    const runId = await useExecutionStore.getState().execute("session-1");
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBe(driftDetail);
+  });
+
+  it("keeps the generic 409 copy for a run-already-active conflict without the drift error_type", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValue({
+      status: 409,
+      detail: "run already active",
+      error_type: "run_already_active",
+    });
+
+    const runId = await useExecutionStore.getState().execute("session-1");
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(state.error).toBe("A run is already in progress for this pipeline.");
+  });
 });
 
 function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostics {
@@ -1627,6 +1661,32 @@ describe("executionStore lastRunOutcome", () => {
     useExecutionStore.getState().acknowledgeRunOutcome();
 
     expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("dismissError clears only the stored error", () => {
+    const outcome = { runId: "run-1", status: "failed", sessionId: "session-1" } as const;
+    const keptValidationResult = makeValidationResult({ is_valid: true });
+    useExecutionStore.setState({
+      error: "A run is already in progress for this pipeline.",
+      validationError: "kept",
+      lastRunOutcome: outcome,
+      // dismissError is the Run-button "Dismiss" affordance for a launch
+      // failure; it must not also cancel an in-flight run's spinner or
+      // discard the last validation result out from under the Checks tab
+      // (the store's own `dismissError` docstring: "One field, one
+      // acknowledgement").
+      validationResult: keptValidationResult,
+      isExecuting: true,
+    });
+
+    useExecutionStore.getState().dismissError();
+
+    const state = useExecutionStore.getState();
+    expect(state.error).toBeNull();
+    expect(state.validationError).toBe("kept");
+    expect(state.lastRunOutcome).toEqual(outcome);
+    expect(state.validationResult).toBe(keptValidationResult);
+    expect(state.isExecuting).toBe(true);
   });
 
   it("reset clears the outcome", () => {

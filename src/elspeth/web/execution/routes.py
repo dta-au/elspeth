@@ -96,6 +96,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.execution.secret_guard import SECRET_GUARD_ERROR_TYPE, ExecutionSecretApprovalRequired
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
+from elspeth.web.interpretation_state import InterpretationReviewIntegrityError
 from elspeth.web.middleware.rate_limit import get_rate_limiter
 from elspeth.web.paths import allowed_sink_directories
 from elspeth.web.sessions.converters import state_from_record
@@ -1251,6 +1252,31 @@ def create_execution_router() -> APIRouter:
                     "detail": "Pipeline is not ready for execution.",
                     "kind": "execution_not_ready",
                     "blockers": [blocker.model_dump() for blocker in exc.blockers],
+                },
+            ) from exc
+        except InterpretationReviewIntegrityError as exc:
+            # A resolved interpretation review no longer matches the artifact
+            # it attested (the strict materializer's drift guards). This is a
+            # conflict between stored review evidence and the current
+            # composition, NOT a missing state, so it must not fall into the
+            # bare ``except ValueError`` 404 below. The class subclasses
+            # ValueError, so this handler MUST sit above that arm. The detail is
+            # fixed copy naming the component: the raw integrity message names
+            # hash domains and never reaches the response body.
+            public_detail = (
+                f"The approved {exc.kind.value} review for {exc.component_type} {exc.component_id!r} "
+                "no longer matches the current pipeline, so the run was not started."
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_type": "interpretation_review_drift",
+                    "kind": "interpretation_review_drift",
+                    "detail": public_detail,
+                    "message": public_detail,
+                    "component_id": exc.component_id,
+                    "component_type": exc.component_type,
+                    "review_kind": exc.kind.value,
                 },
             ) from exc
         except ExecuteRequestValidationError as exc:

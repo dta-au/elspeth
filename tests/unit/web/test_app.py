@@ -846,6 +846,37 @@ class TestSystemStatusEndpoint:
         assert rows["local_capability_configuration"]["status"] == "ok"
         assert rows["local_capability_configuration"]["detail"] is None
 
+    def test_reports_the_default_advisor_model_when_unset(self, tmp_path) -> None:
+        """An operator who sets nothing sees the code default, not null.
+
+        ``WebSettings.composer_advisor_model`` is a non-null ``str`` with a code
+        default and WebSettings has no advisor-disabled setting, so there is no
+        disabled state for the payload to report as null: the field is the
+        model that gates completion for THIS deployment, whatever supplied it.
+        """
+        app = create_app(_settings(tmp_path))
+        response = TestClient(app).get("/api/system/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["composer_advisor_model"] == WebSettings.model_fields["composer_advisor_model"].default
+        assert body["composer_model"] == "gpt-5.5"
+
+    def test_reports_the_configured_advisor_model(self, tmp_path) -> None:
+        """A served override reaches the payload verbatim, beside the planner.
+
+        Live, the served env overrides the code default; without this field
+        the only way to learn which model gated completion was to read it
+        back out of ``llm_call_audit`` rows.
+        """
+        app = create_app(_settings(tmp_path, composer_advisor_model="anthropic/claude-opus-4-7"))
+        response = TestClient(app).get("/api/system/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["composer_advisor_model"] == "anthropic/claude-opus-4-7"
+        assert body["composer_model"] == "gpt-5.5"
+
 
 class TestMetricsEndpoint:
     """Tests for GET /metrics (Prometheus scrape endpoint)."""

@@ -47,6 +47,8 @@ from ._helpers import (
     _composer_conversation_or_llm_audit_messages,
     _composer_conversation_or_tool_messages,
     _composer_conversation_tool_or_llm_audit_messages,
+    _composer_heartbeat_cancel_of,
+    _composer_heartbeat_failed_progress_event,
     _composer_progress_sink,
     _ComposerRequestTerminalStatus,
     _failed_turn_response_body,
@@ -67,6 +69,7 @@ from ._helpers import (
     _publish_progress,
     _record_composer_request_terminal,
     _record_composer_runtime_preflight_telemetry,
+    _rejections_by_tool_call_id,
     _request_plugin_policy_context,
     _safe_frame_strings,
     _state_data_from_composer_state,
@@ -96,8 +99,9 @@ def _requests_audit_grade_messages_view(
     include_tool_rows: bool,
     include_llm_audit: bool,
     include_raw_content: bool,
+    include_rejection_reasons: bool,
 ) -> bool:
-    return include_tool_rows or include_llm_audit or include_raw_content
+    return include_tool_rows or include_llm_audit or include_raw_content or include_rejection_reasons
 
 
 def register_message_routes(router: APIRouter) -> None:
@@ -1076,16 +1080,27 @@ def register_message_routes(router: APIRouter) -> None:
                             name="send-message-cancelled-llm-call-persist",
                         )
                     )
+                # A cancel delivered by the compose heartbeat after it lost
+                # the request's lease is a server fault, not a user Stop
+                # (finding #28): publish ``failed`` and record ``failed``.
+                # The bare ``raise`` below hands it to
+                # ``_track_compose_inflight``, the single place that
+                # uncancels the task and answers with the structured 503.
+                heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
                 await _join_shielded_task_after_cancellation(
                     asyncio.create_task(
                         _publish_progress(
                             progress_sink,
-                            event=client_cancelled_progress_event(),
+                            event=(
+                                client_cancelled_progress_event()
+                                if heartbeat_cancel is None
+                                else _composer_heartbeat_failed_progress_event()
+                            ),
                         ),
                         name="send-message-cancelled-progress-publish",
                     )
                 )
-                terminal_status = "cancelled"
+                terminal_status = "cancelled" if heartbeat_cancel is None else "failed"
                 if _is_client_disconnect_cancel(exc):
                     # Disconnect-initiated cancellation (our
                     # _cancel_on_client_disconnect watcher): the client is
@@ -1144,6 +1159,13 @@ def register_message_routes(router: APIRouter) -> None:
         ),
         include_raw_content: bool = Query(False),
         include_tool_rows: bool = Query(False),
+        include_rejection_reasons: bool = Query(
+            False,
+            description=(
+                "Audit-grade: attach, to tool rows, the unredacted reason a refused composer tool call "
+                "returned to the planner (composition_rejection_events). Requires include_tool_rows=true."
+            ),
+        ),
     ) -> list[ChatMessageResponse]:
         """Get conversation history for a session.
 
@@ -1156,10 +1178,19 @@ def register_message_routes(router: APIRouter) -> None:
         """
         session = await _verify_session_ownership(session_id, user, request)
         service = request.app.state.session_service
+        if include_rejection_reasons and not include_tool_rows:
+            # Rejections attach to tool rows; without them the opt-in would
+            # return nothing and look like "no rejections". Refuse before the
+            # access-log write so no audit-grade read is recorded or served.
+            raise HTTPException(
+                status_code=422,
+                detail="include_rejection_reasons requires include_tool_rows=true",
+            )
         if _requests_audit_grade_messages_view(
             include_tool_rows=include_tool_rows,
             include_llm_audit=include_llm_audit,
             include_raw_content=include_raw_content,
+            include_rejection_reasons=include_rejection_reasons,
         ):
             audit_query_args = {key: value for key, value in request.query_params.items() if key in AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST}
             # The authority re-proves (session, principal, provider) against the
@@ -1205,4 +1236,15 @@ def register_message_routes(router: APIRouter) -> None:
             if has_tool_rows
             else None
         )
-        return [_message_response(m, include_raw_content=include_raw_content, tool_outcomes=tool_outcomes) for m in paged_messages]
+        rejections = (
+            _rejections_by_tool_call_id(await service.list_composition_rejection_events(session.id)) if include_rejection_reasons else None
+        )
+        return [
+            _message_response(
+                m,
+                include_raw_content=include_raw_content,
+                tool_outcomes=tool_outcomes,
+                rejections=rejections,
+            )
+            for m in paged_messages
+        ]

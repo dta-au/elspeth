@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Annotated, Any, Final, Literal, cast
 
@@ -29,6 +29,7 @@ from elspeth.web.composer.state import (
     NodeSpec,
     NodeType,
     SourceSpec,
+    ValidationEntry,
     _batch_aware_placement_error,
     _batch_aware_required_input_fields_error,
     _validate_gate_expression,
@@ -69,6 +70,8 @@ from elspeth.web.composer.tools._common import (
     _validate_transform_provider_config_policy,
     review_reconciliation_failure_message,
 )
+from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
+from elspeth.web.composer.tools.blobs import _llm_authored_inline_prompt_surface_error
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
@@ -719,6 +722,19 @@ def _execute_upsert_node(
         if batch_required_error is not None:
             return _failure_result(state, batch_required_error)
 
+        # Before prevalidation, which withholds a top-level inline_content marker
+        # as a deferred value: an LLM-authored blob in an llm prompt surface or
+        # model refuses with the wire_blob_inline_ref text on every path.
+        prompt_surface_error = _llm_authored_inline_prompt_surface_error(
+            context,
+            tool_name="upsert_node",
+            node_id=node_id,
+            plugin=plugin,
+            options=review_options,
+        )
+        if prompt_surface_error is not None:
+            return _failure_result(state, prompt_surface_error)
+
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
             return _failure_result(
@@ -1290,10 +1306,10 @@ def _execute_splice_transform(
         return _failure_result(state, review_contract_error)
     profile_validation = context.catalog.validate_composition_state(reconciled)
     if not profile_validation.validation.is_valid:
-        return _failure_result(
+        return _splice_validation_rejection(
             state,
-            "Spliced pipeline failed context-aware validation.",
-            error_code="splice_validation_failed",
+            candidate_errors=profile_validation.validation.errors,
+            prior_errors=context.catalog.validate_composition_state(state).validation.errors,
         )
     new_state = replace(reconciled, version=state.version + 1)
     return _mutation_result(
@@ -1308,6 +1324,63 @@ def _execute_splice_transform(
             "replaced_edge_id": direct_edge.id,
             "new_edge_id": new_edge_id,
         },
+    )
+
+
+_SPLICE_VALIDATION_FAILED_MESSAGE: Final[str] = "Spliced pipeline failed context-aware validation."
+
+
+def _rejection_subject_ref(component: str) -> str | None:
+    """The ``rejected_component`` ref for a validation component, when it has one.
+
+    The ref grammar covers only ``source`` / ``source:<name>`` /
+    ``node:<id>`` / ``output:<name>``. A pipeline-wide entry has no single
+    subject and stays unattributed.
+    """
+    if component == "source" or component.startswith(("source:", "node:", "output:")):
+        return component
+    return None
+
+
+def _splice_validation_rejection(
+    state: CompositionState,
+    *,
+    candidate_errors: Sequence[ValidationEntry],
+    prior_errors: Sequence[ValidationEntry],
+) -> ToolResult:
+    """Reject a splice whose candidate fails context-aware validation, naming why.
+
+    The leading ``splice_validation_failed`` entry is unchanged. After it come
+    the candidate's errors that the pre-splice state did not already have,
+    each re-filed as a ``rejected_mutation`` entry with its subject in
+    ``rejected_component``. Two consumers keep only ``rejected_mutation``
+    entries from a rejection: the dispatch-time
+    ``normalize_tool_result_validation``, which rebuilds every other entry
+    from the unchanged ``updated_state``, and the planner's
+    ``_rejection_entries``. An ordinary candidate entry would reach neither
+    surface. Before this, only the generic sentence survived, so no surface
+    could see what the splice broke.
+
+    ``plugin_identity`` is cleared: the entry was not produced from a name
+    this handler resolved through the policy view, and absence is the safe
+    value.
+    """
+    prior_keys = {(entry.component, entry.error_code, entry.message) for entry in prior_errors}
+    forwarded = tuple(
+        replace(
+            entry,
+            component="rejected_mutation",
+            plugin_identity=None,
+            rejected_component=_rejection_subject_ref(entry.component),
+        )
+        for entry in candidate_errors
+        if (entry.component, entry.error_code, entry.message) not in prior_keys
+    )
+    rejection = _failure_result(state, _SPLICE_VALIDATION_FAILED_MESSAGE, error_code="splice_validation_failed")
+    leading, *standing = rejection.validation.errors
+    return replace(
+        rejection,
+        validation=replace(rejection.validation, errors=(leading, *forwarded, *standing)),
     )
 
 
@@ -1388,7 +1461,34 @@ def _execute_upsert_edge(
     if invariant_error is not None:
         message, error_code = invariant_error
         return _failure_result(state, message, error_code=error_code)
-    return _mutation_result(new_state, (from_node, to_node))
+    reconciled = _reconcile_graph_mutation_reviews(state, new_state)
+    if type(reconciled) is ToolResult:
+        return reconciled
+    return _mutation_result(cast(CompositionState, reconciled), (from_node, to_node))
+
+
+def _reconcile_graph_mutation_reviews(
+    state: CompositionState,
+    proposed: CompositionState,
+) -> CompositionState | ToolResult:
+    """Reconcile resolved reviews after a graph-only mutation.
+
+    ``upsert_edge``, ``remove_node`` and ``remove_edge`` change graph facts
+    that resolved review hashes bind: a gate's routes, and every predecessor
+    on an LLM's upstream path. Skipping reconciliation left such a review
+    ``resolved`` against a drifted anchor. No pending site was enumerated,
+    and Execute raised a bare drift ``ValueError`` instead of reopening the
+    review. The failure mapping is the one ``splice_transform`` and
+    ``upsert_node`` use.
+    """
+    try:
+        return reconcile_authoritative_reviews(state, proposed)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
 
 
 def _execute_remove_node(
@@ -1412,7 +1512,10 @@ def _execute_remove_node(
     if new_state is None:
         return _failure_result(state, f"Node '{node_id}' not found.")
 
-    return _mutation_result(new_state, tuple(sorted(affected)))
+    reconciled = _reconcile_graph_mutation_reviews(state, new_state)
+    if type(reconciled) is ToolResult:
+        return reconciled
+    return _mutation_result(cast(CompositionState, reconciled), tuple(sorted(affected)))
 
 
 def _execute_remove_edge(
@@ -1437,7 +1540,10 @@ def _execute_remove_edge(
     if not _sink_route_still_expressed(new_state, edge):
         new_state = _clear_removed_sink_edge_route(new_state, edge)
 
-    return _mutation_result(new_state, affected)
+    reconciled = _reconcile_graph_mutation_reviews(state, new_state)
+    if type(reconciled) is ToolResult:
+        return reconciled
+    return _mutation_result(cast(CompositionState, reconciled), affected)
 
 
 def _execute_set_metadata(
@@ -1586,6 +1692,27 @@ def _execute_patch_node_options(
         plugin_error = _validate_plugin_name(context, "transform", current.plugin)
         if plugin_error is not None:
             return _plugin_policy_failure(state, plugin_error)
+        # The batch-aware guards upsert_node, splice_transform and set_pipeline
+        # run, in the same order. Without them a required_input_fields patch
+        # on a batch-aware node reached plugin construction, whose fail-closed
+        # FrameworkBugError escaped the tool and ended the turn as a 500.
+        batch_placement_error = _batch_aware_placement_error(node_id, current.node_type, current.plugin, current.output_mode)
+        if batch_placement_error is not None:
+            return _failure_result(state, batch_placement_error)
+        batch_required_error = _batch_aware_required_input_fields_error(node_id, current.plugin, new_options)
+        if batch_required_error is not None:
+            return _failure_result(state, batch_required_error)
+
+        # Same refusal upsert_node and splice_transform apply, on the merged options.
+        prompt_surface_error = _llm_authored_inline_prompt_surface_error(
+            context,
+            tool_name="patch_node_options",
+            node_id=node_id,
+            plugin=current.plugin,
+            options=new_options,
+        )
+        if prompt_surface_error is not None:
+            return _failure_result(state, prompt_surface_error)
 
         prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, new_options)
         if prevalidation_error is not None:
@@ -1789,6 +1916,17 @@ def _prepare_transform_candidate(
     if batch_required_error is not None:
         return _failure_result(state, batch_required_error)
 
+    # Same refusal upsert_node and patch_node_options apply (both splice arms).
+    prompt_surface_error = _llm_authored_inline_prompt_surface_error(
+        context,
+        tool_name=tool_name,
+        node_id=node_id,
+        plugin=plugin,
+        options=review_options,
+    )
+    if prompt_surface_error is not None:
+        return _failure_result(state, prompt_surface_error)
+
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
     if prevalidation_error is not None:
         return _failure_result(
@@ -1854,6 +1992,17 @@ def _handle_splice_transform(
     )
 
 
+def _splice_inserted_node_id_schema() -> dict[str, object]:
+    """The inserted transform's id: RuntimeNodeName's schema plus the reserved labels it refuses.
+
+    The same disclosure the canonical set_pipeline ``nodes[].id`` carries.
+    """
+    schema: dict[str, object] = dict(TypeAdapter(RuntimeNodeName).json_schema())
+    _disclose_node_name_constraints(schema)
+    schema["description"] = "Unique ID for the inserted transform."
+    return schema
+
+
 _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
     name="splice_transform",
     handler=_handle_splice_transform,
@@ -1886,10 +2035,7 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
                     "from the insertion point."
                 ),
                 "properties": {
-                    "id": {
-                        **TypeAdapter(RuntimeNodeName).json_schema(),
-                        "description": "Unique ID for the inserted transform.",
-                    },
+                    "id": _splice_inserted_node_id_schema(),
                     "plugin": {"type": "string", "description": "Transform plugin name."},
                     "options": {
                         "type": "object",

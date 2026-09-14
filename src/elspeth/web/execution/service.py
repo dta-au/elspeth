@@ -34,7 +34,8 @@ import structlog
 from opentelemetry import metrics
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.contracts.audit import SecretResolutionInput
@@ -54,6 +55,7 @@ from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.blobs_inline import (
+    _NODE_COLLECTION_KEYS,
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
     _discover_blob_content_refs,
@@ -98,6 +100,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
+from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding
 from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
@@ -205,6 +208,86 @@ _BLOB_INLINE_AUDIT_ROW_TIER1_VIOLATION_TOTAL = _meter.create_counter(
 
 _MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS = 16
 _MAX_AUTHORITATIVE_PROOF_TEXT_CHARS = 1000
+
+# Execution loss watcher (``_signal_shutdown_on_operation_loss``). The watcher
+# is the only carrier of a durable ``cancel_requested_at`` written by another
+# replica to the worker that owns the run, so one transient session-DB error in
+# its poll must not end it. The healthy poll interval is unchanged; after a
+# transient session-DB error the interval doubles per consecutive failure up to
+# the cap, and from the escalation threshold onward every failure is logged at
+# error level. The lease-loss wait stays armed during every backoff interval.
+_LOSS_WATCHER_POLL_SECONDS = 0.25
+_LOSS_WATCHER_MAX_BACKOFF_SECONDS = 5.0
+_LOSS_WATCHER_ESCALATE_AFTER_FAILURES = 5
+# Poll failures classified by what the fault is, not by one class. Transient
+# means a later identical poll can succeed with no change to code or schema:
+# - ``OperationalError``: lock contention, a dropped connection, failover.
+# - ``InterfaceError``: the DBAPI connection object is unusable
+#   (``connection already closed``).
+# - ``sqlalchemy.exc.TimeoutError``: pool checkout timed out. The PostgreSQL
+#   session engine is a bounded ``QueuePool`` (``postgres_engine_kwargs``), so
+#   contention raises this, and it is not an ``OperationalError``.
+# - ``DisconnectionError``: the pool detected a dead connection at checkout.
+# The watcher also retries any other ``DBAPIError`` whose
+# ``connection_invalidated`` flag SQLAlchemy's disconnect detection set. All
+# other faults (``ProgrammingError``, ``IntegrityError``, an unflagged
+# ``DBAPIError``, ``PendingRollbackError``) are logged and re-raised. ``get_run``
+# opens a fresh ``engine.begin()`` per poll, so no failed transaction carries
+# over between polls and a ``PendingRollbackError`` there would be a code defect.
+_LOSS_WATCHER_TRANSIENT_DB_ERRORS: tuple[type[SQLAlchemyError], ...] = (
+    OperationalError,
+    InterfaceError,
+    SQLAlchemyTimeoutError,
+    DisconnectionError,
+)
+
+
+def _log_loss_watcher_poll_retry(exc: SQLAlchemyError, *, run_id: UUID, consecutive_failures: int) -> None:
+    """Log one transient loss-watcher poll failure; error level from the threshold on.
+
+    Class names only, no ``exc_info``: SQLAlchemy cause chains carry the URL.
+    """
+    if consecutive_failures >= _LOSS_WATCHER_ESCALATE_AFTER_FAILURES:
+        slog.error(
+            "execution_loss_watcher_poll_degraded",
+            run_id=str(run_id),
+            exc_class=type(exc).__name__,
+            consecutive_failures=consecutive_failures,
+        )
+    else:
+        slog.warning(
+            "execution_loss_watcher_poll_retrying",
+            run_id=str(run_id),
+            exc_class=type(exc).__name__,
+            consecutive_failures=consecutive_failures,
+        )
+
+
+def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None:
+    """Log a non-transient loss-watcher poll failure before it propagates.
+
+    Logged at once because the run may continue for a long time before
+    ``_on_pipeline_done`` observes the dead task. Class names only.
+    """
+    slog.error(
+        "execution_loss_watcher_poll_failed",
+        run_id=str(run_id),
+        exc_class=type(exc).__name__,
+    )
+
+
+class InlineBlobPromptSurfaceAdmissionError(Exception):
+    """An LLM-authored blob was bound as inline content into an LLM prompt surface.
+
+    Raised at run admission, before any blob is linked to the run or read, when
+    an ``inline_content`` marker in an ``llm`` node's prompt surface or model
+    (the domain ``llm_prompt_surface_field`` defines, shared with /validate and
+    the authoring tools) names a blob whose creation modality is LLM-authored.
+    Substituting such a blob would put
+    planner-written text into the executed prompt (or model choice) without the
+    human prompt-template / model-choice review that a literal value receives.
+    Mirrors the ``blob_rows`` modality refusal (``BlobRowsSourceAdmissionError``).
+    """
 
 
 def _bounded_proof_text(value: object, *, field_name: str) -> str:
@@ -2221,11 +2304,45 @@ class ExecutionServiceImpl:
         run_id: UUID,
     ) -> None:
         """Bridge durable cancellation and loss of the exact web owner."""
+        consecutive_poll_failures = 0
         while True:
+            # Exponent capped so a long outage cannot overflow the float; the
+            # interval itself is capped by _LOSS_WATCHER_MAX_BACKOFF_SECONDS.
+            poll_seconds = min(
+                _LOSS_WATCHER_POLL_SECONDS * (2 ** min(consecutive_poll_failures, 16)),
+                _LOSS_WATCHER_MAX_BACKOFF_SECONDS,
+            )
             try:
-                await asyncio.wait_for(session_operation_lease.wait_until_lost(), timeout=0.25)
+                await asyncio.wait_for(session_operation_lease.wait_until_lost(), timeout=poll_seconds)
             except TimeoutError:
-                run = await self._session_service.get_run(run_id)
+                try:
+                    run = await self._session_service.get_run(run_id)
+                except _LOSS_WATCHER_TRANSIENT_DB_ERRORS as exc:
+                    # Transient session-DB failure (lock contention, pool
+                    # checkout timeout, dropped connection, failover). This task
+                    # is the only path by which a cancel persisted on another
+                    # replica reaches this worker, so it keeps polling with
+                    # backoff rather than dying. It does NOT set shutdown_event:
+                    # cancelling a running pipeline because the session DB is
+                    # flaky is not this watcher's call. Lease loss is still
+                    # observed during every backoff interval.
+                    consecutive_poll_failures += 1
+                    _log_loss_watcher_poll_retry(exc, run_id=run_id, consecutive_failures=consecutive_poll_failures)
+                    continue
+                except DBAPIError as exc:
+                    # Any other DBAPI error is transient only when SQLAlchemy's
+                    # disconnect detection invalidated the connection.
+                    if not exc.connection_invalidated:
+                        _log_loss_watcher_poll_failed(exc, run_id=run_id)
+                        raise
+                    consecutive_poll_failures += 1
+                    _log_loss_watcher_poll_retry(exc, run_id=run_id, consecutive_failures=consecutive_poll_failures)
+                    continue
+                except SQLAlchemyError as exc:
+                    # Non-transient database fault: retrying cannot fix it.
+                    _log_loss_watcher_poll_failed(exc, run_id=run_id)
+                    raise
+                consecutive_poll_failures = 0
                 if run.cancel_requested_at is None:
                     continue
             shutdown_event.set()
@@ -2721,6 +2838,36 @@ class ExecutionServiceImpl:
                             per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
                             aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
                         )
+                        # Modality is checked at ADMISSION, as the blob_rows arm
+                        # below does: the prompt-template and model-choice reviews
+                        # read those options as strings, so an inline_content
+                        # marker there opens no review site, and substituting an
+                        # LLM-authored blob would make planner-written text the
+                        # executed prompt (or model) with no human review. Fail
+                        # closed before any link or read.
+                        llm_node_names = {
+                            node["name"]
+                            for collection_key in _NODE_COLLECTION_KEYS
+                            if collection_key in resolved_dict and type(resolved_dict[collection_key]) is list
+                            for node in resolved_dict[collection_key]
+                            if type(node) is dict and "plugin" in node and node["plugin"] == "llm" and "name" in node
+                        }
+                        llm_authored_prompt_refs = [
+                            ref
+                            for ref in inline_refs
+                            if is_llm_authored_prompt_surface_binding(
+                                ref.field_path,
+                                llm_node_names=llm_node_names,
+                                creation_modality=records_by_blob_id[ref.blob_id].creation_modality,
+                            )
+                        ]
+                        if llm_authored_prompt_refs:
+                            bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in llm_authored_prompt_refs)
+                            raise InlineBlobPromptSurfaceAdmissionError(
+                                f"{bound} binds LLM-authored blob content into an llm prompt surface; inline prompt, "
+                                "system prompt, query template and model content admits only user-verbatim blobs — "
+                                "write the reviewed text into the option instead so its review is staged"
+                            )
                         self._call_async(_link_inline_blobs_to_run())
 
                         async def _read_inline_blob_contents() -> dict[Any, bytes]:
@@ -4058,12 +4205,30 @@ class ExecutionServiceImpl:
             exc = None
 
         async def _finish_execution_authority() -> None:
+            failed_loss_watcher: tuple[str, BaseException] | None = None
             try:
                 if loss_watcher is not None:
                     loss_watcher.cancel()
                     await asyncio.gather(loss_watcher, return_exceptions=True)
+                    # The task is done here. A watcher that died before this
+                    # cancel ended its cancel and lease-loss signalling early;
+                    # that must be visible, not discarded. Our own cancel is
+                    # the normal outcome and is not reported.
+                    if not loss_watcher.cancelled():
+                        watcher_exception = loss_watcher.exception()
+                        if watcher_exception is not None:
+                            failed_loss_watcher = (loss_watcher.get_name(), watcher_exception)
             finally:
                 await session_operation_lease.close()
+            if failed_loss_watcher is not None:
+                # Class names only, for the reason given in this callback's
+                # docstring; logged after the mandatory authority release.
+                watcher_task, watcher_exc = failed_loss_watcher
+                slog.error(
+                    "execution_loss_watcher_failed",
+                    watcher_task=watcher_task,
+                    exc_class_chain=_exception_class_chain(watcher_exc),
+                )
             if exc is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 # Diagnose only after mandatory authority release. A logger
                 # failure belongs to this tracked completion future so that

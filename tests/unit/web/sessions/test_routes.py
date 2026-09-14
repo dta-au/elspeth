@@ -5726,7 +5726,8 @@ class TestMessageRoutes:
                 .one()
             )
         assert cancelled_operation["status"] == "failed"
-        assert cancelled_operation["failure_code"] == "operation_failed"
+        # A client disconnect is a cancellation, not a server failure (#24).
+        assert cancelled_operation["failure_code"] == "request_cancelled"
         assert cancelled_operation["originating_message_id"] is None
         assert cancelled_operation["result_state_id"] is None
         assert cancelled_operation["response_hash"] is None
@@ -5746,9 +5747,9 @@ class TestMessageRoutes:
             first_replay = client.post(f"/api/sessions/{session_id}/guided/chat", json=chat_body)
             second_replay = client.post(f"/api/sessions/{session_id}/guided/chat", json=chat_body)
 
-        assert first_replay.status_code == second_replay.status_code == 500
+        assert first_replay.status_code == second_replay.status_code == 499
         assert first_replay.json() == second_replay.json()
-        assert first_replay.json()["detail"]["failure_code"] == "operation_failed"
+        assert first_replay.json()["detail"]["failure_code"] == "request_cancelled"
         old_provider.assert_not_awaited()
 
         retry_body = {**chat_body, "operation_id": str(uuid.uuid4())}
@@ -8374,6 +8375,7 @@ sinks:
             id=blob_id,
             session_id=session.id,
             storage_path=str(blob_path),
+            status="ready",
         )
         yaml_text = """
 sources:
@@ -8546,6 +8548,7 @@ sinks:
             id=blob_id,
             session_id=session.id,
             storage_path=str(blob_path),
+            status="ready",
         )
         yaml_text = """
 sources:
@@ -8626,6 +8629,7 @@ sinks:
             id=blob_id,
             session_id=session.id,
             storage_path=str(blob_path),
+            status="ready",
         )
         yaml_text = """
 sources:
@@ -9207,6 +9211,7 @@ sinks:
             id=blob_id,
             session_id=session.id,
             storage_path=str(blob_path),
+            status="ready",
         )
         old_blob_path = tmp_path / "blobs" / "old-session" / "old.csv"
         yaml_text = f"""

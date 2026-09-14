@@ -166,6 +166,25 @@ class ChatMessageSegmentResponse(_StrictResponse):
     content: str
 
 
+class ToolRejectionResponse(_StrictResponse):
+    """The reason a refused composer tool call returned to the planner.
+
+    Projected from ``composition_rejection_events`` (elspeth-3e28029d2f) onto
+    ``role="tool"`` rows ONLY when the owner opts in with
+    ``include_tool_rows=true&include_rejection_reasons=true`` on
+    GET /api/sessions/{id}/messages (the access-logged audit-grade view). The
+    chat tool row's ``content`` stays redacted; this is the unredacted
+    session-data reason (operator ruling 2026-09-02). It never carries
+    advisor output, and ``planner_payload`` is not projected.
+    """
+
+    tool_name: str
+    error_code: str | None = None
+    message: str
+    composition_state_id: str | None = None
+    created_at: datetime
+
+
 class ChatMessageResponse(_StrictResponse):
     """Response for a single chat message.
 
@@ -195,6 +214,10 @@ class ChatMessageResponse(_StrictResponse):
     tool_call_id: str | None = None
     parent_assistant_id: str | None = None
     sequence_no: int | None = None
+    # Null unless the audit-grade view opts in with include_rejection_reasons
+    # AND this is a tool row whose call was refused. Always present in the
+    # shape (same posture as ``raw_content``): test ``rejection is not None``.
+    rejection: ToolRejectionResponse | None = None
 
 
 class MessageWithStateResponse(_StrictResponse):

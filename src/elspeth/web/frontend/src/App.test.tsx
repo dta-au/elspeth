@@ -260,6 +260,7 @@ vi.mock("./api/client", () => ({
   fetchSystemStatus: vi.fn().mockResolvedValue({
     composer_available: true,
     composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
     composer_provider: "openai",
     composer_reason: null,
     composer_missing_keys: [],
@@ -344,6 +345,7 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -382,6 +384,7 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -393,6 +396,26 @@ describe("App banner roles", () => {
     const banner = await screen.findByTestId("classification-banner");
     expect(banner).toHaveTextContent("UNOFFICIAL");
     expect(banner).toHaveClass("classification-banner--unofficial");
+  });
+
+  it("publishes the advisor model from the status payload into the session store", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-opus-4-7",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(useSessionStore.getState().composerAdvisorModel).toBe(
+        "anthropic/claude-opus-4-7",
+      ),
+    );
+    expect(useSessionStore.getState().composerModel).toBe("gpt-4o");
   });
 
   it("renders no classification banner when the deployment declares none", async () => {
@@ -408,6 +431,7 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: false,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: "No API key configured",
       composer_missing_keys: ["OPENAI_API_KEY"],
@@ -432,6 +456,7 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: false,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: "No API key configured",
       composer_missing_keys: ["OPENAI_API_KEY"],
@@ -467,6 +492,7 @@ describe("App banner roles", () => {
       vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
         composer_available: false,
         composer_model: "gpt-4o",
+        composer_advisor_model: "anthropic/claude-sonnet-4-6",
         composer_provider: "openai",
         composer_reason: "No API key configured",
         composer_missing_keys: ["OPENAI_API_KEY"],
@@ -1324,6 +1350,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1360,6 +1387,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1385,6 +1413,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
       .mockResolvedValueOnce({
         composer_available: true,
         composer_model: "gpt-4o",
+        composer_advisor_model: "anthropic/claude-sonnet-4-6",
         composer_provider: "openai",
         composer_reason: null,
         composer_missing_keys: [],
@@ -1393,6 +1422,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
       .mockResolvedValue({
         composer_available: true,
         composer_model: "gpt-4o",
+        composer_advisor_model: "anthropic/claude-sonnet-4-6",
         composer_provider: "openai",
         composer_reason: null,
         composer_missing_keys: [],
@@ -1422,6 +1452,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
   const GOOD_STATUS = {
     composer_available: true,
     composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
     composer_provider: "openai",
     composer_reason: null,
     composer_missing_keys: [],
@@ -1430,6 +1461,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
   const PARTIAL_STATUS = {
     composer_available: true,
     composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
     composer_provider: "openai",
     composer_reason: null,
     composer_missing_keys: [],
@@ -1505,6 +1537,7 @@ describe("App composer recovery panel", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1661,6 +1694,7 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1853,6 +1887,7 @@ describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1923,6 +1958,7 @@ describe("App empty landing and auto-resume", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],

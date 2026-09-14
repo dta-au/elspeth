@@ -11,7 +11,7 @@ from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction, DeferredIntentEditAction
+from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction, DeferredIntentCancelAction, DeferredIntentEditAction
 from elspeth.web.composer.guided.intent_management import deferred_intent_management_option
 from elspeth.web.composer.guided.stage_subjects import ComponentCountConstraint, StageName
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
@@ -24,6 +24,7 @@ from elspeth.web.sessions.routes.composer.guided_chat_intent_management import (
     DeferredRequestAuthority,
     DeferredRequestRetained,
     DeferredRequestUnchanged,
+    apply_deferred_clarification,
     apply_deferred_request,
 )
 
@@ -56,6 +57,22 @@ _AGGREGATION_CLAUSE = (
     "flush always happens. Name the batch behaviour you want. "
 )
 _FRAME_CLOSE = "Clarify the concrete topology structure and I'll firm it up."
+
+
+def _recourse(intent_id: UUID) -> str:
+    """The exact wire-confirmation recourse sentence ``_retained_unverified_chat``
+
+    uses (F1 finding #23): a retention path that mints a constraint-free,
+    wire-blocking intent must name that intent's own UUID and the only two
+    commands that can clear it, never only a sibling intent's id.
+    """
+
+    return (
+        f"It is saved as instruction {intent_id} with no structural constraint, and wiring cannot be confirmed while it stands: "
+        f"send 'Edit exact intent {intent_id}: <corrected instruction>' to firm it up, or 'Cancel exact intent {intent_id}.' to drop it."
+    )
+
+
 _AGGREGATION_MESSAGE = "Later add an aggregation that rolls the scored rows up per customer."
 _AGGREGATION_AND_COLLECTOR_MESSAGE = (
     "Later add a collector to stitch the exploded pages back together and an aggregation to roll them up per customer."
@@ -179,7 +196,7 @@ def test_unmentioned_unavailable_model_catalog_identity_teaches_collector_scopes
 
     assert type(result) is DeferredRequestRetained
     assert result.chat.error_class == "DeferredIntentModelCatalogIdentity"
-    assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+    assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE + " " + _recourse(_INTENT_ID)
     # Nothing may bind the proposed plugin to the collector, and the collector
     # must never be called "not a transform plugin". Honest about their power:
     # the first two pass on every ancestor too, so they witness no change —
@@ -214,7 +231,7 @@ def test_collector_and_structural_clauses_both_emit_inside_one_frame() -> None:
     )
 
     assert type(result) is DeferredRequestRetained
-    assert result.chat.assistant_message == _FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+    assert result.chat.assistant_message == (_FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _FRAME_CLOSE + " " + _recourse(_INTENT_ID))
     # Exact equality above already pins single emission; these state the
     # property a reader is looking for when a clause is added.
     assert result.chat.assistant_message.count(_FRAME_OPEN) == 1
@@ -250,7 +267,7 @@ def test_declining_a_collector_still_gets_the_true_structural_clause() -> None:
     )
 
     assert type(result) is DeferredRequestRetained
-    assert result.chat.assistant_message == _FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+    assert result.chat.assistant_message == (_FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _FRAME_CLOSE + " " + _recourse(_INTENT_ID))
 
 
 def test_collector_clause_stays_true_beside_a_successfully_saved_sibling_action() -> None:
@@ -281,7 +298,12 @@ def test_collector_clause_stays_true_beside_a_successfully_saved_sibling_action(
 
     assert type(result) is DeferredRequestRetained
     assert result.chat.assistant_message == (
-        "I saved that instruction for the topology stage. " + _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+        "I saved that instruction for the topology stage. "
+        + _FRAME_OPEN
+        + _COLLECTOR_CLAUSE
+        + _FRAME_CLOSE
+        + " "
+        + _recourse(_SECOND_INTENT_ID)
     )
     assert "collector request" not in result.chat.assistant_message
 
@@ -308,7 +330,7 @@ def test_aggregation_gets_its_own_clause_with_its_own_field_list() -> None:
     )
 
     assert type(result) is DeferredRequestRetained
-    assert result.chat.assistant_message == _FRAME_OPEN + _AGGREGATION_CLAUSE + _FRAME_CLOSE
+    assert result.chat.assistant_message == (_FRAME_OPEN + _AGGREGATION_CLAUSE + _FRAME_CLOSE + " " + _recourse(_INTENT_ID))
     # The collector's scope binding must never be attributed to an aggregation.
     assert "scope_name" not in result.chat.assistant_message
     assert "EXPAND scope" not in result.chat.assistant_message
@@ -336,7 +358,9 @@ def test_both_plugin_bearing_clauses_compose_in_one_frame() -> None:
     )
 
     assert type(result) is DeferredRequestRetained
-    assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE + _FRAME_CLOSE
+    assert result.chat.assistant_message == (
+        _FRAME_OPEN + _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE + _FRAME_CLOSE + " " + _recourse(_INTENT_ID)
+    )
     assert result.chat.assistant_message.count(_FRAME_OPEN) == 1
     assert result.chat.assistant_message.count(_FRAME_CLOSE) == 1
 
@@ -360,7 +384,9 @@ def test_structural_collector_and_aggregation_compose_in_the_stated_order() -> N
     )
 
     assert type(result) is DeferredRequestRetained
-    assert result.chat.assistant_message == (_FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE + _FRAME_CLOSE)
+    assert result.chat.assistant_message == (
+        _FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE + _FRAME_CLOSE + " " + _recourse(_INTENT_ID)
+    )
     assert result.chat.assistant_message.count(_FRAME_OPEN) == 1
     assert result.chat.assistant_message.count(_FRAME_CLOSE) == 1
 
@@ -396,7 +422,7 @@ def test_node_kind_teaching_accepts_regular_plurals_and_rejects_embedded_aliases
         )
 
         assert type(result) is DeferredRequestRetained
-        assert result.chat.assistant_message == _FRAME_OPEN + expected_clauses + _FRAME_CLOSE
+        assert result.chat.assistant_message == (_FRAME_OPEN + expected_clauses + _FRAME_CLOSE + " " + _recourse(_INTENT_ID))
 
 
 def test_plural_node_kind_mention_does_not_count_as_an_exact_catalog_plugin_name() -> None:
@@ -416,7 +442,7 @@ def test_plural_node_kind_mention_does_not_count_as_an_exact_catalog_plugin_name
 
     assert type(result) is DeferredRequestRetained
     assert result.chat.error_class == "DeferredIntentModelCatalogIdentity"
-    assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+    assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE + " " + _recourse(_INTENT_ID)
 
 
 def test_unmentioned_unavailable_identity_cannot_bypass_same_stage_rejection() -> None:
@@ -619,6 +645,13 @@ def test_contradiction_rejection_retains_instruction_as_clarification_debt() -> 
     assert _RETAINED_INTENT_ID in result.chat.assistant_message
     assert "pending clarification" in result.chat.assistant_message
     assert retained.redacted_summary in result.chat.assistant_message
+    # F1 finding #23: naming only the OTHER (already-retained) conflicting
+    # intent is not enough — the retention itself just minted a SECOND,
+    # constraint-free intent (`_INTENT_ID`) that also blocks wire
+    # confirmation, and "restate it" mints yet another rather than clearing
+    # this one. The copy must name ITS OWN id and exact recourse commands too.
+    assert str(_INTENT_ID) in result.chat.assistant_message
+    assert _recourse(_INTENT_ID) in result.chat.assistant_message
     first, clarification = result.guided.deferred_intents
     assert first == retained
     assert clarification.intent_id == str(_INTENT_ID)
@@ -792,3 +825,99 @@ def test_unparseable_catalog_identity_is_not_the_unavailable_seam() -> None:
         )
         is False
     )
+
+
+def test_apply_deferred_clarification_names_the_minted_intent_and_recourse() -> None:
+    """F1 finding #23: the bounded-repair degrade path also mints a
+    permanently unclaimable, constraint-free intent (R2-F15 last resort), and
+    its chat copy must name that intent's own UUID and the exact
+    Cancel/Edit commands — never only the generic "I kept it, tell me more"
+    copy the caller built before the id existed.
+    """
+
+    result = apply_deferred_clarification(
+        authority=DeferredRequestAuthority(
+            guided=GuidedSession.initial(),
+            catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+            originating_message=GuidedOriginatingUserMessageDraft(
+                message_id=_MESSAGE_ID,
+                content="Later do something with the future stage, somehow.",
+            ),
+            new_intent_ids=(_INTENT_ID,),
+        ),
+        chat=StepChatResult(
+            assistant_message=(
+                "I kept that future-stage instruction, but I couldn't verify its structure "
+                "yet. Tell me the target stage and the concrete structural requirement — "
+                "for example the plugin it must add or the connection it must produce — "
+                "and I'll firm it up."
+            ),
+            status=ComposerChatTurnStatus.SUCCESS,
+            latency_ms=5,
+            error_class=None,
+        ),
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.retained_intent_ids == (_INTENT_ID,)
+    (clarification,) = result.guided.deferred_intents
+    assert clarification.intent_id == str(_INTENT_ID)
+    assert str(_INTENT_ID) in result.chat.assistant_message
+    assert _recourse(_INTENT_ID) in result.chat.assistant_message
+
+
+def test_ambiguous_management_names_every_current_intent_with_its_exact_commands() -> None:
+    """F1 finding #23 residue: an unauthorised cancel/edit must hand the user the
+    real ids — a '<UUID>' placeholder leaves no way to learn the id the command
+    needs. Every current intent is named, in session order, with both commands."""
+
+    first = _count_intent(
+        intent_id=_RETAINED_INTENT_ID,
+        plugin_name="passthrough",
+        operator="at_least",
+        count=1,
+        summary="Future topology instruction; one passthrough node.",
+    )
+    second = _count_intent(
+        intent_id=_EDITED_INTENT_ID,
+        plugin_name="passthrough",
+        operator="at_least",
+        count=1,
+        summary="Future topology instruction; another passthrough node.",
+    )
+    guided = replace(GuidedSession.initial(), deferred_intents=(first, second))
+    result = apply_deferred_request(
+        (),
+        DeferredIntentCancelAction(
+            intent_id=_RETAINED_INTENT_ID,
+            selection_token=deferred_intent_management_option(first).selection_token,
+        ),
+        authority=DeferredRequestAuthority(
+            guided=guided,
+            catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+            originating_message=GuidedOriginatingUserMessageDraft(
+                message_id=_MESSAGE_ID,
+                content="Cancel the saved passthrough instruction.",
+            ),
+            new_intent_ids=(_INTENT_ID,),
+        ),
+        chat=StepChatResult(
+            assistant_message="model-authored response",
+            status=ComposerChatTurnStatus.SUCCESS,
+            latency_ms=7,
+            error_class=None,
+        ),
+    )
+
+    assert type(result) is DeferredRequestUnchanged
+    assert result.guided.deferred_intents == (first, second)
+    assert result.chat.error_class == "DeferredIntentAmbiguous"
+    assert result.chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+    assert result.chat.assistant_message == (
+        "Use an exact command before I change a saved instruction. "
+        f"For instruction {_RETAINED_INTENT_ID} (Future topology instruction; one passthrough node.) send "
+        f"'Cancel exact intent {_RETAINED_INTENT_ID}.' or 'Edit exact intent {_RETAINED_INTENT_ID}: <new instruction>'. "
+        f"For instruction {_EDITED_INTENT_ID} (Future topology instruction; another passthrough node.) send "
+        f"'Cancel exact intent {_EDITED_INTENT_ID}.' or 'Edit exact intent {_EDITED_INTENT_ID}: <new instruction>'."
+    )
+    assert "<UUID>" not in result.chat.assistant_message

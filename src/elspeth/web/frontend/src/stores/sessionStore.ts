@@ -571,6 +571,12 @@ function clearComposerProgressPollTimer(): void {
 const INFLIGHT_MESSAGES_POLL_INTERVAL_MS = 1500;
 let inflightMessagesPollTimer: ReturnType<typeof setInterval> | null = null;
 let inflightMessagesPollSessionId: string | null = null;
+// Latest inflight-poller claim generation per session. Unlike
+// inflightMessagesPollSessionId this survives clearInflightMessagesPollTimer:
+// a session switch stops the poller but does not abort the turn, so the
+// owning turn's explicit sync needs to know whether a NEWER turn on the SAME
+// session has claimed the poller since — not whether the timer still runs.
+const inflightMessagesLatestClaimBySession = new Map<string, number>();
 
 function clearInflightMessagesPollTimer(): void {
   if (inflightMessagesPollTimer !== null) {
@@ -745,8 +751,12 @@ async function waitForCancelledComposeToSettle(
 async function resyncAfterAbortedComposeTurn(
   sessionId: string,
   ownerGeneration: number,
+  inflightOwnerGeneration: number,
   preTurnVersion: number | null,
 ): Promise<void> {
+  // inflightOwnerGeneration is the aborted turn's inflight-messages poller
+  // claim (a DIFFERENT counter from ownerGeneration); it lets the message
+  // sync below land even when a session switch has stopped that poller.
   // ownerGeneration is the aborted turn's progress-poller claim (returned
   // by its startComposerProgressPolling). It fences every stage of the
   // resync: a newer compose turn in ANY mode — freeform or guided — claims
@@ -765,7 +775,9 @@ async function resyncAfterAbortedComposeTurn(
   // Reuse the inflight reconciler: it drops the optimistic local-* row only
   // when its canonical counterpart was actually persisted, so a request
   // that never reached the route keeps its failed row + retry affordance.
-  await useSessionStore.getState().loadInflightMessages(sessionId);
+  await useSessionStore
+    .getState()
+    .loadInflightMessages(sessionId, inflightOwnerGeneration);
   let state: CompositionState | null | undefined;
   let proposals: CompositionProposal[] | null | undefined;
   try {
@@ -1204,6 +1216,15 @@ interface SessionState {
    */
   composerModel: string | null;
   setComposerModel: (model: string | null) => void;
+  /**
+   * Deployment-level advisor model identity
+   * (ELSPETH_WEB__COMPOSER_ADVISOR_MODEL) — the model that gates completion —
+   * written by the same health poll beside composerModel and read by the
+   * AppHeader ModelChip. NULL until the first successful status poll
+   * publishes it; a later failed poll does not clear it.
+   */
+  composerAdvisorModel: string | null;
+  setComposerAdvisorModel: (model: string | null) => void;
   stateVersions: CompositionStateVersion[];
   error: string | null;
   /**
@@ -1280,7 +1301,16 @@ interface SessionState {
    */
   startComposerProgressPolling: (sessionId: string) => number;
   stopComposerProgressPolling: (sessionId?: string, generation?: number) => void;
-  loadInflightMessages: (sessionId: string) => Promise<void>;
+  /**
+   * Omit ownerGeneration for the interval tick (fenced on the live poller
+   * claim). The owning turn's explicit sync passes the generation its
+   * startInflightMessagesPolling returned, so a session switch that stopped
+   * the poller does not drop it.
+   */
+  loadInflightMessages: (
+    sessionId: string,
+    ownerGeneration?: number,
+  ) => Promise<void>;
   startInflightMessagesPolling: (sessionId: string) => number;
   stopInflightMessagesPolling: (sessionId?: string, generation?: number) => void;
   retryMessage: (messageId: string, signal?: AbortSignal) => Promise<void>;
@@ -1469,6 +1499,7 @@ const initialState = {
   composeTimeoutReady: false,
   composerTimeoutUnavailable: false,
   composerModel: null as string | null,
+  composerAdvisorModel: null as string | null,
   stateVersions: [] as CompositionStateVersion[],
   isLoadingVersions: false,
   error: null as string | null,
@@ -1496,6 +1527,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   setComposerModel(model) {
     set({ composerModel: model });
+  },
+
+  setComposerAdvisorModel(model) {
+    set({ composerAdvisorModel: model });
   },
 
   async loadSessions() {
@@ -1966,7 +2001,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // then only needs to update derived state (compositionState, proposals,
       // isComposing) without re-appending the final assistant message that
       // the poll has already pulled in.
-      await get().loadInflightMessages(activeSessionId);
+      await get().loadInflightMessages(activeSessionId, inflightPollGeneration);
       // Navigation can also happen during the post-completion message sync.
       // Keep the compose response scoped to the session that initiated it.
       if (get().activeSessionId !== activeSessionId) {
@@ -2133,6 +2168,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         await resyncAfterAbortedComposeTurn(
           activeSessionId,
           progressPollGeneration,
+          inflightPollGeneration,
           recoveryStartedCompositionVersion,
         );
       }
@@ -2376,21 +2412,46 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearComposerProgressPollTimer();
   },
 
-  async loadInflightMessages(sessionId: string) {
+  async loadInflightMessages(sessionId: string, ownerGeneration?: number) {
     // Refresh the chat messages from the server so newly-persisted assistant
     // rows from the inflight compose loop are visible immediately. The
     // optimistic local-* user message is preserved when its canonical
     // counterpart hasn't appeared in the fresh list yet (race between the
     // first poll and the route's user-message persist); once the canonical
     // user row arrives, the optimistic one is dropped.
+    //
+    // Ownership fence (elspeth-90f453d7b2) has two modes.
+    //
+    // Interval tick (ownerGeneration omitted): the poll generation is
+    // captured BEFORE the fetch and the response is applied only while the
+    // same poller claim is still live for this session. Stopped (id null),
+    // rebound to another session, or reclaimed by a newer same-session turn
+    // (generation moved) all drop it — otherwise a tick started mid-compose
+    // that lands after the turn settled replaces the post-settle list with
+    // an older one and wipes the final reply, with no poller left to repair
+    // it.
+    //
+    // Owning turn's explicit sync (ownerGeneration = the generation its
+    // startInflightMessagesPolling returned; sendMessage/retryMessage
+    // post-settle sync and the aborted-turn resync): the poller being
+    // stopped is NOT a reason to drop it. selectSession stops the poller on
+    // A -> B -> A without aborting the turn, and this sync is then the only
+    // thing that brings the rows persisted during the turn into view. It is
+    // dropped only when the session is no longer active or a newer turn on
+    // the SAME session has claimed the poller (that turn owns the sync now).
+    const pollGeneration = inflightMessagesPollGeneration;
     try {
       const fresh = await api.fetchMessages(sessionId);
       if (get().activeSessionId !== sessionId) return;
-      // If polling has been stopped (or rebound to a different session), drop
-      // this stale response on the floor.
-      if (
-        inflightMessagesPollSessionId !== null &&
-        inflightMessagesPollSessionId !== sessionId
+      if (ownerGeneration === undefined) {
+        if (
+          inflightMessagesPollSessionId !== sessionId ||
+          inflightMessagesPollGeneration !== pollGeneration
+        ) {
+          return;
+        }
+      } else if (
+        inflightMessagesLatestClaimBySession.get(sessionId) !== ownerGeneration
       ) {
         return;
       }
@@ -2417,6 +2478,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearInflightMessagesPollTimer();
     inflightMessagesPollGeneration += 1;
     inflightMessagesPollSessionId = sessionId;
+    inflightMessagesLatestClaimBySession.set(
+      sessionId,
+      inflightMessagesPollGeneration,
+    );
     inflightMessagesPollTimer = setInterval(() => {
       if (inflightMessagesPollSessionId !== sessionId) return;
       void useSessionStore.getState().loadInflightMessages(sessionId);
@@ -2478,7 +2543,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }
       // Sync the chat panel against the DB state (see sendMessage for
       // rationale).
-      await get().loadInflightMessages(activeSessionId);
+      await get().loadInflightMessages(activeSessionId, inflightPollGeneration);
       if (get().activeSessionId !== activeSessionId) {
         return;
       }
@@ -2600,6 +2665,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         await resyncAfterAbortedComposeTurn(
           activeSessionId,
           progressPollGeneration,
+          inflightPollGeneration,
           recoveryStartedCompositionVersion,
         );
       }

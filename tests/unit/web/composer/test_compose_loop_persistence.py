@@ -23,7 +23,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
-from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError, ComposerServiceError, ToolArgumentError
+from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
@@ -532,8 +532,8 @@ async def test_explicit_approval_batch_preflights_proposal_cap_before_creation(
         assert caught is None
         expected_proposals = 10
     else:
-        assert type(caught) is ComposerServiceError
-        assert str(caught) == "Composer produced too many pending tool proposals in one turn (10 maximum)."
+        assert type(caught) is ComposerConvergenceError
+        assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
         expected_proposals = 0
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         proposal_ids = conn.execute(
@@ -553,8 +553,8 @@ async def test_explicit_approval_batch_preflights_proposal_cap_before_creation(
             session_id=result_session_id,
             response=response,
         )
-        assert type(retry_caught) is ComposerServiceError
-        assert str(retry_caught) == "Composer produced too many pending tool proposals in one turn (10 maximum)."
+        assert type(retry_caught) is ComposerConvergenceError
+        assert dict(retry_caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
         assert proposal_calls == 0
         with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
             assert (
@@ -600,8 +600,8 @@ async def test_proposal_attempt_cap_rejects_mixed_schema_and_semantic_invalid_ca
         ),
     )
 
-    assert type(caught) is ComposerServiceError
-    assert str(caught) == "Composer produced too many pending tool proposals in one turn (10 maximum)."
+    assert type(caught) is ComposerConvergenceError
+    assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
     assert handler_calls == []
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         assert (
@@ -673,8 +673,8 @@ async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutatio
         ),
     )
 
-    assert type(caught) is ComposerServiceError
-    assert str(caught) == "Composer produced too many pending tool proposals in one turn (10 maximum)."
+    assert type(caught) is ComposerConvergenceError
+    assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         assert (
             conn.execute(

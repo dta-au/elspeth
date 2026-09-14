@@ -280,6 +280,7 @@ AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST: frozenset[str] = frozenset(
         "include_tool_rows",
         "include_llm_audit",
         "include_raw_content",
+        "include_rejection_reasons",
         "limit",
         "offset",
     }
@@ -1051,6 +1052,45 @@ class ChatMessageRecord:
         # Only ``tool_calls`` carries mutable contents.
         if self.tool_calls is not None:
             freeze_fields(self, "tool_calls")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompositionRejectionEventRecord:
+    """One ``composition_rejection_events`` row, projected for the audit-grade view.
+
+    elspeth-3e28029d2f persisted the reason a composer tool call was refused
+    (operator ruling 2026-09-02: session data, the private audit-attribution
+    surface like ``chat_messages.raw_content``). This record is the READ side,
+    returned only to the owner-only, access-logged audit-grade messages view
+    behind ``include_rejection_reasons``. ``planner_payload`` is deliberately
+    not carried: whether it may cross HTTP has not been ruled.
+
+    Tier 1: built from our own session DB, so a wrong scalar type is
+    corruption and crashes rather than coercing.
+    """
+
+    id: str
+    session_id: str
+    tool_call_id: str
+    tool_name: str
+    error_code: str | None
+    message: str
+    composition_state_id: str | None
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.id) is not str
+            or type(self.session_id) is not str
+            or type(self.tool_call_id) is not str
+            or type(self.tool_name) is not str
+            or type(self.message) is not str
+            or (self.error_code is not None and type(self.error_code) is not str)
+            or (self.composition_state_id is not None and type(self.composition_state_id) is not str)
+        ):
+            raise AuditIntegrityError("Tier 1: composition_rejection_events row has an invalid scalar")
+        if type(self.created_at) is not datetime:
+            raise AuditIntegrityError("Tier 1: composition_rejection_events.created_at is not a datetime")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -4662,6 +4702,18 @@ class SessionServiceProtocol(Protocol):
         resolve state ids to version numbers without hydrating full state
         rows — e.g. the messages route's per-tool-call outcome stamping
         (elspeth-f5e6723133).
+        """
+        ...
+
+    async def list_composition_rejection_events(
+        self,
+        session_id: UUID,
+    ) -> tuple[CompositionRejectionEventRecord, ...]:
+        """Refused composer tool-call reasons for one session (elspeth-3e28029d2f).
+
+        Read side of ``composition_rejection_events`` for the audit-grade
+        messages view (``include_rejection_reasons``). Ordered by
+        ``created_at`` then ``id``. Never selects ``planner_payload``.
         """
         ...
 

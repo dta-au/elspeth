@@ -1646,7 +1646,10 @@ def _parse_response_tool_calls(
         # nudge budget is spent; the code never escapes the planner.
         raise PipelinePlannerError("planner response must call a declared tool", code="PROSE_REPLY")
     if len(raw_calls) > max_tool_calls:
-        raise PipelinePlannerError("planner response exceeds the per-turn tool call limit", code="MALFORMED_RESPONSE")
+        # Checked before any argument is parsed, and classified as the
+        # per-turn tool-call cap: over-batching is the model's own budget
+        # overrun, not a malformed provider response.
+        raise PipelinePlannerError("planner response exceeds the per-turn tool call limit", code="TOOL_CALLS_EXHAUSTED")
     parsed: list[_ParsedToolCall] = []
     seen_call_ids: set[str] = set()
     for raw_call in raw_calls:
@@ -1662,7 +1665,10 @@ def _parse_response_tool_calls(
         arguments = _parse_json_object(raw_arguments, label=f"{name} arguments")
         parsed.append(_ParsedToolCall(call_id, name, cast(str, raw_arguments), arguments))
     terminal_calls = tuple(call for call in parsed if call.name == _TERMINAL_TOOL_NAME)
-    if terminal_calls and len(parsed) != 1:
+    # One terminal call batched with discovery calls is returned: the loop
+    # rejects that turn repairably before dispatching anything in it. Two
+    # proposals in one turn stay malformed.
+    if len(terminal_calls) > 1:
         raise PipelinePlannerError("terminal proposal call must be the only tool call", code="MALFORMED_RESPONSE")
     return message, tuple(parsed)
 
@@ -1681,6 +1687,19 @@ def _truncated_response_notice() -> str:
         "Respond again more compactly: shorter prompt templates, omit optional fields, and emit "
         "the tool call with no surrounding prose."
     )
+
+
+def _terminal_call_not_alone_feedback() -> dict[str, object]:
+    # Static, value-free protocol rejection returned for every call in a turn
+    # that batched emit_pipeline_proposal with other calls.
+    return {
+        "success": False,
+        "error_code": "TERMINAL_CALL_NOT_ALONE",
+        "message": (
+            "emit_pipeline_proposal must be the only tool call in its turn. No call in that turn was executed. "
+            "Finish discovery in earlier turns, then call emit_pipeline_proposal alone."
+        ),
+    }
 
 
 # Bounded retries for the no-tool-call response class, separate from the
@@ -4048,13 +4067,24 @@ async def _plan_pipeline_inner(
                     text_marker=text_reply_marker,
                 )
             except PipelinePlannerError as exc:
+                if exc.code == "TOOL_CALLS_EXHAUSTED":
+                    # The provider call completed and is audited like the
+                    # other post-call budget refusals above; the semantic
+                    # attempt settles as budget_exhausted when it propagates.
+                    recorder.record_llm_call(call)
+                    begin_response_attempt(call)
+                    raise
                 if exc.code not in ("MALFORMED_RESPONSE", "PROSE_REPLY"):
                     raise
-                # A response that consumed the whole completion budget and
-                # failed to parse was almost certainly cut off mid-write —
-                # that is a capacity event, not malformed output, and the
+                # A response that failed to parse was almost certainly cut
+                # off mid-write when it consumed the whole completion budget,
+                # or when the provider itself reports it stopped at an output
+                # limit (a model or gateway limit can sit below the requested
+                # cap). That is a capacity event, not malformed output, and the
                 # loop can repair it by asking for a more compact reply.
-                truncated = call.completion_tokens is not None and call.completion_tokens >= budget_policy.max_completion_tokens
+                truncated = (
+                    call.completion_tokens is not None and call.completion_tokens >= budget_policy.max_completion_tokens
+                ) or call.finish_reason == "length"
                 recorder.record_llm_call(
                     replace(
                         call,
@@ -4269,6 +4299,36 @@ async def _plan_pipeline_inner(
                 "planner escape-hatch advisor declined the request" if is_hatch_turn else "planner declined the request",
                 decline_text=raw_text if is_hatch_turn else (marker_body if marker_body is not None else ""),
             )
+        if terminal_calls and len(calls) > 1:
+            # emit_pipeline_proposal batched with other calls. Nothing in the
+            # turn is dispatched. On an ordinary turn every call gets a
+            # rejecting tool result, so the protocol stays complete, and the
+            # turn is charged to the repair budget like a rejected candidate,
+            # reaching the escape hatch once that budget is spent.
+            if is_hatch_turn:
+                trail.finish_attempt(
+                    "hatch", "malformed_response", planner_code="MALFORMED_RESPONSE", led_to="terminal", tool_calls=len(calls)
+                )
+                assert hatch_error is not None
+                raise hatch_error from None
+            messages.append(_assistant_tool_calls_message(message, calls))
+            not_alone_feedback = canonical_json(_terminal_call_not_alone_feedback())
+            for rejected_call in calls:
+                messages.append({"role": "tool", "tool_call_id": rejected_call.call_id, "content": not_alone_feedback})
+            repair_count += 1
+            if repair_count > repair_budget:
+                if _hatch_available():
+                    trail.finish_attempt(
+                        attempt_phase, "guard_fired", planner_code="REPAIR_EXHAUSTED", led_to="hatch", tool_calls=len(calls)
+                    )
+                    _engage_escape_hatch(_rejection_exhausted())
+                    continue
+                trail.finish_attempt(
+                    attempt_phase, "guard_fired", planner_code="REPAIR_EXHAUSTED", led_to="terminal", tool_calls=len(calls)
+                )
+                raise _rejection_exhausted() from None
+            trail.finish_attempt(attempt_phase, "guard_fired", led_to="repair", tool_calls=len(calls))
+            continue
         if len(calls) > model_config.max_tool_calls_per_turn:
             trail.finish_attempt(
                 attempt_phase, "budget_exhausted", planner_code="TOOL_CALLS_EXHAUSTED", led_to="terminal", tool_calls=len(calls)

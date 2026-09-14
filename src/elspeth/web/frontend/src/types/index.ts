@@ -1237,6 +1237,12 @@ export interface SystemStatus {
   frontend_build?: string | null;
   composer_available: boolean;
   composer_model: string;
+  /**
+   * The advisor model that gates completion
+   * (ELSPETH_WEB__COMPOSER_ADVISOR_MODEL). Required: the server always
+   * sends a non-empty string (WebSettings has no advisor-disabled state).
+   */
+  composer_advisor_model: string;
   composer_provider: string | null;
   composer_reason: string | null;
   composer_missing_keys: string[];

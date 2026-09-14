@@ -82,6 +82,7 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
       json: {
         composer_available: true,
         composer_model: "deterministic-e2e",
+        composer_advisor_model: "deterministic-e2e-advisor",
         composer_provider: "playwright-route",
         composer_reason: null,
         composer_missing_keys: [],

@@ -47,9 +47,10 @@ export interface PromptDisplaySegment {
 export interface PromptDisplayResult {
   segments: PromptDisplaySegment[];
   /**
-   * True when the structured parts could not be rendered and the result is
-   * a single flat text segment from the fallback chain (node
-   * prompt_template, then event llm_draft).
+   * True when the structured parts could not be rendered: the result is a
+   * single flat text segment from the fallback chain (node prompt_template,
+   * then event llm_draft), or, for a multi-query surface, the node-level
+   * template section shows the stored prompt_template text as-is.
    */
   usedFallback: boolean;
 }
@@ -118,11 +119,179 @@ function segmentsFromParts(
   return segments;
 }
 
+/** A query whose `template` is present but is not text (backend InvalidQueryTemplate). */
+const INVALID_QUERY_TEMPLATE = Symbol("invalid query template");
+
+interface SurfaceQuery {
+  name: string;
+  /** Own template text; null = uses the node-level template; or not text. */
+  override: string | null | typeof INVALID_QUERY_TEMPLATE;
+}
+
+interface MultiQuerySurface {
+  nodePromptTemplate: string;
+  systemPrompt: string | null;
+  queries: SurfaceQuery[];
+}
+
+/** A JSON object value (not an array, not null). */
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The well-formed `(name, entry)` pairs of an untrusted `queries` option,
+ * mirroring state.py `_well_formed_query_entries`: the mapping form keeps
+ * every object-valued entry keyed by name; the list form keeps every object
+ * item, named by its non-empty string `name` or else by its index in the
+ * original list (`#<index>`); anything else yields no entries.
+ */
+function wellFormedQueryEntries(
+  queries: unknown,
+): [string, Record<string, unknown>][] {
+  if (Array.isArray(queries)) {
+    const entries: [string, Record<string, unknown>][] = [];
+    queries.forEach((item, index) => {
+      if (!isJsonObject(item)) return;
+      const name = item.name;
+      entries.push([
+        typeof name === "string" && name !== "" ? name : `#${index}`,
+        item,
+      ]);
+    });
+    return entries;
+  }
+  if (isJsonObject(queries)) {
+    const entries: [string, Record<string, unknown>][] = [];
+    for (const [name, entry] of Object.entries(queries)) {
+      if (isJsonObject(entry)) entries.push([name, entry]);
+    }
+    return entries;
+  }
+  return [];
+}
+
+/**
+ * The multi-query prompt surface, mirroring interpretation_state.py
+ * `multi_query_prompt_surface_from_options`: null unless a string
+ * `prompt_template` sits beside a `queries` value with at least one
+ * well-formed entry (every other shape is a single-prompt node there too).
+ */
+function multiQuerySurfaceFromOptions(
+  options: Record<string, unknown>,
+): MultiQuerySurface | null {
+  const rawQueries = options.queries;
+  const promptTemplate = options.prompt_template;
+  if (
+    rawQueries === undefined ||
+    rawQueries === null ||
+    typeof promptTemplate !== "string"
+  ) {
+    return null;
+  }
+  const entries = wellFormedQueryEntries(rawQueries);
+  if (entries.length === 0) return null;
+  const queries = entries.map(([name, entry]): SurfaceQuery => {
+    const override = entry.template;
+    if (override === undefined || override === null) {
+      return { name, override: null };
+    }
+    return {
+      name,
+      override: typeof override === "string" ? override : INVALID_QUERY_TEMPLATE,
+    };
+  });
+  const systemPrompt = options.system_prompt;
+  return {
+    nodePromptTemplate: promptTemplate,
+    systemPrompt: typeof systemPrompt === "string" ? systemPrompt : null,
+    queries,
+  };
+}
+
+/**
+ * Render the COMPLETE multi-query surface from live node options.
+ *
+ * Covers exactly what the review anchor covers
+ * (`MultiQueryPromptSurface.anchor_hash`): the system prompt, every query's
+ * name and template override in order, and the node-level template. Labels
+ * are the backend `render_for_review` wording, so an unbounded surface with
+ * no resolved slot renders byte-identical to that draft, with two deliberate
+ * differences: nothing is shortened or omitted (the draft is bounded to 8000
+ * chars while the anchor covers every query), and the node-level template's
+ * text is shown even when no query uses it (the anchor covers it either
+ * way). The node-level template goes through the structured-parts
+ * substitution so resolved slots show their accepted values and pending
+ * slots stay marked; when its parts cannot be broken out it shows the stored
+ * `prompt_template` text and `usedFallback` is true.
+ */
+function segmentsFromSurface(
+  surface: MultiQuerySurface,
+  options: Record<string, unknown>,
+): PromptDisplayResult {
+  const lines: string[] = [
+    "Multi-query LLM node: for every row the model receives one call per query below.",
+    "",
+    "System prompt (sent with every query):",
+    surface.systemPrompt !== null ? surface.systemPrompt : "(none)",
+  ];
+  for (const { name, override } of surface.queries) {
+    lines.push("");
+    if (override === null) {
+      lines.push(`Query '${name}': uses the node-level prompt_template (below).`);
+    } else if (override === INVALID_QUERY_TEMPLATE) {
+      lines.push(
+        `Query '${name}': (template value is not text; plugin validation rejects this node)`,
+      );
+    } else {
+      lines.push(`Query '${name}':`, override);
+    }
+  }
+  lines.push("");
+  const users = surface.queries
+    .filter((query) => query.override === null)
+    .map((query) => query.name);
+  if (users.length > 0) {
+    lines.push(
+      `Node-level prompt_template, used by queries without their own template: ${users.join(", ")}`,
+    );
+  } else if (
+    surface.queries.some((query) => query.override === INVALID_QUERY_TEMPLATE)
+  ) {
+    lines.push("Node-level prompt_template: not used (no query falls back to it).");
+  } else {
+    lines.push(
+      "Node-level prompt_template: not used (every query supplies its own template).",
+    );
+  }
+
+  const requirements = parseRequirements(options.interpretation_requirements);
+  const templateSegments =
+    requirements !== null
+      ? segmentsFromParts(options.prompt_template_parts, requirements)
+      : null;
+  const segments: PromptDisplaySegment[] = [
+    { kind: "text", text: `${lines.join("\n")}\n` },
+    ...(templateSegments ?? [
+      { kind: "text" as const, text: surface.nodePromptTemplate },
+    ]),
+  ];
+  return { segments, usedFallback: templateSegments === null };
+}
+
 /**
  * Resolve the display segments for a prompt-template review card.
  *
- * Fallback chain: structured parts → node's current `prompt_template`
- * string → the event's frozen `llm_draft` ("" when null).
+ * Multi-query nodes (see `multiQuerySurfaceFromOptions`) render the complete
+ * prompt surface from live node options (`segmentsFromSurface`): the review
+ * attests that whole surface, not the node-level `prompt_template` alone,
+ * which every query may override (session 94f6f00c), and the event's bounded
+ * `llm_draft` may omit query text the anchor covers.
+ *
+ * Single-prompt fallback chain: structured parts → node's current
+ * `prompt_template` string → the event's frozen `llm_draft` ("" when null).
+ * The `llm_draft` is also the last resort for multi-query options that do
+ * not describe a surface.
  */
 export function resolvePromptDisplaySegments(
   state: CompositionState | null,
@@ -133,6 +302,10 @@ export function resolvePromptDisplaySegments(
       ? (state?.nodes.find((n) => n.id === event.affected_node_id) ?? null)
       : null;
   const options = node?.options ?? null;
+  if (options !== null) {
+    const surface = multiQuerySurfaceFromOptions(options);
+    if (surface !== null) return segmentsFromSurface(surface, options);
+  }
   if (options !== null) {
     const requirements = parseRequirements(options.interpretation_requirements);
     if (requirements !== null) {

@@ -141,7 +141,12 @@ def test_set_pipeline_projections_reject_invalid_complete_input(invalid: str, fr
             build_tool_proposal_summary(tool_name="set_pipeline", arguments=owned, redacted_arguments={})
     assert caught.value.argument == "set_pipeline arguments"
     assert "PRIVATE_MALFORMED_SOURCE" not in str(caught.value)
-    assert "actual JSON objects and arrays" in caught.value.expected
+    # JSON-type repair guidance only for a type fault. The missing, both and
+    # null cases fail the source/sources model validator (value_error), whose
+    # single fixed message does not say which of the three it was.
+    type_shape_guidance = ". Match the tool's declared JSON types. Supply object and array fields as actual JSON objects and arrays, not strings containing JSON."
+    expected_guidance = type_shape_guidance if invalid in {"source_type", "sources_type", "nodes_type"} else ""
+    assert caught.value.expected == "object conforming to SetPipelineArgumentsModel" + expected_guidance
 
 
 @pytest.mark.parametrize("validate_arguments", [False, True])

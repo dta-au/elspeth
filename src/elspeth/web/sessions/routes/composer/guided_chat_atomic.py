@@ -115,6 +115,8 @@ from .._helpers import (
     CompositionStateRecord,
     UserIdentity,
     _cancel_on_client_disconnect,
+    _composer_heartbeat_cancel_of,
+    _composer_heartbeat_failed_progress_event,
     _composer_progress_sink,
     _failure_log_request_id,
     _get_composer_progress_registry,
@@ -168,6 +170,52 @@ type GuidedChatProviderOutcome = (
 
 
 ProviderRunner = Callable[..., Awaitable[GuidedChatProviderOutcome]]
+
+
+# ``chat_result.error_class`` values whose own copy already directs the real
+# next step (inv-f1 D4, GuidedChatHistory.tsx:196-204) — a refusal whose turn
+# text names the wizard, the exact stable-identity command, or the corrected
+# resend, so the SPA must NOT offer Retry for it. Hoisted to a module
+# constant (F1 finding #36) so a new producer of this shape cannot silently
+# fall through to the "unavailable" default just by being added to the wrong
+# list, or forgotten from this one, the way ``UploadedSourceReselectionNotApplied``
+# was: 2164e58b3 added its producer without adding it here, so the refusal it
+# builds — which already tells the user to pick the source type in the wizard —
+# persisted as ``synthetic_failure_reason="unavailable"`` and the SPA offered a
+# Retry that would just spend another provider call on the same refusal.
+_NOT_APPLIED_ERROR_CLASSES = frozenset(
+    {
+        "SinkAdmissionRejected",
+        "StepTransitionRejected",
+        "GuidedUploadedSourceConfigError",
+        "ComponentRevisionNotApplied",
+        "InlineSourceNotApplied",
+        "UploadedSourceReselectionNotApplied",
+        "DeferredIntentActionShapeError",
+        "DeferredIntentManagementActionShapeError",
+        "DeferredIntentUnknown",
+        "DeferredIntentBindingMismatch",
+        "DeferredIntentAmbiguous",
+        "DeferredIntentClarification",
+        "DeferredIntentUnsupported",
+        "DeferredIntentRejected",
+        # ADR-033: a contradiction rejection is a deliberate not-applied
+        # verdict (the instruction is retained as clarification debt), never
+        # provider weather.
+        "DeferredIntentContradiction",
+        "DeferredIntentModelCatalogIdentity",
+        # The model's sink config failed plugin validation and was
+        # deliberately not staged — a rejected application, not provider
+        # weather (inv-f1 incidental 2).
+        "SinkPrefillConfigRejected",
+        # Retain-alone: the pair's resolution half was withheld while the
+        # retain applied — the not-applied signal is scoped to that half
+        # (round-2 review finding).
+        "PairedResolutionShapeRejected",
+        "PairedResolutionConfigRejected",
+        "PairedResolutionNotResent",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2079,41 +2127,7 @@ async def post_guided_chat_schema8(
                             None
                             if assistant_kind == "assistant"
                             else "not_applied"
-                            if chat_result.error_class
-                            in {
-                                "SinkAdmissionRejected",
-                                "StepTransitionRejected",
-                                "GuidedUploadedSourceConfigError",
-                                "ComponentRevisionNotApplied",
-                                "InlineSourceNotApplied",
-                                "UploadedSourceTypeMismatch",
-                                "DeferredIntentActionShapeError",
-                                "DeferredIntentManagementActionShapeError",
-                                "DeferredIntentUnknown",
-                                "DeferredIntentBindingMismatch",
-                                "DeferredIntentAmbiguous",
-                                "DeferredIntentClarification",
-                                "DeferredIntentUnsupported",
-                                "DeferredIntentRejected",
-                                # ADR-033: a contradiction rejection is a
-                                # deliberate not-applied verdict (the
-                                # instruction is retained as clarification
-                                # debt), never provider weather.
-                                "DeferredIntentContradiction",
-                                "DeferredIntentModelCatalogIdentity",
-                                # The model's sink config failed plugin
-                                # validation and was deliberately not staged —
-                                # a rejected application, not provider weather
-                                # (inv-f1 incidental 2).
-                                "SinkPrefillConfigRejected",
-                                # Retain-alone: the pair's resolution half was
-                                # withheld while the retain applied — the
-                                # not-applied signal is scoped to that half
-                                # (round-2 review finding).
-                                "PairedResolutionShapeRejected",
-                                "PairedResolutionConfigRejected",
-                                "PairedResolutionNotResent",
-                            }
+                            if chat_result.error_class in _NOT_APPLIED_ERROR_CLASSES
                             else "quality_guard"
                             if chat_result.error_class == "AssistantScaffoldLeakError"
                             # The provider ANSWERED; the reply violated the
@@ -2367,12 +2381,33 @@ async def post_guided_chat_schema8(
             except GuidedOperationFenceLostError:
                 rejoin_after_lock = True
             except asyncio.CancelledError as exc:
+                # A user Stop or client disconnect is not a server failure
+                # (F1 finding #24): mirror guided_plan.py's cancel arm so the
+                # durable audit row and the terminal envelope both record
+                # request_cancelled (499), never operation_failed (500), for
+                # a disconnect or an outer cancellation of this task.
+                cancel_caller_task = asyncio.current_task()
+                cancel_disconnected = _is_client_disconnect_cancel(exc)
+                # A cancel delivered by the compose heartbeat after it lost the
+                # request's lease also leaves ``cancelling() > 0``, but it is a
+                # server fault, not a user Stop (finding #28): settle
+                # ``operation_failed`` and publish the failed event. The bare
+                # ``raise`` below hands it to ``_track_compose_inflight``,
+                # which answers with the structured 503.
+                cancel_heartbeat = _composer_heartbeat_cancel_of(exc)
+                cancel_failure_code: GuidedOperationFailureCode = (
+                    "operation_failed"
+                    if cancel_heartbeat is not None
+                    else "request_cancelled"
+                    if cancel_disconnected or (cancel_caller_task is not None and cancel_caller_task.cancelling() > 0)
+                    else "operation_failed"
+                )
                 try:
                     await asyncio.shield(
                         service.fail_guided_operation_with_audit(
                             GuidedOperationFailureCommand(
                                 fence=reserved.fence,
-                                failure_code="operation_failed",
+                                failure_code=cancel_failure_code,
                                 actor="composer_route",
                                 audit_evidence=GuidedAuditEvidence(
                                     invocations=recorder.invocations,
@@ -2405,7 +2440,11 @@ async def post_guided_chat_schema8(
                         await asyncio.shield(
                             _publish_progress(
                                 progress_sink,
-                                event=client_cancelled_progress_event(),
+                                event=(
+                                    client_cancelled_progress_event()
+                                    if cancel_heartbeat is None
+                                    else _composer_heartbeat_failed_progress_event()
+                                ),
                             )
                         )
                     except Exception as progress_exc:
@@ -2429,7 +2468,7 @@ async def post_guided_chat_schema8(
                             frames=_safe_frame_strings(progress_exc),
                         )
                         raise
-                if _is_client_disconnect_cancel(exc):
+                if cancel_disconnected:
                     raise HTTPException(status_code=499, detail="Client disconnected while the guided chat turn was running.") from exc
                 raise
             except Exception as exc:

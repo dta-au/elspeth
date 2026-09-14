@@ -48,6 +48,8 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT,
     SOURCE_AUTHORING_KEY,
+    prompt_review_anchor_hash_from_options,
+    prompt_review_draft_from_options,
 )
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
@@ -1816,7 +1818,12 @@ _EXPECTED_STATE_HASHES = {
     "fork_coalesce": "21fef020c5ef5d8c9d9b5319446795a57c257ef366d6ddb1c63cfee24d5a4315",
     "gate": "c0380bca12a88112057ce36547ab39547eb691c03a8751e27f2371593b5abb9e",
     "aggregation": "427cde0492596be8a65cf854e3183de0c868f31fb7a24884d4bd86963fbb22cd",
-    "structured_llm": "c324e56c54db6abba0c1eac06fd720ef3cbbd84502b389c0285b32371ecbf31f",
+    # Re-pinned 2026-09-14: the multi-query llm node's staged prompt review now
+    # drafts the rendered prompt SURFACE (per-query templates, system prompt,
+    # node-level in-use status) instead of the node-level prompt_template alone
+    # (session 94f6f00c). Control: swapping that one draft back to the
+    # prompt_template text reproduces the previous pin exactly.
+    "structured_llm": "55dd9ee642bcc414e77a6801e83be943f92cfbf1913eff06ba102a6ce9a13143",
     "multi_output": "a8e0698429a06efa22423ebc37033b585f1b6cdc225eb2501b4d69ee6b67ad8a",
 }
 
@@ -2151,14 +2158,18 @@ def test_current_executor_reopens_stale_authoritative_review(tmp_path: Path) -> 
     original_options = deep_thaw(original_node.options)
     requirements = original_options[INTERPRETATION_REQUIREMENTS_KEY]
     prompt_requirement = next(item for item in requirements if item["kind"] == "llm_prompt_template")
-    prompt = original_options["prompt_template"]
+    # The node is multi-query, so the operator approved the rendered prompt
+    # surface and the review is anchored to that surface's hash.
+    accepted_surface = prompt_review_draft_from_options(original_options)
+    surface_anchor = prompt_review_anchor_hash_from_options(original_options)
+    assert accepted_surface is not None and surface_anchor is not None
     resolved = {
         **prompt_requirement,
         "status": "resolved",
         "event_id": "authoritative-prompt-review",
-        "accepted_value": prompt,
+        "accepted_value": accepted_surface,
         "accepted_artifact_hash": None,
-        "resolved_prompt_template_hash": stable_hash(prompt),
+        "resolved_prompt_template_hash": surface_anchor,
     }
     previous = replace(
         first.updated_state,
@@ -2172,7 +2183,13 @@ def test_current_executor_reopens_stale_authoritative_review(tmp_path: Path) -> 
     assert result.success and result.validation.is_valid
     reconciled = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
     current = next(item for item in reconciled if item["kind"] == "llm_prompt_template")
-    assert current["draft"] == "Reclassify {{ row.text }}"
+    # This node is multi-query (its one query carries its own template), so the
+    # review drafts the rendered prompt SURFACE, not the node-level text. The
+    # approval above carried the surface anchor, and the changed prompt moves
+    # that anchor, so the review is reopened rather than inherited.
+    assert current["draft"] == prompt_review_draft_from_options(result.updated_state.nodes[0].options)
+    assert "Query 'colour':" in current["draft"]
+    assert "Node-level prompt_template: not used" in current["draft"]
     assert current["status"] == "pending"
     assert current["event_id"] is None
     assert current["accepted_value"] is None

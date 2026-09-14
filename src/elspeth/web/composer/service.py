@@ -51,7 +51,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
 from elspeth.contracts.chargeable_admission import ChargeableOperation
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource
 from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
@@ -215,7 +215,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._registry import resolve_tool_effects
 from elspeth.web.composer.tools.declarations import EffectDomain
-from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, interpretation_rate_cap_hit
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
@@ -250,6 +250,7 @@ from elspeth.web.interpretation_state import (
     current_source_data_contract_demand,
     interpretation_sites,
     pending_execution_interpretation_sites,
+    prompt_review_draft_from_options,
     source_name_from_component_id,
     vague_term_wiring_count,
     validate_pipeline_decision_node_semantics,
@@ -397,6 +398,8 @@ async def _await_pipeline_staging_write_with_deferred_cancellation[T](
 _blocking_result_from_tool_invocations = _no_tool_policy.blocking_result_from_tool_invocations
 _compose_advisor_signoff_pending_message = _no_tool_policy.compose_advisor_signoff_pending_message
 _compose_advisor_signoff_unverified_message = _no_tool_policy.compose_advisor_signoff_unverified_message
+_compose_advisor_signoff_unrendered_pending_message = _no_tool_policy.compose_advisor_signoff_unrendered_pending_message
+_compose_advisor_signoff_unrendered_unverified_message = _no_tool_policy.compose_advisor_signoff_unrendered_unverified_message
 _compose_advisor_signoff_unrepairable_message = _no_tool_policy.compose_advisor_signoff_unrepairable_message
 _compose_advisor_signoff_unrepairable_unverified_message = _no_tool_policy.compose_advisor_signoff_unrepairable_unverified_message
 _compose_advisor_signoff_unrepairable_handoff_message = _no_tool_policy.compose_advisor_signoff_unrepairable_handoff_message
@@ -888,6 +891,29 @@ def _pending_interpretation_review_repair_message(
         "with an interpretation_requirements entry whose kind is 'pipeline_decision', "
         f"user_term is {PROMPT_SHIELD_USER_TERM!r}, and draft is {PROMPT_SHIELD_WARNING_DRAFT!r}; if the "
         "workflow cannot add the shield, keep going with the warning instead of blocking. "
+        f"This is forced repair turn {next_turn} of {_MAX_REPAIR_TURNS}."
+    )
+
+
+def _rate_capped_vague_term_fallback_message(
+    capped_sites: tuple[tuple[str, str, InterpretationKind], ...],
+    *,
+    next_turn: int,
+) -> str:
+    """Repair instruction for vague_term sites whose review request a rate cap refuses.
+
+    Asking for ``request_interpretation_review`` again would be refused by the
+    same cap, so these sites get the documented fallback (ADR-037) instead.
+    """
+    sites = ", ".join(f"{kind.value}:{component_id}:{term}" for component_id, term, kind in capped_sites)
+    return (
+        "[composer-system] The interpretation request limit refuses a review for these "
+        f"vague-term handoff(s): {sites}. Do not reply to the user yet, and do not call "
+        "request_interpretation_review for them again. Use a direct interpretation in the "
+        "prompt template instead: for each listed handoff, write the interpretation into "
+        "options.prompt_template and remove the pending vague_term interpretation_requirements "
+        "entry and its prompt wiring (its interpretation_ref prompt_template_parts entry or "
+        "its {{interpretation:<term>}} token) from the target LLM node. "
         f"This is forced repair turn {next_turn} of {_MAX_REPAIR_TURNS}."
     )
 
@@ -1821,7 +1847,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
         surfaced = _backend_surface_args_for_site(state, site)
         if surfaced is None:
             continue
-        affected_node_id, user_term, prompt_template = surfaced
+        affected_node_id, user_term, review_draft = surfaced
         if (affected_node_id, user_term, InterpretationKind.LLM_PROMPT_TEMPLATE) in already_surfaced:
             continue
         # The transactional writer owns kind-specific reviewed-content
@@ -1836,7 +1862,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
                 tool_call_id=f"{BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}{uuid4()}",  # (D1)
                 user_term=user_term,
                 kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-                llm_draft=prompt_template,
+                llm_draft=review_draft,
                 session_operation_context=session_operation_context,
                 model_identifier=model_identifier,  # (D2)
                 model_version=model_version,  # (D2)
@@ -1928,7 +1954,17 @@ def _backend_surface_args_for_site(
         # requirement-free legacy site cannot become a resolvable card.
         if not ComposerServiceImpl._has_pending_prompt_template_requirement(options, user_term=site.user_term):
             return None
-        return (node.id, site.user_term, prompt_template)
+        # The card shows what the review attests: a multi-query node's whole
+        # prompt surface, any other node's prompt_template. One derivation,
+        # shared with the auto-stager that drafted the requirement — returning
+        # prompt_template here put the dead node-level template on every
+        # multi-query card.
+        review_draft = prompt_review_draft_from_options(options)
+        if review_draft is None:
+            raise InvariantError(
+                "_auto_surface_prompt_template_reviews: prompt-template review draft vanished for a string prompt_template"
+            )
+        return (node.id, site.user_term, review_draft)
     if site.kind is InterpretationKind.LLM_MODEL_CHOICE:
         if not is_llm_transform:
             return None
@@ -2686,6 +2722,55 @@ class ComposerServiceImpl:
             profile_registry=self._operator_profile_registry,
             catalog=self._catalog,
         )
+
+    async def _rate_capped_vague_term_sites(
+        self,
+        sites: tuple[tuple[str, str, InterpretationKind], ...],
+        *,
+        session_id: str | None,
+        current_state_id: str | None,
+    ) -> frozenset[tuple[str, str, InterpretationKind]]:
+        """Return the vague_term sites whose review request a rate cap refuses now.
+
+        Answers in the handler's order for a request on the current persisted
+        state: a site with a user-approved event for its exact
+        ``(kind, user_term, affected_node_id)`` on this branch is answered by
+        the dedup gate (idempotent or duplicate), never by a cap; every other
+        site is checked with :func:`interpretation_rate_cap_hit`, the counting
+        rule the handler refuses with. The ``AUTO_INTERPRETED_NO_SURFACES`` row
+        a refusal writes carries no node or term, so the refusal itself cannot
+        be matched to a site; recomputing the cap can.
+        """
+        candidates = tuple(site for site in sites if site[2] is InterpretationKind.VAGUE_TERM)
+        if session_id is None or current_state_id is None or not candidates:
+            return frozenset()
+        sessions_service = self._require_sessions_service()
+        events = await sessions_service.list_interpretation_events(UUID(session_id), status="all")
+        composition_state_id = UUID(current_state_id)
+        now = datetime.now(UTC)
+        capped: set[tuple[str, str, InterpretationKind]] = set()
+        for site in candidates:
+            component_id, user_term, kind = site
+            if any(
+                event.interpretation_source is InterpretationSource.USER_APPROVED
+                and event.composition_state_id == composition_state_id
+                and event.kind is kind
+                and event.user_term == user_term
+                and event.affected_node_id == component_id
+                for event in events
+            ):
+                continue
+            cap_hit = interpretation_rate_cap_hit(
+                events,
+                user_term=user_term,
+                composition_state_id=composition_state_id,
+                per_term_cap=self._settings.composer_interpretation_rate_limit_per_term,
+                per_session_day_cap=self._settings.composer_interpretation_rate_limit_per_session_day,
+                now=now,
+            )
+            if cap_hit is not None:
+                capped.add(site)
+        return frozenset(capped)
 
     async def _missing_pending_interpretation_review_sites(
         self,
@@ -5179,6 +5264,9 @@ class ComposerServiceImpl:
         cancellation_requested: asyncio.Event,
         plugin_snapshot: PluginAvailabilitySnapshot,
         policy_catalog: PolicyCatalogView,
+        composition_turns_used: int,
+        discovery_turns_used: int,
+        failed_turn: FailedTurnMetadata | None,
     ) -> tuple[_DispatchOutcome, int]:
         """Phase P3 of the compose loop — delegates to :func:`tool_batch.run_tool_batch`."""
         from elspeth.web.composer.tool_batch import (
@@ -5218,6 +5306,9 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
             session_operation_authority=(turn_sessions_service.session_operation_authority if turn_sessions_service is not None else None),
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            failed_turn=failed_turn,
         )
         acc = BatchAccumulator(
             state=state,
@@ -5733,13 +5824,26 @@ class ComposerServiceImpl:
                     site for site in missing_interpretation_sites if site[2] not in _FINALIZATION_AUTO_SURFACEABLE_KINDS
                 )
                 if model_repairable:
+                    # A vague_term site whose review request a rate cap refuses
+                    # would be refused again, so it gets the documented
+                    # fallback instead of the ask; the orphan gate below still
+                    # fails closed if the planner leaves it unresolved.
+                    rate_capped = await self._rate_capped_vague_term_sites(
+                        model_repairable,
+                        session_id=session_id,
+                        current_state_id=current_state_id,
+                    )
+                    askable = tuple(site for site in model_repairable if site not in rate_capped)
+                    capped = tuple(site for site in model_repairable if site in rate_capped)
+                    repair_parts: list[str] = []
+                    if askable:
+                        repair_parts.append(_pending_interpretation_review_repair_message(askable, next_turn=repair_turns_used + 1))
+                    if capped:
+                        repair_parts.append(_rate_capped_vague_term_fallback_message(capped, next_turn=repair_turns_used + 1))
                     llm_messages.append(
                         {
                             "role": "user",
-                            "content": _pending_interpretation_review_repair_message(
-                                model_repairable,
-                                next_turn=repair_turns_used + 1,
-                            ),
+                            "content": "\n\n".join(repair_parts),
                         }
                     )
                     return _TerminateOutcome(action="continue", repair_turns_delta=1)
@@ -6772,6 +6876,9 @@ class ComposerServiceImpl:
                 _persisted_assistant_message_id: str | None = persisted_assistant_message_id,
                 _persisted_assistant_content: str | None = persisted_assistant_content,
                 _advisor_repair_context_introduced: bool = advisor_repair_context_introduced,
+                _composition_turns_used: int = composition_turns_used,
+                _discovery_turns_used: int = discovery_turns_used,
+                _failed_turn: FailedTurnMetadata | None = failed_turn,
             ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool, bool]:
                 dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
                     call_model=_call_model,
@@ -6798,6 +6905,9 @@ class ComposerServiceImpl:
                     cancellation_requested=_cancellation_requested,
                     plugin_snapshot=plugin_snapshot,
                     policy_catalog=policy_catalog,
+                    composition_turns_used=_composition_turns_used,
+                    discovery_turns_used=_discovery_turns_used,
+                    failed_turn=_failed_turn,
                 )
                 # Preserve the existing test/debug seam before P4: callers
                 # inspecting an audit-persist failure must still see the P3
@@ -7296,7 +7406,7 @@ class ComposerServiceImpl:
         # load_deployment_skill's byte cap; this setting bounds the
         # LLM-controlled variable part.
         total_chars = len(_build_advisor_user_message(validated.to_internal_request()))
-        char_cap = self._settings.composer_advisor_max_prompt_tokens * 4
+        char_cap = self._settings.composer_advisor_max_prompt_tokens * _ADVISOR_CHARS_PER_TOKEN
         if total_chars > char_cap:
             return {
                 "status": "ARG_ERROR",
@@ -7861,6 +7971,18 @@ class ComposerServiceImpl:
         topology/field-contract coherence because it receives no user intent.
         """
         pipeline_summary = _summarize_pipeline_for_advisor(state)
+        # The checkpoint path bypasses ``_validate_advisor_arguments`` (Tier-1
+        # backend-produced arguments), so the per-value budgets inside the
+        # summary were previously its ONLY size control and nothing bounded
+        # their sum across a whole pipeline. Bound the published excerpt to the
+        # same figure the tool path caps its whole message at; the evidence
+        # IDENTITY hashes (here and the loop-invariant one in the gate) stay
+        # over the complete summary so a repair to a withheld line still moves
+        # the identity.
+        schema_excerpt = _bound_advisor_pipeline_summary(
+            pipeline_summary,
+            self._settings.composer_advisor_max_prompt_tokens * _ADVISOR_CHARS_PER_TOKEN,
+        )
         if phase == "early":
             return {
                 "trigger": ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
@@ -7872,7 +7994,7 @@ class ComposerServiceImpl:
                 ),
                 "recent_errors": [],
                 "attempted_actions": [],
-                "schema_excerpt": pipeline_summary,
+                "schema_excerpt": schema_excerpt,
             }
         review_state = advisor_review_state or _AdvisorReviewState()
         current_evidence_hash = stable_hash({"advisor_evidence": pipeline_summary})
@@ -7938,7 +8060,7 @@ class ComposerServiceImpl:
             ),
             "recent_errors": recent_errors,
             "attempted_actions": attempted_actions,
-            "schema_excerpt": pipeline_summary,
+            "schema_excerpt": schema_excerpt,
         }
         if user_message is not None and user_message.strip():
             end_arguments["user_message"] = _truncate_for_advisor(user_message, _ADVISOR_USER_MESSAGE_MAX_CHARS)
@@ -8030,7 +8152,16 @@ class ComposerServiceImpl:
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
             )
-            augmented = _compose_advisor_signoff_pending_message("")
+            # Same verdict-class split as the red arm below: did-not-clear is
+            # true only for a rendered FLAG; an unrendered verdict names its
+            # class and remedy instead of telling the user to review a
+            # pipeline that validated.
+            if verdict.ok:
+                augmented = _compose_advisor_signoff_pending_message("")
+            else:
+                augmented = _compose_advisor_signoff_unrendered_pending_message(
+                    "", failure_class="unavailable" if reason == "unavailable" else "malformed"
+                )
         elif runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
             # Matches the discriminator EXACTLY, not merely ``not is_valid``:
             # preservation is owed to the resolvable review card, not to every
@@ -8051,7 +8182,12 @@ class ComposerServiceImpl:
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
             )
-            augmented = _compose_advisor_signoff_unverified_message("")
+            if verdict.ok:
+                augmented = _compose_advisor_signoff_unverified_message("")
+            else:
+                augmented = _compose_advisor_signoff_unrendered_unverified_message(
+                    "", failure_class="unavailable" if reason == "unavailable" else "malformed"
+                )
         else:
             runtime_result = _advisor_signoff_blocked_validation(
                 reason=reason,
@@ -8863,11 +8999,28 @@ _ADVISOR_VERDICT_LINE_RE: Final[re.Pattern[str]] = re.compile(
     r"^(CLEAN|FLAGGED)\s*(?:[:.\-\u2013\u2014]|$)",
     re.IGNORECASE,
 )
+# CLEAN acceptance uses its own anchored arm. An ASCII hyphen JOINS compound
+# words ("Clean-up needed: ...", "Clean-room rewrite ...") and a full stop
+# joins a file name ("clean.csv is the input"): each is a reply describing
+# something, and each used to mint a sign-off through the unconditional
+# ``-`` / ``.`` terminators this arm copied from the shared set above. So a
+# run of hyphens or full stops terminates the token only when whitespace or
+# end-of-line follows the run. That still accepts ``CLEAN.``,
+# ``CLEAN...``, ``CLEAN - ok`` and the ASCII double-hyphen dash models type
+# (``CLEAN -- no issues found.``). The en/em dash and ``:`` close the token
+# unconditionally. FLAGGED keeps the shared pattern: a false FLAGGED is the
+# fail-closed direction, and its matching is not changed by this tightening.
+# Both CLEAN arms read this one terminator so they cannot drift apart.
+_ADVISOR_CLEAN_VERDICT_TERMINATOR: Final[str] = r"(?:[:\u2013\u2014]|\.+(?=\s|$)|-+(?=\s|$)|$)"
+_ADVISOR_CLEAN_VERDICT_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^CLEAN\s*" + _ADVISOR_CLEAN_VERDICT_TERMINATOR,
+    re.IGNORECASE,
+)
 # The labeled tolerance arm preserves the observed ``Verdict: CLEAN`` model
 # formatting without treating an arbitrary uppercase CLEAN mention as a sign-
 # off. The label is case-insensitive, but CLEAN deliberately is not: the bare
 # lowercase form is accepted only by the stricter line-start arm above.
-_ADVISOR_CLEAN_VERDICT_LABEL_RE: Final[re.Pattern[str]] = re.compile(r"^(?i:verdict):\s*CLEAN\s*(?:[:.\-\u2013\u2014]|$)")
+_ADVISOR_CLEAN_VERDICT_LABEL_RE: Final[re.Pattern[str]] = re.compile(r"^(?i:verdict):\s*CLEAN\s*" + _ADVISOR_CLEAN_VERDICT_TERMINATOR)
 # Each family below trips the scan ALONE (elspeth-4f7377f99d/C2): a template
 # author does not need both an "ignore/override" verb-phrase AND a
 # CLEAN-imperative in the same string to be flagged. IGNORE_RE requires the
@@ -9173,10 +9326,13 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
             # blocking is the safe direction. The second arm is the widened
             # any-register FLAGGED (terminator-guarded; see its definition).
             return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=text)
-        explicit_marker = _ADVISOR_VERDICT_LINE_RE.match(line)
+        # CLEAN acceptance reads its own scanned copy, in which a code span
+        # holding lowercase text keeps its backticks (quoted data, e.g. a field
+        # named ``clean``); FLAGGED dominance above keeps the full strip.
+        clean_line = _advisor_clean_acceptance_scan_line(raw_line)
         explicit_clean = (
-            explicit_marker is not None and explicit_marker.group(1).upper() == "CLEAN"
-        ) or _ADVISOR_CLEAN_VERDICT_LABEL_RE.match(line) is not None
+            _ADVISOR_CLEAN_VERDICT_LINE_RE.match(clean_line) is not None or _ADVISOR_CLEAN_VERDICT_LABEL_RE.match(clean_line) is not None
+        )
         if scanned <= _ADVISOR_VERDICT_SCAN_MAX_LINES:
             saw_clean = saw_clean or explicit_clean
 
@@ -9507,6 +9663,53 @@ _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS: Final[frozenset[str]] = frozenset({"prompt_t
 _ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES: Final[int] = 8
 _ADVISOR_SUMMARY_INVALID_QUERIES_MARKER: Final[str] = "<invalid queries>"
 _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER: Final[str] = "(node-level prompt_template)"
+_ADVISOR_SUMMARY_QUERY_INVALID_TEMPLATE_MARKER: Final[str] = "(template value is not text; plugin validation rejects this node)"
+# Rough provider cost approximation shared by the tool-path argument cap and
+# the checkpoint-path summary bound: ``composer_advisor_max_prompt_tokens``
+# tokens ≈ this many characters.
+_ADVISOR_CHARS_PER_TOKEN: Final[int] = 4
+# Rubric-legible omission marker for a pipeline summary that exceeds the
+# checkpoint budget: the END rubric reads every ``additional_*_withheld``
+# count as "that many further entries exist but are not shown" and forbids a
+# FLAG on them, so the truncation cannot itself manufacture a finding.
+_ADVISOR_SUMMARY_LINES_WITHHELD_MARKER: Final[str] = (
+    "additional_evidence_lines_withheld={count} (pipeline evidence exceeds the advisor budget of {limit} chars)"
+)
+
+
+def _bound_advisor_pipeline_summary(summary: str, char_cap: int) -> str:
+    """Bound the checkpoint's published pipeline summary to ``char_cap`` chars.
+
+    The EARLY/END checkpoint builds its advisor arguments in
+    ``_build_checkpoint_arguments`` and never passes through
+    ``_validate_advisor_arguments`` (that validator guards the Tier-3
+    ``request_advisor_hint`` tool boundary), so until this bound the summary's
+    total size was controlled only by its per-value budgets multiplied by the
+    node count — a pipeline of several near-cap multi-query LLM nodes had no
+    backstop before the provider call.
+
+    Whole lines only: a node line is one evidence record and a sliced record
+    is misleading evidence (the same rule ``_render_schema_for_advisor``
+    applies to field definitions). Kept lines are an exact prefix of the
+    summary's lines, followed by ONE :data:`_ADVISOR_SUMMARY_LINES_WITHHELD_MARKER`
+    naming the number of lines withheld. A summary already within the cap is
+    returned byte-identical. If not even the first line fits beside the
+    marker, the marker alone is published — fail closed toward "evidence
+    withheld", never toward a partial line. Never raises.
+    """
+    if len(summary) <= char_cap:
+        return summary
+    lines = summary.split("\n")
+    kept: list[str] = []
+    for index, line in enumerate(lines):
+        marker = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=len(lines) - index - 1, limit=char_cap)
+        candidate = "\n".join([*kept, line, marker])
+        if len(candidate) > char_cap:
+            break
+        kept.append(line)
+    withheld = len(lines) - len(kept)
+    marker = _ADVISOR_SUMMARY_LINES_WITHHELD_MARKER.format(count=withheld, limit=char_cap)
+    return "\n".join([*kept, marker])
 
 
 @observation_boundary(
@@ -9517,8 +9720,9 @@ _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER: Final[str] = "(node-level prom
     invariant=(
         "walks only well-formed query entries in authoring order, emits each string template "
         "override as prose-shaped and each input_fields mapping as structural, substitutes fixed "
-        "markers for a fallback-to-node-template query and for a malformed queries value, bounds "
-        "the rendered entries with an explicit withheld count, and never raises"
+        "markers for a fallback-to-node-template query, for a query whose template is present but "
+        "not a string (never counted as a node-template user), and for a malformed queries value, "
+        "bounds the rendered entries with an explicit withheld count, and never raises"
     ),
 )
 def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, str, bool]]:
@@ -9540,7 +9744,15 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
       structural;
     * ``queries.<name>.template`` — the override text, prose-shaped, or the
       fixed :data:`_ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER` when the
-      query falls back to the node-level ``prompt_template``.
+      query falls back to the node-level ``prompt_template``, or the fixed
+      :data:`_ADVISOR_SUMMARY_QUERY_INVALID_TEMPLATE_MARKER` (structural, not
+      prose) when ``template`` is present but not a string. Such a query is
+      neither a template nor a node-level-template user: plugin schema
+      validation rejects the node. The binding guard
+      (``state._validate_multi_query_template_variable_bindings``) skips it
+      the same way, and the review surface
+      (``interpretation_state.multi_query_prompt_surface_from_options``)
+      carries it as ``InvalidQueryTemplate`` and prints the same fact.
 
     Then ``additional_queries_withheld`` when entries were cut, and
     ``prompt_template_in_use`` naming which queries render the node-level
@@ -9572,6 +9784,9 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
         return [("queries", _ADVISOR_SUMMARY_INVALID_QUERIES_MARKER, False)]
     values: list[tuple[str, str, bool]] = []
     node_template_users: list[str] = []
+    any_invalid_template = any(
+        entry.get("template") is not None and not isinstance(entry.get("template"), str) for _label, entry in entries
+    )
     for label, entry in entries[:_ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES]:
         input_fields = entry.get("input_fields")
         if isinstance(input_fields, Mapping):
@@ -9582,9 +9797,11 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
         elif override is None:
             node_template_users.append(label)
             values.append((f"queries.{label}.template", _ADVISOR_SUMMARY_QUERY_USES_NODE_TEMPLATE_MARKER, False))
-        # A present-but-non-string override is unknowable until schema
-        # validation rejects it (state.py's binding guard skips it the same
-        # way); it is neither rendered nor counted as a node-template user.
+        else:
+            # Present but not a string: plugin schema validation rejects the
+            # node, so it is not rendered as prose and not a node-template
+            # user — state the fact instead of skipping silently.
+            values.append((f"queries.{label}.template", _ADVISOR_SUMMARY_QUERY_INVALID_TEMPLATE_MARKER, False))
     withheld = len(entries) - _ADVISOR_SUMMARY_MAX_QUERY_TEMPLATES
     if withheld > 0:
         values.append(("additional_queries_withheld", str(withheld), False))
@@ -9599,6 +9816,8 @@ def _advisor_query_option_values(options: Mapping[str, Any]) -> list[tuple[str, 
     # honestly-present field as a defect in itself.
     if node_template_users:
         values.append(("prompt_template_in_use", "queries without their own template: " + ", ".join(node_template_users), False))
+    elif any_invalid_template:
+        values.append(("prompt_template_in_use", "not used (no query falls back to it)", False))
     else:
         values.append(("prompt_template_in_use", "not used (every query supplies its own template)", False))
     # ``system_prompt`` is rendered by the generic prompt-key path; in
@@ -9631,7 +9850,11 @@ def _node_effective_prompt_templates(node: NodeSpec) -> list[str]:
     a query without one — mirroring ``LLMConfig``'s own field extraction over
     the same union. A node-level template no query falls back to is dead and
     is NOT included: the degeneracy signal must describe the prompts the model
-    will see, not a slot that never renders. Never raises.
+    will see, not a slot that never renders. A query whose ``template`` is
+    present but not a string contributes nothing (neither text nor the
+    node-level template): plugin schema validation rejects the node, the same
+    reading :func:`_advisor_query_option_values` and the review surface take.
+    Never raises.
     """
     node_template = _node_prompt_template(node)
     raw_queries = node.options.get("queries")
@@ -10281,6 +10504,42 @@ _ADVISOR_FLAGGED_ANYCASE_RE: Final[re.Pattern[str]] = re.compile(
 # it, ``__CLEAN__`` never matches. Applied only to the scanned copy of the
 # line; ``findings_text`` keeps the advisor's original text verbatim.
 _ADVISOR_MARKDOWN_EMPHASIS_RE: Final[re.Pattern[str]] = re.compile(r"[*_`~]")
+# The CLEAN-acceptance scan's variant of the strip above: one left-to-right
+# pass that matches a whole code span first, so the span's own backticks are
+# decided as a unit rather than character by character. A code span follows
+# CommonMark: an opening backtick run closed by a run of the SAME length, with
+# neither run adjacent to a further backtick. Pairing single backticks instead
+# read the empty gap inside a double-backtick opener as an (uppercase) span.
+# A backtick outside any span is a literal character and is not stripped.
+_ADVISOR_CLEAN_SCAN_MARKUP_RE: Final[re.Pattern[str]] = re.compile(r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)|[*_~]")
+
+
+def _advisor_clean_acceptance_scan_line(raw_line: str) -> str:
+    """Return the copy of an advisor reply line that CLEAN acceptance scans.
+
+    Identical to the emphasis strip except for backticks. Stripping the
+    backticks of a code span holding lowercase text turned a quoted
+    identifier — "`clean`: requested as a boolean output field, but no node
+    emits it", or the same with a double-backtick span — into the bare
+    ``clean:`` verdict form and minted a sign-off for a reply describing a
+    defect. A span with lowercase text is quoted data and keeps its backticks,
+    so the anchored CLEAN arm cannot match it; an all-uppercase span such as
+    ``CLEAN`` is still unwrapped and accepted. An unbalanced backtick is kept
+    too: it cannot be told apart from a truncated quote, so the reply is
+    re-prompted rather than signed off.
+    """
+
+    def _strip(match: re.Match[str]) -> str:
+        span = match.group(2)
+        if span is None:
+            return ""
+        if span != span.upper():
+            return match.group(0)
+        return _ADVISOR_MARKDOWN_EMPHASIS_RE.sub("", span)
+
+    return _ADVISOR_CLEAN_SCAN_MARKUP_RE.sub(_strip, raw_line).strip()
+
+
 # The one-line re-prompt appended to the (Tier-1, backend-produced) checkpoint
 # ``problem_summary`` when a transport-successful reply could not be parsed as
 # a verdict. It travels the SAME contracted advisor-arguments channel as the

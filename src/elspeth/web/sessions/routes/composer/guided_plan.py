@@ -56,6 +56,7 @@ from .._helpers import (
     UserIdentity,
     WebRateLimiter,
     _cancel_on_client_disconnect,
+    _composer_heartbeat_cancel_of,
     _composer_progress_sink,
     _failure_log_request_id,
     _get_composer_progress_registry,
@@ -729,9 +730,18 @@ async def post_guided_plan(
         caller_task = asyncio.current_task()
         caller_cancelled = caller_task is not None and caller_task.cancelling() > 0
         disconnected = _is_client_disconnect_cancel(exc)
+        # A cancel delivered by the compose heartbeat after it lost the
+        # request's lease also leaves ``cancelling() > 0``, but it is a server
+        # fault, not a user Stop (finding #28): settle ``operation_failed`` and
+        # publish the failed event. ``caller_cancelled`` is true for it as
+        # well, so it is re-raised below (never answered with a response) and
+        # ``_track_compose_inflight`` answers with the structured 503.
+        heartbeat_cancelled = _composer_heartbeat_cancel_of(exc) is not None
         cancel_failure_code: GuidedOperationFailureCode = (
             _guided_full_failure_code(settlement_failure)
             if settlement_failure is not None
+            else "operation_failed"
+            if heartbeat_cancelled
             else "request_cancelled"
             if disconnected or caller_cancelled
             else "operation_failed"

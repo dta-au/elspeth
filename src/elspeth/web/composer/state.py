@@ -66,6 +66,11 @@ from elspeth.plugins.sources.field_normalization import (
     undeclared_row_fields,
 )
 from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+from elspeth.plugins.transforms.llm.base import (
+    MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY,
+    multi_query_source_row_columns,
+    multi_query_undeclared_columns_message,
+)
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
@@ -1918,6 +1923,20 @@ _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX: Final[str] = (
     "required_input_fields: [] withdraws the contract for every field the node reads, including the unconditional ones."
 )
 
+# Catalogue guidance for ``query_input_columns_undeclared``. The FIX is the
+# plugin layer's remedy verbatim — the rejection message ends with it too — so
+# the tool-call surface and the planner's repair turn cannot drift
+# (elspeth-a10d15055b).
+_QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION: Final[str] = (
+    "A multi-query llm node declares options.required_input_fields, but one of its queries reads a row column that "
+    "declaration does not cover — through an input_fields value (template variable → row column) or a "
+    "'row.source_row.<column>' reference. The declaration IS the node's input contract, the only thing edge "
+    "validation checks against the upstream producer, so nothing obliges a producer to supply that column and every "
+    "row without it fails the query with template_context_failed. The rejection names the query, the columns read, "
+    "and the fields declared."
+)
+_QUERY_INPUT_COLUMNS_UNDECLARED_FIX: Final[str] = MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY
+
 
 def _is_plugin_config_probe_exception(exc: Exception, *, config_error_prefix: str) -> bool:
     """Return True only for expected draft/config failures from probe construction.
@@ -3713,10 +3732,14 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
 
     Returns () when prompt_template is absent, not a string, or fails to parse
     (other layers own those shapes), and for multi-query nodes: with
-    ``queries`` present, each query's ``input_fields`` maps template variables
-    to row columns directly (``build_template_context`` in multi_query.py), so
-    bare names are the documented idiom there — the same ``queries is None``
-    scoping as ``LLMConfig._validate_required_input_fields_appear_in_template``.
+    ``queries`` present, each query renders with ``row`` bound to its
+    ``input_fields`` variables plus ``source_row`` (``build_template_context``
+    in multi_query.py), so references are still ``{{ row.<variable> }}`` —
+    a bare name is undefined there too — but the declaration to check against
+    is the query's ``input_fields``, not ``required_input_fields``, and
+    this function owns that comparison. Same
+    ``queries is None`` scoping as
+    ``LLMConfig._validate_required_input_fields_appear_in_template``.
     """
     if node.options.get("queries") is not None:
         return ()
@@ -3983,6 +4006,92 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
                 )
             )
 
+    return tuple(errors)
+
+
+@observation_boundary(
+    tier=3,
+    source=(
+        "NodeSpec carrying web-authored multi-query options (untrusted queries entries, required_input_fields, "
+        "image_inputs and Jinja2 text)"
+    ),
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "emits one high-severity ValidationEntry per well-formed query whose string input_fields values or literal "
+        "row.source_row.<column> reads fall outside a declared non-empty required_input_fields (plus string "
+        "image_inputs field/format_field names); absent, mistyped or unparseable pieces contribute nothing and "
+        "it never raises"
+    ),
+)
+def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """Reject multi-query columns the node's input contract does not cover.
+
+    The Stage-1 twin of the ``required_input_fields`` limb of
+    ``LLMConfig._validate_template_variable_bindings`` in multi-query mode,
+    and required rather than redundant for the same reason as
+    ``_validate_prompt_template_variable_bindings``: the plugin probe DOES
+    construct the node and see that rejection, then swallows it through
+    ``_is_config_probe_exception``. ``build_template_context`` reads
+    ``row[row_column]`` for every ``input_fields`` value and a template may
+    read ``row.source_row.<column>``; when neither is in the declaration, the
+    edge contract checks only the declaration, validates green, and every row
+    fails the query with ``template_context_failed`` (elspeth-a10d15055b).
+
+    Separate from ``_validate_multi_query_template_variable_bindings``: that
+    rule proves the template renders against the query context, this one that
+    the context can be built from a contracted row — the ``input_fields``
+    values need no template at all. The message is the plugin layer's
+    (``multi_query_undeclared_columns_message``), so both surfaces read one
+    text. Coverage is ``undeclared_row_fields``'s exact comparison against the
+    declaration plus ``image_inputs`` columns, matching
+    ``LLMConfig.declared_input_fields``.
+    """
+    queries = node.options.get("queries")
+    if queries is None:
+        return ()
+    declared = node.options.get("required_input_fields")
+    if not isinstance(declared, Sequence) or isinstance(declared, (str, bytes)):
+        return ()
+    declared_names = tuple(name for name in declared if isinstance(name, str))
+    if not declared_names:
+        return ()
+
+    covering = set(declared_names)
+    image_inputs = node.options.get("image_inputs")
+    if isinstance(image_inputs, Sequence) and not isinstance(image_inputs, (str, bytes)):
+        for image_spec in image_inputs:
+            if isinstance(image_spec, Mapping):
+                covering.update(name for name in (image_spec.get("field"), image_spec.get("format_field")) if isinstance(name, str))
+
+    node_template = node.options.get("prompt_template")
+    errors: list[ValidationEntry] = []
+    for label, entry in _well_formed_query_entries(queries):
+        input_fields = entry.get("input_fields")
+        if not isinstance(input_fields, Mapping):
+            continue
+        columns = {column for column in input_fields.values() if isinstance(column, str)}
+
+        override = entry.get("template")
+        effective_template = override if isinstance(override, str) else (node_template if override is None else None)
+        if isinstance(effective_template, str):
+            # Plugin-config admission owns the syntax rejection, so an
+            # unparseable template contributes no source_row columns — its
+            # input_fields values are still checked without it.
+            parsed, _syntax_error = _parse_template_names(effective_template)
+            if parsed is not None:
+                columns.update(multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", effective_template)))
+
+        undeclared = undeclared_row_fields(columns, covering)
+        if undeclared:
+            errors.append(
+                ValidationEntry(
+                    component=f"node:{node.id}",
+                    message=multi_query_undeclared_columns_message(label, undeclared, declared_names),
+                    severity="high",
+                    error_code="query_input_columns_undeclared",
+                )
+            )
     return tuple(errors)
 
 
@@ -7259,6 +7368,7 @@ class CompositionState:
 
             errors.extend(_validate_prompt_template_variable_bindings(node))
             errors.extend(_validate_multi_query_template_variable_bindings(node))
+            errors.extend(_validate_multi_query_required_input_columns(node))
 
             # ``timeout_seconds`` is a top-level structural-barrier field.
             # Queue rejects it through queue_node_contract_error below so every
@@ -7306,6 +7416,29 @@ class CompositionState:
                 errors.append(_err(f"node:{node.id}", structural_plugin_error, "high", "structural_node_plugin_forbidden"))
 
             if node.node_type == "gate":
+                # ``GateSettings`` is a built-in structural contract with no
+                # options field, and ``_lower_gate_nodes`` never emits
+                # NodeSpec.options, so a runtime-looking gate option is
+                # authored state that disappears before the pipeline runs —
+                # the gate analogue of ``coalesce_config_invalid``. Unlike a
+                # coalesce, a gate legitimately carries web-only authoring
+                # metadata (a ``gate_condition_authored`` pipeline_decision
+                # row rides in ``interpretation_requirements``), which lowering
+                # strips by design, so only keys outside that set are refused.
+                # Local import: interpretation_state imports NodeSpec from here.
+                from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
+
+                stray_gate_option_keys = sorted(key for key in node.options if key not in AUTHORING_METADATA_OPTION_KEYS)
+                if stray_gate_option_keys:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Gate '{node.id}' does not accept options {stray_gate_option_keys}; a gate is configured "
+                            "only by condition, routes, fork_to, and on_error.",
+                            "high",
+                            "gate_config_invalid",
+                        )
+                    )
                 if node.condition is None:
                     errors.append(
                         _err(

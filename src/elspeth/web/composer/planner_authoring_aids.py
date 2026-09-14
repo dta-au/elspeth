@@ -832,7 +832,12 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "review resolution rewrites only the node-level prompt_template/"
     "prompt_template_parts, so a per-query token survives resolution and is "
     "rejected at the compose gate. Reviewed slots belong in the node-level "
-    "template; per-query templates reference plain query variables only.",
+    "template. A per-query template sees only 'row' and 'lookup': reference "
+    "each of its input_fields variables as {{ row.<variable> }} (the whole "
+    "source row is {{ row.source_row.<column> }}, lookups are "
+    "{{ lookup.<key> }}); a bare {{ <variable> }} is rejected by the plugin "
+    "schema as an undefined name (session 94f6f00c: the planner's first "
+    "set_pipeline followed the old bare-name teaching and was rejected).",
     "Sink hygiene: the auto-appended <response_field>_usage / _model operational row "
     "fields ride the row automatically — do not map or require them into "
     "sinks unless the user asked for token/model reporting.",

@@ -467,6 +467,12 @@ async def _state_with_imported_source_blobs(
             raise HTTPException(status_code=404, detail="Blob not found") from None
         if blob.session_id != session_id:
             raise HTTPException(status_code=404, detail="Blob not found")
+        # Ownership first so a missing blob and another session's blob stay
+        # indistinguishable (404). A pending or error blob has no settled
+        # bytes to bind: the export side of this round trip and the blob
+        # download/preview routes already refuse a non-ready blob.
+        if blob.status != "ready":
+            raise HTTPException(status_code=409, detail="Blob is not ready")
 
         source = sources[source_name]
         options = dict(source.options)
@@ -814,6 +820,12 @@ async def import_state_yaml(
     """Seed a session's composition state from exported runtime YAML."""
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
+    # Everything that can raise before the body runs is resolved BEFORE the
+    # lease exists: the lease self-renews until closed, and only the
+    # try/finally below closes it, so a raise between acquire and that try
+    # would refuse every later COMPOSE writer on this session until restart.
+    catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
+    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     lease = await SessionOperationLease.acquire(
         service.session_operation_authority,
         session_id=session.id,
@@ -821,8 +833,6 @@ async def import_state_yaml(
         owner_instance_id=service.session_operation_owner_instance_id,
         lease_seconds=service.session_operation_lease_seconds,
     )
-    catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
-    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     try:
         async with compose_lock:
             try:
@@ -853,6 +863,7 @@ async def import_state_yaml(
                 user_id=str(user.user_id),
             )
             _reject_malformed_interpretation_requirements(imported_state)
+            _reject_resolved_interpretation_requirements(imported_state)
             # Import must be atomic with respect to review recoverability. Reuse
             # the generic Composer surfacer's own pure site-to-writer mapping so a
             # pending site that cannot become a consumable event is rejected before
@@ -953,6 +964,44 @@ def _reject_malformed_interpretation_requirements(state: CompositionState) -> No
             ) from exc
 
 
+def _reject_resolved_interpretation_requirements(state: CompositionState) -> None:
+    """Refuse hand-written ``status: resolved`` review rows in pasted YAML.
+
+    A resolved row is resolver-owned evidence: it records that the user
+    accepted a card, citing the interpretation event that did so. Pasted YAML
+    carries no such event, and the run gate (``materialize_state_for_execution``)
+    trusts a coherent resolved row without consulting the events table, so
+    admitting one would let the document approve its own prompt and model
+    reviews and persist review evidence for events that never happened. The
+    Composer tool path refuses the same "resolver-owned status 'resolved'" at
+    admission; this is that refusal at the paste-facing import boundary.
+
+    Refused rather than demoted to a pending shell: legitimate exports never
+    carry requirement rows (``strip_authoring_options``), so a resolved row is
+    always hand-written, and silently rewriting pasted input would hide that.
+    Hand-written PENDING rows stay importable. Must run after
+    ``_reject_malformed_interpretation_requirements`` so every row parses.
+    Audit hygiene: name the component, never echo row content.
+    """
+    components = [
+        *((f"Source '{source_name}'", source.options) for source_name, source in state.sources.items()),
+        *((f"Node '{node.id}'", node.options) for node in state.nodes),
+    ]
+    for component, options in components:
+        requirements = parse_interpretation_requirements(options)
+        if requirements is None:
+            continue
+        if any(requirement["status"] != "pending" for requirement in requirements):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{component} carries a hand-written interpretation_requirements entry with status "
+                    "'resolved'. Imported YAML may stage pending review requirements only; remove the "
+                    "resolved entry and re-import, then resolve the review cards in this session."
+                ),
+            )
+
+
 @router.post(
     "/{session_id}/state/e2e-seed",
     response_model=CompositionStateResponse,
@@ -970,6 +1019,13 @@ async def seed_state_for_e2e(
     session = await _verify_session_ownership(session_id, user, request)
     catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
     service: SessionServiceProtocol = request.app.state.session_service
+    # Body parse and lock lookup precede the self-renewing lease for the same
+    # reason as import_state_yaml: only the try/finally below closes it.
+    try:
+        body = SeedCompositionStateRequest.model_validate(await request.json())
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid seed request JSON") from exc
+    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     lease = await SessionOperationLease.acquire(
         service.session_operation_authority,
         session_id=session.id,
@@ -977,14 +1033,6 @@ async def seed_state_for_e2e(
         owner_instance_id=service.session_operation_owner_instance_id,
         lease_seconds=service.session_operation_lease_seconds,
     )
-
-    try:
-        body = SeedCompositionStateRequest.model_validate(await request.json())
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        await lease.close()
-        raise HTTPException(status_code=400, detail="Invalid seed request JSON") from exc
-
-    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     try:
         async with compose_lock:
             try:

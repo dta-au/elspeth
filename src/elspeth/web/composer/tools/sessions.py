@@ -25,6 +25,9 @@ from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.protocol import (
+    INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
+    INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
+    LLM_PROMPT_REVIEW_DRAFT_EXPECTATION,
     REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
     REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
     REQUEST_INTERPRETATION_REVIEW_KINDS,
@@ -110,6 +113,7 @@ from elspeth.web.composer.tools._common import (
 from elspeth.web.composer.tools.blobs import (
     _blob_create_payload,
     _blob_creation_provenance,
+    _llm_authored_inline_prompt_surface_error,
     _persist_prepared_blob_create,
     _prepare_blob_create,
     _PreparedBlobCreate,
@@ -149,6 +153,7 @@ from elspeth.web.interpretation_state import (
     current_source_data_contract_demand,
     interpretation_sites,
     parse_interpretation_requirements,
+    prompt_review_draft_from_options,
     reconcile_authoritative_reviews,
     source_name_from_component_id,
     transform_vague_term_site_tuples,
@@ -1460,6 +1465,21 @@ def build_set_pipeline_candidate(
                 _record_component_rejection(_failure_result(state, batch_required_error, rejected_component=node_ref))
                 continue
 
+            # Before prevalidation, which withholds a top-level inline_content
+            # marker as a deferred value: an LLM-authored blob in an llm prompt
+            # surface or model refuses with the wire_blob_inline_ref text, as
+            # upsert_node, patch_node_options and splice_transform do.
+            prompt_surface_error = _llm_authored_inline_prompt_surface_error(
+                context,
+                tool_name="set_pipeline",
+                node_id=node_id,
+                plugin=node_plugin,
+                options=review_options,
+            )
+            if prompt_surface_error is not None:
+                _record_component_rejection(_failure_result(state, prompt_surface_error, rejected_component=node_ref))
+                continue
+
             node_prevalidation = _prevalidate_transform_for_context(context, node_plugin, review_options)
             if node_prevalidation is not None:
                 _record_component_rejection(
@@ -1978,7 +1998,9 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                                 "type": "string",
                                 "enum": sorted(ALLOWED_MIME_TYPES),
                             },
-                            "content": {"type": "string"},
+                            # Discloses the cap _InlineBlobModel.content enforces
+                            # (redaction.py, Field(max_length=262_144)).
+                            "content": {"type": "string", "maxLength": 262_144},
                             "description": {"type": ["string", "null"]},
                         },
                         "required": ["filename", "mime_type", "content"],
@@ -2618,13 +2640,17 @@ def _assert_affected_component(
                     )
                 staged_draft = current_draft if isinstance(current_draft, str) else None
     if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-        if llm_draft is not None and llm_draft != prompt_template:
+        # The reviewed text is what the model receives — the rendered prompt
+        # surface on a multi-query node, ``prompt_template`` otherwise — the
+        # same derivation the auto-stager and the event writer use.
+        review_draft = prompt_review_draft_from_options(options)
+        if llm_draft is not None and llm_draft != review_draft:
             raise ToolArgumentError(
                 argument="llm_draft",
-                expected=f"current options.prompt_template for node {affected_node_id!r}",
+                expected=LLM_PROMPT_REVIEW_DRAFT_EXPECTATION,
                 actual_type="stale prompt-template draft",
             )
-        staged_draft = prompt_template
+        staged_draft = review_draft
     if kind is InterpretationKind.LLM_MODEL_CHOICE:
         current_model = options.get("model")
         if not isinstance(current_model, str) or not current_model:
@@ -2734,6 +2760,67 @@ def _utc_day_start(now: datetime) -> datetime:
     aware_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
     aware_now_utc = aware_now.astimezone(UTC)
     return aware_now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+@dataclass(frozen=True, slots=True)
+class InterpretationRateCapHit:
+    """Which interpretation rate cap refuses the next ``vague_term`` review request.
+
+    ``code`` is ``RATE_CAP_PER_TERM_CODE`` or ``RATE_CAP_PER_SESSION_DAY_CODE``;
+    ``request_number`` is the 1-based number the refused request would have
+    had under that cap.
+    """
+
+    code: str
+    request_number: int
+
+
+def interpretation_rate_cap_hit(
+    events: Sequence[InterpretationEventRecord],
+    *,
+    user_term: str,
+    composition_state_id: UUID,
+    per_term_cap: int,
+    per_session_day_cap: int,
+    now: datetime,
+) -> InterpretationRateCapHit | None:
+    """Return the rate cap a ``vague_term`` review request for ``user_term`` would hit now.
+
+    The single counting rule for both caps (F-30/F-31), shared by the tool
+    handler's refusal (:func:`_check_interpretation_rate_limits`) and the
+    compose loop's repair gate, which must not ask the planner to request a
+    review this rule refuses. ``events`` is the session's full event list
+    (``status="all"``). Per-term is checked first, then per-session-day.
+    """
+    # Count only what the caps govern (elspeth-558fa5a321): LLM surfacing
+    # invocations of the capped kind. The handler only calls this check for
+    # ``vague_term``, so rows of every other kind are uncapped obligations
+    # and must not drain the budgets. Backend-surfaced rows (the
+    # ``backend_auto_surface:`` provenance sentinel) are server obligations
+    # even when their kind is vague_term — measured on battery-r2 g08, a
+    # third of the consumed per-term budget had been spent by the server
+    # against an allowance documented as throttling the composer LLM.
+    capped_events = [
+        event
+        for event in events
+        if event.kind is InterpretationKind.VAGUE_TERM and not (event.tool_call_id or "").startswith(BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX)
+    ]
+    # Per-term cap — count rows for this composition branch with matching user_term.
+    per_term_count = sum(
+        1
+        for event in capped_events
+        if event.composition_state_id == composition_state_id and event.user_term is not None and event.user_term == user_term
+    )
+    if per_term_count >= per_term_cap:
+        return InterpretationRateCapHit(code=RATE_CAP_PER_TERM_CODE, request_number=per_term_count + 1)
+    # Per-session-day cap — UTC-midnight fixed window. Only rows with
+    # populated ``user_term`` (i.e. not opt-out skeletons) count toward the
+    # invocation budget; opt-out is a different action with its own row.
+    day_start = _utc_day_start(now)
+    per_day_count = sum(1 for event in capped_events if event.user_term is not None and event.created_at >= day_start)
+    if per_day_count >= per_session_day_cap:
+        return InterpretationRateCapHit(code=RATE_CAP_PER_SESSION_DAY_CODE, request_number=per_day_count + 1)
+    return None
 
 
 async def _check_duplicate_interpretation(
@@ -2877,31 +2964,22 @@ async def _check_interpretation_rate_limits(
     object. Production callers thread ``WebSettings.composer_interpretation_*``
     in.
     """
-    # Count only what the caps govern (elspeth-558fa5a321): LLM surfacing
-    # invocations of the capped kind. The handler only calls this check for
-    # ``vague_term``, so rows of every other kind are uncapped obligations
-    # and must not drain the budgets. Backend-surfaced rows (the
-    # ``backend_auto_surface:`` provenance sentinel) are server obligations
-    # even when their kind is vague_term — measured on battery-r2 g08, a
-    # third of the consumed per-term budget had been spent by the server
-    # against an allowance documented as throttling the composer LLM.
-    events = [
-        event
-        for event in await list_events_fn(session_id, status="all")
-        if event.kind is InterpretationKind.VAGUE_TERM and not (event.tool_call_id or "").startswith(BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX)
-    ]
-    # Per-term cap — count rows for this composition branch with matching user_term.
-    per_term_count = sum(
-        1
-        for event in events
-        if event.composition_state_id == composition_state_id and event.user_term is not None and event.user_term == user_term
+    cap_hit = interpretation_rate_cap_hit(
+        await list_events_fn(session_id, status="all"),
+        user_term=user_term,
+        composition_state_id=composition_state_id,
+        per_term_cap=per_term_cap,
+        per_session_day_cap=per_session_day_cap,
+        now=now,
     )
-    if per_term_count >= per_term_cap:
+    if cap_hit is None:
+        return
+    if cap_hit.code == RATE_CAP_PER_TERM_CODE:
         raise ToolArgumentError(
             argument="user_term",
-            expected=f"at most {per_term_cap} interpretation requests per term in this composition",
+            expected=INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
             actual_type=(
-                f"per-term cap would be exceeded on request {per_term_count + 1}; use a direct interpretation "
+                f"per-term cap would be exceeded on request {cap_hit.request_number}; use a direct interpretation "
                 "in the prompt template instead"
             ),
             # Compose-loop discriminant (F-6): the rate-cap branch is the
@@ -2911,22 +2989,16 @@ async def _check_interpretation_rate_limits(
             # generic ARG_ERROR without grepping the message string.
             code=RATE_CAP_PER_TERM_CODE,
         )
-    # Per-session-day cap — UTC-midnight fixed window. Only rows with
-    # populated ``user_term`` (i.e. not opt-out skeletons) count toward the
-    # invocation budget; opt-out is a different action with its own row.
-    day_start = _utc_day_start(now)
-    per_day_count = sum(1 for event in events if event.user_term is not None and event.created_at >= day_start)
-    if per_day_count >= per_session_day_cap:
-        raise ToolArgumentError(
-            argument="user_term",
-            expected=f"at most {per_session_day_cap} interpretation requests per session per UTC day",
-            actual_type=(
-                f"session would record {per_day_count + 1} requests today — the compose loop should "
-                f"fall back to auto-interpretation (AUTO_INTERPRETED_NO_SURFACES)"
-            ),
-            # See per-term cap above for the ``code`` field rationale.
-            code=RATE_CAP_PER_SESSION_DAY_CODE,
-        )
+    raise ToolArgumentError(
+        argument="user_term",
+        expected=INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
+        actual_type=(
+            f"session would record {cap_hit.request_number} requests today — the compose loop should "
+            f"fall back to auto-interpretation (AUTO_INTERPRETED_NO_SURFACES)"
+        ),
+        # See per-term cap above for the ``code`` field rationale.
+        code=RATE_CAP_PER_SESSION_DAY_CODE,
+    )
 
 
 async def _handle_request_interpretation_review(

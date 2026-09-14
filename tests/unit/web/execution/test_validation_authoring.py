@@ -917,11 +917,12 @@ def test_path_gate_admits_a_legitimate_in_subtree_path_on_every_kind(node_type: 
 def test_path_gate_still_skips_plugin_less_structural_nodes(tmp_path: Path) -> None:
     """The subject set is ``node.plugin is not None``, NOT every node.
 
-    gate/queue/coalesce can carry an inert ``provider_config`` through
-    composer validation today (only ``row_union`` rejects non-empty options),
-    and nothing reads it for a plugin-less kind. Gating it would newly reject
-    a nonsense-but-harmless composition that passes today — a behaviour
-    change with no security benefit, since no plugin can act on the value.
+    Composer validation already refuses a stray ``provider_config`` on every
+    plugin-less kind (``gate_config_invalid``, ``coalesce_config_invalid``,
+    the queue option allowlist and ``row_union``'s empty-options rule), and
+    nothing reads it for such a kind. This path gate is not the place to
+    restate that refusal: no plugin can act on the value, so gating it here
+    would add a second rejection with no security benefit.
     """
     gate_node = _node(node_id="g1", plugin=None, node_type="gate", options={"provider_config": {"persist_directory": _TRAVERSAL}})
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,54 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 def test_reject_non_string_mapping_keys_rejects_nested_non_string_keys(value: object) -> None:
     with pytest.raises(RuntimeYamlImportError, match="non-string mapping key"):
         _reject_non_string_mapping_keys(value, "options")
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ({1: "bad"}, r"^options contains non-string mapping key 1$"),
+        ({"start": date(2024, 1, 2)}, r"^options\.start must be a JSON value, got date$"),
+        ({"at": datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)}, r"^options\.at must be a JSON value, got datetime$"),
+        ({"blob": b"hello"}, r"^options\.blob must be a JSON value, got bytes$"),
+        ({"blob": bytearray(b"hello")}, r"^options\.blob must be a JSON value, got bytearray$"),
+        ({"tags": {"a", "b"}}, r"^options\.tags must be a JSON value, got set$"),
+        ({"ratio": float("nan")}, r"^options\.ratio must be a JSON value, got float$"),
+        ({"ratio": float("-inf")}, r"^options\.ratio must be a JSON value, got float$"),
+        ({"nested": [1, {"when": date(2024, 1, 2)}]}, r"^options\.nested\[1\]\.when must be a JSON value, got date$"),
+    ],
+)
+def test_reject_non_string_mapping_keys_rejects_non_json_keys_and_values(value: object, message: str) -> None:
+    with pytest.raises(RuntimeYamlImportError, match=message):
+        _reject_non_string_mapping_keys(value, "options")
+
+
+def test_reject_non_string_mapping_keys_admits_json_values() -> None:
+    """Control: every JSON value shape passes, including tuples SafeLoader never builds."""
+    _reject_non_string_mapping_keys(
+        {"s": "x", "i": -3, "f": 1.5, "b": False, "n": None, "l": [1, [2.0, {"k": "v"}]], "t": ("a",)},
+        "options",
+    )
+
+
+@pytest.mark.parametrize(
+    ("yaml_value", "type_name"),
+    [("2024-01-02", "date"), ("!!binary aGVsbG8=", "bytes"), (".nan", "float"), ("!!set {a: null}", "set")],
+)
+def test_runtime_yaml_import_refuses_non_json_option_values(yaml_value: str, type_name: str) -> None:
+    doc = f"""
+sources:
+  source:
+    plugin: csv
+    on_success: main
+    options:
+      note: {yaml_value}
+sinks:
+  main:
+    plugin: csv
+    on_write_failure: discard
+"""
+    with pytest.raises(RuntimeYamlImportError, match=rf"^sources\.source\.options\.note must be a JSON value, got {type_name}$"):
+        composition_state_from_runtime_yaml(doc)
 
 
 def test_require_str_rejects_non_string_value() -> None:

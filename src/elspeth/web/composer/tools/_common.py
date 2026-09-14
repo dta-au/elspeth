@@ -95,6 +95,7 @@ from elspeth.web.interpretation_state import (
     composer_pipeline_decision_user_term_error,
     parse_interpretation_requirements,
     project_planner_context_interpretation_requirement,
+    prompt_review_draft_from_options,
     resolved_review_evidence_is_coherent,
     serialize_authoring_review_options,
     source_name_from_component_id,
@@ -367,7 +368,10 @@ def _options_with_pending_requirement(
     source_param="options",
     suppresses=("R1", "R5"),
     invariant="returns options unchanged when the node is not an llm node or carries no non-empty "
-    "string prompt_template, otherwise a copy with the review requirement staged; never raises",
+    "string prompt_template, otherwise a copy with the review requirement staged whose draft is the "
+    "prompt_template, shortened to PROMPT_SURFACE_REVIEW_MAX_CHARS with an inline marker when longer, "
+    "for a single-prompt node and the rendered multi-query prompt surface "
+    "(per-query templates, system prompt, node-level template) for a multi-query node; never raises",
 )
 def _options_with_default_prompt_template_review(
     *,
@@ -376,23 +380,39 @@ def _options_with_default_prompt_template_review(
     options: Mapping[str, Any],
     existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
-    """Ensure LLM-authored prompt templates carry a Class 3 review gate."""
+    """Ensure LLM-authored prompt templates carry a Class 3 review gate.
+
+    The reviewed text is what the model will actually receive: the
+    ``prompt_template`` for a single-prompt node, shortened to
+    ``PROMPT_SURFACE_REVIEW_MAX_CHARS`` with an inline marker when longer, and for a multi-query node
+    the rendered prompt SURFACE — every query's template override, the shared
+    ``system_prompt`` and the node-level template with its in-use status
+    (:func:`prompt_review_draft_from_options`). Using that same text as the
+    idempotency key means an edit to a query template or the system prompt
+    re-stages the review, while re-issuing an identical mutation does not
+    churn it (session 94f6f00c: the card attested a node-level prompt that
+    every query overrode, and a repair to the live per-query prompt was
+    never re-reviewed).
+    """
     if plugin != "llm":
         return options
     prompt_template = options["prompt_template"] if "prompt_template" in options else None
     if not isinstance(prompt_template, str) or not prompt_template:
         return options
+    draft = prompt_review_draft_from_options(options)
+    if draft is None:
+        return options
     requirement = _pending_interpretation_requirement(
         requirement_id=_prompt_template_review_requirement_id(node_id),
         kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
         user_term=f"llm_prompt_template:{node_id}",
-        draft=prompt_template,
+        draft=draft,
     )
     return _options_with_pending_requirement(
         options,
         requirement=requirement,
         replace_kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-        current_field_value=prompt_template,
+        current_field_value=draft,
         existing_options=existing_options,
     )
 
@@ -828,7 +848,13 @@ def _duplicate_consumer_repair_suggestions(
                 # Widened deliberately: this is a repair-call argument the loop
                 # below re-keys, not the node payload the census reports, so it
                 # must not borrow ``_SetPipelineNodePayload``'s closed key set.
-                patched_consumers[node.id] = dict(_serialize_node(node))
+                # Built from the AUTHORING projection, not the diagnostic
+                # ``_serialize_node``: every call here is replayed through
+                # upsert_node, which refuses runtime-owned options (a resolved
+                # LLM prompt's node-level resolved_prompt_template_hash) and
+                # resolver-owned review linkage, so the diagnostic shape made
+                # the first call fail and the rest half-apply.
+                patched_consumers[node.id] = dict(_serialize_set_pipeline_node(node))
             patched_consumer = patched_consumers[node.id]
             if consumer_branch_alias is None:
                 patched_consumer["input"] = branch_name
@@ -1945,8 +1971,10 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
         "'coalesce' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
         "node with node_type='coalesce', plugin=null, branches mapping each branch name to its "
         "incoming connection, policy (e.g. 'require_all') and merge (e.g. 'union'); downstream nodes "
-        "read the coalesce node id as their input. For running several LLM assessments per row, "
-        "prefer ONE llm transform with a `queries` map instead of fork/coalesce."
+        "read the coalesce node id as their input. SHAPE SELECTION: several assessments of the SAME "
+        "input field belong on a SINGLE llm node's `queries` map (multi_query) instead of "
+        "fork/coalesce; use fork/coalesce only when the branches take genuinely INDEPENDENT inputs "
+        "or independent per-branch processing chains."
     ),
     "gate": (
         "'gate' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a node "
@@ -3657,6 +3685,10 @@ _MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC
     # lowering; rejecting the mutation prevents misleading state from ever
     # persisting through either upsert_node or set_pipeline.
     "coalesce_config_invalid",
+    # Same for gate options outside the web-only authoring metadata set:
+    # GateSettings has no options field, so upsert_node, set_pipeline and
+    # patch_node_options must refuse them rather than persist inert config.
+    "gate_config_invalid",
     "node_timeout_unsupported",
     # A plugin on a gate or coalesce must never persist: upsert_node's
     # post-call hint lookup would resolve the authored token against the

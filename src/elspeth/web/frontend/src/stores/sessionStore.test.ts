@@ -2081,6 +2081,343 @@ describe("sessionStore", () => {
       }
     });
 
+    describe("inflight poll fence (elspeth-90f453d7b2)", () => {
+      const pollUser: ChatMessage = {
+        id: "msg-poll-user",
+        session_id: "session-1",
+        role: "user",
+        content: "hi",
+        tool_calls: null,
+        created_at: "2026-04-26T10:00:00Z",
+      };
+      const pollReply: ChatMessage = {
+        id: "msg-poll-reply",
+        session_id: "session-1",
+        role: "assistant",
+        content: "REPLY",
+        tool_calls: null,
+        created_at: "2026-04-26T10:00:02Z",
+      };
+
+      async function armProgressIdle(): Promise<void> {
+        const { fetchComposerProgress } = await import("@/api/client");
+        (fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({
+          session_id: "session-1",
+          request_id: "msg-poll-user",
+          phase: "idle",
+          headline: "",
+          evidence: [],
+          likely_next: null,
+          reason: null,
+          updated_at: "2026-04-26T10:00:00Z",
+        });
+      }
+
+      it("drops a poll tick that resolves after the turn settled and polling stopped", async () => {
+        vi.useFakeTimers();
+        try {
+          const { sendMessage: mockSendMessage, fetchMessages } = await import(
+            "@/api/client"
+          );
+          await armProgressIdle();
+          const sendDeferred = deferred<{ message: ChatMessage; state: null }>();
+          const tickDeferred = deferred<ChatMessage[]>();
+          (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+            sendDeferred.promise,
+          );
+          // Call 1 = the interval tick (held open); call 2 = the owning
+          // turn's explicit post-settle sync, which carries the final reply.
+          (fetchMessages as ReturnType<typeof vi.fn>)
+            .mockReturnValueOnce(tickDeferred.promise)
+            .mockResolvedValueOnce([pollUser, pollReply]);
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+          const sendPromise = useSessionStore.getState().sendMessage("hi");
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(1500);
+          expect(fetchMessages).toHaveBeenCalledTimes(1);
+
+          sendDeferred.resolve({ message: pollReply, state: null });
+          await sendPromise;
+          expect(useSessionStore.getState().isComposing).toBe(false);
+          expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+            "msg-poll-user",
+            "msg-poll-reply",
+          ]);
+
+          // The tick started mid-compose lands now, carrying the OLDER list.
+          tickDeferred.resolve([pollUser]);
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+            "msg-poll-user",
+            "msg-poll-reply",
+          ]);
+          expect(fetchMessages).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("drops an old turn's poll tick once a newer same-session turn owns the poller", async () => {
+        vi.useFakeTimers();
+        try {
+          const { sendMessage: mockSendMessage, fetchMessages } = await import(
+            "@/api/client"
+          );
+          await armProgressIdle();
+          const firstSend = deferred<{ message: ChatMessage; state: null }>();
+          const secondSend = deferred<{ message: ChatMessage; state: null }>();
+          const tickDeferred = deferred<ChatMessage[]>();
+          (mockSendMessage as ReturnType<typeof vi.fn>)
+            .mockReturnValueOnce(firstSend.promise)
+            .mockReturnValueOnce(secondSend.promise);
+          (fetchMessages as ReturnType<typeof vi.fn>)
+            .mockReturnValueOnce(tickDeferred.promise)
+            .mockResolvedValue([pollUser, pollReply]);
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+          const firstPromise = useSessionStore.getState().sendMessage("hi");
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(1500);
+          expect(fetchMessages).toHaveBeenCalledTimes(1);
+
+          firstSend.resolve({ message: pollReply, state: null });
+          await firstPromise;
+
+          // A second turn on the SAME session re-binds the poller, so the
+          // session id alone no longer tells the old tick apart.
+          const secondPromise = useSessionStore.getState().sendMessage("again");
+          await Promise.resolve();
+
+          tickDeferred.resolve([pollUser]);
+          await Promise.resolve();
+          await Promise.resolve();
+
+          expect(
+            useSessionStore
+              .getState()
+              .messages.filter((m) => !m.id.startsWith("local-"))
+              .map((m) => m.id),
+          ).toEqual(["msg-poll-user", "msg-poll-reply"]);
+
+          secondSend.resolve({ message: pollReply, state: null });
+          await secondPromise;
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // A -> B -> A while the turn is in flight: selectSession stops the
+      // poller (id null) but does not abort the POST, so the owning turn's
+      // explicit post-settle sync must still land on its return.
+      async function armSelectSessionReads(): Promise<void> {
+        const api = await import("@/api/client");
+        (api.getGuided as ReturnType<typeof vi.fn>).mockRejectedValue(
+          new Error("no guided state"),
+        );
+        (api.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(
+          null,
+        );
+        (
+          api.fetchCompositionProposals as ReturnType<typeof vi.fn>
+        ).mockResolvedValue([]);
+        (
+          api.fetchComposerPreferences as ReturnType<typeof vi.fn>
+        ).mockResolvedValue(null);
+      }
+
+      const pollTool: ChatMessage = {
+        id: "msg-poll-tool",
+        session_id: "session-1",
+        role: "assistant",
+        content: "TOOLROW",
+        tool_calls: null,
+        created_at: "2026-04-26T10:00:01Z",
+      };
+
+      it("applies the owning turn's post-settle sync after an A->B->A switch stopped the poller", async () => {
+        const { sendMessage: mockSendMessage, fetchMessages } = await import(
+          "@/api/client"
+        );
+        await armProgressIdle();
+        await armSelectSessionReads();
+        const sendDeferred = deferred<{ message: ChatMessage; state: null }>();
+        (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+          sendDeferred.promise,
+        );
+        let sessionOneFetches = 0;
+        (fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(
+          async (id: string) => {
+            if (id !== "session-1") return [];
+            sessionOneFetches += 1;
+            // 1 = the reselect load; 2 = the owning turn's post-settle sync,
+            // which carries the tool row persisted after the reselect.
+            return sessionOneFetches === 1
+              ? [pollUser]
+              : [pollUser, pollTool, pollReply];
+          },
+        );
+
+        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+        const sendPromise = useSessionStore.getState().sendMessage("hi");
+        await Promise.resolve();
+        await useSessionStore.getState().selectSession("session-2");
+        await useSessionStore.getState().selectSession("session-1");
+        expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+          "msg-poll-user",
+        ]);
+
+        sendDeferred.resolve({ message: pollReply, state: null });
+        await sendPromise;
+
+        expect(sessionOneFetches).toBe(2);
+        expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+          "msg-poll-user",
+          "msg-poll-tool",
+          "msg-poll-reply",
+        ]);
+      });
+
+      it("applies the owning turn's post-settle sync when the newer turn belongs to another session", async () => {
+        const { sendMessage: mockSendMessage, fetchMessages } = await import(
+          "@/api/client"
+        );
+        await armProgressIdle();
+        await armSelectSessionReads();
+        const sessionOneSend = deferred<{ message: ChatMessage; state: null }>();
+        const sessionTwoSend = deferred<{ message: ChatMessage; state: null }>();
+        (mockSendMessage as ReturnType<typeof vi.fn>)
+          .mockReturnValueOnce(sessionOneSend.promise)
+          .mockReturnValueOnce(sessionTwoSend.promise);
+        let sessionOneFetches = 0;
+        (fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(
+          async (id: string) => {
+            if (id !== "session-1") return [];
+            sessionOneFetches += 1;
+            return sessionOneFetches === 1
+              ? [pollUser]
+              : [pollUser, pollTool, pollReply];
+          },
+        );
+
+        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+        const sessionOnePromise = useSessionStore.getState().sendMessage("hi");
+        await Promise.resolve();
+        await useSessionStore.getState().selectSession("session-2");
+        // A turn on session-2 claims the poller; it owns nothing on session-1.
+        const sessionTwoPromise = useSessionStore.getState().sendMessage("other");
+        await Promise.resolve();
+        await useSessionStore.getState().selectSession("session-1");
+
+        sessionOneSend.resolve({ message: pollReply, state: null });
+        await sessionOnePromise;
+
+        expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+          "msg-poll-user",
+          "msg-poll-tool",
+          "msg-poll-reply",
+        ]);
+
+        sessionTwoSend.resolve({ message: pollReply, state: null });
+        await sessionTwoPromise;
+      });
+
+      it("drops an old turn's post-settle sync once a newer turn on the same session claimed the poller", async () => {
+        const { sendMessage: mockSendMessage, fetchMessages } = await import(
+          "@/api/client"
+        );
+        await armProgressIdle();
+        await armSelectSessionReads();
+        const firstSend = deferred<{ message: ChatMessage; state: null }>();
+        const secondSend = deferred<{ message: ChatMessage; state: null }>();
+        (mockSendMessage as ReturnType<typeof vi.fn>)
+          .mockReturnValueOnce(firstSend.promise)
+          .mockReturnValueOnce(secondSend.promise);
+        const staleSentinel: ChatMessage = {
+          ...pollTool,
+          id: "msg-stale-sentinel",
+          content: "STALE",
+        };
+        let sessionOneFetches = 0;
+        (fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(
+          async (id: string) => {
+            if (id !== "session-1") return [];
+            sessionOneFetches += 1;
+            // 1 = reselect load; 2 = the OLD turn's post-settle sync.
+            return sessionOneFetches === 1
+              ? [pollUser]
+              : [pollUser, staleSentinel];
+          },
+        );
+
+        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+        const firstPromise = useSessionStore.getState().sendMessage("hi");
+        await Promise.resolve();
+        await useSessionStore.getState().selectSession("session-2");
+        await useSessionStore.getState().selectSession("session-1");
+        // selectSession cleared isComposing, so a newer turn on session-1
+        // starts while the first POST is still in flight.
+        const secondPromise = useSessionStore.getState().sendMessage("again");
+        await Promise.resolve();
+
+        firstSend.resolve({ message: pollReply, state: null });
+        await firstPromise;
+
+        expect(sessionOneFetches).toBe(2);
+        expect(useSessionStore.getState().messages.map((m) => m.id)).not.toContain(
+          "msg-stale-sentinel",
+        );
+
+        secondSend.resolve({ message: pollReply, state: null });
+        await secondPromise;
+      });
+
+      it("applies the aborted turn's resync message sync after an A->B->A switch stopped the poller", async () => {
+        const { sendMessage: mockSendMessage, fetchMessages } = await import(
+          "@/api/client"
+        );
+        await armSelectSessionReads();
+        const controller = new AbortController();
+        (mockSendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+          () =>
+            new Promise((_resolve, reject) => {
+              controller.signal.addEventListener("abort", () =>
+                reject(controller.signal.reason),
+              );
+            }),
+        );
+        let sessionOneFetches = 0;
+        (fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(
+          async (id: string) => {
+            if (id !== "session-1") return [];
+            sessionOneFetches += 1;
+            // 1 = reselect load; 2 = the aborted turn's resync, carrying the
+            // assistant row the cancelled turn persisted after the reselect.
+            return sessionOneFetches === 1 ? [pollUser] : [pollUser, pollTool];
+          },
+        );
+
+        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+        const sendPromise = useSessionStore
+          .getState()
+          .sendMessage("hi", controller.signal);
+        await Promise.resolve();
+        await useSessionStore.getState().selectSession("session-2");
+        await useSessionStore.getState().selectSession("session-1");
+        controller.abort("compose_user_cancel");
+        await sendPromise;
+
+        expect(sessionOneFetches).toBe(2);
+        expect(
+          useSessionStore
+            .getState()
+            .messages.filter((m) => !m.id.startsWith("local-"))
+            .map((m) => m.id),
+        ).toEqual(["msg-poll-user", "msg-poll-tool"]);
+      });
+    });
+
     it("drops a stale send response after the active session changes", async () => {
       const { sendMessage: mockSendMessage } = await import("@/api/client");
       const sendDeferred = deferred<{

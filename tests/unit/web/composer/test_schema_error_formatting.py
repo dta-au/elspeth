@@ -50,6 +50,20 @@ def test_required_validator_does_not_produce_missing_field_error_for_scalar() ->
     assert _schema_error_summary(errors[0]) == "arguments must be of type object"
 
 
+def test_not_validator_names_the_reserved_value_rule_instead_of_the_keyword() -> None:
+    # The reserved-label disclosures (splice_transform node.id, set_pipeline
+    # nodes[].id) are "not" clauses; the summary must say what the rule means.
+    validator = Draft202012Validator(
+        {
+            "type": "object",
+            "properties": {"node": {"type": "object", "properties": {"id": {"type": "string", "not": {"enum": ["continue", "fork"]}}}}},
+        }
+    )
+    errors = list(validator.iter_errors({"node": {"id": "fork"}}))
+    assert [error.validator for error in errors] == ["not"]
+    assert _schema_error_summary(errors[0]) == "arguments.node.id must not be one of the reserved values"
+
+
 def test_gate_field_discovery_distinguishes_literal_fields_from_other_ast_values() -> None:
     assert _row_fields_referenced_by_condition(
         "row['direct'] == row.get('optional') and row['direct'] != row[0] and row.get(True) is None"

@@ -478,6 +478,8 @@ def _schema_error_summary(error: ValidationError) -> str:
         return f"{path} must be of type {_json_type_label(cast(str | list[str], error.validator_value))}"
     if error.validator == "enum":
         return f"{path} must be one of the declared values"
+    if error.validator == "not":
+        return f"{path} must not be one of the reserved values"
     return f"{path} violates schema rule '{error.validator}'"
 
 
@@ -507,7 +509,9 @@ def _validate_tool_arguments(
     if not errors:
         return None
     if raise_on_error:
-        raise _schema_tool_argument_error(tool_name, errors[0])
+        # The JSON-type guidance is decided on the reported error, so report a
+        # type fault whenever one exists, not whichever error sorts first.
+        raise _schema_tool_argument_error(tool_name, next((error for error in errors if error.validator == "type"), errors[0]))
     return _failure_result(state, f"Invalid arguments for tool '{tool_name}': {_schema_error_summary(errors[0])}.")
 
 

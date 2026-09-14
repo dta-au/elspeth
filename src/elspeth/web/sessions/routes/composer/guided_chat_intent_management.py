@@ -214,7 +214,49 @@ def _guided_stage_name(step: GuidedStep) -> StageName:
     raise AuditIntegrityError("Guided Chat step is outside the closed stage vocabulary")
 
 
-def _contradiction_chat(rejection: DeferredIntentRejected, *, latency_ms: int, retained: bool) -> StepChatResult:
+def _deferred_intent_recourse_sentence(intent_id: UUID) -> str:
+    """The one deterministic exit from a constraint-free, wire-blocking intent.
+
+    Shared verbatim by every retention path (F1 finding #23): the intent
+    carries no structural constraint, so nothing can ever claim it — the
+    ONLY exits are ``Edit exact intent <UUID>: ...`` and ``Cancel exact
+    intent <UUID>.``, and the UUID reaches the user only through this
+    sentence (elspeth-3d392c04ca, addendum 7992 #2).
+    """
+
+    return (
+        f"It is saved as instruction {intent_id} with no structural constraint, and wiring cannot be confirmed while it stands: "
+        f"send 'Edit exact intent {intent_id}: <corrected instruction>' to firm it up, or 'Cancel exact intent {intent_id}.' to drop it."
+    )
+
+
+def _deferred_intent_exact_command_message(deferred_intents: tuple[DeferredStageIntent, ...]) -> str:
+    """Name every current intent's id and exact commands after an unauthorised change.
+
+    A cancel or edit applies only when the user's own message is the exact
+    ``Cancel exact intent <UUID>.`` / ``Edit exact intent <UUID>: ...``
+    command, and the id reaches the user only through chat copy, so the
+    refusal names each current intent (session order, with its redacted
+    summary to tell them apart) rather than a placeholder (F1 finding #23).
+    """
+
+    if not deferred_intents:
+        raise AuditIntegrityError("ambiguous deferred management resolved without a current intent")
+    commands = " ".join(
+        f"For instruction {intent.intent_id} ({intent.redacted_summary}) send "
+        f"'Cancel exact intent {intent.intent_id}.' or 'Edit exact intent {intent.intent_id}: <new instruction>'."
+        for intent in deferred_intents
+    )
+    return f"Use an exact command before I change a saved instruction. {commands}"
+
+
+def _contradiction_chat(
+    rejection: DeferredIntentRejected,
+    *,
+    latency_ms: int,
+    retained: bool,
+    retained_intent_id: UUID | None = None,
+) -> StepChatResult:
     """Render one distinct, actionable contradiction rejection (ADR-033).
 
     The message names the exact conflicting retained intent and its
@@ -222,6 +264,12 @@ def _contradiction_chat(rejection: DeferredIntentRejected, *, latency_ms: int, r
     collapsed catch-all.  ``retained`` selects the wording for the R2-F15
     clarification-retention path versus a rejected edit of an existing
     intent, which leaves the original saved instruction in place.
+
+    When ``retained`` is True this call ALSO just minted a second,
+    constraint-free intent (``retained_intent_id``) distinct from the
+    conflicting one it names above — editing or cancelling the CONFLICTING
+    intent does nothing to clear that new one, so the copy must name both
+    (F1 finding #23).
     """
 
     contradiction = rejection.contradiction
@@ -240,8 +288,11 @@ def _contradiction_chat(rejection: DeferredIntentRejected, *, latency_ms: int, r
         if retained
         else "I did not change your saved instructions. "
     )
+    message = f"{retention}{conflict} {recourse}"
+    if retained and retained_intent_id is not None:
+        message = f"{message} {_deferred_intent_recourse_sentence(retained_intent_id)}"
     return StepChatResult(
-        assistant_message=f"{retention}{conflict} {recourse}",
+        assistant_message=message,
         status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
         latency_ms=latency_ms,
         error_class="DeferredIntentContradiction",
@@ -387,10 +438,7 @@ def _retained_unverified_chat(
         else:
             detail = "I couldn't verify its structural details against your message, so state the concrete structural requirement."
         error_class = "DeferredIntentRejected"
-    recourse = (
-        f"It is saved as instruction {intent_id} with no structural constraint, and wiring cannot be confirmed while it stands: "
-        f"send 'Edit exact intent {intent_id}: <corrected instruction>' to firm it up, or 'Cancel exact intent {intent_id}.' to drop it."
-    )
+    recourse = _deferred_intent_recourse_sentence(intent_id)
     return StepChatResult(
         assistant_message=f"I kept your instruction as a pending clarification instead of applying it. {detail} {recourse}",
         status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
@@ -399,8 +447,13 @@ def _retained_unverified_chat(
     )
 
 
-def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepChatResult:
+def _model_catalog_identity_chat(*, user_message: str, intent_id: UUID, latency_ms: int) -> StepChatResult:
     """Explain an unavailable model-authored catalog identity the user never named.
+
+    This retention path also mints a permanently unclaimable, constraint-free
+    intent (``intent_id``); the closing sentence must name it and the exact
+    Cancel/Edit commands (F1 finding #23) — the frame's own "Clarify..."
+    close does not, by itself, tell the user how to unblock wire confirmation.
 
     The message is COMPOSED, not selected: a shared frame open; at most one
     plugin-free clause plus the collector and aggregation clauses when the
@@ -537,7 +590,8 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
         "The plugin I proposed for it is not available here, and you did not ask for it by name, "
         "so I did not treat it as a deployment problem. "
         f"{''.join(clauses)}"
-        "Clarify the concrete topology structure and I'll firm it up."
+        "Clarify the concrete topology structure and I'll firm it up. "
+        f"{_deferred_intent_recourse_sentence(intent_id)}"
     )
     return StepChatResult(
         assistant_message=message,
@@ -574,10 +628,7 @@ def _apply_deferred_management(
             assistant_message = "That saved-instruction selection did not match its server binding, so I didn't change anything."
             error_class = "DeferredIntentBindingMismatch"
         else:
-            assistant_message = (
-                "Use an exact command before I change a saved instruction: "
-                "'Cancel exact intent <UUID>.' or 'Edit exact intent <UUID>: <new instruction>'."
-            )
+            assistant_message = _deferred_intent_exact_command_message(guided.deferred_intents)
             error_class = "DeferredIntentAmbiguous"
         unavailable = StepChatResult(
             assistant_message=assistant_message,
@@ -688,7 +739,7 @@ def _apply_one_deferred_action(
     ):
         return (
             _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
-            _model_catalog_identity_chat(user_message=originating_message.content, latency_ms=latency_ms),
+            _model_catalog_identity_chat(user_message=originating_message.content, intent_id=intent_id, latency_ms=latency_ms),
             intent_id,
         )
     disposition = validate_deferred_intent_action(
@@ -705,7 +756,7 @@ def _apply_one_deferred_action(
         # the exact conflicting retained intent with edit/cancel recourse.
         return (
             _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
-            _contradiction_chat(disposition, latency_ms=latency_ms, retained=True),
+            _contradiction_chat(disposition, latency_ms=latency_ms, retained=True, retained_intent_id=intent_id),
             intent_id,
         )
     if type(disposition) in {DeferredIntentClarification, DeferredIntentRejected}:
@@ -822,6 +873,11 @@ def apply_deferred_clarification(
     ``retained_deferred_intent_ids`` exactly like an ordinary retain, so
     ``_verify_guided_deferred_intent_append`` verifies the append and message
     binding unchanged.
+
+    ``chat`` was composed before this intent existed, so it cannot name the
+    UUID that is the only way to clear the wire-blocking debt it just
+    created; this appends that recourse (F1 finding #23) rather than leaving
+    the caller's generic "tell me more" copy as the only signal.
     """
     intent_id = authority.new_intent_ids[0]
     prospective = _append_clarification_intent(
@@ -829,9 +885,13 @@ def apply_deferred_clarification(
         intent_id=intent_id,
         originating_message=authority.originating_message,
     )
+    recoursed_chat = replace(
+        chat,
+        assistant_message=f"{chat.assistant_message} {_deferred_intent_recourse_sentence(intent_id)}",
+    )
     return DeferredRequestRetained(
         guided=prospective,
-        chat=chat,
+        chat=recoursed_chat,
         retained_intent_ids=(intent_id,),
     )
 

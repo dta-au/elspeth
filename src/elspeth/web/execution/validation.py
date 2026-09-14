@@ -82,7 +82,13 @@ from elspeth.web.execution._validation_materialization import (
     validate_llm_tracing_policy,
     validate_managed_identity_policy,
 )
-from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport, _blocked_readiness
+from elspeth.web.execution._validation_model import (
+    AuthoredValidatedState,
+    InterpretationValidatedState,
+    PhaseFailure,
+    PhaseReport,
+    _blocked_readiness,
+)
 from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 from elspeth.web.execution._validation_runtime import (
     _GraphBuilder,
@@ -109,16 +115,20 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
+    CHECK_INTERPRETATION_REVIEW,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     CHECK_SETTINGS,
     CHECK_VALUE_SOURCE_COMPLIANCE,
     VALIDATION_BLOCKING_CHECK_NAMES,
+    SemanticEdgeContractResponse,
     ValidationCheck,
     ValidationError,
     ValidationReadiness,
     ValidationResult,
 )
 from elspeth.web.interpretation_state import (
+    INTERPRETATION_REVIEW_DRIFT_CODE,
+    InterpretationReviewIntegrityError,
     InterpretationReviewPending,
     materialize_state_for_authoring,
     materialize_state_for_execution,
@@ -172,6 +182,62 @@ _DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
 def _apply_phase[T](ledger: ValidationLedger, outcome: PhaseReport[T] | PhaseFailure) -> T:
     """Apply one typed outcome; failures terminate through ``PhaseTermination``."""
     return outcome.apply(ledger)
+
+
+def _interpretation_review_drift_failure(
+    exc: InterpretationReviewIntegrityError,
+    *,
+    semantic_contracts: tuple[SemanticEdgeContractResponse, ...],
+) -> PhaseFailure:
+    """Readiness failure for resolved review evidence the strict materializer refused.
+
+    /execute maps the same error to a structured 409; here it becomes the
+    interpretation-review check's failure so /validate reports a blocker
+    instead of letting the exception escape as a 500. Fixed copy naming the
+    component and review kind: the raw integrity message (hash domains) is
+    not carried. The review is deliberately NOT reopened — re-approving over
+    drifted evidence is an operator ruling, not a validation side effect.
+    """
+    detail = f"The approved {exc.kind.value} review for {exc.component_type} {exc.component_id!r} no longer matches the current pipeline."
+    return PhaseFailure(
+        passed_checks=(),
+        failed_check=ValidationCheck(
+            name=CHECK_INTERPRETATION_REVIEW,
+            passed=False,
+            detail=detail,
+            affected_nodes=(exc.component_id,) if exc.component_type == "transform" else (),
+            outcome_code=None,
+        ),
+        errors=(
+            ValidationError(
+                component_id=exc.component_id,
+                component_type=exc.component_type,
+                message=detail,
+                suggestion=("Restore the reviewed value, or replace this component so its review is staged again, before running."),
+                error_code=INTERPRETATION_REVIEW_DRIFT_CODE,
+            ),
+        ),
+        readiness=_blocked_readiness(
+            code=INTERPRETATION_REVIEW_DRIFT_CODE,
+            detail=detail,
+            component_id=exc.component_id,
+            component_type=exc.component_type,
+            authoring_valid=True,
+        ),
+        semantic_contracts=semantic_contracts,
+    )
+
+
+def _review_interpretations_or_drift_failure(
+    authored: AuthoredValidatedState,
+    *,
+    allow_pending_placeholders: bool,
+) -> PhaseReport[InterpretationValidatedState] | PhaseFailure:
+    """The interpretation-review phase outcome, with resolved-review drift as its failure."""
+    try:
+        return review_interpretations(authored, allow_pending_placeholders=allow_pending_placeholders)
+    except InterpretationReviewIntegrityError as exc:
+        return _interpretation_review_drift_failure(exc, semantic_contracts=authored.semantic_contracts)
 
 
 def _build_edge_contract_suggestion(
@@ -527,7 +593,7 @@ def _validate_pipeline_impl(
     )
     interpretation_validated = _apply_phase(
         ledger,
-        review_interpretations(
+        _review_interpretations_or_drift_failure(
             batch_validated,
             allow_pending_placeholders=allow_pending_interpretation_placeholders,
         ),

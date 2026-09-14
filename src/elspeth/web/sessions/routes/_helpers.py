@@ -10,7 +10,8 @@ import asyncio
 import contextlib
 import json
 import sys
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import replace as _replace
@@ -25,7 +26,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from opentelemetry import metrics
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import insert
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeoutError
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
@@ -134,7 +136,7 @@ from elspeth.web.composer.telemetry_phase8 import (
 )
 from elspeth.web.composer.tools import ToolResult, execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
-from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry
+from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, DatabaseComposerProgressRegistry
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import (
     COMPLETION_GATES_META_KEY,
@@ -173,6 +175,7 @@ from elspeth.web.sessions.protocol import (
     ChatMessageRole,
     ComposerSessionPreferencesRecord,
     CompositionProposalRecord,
+    CompositionRejectionEventRecord,
     CompositionStateData,
     CompositionStateRecord,
     CompositionValidationError,
@@ -229,6 +232,7 @@ from elspeth.web.sessions.schemas import (
     SendMessageRequest,
     SessionResponse,
     TerminalStateResponse,
+    ToolRejectionResponse,
     TurnPayloadResponse,
     TurnRecordResponse,
     UpdateComposerPreferencesRequest,
@@ -592,11 +596,29 @@ def _tool_call_outcomes_by_call_id(
     return outcomes
 
 
+def _rejections_by_tool_call_id(
+    records: Sequence[CompositionRejectionEventRecord],
+) -> dict[str, CompositionRejectionEventRecord]:
+    """Index one session's rejection rows by provider tool_call_id.
+
+    ``uq_chat_messages_tool_call_id`` makes a tool_call_id unique per session
+    and the compose loop writes at most one rejection per tool row, so a
+    duplicate is Tier-1 corruption: crash rather than silently pick one.
+    """
+    indexed: dict[str, CompositionRejectionEventRecord] = {}
+    for record in records:
+        if record.tool_call_id in indexed:
+            raise AuditIntegrityError("composition_rejection_events holds two rows for one tool_call_id in a session")
+        indexed[record.tool_call_id] = record
+    return indexed
+
+
 def _message_response(
     msg: ChatMessageRecord,
     *,
     include_raw_content: bool = False,
     tool_outcomes: Mapping[str, _ToolCallOutcome] | None = None,
+    rejections: Mapping[str, CompositionRejectionEventRecord] | None = None,
 ) -> ChatMessageResponse:
     """Convert a ChatMessageRecord to a ChatMessageResponse.
 
@@ -612,6 +634,11 @@ def _message_response(
     stamp is derived from Tier-1 tool rows server-side — never from tool
     names. Envelopes without a projection are passed through untouched and
     render under the client's conservative default.
+
+    ``rejections`` (elspeth-3e28029d2f read side) is supplied only by the
+    audit-grade view under ``include_rejection_reasons``; a ``role="tool"``
+    row whose call id has a rejection row carries it as ``rejection``. Every
+    other caller omits it and the field stays ``None``.
     """
     tool_calls = deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None
     if tool_calls is not None and tool_outcomes:
@@ -636,6 +663,22 @@ def _message_response(
                 }
             stamped.append(entry)
         tool_calls = stamped
+    rejection_record = (
+        rejections[msg.tool_call_id]
+        if rejections is not None and msg.role == "tool" and msg.tool_call_id is not None and msg.tool_call_id in rejections
+        else None
+    )
+    rejection = (
+        ToolRejectionResponse(
+            tool_name=rejection_record.tool_name,
+            error_code=rejection_record.error_code,
+            message=rejection_record.message,
+            composition_state_id=rejection_record.composition_state_id,
+            created_at=rejection_record.created_at,
+        )
+        if rejection_record is not None
+        else None
+    )
     return ChatMessageResponse(
         id=str(msg.id),
         session_id=str(msg.session_id),
@@ -655,6 +698,7 @@ def _message_response(
         tool_call_id=msg.tool_call_id,
         parent_assistant_id=str(msg.parent_assistant_id) if msg.parent_assistant_id else None,
         sequence_no=msg.sequence_no,
+        rejection=rejection,
     )
 
 
@@ -2283,6 +2327,107 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
 
 _COMPOSER_HEARTBEAT_SECONDS = 15.0
 
+_COMPOSER_REQUEST_LEASE_SECONDS = 60
+"""Lifetime a composer request lease gains on each renewal.
+
+Copy of ``SessionComposerProgressAuthority``'s ``lease_seconds`` default,
+which ``web/app.py`` does not override. The progress-registry protocol does
+not expose the lease length, so the heartbeat derives its retry headroom
+from this copy.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerHeartbeatTimer:
+    """Clock and wait the compose heartbeat measures its lease headroom with.
+
+    ``now`` is a monotonic reading in seconds and ``wait`` suspends for the
+    given seconds. Kept together so a test that fakes the clock also fakes the
+    interval wait it measures.
+    """
+
+    now: Callable[[], float]
+    wait: Callable[[float], Awaitable[None]]
+
+
+_COMPOSER_HEARTBEAT_TIMER = _ComposerHeartbeatTimer(now=time.monotonic, wait=asyncio.sleep)
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerHeartbeatCancel:
+    """Why the compose heartbeat cancelled its owning request.
+
+    Only the three module singletons below exist. One is passed through
+    ``Task.cancel(message)``, so it arrives as the sole ``CancelledError.args``
+    entry and is recognised by identity, exactly like
+    ``_CLIENT_DISCONNECT_CANCEL_MARKER``. Unlike that marker it names why, so a
+    route can record a server fault instead of a client Stop.
+    """
+
+    kind: Literal["transient_exhausted", "lease_lost", "renewal_defect"]
+
+
+_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED = _ComposerHeartbeatCancel(kind="transient_exhausted")
+_COMPOSER_HEARTBEAT_LEASE_LOST = _ComposerHeartbeatCancel(kind="lease_lost")
+_COMPOSER_HEARTBEAT_RENEWAL_DEFECT = _ComposerHeartbeatCancel(kind="renewal_defect")
+# Keyed by identity: the singletons live for the whole process, so no other
+# live object (such as a CancelledError's argument) can share one of these ids.
+_COMPOSER_HEARTBEAT_CANCELS_BY_ID: Final[dict[int, _ComposerHeartbeatCancel]] = {
+    id(marker): marker
+    for marker in (
+        _COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED,
+        _COMPOSER_HEARTBEAT_LEASE_LOST,
+        _COMPOSER_HEARTBEAT_RENEWAL_DEFECT,
+    )
+}
+
+
+def _composer_heartbeat_cancel_of(exc: asyncio.CancelledError) -> _ComposerHeartbeatCancel | None:
+    """Return the heartbeat's cancel marker when ``exc`` was delivered by it."""
+    if len(exc.args) != 1:
+        return None
+    delivered_id = id(exc.args[0])
+    if delivered_id not in _COMPOSER_HEARTBEAT_CANCELS_BY_ID:
+        return None
+    return _COMPOSER_HEARTBEAT_CANCELS_BY_ID[delivered_id]
+
+
+def _composer_heartbeat_failed_progress_event() -> ComposerProgressEvent:
+    """Terminal progress for a request the server cancelled after losing its lease.
+
+    A server fault, never ``client_cancelled``: the user did not press Stop.
+    ``service_setup_failed`` is the progress contract's catch-all server-side
+    code; the contract has no dedicated lease-loss code.
+    """
+    return ComposerProgressEvent(
+        phase="failed",
+        headline="The server could not keep this composer request running.",
+        evidence=("The server lost this request's lease before the composer finished.",),
+        likely_next="Resubmit the message.",
+        reason="service_setup_failed",
+    )
+
+
+def _composer_heartbeat_http_error(cancel: _ComposerHeartbeatCancel) -> HTTPException:
+    """Structured, retryable 503 for a request the heartbeat cancelled."""
+    if cancel.kind == "transient_exhausted":
+        # Same envelope text as the app's OperationalError handler, which is
+        # what this request answered before the heartbeat learned to retry.
+        return HTTPException(
+            status_code=503,
+            detail={
+                "error_type": "database_unavailable",
+                "detail": "Database is currently unavailable. Please retry in a moment.",
+            },
+        )
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error_type": "composer_request_lease_lost",
+            "detail": "The server lost this composer request's lease before it finished. Please resubmit.",
+        },
+    )
+
 
 async def _track_compose_inflight(
     session_id: UUID,
@@ -2306,7 +2451,21 @@ async def _track_compose_inflight(
 
     Admission follows authenticated session ownership verification. Each request
     owns an exact server token, renewed until teardown, including long provider
-    calls and lock waits. Losing renewal cancels the owning request.
+    calls and lock waits.
+
+    Renewal failures (finding #28): a transient database failure
+    (``OperationalError``, pool ``TimeoutError``) is retried only while the
+    next attempt would still start inside the lease. Headroom is measured in
+    time since the last good renewal, not in failures, because a pool checkout
+    that times out takes 30 s to fail; a renewal still unresolved when the
+    lease runs out is abandoned. A lost lease (``ComposerRequestLeaseLost``,
+    ``PermissionError``) or any other renewal failure cancels the owning
+    request at once. The cancel carries a
+    :class:`_ComposerHeartbeatCancel` marker, so it is recorded as ``failed``
+    rather than a client ``cancelled``, and it leaves this dependency as a
+    structured 503 (or, for a renewal defect, as the defect itself) instead of
+    a bare cancellation. Teardown never re-raises the heartbeat's stored
+    renewal failure over the request's own outcome.
     """
     await _verify_session_ownership(session_id, user, request)
     registry = _get_composer_progress_registry(request)
@@ -2314,6 +2473,11 @@ async def _track_compose_inflight(
     # This dependency is mounted only on Composer endpoints. Collapse the
     # route family to a closed surface label; never export the raw path.
     surface: Literal["freeform", "guided"] = "guided" if "/guided/" in request.url.path else "freeform"
+    timer = _COMPOSER_HEARTBEAT_TIMER
+    # Read before the call that creates the lease: the database stamps its
+    # expiry during that call, so the lease lasts at least
+    # _COMPOSER_REQUEST_LEASE_SECONDS from this reading.
+    lease_started_at = timer.now()
     lease = await registry.start_request(sid, user.user_id)
     request.state.composer_request_lease = lease
     metrics_token = begin_composer_request_metrics(surface=surface)
@@ -2324,20 +2488,118 @@ async def _track_compose_inflight(
         raise RuntimeError("Composer lifecycle requires an owning task")
 
     async def renew() -> None:
-        try:
-            while True:
-                await asyncio.sleep(_COMPOSER_HEARTBEAT_SECONDS)
-                await registry.renew_request(lease)
-        except Exception:
-            owner_task.cancel()
-            raise
+        # Every exit except a transient retry cancels the owner and re-raises,
+        # so the heartbeat task ends holding the renewal failure. exc_info is
+        # deliberately omitted from the diagnostics: SQLAlchemy cause chains
+        # carry the database URL.
+        #
+        # Lease headroom is time, not a failure count: a pool checkout that
+        # times out takes 30 s to fail, so three counted failures ran 75 s past
+        # a 60 s lease. ``renewed_at`` is read before the call that last
+        # extended the lease, for the same reason as ``lease_started_at``.
+        renewed_at = lease_started_at
+        consecutive_failures = 0
+
+        def lease_headroom_exhausted(exc: Exception) -> bool:
+            # Records a transient failure; True when the next attempt would
+            # start outside the lease, so the owner must be cancelled now.
+            nonlocal consecutive_failures
+            consecutive_failures += 1
+            seconds_since_renewal = timer.now() - renewed_at
+            exhausted = seconds_since_renewal + _COMPOSER_HEARTBEAT_SECONDS >= _COMPOSER_REQUEST_LEASE_SECONDS
+            if exhausted:
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "compose.heartbeat_cancelled_request",
+                    kind=_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED.kind,
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                    seconds_since_renewal=round(seconds_since_renewal, 1),
+                )
+            else:
+                _log_last_resort_diagnostic(
+                    slog.warning,
+                    "compose.heartbeat_renewal_retrying",
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                    seconds_since_renewal=round(seconds_since_renewal, 1),
+                )
+            return exhausted
+
+        while True:
+            await timer.wait(_COMPOSER_HEARTBEAT_SECONDS)
+            attempt_started_at = timer.now()
+            # A renewal still unresolved when the lease runs out is abandoned
+            # rather than left to hold the request past its lease.
+            lease_deadline = asyncio.timeout(renewed_at + _COMPOSER_REQUEST_LEASE_SECONDS - attempt_started_at)
+            try:
+                async with lease_deadline:
+                    await registry.renew_request(lease)
+            except (OperationalError, SQLAlchemyPoolTimeoutError) as exc:
+                # The one failure family that models a transient blip (a
+                # connection dropped mid-transaction, pool exhaustion, a
+                # failover): retried only while the next attempt would still
+                # start inside the lease.
+                if lease_headroom_exhausted(exc):
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED)
+                    raise
+            except TimeoutError as exc:
+                if not lease_deadline.expired():
+                    # A TimeoutError the renewal raised itself, not the lease
+                    # deadline above: treated like any other renewal defect.
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_RENEWAL_DEFECT)
+                    raise
+                # The lease deadline expired with the renewal unresolved.
+                if lease_headroom_exhausted(exc):
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED)
+                    raise
+            except (ComposerRequestLeaseLost, PermissionError) as exc:
+                # The lease row is gone, expired or no longer ours: renewing
+                # again cannot restore it.
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "compose.heartbeat_cancelled_request",
+                    kind=_COMPOSER_HEARTBEAT_LEASE_LOST.kind,
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                )
+                owner_task.cancel(_COMPOSER_HEARTBEAT_LEASE_LOST)
+                raise
+            except Exception:
+                # Anything else is a first-party defect: the owning request
+                # raises it (see the CancelledError arm below).
+                owner_task.cancel(_COMPOSER_HEARTBEAT_RENEWAL_DEFECT)
+                raise
+            else:
+                renewed_at = attempt_started_at
+                consecutive_failures = 0
 
     heartbeat = asyncio.create_task(renew())
     try:
         yield
-    except asyncio.CancelledError:
-        terminal_status = "cancelled"
-        raise
+    except asyncio.CancelledError as exc:
+        heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
+        if heartbeat_cancel is None:
+            terminal_status = "cancelled"
+            raise
+        # The heartbeat re-raised in the same step that cancelled this task,
+        # so it is done and holds the renewal failure; retrieving it here is
+        # what keeps teardown from ever re-raising it.
+        renewal_failure = heartbeat.exception()
+        # Convert only when the heartbeat's cancel is the task's sole pending
+        # request (the disconnect watcher's rule): an external cancel (server
+        # shutdown) racing it keeps unwinding as genuinely cancelled.
+        if owner_task.uncancel() > 0:
+            terminal_status = "cancelled"
+            raise
+        terminal_status = "failed"
+        if renewal_failure is None:
+            raise RuntimeError("Composer heartbeat cancelled its request without a renewal failure") from exc
+        if heartbeat_cancel is _COMPOSER_HEARTBEAT_RENEWAL_DEFECT:
+            # Keep the defect's own cause chain; the cancellation is only the
+            # delivery mechanism, not its cause.
+            raise renewal_failure from renewal_failure.__cause__
+        raise _composer_heartbeat_http_error(heartbeat_cancel) from exc
     except TimeoutError:
         terminal_status = "timed_out"
         raise
@@ -2355,10 +2617,14 @@ async def _track_compose_inflight(
     finally:
         primary_error = sys.exception()
         try:
-            heartbeat.cancel()
             try:
-                with suppress(asyncio.CancelledError):
-                    await heartbeat
+                # A heartbeat that already ended holds the renewal failure it
+                # cancelled this request over; awaiting it would re-raise that
+                # failure over the request's own outcome (finding #28).
+                if not heartbeat.done():
+                    heartbeat.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat
             finally:
                 await registry.finish_request(lease)
         finally:
@@ -3608,6 +3874,8 @@ __all__ = [
     "_composer_conversation_or_llm_audit_messages",
     "_composer_conversation_or_tool_messages",
     "_composer_conversation_tool_or_llm_audit_messages",
+    "_composer_heartbeat_cancel_of",
+    "_composer_heartbeat_failed_progress_event",
     "_composer_history_content",
     "_composer_persisted_validation",
     "_composer_preferences_response",
@@ -3643,6 +3911,7 @@ __all__ = [
     "_record_composer_authoring_validation_telemetry",
     "_record_composer_request_terminal",
     "_record_composer_runtime_preflight_telemetry",
+    "_rejections_by_tool_call_id",
     "_replace",
     "_run_accounting_integrity_http",
     "_runtime_preflight_failure_errors",

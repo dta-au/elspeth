@@ -159,6 +159,7 @@ vi.mock("../api/client", () => ({
   fetchSystemStatus: vi.fn().mockResolvedValue({
     composer_available: true,
     composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
     composer_provider: "openai",
     composer_reason: null,
     composer_missing_keys: [],
@@ -406,6 +407,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],

@@ -20,8 +20,8 @@
     "shape": "declarative"
   },
   "explain_validation_error": {
-    "hash": "61a5770a00f1d2896ade1764d08f6fad36cb0d3567e96c1400f712404bbd288b",
-    "sensitive_path_count": 0,
+    "hash": "b28cfaadff3dfcd70a41dc5ecbe85baa8bca3781b5f8cc77508d9a5743d79fd6",
+    "sensitive_path_count": 1,
     "shape": "declarative"
   },
   "get_audit_info": {

@@ -31,7 +31,16 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import (
+    DBAPIError,
+    DisconnectionError,
+    InterfaceError,
+    OperationalError,
+    PendingRollbackError,
+    ProgrammingError,
+    SQLAlchemyError,
+)
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from elspeth.contracts import CallType, NodeStateStatus, NodeType
 from elspeth.contracts.audit import TokenRef
@@ -98,9 +107,19 @@ from elspeth.web.execution.schemas import (
     ValidationResult,
 )
 from elspeth.web.execution.secret_guard import ExecutionSecretApprovalRequired
-from elspeth.web.execution.service import _MAX_FRAME_PATH_PARTS, ExecutionServiceImpl, _discover_blob_rows_sources
+from elspeth.web.execution.service import (
+    _LOSS_WATCHER_ESCALATE_AFTER_FAILURES,
+    _MAX_FRAME_PATH_PARTS,
+    ExecutionServiceImpl,
+    InlineBlobPromptSurfaceAdmissionError,
+    _discover_blob_rows_sources,
+)
 from elspeth.web.execution.validation import validate_pipeline as _real_validate_pipeline
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
+    prompt_review_anchor_hash_from_options,
+)
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
     PluginAvailabilitySnapshot,
@@ -1122,6 +1141,35 @@ class TestExecutionFlow:
         source_path = tmp_path / "blobs" / "input.txt"
         source_path.write_text("Ada\n" * 34, encoding="utf-8")
         mock_settings.data_dir = tmp_path
+        summarise_options: dict[str, Any] = {
+            "profile": "tutorial",
+            "prompt_template": "Summarise {{ row }}",
+            "schema": {"mode": "observed", "fields": None},
+            "required_input_fields": [],
+            "queries": [
+                {"name": "summary", "input_fields": {"text": "body"}},
+                {"name": "sentiment", "input_fields": {"text": "body"}},
+                {"name": "topics", "input_fields": {"text": "body"}},
+            ],
+        }
+        # A multi-query node's accepted review is anchored to the whole prompt
+        # SURFACE (per-query templates + system prompt + node-level template),
+        # exactly as the live resolve path writes it; a bare hash of the
+        # node-level prompt_template is not that anchor, and execution
+        # refuses it as drift.
+        summarise_options[INTERPRETATION_REQUIREMENTS_KEY] = [
+            {
+                "id": "prompt_template_review:summarise",
+                "kind": "llm_prompt_template",
+                "user_term": "llm_prompt_template:summarise",
+                "status": "resolved",
+                "draft": "Summarise {{ row }}",
+                "event_id": "prompt-template-accepted:summarise",
+                "accepted_value": "Summarise {{ row }}",
+                "accepted_artifact_hash": None,
+                "resolved_prompt_template_hash": prompt_review_anchor_hash_from_options(summarise_options),
+            }
+        ]
         state_record = _composition_state_record(
             session_id=session_id,
             source_path=source_path,
@@ -1134,30 +1182,7 @@ class TestExecutionFlow:
                     "input": "source_rows",
                     "on_success": "out",
                     "on_error": "discard",
-                    "options": {
-                        "profile": "tutorial",
-                        "prompt_template": "Summarise {{ row }}",
-                        "schema": {"mode": "observed", "fields": None},
-                        "required_input_fields": [],
-                        "queries": [
-                            {"name": "summary", "input_fields": {"text": "body"}},
-                            {"name": "sentiment", "input_fields": {"text": "body"}},
-                            {"name": "topics", "input_fields": {"text": "body"}},
-                        ],
-                        INTERPRETATION_REQUIREMENTS_KEY: [
-                            {
-                                "id": "prompt_template_review:summarise",
-                                "kind": "llm_prompt_template",
-                                "user_term": "llm_prompt_template:summarise",
-                                "status": "resolved",
-                                "draft": "Summarise {{ row }}",
-                                "event_id": "prompt-template-accepted:summarise",
-                                "accepted_value": "Summarise {{ row }}",
-                                "accepted_artifact_hash": None,
-                                "resolved_prompt_template_hash": stable_hash("Summarise {{ row }}"),
-                            }
-                        ],
-                    },
+                    "options": summarise_options,
                 }
             ],
         )
@@ -8898,7 +8923,17 @@ class TestTransformProviderConfigPathRestriction:
     """
 
     @staticmethod
-    def _resolved_llm_reviews(*, node_id: str, prompt_template: str, model: str) -> list[dict[str, object]]:
+    def _resolved_llm_reviews(*, node_id: str, options: Mapping[str, Any], model: str) -> list[dict[str, object]]:
+        """Resolved reviews for ``options``, anchored as the live resolve path anchors them.
+
+        ``options`` is the node's option mapping WITHOUT the requirements entry.
+        A multi-query node's prompt review attests the whole prompt surface, so
+        its anchor comes from :func:`prompt_review_anchor_hash_from_options`;
+        a single-prompt node keeps the bare ``stable_hash(prompt_template)``.
+        """
+        prompt_template = options["prompt_template"]
+        assert isinstance(prompt_template, str)
+        surface_anchor = prompt_review_anchor_hash_from_options(options)
         return [
             {
                 "id": f"prompt_template_review:{node_id}",
@@ -8909,7 +8944,7 @@ class TestTransformProviderConfigPathRestriction:
                 "event_id": f"prompt-template-accepted:{node_id}",
                 "accepted_value": prompt_template,
                 "accepted_artifact_hash": None,
-                "resolved_prompt_template_hash": stable_hash(prompt_template),
+                "resolved_prompt_template_hash": surface_anchor if surface_anchor is not None else stable_hash(prompt_template),
             },
             {
                 "id": f"model_choice_review:{node_id}",
@@ -9130,6 +9165,16 @@ class TestTransformProviderConfigPathRestriction:
         model = "openai/gpt-4o-mini"
         state.source = None
         state.outputs = None
+        options: dict[str, Any] = {
+            "provider": "openrouter",
+            "model": model,
+            "api_key": "test-key",
+            "prompt_template": prompt_template,
+            "schema": {"mode": "observed"},
+            "required_input_fields": [],
+            "queries": [{"name": "classify", "input_fields": {"text": "body"}}],
+        }
+        options[INTERPRETATION_REQUIREMENTS_KEY] = self._resolved_llm_reviews(node_id=node_id, options=options, model=model)
         state.nodes = [
             {
                 "id": node_id,
@@ -9138,20 +9183,7 @@ class TestTransformProviderConfigPathRestriction:
                 "input": "transform_in",
                 "on_success": "results",
                 "on_error": "discard",
-                "options": {
-                    "provider": "openrouter",
-                    "model": model,
-                    "api_key": "test-key",
-                    "prompt_template": prompt_template,
-                    "schema": {"mode": "observed"},
-                    "required_input_fields": [],
-                    "queries": [{"name": "classify", "input_fields": {"text": "body"}}],
-                    INTERPRETATION_REQUIREMENTS_KEY: self._resolved_llm_reviews(
-                        node_id=node_id,
-                        prompt_template=prompt_template,
-                        model=model,
-                    ),
-                },
+                "options": options,
             }
         ]
         state.edges = None
@@ -9179,6 +9211,17 @@ class TestTransformProviderConfigPathRestriction:
         model = "openai/gpt-4o-mini"
         state.source = None
         state.outputs = None
+        pooled_options: dict[str, Any] = {
+            "provider": "openrouter",
+            "model": model,
+            "api_key": "test-key",
+            "prompt_template": prompt_template,
+            "schema": {"mode": "observed"},
+            "required_input_fields": [],
+            "queries": [{"name": "classify", "input_fields": {"text": "body"}}],
+            "pool_size": "2.0",
+        }
+        pooled_options[INTERPRETATION_REQUIREMENTS_KEY] = self._resolved_llm_reviews(node_id=node_id, options=pooled_options, model=model)
         state.nodes = [
             {
                 "id": node_id,
@@ -9187,21 +9230,7 @@ class TestTransformProviderConfigPathRestriction:
                 "input": "transform_in",
                 "on_success": "results",
                 "on_error": "discard",
-                "options": {
-                    "provider": "openrouter",
-                    "model": model,
-                    "api_key": "test-key",
-                    "prompt_template": prompt_template,
-                    "schema": {"mode": "observed"},
-                    "required_input_fields": [],
-                    "queries": [{"name": "classify", "input_fields": {"text": "body"}}],
-                    "pool_size": "2.0",
-                    INTERPRETATION_REQUIREMENTS_KEY: self._resolved_llm_reviews(
-                        node_id=node_id,
-                        prompt_template=prompt_template,
-                        model=model,
-                    ),
-                },
+                "options": pooled_options,
             }
         ]
         state.edges = None
@@ -11188,3 +11217,397 @@ class TestFanoutMarkerCollectorArm:
         upstream = guard.risks[0].upstream_fanout
         assert "collector:c1:batch_replicate" in upstream
         assert "transform:op:json_explode" in upstream  # control: the opener was always marked
+
+
+class TestLossWatcherPollResilience:
+    """The execution loss watcher must survive transient session-DB errors.
+
+    ``_signal_shutdown_on_operation_loss`` is the only carrier of a durable
+    ``cancel_requested_at`` (written by whichever replica received the cancel)
+    to the worker that owns the run. A single exception from its poll used to
+    end the task for good, and ``_on_pipeline_done`` discarded that exception,
+    so a later cross-replica cancel was silently ignored.
+    """
+
+    def _watch(
+        self,
+        service: ExecutionServiceImpl,
+        real_loop: asyncio.AbstractEventLoop,
+        shutdown_event: threading.Event,
+        run_id: UUID,
+    ) -> None:
+        # The timeout is a hang guard for a broken watcher, not a timing claim.
+        real_loop.run_until_complete(
+            asyncio.wait_for(
+                service._signal_shutdown_on_operation_loss(_execute_lease(), shutdown_event, run_id=run_id),
+                timeout=60,
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("transient_error", "exc_class"),
+        [
+            pytest.param(
+                OperationalError("SELECT runs", {}, Exception("database is locked")),
+                "OperationalError",
+                id="operational",
+            ),
+            # The PostgreSQL session engine is a bounded QueuePool
+            # (postgres_engine_kwargs); exhaustion raises this pool checkout
+            # timeout, which is not an OperationalError.
+            pytest.param(
+                SQLAlchemyTimeoutError("QueuePool limit of size 5 overflow 5 reached, connection timed out"),
+                "TimeoutError",
+                id="pool-checkout-timeout",
+            ),
+            pytest.param(
+                InterfaceError("SELECT runs", {}, Exception("connection already closed")),
+                "InterfaceError",
+                id="interface",
+            ),
+            # SQLAlchemy's disconnect detection flags the wrapped DBAPI error
+            # whatever class it maps to.
+            pytest.param(
+                DBAPIError("SELECT runs", {}, Exception("terminating connection"), connection_invalidated=True),
+                "DBAPIError",
+                id="connection-invalidated",
+            ),
+            # Raised by the pool itself on a dead connection at checkout; not a
+            # DBAPIError, so only the transient tuple can admit it.
+            pytest.param(
+                DisconnectionError("connection dead at checkout"),
+                "DisconnectionError",
+                id="disconnection",
+            ),
+        ],
+    )
+    def test_transient_poll_error_does_not_lose_a_later_remote_cancel(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        real_loop: asyncio.AbstractEventLoop,
+        transient_error: SQLAlchemyError,
+        exc_class: str,
+    ) -> None:
+        run_id = uuid4()
+        shutdown_event = threading.Event()
+        polls: list[UUID] = []
+
+        async def get_run(requested: UUID) -> SimpleNamespace:
+            polls.append(requested)
+            assert not shutdown_event.is_set(), "a poll failure must not cancel the run"
+            if len(polls) == 1:
+                raise transient_error
+            return _run_record_stub(id=run_id, status="running", cancel_requested_at=datetime.now(UTC))
+
+        mock_session_service.get_run.side_effect = get_run
+
+        with patch("elspeth.web.execution.service.slog") as mock_slog:
+            self._watch(service, real_loop, shutdown_event, run_id)
+
+        assert shutdown_event.is_set(), "the durable cancel after a transient poll error must still reach the worker"
+        assert polls == [run_id, run_id]
+        mock_slog.warning.assert_called_once()
+        event_name, *_ = mock_slog.warning.call_args.args
+        assert event_name == "execution_loss_watcher_poll_retrying"
+        assert mock_slog.warning.call_args.kwargs == {
+            "run_id": str(run_id),
+            "exc_class": exc_class,
+            "consecutive_failures": 1,
+        }
+        mock_slog.error.assert_not_called()
+
+    def test_repeated_poll_errors_escalate_to_error_logs_and_never_cancel_the_run(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        real_loop: asyncio.AbstractEventLoop,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("elspeth.web.execution.service._LOSS_WATCHER_POLL_SECONDS", 0.001)
+        monkeypatch.setattr("elspeth.web.execution.service._LOSS_WATCHER_MAX_BACKOFF_SECONDS", 0.004)
+        run_id = uuid4()
+        shutdown_event = threading.Event()
+        failures = _LOSS_WATCHER_ESCALATE_AFTER_FAILURES + 2
+        polls: list[UUID] = []
+
+        async def get_run(requested: UUID) -> SimpleNamespace:
+            polls.append(requested)
+            # Cancelling a running pipeline because the session DB is flaky is
+            # an operator decision this watcher does not take.
+            assert not shutdown_event.is_set(), "repeated poll failures must not set the shutdown event"
+            if len(polls) <= failures:
+                raise OperationalError("SELECT runs", {}, Exception("server closed the connection unexpectedly"))
+            return _run_record_stub(id=run_id, status="running", cancel_requested_at=datetime.now(UTC))
+
+        mock_session_service.get_run.side_effect = get_run
+
+        with patch("elspeth.web.execution.service.slog") as mock_slog:
+            self._watch(service, real_loop, shutdown_event, run_id)
+
+        assert shutdown_event.is_set(), "the watcher must keep polling through the outage and deliver the cancel"
+        assert len(polls) == failures + 1
+        warning_counts = [call.kwargs["consecutive_failures"] for call in mock_slog.warning.call_args_list]
+        assert warning_counts == list(range(1, _LOSS_WATCHER_ESCALATE_AFTER_FAILURES))
+        assert {call.args[0] for call in mock_slog.warning.call_args_list} == {"execution_loss_watcher_poll_retrying"}
+        error_counts = [call.kwargs["consecutive_failures"] for call in mock_slog.error.call_args_list]
+        assert error_counts == list(range(_LOSS_WATCHER_ESCALATE_AFTER_FAILURES, failures + 1))
+        assert {call.args[0] for call in mock_slog.error.call_args_list} == {"execution_loss_watcher_poll_degraded"}
+
+    @pytest.mark.parametrize(
+        ("non_transient_error", "exc_class"),
+        [
+            # PostgreSQL wording: SQLite reports a missing column as an
+            # OperationalError, which this watcher retries.
+            pytest.param(
+                ProgrammingError("SELECT runs", {}, Exception("column runs.cancel_requested_at does not exist")),
+                "ProgrammingError",
+                id="programming",
+            ),
+            # A DBAPI error SQLAlchemy did NOT flag as a disconnect is not
+            # retried merely for being a DBAPIError.
+            pytest.param(
+                DBAPIError("SELECT runs", {}, Exception("unclassified driver error"), connection_invalidated=False),
+                "DBAPIError",
+                id="dbapi-connection-valid",
+            ),
+            # Not a DBAPIError, so only the final SQLAlchemyError arm can
+            # handle it; the two params above never reach that arm.
+            pytest.param(
+                PendingRollbackError("Can't reconnect until invalid transaction is rolled back"),
+                "PendingRollbackError",
+                id="non-dbapi-pending-rollback",
+            ),
+        ],
+    )
+    def test_non_transient_poll_error_is_logged_and_raised_without_cancelling(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        real_loop: asyncio.AbstractEventLoop,
+        non_transient_error: SQLAlchemyError,
+        exc_class: str,
+    ) -> None:
+        run_id = uuid4()
+        shutdown_event = threading.Event()
+        polls: list[UUID] = []
+
+        async def get_run(requested: UUID) -> SimpleNamespace:
+            polls.append(requested)
+            if len(polls) == 1:
+                raise non_transient_error
+            # Reached only if the watcher swallowed the error and polled again:
+            # the watcher then returns normally and pytest.raises goes red
+            # promptly instead of spinning until the hang guard.
+            return _run_record_stub(id=run_id, status="running", cancel_requested_at=datetime.now(UTC))
+
+        mock_session_service.get_run.side_effect = get_run
+
+        with patch("elspeth.web.execution.service.slog") as mock_slog, pytest.raises(SQLAlchemyError) as raised:
+            self._watch(service, real_loop, shutdown_event, run_id)
+
+        assert raised.value is non_transient_error
+        assert polls == [run_id]
+        assert not shutdown_event.is_set()
+        mock_slog.warning.assert_not_called()
+        mock_slog.error.assert_called_once()
+        event_name, *_ = mock_slog.error.call_args.args
+        assert event_name == "execution_loss_watcher_poll_failed"
+        # Class names only: SQLAlchemy messages carry SQL and connection detail.
+        assert mock_slog.error.call_args.kwargs == {"run_id": str(run_id), "exc_class": exc_class}
+
+    def test_done_callback_logs_a_failed_loss_watcher_instead_of_discarding_it(
+        self,
+        service: ExecutionServiceImpl,
+        real_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        async def failed_watcher() -> None:
+            raise OperationalError("SELECT runs", {}, Exception("database is locked"))
+
+        watcher = real_loop.create_task(failed_watcher(), name="execution-operation-loss-test-run")
+        real_loop.run_until_complete(asyncio.gather(watcher, return_exceptions=True))
+        lease = _execute_lease()
+        future: Future[None] = Future()
+        future.set_result(None)
+        service._loop = real_loop
+
+        with patch("elspeth.web.execution.service.slog") as mock_slog:
+            service._on_pipeline_done(future, session_operation_lease=lease, loss_watcher=watcher)
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+
+        mock_slog.error.assert_called_once()
+        event_name, *_ = mock_slog.error.call_args.args
+        assert event_name == "execution_loss_watcher_failed"
+        assert mock_slog.error.call_args.kwargs == {
+            "watcher_task": "execution-operation-loss-test-run",
+            "exc_class_chain": ["OperationalError"],
+        }
+        assert lease.closed, "logging the watcher failure must not skip the lease close"
+
+    def test_done_callback_does_not_log_a_loss_watcher_it_cancelled(
+        self,
+        service: ExecutionServiceImpl,
+        real_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        async def idle_watcher() -> None:
+            await asyncio.Event().wait()
+
+        watcher = real_loop.create_task(idle_watcher(), name="execution-operation-loss-idle-run")
+        lease = _execute_lease()
+        future: Future[None] = Future()
+        future.set_result(None)
+        service._loop = real_loop
+
+        with patch("elspeth.web.execution.service.slog") as mock_slog:
+            service._on_pipeline_done(future, session_operation_lease=lease, loss_watcher=watcher)
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+
+        assert watcher.cancelled()
+        mock_slog.error.assert_not_called()
+        assert lease.closed
+
+
+def _llm_inline_marker_pipeline_yaml(field_path: str, *, blob_id: UUID, sha256: str) -> str:
+    """An ``llm`` transform whose ``field_path`` option is an inline_content marker (JSON is YAML)."""
+    marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": sha256}
+    options: dict[str, Any] = {"model": "test-model", "prompt_template": "Classify {{ row.text }}"}
+    if field_path == "queries.q1.template":
+        options["queries"] = {"q1": {"template": marker}}
+    else:
+        options[field_path] = marker
+    config = {
+        "source": {"plugin": "csv", "options": {"path": "input.csv"}},
+        "transforms": [{"name": "classify", "plugin": "llm", "options": options}],
+        "sinks": {"primary": {"plugin": "json", "options": {"path": "output.jsonl"}}},
+    }
+    return json.dumps(config)
+
+
+@pytest.mark.usefixtures("mock_pipeline_config_assembly")
+class TestInlineBlobPromptSurfaceModalityAdmission:
+    """An LLM-authored blob must not become an executed LLM prompt or model by substitution.
+
+    The prompt-template and model-choice reviews read those options as strings,
+    so an inline_content marker there opens no review site. Run admission is
+    the gate that holds for every authoring path: it refuses an LLM-authored
+    blob in an ``llm`` transform's prompt surfaces before linking or reading
+    it, as the ``blob_rows`` arm refuses LLM-authored rows.
+    """
+
+    @pytest.mark.parametrize(
+        "modality",
+        [
+            pytest.param(CreationModality.LLM_GENERATED, id="llm_generated"),
+            pytest.param(CreationModality.LLM_GENERATED_THEN_AMENDED, id="llm_generated_then_amended"),
+        ],
+    )
+    @pytest.mark.parametrize("field_path", ["prompt_template", "system_prompt", "queries.q1.template", "model"])
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_llm_authored_blob_in_llm_prompt_surface_is_refused_before_link(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        field_path: str,
+        modality: CreationModality,
+    ) -> None:
+        del mock_landscape_cls, mock_runtime_graph
+        content = b"You are a planner-written prompt."
+        blob_id = uuid4()
+        owner_session = uuid4()
+        sha256 = hashlib.sha256(content).hexdigest()
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=owner_session,
+            content_hash=sha256,
+            size_bytes=len(content),
+            creation_modality=modality,
+        )
+        blob_service.read_blob_content.return_value = content
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        with pytest.raises(InlineBlobPromptSurfaceAdmissionError, match="LLM-authored") as caught:
+            service._run_pipeline(
+                str(uuid4()),
+                _llm_inline_marker_pipeline_yaml(field_path, blob_id=blob_id, sha256=sha256),
+                threading.Event(),
+                session_operation_lease=_execute_lease(),
+            )
+
+        assert f"node:classify.options.{field_path}" in str(caught.value)
+        blob_service.link_blob_to_run.assert_not_awaited()
+        blob_service.read_blob_content.assert_not_awaited()
+        mock_session_service.record_blob_inline_resolutions.assert_not_awaited()
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()
+        mock_payload_cls.return_value.store.assert_not_called()
+
+    @pytest.mark.parametrize("field_path", ["prompt_template", "queries.q1.template", "model"])
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_verbatim_blob_in_llm_prompt_surface_passes_modality_admission(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        field_path: str,
+    ) -> None:
+        """Control: user-verbatim content is linked, read and substituted as before.
+
+        The audit write is made to fail so the run stops right after
+        substitution; reaching it proves the modality gate admitted the ref.
+        """
+        del mock_payload_cls, mock_landscape_cls, mock_runtime_graph
+        content = b"You are a user-written prompt."
+        blob_id = uuid4()
+        owner_session = uuid4()
+        sha256 = hashlib.sha256(content).hexdigest()
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=owner_session,
+            content_hash=sha256,
+            size_bytes=len(content),
+            creation_modality=CreationModality.VERBATIM,
+        )
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+        mock_session_service.record_blob_inline_resolutions.side_effect = AuditIntegrityError("stop after substitution")
+
+        with pytest.raises(AuditIntegrityError, match="stop after substitution"):
+            service._run_pipeline(
+                str(uuid4()),
+                _llm_inline_marker_pipeline_yaml(field_path, blob_id=blob_id, sha256=sha256),
+                threading.Event(),
+                session_operation_lease=_execute_lease(),
+            )
+
+        blob_service.link_blob_to_run.assert_awaited_once()
+        blob_service.read_blob_content.assert_awaited_once()
+        resolutions = mock_session_service.record_blob_inline_resolutions.await_args.kwargs["resolutions"]
+        assert [resolution.field_path for resolution in resolutions] == [f"node:classify.options.{field_path}"]
+        mock_load.assert_not_called()
+        mock_orch_cls.assert_not_called()

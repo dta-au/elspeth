@@ -283,25 +283,44 @@ def _optional_mapping(value: Any, path: str) -> Mapping[str, Any]:
     source="operator-supplied YAML option values before JSON persistence",
     source_param="value",
     suppresses=("R5",),
-    invariant="raises RuntimeYamlImportError for non-string mapping keys at every nested mapping or sequence depth",
-    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_non_string_mapping_keys_rejects_nested_non_string_keys",
-    test_fingerprint="ae8670eee6a8bf082898aa8f3a9844fd6affea3c11f8124d3098cc84ae672013",
+    invariant=(
+        "raises RuntimeYamlImportError for non-string mapping keys and for any value other than str, int, "
+        "finite float, bool, None, a non-string non-bytes sequence or a mapping, at every nested depth"
+    ),
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_non_string_mapping_keys_rejects_non_json_keys_and_values",
+    test_fingerprint="b84a5347dde33aa8ea4f9808c1a87070a8b56f2497489b2b83cea4ce47b65bfd",
 )
 def _reject_non_string_mapping_keys(value: object, path: str) -> None:
-    """Reject keys that JSON persistence would stringify ambiguously."""
+    """Admit only JSON values: str-keyed mappings, sequences and JSON scalars.
+
+    SafeLoader also builds ``date``/``datetime`` (unquoted timestamps),
+    ``bytes`` (``!!binary``), ``set`` (``!!set``) and non-finite floats
+    (``.nan``/``.inf``). None of them survives JSON persistence faithfully:
+    the first four fail at the composition-state INSERT and a NaN persists as
+    non-standard JSON that reads back as null. Messages name the dotted path
+    and the type only, never the value.
+    """
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise RuntimeYamlImportError(f"{path} contains non-string mapping key {key!r}")
             _reject_non_string_mapping_keys(item, f"{path}.{key}")
         return
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, (bytes, bytearray)):
+        raise RuntimeYamlImportError(f"{path} must be a JSON value, got {type(value).__name__}")
+    if isinstance(value, Sequence) and not isinstance(value, str):
         for index, item in enumerate(value):
             _reject_non_string_mapping_keys(item, f"{path}[{index}]")
+        return
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float) and isfinite(value):
+        return
+    raise RuntimeYamlImportError(f"{path} must be a JSON value, got {type(value).__name__}")
 
 
 def _json_mapping(value: Any, path: str) -> Mapping[str, Any]:
-    """Copy a mapping after proving every nested key is JSON-safe."""
+    """Copy a mapping after proving every nested key and value is a JSON value."""
     mapping = dict(_optional_mapping(value, path))
     _reject_non_string_mapping_keys(mapping, path)
     return mapping

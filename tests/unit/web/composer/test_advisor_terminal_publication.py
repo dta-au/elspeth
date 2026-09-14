@@ -119,6 +119,10 @@ class TestWithheldProseDisclosure:
         [
             no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE,
             no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+            no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE,
+            no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_NOTICE,
+            no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_NOTICE,
+            no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_NOTICE,
             no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE,
             no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE,
             no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE,
@@ -134,6 +138,10 @@ class TestWithheldProseDisclosure:
         ids=[
             "signoff_pending_notice",
             "signoff_unverified_notice",
+            "signoff_unavailable_pending_notice",
+            "signoff_malformed_pending_notice",
+            "signoff_unavailable_unverified_notice",
+            "signoff_malformed_unverified_notice",
             "signoff_unrepairable_notice",
             "signoff_unrepairable_unverified_notice",
             "signoff_unrepairable_handoff_notice",
@@ -687,6 +695,11 @@ class TestEmptyRawProducersPublishCanonicalShapes:
             # elspeth-b61894d93d: the unrendered-verdict red shapes.
             ("unavailable", "red"),
             ("malformed", "red"),
+            # Finding #4: the unrendered-verdict green and absent shapes.
+            ("unavailable", "valid"),
+            ("malformed", "valid"),
+            ("unavailable", None),
+            ("malformed", None),
         ],
         ids=[
             "absent",
@@ -699,6 +712,10 @@ class TestEmptyRawProducersPublishCanonicalShapes:
             "unrepairable_red",
             "unavailable_red",
             "malformed_red",
+            "unavailable_green",
+            "malformed_green",
+            "unavailable_absent",
+            "malformed_absent",
         ],
     )
     def test_blocked_terminal_site(self, reason: str, preflight: str | None) -> None:

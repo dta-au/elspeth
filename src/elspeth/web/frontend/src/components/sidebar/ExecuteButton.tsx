@@ -548,6 +548,13 @@ export function ExecuteButton(): JSX.Element | null {
   const isExecuting = useExecutionStore((s) => s.isExecuting);
   const progress = useExecutionStore((s) => s.progress);
   const execute = useExecutionStore((s) => s.execute);
+  // Launch/run failure reason (409, 422 detail, 500, stale readiness, WS
+  // 4004, cancel failure, validation fetch failure). Rendered beside Run so
+  // a failed click is never silent at the control the user clicked
+  // (operator placement ruling 2026-09-13); the Checks-tab banner keeps
+  // its secondary copy of the same field.
+  const executionError = useExecutionStore((s) => s.error);
+  const dismissExecutionError = useExecutionStore((s) => s.dismissError);
   const disclosureAcknowledged = useExecutionStore((s) =>
     activeSessionId ? s.runDisclosureAckBySession[activeSessionId] === true : false,
   );
@@ -714,33 +721,49 @@ export function ExecuteButton(): JSX.Element | null {
 
           It is emitted BEFORE the button (operator decision, 2026-08-16) so it
           renders to Run's LEFT and vertically centred against it, rather than
-          on a line of its own underneath. DOM order, not CSS `order`: the two
-          <p> variants are mutually exclusive, so exactly one can precede the
-          button, and workspace.css keys the spacing off that adjacency. Using
+          on a line of its own underneath. DOM order, not CSS `order`: the three
+          <p> variants (launch failure, block reason, advisory note) are
+          mutually exclusive, so exactly one can precede the button, and
+          workspace.css keys the spacing off that adjacency. Using
           `order` would have worked visually but the rule against it on
           interactive controls exists precisely so nobody has to re-derive
           whether a given lift is the safe kind — moving the markup keeps
           visual, DOM and tab order identical with nothing to reason about.
           For AT this reads better too: the reason is announced on the way IN
-          to the button rather than after it (WCAG 1.3.2 meaningful sequence). */}
-      {blockReason && (
+          to the button rather than after it (WCAG 1.3.2 meaningful sequence).
+
+          A stored launch/run failure takes the slot first: it is the event
+          the user just triggered, and dismissing it reveals whichever gate
+          reason sits underneath. The text is the stored error verbatim. */}
+      {executionError ? (
+        <p className="side-rail-execute-reason" role="alert" data-run-failure="">
+          {executionError}{" "}
+          <Button
+            variant="bare"
+            className="link-button"
+            aria-label="Dismiss run failure"
+            onClick={dismissExecutionError}
+          >
+            Dismiss
+          </Button>
+        </p>
+      ) : blockReason ? (
         <p
           className="side-rail-execute-reason"
           data-run-block-reason={blockReason}
         >
           {blockReasonText}
         </p>
-      )}
-      {/* Run is enabled, but the audit-readiness panel has a non-green
-          advisory row (plugin trust / provenance / retention / secrets).
-          These rows never gate Run — say so in one line rather than
-          leaving the user to infer it from an amber/red row that did
-          nothing when they ran anyway. */}
-      {!blockReason && advisoryRowsNonGreen && (
+      ) : advisoryRowsNonGreen ? (
+        /* Run is enabled, but the audit-readiness panel has a non-green
+           advisory row (plugin trust / provenance / retention / secrets).
+           These rows never gate Run — say so in one line rather than
+           leaving the user to infer it from an amber/red row that did
+           nothing when they ran anyway. */
         <p className="side-rail-execute-reason side-rail-execute-reason--advisory">
           Advisory checks don't block Run.
         </p>
-      )}
+      ) : null}
       <Button
         // variant="danger" is a DELIBERATE 2026-08-15 operator decision that
         // supersedes the earlier no-emphasis rule (elspeth-0d37694c8c): Run

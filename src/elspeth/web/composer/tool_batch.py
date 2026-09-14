@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
@@ -88,6 +88,7 @@ from elspeth.web.composer.discovery_response import (
     admit_discovery_result,
     serialize_admitted_discovery_result,
 )
+from elspeth.web.composer.llm_response_parsing import attach_llm_calls
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.pipeline_custody import (
     finalize_pipeline_custody,
@@ -112,9 +113,9 @@ from elspeth.web.composer.progress import (
 )
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
+    ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerRuntimePreflightError,
-    ComposerServiceError,
     ToolArgumentError,
 )
 from elspeth.web.composer.required_controls import (
@@ -294,8 +295,15 @@ async def _preflight_session_tool_call_ids(
     *,
     sessions_service: SessionServiceProtocol | None,
     session_id: UUID | None,
+    recorder: BufferingRecorder,
 ) -> None:
-    """Reject IDs already owned by durable rows before current-turn effects."""
+    """Reject IDs already owned by durable rows before current-turn effects.
+
+    The refusal is correct and fail-closed, but the provider completion that
+    carried the reused ID is already buffered in ``recorder`` and nothing
+    before P4 makes it durable. The recorder's LLM calls are attached to the
+    exception so the route's LLM-call persistence still writes them.
+    """
     if sessions_service is None or session_id is None:
         return
 
@@ -311,7 +319,50 @@ async def _preflight_session_tool_call_ids(
     )
     prior_tool_call_ids.update(event.tool_call_id for event in prior_interpretations if event.tool_call_id is not None)
     if not batch.call_ids.isdisjoint(prior_tool_call_ids):
-        raise AuditIntegrityError("Composer tool batch reuses a provider tool-call ID already persisted in this session")
+        reused_id_error = AuditIntegrityError("Composer tool batch reuses a provider tool-call ID already persisted in this session")
+        attach_llm_calls(reused_id_error, recorder)
+        raise reused_id_error
+
+
+def _pending_proposal_cap_error(
+    observed: int,
+    *,
+    ctx: ToolBatchContext,
+    state: CompositionState,
+) -> ComposerConvergenceError:
+    """Build the failure for an explicit-approval turn over the pending-proposal cap.
+
+    The model's own turn exceeded a composer per-turn budget, so this is a
+    convergence failure (422 with partial-state persistence), not the generic
+    service-setup failure a bare ``ComposerServiceError`` maps to. The
+    provider completion that carried the batch is already in ``ctx.recorder``
+    and rides out on the exception for the route's LLM-call persistence.
+
+    ``tool_invocations`` is empty: the cap applies only to a session-bound
+    explicit-approval turn, where every earlier tool turn was made durable by
+    P4, and the preflight site dispatches nothing from this batch, so the
+    route has no invocation to replay.
+
+    Mirrors ``ComposerServiceImpl._enforce_tool_call_cap``: the same reason
+    code (the wire reason is derived from ``budget_exhausted``), with a
+    value-free ``cap_kind`` evidence key that tells the two per-turn caps
+    apart in the exception evidence.
+    """
+    return ComposerConvergenceError.capture(
+        max_turns=ctx.composition_turns_used + ctx.discovery_turns_used,
+        budget_exhausted="composition",
+        state=state,
+        initial_version=ctx.initial_version,
+        tool_invocations=(),
+        llm_calls=ctx.recorder.llm_calls,
+        reason="tool_call_cap_exceeded",
+        evidence={
+            "observed": observed,
+            "cap": _MAX_PENDING_PROPOSALS_PER_TURN,
+            "cap_kind": "pending_proposals",
+        },
+        failed_turn=ctx.failed_turn,
+    )
 
 
 async def _try_finalize_proposal_custody(
@@ -586,6 +637,13 @@ class ToolBatchContext:
     plugin_snapshot: PluginAvailabilitySnapshot
     policy_catalog: PolicyCatalogView
     session_operation_authority: SessionOperationAuthority | None = None
+    # Driver turn counters and last persisted tool-call turn, read only when
+    # the batch raises a ComposerConvergenceError (``turns_used`` and
+    # ``failed_turn`` on the 422 body), exactly as ``_enforce_tool_call_cap``
+    # reports them.
+    composition_turns_used: int = 0
+    discovery_turns_used: int = 0
+    failed_turn: FailedTurnMetadata | None = None
 
 
 @dataclass(slots=True)
@@ -666,7 +724,8 @@ async def run_tool_batch(
         and turn_session_uuid is not None
         and turn_preferences is not None
         and turn_preferences.trust_mode == "explicit_approve"
-        and sum(
+    ):
+        approval_required_mutations = sum(
             1
             for tool_call in assistant_tool_calls
             if is_mutation_tool(tool_call.function.name)
@@ -675,15 +734,13 @@ async def run_tool_batch(
                 or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
             )
         )
-        > _MAX_PENDING_PROPOSALS_PER_TURN
-    ):
-        raise ComposerServiceError(
-            f"Composer produced too many pending tool proposals in one turn ({_MAX_PENDING_PROPOSALS_PER_TURN} maximum)."
-        )
+        if approval_required_mutations > _MAX_PENDING_PROPOSALS_PER_TURN:
+            raise _pending_proposal_cap_error(approval_required_mutations, ctx=ctx, state=state)
     await _preflight_session_tool_call_ids(
         admitted_batch,
         sessions_service=turn_sessions_service,
         session_id=turn_session_uuid,
+        recorder=recorder,
     )
 
     await emit_progress(
@@ -1214,9 +1271,10 @@ async def run_tool_batch(
             assert turn_sessions_service is not None
             assert turn_session_uuid is not None
             if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
-                raise ComposerServiceError(
-                    f"Composer produced too many pending tool proposals in one turn ({_MAX_PENDING_PROPOSALS_PER_TURN} maximum)."
-                )
+                # Shadowed by the batch preflight above (same population, same
+                # cap); kept so a later change to either count cannot open an
+                # unbounded proposal turn.
+                raise _pending_proposal_cap_error(proposals_this_turn + 1, ctx=ctx, state=state)
 
             from pydantic import ValidationError as PydanticValidationError
 

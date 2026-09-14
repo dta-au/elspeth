@@ -406,7 +406,10 @@ async def test_endpoint_fails_closed_when_audit_access_log_write_fails(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("audit_query", ["include_llm_audit=true", "include_raw_content=true"])
+@pytest.mark.parametrize(
+    "audit_query",
+    ["include_llm_audit=true", "include_raw_content=true", "include_tool_rows=true&include_rejection_reasons=true"],
+)
 async def test_endpoint_fails_closed_when_audit_access_log_write_fails_for_non_tool_audit_views(
     test_client: TestClient,
     inject_audit_access_log_write_failure,

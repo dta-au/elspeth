@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from dataclasses import replace
 
 from elspeth.contracts import errors as contract_errors
@@ -7,6 +8,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.protocol import ComposerRuntimePreflightError
 from elspeth.web.composer.required_controls import (
     merge_required_control_affected_components,
     wire_required_controls_state,
@@ -194,6 +196,45 @@ def _ensure_inline_blob_proposal_context(
     )
 
 
+def _accept_runtime_preflight_failure(proposal: CompositionProposalRecord) -> HTTPException:
+    """Name a settle-time runtime-preflight failure without committing anything.
+
+    ``_state_data_from_composer_state(preflight_exception_policy="raise")``
+    has already recorded the exception telemetry. The status is deliberately
+    not 409: the SPA's ``acceptProposal`` treats every 409 as a stale proposal
+    ("the state changed, rebase"), which would misdiagnose this failure. The
+    same exception class is a structured 500 on the compose and message
+    routes. The wrapped exception's text stays server-side.
+    """
+    return HTTPException(
+        status_code=500,
+        detail={
+            "detail": (
+                "Runtime preflight could not complete, so the proposal was not applied and was left pending. Try accepting it again."
+            ),
+            "error_type": "runtime_preflight_failed",
+            "tool_name": proposal.tool_name,
+        },
+    )
+
+
+async def _await_accept_state_data[T](
+    awaitable: Awaitable[T],
+    *,
+    proposal: CompositionProposalRecord,
+) -> tuple[T, bool]:
+    """Await accept-time state preparation, naming a runtime-preflight failure.
+
+    The raised ``HTTPException`` reaches the route's precommit handler, which
+    closes the lease before re-raising, exactly as the other pre-commit
+    refusals do.
+    """
+    try:
+        return await _await_with_deferred_cancellation(awaitable)
+    except ComposerRuntimePreflightError as preflight_error:
+        raise _accept_runtime_preflight_failure(proposal) from preflight_error
+
+
 @router.get(
     "/{session_id}/proposals",
     response_model=list[CompositionProposalResponse],
@@ -279,6 +320,10 @@ async def accept_composition_proposal(
                     draft_hash=body.draft_hash,
                     session_operation_context=lease.context,
                 )
+            except ComposerRuntimePreflightError as preflight_error:
+                preflight_failure = _accept_runtime_preflight_failure(proposal)
+                await _close_proposal_lease_before_commit(lease, primary=preflight_failure)
+                raise preflight_failure from preflight_error
             except BaseException as primary:
                 await _close_proposal_lease_before_commit(lease, primary=primary)
                 raise
@@ -345,7 +390,7 @@ async def accept_composition_proposal(
             if blob_effect_applied:
                 accepted_state = None
                 if current_record is None:
-                    (accepted_state, _validation), was_cancelled = await _await_with_deferred_cancellation(
+                    (accepted_state, _validation), was_cancelled = await _await_accept_state_data(
                         _state_data_from_composer_state(
                             current_state,
                             settings=request.app.state.settings,
@@ -359,7 +404,8 @@ async def accept_composition_proposal(
                             preflight_exception_policy="raise",
                             initial_version=current_state.version,
                             telemetry_source="compose",
-                        )
+                        ),
+                        proposal=proposal,
                     )
                     cancellation_deferred = cancellation_deferred or was_cancelled
                 committed, was_cancelled = await _await_with_deferred_cancellation(
@@ -530,7 +576,7 @@ async def accept_composition_proposal(
                         detail="Accepted proposal did not change composition state.",
                     )
                 if current_record is None:
-                    (accepted_state, _validation), was_cancelled = await _await_with_deferred_cancellation(
+                    (accepted_state, _validation), was_cancelled = await _await_accept_state_data(
                         _state_data_from_composer_state(
                             current_state,
                             settings=request.app.state.settings,
@@ -544,11 +590,12 @@ async def accept_composition_proposal(
                             preflight_exception_policy="raise",
                             initial_version=current_state.version,
                             telemetry_source="compose",
-                        )
+                        ),
+                        proposal=proposal,
                     )
                     cancellation_deferred = cancellation_deferred or was_cancelled
             else:
-                (accepted_state, _validation), was_cancelled = await _await_with_deferred_cancellation(
+                (accepted_state, _validation), was_cancelled = await _await_accept_state_data(
                     _state_data_from_composer_state(
                         result.updated_state,
                         settings=request.app.state.settings,
@@ -562,7 +609,8 @@ async def accept_composition_proposal(
                         preflight_exception_policy="raise",
                         initial_version=current_state.version,
                         telemetry_source="compose",
-                    )
+                    ),
+                    proposal=proposal,
                 )
                 cancellation_deferred = cancellation_deferred or was_cancelled
 

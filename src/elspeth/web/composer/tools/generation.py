@@ -52,6 +52,8 @@ from elspeth.web.composer.source_inspection import (
 from elspeth.web.composer.state import (
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
+    _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION,
+    _QUERY_INPUT_COLUMNS_UNDECLARED_FIX,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
     _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
@@ -1745,6 +1747,33 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "output_mode='transform' and specify the expected count. These modes have different row semantics; "
         "choose according to the intended pipeline behavior.",
     ),
+    # Multi-query declaration guard (elspeth-a10d15055b): serves the state.py
+    # constants, whose FIX is the plugin layer's remedy, rather than a copy.
+    DirectValidationGuidance(
+        "query_input_columns_undeclared",
+        _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION,
+        _QUERY_INPUT_COLUMNS_UNDECLARED_FIX,
+    ),
+    # Gate analogue of coalesce_config_invalid: GateSettings has no options
+    # field, so lowering drops every non-metadata gate option.
+    DirectValidationGuidance(
+        "gate_config_invalid",
+        "A gate is a built-in structural node; it has no runtime options contract, so authored options other than "
+        "review metadata cannot be preserved and would silently disappear before the pipeline runs.",
+        "Remove the named keys from the gate's options. Express the routing decision in the gate's condition and "
+        "routes (plus fork_to and on_error where needed), not in options.",
+    ),
+    # Leading entry of a splice_transform rejection; the planner's redacted
+    # repair feedback resolves it by code like every other entry.
+    DirectValidationGuidance(
+        "splice_validation_failed",
+        "The inserted transform passed its own option checks, but the pipeline that results from inserting it fails "
+        "context-aware validation. The rejected_mutation entries that follow this one name each new error, attributed "
+        "to the component it concerns in rejected_component. Nothing was mutated.",
+        "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
+        "or satisfy the fields it names), or splice at a position whose producer supplies them, then retry "
+        "splice_transform.",
+    ),
     *_direct_plugin_policy_guidance(),
 )
 
@@ -2109,6 +2138,9 @@ def _execute_get_plugin_assistance(
     * ``issue_code is None`` (or absent) — discovery-time guidance. The
       plugin returns a one-line ``summary`` and ``composer_hints``
       (same surface that list_* and get_plugin_schema already carry).
+      ``examples`` may also be populated here — it is plugin-defined,
+      not exclusive to failure mode (e.g. ``llm`` publishes a worked
+      ``queries`` exemplar in discovery mode).
     * ``issue_code is not None`` — failure-time guidance. The
       semantic validator emits ``requirement_code`` values like
       ``line_explode.source_field.line_framed_text``; the agent echoes
@@ -2197,7 +2229,9 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
         "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
         "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
         "    are also carried on list_sources / list_transforms / list_sinks / "
-        "    get_plugin_schema responses; this tool is the explicit path.)\n"
+        "    get_plugin_schema responses; this tool is the explicit path.) `examples` "
+        "    may also be populated in this mode — it is plugin-defined, not exclusive "
+        "    to failure mode.\n"
         "  * Pass an ``issue_code`` (validators emit these as requirement_code "
         "    on semantic_contracts entries) to get failure-time guidance — "
         "    `summary`, `suggested_fixes`, and `examples` — each a `title` with the "

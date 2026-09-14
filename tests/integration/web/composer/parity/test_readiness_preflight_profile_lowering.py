@@ -48,7 +48,7 @@ from elspeth.web.execution.fanout_guard import LLM_FANOUT_HIGH_CALL_THRESHOLD, E
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.execution.service import ExecutionServiceImpl
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, prompt_review_anchor_hash_from_options
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.composer.parity.conftest import PARITY_FIXTURES
@@ -72,6 +72,12 @@ def _resolve_prompt_template_review(node: dict[str, Any]) -> dict[str, Any]:
     """
     options = dict(node["options"])
     prompt_template = options["prompt_template"]
+    # The live resolve path anchors a multi-query node's review to the whole
+    # prompt surface (per-query templates + system prompt + node-level
+    # template); a bare hash of the node-level prompt_template is not that
+    # anchor, and execution refuses it as drift. Single-prompt nodes keep the bare hash.
+    surface_anchor = prompt_review_anchor_hash_from_options(options)
+    review_anchor = surface_anchor if surface_anchor is not None else stable_hash(prompt_template)
     resolved_reqs = []
     for requirement in options.get(INTERPRETATION_REQUIREMENTS_KEY, ()):
         requirement = dict(requirement)
@@ -80,7 +86,7 @@ def _resolve_prompt_template_review(node: dict[str, Any]) -> dict[str, Any]:
                 status="resolved",
                 event_id=f"prompt-template-accepted:{node['id']}",
                 accepted_value=prompt_template,
-                resolved_prompt_template_hash=stable_hash(prompt_template),
+                resolved_prompt_template_hash=review_anchor,
             )
         resolved_reqs.append(requirement)
     options[INTERPRETATION_REQUIREMENTS_KEY] = resolved_reqs

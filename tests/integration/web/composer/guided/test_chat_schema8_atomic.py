@@ -792,6 +792,45 @@ def test_schema_form_source_plugin_reselection_rebuilds_form_and_preserves_ready
     assert provider_calls == 1
 
 
+def test_uploaded_source_reselection_refusal_is_not_applied_not_unavailable(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1 finding #36: this deterministic refusal must not offer Retry.
+
+    When the planner returns a source-plugin reselection on a message whose
+    trailing line is the upload-bind sentinel, the route deliberately
+    discards the reselection (``error_class="UploadedSourceReselectionNotApplied"``)
+    because the copy already tells the user to pick the source type in the
+    wizard. That refusal must classify as ``not_applied`` — the sibling
+    ``InlineSourceNotApplied`` shape does — never fall through to
+    ``unavailable``, which invites a Retry that just spends another
+    provider call on the identical refusal.
+    """
+    session_id = _create_session(composer_test_client)
+    initial_turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    chosen = _choose_source(composer_test_client, session_id, initial_turn, plugin="text")
+    schema_turn = chosen["next_turn"]
+    _upload_blob(composer_test_client, session_id, "MOCK_DATA.json", b'[{"name":"alice","value":1}]\n', "application/json")
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _reselected_json_source_provider, raising=False)
+    request_body = _chat_body(
+        schema_turn,
+        message='Please look at this again.\nI\'ve uploaded "MOCK_DATA.json"; please use it as the pipeline input.',
+    )
+
+    response = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=request_body)
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["assistant_message"] == (
+        "I did not change the source type while resolving your uploaded file. "
+        "Choose the source type in the wizard, then ask me to use that file again."
+    )
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+
+
 def test_same_operation_concurrent_callers_join_one_provider_result_outside_compose_lock(
     file_composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1141,6 +1180,41 @@ def test_cancellation_settlement_failure_surfaces_as_an_integrity_error(
                 await request_task
 
     asyncio.run(drive())
+
+
+def test_task_cancellation_records_request_cancelled_not_operation_failed(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1 finding #24: a cancellation is never a server failure.
+
+    The chat route's ``asyncio.CancelledError`` arm used to hard-code
+    ``failure_code="operation_failed"`` for every cancellation, including one
+    with no client disconnect involved at all — misfiling a Stop/timeout in
+    the durable audit row as a server failure and replaying a misleading
+    500 ("The operation failed.") on a same-operation retry. The sibling
+    guided PLAN route (``guided_plan.py``) records ``request_cancelled`` for
+    the same shape of cancellation; CHAT must match.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    body = _chat_body(turn)
+    started = _blocking_provider(monkeypatch)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            request_task.cancel("no client disconnect here, just a plain cancel")
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+    asyncio.run(drive())
+
+    operation = _guided_operation_row(client, session_id, body["operation_id"])
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "request_cancelled"
 
 
 def test_cancelled_progress_publish_defect_surfaces_instead_of_riding_the_cancellation(

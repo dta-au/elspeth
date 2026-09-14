@@ -783,7 +783,7 @@ files:
   src/elspeth/web/composer/pipeline_planner.py:
     Mapping[str, Any]: 38
     dict[str, Any]: 20
-    dict[str, object]: 1
+    dict[str, object]: 2
   src/elspeth/web/composer/pipeline_proposal.py:
     Mapping[str, Any]: 21
     dict[str, Any]: 18
@@ -850,10 +850,13 @@ files:
     dict[str, Any]: 6
   src/elspeth/web/composer/tools/_generation_responses.py:
     dict[str, object]: 1
+  src/elspeth/web/composer/tools/_naming_disclosure.py:
+    Mapping[str, Any]: 3
+    MutableMapping[str, Any]: 6
   src/elspeth/web/composer/tools/_registry.py:
     Mapping[str, Any]: 2
   src/elspeth/web/composer/tools/blobs.py:
-    boundary: 2
+    boundary: 3
     dict[str, Any]: 11
   src/elspeth/web/composer/tools/declarations.py:
     Mapping[str, Any]: 4
@@ -864,8 +867,8 @@ files:
   src/elspeth/web/composer/tools/outputs.py:
     dict[str, Any]: 7
   src/elspeth/web/composer/tools/schema_contract.py:
-    Mapping[str, Any]: 46
-    MutableMapping[str, Any]: 7
+    Mapping[str, Any]: 43
+    MutableMapping[str, Any]: 1
     dict[str, Any]: 3
   src/elspeth/web/composer/tools/secrets.py:
     dict[str, Any]: 3
@@ -881,6 +884,7 @@ files:
   src/elspeth/web/composer/tools/transforms.py:
     Mapping[str, Any]: 7
     dict[str, Any]: 19
+    dict[str, object]: 2
   src/elspeth/web/composer/turn_audit.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 1
@@ -939,7 +943,7 @@ files:
     Mapping[str, Any]: 6
     dict[str, Any]: 5
   src/elspeth/web/interpretation_state.py:
-    Mapping[str, Any]: 15
+    Mapping[str, Any]: 18
     boundary: 8
     dict[str, Any]: 6
   src/elspeth/web/plugin_policy/coverage.py:
@@ -1024,10 +1028,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 869
+  Mapping[str, Any]: 872
   Mapping[str, object]: 298
   MutableMapping[str, Any]: 13
-  boundary: 63
+  boundary: 64
   dict[str, Any]: 1136
-  dict[str, object]: 400
-  soft: 2716
+  dict[str, object]: 403
+  soft: 2722

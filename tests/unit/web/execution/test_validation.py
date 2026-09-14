@@ -2716,6 +2716,49 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
         assert "llm_prompt_template:test_node" in result.errors[1].message
         mock_yaml_gen.generate_yaml.assert_not_called()
 
+    @staticmethod
+    def _multi_query_llm_state() -> CompositionState:
+        """A multi-query llm node whose llm_prompt_template review is RESOLVED with the prompt-surface anchor."""
+        from elspeth.web.interpretation_state import prompt_review_anchor_hash_from_options, prompt_review_draft_from_options
+
+        prompt_template = "Answer the question about the colour {{ row.colour }}."
+        options: dict[str, Any] = {
+            "prompt_template": prompt_template,
+            "queries": {
+                "good_pair": {"input_fields": {"colour": "colour"}, "template": "What colour pairs with {{ row.colour }}?"},
+                "hex_code": {"input_fields": {"colour": "colour"}, "template": "What is the hex code of {{ row.colour }}?"},
+            },
+        }
+        surface_anchor = prompt_review_anchor_hash_from_options(options)
+        surface_draft = prompt_review_draft_from_options(options)
+        assert surface_anchor is not None
+        assert surface_draft is not None
+        options[INTERPRETATION_REQUIREMENTS_KEY] = [
+            {
+                "id": "prompt_template_review:test_node",
+                "kind": "llm_prompt_template",
+                "user_term": "llm_prompt_template:test_node",
+                "status": "resolved",
+                "draft": surface_draft,
+                "event_id": "evt-prompt",
+                "accepted_value": surface_draft,
+                "accepted_artifact_hash": None,
+                "resolved_prompt_template_hash": surface_anchor,
+            }
+        ]
+        return _make_state(nodes=(_make_node(plugin="llm", options=options),))
+
+    def test_resolved_surface_anchored_multi_query_prompt_review_is_not_a_readiness_blocker(self) -> None:
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        result = validate_pipeline_for_trained_operator(self._multi_query_llm_state(), _make_settings(), mock_yaml_gen)
+
+        assert [blocker for blocker in result.readiness.blockers if blocker.code == "interpretation_review_pending"] == []
+        assert all(error.error_code != "interpretation_review_pending" for error in result.errors)
+        # The interpretation-review phase passed: validation went on to generate YAML.
+        mock_yaml_gen.generate_yaml.assert_called_once()
+
     def test_pending_invented_source_review_returns_source_readiness(self) -> None:
         state = _make_state(
             source_options={

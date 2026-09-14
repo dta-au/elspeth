@@ -9,6 +9,7 @@
 
 import type {
   ApiError,
+  ApiStructuredError,
   AuthConfig,
   BlobCreationModalityWire,
   BlobMetadata,
@@ -134,6 +135,35 @@ function firstStringField(
     }
   }
   return undefined;
+}
+
+/**
+ * FastAPI's global RequestValidationError handler (app.py) returns
+ * `{detail: [{type, loc, msg}, ...], request_id}` -- an ARRAY `detail`, not
+ * the string/object shape every other route uses. Neither `firstStringField`
+ * nor the `errors` lookup below reads an array, so without this the human
+ * `msg` the backend already allowlisted as safe was dropped and every caller
+ * fell back to `response.statusText` ("Unprocessable Entity", or "" over
+ * HTTP/2). Map each entry with a string `msg` into a structured error,
+ * loc-prefixed so "body -> content: String should have at most 65536
+ * characters" beats a bare status phrase.
+ */
+function fastApiValidationErrors(
+  detailArray: readonly unknown[],
+): ApiStructuredError[] {
+  const out: ApiStructuredError[] = [];
+  for (const entry of detailArray) {
+    const msg = ownField(entry, "msg");
+    if (typeof msg !== "string") {
+      continue;
+    }
+    const loc = ownField(entry, "loc");
+    const locPath = Array.isArray(loc)
+      ? loc.filter((part) => typeof part === "string" || typeof part === "number").join(" -> ")
+      : undefined;
+    out.push({ message: locPath ? `${locPath}: ${msg}` : msg });
+  }
+  return out;
 }
 
 function optionalResponseHeader(response: Response, name: string): string | undefined {
@@ -345,7 +375,7 @@ export async function parseResponse<T>(
         ownField(body, "errors"),
         ownField(nestedDetail, "errors"),
       );
-      errors = Array.isArray(rawErrors)
+      const filteredErrors = Array.isArray(rawErrors)
         ? rawErrors.filter(
             (entry): entry is NonNullable<ApiError["errors"]>[number] =>
               typeof entry === "object" &&
@@ -354,6 +384,15 @@ export async function parseResponse<T>(
               typeof ownField(entry, "message") === "string",
           )
         : undefined;
+      // FastAPI's global RequestValidationError envelope puts its own
+      // array shape on `detail` (see fastApiValidationErrors above), not on
+      // `errors` -- only reached when nothing already claimed `errors`.
+      const fastApiErrors =
+        filteredErrors === undefined && Array.isArray(body.detail)
+          ? fastApiValidationErrors(body.detail)
+          : undefined;
+      errors =
+        filteredErrors ?? (fastApiErrors && fastApiErrors.length > 0 ? fastApiErrors : undefined);
 
       const explicitDetail = firstStringField(
         [nestedDetail, body],

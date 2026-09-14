@@ -153,8 +153,8 @@ async def finalize_no_tool_response(
             succeeded this turn. Suppresses the no-mutation
             augmentation path.
         tool_invocations: Tool calls made this turn; the most
-            recent failure feeds the operator-facing blocker
-            suffix.
+            recent failed build/edit (non-discovery) call feeds the
+            operator-facing blocker suffix.
         llm_calls: LLM call audit rows for this turn.
 
     Unexpected preflight exceptions (anything other than a

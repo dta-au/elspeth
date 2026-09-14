@@ -5,6 +5,7 @@ from dataclasses import replace as _replace_dataclass
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
+from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 
 from .._helpers import (
@@ -35,6 +36,8 @@ from .._helpers import (
     _cancel_on_client_disconnect,
     _composer_chat_history,
     _composer_conversation_messages,
+    _composer_heartbeat_cancel_of,
+    _composer_heartbeat_failed_progress_event,
     _composer_progress_sink,
     _ComposerRequestTerminalStatus,
     _get_composer_progress_registry,
@@ -424,6 +427,26 @@ async def recompose(
                     session_operation_context=compose_operation_lease.context,
                 )
                 raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
+            except ComposerAdmissionRefused as exc:
+                # Mirror of the send_message arm (messages.py). The refusal is
+                # a committed admission decision (identity disabled, quota), so
+                # the retry is permanent: it must not fall into the generic
+                # ComposerServiceError arm below, whose 502 without a
+                # failure_code makes the SPA offer Retry again.
+                await _publish_progress(
+                    progress_sink,
+                    event=ComposerProgressEvent(
+                        phase="failed",
+                        headline="This request was refused by the admission policy.",
+                        evidence=(str(exc),),
+                        likely_next="Ask an administrator to review your access and quota configuration.",
+                        reason="admission_refused",
+                    ),
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
+                ) from exc
             except ComposerServiceError as exc:
                 await _publish_progress(
                     progress_sink,
@@ -750,14 +773,22 @@ async def recompose(
                             session_operation_context=compose_operation_lease.context,
                         )
                     )
+            # A cancel delivered by the compose heartbeat after it lost the
+            # request's lease is a server fault, not a user Stop (finding
+            # #28): publish ``failed`` and record ``failed``. The bare
+            # ``raise`` below hands it to ``_track_compose_inflight``, which
+            # uncancels the task and answers with the structured 503.
+            heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.shield(
                     _publish_progress(
                         progress_sink,
-                        event=client_cancelled_progress_event(),
+                        event=(
+                            client_cancelled_progress_event() if heartbeat_cancel is None else _composer_heartbeat_failed_progress_event()
+                        ),
                     )
                 )
-            terminal_status = "cancelled"
+            terminal_status = "cancelled" if heartbeat_cancel is None else "failed"
             if _is_client_disconnect_cancel(exc):
                 # Disconnect-initiated cancel — see the send_message
                 # mirror for the 499-conversion rationale.

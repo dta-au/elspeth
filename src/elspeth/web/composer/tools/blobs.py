@@ -40,6 +40,7 @@ from elspeth.contracts.blobs_inline import (
     ALLOWED_CONTENT_ENCODINGS,
     BlobInlineRef,
     ContentEncoding,
+    is_widened_blob_ref,
 )
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
@@ -89,12 +90,14 @@ from elspeth.web.composer.tools._common import (
     _failure_result,
     _mutation_result,
     _validate_mutation_arguments,
+    review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding, llm_prompt_surface_field
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, reconcile_authoritative_reviews
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -857,6 +860,137 @@ def _inline_blob_endpoint_policy_error(state: CompositionState, field_path: str)
     return None
 
 
+def _llm_authored_prompt_surface_message(*, tool_name: str, blob_id: UUID, node_id: str, option_path: str) -> str:
+    """The repairable refusal for an LLM-authored blob bound into an ``llm`` prompt surface or model.
+
+    One text for ``wire_blob_inline_ref`` and the node-option authoring tools
+    (``upsert_node``, ``patch_node_options``, ``splice_transform``), so the
+    planner is given the same repair whichever tool it used.
+    """
+    review_kind = "llm_model_choice" if option_path.split(".")[0] == "model" else "llm_prompt_template"
+    return (
+        f"{tool_name} cannot wire LLM-authored blob '{blob_id}' into LLM node '{node_id}' option "
+        f"'{option_path}': that field is covered by the {review_kind} review, and an inline blob marker would "
+        "hand planner-written text to the run without that review. Write the text directly with "
+        f"patch_node_options (or upsert_node) so ELSPETH stages the {review_kind} review; only user-uploaded "
+        "blobs may back an LLM prompt or model field."
+    )
+
+
+def _llm_authored_prompt_surface_error(
+    state: CompositionState,
+    field_path: str,
+    *,
+    blob_id: UUID,
+    creation_modality: CreationModality,
+) -> str | None:
+    """Refuse an LLM-authored blob as an ``llm`` node's prompt surface or model.
+
+    ADR-034 admits ``inline_content`` markers in prompt fields so a USER-uploaded
+    prompt artifact can back an LLM node. The ``llm_prompt_template`` and
+    ``llm_model_choice`` reviews read those options as strings, so a marker
+    there carries no reviewable text, and the run substitutes the blob bytes
+    afterwards. The guarded domain and the modality rule are
+    ``is_llm_authored_prompt_surface_binding``, the predicate /validate and run
+    admission apply too. An unknown or non-``llm`` node returns ``None`` so the
+    marker writer reports the missing node.
+    """
+    surface = llm_prompt_surface_field(field_path)
+    llm_node_names = frozenset(node.id for node in state.nodes if node.plugin == "llm")
+    if surface is None or not is_llm_authored_prompt_surface_binding(
+        field_path,
+        llm_node_names=llm_node_names,
+        creation_modality=creation_modality,
+    ):
+        return None
+    node_id, option_path = surface
+    return _llm_authored_prompt_surface_message(
+        tool_name="wire_blob_inline_ref",
+        blob_id=blob_id,
+        node_id=node_id,
+        option_path=option_path,
+    )
+
+
+def _inline_content_marker_blob_ids(value: object, option_path: str) -> list[tuple[str, UUID]]:
+    """Every widened ``inline_content`` marker at or beneath ``value``, with its option path."""
+    shape = is_widened_blob_ref(value)
+    if shape is not None:
+        return [(option_path, shape.blob_id)] if shape.mode == "inline_content" else []
+    if type(value) is not dict:
+        return []
+    found: list[tuple[str, UUID]] = []
+    for key, child in cast(dict[object, object], value).items():
+        if type(key) is str:
+            found.extend(_inline_content_marker_blob_ids(child, f"{option_path}.{key}"))
+    return found
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "node plugin options authored through an LLM composer tool call (upsert_node, patch_node_options, splice_transform, set_pipeline)"
+    ),
+    source_param="options",
+    suppresses=(),
+    invariant=(
+        "parses each widened inline_content marker with is_widened_blob_ref into an owned WidenedBlobRefShape; "
+        "returns the wire tool's repairable refusal text when a marker in an llm prompt surface or model names "
+        "an LLM-authored blob in this session, and None for every other options shape; never raises on options"
+    ),
+    non_raising=True,
+)
+def _llm_authored_inline_prompt_surface_error(
+    context: ToolContext,
+    *,
+    tool_name: str,
+    node_id: str,
+    plugin: str | None,
+    options: Mapping[str, Any],
+) -> str | None:
+    """Refuse a node-option write that binds an LLM-authored blob into an ``llm`` prompt surface or model.
+
+    ``wire_blob_inline_ref`` is not the only way an ``inline_content`` marker
+    reaches node options: ``upsert_node``, ``patch_node_options``,
+    ``splice_transform`` and ``set_pipeline`` accept a hand-authored widened
+    marker, and plugin prevalidation withholds a top-level one as a deferred
+    value. Each marker in the guarded domain
+    (``is_llm_authored_prompt_surface_binding``) is looked up
+    in this session, and an LLM-authored blob refuses with the wire tool's
+    repairable text, so the planner cannot route around the wire tool.
+
+    A marker is not judged here when no session engine is attached (no blob can
+    be looked up) or when its blob is not in this session: /validate reports it
+    as missing, and both /validate and run admission apply the same modality
+    rule to every blob they resolve.
+    """
+    session_engine = context.session_engine
+    session_id = context.session_id
+    if plugin != "llm" or session_engine is None or session_id is None:
+        return None
+    thawed = deep_thaw(options)
+    for key, value in thawed.items():
+        for option_path, blob_id in _inline_content_marker_blob_ids(value, key):
+            field_path = f"node:{node_id}.options.{option_path}"
+            if llm_prompt_surface_field(field_path) is None:
+                continue
+            blob = _sync_get_blob(session_engine, str(blob_id), session_id)
+            if blob is None:
+                continue
+            if is_llm_authored_prompt_surface_binding(
+                field_path,
+                llm_node_names=(node_id,),
+                creation_modality=CreationModality(blob["creation_modality"]),
+            ):
+                return _llm_authored_prompt_surface_message(
+                    tool_name=tool_name,
+                    blob_id=blob_id,
+                    node_id=node_id,
+                    option_path=option_path,
+                )
+    return None
+
+
 def _execute_wire_blob_inline_ref(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -897,6 +1031,15 @@ def _execute_wire_blob_inline_ref(
     except ValueError as exc:
         return _failure_result(state, f"Invalid field_path for inline blob ref: {exc}")
 
+    prompt_surface_error = _llm_authored_prompt_surface_error(
+        state,
+        ref.field_path,
+        blob_id=blob_id,
+        creation_modality=CreationModality(blob["creation_modality"]),
+    )
+    if prompt_surface_error is not None:
+        return _failure_result(state, prompt_surface_error)
+
     marker: dict[str, Any] = {
         "blob_ref": str(blob_id),
         "mode": "inline_content",
@@ -922,7 +1065,30 @@ def _execute_wire_blob_inline_ref(
     endpoint_policy_error = _inline_blob_endpoint_policy_error(new_state, ref.field_path)
     if endpoint_policy_error is not None:
         return _failure_result(state, endpoint_policy_error)
-    return _mutation_result(new_state, _affected_component_for_inline_field_path(ref.field_path), data={"field_path": ref.field_path})
+    # The marker rewrites the component's options in place, so a resolved
+    # review whose artifact covers the wired field must reopen (or the edit is
+    # refused here) — the same post-mutation invariant splice_transform and the
+    # option patchers enforce. Without it the review stayed ``resolved`` over a
+    # drifted anchor and Execute failed with a bare drift ValueError.
+    try:
+        reconciled = reconcile_authoritative_reviews(state, new_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        reconciled,
+        tool_name="wire_blob_inline_ref",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
+    return _mutation_result(reconciled, _affected_component_for_inline_field_path(ref.field_path), data={"field_path": ref.field_path})
 
 
 _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(

@@ -53,4 +53,25 @@ describe("ModelChip", () => {
     const { container } = render(<ModelChip />);
     expect(container).toBeEmptyDOMElement();
   });
+
+  it("shows the advisor model beside the composer model, labelled and with its raw id in title", () => {
+    useSessionStore.setState({
+      composerModel: "anthropic/claude-sonnet-4.6",
+      composerAdvisorModel: "anthropic/claude-opus-4-7",
+    });
+
+    const { container } = render(<ModelChip />);
+
+    // "Advisor:" names the model that gates completion, distinct from the
+    // composing model; both stay ordinary text with raw ids in `title`.
+    expect(screen.getByText("Composer:")).toBeInTheDocument();
+    expect(screen.getByText("Advisor:")).toBeInTheDocument();
+    // Hyphen-separated numeric version parts render dotted ("4-7" -> "4.7"),
+    // not as disconnected words ("4 7") -- modelDisplayName.test.ts pins the
+    // mechanism.
+    expect(screen.getByText("Claude Opus 4.7")).toBeInTheDocument();
+    expect(screen.getByTitle("anthropic/claude-opus-4-7")).toBeInTheDocument();
+    expect(screen.getByTitle("anthropic/claude-sonnet-4.6")).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
 });

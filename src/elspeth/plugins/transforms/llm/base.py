@@ -8,12 +8,15 @@ and pool configuration (flat fields assembled into PoolConfig).
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Sequence
 from typing import Any, Final, Literal
 
 from jinja2 import TemplateSyntaxError
+from jinja2 import nodes as jinja_nodes
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
@@ -59,6 +62,102 @@ _UNDECLARED_ROW_FIELDS_REMEDY: Final[str] = (
     "here and then fails every row at run time. Do not empty required_input_fields to silence this: "
     "[] withdraws the contract for every field the node reads, including the unconditional ones."
 )
+
+# A multi-query query reads the row through exactly two paths: its input_fields
+# VALUES (``build_template_context`` does ``row[row_column]``) and second-level
+# ``row.source_row.<column>`` references. Its ``row.<variable>`` names are the
+# query's own bindings, never columns. Single-owned here and imported by the
+# composer's Stage-1 twin and the validation catalogue, so the YAML author, the
+# tool-call surface and the planner's repair turn read one remedy.
+MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY: Final[str] = (
+    "Point each input_fields value (template variable → row column) and each 'row.source_row.<column>' "
+    "reference at a column the node already declares — those are the only two ways a query reads the row, and "
+    "the query's own 'row.<variable>' names need no declaration. Add a column to options.required_input_fields "
+    "ONLY if the upstream producer guarantees that exact name (declare the parenthesised form where one is shown; "
+    "a bracket literal is not a legal declaration entry), and send the full list: patch_node_options replaces the "
+    "option's value, it does not append. Do not empty required_input_fields to silence this: [] withdraws the "
+    "contract for every column the node reads."
+)
+
+# PipelineRow API names a ``row.source_row.<name>`` read resolves to a method,
+# not a column — the same set ``core.templates`` refuses to treat as fields.
+_SOURCE_ROW_API_NAMES: Final[frozenset[str]] = frozenset({"get", "contract", "to_dict", "to_checkpoint_format"})
+
+
+@observation_boundary(
+    tier=3,
+    source="a multi-query prompt template (YAML- or web-authored Jinja2 text) parsed into its AST",
+    source_param="template",
+    suppresses=("R5",),
+    invariant=(
+        "returns only literal column names read as row.source_row.<name>, row.source_row['<name>'], "
+        "row['source_row']['<name>'] or row.source_row.get('<name>'); PipelineRow API names, bare "
+        "row.source_row, aliases and computed keys contribute nothing; raises only TemplateSyntaxError "
+        "for text that does not parse"
+    ),
+)
+def multi_query_source_row_columns(template: str) -> frozenset[str]:
+    """Row columns a multi-query template reads directly through ``row.source_row``.
+
+    Literal reads only. A computed key (``row.source_row[k]``), an alias
+    (``{% set s = row.source_row %}``) or the bare row object carries no
+    config-time column name, so it contributes nothing rather than a guess.
+    """
+
+    def is_source_row(node: jinja_nodes.Node) -> bool:
+        if isinstance(node, jinja_nodes.Getattr):
+            return isinstance(node.node, jinja_nodes.Name) and node.node.name == "row" and node.attr == "source_row"
+        if isinstance(node, jinja_nodes.Getitem):
+            return (
+                isinstance(node.node, jinja_nodes.Name)
+                and node.node.name == "row"
+                and isinstance(node.arg, jinja_nodes.Const)
+                and node.arg.value == "source_row"
+            )
+        return False
+
+    ast = create_sandboxed_environment().parse(template)
+    columns: set[str] = set()
+    for attr in ast.find_all(jinja_nodes.Getattr):
+        if is_source_row(attr.node) and attr.attr not in _SOURCE_ROW_API_NAMES:
+            columns.add(attr.attr)
+    for item in ast.find_all(jinja_nodes.Getitem):
+        if is_source_row(item.node) and isinstance(item.arg, jinja_nodes.Const) and isinstance(item.arg.value, str):
+            columns.add(item.arg.value)
+    for call in ast.find_all(jinja_nodes.Call):
+        callee = call.node
+        if (
+            isinstance(callee, jinja_nodes.Getattr)
+            and callee.attr == "get"
+            and is_source_row(callee.node)
+            and call.args
+            and isinstance(call.args[0], jinja_nodes.Const)
+            and isinstance(call.args[0].value, str)
+        ):
+            columns.add(call.args[0].value)
+    return frozenset(columns)
+
+
+def multi_query_undeclared_columns_message(query_name: str, undeclared: Sequence[str], declared: Iterable[str]) -> str:
+    """The one rejection text for a query column outside ``required_input_fields``.
+
+    ``undeclared`` is an ``undeclared_row_fields`` shortfall; ``declared`` is
+    the authored ``required_input_fields`` list. Shared verbatim by
+    ``LLMConfig._validate_template_variable_bindings`` and the composer's
+    ``_validate_multi_query_required_input_columns``.
+    """
+    from elspeth.plugins.sources.field_normalization import describe_undeclared_row_fields
+
+    noun = "column" if len(undeclared) == 1 else "columns"
+    declared_names = ", ".join(f"'{name}'" for name in sorted(declared))
+    return (
+        f"Query '{query_name}' reads row {noun} {describe_undeclared_row_fields(undeclared)} through its "
+        f"input_fields values or 'row.source_row', which options.required_input_fields does not cover — it "
+        f"declares {declared_names}. required_input_fields IS this node's input contract: it is what the DAG "
+        "checks against the upstream producer's guarantees and what the engine verifies on every row. A column "
+        "outside it is required by nothing, so no producer is obliged to supply it, and every row that arrives "
+        f"without it fails this query with template_context_failed. {MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY}"
+    )
 
 
 class LLMConfig(TransformDataConfig):
@@ -466,9 +565,14 @@ class LLMConfig(TransformDataConfig):
         This enforces the "explicit contracts" pattern from ELSPETH's audit philosophy.
         If a template accesses row.field, the user MUST declare what fields are required.
 
-        In multi-query mode, required fields are derived from the union of all
-        query specs' input_fields values (the row column names), plus any row
-        references in the top-level template and per-query template overrides.
+        In multi-query mode, required fields are the row COLUMNS the queries
+        read: the union of every query's input_fields values plus the literal
+        ``row.source_row.<column>`` reads in each query's effective template
+        (its override, else the node-level prompt_template). A query renders
+        with ``row`` bound to its synthetic context, so its ``row.<variable>``
+        names are bindings, not columns — suggesting them (or ``source_row``)
+        handed the planner a declaration the DAG then rejected as missing
+        upstream fields.
 
         Opt-out mechanism:
         - required_input_fields: [field_a, field_b]  # Declare specific requirements
@@ -485,17 +589,15 @@ class LLMConfig(TransformDataConfig):
             from elspeth.core.templates import extract_jinja2_fields
 
             if self.queries is not None:
-                # Multi-query mode: required row fields are the union of all
-                # query specs' input_fields values (row column names), plus
-                # any row.* references in the top-level and per-query templates.
+                # Multi-query mode: the row columns each query reads — its
+                # input_fields values plus literal row.source_row.<column>
+                # reads in its effective template. Never its row.<variable>
+                # names: those are the query's own bindings.
                 extracted: set[str] = set()
-                # Collect row column names from input_fields mappings
                 for spec in resolve_queries(self.queries):
                     extracted.update(spec.input_fields.values())
-                    if spec.template:
-                        extracted.update(extract_jinja2_fields(spec.template))
-                # Also check the top-level template for row references
-                extracted.update(extract_jinja2_fields(self.prompt_template))
+                    effective_template = spec.template if spec.template is not None else self.prompt_template
+                    extracted.update(multi_query_source_row_columns(effective_template))
             else:
                 # Single-query mode: detect row references in the template
                 extracted = set(extract_jinja2_fields(self.prompt_template))
@@ -597,6 +699,11 @@ class LLMConfig(TransformDataConfig):
         * in multi-query mode, a ``row.<name>`` reference outside that
           query's ``input_fields`` keys + ``{source_row}`` raises
           ``Undefined variable`` when that query renders;
+        * in multi-query mode with a non-empty ``required_input_fields``, a
+          row COLUMN a query reads — an ``input_fields`` value or a literal
+          ``row.source_row.<column>`` — outside ``declared_input_fields``
+          (elspeth-a10d15055b; message shared with the composer twin through
+          ``multi_query_undeclared_columns_message``);
         * in single-prompt mode, a ``row.<name>`` reference outside
           ``required_input_fields`` (elspeth-a9ba80cb0b). This limb is a
           CONTRACT check, not a proof of failure, and its wording must not
@@ -724,6 +831,25 @@ class LLMConfig(TransformDataConfig):
                     "'{{ row.<variable> }}' with <variable> an input_fields key of every query that uses "
                     "this template, or give those queries template overrides."
                 )
+
+        # The binding checks above prove each query's template renders against
+        # its synthetic context; this one proves the context itself can be BUILT
+        # from a contracted row. ``build_template_context`` does
+        # ``row[row_column]`` for every input_fields value, and a template reads
+        # ``row.source_row.<column>`` directly, so with a non-empty declaration
+        # each such column must be covered by the node's declared input fields
+        # — otherwise edge validation checks only the declaration, validates
+        # green, and every row fails the query with template_context_failed
+        # (elspeth-a10d15055b). Skipped for None (the sibling validator above
+        # rejects that) and for [], the documented opt-out.
+        if self.required_input_fields:
+            covering = self.declared_input_fields
+            for spec in resolve_queries(self.queries):
+                effective_template = spec.template if spec.template is not None else self.prompt_template
+                columns = {*spec.input_fields.values(), *multi_query_source_row_columns(effective_template)}
+                undeclared_columns = undeclared_row_fields(columns, covering)
+                if undeclared_columns:
+                    raise ValueError(multi_query_undeclared_columns_message(spec.name, undeclared_columns, self.required_input_fields))
         return self
 
     @property

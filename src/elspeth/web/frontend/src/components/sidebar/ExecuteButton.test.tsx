@@ -119,6 +119,7 @@ describe("ExecuteButton", () => {
       validationResult: null,
       isExecuting: false,
       progress: null,
+      error: null,
       execute: vi.fn(),
       runDisclosureAckBySession: {},
     } as never);
@@ -155,6 +156,137 @@ describe("ExecuteButton", () => {
     expect(
       screen.getByRole("button", { name: /run pipeline/i }),
     ).toBeInTheDocument();
+  });
+
+  describe("launch failure beside Run (operator placement ruling 2026-09-13)", () => {
+    const READY_VALIDATION = {
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [],
+      readiness: READY_READINESS,
+    };
+
+    it("shows the stored execution error beside Run as an alert", () => {
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        error: "A run is already in progress for this pipeline.",
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      const { container } = render(<ExecuteButton />);
+
+      const alert = screen.getByRole("alert");
+      expect(alert).toHaveTextContent(
+        "A run is already in progress for this pipeline.",
+      );
+      expect(alert).toHaveClass("side-rail-execute-reason");
+      // DOM order: the reason slot precedes Run (workspace.css adjacency).
+      expect(alert.nextElementSibling).toBe(
+        screen.getByRole("button", { name: /run pipeline/i }),
+      );
+      // Exactly one reason-slot <p> — a second grid child would wrap the bar.
+      expect(container.querySelectorAll(".side-rail-execute-reason")).toHaveLength(1);
+    });
+
+    it("surfaces a launch failure that execute() writes after a Run click", async () => {
+      const execute = vi.fn(async () => {
+        useExecutionStore.setState({
+          isExecuting: false,
+          error: "Server readiness refused this run.",
+        } as never);
+        return null;
+      });
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        execute,
+        runDisclosureAckBySession: { "sess-1": true },
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      render(<ExecuteButton />);
+      expect(screen.queryByRole("alert")).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Server readiness refused this run.",
+      );
+      expect(execute).toHaveBeenCalledWith("sess-1");
+    });
+
+    it("dismisses the failure line and clears the stored error", () => {
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        error: "Pipeline execution failed.",
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      render(<ExecuteButton />);
+      fireEvent.click(
+        screen.getByRole("button", { name: /dismiss run failure/i }),
+      );
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(useExecutionStore.getState().error).toBeNull();
+    });
+
+    it("renders nothing extra when there is no stored error", () => {
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        error: null,
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      const { container } = render(<ExecuteButton />);
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(container.querySelector(".side-rail-execute-reason")).toBeNull();
+    });
+
+    it("renders no empty alert for an empty stored error (Checks banner parity)", () => {
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        error: "",
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      render(<ExecuteButton />);
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: /dismiss run failure/i }),
+      ).toBeNull();
+    });
+
+    it("puts a stored error ahead of a live gate reason, and dismissing reveals the gate reason", () => {
+      // Realistic both-present case: validate()'s fetch failed, so the
+      // error is set AND validationResult is null (gate reason = not
+      // validated). The failure the user just hit takes the single slot.
+      useExecutionStore.setState({
+        validationResult: null,
+        error: "Validation encountered an internal error. Please try again.",
+      } as never);
+      useSessionStore.setState({
+        activeSessionId: "sess-1",
+        compositionState: null,
+      } as never);
+
+      const { container } = render(<ExecuteButton />);
+
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Validation encountered an internal error. Please try again.",
+      );
+      expect(container.querySelector("[data-run-block-reason]")).toBeNull();
+      expect(container.querySelectorAll(".side-rail-execute-reason")).toHaveLength(1);
+
+      fireEvent.click(
+        screen.getByRole("button", { name: /dismiss run failure/i }),
+      );
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(container.querySelector("[data-run-block-reason]")).not.toBeNull();
+    });
   });
 
   it("disables the Run pipeline button when validation is failing", () => {

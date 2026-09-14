@@ -151,6 +151,7 @@ from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
     composition_proposals_table,
+    composition_rejection_events_table,
     composition_states_table,
     guided_operation_admission_blocks_table,
     guided_operation_events_table,
@@ -206,6 +207,7 @@ from elspeth.web.sessions.protocol import (
     ComposerSessionPreferencesTransition,
     ComposerTrustMode,
     CompositionProposalRecord,
+    CompositionRejectionEventRecord,
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
@@ -14361,6 +14363,53 @@ class SessionServiceImpl:
 
         rows = await self._run_sync(_sync)
         return {row.id: int(row.version) for row in rows}
+
+    async def list_composition_rejection_events(
+        self,
+        session_id: UUID,
+    ) -> tuple[CompositionRejectionEventRecord, ...]:
+        """Read-only projection of ``composition_rejection_events`` (elspeth-3e28029d2f).
+
+        Placed after ``get_state_version_numbers`` on purpose: the Sessions DB
+        read inventory pins ``line`` and no reviewed identity sits below it.
+        ``planner_payload`` is not selected.
+        """
+
+        def _sync() -> Any:
+            with self._engine.connect() as conn:
+                return conn.execute(
+                    select(
+                        composition_rejection_events_table.c.id,
+                        composition_rejection_events_table.c.session_id,
+                        composition_rejection_events_table.c.tool_call_id,
+                        composition_rejection_events_table.c.tool_name,
+                        composition_rejection_events_table.c.error_code,
+                        composition_rejection_events_table.c.message,
+                        composition_rejection_events_table.c.composition_state_id,
+                        composition_rejection_events_table.c.created_at,
+                    )
+                    .where(composition_rejection_events_table.c.session_id == str(session_id))
+                    .order_by(
+                        composition_rejection_events_table.c.created_at,
+                        composition_rejection_events_table.c.id,
+                    )
+                ).fetchall()
+
+        rows = await self._run_sync(_sync)
+        return tuple(
+            CompositionRejectionEventRecord(
+                id=row.id,
+                session_id=row.session_id,
+                tool_call_id=row.tool_call_id,
+                tool_name=row.tool_name,
+                error_code=row.error_code,
+                message=row.message,
+                composition_state_id=row.composition_state_id,
+                # Same normalization as ``_row_to_chat_message_record``.
+                created_at=self._ensure_utc(row.created_at),
+            )
+            for row in rows
+        )
 
     @contextlib.contextmanager
     def _session_mutations(

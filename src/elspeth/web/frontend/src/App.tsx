@@ -336,6 +336,12 @@ function App() {
       ) {
         useSessionStore.getState().setComposerModel(status.composer_model);
       }
+      // Same publication for the advisor model that gates completion. The
+      // field is required on the wire (the server always sends the
+      // configured advisor model), so every successful poll publishes it.
+      useSessionStore
+        .getState()
+        .setComposerAdvisorModel(status.composer_advisor_model);
       // Derive the compose abort ceiling from the deployment's configured
       // wall clock — a hard-coded client cap only satisfies the
       // client-outlives-server invariant for the checked-in defaults.

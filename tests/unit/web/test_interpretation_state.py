@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Iterator
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1343,7 +1346,7 @@ def test_resolved_raw_html_cleanup_decision_rejects_mapping_that_preserves_raw_f
         }
     )
     state = _state_with_cleanup_node(bad_options)
-    requirement = dict(state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0])  # type: ignore[index]
+    requirement = dict(state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0])
     requirement["status"] = "resolved"
     requirement["event_id"] = "event-raw-html-drop"
     requirement["accepted_value"] = requirement["draft"]
@@ -2815,3 +2818,646 @@ def test_validated_mapping_field_rejects_non_string_mapping_sides(bad_field: obj
 
     with pytest.raises(ValueError, match="must map string field names"):
         _validated_mapping_field(bad_field, context="raw-html cleanup review contract", node_id="drop-raw")
+
+
+# ---------------------------------------------------------------------------
+# Multi-query prompt surface attestation (session 94f6f00c).
+#
+# The llm_prompt_template review used to anchor to the node-level
+# prompt_template alone. On a multi-query node every query may override it, so
+# the operator attested text the model never sees while the per-query
+# templates and the shared system_prompt went unreviewed. The review now
+# anchors to the whole prompt surface for that node shape; single-prompt
+# anchors are byte-identical to before.
+# ---------------------------------------------------------------------------
+
+
+def _multi_query_queries() -> dict[str, dict[str, object]]:
+    return {
+        "good_pair": {
+            "input_fields": {"colour": "colour"},
+            "template": "What is a good colour pair for {{ row.colour }}? Reply with the single colour name only.",
+        },
+        "hex_code": {
+            "input_fields": {"colour": "colour"},
+            "template": "What is the approximate hex code of the colour {{ row.colour }}?",
+        },
+    }
+
+
+def _multi_query_options(**overrides: object) -> dict[str, object]:
+    options: dict[str, object] = {
+        "prompt_template": "Answer the question about the colour {{ row.colour }} in one short reply.",
+        "system_prompt": "Reply with only the value asked for and nothing else.",
+        "queries": _multi_query_queries(),
+        "required_input_fields": ["colour"],
+    }
+    options.update(overrides)
+    return options
+
+
+def test_single_prompt_review_anchor_is_the_skeleton_hash_or_none() -> None:
+    """Single-prompt anchors: structured nodes anchor to the skeleton hash,
+    unstructured no-parts nodes return None (callers use the text hash)."""
+    from elspeth.web.interpretation_state import (
+        prompt_review_anchor_hash_from_options,
+        prompt_review_draft_from_options,
+    )
+
+    structured = _pending_options()
+    assert prompt_review_anchor_hash_from_options(structured) == prompt_structure_hash_from_options(structured)
+    unstructured = {"prompt_template": "Rate {{ row.text }}"}
+    assert prompt_review_anchor_hash_from_options(unstructured) is None
+    assert prompt_review_draft_from_options(unstructured) == "Rate {{ row.text }}"
+
+
+def test_multi_query_review_anchor_covers_every_prompt_the_model_receives() -> None:
+    from elspeth.web.interpretation_state import PROMPT_SURFACE_HASH_DOMAIN, prompt_review_anchor_hash_from_options
+
+    base = prompt_review_anchor_hash_from_options(_multi_query_options())
+    assert base is not None
+    assert base != stable_hash(_multi_query_options()["prompt_template"])
+
+    queries = _multi_query_queries()
+    queries["good_pair"] = {**queries["good_pair"], "template": "Name a colour that pairs with {{ row.colour }}."}
+    assert prompt_review_anchor_hash_from_options(_multi_query_options(queries=queries)) != base
+    assert prompt_review_anchor_hash_from_options(_multi_query_options(system_prompt="Be terse.")) != base
+    assert prompt_review_anchor_hash_from_options(_multi_query_options(prompt_template="Different dead prompt.")) != base
+    # Order-insensitive to unrelated keys, deterministic across calls.
+    assert prompt_review_anchor_hash_from_options(_multi_query_options(model="x")) == base
+    assert PROMPT_SURFACE_HASH_DOMAIN == "llm_prompt_surface/v1"
+
+
+def test_multi_query_review_draft_shows_the_live_prompts_and_marks_the_dead_slot() -> None:
+    from elspeth.web.interpretation_state import prompt_review_draft_from_options
+
+    draft = prompt_review_draft_from_options(_multi_query_options())
+    assert draft is not None
+    assert "System prompt (sent with every query):" in draft
+    assert "Reply with only the value asked for and nothing else." in draft
+    assert "Query 'good_pair':" in draft
+    assert "What is a good colour pair for {{ row.colour }}?" in draft
+    assert "Query 'hex_code':" in draft
+    assert "Node-level prompt_template: not used (every query supplies its own template)." in draft
+    # The dead text itself is not presented as the prompt under review.
+    assert "Answer the question about the colour" not in draft
+
+    queries = _multi_query_queries()
+    queries["hex_code"] = {"input_fields": {"colour": "colour"}}
+    partial = prompt_review_draft_from_options(_multi_query_options(queries=queries))
+    assert partial is not None
+    assert "Query 'hex_code': uses the node-level prompt_template (below)." in partial
+    assert "used by queries without their own template: hex_code" in partial
+    assert "Answer the question about the colour {{ row.colour }} in one short reply." in partial
+
+
+def test_well_formed_multi_query_review_anchors_are_pinned() -> None:
+    """Captured from the code BEFORE the invalid-template state was added
+    (HEAD 818d04577 + round-2 working set, 2026-09-14): a well-formed surface's
+    anchor must never move, or every resolved multi-query review reopens."""
+    from elspeth.web.interpretation_state import prompt_review_anchor_hash_from_options
+
+    assert (
+        prompt_review_anchor_hash_from_options(_multi_query_options()) == "18a8f2c191fa96d7b5eca1f1afb6d79533be2d484b5bcc9e62f73e82d00ed014"
+    )
+    queries = {
+        "good_pair": {
+            "input_fields": {"colour": "colour"},
+            "template": "What is a good colour pair for {{ row.colour }}? Reply with the single colour name only.",
+        },
+        "hex_code": {"input_fields": {"colour": "colour"}},
+    }
+    assert (
+        prompt_review_anchor_hash_from_options(_multi_query_options(queries=queries))
+        == "e50b5fc7d96ac7bc5bf8baaca8b9d7ee18c55b14c9bd26d0b2b48792622e9f80"
+    )
+    list_form = {
+        "prompt_template": "Dead node prompt",
+        "queries": [
+            {"name": "one", "input_fields": {"a": "b"}, "template": "One {{ row.a }}"},
+            {"name": "two", "input_fields": {"a": "b"}},
+        ],
+    }
+    assert prompt_review_anchor_hash_from_options(list_form) == "4a07d052ce6efd9ef81ec3075b17eb861105935380c0070a7efbc75a3b6946f8"
+
+
+@pytest.mark.parametrize("bad_template", [["not", "text"], 7, {"nested": "x"}])
+def test_multi_query_review_draft_marks_a_non_string_query_template_invalid(bad_template: object) -> None:
+    """A present non-string template is neither prose nor a node-level-template user."""
+    from elspeth.web.interpretation_state import (
+        InvalidQueryTemplate,
+        multi_query_prompt_surface_from_options,
+        prompt_review_anchor_hash_from_options,
+    )
+
+    good_pair = {
+        "input_fields": {"colour": "colour"},
+        "template": "What is a good colour pair for {{ row.colour }}? Reply with the single colour name only.",
+    }
+    queries = {"good_pair": good_pair, "hex_code": {"input_fields": {"colour": "colour"}, "template": bad_template}}
+    options = _multi_query_options(queries=queries)
+    surface = multi_query_prompt_surface_from_options(options)
+    assert surface is not None
+    assert surface.queries[1] == ("hex_code", InvalidQueryTemplate())
+    assert surface.node_template_users == ()
+
+    draft = surface.render_for_review()
+    assert "Query 'hex_code': (template value is not text; plugin validation rejects this node)" in draft
+    assert "Query 'hex_code': uses the node-level prompt_template" not in draft
+    assert "used by queries without their own template" not in draft
+    assert "Answer the question about the colour" not in draft
+    assert "Node-level prompt_template: not used (no query falls back to it)." in draft
+
+    # Collision control: the invalid query's anchor differs from both the
+    # fallback (None) and a real-template reading of the same node.
+    invalid_anchor = prompt_review_anchor_hash_from_options(options)
+    fallback = dict(queries)
+    fallback["hex_code"] = {"input_fields": {"colour": "colour"}}
+    assert invalid_anchor != prompt_review_anchor_hash_from_options(_multi_query_options(queries=fallback))
+    assert invalid_anchor != prompt_review_anchor_hash_from_options(_multi_query_options())
+
+
+def test_multi_query_review_draft_invalid_template_beside_a_fallback_query() -> None:
+    from elspeth.web.interpretation_state import multi_query_prompt_surface_from_options
+
+    queries = {
+        "good_pair": {"input_fields": {"colour": "colour"}},
+        "hex_code": {"input_fields": {"colour": "colour"}, "template": 42},
+    }
+    surface = multi_query_prompt_surface_from_options(_multi_query_options(queries=queries))
+    assert surface is not None
+    assert surface.node_template_users == ("good_pair",)
+    draft = surface.render_for_review()
+    assert "Node-level prompt_template, used by queries without their own template: good_pair\n" in draft
+    assert "Query 'hex_code': (template value is not text; plugin validation rejects this node)" in draft
+
+
+def test_multi_query_review_draft_stays_under_the_wire_bound_and_says_what_it_cut() -> None:
+    from elspeth.web.interpretation_state import PROMPT_SURFACE_REVIEW_MAX_CHARS, multi_query_prompt_surface_from_options
+
+    queries = {f"q{n}": {"input_fields": {"colour": "colour"}, "template": f"Q{n} " + ("x" * 3000) + " {{ row.colour }}"} for n in range(6)}
+    surface = multi_query_prompt_surface_from_options(_multi_query_options(queries=queries))
+    assert surface is not None
+    draft = surface.render_for_review()
+    assert len(draft) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
+    assert "more chars not shown; the review attests the full text" in draft
+    # The anchor is over the COMPLETE texts regardless of display bounding.
+    assert surface.anchor_hash() == multi_query_prompt_surface_from_options(_multi_query_options(queries=queries)).anchor_hash()  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Review-draft bounding: termination, byte stability, and the wire bound.
+#
+# The per-text shortening loop never terminated once every text sat at its
+# floor and the total still exceeded the budget: 25 queries of 250-char
+# templates pinned a worker at 100% CPU on every planner write that staged the
+# review. The floor is now terminal, and whole-entry omission keeps the draft
+# under the ``llm_draft`` wire cap (8192; an over-long draft is stored and then
+# fails ``InterpretationEventResponse`` on read) when shortening cannot.
+# ---------------------------------------------------------------------------
+
+
+def _surface_fixture_text(tag: str, length: int) -> str:
+    body = "".join(chr(97 + (i * 7 + len(tag)) % 26) for i in range(length))
+    return f"{tag} {body} {{{{ row.colour }}}}"
+
+
+def _exact_length_template(tag: str, length: int) -> str:
+    return (f"{tag} {{{{ row.colour }}}} " + "y" * length)[:length]
+
+
+def _fixture_queries(count: int, length: int) -> dict[str, object]:
+    return {f"q{n}": {"input_fields": {"colour": "colour"}, "template": _surface_fixture_text(f"Q{n}", length)} for n in range(count)}
+
+
+def _exact_length_queries(count: int, length: int) -> dict[str, object]:
+    return {f"q{n}": {"input_fields": {"colour": "colour"}, "template": _exact_length_template(f"Q{n}", length)} for n in range(count)}
+
+
+def _byte_stability_options(name: str) -> dict[str, object]:
+    if name == "base":
+        return _multi_query_options()
+    if name == "single_long":
+        return _multi_query_options(
+            queries={"only": {"input_fields": {"colour": "colour"}, "template": _surface_fixture_text("ONLY", 20000)}}
+        )
+    if name == "six_x_3000":
+        return _multi_query_options(
+            queries={
+                f"q{n}": {"input_fields": {"colour": "colour"}, "template": f"Q{n} " + ("x" * 3000) + " {{ row.colour }}"} for n in range(6)
+            }
+        )
+    if name == "mix":
+        return _multi_query_options(
+            system_prompt=_surface_fixture_text("SYS", 5000),
+            prompt_template=_surface_fixture_text("NODE", 1500),
+            queries={
+                "alpha": {"input_fields": {"colour": "colour"}, "template": _surface_fixture_text("ALPHA", 400)},
+                "beta": {"input_fields": {"colour": "colour"}, "template": _surface_fixture_text("BETA", 2500)},
+                "gamma": {"input_fields": {"colour": "colour"}},
+                "delta": {"input_fields": {"colour": "colour"}, "template": _surface_fixture_text("DELTA", 1200)},
+            },
+        )
+    if name == "ten_x_1000":
+        return _multi_query_options(queries=_fixture_queries(10, 1000))
+    if name == "twenty_four_x_250":
+        return _multi_query_options(queries=_exact_length_queries(24, 250))
+    if name == "twenty_three_x_300":
+        # Reaches the 200-char display floor (300 // 2 < 200) and still fits,
+        # so the floor constant itself is pinned.
+        return _multi_query_options(queries=_exact_length_queries(23, 300))
+    raise AssertionError(f"unknown byte-stability fixture {name!r}")
+
+
+# (len, sha256) of ``render_for_review()`` captured from the pre-fix code for
+# inputs it terminated on and fitted under the bound. The draft is the review's
+# idempotency key, so a moved byte re-stages every such review.
+_PRE_FIX_REVIEW_DRAFTS: dict[str, tuple[int, str]] = {
+    "base": (446, "ef7ad5702eed2184a6b1f894d5c7ea1fb13eddb7eb30923d732c81183cf60ae6"),
+    "single_long": (5370, "afff75e694d255c141419d60690600c47e9e0ebf1f43daf2172e9818368da675"),
+    "six_x_3000": (6879, "2b2291236c7907742cdad092cc431761f3892166bedc1e7743606b639f3a84a5"),
+    "mix": (7351, "49998c97e1262561a9981b53be06bfae90465dff81374d62af535939c83fa130"),
+    "ten_x_1000": (7009, "6ff7c7511a4a0b6cd2f0f012af74a5d100d13fc49bf2edd93f07f616b8799da4"),
+    "twenty_four_x_250": (6603, "8a989c7bf760791f810f466e4cbb24bb0c8cf652596dc1f420e82ad95dd50c6c"),
+    "twenty_three_x_300": (6652, "0ca8a997fbc0f3f9a55fedb7465b8b91adb3948d0ab22d1c2a4dee51c79c425a"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_PRE_FIX_REVIEW_DRAFTS))
+def test_multi_query_review_draft_is_byte_identical_to_the_pre_fix_render_that_fit(name: str) -> None:
+    from elspeth.web.interpretation_state import multi_query_prompt_surface_from_options
+
+    surface = multi_query_prompt_surface_from_options(_byte_stability_options(name))
+    assert surface is not None
+    draft = surface.render_for_review()
+    assert (len(draft), hashlib.sha256(draft.encode()).hexdigest()) == _PRE_FIX_REVIEW_DRAFTS[name]
+
+
+def _limit_review_draft_shortening_steps(monkeypatch: pytest.MonkeyPatch, *, text_count: int) -> list[int]:
+    """Fail the draft's shortening loop after a bounded number of steps instead of letting it spin.
+
+    ``_bounded_texts`` pops one heap entry per step, and every step either
+    strictly shortens a text (halving it, so at most 63 times for any real
+    string) or exhausts it (once). ``64 * text_count`` pops therefore bounds a
+    terminating loop, while a loop that stops exhausting a text at its floor
+    pops the same entry forever. The counter turns that into an assertion
+    failure after a finite number of steps: deterministic, no timer. The
+    returned cell holds the pop count, so a test can show the counter saw the
+    loop at all.
+    """
+    import heapq
+
+    from elspeth.web import interpretation_state
+
+    limit = 64 * text_count
+    pops = [0]
+
+    def counting_heappop(heap: list[tuple[int, int]]) -> tuple[int, int]:
+        pops[0] += 1
+        if pops[0] > limit:
+            raise AssertionError(f"review-draft shortening did not terminate within {limit} steps")
+        return heapq.heappop(heap)
+
+    monkeypatch.setattr(
+        interpretation_state,
+        "heapq",
+        SimpleNamespace(heapify=heapq.heapify, heappush=heapq.heappush, heappop=counting_heappop),
+    )
+    return pops
+
+
+def test_multi_query_review_draft_terminates_when_every_template_sits_at_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.interpretation_state import PROMPT_SURFACE_REVIEW_MAX_CHARS, multi_query_prompt_surface_from_options
+
+    surface = multi_query_prompt_surface_from_options(_multi_query_options(queries=_exact_length_queries(25, 250)))
+    assert surface is not None
+    pops = _limit_review_draft_shortening_steps(monkeypatch, text_count=25 + 2)
+    draft = surface.render_for_review()
+    assert pops[0] > 0
+    assert len(draft) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
+    # A 250-char template cannot shrink (its shortened form is longer), so it
+    # is shown in full; the floor alone fits this surface, so nothing is omitted.
+    assert "Query 'q24':\n" + _exact_length_template("Q24", 250) in draft
+    assert "not shown in this draft" not in draft
+    assert "not listed in this draft" not in draft
+
+
+def test_multi_query_review_draft_omits_whole_templates_from_the_end_when_the_floor_cannot_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.interpretation_state import PROMPT_SURFACE_REVIEW_MAX_CHARS, multi_query_prompt_surface_from_options
+
+    queries = _exact_length_queries(60, 250)
+    surface = multi_query_prompt_surface_from_options(_multi_query_options(queries=queries))
+    assert surface is not None
+    pops = _limit_review_draft_shortening_steps(monkeypatch, text_count=60 + 2)
+
+    class _Counting(_ScanCountingQueries):
+        scans = 0
+
+    draft = replace(surface, queries=_Counting(surface.queries)).render_for_review()
+    assert pops[0] > 0
+    # Whole-entry omission takes one sizing step per omitted template; a scan of
+    # ``queries`` inside a step makes the render quadratic.
+    assert _Counting.scans <= 16
+    assert len(draft) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
+    omitted = draft.count(" chars not shown; the review attests the full text)")
+    assert 0 < omitted < 60
+    assert f"Query templates not shown in this draft: {omitted} of 60; the review attests every template in full." in draft
+    # From the END: the last query is a fact line, the first is shown in full.
+    assert "Query 'q59': (template of 250 chars not shown; the review attests the full text)" in draft
+    assert "Query 'q0':\n" + _exact_length_template("Q0", 250) in draft
+    assert "not listed in this draft" not in draft
+    # The anchor still covers an omitted template.
+    changed = dict(queries)
+    changed["q59"] = {"input_fields": {"colour": "colour"}, "template": "Changed {{ row.colour }}"}
+    changed_surface = multi_query_prompt_surface_from_options(_multi_query_options(queries=changed))
+    assert changed_surface is not None
+    assert changed_surface.anchor_hash() != surface.anchor_hash()
+
+
+def test_multi_query_review_draft_stops_listing_trailing_queries_when_fact_lines_cannot_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.interpretation_state import PROMPT_SURFACE_REVIEW_MAX_CHARS, multi_query_prompt_surface_from_options
+
+    long_name = "n" * 60
+    queries = {f"{long_name}{n}": {"input_fields": {"colour": "colour"}} for n in range(400)}
+    options = _multi_query_options(
+        system_prompt=_surface_fixture_text("SYS", 20000),
+        prompt_template=_surface_fixture_text("NODE", 20000),
+        queries=queries,
+    )
+    surface = multi_query_prompt_surface_from_options(options)
+    assert surface is not None
+    pops = _limit_review_draft_shortening_steps(monkeypatch, text_count=400 + 2)
+
+    class _Counting(_ScanCountingQueries):
+        scans = 0
+
+    draft = replace(surface, queries=_Counting(surface.queries)).render_for_review()
+    assert pops[0] > 0
+    # Stopping the listing takes one sizing step per trailing query; a scan of
+    # ``queries`` inside a step makes the render quadratic.
+    assert _Counting.scans <= 16
+    assert len(draft) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
+    assert "Queries not listed in this draft: the last " in draft
+    assert f"Query '{long_name}0': uses the node-level prompt_template (below)." in draft
+    assert f"Query '{long_name}399'" not in draft
+    assert "more not listed" in draft
+    # The anchor still covers an unlisted query.
+    renamed = dict(queries)
+    renamed[f"{long_name}399x"] = renamed.pop(f"{long_name}399")
+    renamed_surface = multi_query_prompt_surface_from_options(_multi_query_options(**{**options, "queries": renamed}))
+    assert renamed_surface is not None
+    assert renamed_surface.anchor_hash() != surface.anchor_hash()
+
+
+def test_multi_query_review_draft_measures_the_render_not_the_frame_estimate() -> None:
+    """A fallback query's name is printed twice (its own line and the users
+    line) but the frame estimate reserves it once, so a long name can push a
+    draft whose texts fit the budget over the bound."""
+    from elspeth.web.interpretation_state import PROMPT_SURFACE_REVIEW_MAX_CHARS, multi_query_prompt_surface_from_options
+
+    system_prompt = _surface_fixture_text("SYS", 2000)
+    options = _multi_query_options(
+        system_prompt=system_prompt,
+        prompt_template=_surface_fixture_text("NODE", 2000),
+        queries={"F" * 3000: {"input_fields": {"colour": "colour"}}},
+    )
+    surface = multi_query_prompt_surface_from_options(options)
+    assert surface is not None
+    draft = surface.render_for_review()
+    assert len(draft) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
+    assert "System prompt (sent with every query):\n" + system_prompt + "\n" in draft
+    assert "Queries not listed in this draft: the last 1 of 1;" in draft
+
+
+class _ScanCountingQueries(tuple[tuple[str, Any], ...]):
+    """A queries tuple that counts full iterations over itself.
+
+    Every whole-surface property of ``MultiQueryPromptSurface`` (fallback
+    users, templated count, invalid-template check) is one ``__iter__`` over
+    ``queries``, so the count is the number of O(n) scans one render made.
+    """
+
+    scans: int = 0
+
+    def __iter__(self) -> Iterator[tuple[str, Any]]:
+        type(self).scans += 1
+        return super().__iter__()
+
+
+@pytest.mark.parametrize("count", [500, 5000])
+def test_multi_query_review_draft_scans_the_queries_a_size_independent_number_of_times(count: int) -> None:
+    """Whole-entry omission takes up to ``2 * len(queries)`` sizing steps, so any
+    scan of ``queries`` inside a step makes the render quadratic: at 5000
+    queries the invalid-template check ran 9910 times per render (1.6 s
+    serially). The render may scan ``queries`` only a fixed number of times,
+    whatever its size. Counted, not timed, so the guard is deterministic under
+    load."""
+    from elspeth.web.interpretation_state import PROMPT_SURFACE_REVIEW_MAX_CHARS, multi_query_prompt_surface_from_options
+
+    surface = multi_query_prompt_surface_from_options(_multi_query_options(queries=_fixture_queries(count, 250)))
+    assert surface is not None
+    expected_draft = surface.render_for_review()
+    # Both sizes reach the stage that stops listing trailing queries, so they
+    # take the same code path and must make the same number of scans.
+    assert "Queries not listed in this draft: the last " in expected_draft
+
+    class _Counting(_ScanCountingQueries):
+        scans = 0
+
+    counted = replace(surface, queries=_Counting(surface.queries))
+    draft = counted.render_for_review()
+
+    assert draft == expected_draft
+    assert len(draft) <= PROMPT_SURFACE_REVIEW_MAX_CHARS
+    assert _Counting.scans <= 16
+
+
+def _resolved_prompt_review(anchor: str, draft: str) -> dict[str, object]:
+    return {
+        "id": "prompt-template-review",
+        "kind": "llm_prompt_template",
+        "user_term": "llm_prompt_template:rate_coolness",
+        "status": "resolved",
+        "draft": draft,
+        "event_id": "event-9",
+        "accepted_value": draft,
+        "accepted_artifact_hash": None,
+        "resolved_prompt_template_hash": anchor,
+    }
+
+
+def test_multi_query_execution_guard_accepts_the_surface_anchor_and_keeps_the_runtime_hash() -> None:
+    from elspeth.web.interpretation_state import prompt_review_anchor_hash_from_options, prompt_review_draft_from_options
+
+    options = _multi_query_options()
+    anchor = prompt_review_anchor_hash_from_options(options)
+    assert anchor is not None
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [_resolved_prompt_review(anchor, prompt_review_draft_from_options(options) or "")]
+
+    materialized = materialize_state_for_execution(_state_with_llm(options))
+
+    assert isinstance(materialized, CompositionState)
+    # The node-level runtime hash the plugin re-validates is still the text hash
+    # of prompt_template (LLMConfig demands exactly that); only the REVIEW anchor widened.
+    assert materialized.nodes[0].options["resolved_prompt_template_hash"] == stable_hash(options["prompt_template"])
+
+
+def _node_template_anchored_multi_query_options(anchor_kind: str) -> dict[str, object]:
+    """A multi-query node whose RESOLVED review is anchored to the node-level template
+    alone: its text hash, or (for a structured template) its skeleton hash."""
+    if anchor_kind == "text_hash":
+        options = _multi_query_options()
+        prompt_template = options["prompt_template"]
+        assert isinstance(prompt_template, str)
+        anchor = stable_hash(prompt_template)
+    else:
+        prompt_template = "Rate {{ row.colour }}"
+        options = _multi_query_options(
+            prompt_template=prompt_template,
+            **{PROMPT_TEMPLATE_PARTS_KEY: [{"kind": "text", "text": prompt_template}]},
+        )
+        skeleton_anchor = prompt_structure_hash_from_options(options)
+        assert skeleton_anchor is not None
+        assert skeleton_anchor != stable_hash(prompt_template)
+        anchor = skeleton_anchor
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [_resolved_prompt_review(anchor, prompt_template)]
+    return options
+
+
+@pytest.mark.parametrize("anchor_kind", ["text_hash", "skeleton_hash"])
+def test_multi_query_review_anchored_to_the_node_level_template_is_drift(anchor_kind: str) -> None:
+    """The node-level template's hash is not a multi-query node's anchor (the surface
+    anchor is), so a review carrying it takes the path every other anchor mismatch
+    takes: no review site, and the execution gate refuses it as drift."""
+    state = _state_with_llm(_node_template_anchored_multi_query_options(anchor_kind))
+
+    assert interpretation_sites(state) == ()
+    with pytest.raises(ValueError, match="prompt-template review hash drifted"):
+        materialize_state_for_execution(state)
+
+
+def test_resolved_surface_anchored_multi_query_review_is_not_a_site() -> None:
+    from elspeth.web.interpretation_state import prompt_review_anchor_hash_from_options, prompt_review_draft_from_options
+
+    options = _multi_query_options()
+    anchor = prompt_review_anchor_hash_from_options(options)
+    assert anchor is not None
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [_resolved_prompt_review(anchor, prompt_review_draft_from_options(options) or "")]
+
+    assert interpretation_sites(_state_with_llm(options)) == ()
+
+
+def test_resolved_single_prompt_review_with_its_text_hash_anchor_is_not_a_site() -> None:
+    """For an unstructured single-prompt node ``stable_hash(prompt_template)`` IS the
+    anchor, so a review carrying it is no site."""
+    options: dict[str, object] = {"prompt_template": "Answer the question about the colour {{ row.colour }} in one short reply."}
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [
+        _resolved_prompt_review(stable_hash(options["prompt_template"]), str(options["prompt_template"]))
+    ]
+
+    assert interpretation_sites(_state_with_llm(options)) == ()
+
+
+def test_multi_query_execution_guard_still_reports_a_genuine_drift() -> None:
+    options = _multi_query_options()
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [_resolved_prompt_review("0" * 64, "whatever")]
+
+    with pytest.raises(ValueError, match="prompt-template review hash drifted"):
+        materialize_state_for_execution(_state_with_llm(options))
+
+
+def _reconcile_multi_query(previous_options: dict[str, object], proposed_options: dict[str, object]) -> dict[str, object]:
+    from elspeth.web.interpretation_state import reconcile_authoritative_reviews
+
+    reconciled = reconcile_authoritative_reviews(_state_with_llm(previous_options), _state_with_llm(proposed_options))
+    return dict(reconciled.nodes[0].options)
+
+
+def _prompt_review_of(options: dict[str, object]) -> dict[str, object]:
+    requirements = options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert isinstance(requirements, tuple)
+    matches = [dict(entry) for entry in requirements if entry["kind"] == "llm_prompt_template"]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_reconcile_carries_a_multi_query_review_whose_surface_is_unchanged() -> None:
+    from elspeth.web.interpretation_state import prompt_review_anchor_hash_from_options, prompt_review_draft_from_options
+
+    previous = _multi_query_options()
+    anchor = prompt_review_anchor_hash_from_options(previous)
+    assert anchor is not None
+    review = _resolved_prompt_review(anchor, prompt_review_draft_from_options(previous) or "")
+    previous[INTERPRETATION_REQUIREMENTS_KEY] = [review]
+    proposed = _multi_query_options(model="different-but-not-prompt")
+    proposed[INTERPRETATION_REQUIREMENTS_KEY] = [dict(review)]
+
+    carried = _prompt_review_of(_reconcile_multi_query(previous, proposed))
+
+    assert carried["status"] == "resolved"
+    assert carried["resolved_prompt_template_hash"] == anchor
+
+
+def test_reconcile_reopens_a_multi_query_review_when_a_query_template_changes() -> None:
+    from elspeth.web.interpretation_state import prompt_review_anchor_hash_from_options, prompt_review_draft_from_options
+
+    previous = _multi_query_options()
+    anchor = prompt_review_anchor_hash_from_options(previous)
+    assert anchor is not None
+    review = _resolved_prompt_review(anchor, prompt_review_draft_from_options(previous) or "")
+    previous[INTERPRETATION_REQUIREMENTS_KEY] = [review]
+    queries = _multi_query_queries()
+    queries["good_pair"] = {**queries["good_pair"], "template": "Name a colour that pairs with {{ row.colour }}."}
+    proposed = _multi_query_options(queries=queries)
+    proposed[INTERPRETATION_REQUIREMENTS_KEY] = [dict(review)]
+
+    reopened = _prompt_review_of(_reconcile_multi_query(previous, proposed))
+
+    assert reopened["status"] == "pending"
+    assert reopened["accepted_value"] is None
+
+
+def test_reconcile_reopens_a_multi_query_review_when_only_the_node_level_prompt_changes() -> None:
+    """The node-level template is part of the reviewed surface even when every query
+    overrides it, so editing only that text reopens a review anchored to the surface."""
+    from elspeth.web.interpretation_state import prompt_review_anchor_hash_from_options, prompt_review_draft_from_options
+
+    previous = _multi_query_options()
+    anchor = prompt_review_anchor_hash_from_options(previous)
+    assert anchor is not None
+    review = _resolved_prompt_review(anchor, prompt_review_draft_from_options(previous) or "")
+    previous[INTERPRETATION_REQUIREMENTS_KEY] = [review]
+    proposed = _multi_query_options(prompt_template="Answer briefly about the colour {{ row.colour }}.")
+    proposed[INTERPRETATION_REQUIREMENTS_KEY] = [dict(review)]
+
+    reopened = _prompt_review_of(_reconcile_multi_query(previous, proposed))
+
+    assert reopened["status"] == "pending"
+    assert reopened["event_id"] is None
+    assert reopened["accepted_value"] is None
+    assert reopened["resolved_prompt_template_hash"] is None
+
+
+def test_reconcile_raises_on_a_multi_query_review_anchored_to_the_node_level_text_hash() -> None:
+    """The node-level text hash is not a multi-query node's anchor, so reconcile treats
+    a review carrying it exactly like any other mismatched anchor."""
+    previous = _multi_query_options()
+    text_hash_anchor = stable_hash(previous["prompt_template"])
+    review = _resolved_prompt_review(text_hash_anchor, str(previous["prompt_template"]))
+    previous[INTERPRETATION_REQUIREMENTS_KEY] = [review]
+    proposed = _multi_query_options()
+    proposed[INTERPRETATION_REQUIREMENTS_KEY] = [dict(review)]
+
+    with pytest.raises(ValueError, match="hash drifted"):
+        _reconcile_multi_query(previous, proposed)
+
+
+def test_reconcile_still_raises_on_a_genuinely_drifted_multi_query_review() -> None:
+    previous = _multi_query_options()
+    review = _resolved_prompt_review("0" * 64, "whatever")
+    previous[INTERPRETATION_REQUIREMENTS_KEY] = [review]
+    proposed = _multi_query_options()
+    proposed[INTERPRETATION_REQUIREMENTS_KEY] = [dict(review)]
+
+    with pytest.raises(ValueError, match="hash drifted"):
+        _reconcile_multi_query(previous, proposed)

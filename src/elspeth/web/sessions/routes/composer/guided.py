@@ -137,6 +137,7 @@ from .._helpers import (
     TurnRecordResponse,
     TurnType,
     UserIdentity,
+    _composer_heartbeat_cancel_of,
     _composer_progress_sink,
     _failure_log_request_id,
     _get_composer_progress_registry,
@@ -3436,14 +3437,24 @@ async def post_guided_respond(
                     )
                 except (KeyError, ValueError) as exc:
                     raise AuditIntegrityError("guided wire confirmation proposal authority is missing or cross-session") from exc
-                if verified_remaining_deferred_intents(guided=observed_guided, proposal=authority.proposal):
+                remaining_intents = verified_remaining_deferred_intents(guided=observed_guided, proposal=authority.proposal)
+                if remaining_intents:
                     # Refuse before operation reservation or pipeline dispatch.
                     # Constraint-bearing debt belongs back in planner repair;
                     # constraint-free clarification debt needs an explicit
                     # operator edit/cancel and must remain visibly pending.
+                    # The detail names each blocking instruction and the exact
+                    # commands that clear it (F1 finding #23): no other client
+                    # wire carries the intent id the user has to type.
                     raise HTTPException(
                         status_code=409,
-                        detail="Guided wiring still has unresolved retained instructions.",
+                        detail="Guided wiring still has unresolved retained instructions. "
+                        + " ".join(
+                            f"Instruction {intent.intent_id} blocks wiring: in the guided chat, send "
+                            f"'Edit exact intent {intent.intent_id}: <corrected instruction>' to change it, "
+                            f"or 'Cancel exact intent {intent.intent_id}.' to drop it."
+                            for intent in remaining_intents
+                        ),
                     )
             requires_planner = is_correction and body.edit_target is not None and body.edit_target.kind in {"node", "edge"}
             return None, None, requires_planner
@@ -5540,6 +5551,13 @@ async def post_guided_respond(
                     raise
                 caller_task = asyncio.current_task()
                 request_cancelled = caller_task is not None and caller_task.cancelling() > 0
+                # A cancel delivered by the compose heartbeat after it lost the
+                # request's lease also leaves ``cancelling() > 0``, but it is a
+                # server fault, not a user Stop (finding #28): it settles
+                # ``operation_failed``. The bare ``raise`` hands it to
+                # ``_track_compose_inflight``, which answers with the
+                # structured 503.
+                heartbeat_cancelled = _composer_heartbeat_cancel_of(exc) is not None
                 if request_cancelled or "llm_calls" not in exc_dict:
                     cancel_failure_code: GuidedOperationFailureCode = (
                         "stale_conflict"
@@ -5547,7 +5565,7 @@ async def post_guided_respond(
                         else "integrity_error"
                         if isinstance(settlement_failure, (AuditIntegrityError, InvariantError))
                         else "operation_failed"
-                        if settlement_failure is not None or not request_cancelled
+                        if settlement_failure is not None or heartbeat_cancelled or not request_cancelled
                         else "request_cancelled"
                     )
                     try:

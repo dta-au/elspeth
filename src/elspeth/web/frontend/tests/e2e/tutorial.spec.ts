@@ -358,6 +358,7 @@ async function installTutorialRoutes(
         json: {
           composer_available: true,
           composer_model: "gpt-5.5",
+          composer_advisor_model: "gpt-5.5-advisor",
           composer_provider: "test",
           composer_reason: null,
           composer_missing_keys: [],

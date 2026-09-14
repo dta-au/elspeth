@@ -253,6 +253,14 @@ def test_repair_argument_summary_never_exposes_arbitrary_key_names(tool_name: st
     assert key_canary not in json.dumps(result, sort_keys=True)
 
 
+# ``data`` is a declared known response key for upsert_node, so the projection
+# budget now degrades only that key (per-key sentinel) instead of replacing the
+# whole row with the ``response_projection_limit`` stub. The DoS properties
+# these tests pin — no recursion, no amplification, a tiny output — are
+# unchanged.
+_PER_KEY_PROJECTION_LIMIT = {"data": "<redacted-response-projection-limit>"}
+
+
 def test_declarative_projection_rejects_excessive_depth_without_recursion() -> None:
     nested: object = "leaf"
     for _ in range(1200):
@@ -264,7 +272,7 @@ def test_declarative_projection_rejects_excessive_depth_without_recursion() -> N
         telemetry=NoopRedactionTelemetry(),
     )
 
-    assert result == {"_redaction_status": "response_projection_limit"}
+    assert result == _PER_KEY_PROJECTION_LIMIT
 
 
 def test_declarative_projection_rejects_excessive_width_without_amplification() -> None:
@@ -274,7 +282,7 @@ def test_declarative_projection_rejects_excessive_width_without_amplification() 
         telemetry=NoopRedactionTelemetry(),
     )
 
-    assert result == {"_redaction_status": "response_projection_limit"}
+    assert result == _PER_KEY_PROJECTION_LIMIT
     assert len(json.dumps(result)) < 256
 
 
@@ -285,7 +293,7 @@ def test_declarative_projection_rejects_excessive_total_nodes() -> None:
         telemetry=NoopRedactionTelemetry(),
     )
 
-    assert result == {"_redaction_status": "response_projection_limit"}
+    assert result == _PER_KEY_PROJECTION_LIMIT
 
 
 def test_type_driven_projection_rejects_oversized_validation_list_before_model_validation() -> None:
