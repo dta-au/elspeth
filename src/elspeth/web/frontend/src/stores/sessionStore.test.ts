@@ -1739,6 +1739,82 @@ describe("sessionStore", () => {
       expect(state.messages[0].local_status).toBe("failed");
     });
 
+    it("reconciles a lost POST response from saved messages and state without resending", async () => {
+      const apiMod = await import("@/api/client");
+      const canonicalUser: ChatMessage = {
+        id: "user-network",
+        session_id: "session-1",
+        role: "user",
+        content: "hello",
+        tool_calls: null,
+        created_at: "2026-09-15T00:00:00Z",
+      };
+      const canonicalAssistant: ChatMessage = {
+        id: "assistant-network",
+        session_id: "session-1",
+        role: "assistant",
+        content: "The pipeline is ready.",
+        tool_calls: null,
+        created_at: "2026-09-15T00:00:01Z",
+      };
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new TypeError("Failed to fetch"),
+      );
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
+        canonicalUser,
+        canonicalAssistant,
+      ]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeCompositionState(3, ["new-node"]),
+      );
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
+      expect(apiMod.fetchMessages).toHaveBeenCalled();
+      expect(apiMod.fetchCompositionState).toHaveBeenCalledWith("session-1");
+      expect(state.messages.map((message) => message.id)).toEqual([
+        "user-network",
+        "assistant-network",
+      ]);
+      expect(state.messages.every((message) => message.local_status === undefined)).toBe(
+        true,
+      );
+      expect(state.compositionState?.version).toBe(3);
+      expect(state.error).toContain("Your request was saved");
+      expect(clearValidationMock).toHaveBeenCalled();
+    });
+
+    it("keeps the retry affordance when a lost POST response has no durable evidence", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new TypeError("Failed to fetch"),
+      );
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeCompositionState(1),
+      );
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(apiMod.fetchMessages).toHaveBeenCalled();
+      expect(apiMod.fetchCompositionState).toHaveBeenCalledWith("session-1");
+      expect(state.messages[0]?.local_status).toBe("failed");
+      expect(state.error).toBe("Failed to send message. Please try again.");
+    });
+
     it("includes provider detail when an LLM unavailable response exposes it", async () => {
       const { sendMessage: mockSendMessage } = await import("@/api/client");
       (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({

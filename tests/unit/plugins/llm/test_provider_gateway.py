@@ -22,6 +22,7 @@ import pytest
 import respx
 
 from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -76,6 +77,7 @@ class FakeAuditRecorder:
     def record_operation_call(self, **call: Any) -> SimpleNamespace:
         self.operation_calls.append(call)
         return SimpleNamespace(
+            call_id=f"operation-call-{len(self.operation_calls)}",
             request_ref=f"operation-request-{len(self.operation_calls)}",
             response_ref=f"operation-response-{len(self.operation_calls)}",
         )
@@ -1008,6 +1010,56 @@ class TestClose:
 # ---------------------------------------------------------------------------
 # runtime_preflight — both halves required
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["success", "unknown", "malformed", "refused"])
+@respx.mock
+def test_governance_covers_preflight_completion_without_charging_readiness(
+    audit_recorder: FakeAuditRecorder, telemetry_emit: FakeTelemetryEmit, mode: str
+) -> None:
+    events: list[str] = []
+
+    def before() -> str:
+        events.append("before")
+        if mode == "refused":
+            raise RuntimeError("quota refused")
+        return "attempt-1"
+
+    def after(attempt_id: str, call_id: str) -> None:
+        assert attempt_id == "attempt-1"
+        assert call_id == f"operation-call-{len(audit_recorder.operation_calls)}"
+        assert audit_recorder.operation_calls[-1]["call_type"] is CallType.LLM
+        events.append("after")
+
+    provider = GatewayLLMProvider(
+        endpoint=_ENDPOINT,
+        api_key="test-key",
+        contract_major=1,
+        recorder=audit_recorder,
+        run_id="run-1",
+        telemetry_emit=telemetry_emit,
+        llm_call_governance=LLMCallGovernance(before_call=before, after_call=after),
+    )
+    ready = respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "1"}))
+    body = _completion_body(usage=None if mode == "unknown" else {"prompt_tokens": 10, "completion_tokens": 5})
+    if mode == "malformed":
+        del body["choices"]
+    completion = respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body))
+    if mode == "refused":
+        with pytest.raises(RuntimeError, match="quota refused"):
+            provider.runtime_preflight(operation_id="op-1", model="standard", coordination_token=_LEADER_TOKEN)
+    elif mode == "malformed":
+        with pytest.raises(LLMClientError):
+            provider.runtime_preflight(operation_id="op-1", model="standard", coordination_token=_LEADER_TOKEN)
+    else:
+        provider.runtime_preflight(operation_id="op-1", model="standard", coordination_token=_LEADER_TOKEN)
+    assert ready.call_count == 1
+    assert completion.call_count == (0 if mode == "refused" else 1)
+    assert events == (["before"] if mode == "refused" else ["before", "after"])
+    llm_calls = [call for call in audit_recorder.operation_calls if call["call_type"] is CallType.LLM]
+    assert len(llm_calls) == (0 if mode == "refused" else 1)
+    if mode == "unknown":
+        assert llm_calls[0]["token_usage"].prompt_tokens is None
 
 
 class TestRuntimePreflight:

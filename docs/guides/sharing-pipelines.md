@@ -70,8 +70,8 @@ accept this trade-off.
 ## First-deploy operator action
 
 For 0.8.1, shareable-review state is part of the broader web session database
-contract. The release expects `SESSION_SCHEMA_EPOCH=57` and
-`SQLITE_SCHEMA_EPOCH=41`. Session epoch 29 introduced durable guided
+contract. The release expects `SESSION_SCHEMA_EPOCH=58` and
+`SQLITE_SCHEMA_EPOCH=42`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed
 proposal admission, retryable blob cleanup, ordinary guided-plan decline
@@ -100,7 +100,11 @@ approval revocation provenance and durable admission decisions. Session epoch 56
 preserves sparse proposal arguments and structured validation errors. Landscape epoch
 40 adds call token measures and quota-policy/secret-wiring admission evidence.
 Session epoch 57 and Landscape epoch 41 replace the fallback-template digest
-with the approved prompt artifact anchor. A Landscape store below epoch 41 is stale and must be recreated. When
+with the approved prompt artifact anchor. Session epoch 58 widens the three quota
+policy limits to 64-bit integers and makes token-ledger prompt/completion measures
+nullable: unknown usage is NULL, never zero. Landscape epoch 42 requires
+admission evidence v2 with per-principal token quota usage and limits; stored
+v1 evidence is incompatible. A Landscape store below epoch 42 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this

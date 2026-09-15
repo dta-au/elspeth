@@ -20,6 +20,7 @@ import structlog
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.value_source import ValueSource
@@ -117,6 +118,7 @@ class AzureLLMProvider:
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
         approved_prompt_artifact_hash: str | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._api_key: str | None = api_key
@@ -130,6 +132,7 @@ class AzureLLMProvider:
         # ``client.chat_completion`` call so the Landscape ``calls`` row
         # carries the matching SHA-256.
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
+        self._llm_call_governance = llm_call_governance
 
         # Client caches — lock ordering: _llm_clients_lock → _underlying_client_lock
         # (always acquire _llm_clients_lock first to prevent deadlock)
@@ -223,6 +226,7 @@ class AzureLLMProvider:
             underlying_client=self._get_underlying_client(),
             provider="azure",
             limiter=self._limiter,
+            llm_call_governance=self._llm_call_governance,
         )
         try:
             client.chat_completion(
@@ -249,6 +253,7 @@ class AzureLLMProvider:
                     azure_endpoint=self._endpoint,
                     api_key=self._api_key,
                     api_version=self._api_version,
+                    max_retries=0,
                 )
                 # Clear plaintext key — SDK client holds its own copy
                 self._api_key = None
@@ -266,6 +271,7 @@ class AzureLLMProvider:
                     underlying_client=self._get_underlying_client(),
                     provider="azure",
                     limiter=self._limiter,
+                    llm_call_governance=self._llm_call_governance,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

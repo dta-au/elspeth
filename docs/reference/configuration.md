@@ -502,7 +502,7 @@ stating it can still break the glass.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `sso_admin_subjects` | JSON array of strings | No | `[]` | Provider `sub` claims that may seed the first `admin` role at first login, and **only** while the container has zero active human admins. The gate is a live count re-evaluated at every login, not a record that a bootstrap has happened, so the list **re-arms** if the container ever returns to zero active human admins. Delete it once the first administrator is activated. Entries are matched exactly and are not validated at load |
-| `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Enforced for every chargeable LLM operation when configured |
 | `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Validated only; no runtime path reads it in this release |
 | `identity_dormancy_days` | int | No | `90` | Dormancy window for an activated identity (R9). A login by an `active` identity whose previous login is **older than** this many days drops it back to `pending` with `disable_reason='dormant'`, writes an `identity_disabled` audit row, and refuses the login at the admission gate; an administrator must re-activate it. A re-pend takes the identity's **admission**, not its roles, quota or org-tree edges — the same posture R3's rebound disable takes — so re-activating it restores the access it already held, whichever role the administrator picks (including `none`), and the `identity_activated` audit row names those retained roles in its metadata. Use `POST /api/auth/admin/roles/{role_id}/revoke` to remove one; activation is not a way to strip authority. Exactly this many days is still admitted. An identity that has never logged in (`last_login_at` is NULL — a pre-provisioned row) is not dormant, and becomes measurable from its second login. The **last active human administrator is exempt** (D34): they are not re-pended and their login proceeds, so a single-admin container cannot walk itself to zero administrators by being left alone; the exemption writes its own `auth_events` row (`identity_disabled` with `outcome='failure'` and `failure_category='dormancy_last_admin_exempt'`). Must be greater than 0 |
 | `identity_pending_retention_days` | int | No | `90` | Intended retention for a never-activated pending identity before it is purged. Must be greater than 0. Validated only; no runtime path reads it in this release |
@@ -2138,7 +2138,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 41
+### Landscape schema epoch 42
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2189,16 +2189,18 @@ key. Epoch 39 adds immutable web run-start permit binding and recoverable
 pre-effect admission state. Epoch 40 adds nullable call token measures and
 quota-policy/secret-wiring admission evidence in the same prepared window as
 Sessions epoch 55. Epoch 41 replaces the fallback-template digest with the
-approved prompt artifact anchor, paired with session epoch 57. See the
+approved prompt artifact anchor, paired with session epoch 57. Epoch 42 requires
+admission evidence v2 with token quota usage and limits; its decoder rejects
+stored v1 evidence, requiring recreation even with an unchanged table layout. See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-41, either automatically at startup or through an operator migration command.
+42, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-41 database.
+an older epoch must not be rolled back over an epoch-42 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

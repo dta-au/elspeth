@@ -32,6 +32,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.sink_effects import SinkEffectInputKind
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run as prepare_for_run
 from elspeth.engine.orchestrator.ceremony import RunCeremony
@@ -111,6 +112,7 @@ class Orchestrator:
         concurrency_config: RuntimeConcurrencyConfig | None = None,
         telemetry_manager: TelemetryManagerProtocol | None = None,
         coalesce_completed_keys_limit: int = 10000,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         from elspeth.core.events import NullEventBus
         from elspeth.engine.clock import DEFAULT_CLOCK
@@ -138,6 +140,7 @@ class Orchestrator:
             coalesce_completed_keys_limit=self._coalesce_completed_keys_limit,
         )
         self._context_factory = RunContextFactory(
+            llm_call_governance=llm_call_governance,
             ceremony=self._ceremony,
             rate_limit_registry=self._rate_limit_registry,
             concurrency_config=self._concurrency_config,

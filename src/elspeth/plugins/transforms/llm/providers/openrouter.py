@@ -29,6 +29,7 @@ from pydantic import Field, field_validator
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
@@ -301,6 +302,7 @@ class OpenRouterLLMProvider:
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
         approved_prompt_artifact_hash: str | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         # Pre-build auth headers — avoids storing the raw API key as a named attribute
         self._request_headers = {
@@ -322,6 +324,7 @@ class OpenRouterLLMProvider:
         # post() call so the Landscape ``calls`` row carries the matching
         # SHA-256.
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
+        self._llm_call_governance = llm_call_governance
 
         # Client cache with reference counting for parallel multi-query safety.
         # Multiple parallel queries share the same row parent, so _get_http_client()
@@ -373,6 +376,7 @@ class OpenRouterLLMProvider:
         )
         logical_start = time.perf_counter()
 
+        attempt_id = self._llm_call_governance.before_call() if self._llm_call_governance is not None else None
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
         observed_usage = TokenUsage.unknown()
@@ -438,6 +442,7 @@ class OpenRouterLLMProvider:
                 model=response_model,
                 usage=usage,
                 raw_response=data,
+                attempt_id=attempt_id,
             )
             return result
         except LLMClientError as exc:
@@ -448,6 +453,7 @@ class OpenRouterLLMProvider:
                 request_payload=llm_request_payload,
                 exc=exc,
                 usage=observed_usage,
+                attempt_id=attempt_id,
             )
             raise
         except BaseException as exc:
@@ -504,10 +510,11 @@ class OpenRouterLLMProvider:
         model: str,
         usage: TokenUsage,
         raw_response: dict[str, Any],
+        attempt_id: str | None,
     ) -> None:
         """Record the semantic LLM call that the HTTP transport fulfilled."""
         call_index = audit_parent.allocate_call_index(self._recorder)
-        audit_parent.record_call(
+        call = audit_parent.record_call(
             self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
@@ -523,6 +530,10 @@ class OpenRouterLLMProvider:
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
         )
+        if self._llm_call_governance is not None:
+            if attempt_id is None:
+                raise RuntimeError("Governed LLM call has no admission attempt")
+            self._llm_call_governance.after_call(attempt_id, call.call_id)
 
     def _record_logical_llm_error(
         self,
@@ -532,10 +543,11 @@ class OpenRouterLLMProvider:
         request_payload: LLMCallRequest,
         exc: LLMClientError,
         usage: TokenUsage,
+        attempt_id: str | None,
     ) -> None:
         call_index = audit_parent.allocate_call_index(self._recorder)
         message = str(exc) or type(exc).__name__
-        audit_parent.record_call(
+        call = audit_parent.record_call(
             self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
@@ -550,51 +562,21 @@ class OpenRouterLLMProvider:
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
         )
+        if self._llm_call_governance is not None:
+            if attempt_id is None:
+                raise RuntimeError("Governed LLM call has no admission attempt")
+            self._llm_call_governance.after_call(attempt_id, call.call_id)
 
     def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited OpenRouter call under an operation parent."""
-        http_client = AuditedHTTPClient(
-            execution=self._recorder,
-            state_id=None,
-            operation_id=operation_id,
-            coordination_token=coordination_token,
-            run_id=self._run_id,
-            telemetry_emit=self._telemetry_emit,
-            timeout=self._timeout,
-            base_url=self._base_url,
-            headers=self._request_headers,
-            limiter=self._limiter,
+        self.execute_query(
+            [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
+            model=model,
+            temperature=0.0,
+            # The allowance includes reasoning tokens as well as reply text.
+            max_tokens=256,
+            audit_parent=LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=coordination_token),
         )
-        try:
-            request_body: dict[str, Any] = {
-                "model": model,
-                "messages": wire_messages([ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]),
-                "temperature": 0.0,
-                # The output allowance also pays for reasoning tokens. A 32-token
-                # probe exhausted that allowance before producing even "ok".
-                # Keep the smoke test bounded, with room for reasoning and text;
-                # this also clears the Azure-backed route minimum of 16.
-                "max_tokens": 256,
-            }
-            response = http_client.post(
-                "/chat/completions",
-                json=request_body,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            _validate_chat_completion_response(response)
-        except httpx.HTTPStatusError as e:
-            status_code = e.response.status_code
-            detail = _summarize_http_error_body(e)
-            if status_code == 429:
-                raise RateLimitError(f"Rate limited (HTTP {status_code}){detail}") from e
-            if status_code >= 500:
-                raise ServerError(f"Server error (HTTP {status_code}){detail}") from e
-            raise LLMClientError(f"HTTP {status_code}{detail}", retryable=False) from e
-        except httpx.RequestError as e:
-            raise NetworkError(f"Network error: {e}") from e
-        finally:
-            http_client.close()
 
     def _get_http_client(self, audit_parent: LLMAuditParent) -> AuditedHTTPClient:
         """Get or create AuditedHTTPClient for an audit parent (thread-safe).

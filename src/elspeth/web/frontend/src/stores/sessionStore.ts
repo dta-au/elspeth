@@ -406,6 +406,28 @@ function isComposeAbort(err: unknown): boolean {
   );
 }
 
+/**
+ * A fetch transport failure does not tell the browser whether the POST
+ * reached the server.  Treating that failure as a definitive rejection leaves
+ * the optimistic row marked retryable while the server may already have
+ * persisted the user's message and advanced the pipeline.  Reconcile the
+ * read-only session surfaces before offering a retry.
+ *
+ * HTTP errors are intentionally excluded: parseResponse received a response
+ * and the route's structured error contract is authoritative for those
+ * outcomes.  Abort errors have their own server-settlement resync above.
+ */
+function isAmbiguousComposeNetworkFailure(err: unknown): boolean {
+  if (isComposeAbort(err) || typeof err !== "object" || err === null) {
+    return false;
+  }
+  if (err instanceof TypeError) {
+    return true;
+  }
+  const record = err as { name?: unknown; status?: unknown };
+  return record.name === "NetworkError" || record.status === 0;
+}
+
 function abortReason(signal?: AbortSignal): unknown {
   return signal?.aborted === true ? signal.reason : undefined;
 }
@@ -825,6 +847,106 @@ async function resyncAfterAbortedComposeTurn(
   // Same fire-and-forget refreshes as the success branches: the cancelled
   // turn may have created blobs, auto-titled the session, and minted
   // interpretation reviews before the cancel landed.
+  useBlobStore.getState().loadBlobs(sessionId);
+  void useSessionStore.getState().loadSessions();
+  void refreshInterpretationEventsForSession(sessionId);
+}
+
+/**
+ * Reconcile a freeform turn whose POST result was lost at the transport
+ * boundary.  The request may still be running after fetch rejects, so wait for
+ * the same semantic quiescence used by the abort path before reading the
+ * durable message/state/proposal surfaces.  This helper performs no write and
+ * never replays the user's request.
+ *
+ * `baselineMessageIds` lets the caller distinguish a reply created by this
+ * turn from messages that were already visible.  When no new durable evidence
+ * is found, the failed-row retry contract remains in place; a later explicit
+ * retry is then the only path that can issue another POST.
+ */
+async function resyncAfterAmbiguousComposeFailure(
+  sessionId: string,
+  ownerGeneration: number,
+  inflightOwnerGeneration: number,
+  baselineVersion: number | null,
+  baselineMessageIds: ReadonlySet<string>,
+  messageId: string,
+  messageContent: string,
+): Promise<void> {
+  const superseded = () =>
+    useSessionStore.getState().activeSessionId !== sessionId ||
+    composerProgressPollGeneration !== ownerGeneration;
+  await waitForCancelledComposeToSettle(sessionId, ownerGeneration);
+  if (superseded()) return;
+
+  const freshMessages = await useSessionStore
+    .getState()
+    .loadInflightMessages(sessionId, inflightOwnerGeneration);
+  if (superseded()) return;
+
+  let state: CompositionState | null | undefined;
+  let proposals: CompositionProposal[] | null | undefined;
+  const [stateResult, proposalsResult] = await Promise.allSettled([
+    api.fetchCompositionState(sessionId),
+    api.fetchCompositionProposals(sessionId),
+  ]);
+  if (stateResult.status === "fulfilled") state = stateResult.value;
+  if (proposalsResult.status === "fulfilled") proposals = proposalsResult.value;
+  if (superseded()) return;
+
+  const newDurableUser =
+    freshMessages?.some(
+      (message) =>
+        !baselineMessageIds.has(message.id) &&
+        message.role === "user" &&
+        message.content === messageContent,
+    ) ?? false;
+  const newAssistant =
+    freshMessages?.some(
+      (message) =>
+        !baselineMessageIds.has(message.id) && message.role === "assistant",
+    ) ?? false;
+  const stateAdvanced =
+    state?.version !== undefined &&
+    state.version !== null &&
+    state.version > (baselineVersion ?? 0);
+  const durableEvidence = newDurableUser || newAssistant || stateAdvanced;
+
+  useSessionStore.setState((s) => {
+    const previousVersion = s.compositionState?.version ?? null;
+    const newVersion = state?.version ?? null;
+    if (newVersion !== null && newVersion !== previousVersion) {
+      getExecutionStore().clearValidation();
+    }
+    const newState = state ?? s.compositionState;
+    const nodeStillExists =
+      !s.selectedNodeId ||
+      newState?.nodes.some((node) => node.id === s.selectedNodeId);
+    const repairedMessages = durableEvidence
+      ? s.messages.map((message) =>
+          message.id === messageId
+            ? {
+                ...message,
+                local_status: undefined,
+                local_error: undefined,
+                local_failure_code: undefined,
+              }
+            : message,
+        )
+      : s.messages;
+    return {
+      compositionState: newState,
+      compositionProposals: proposals ?? s.compositionProposals,
+      ...(durableEvidence
+        ? {
+            messages: repairedMessages,
+            error:
+              "Your request was saved, but its response could not be confirmed. The latest messages and pipeline state are shown; reload if anything looks missing.",
+          }
+        : {}),
+      ...(nodeStillExists ? {} : { selectedNodeId: null }),
+    };
+  });
   useBlobStore.getState().loadBlobs(sessionId);
   void useSessionStore.getState().loadSessions();
   void refreshInterpretationEventsForSession(sessionId);
@@ -1308,7 +1430,7 @@ interface SessionState {
   loadInflightMessages: (
     sessionId: string,
     ownerGeneration?: number,
-  ) => Promise<void>;
+  ) => Promise<ChatMessage[] | null>;
   startInflightMessagesPolling: (sessionId: string) => number;
   stopInflightMessagesPolling: (sessionId?: string, generation?: number) => void;
   retryMessage: (messageId: string, signal?: AbortSignal) => Promise<void>;
@@ -1961,6 +2083,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     if (isComposing) return;
     const recoveryStartedCompositionVersion =
       get().compositionState?.version ?? null;
+    const baselineMessageIds = new Set(get().messages.map((message) => message.id));
 
     const optimisticMessage: ChatMessage = {
       id: `local-${crypto.randomUUID()}`,
@@ -2168,6 +2291,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           progressPollGeneration,
           inflightPollGeneration,
           recoveryStartedCompositionVersion,
+        );
+      } else if (isAmbiguousComposeNetworkFailure(err)) {
+        await resyncAfterAmbiguousComposeFailure(
+          activeSessionId,
+          progressPollGeneration,
+          inflightPollGeneration,
+          recoveryStartedCompositionVersion,
+          baselineMessageIds,
+          optimisticMessage.id,
+          content,
         );
       }
     } finally {
@@ -2410,7 +2543,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearComposerProgressPollTimer();
   },
 
-  async loadInflightMessages(sessionId: string, ownerGeneration?: number) {
+  async loadInflightMessages(
+    sessionId: string,
+    ownerGeneration?: number,
+  ): Promise<ChatMessage[] | null> {
     // Refresh the chat messages from the server so newly-persisted assistant
     // rows from the inflight compose loop are visible immediately. The
     // optimistic local-* user message is preserved when its canonical
@@ -2440,18 +2576,18 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const pollGeneration = inflightMessagesPollGeneration;
     try {
       const fresh = await api.fetchMessages(sessionId);
-      if (get().activeSessionId !== sessionId) return;
+      if (get().activeSessionId !== sessionId) return null;
       if (ownerGeneration === undefined) {
         if (
           inflightMessagesPollSessionId !== sessionId ||
           inflightMessagesPollGeneration !== pollGeneration
         ) {
-          return;
+          return null;
         }
       } else if (
         inflightMessagesLatestClaimBySession.get(sessionId) !== ownerGeneration
       ) {
-        return;
+        return null;
       }
       set((s) => {
         if (s.activeSessionId !== sessionId) return s;
@@ -2466,9 +2602,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         );
         return { messages: [...fresh, ...survivors] };
       });
+      return fresh;
     } catch {
       // Inflight polling is advisory — failures keep the existing UI state
       // until the next poll or the POST completion handler refreshes it.
+      return null;
     }
   },
 
@@ -2513,6 +2651,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
     const message = messages.find((entry) => entry.id === messageId);
     if (!message || message.role !== "user") return;
+    const baselineMessageIds = new Set(messages.map((entry) => entry.id));
 
     set((state) => ({
       isComposing: true,
@@ -2665,6 +2804,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           progressPollGeneration,
           inflightPollGeneration,
           recoveryStartedCompositionVersion,
+        );
+      } else if (isAmbiguousComposeNetworkFailure(err)) {
+        await resyncAfterAmbiguousComposeFailure(
+          activeSessionId,
+          progressPollGeneration,
+          inflightPollGeneration,
+          recoveryStartedCompositionVersion,
+          baselineMessageIds,
+          messageId,
+          message.content,
         );
       }
     } finally {

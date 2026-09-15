@@ -116,7 +116,7 @@ class FakeExecutionRepository:
 
     def record_call(self, **kwargs: Any) -> SimpleNamespace:
         self.recorded_calls.append(kwargs)
-        return SimpleNamespace(**kwargs)
+        return SimpleNamespace(call_id=f"call-{len(self.recorded_calls)}", **kwargs)
 
     def assert_recorded_once(self) -> None:
         assert len(self.recorded_calls) == 1
@@ -1563,3 +1563,95 @@ class TestTier3UsageBoundary:
         # Bool values should be rejected by from_dict
         assert result.usage.prompt_tokens is None
         assert result.usage.completion_tokens is None
+
+
+def test_quota_refusal_precedes_provider_dispatch() -> None:
+    from elspeth.contracts.call_governance import LLMCallGovernance
+
+    execution = FakeExecutionRepository()
+    provider = FakeOpenAIClient(response=provider_response())
+    completions: list[None] = []
+
+    def refuse() -> str:
+        raise RuntimeError("quota exhausted")
+
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        underlying_client=provider,
+        llm_call_governance=LLMCallGovernance(refuse, lambda attempt, call_id: completions.append(None)),
+        **mock_audit_authority(),
+    )
+    with pytest.raises(RuntimeError, match="quota exhausted"):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="hello")])
+    assert provider.create_calls == []
+    assert execution.recorded_calls == []
+    assert completions == []
+
+
+@pytest.mark.parametrize("provider_fails", [False, True])
+def test_each_attempt_accounts_once_after_its_audit_outcome(provider_fails: bool) -> None:
+    from elspeth.contracts.call_governance import LLMCallGovernance
+
+    execution = FakeExecutionRepository()
+    provider = (
+        FakeOpenAIClient(exception=RuntimeError("network failure")) if provider_fails else FakeOpenAIClient(response=provider_response())
+    )
+    observed: list[tuple[str, int]] = []
+
+    def admit() -> str:
+        observed.append(("before", len(execution.recorded_calls)))
+        return f"attempt-{len(execution.recorded_calls) + 1}"
+
+    def settle(attempt: str, call_id: str) -> None:
+        assert attempt == f"attempt-{len(execution.recorded_calls)}"
+        assert call_id == f"call-{len(execution.recorded_calls)}"
+        observed.append(("after", len(execution.recorded_calls)))
+
+    governance = LLMCallGovernance(before_call=admit, after_call=settle)
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        underlying_client=provider,
+        llm_call_governance=governance,
+        **mock_audit_authority(),
+    )
+    for _attempt in range(2):
+        if provider_fails:
+            with pytest.raises(LLMClientError):
+                client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="hello")])
+        else:
+            client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="hello")])
+    assert observed == [("before", 0), ("after", 1), ("before", 1), ("after", 2)]
+    assert len(provider.create_calls) == 2
+    assert [record["call_index"] for record in execution.recorded_calls] == [0, 1]
+    assert execution.recorded_calls[-1]["token_usage"] == (TokenUsage.unknown() if provider_fails else TokenUsage.known(10, 5))
+
+
+def test_accounting_hook_failure_propagates_after_successful_audit() -> None:
+    from elspeth.contracts.call_governance import LLMCallGovernance
+
+    execution = FakeExecutionRepository()
+    provider = FakeOpenAIClient(response=provider_response())
+
+    def fail_accounting(attempt: str, call_id: str) -> None:
+        assert len(execution.recorded_calls) == 1
+        raise RuntimeError("ledger unavailable")
+
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        underlying_client=provider,
+        llm_call_governance=LLMCallGovernance(lambda: "attempt", fail_accounting),
+        **mock_audit_authority(),
+    )
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="hello")])
+    assert len(provider.create_calls) == 1
+    assert execution.recorded_calls[0]["status"] is CallStatus.SUCCESS

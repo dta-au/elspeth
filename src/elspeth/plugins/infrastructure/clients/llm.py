@@ -16,6 +16,7 @@ import structlog
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, RawCallPayload
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import PluginRetryableError
@@ -322,6 +323,7 @@ class AuditedLLMClient(AuditedClientBase):
         coordination_token: CoordinationToken | None = None,
         member_token: WorkerMembershipToken | None = None,
         work_item: TokenWorkItem | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         """Initialize audited LLM client.
 
@@ -347,6 +349,7 @@ class AuditedLLMClient(AuditedClientBase):
             coordination_token=coordination_token,
             member_token=member_token,
             work_item=work_item,
+            llm_call_governance=llm_call_governance,
         )
         self._client = underlying_client
         self._provider = provider
@@ -477,6 +480,7 @@ class AuditedLLMClient(AuditedClientBase):
         if max_tokens is not None:
             sdk_kwargs["max_tokens"] = max_tokens
 
+        llm_call_attempt = self._before_llm_call()
         start = time.perf_counter()
         usage = TokenUsage.unknown()
 
@@ -491,6 +495,7 @@ class AuditedLLMClient(AuditedClientBase):
             is_retryable = error_class in {"rate_limit", "server", "network"}
 
             self._record_call(
+                llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
@@ -559,6 +564,7 @@ class AuditedLLMClient(AuditedClientBase):
             # audit trail reflects the consumed tokens even though we can't
             # fully read/serialize the response.
             self._record_call(
+                llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
@@ -596,6 +602,7 @@ class AuditedLLMClient(AuditedClientBase):
             error_msg = f"{model_exc}. Provider returned malformed data at Tier 3 boundary."
             response_payload = RawCallPayload(raw_response)
             self._record_call(
+                llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
@@ -634,6 +641,7 @@ class AuditedLLMClient(AuditedClientBase):
                 raw_response=raw_response,
             )
             self._record_call(
+                llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
@@ -677,6 +685,7 @@ class AuditedLLMClient(AuditedClientBase):
             error_msg = f"LLM response missing expected attribute at Tier-3 boundary: {attr_exc}"
             response_payload = RawCallPayload(raw_response)
             self._record_call(
+                llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
@@ -718,6 +727,7 @@ class AuditedLLMClient(AuditedClientBase):
                     raw_response=raw_response,
                 )
                 self._record_call(
+                    llm_call_attempt=llm_call_attempt,
                     call_index=call_index,
                     call_type=CallType.LLM,
                     status=CallStatus.ERROR,
@@ -758,6 +768,7 @@ class AuditedLLMClient(AuditedClientBase):
                 raw_response=raw_response,
             )
             self._record_call(
+                llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
@@ -798,6 +809,7 @@ class AuditedLLMClient(AuditedClientBase):
             )
             response_payload = RawCallPayload(raw_response)
             self._record_call(
+                llm_call_attempt=llm_call_attempt,
                 call_index=call_index,
                 call_type=CallType.LLM,
                 status=CallStatus.ERROR,
@@ -836,6 +848,7 @@ class AuditedLLMClient(AuditedClientBase):
         response_data = response_dto.to_dict()
 
         self._record_call(
+            llm_call_attempt=llm_call_attempt,
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,

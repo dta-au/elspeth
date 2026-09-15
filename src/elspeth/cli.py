@@ -2228,10 +2228,10 @@ def composer_users_bootstrap_admin(
         help="Landscape URL for the activation audit rows; defaults to ELSPETH_WEB__LANDSCAPE_URL, then <data-dir>/runs/audit.db.",
     ),
     quota_tokens_per_day: int | None = typer.Option(
-        None, "--quota-tokens-per-day", min=1, help="The D31 allowance row; both quota options or neither."
+        None, "--quota-tokens-per-day", min=1, max=2**63 - 1, help="The D31 allowance row; both quota options or neither."
     ),
     quota_storage_bytes: int | None = typer.Option(
-        None, "--quota-storage-bytes", min=1, help="The D31 allowance row; both quota options or neither."
+        None, "--quota-storage-bytes", min=1, max=2**63 - 1, help="The D31 allowance row; both quota options or neither."
     ),
 ) -> None:
     """Make the first administrator, once: the operator's lockout recovery (spec D20).

@@ -49,6 +49,7 @@ from pydantic import Field, field_validator, model_validator
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
@@ -523,6 +524,7 @@ class GatewayLLMProvider:
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
         approved_prompt_artifact_hash: str | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         # Re-validate defensively (mirrors OpenRouterLLMProvider): GatewayConfig
         # already enforces this shape at config-construction time, but this
@@ -546,6 +548,7 @@ class GatewayLLMProvider:
         self._telemetry_emit = telemetry_emit
         self._limiter = limiter
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
+        self._llm_call_governance = llm_call_governance
 
         # Client cache with reference counting for parallel multi-query safety
         # — same pattern as OpenRouterLLMProvider.
@@ -583,6 +586,7 @@ class GatewayLLMProvider:
         )
         logical_start = time.perf_counter()
 
+        attempt_id = self._llm_call_governance.before_call() if self._llm_call_governance is not None else None
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
         observed_usage = TokenUsage.unknown()
@@ -619,6 +623,7 @@ class GatewayLLMProvider:
                 model=response_model,
                 usage=usage,
                 raw_response=data,
+                attempt_id=attempt_id,
             )
             return result
         except LLMClientError as exc:
@@ -629,6 +634,7 @@ class GatewayLLMProvider:
                 request_payload=llm_request_payload,
                 exc=exc,
                 usage=observed_usage,
+                attempt_id=attempt_id,
             )
             raise
         except BaseException as exc:
@@ -721,10 +727,11 @@ class GatewayLLMProvider:
         model: str,
         usage: TokenUsage,
         raw_response: dict[str, Any],
+        attempt_id: str | None,
     ) -> None:
         """Record the semantic LLM call that the HTTP transport fulfilled."""
         call_index = audit_parent.allocate_call_index(self._recorder)
-        audit_parent.record_call(
+        call = audit_parent.record_call(
             self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
@@ -740,6 +747,10 @@ class GatewayLLMProvider:
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
         )
+        if self._llm_call_governance is not None:
+            if attempt_id is None:
+                raise RuntimeError("Governed LLM call has no admission attempt")
+            self._llm_call_governance.after_call(attempt_id, call.call_id)
 
     def _record_logical_llm_error(
         self,
@@ -749,10 +760,11 @@ class GatewayLLMProvider:
         request_payload: LLMCallRequest,
         exc: LLMClientError,
         usage: TokenUsage,
+        attempt_id: str | None,
     ) -> None:
         call_index = audit_parent.allocate_call_index(self._recorder)
         message = str(exc) or type(exc).__name__
-        audit_parent.record_call(
+        call = audit_parent.record_call(
             self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
@@ -767,6 +779,10 @@ class GatewayLLMProvider:
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
         )
+        if self._llm_call_governance is not None:
+            if attempt_id is None:
+                raise RuntimeError("Governed LLM call has no admission attempt")
+            self._llm_call_governance.after_call(attempt_id, call.call_id)
 
     def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Validate gateway readiness, THEN run one bounded real completion.
@@ -819,30 +835,13 @@ class GatewayLLMProvider:
 
     def _smoke_test_completion(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited gateway completion under an operation parent."""
-        http_client = AuditedHTTPClient(
-            coordination_token=coordination_token,
-            execution=self._recorder,
-            state_id=None,
-            operation_id=operation_id,
-            run_id=self._run_id,
-            telemetry_emit=self._telemetry_emit,
-            timeout=self._timeout,
-            base_url=self._base_url,
-            headers=self._request_headers,
-            limiter=self._limiter,
+        self.execute_query(
+            [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
+            model=model,
+            temperature=0.0,
+            max_tokens=32,
+            audit_parent=LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=coordination_token),
         )
-        try:
-            request_body: dict[str, Any] = {
-                "model": model,
-                "messages": wire_messages([ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]),
-                "temperature": 0.0,
-                "max_tokens": 32,
-            }
-            response = self._post_chat_completion(http_client, request_body)
-            self._validate_completion_status(response)
-            _validate_gateway_success_response(response, usage_required=self._usage_required)
-        finally:
-            http_client.close()
 
     def _get_http_client(self, audit_parent: LLMAuditParent) -> AuditedHTTPClient:
         """Get or create AuditedHTTPClient for an audit parent (thread-safe).

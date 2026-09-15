@@ -7,6 +7,7 @@ import contextlib
 import errno
 import os
 import threading
+import time
 import traceback
 import uuid
 from datetime import UTC, datetime
@@ -16,8 +17,11 @@ import structlog
 from sqlalchemy import event, func, insert, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer.audit import llm_call_audit_envelope
+from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.execution.schemas import (
     RunAccounting,
     RunAccountingIntegrity,
@@ -88,6 +92,22 @@ def service(engine):
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
+    )
+
+
+def _llm_call_envelope() -> dict[str, object]:
+    """A real ``llm_call_audit`` envelope: the Task I1 ledger adapter reads every call field the writer emits."""
+    return llm_call_audit_envelope(
+        build_llm_call_record(
+            model_requested="test/model",
+            messages=[{"role": "user", "content": "prompt"}],
+            tools=None,
+            status=ComposerLLMCallStatus.SUCCESS,
+            started_at=datetime(2026, 9, 13, tzinfo=UTC),
+            started_ns=time.monotonic_ns(),
+            temperature=None,
+            seed=None,
+        )
     )
 
 
@@ -1588,7 +1608,7 @@ class TestRunDiagnosticsAuditMessage:
         record = await service.add_run_diagnostics_audit_message(
             authority,
             "diagnostics explanation audited",
-            tool_calls=[{"_kind": "llm_call_audit", "run_id": str(run.id), "call": {}}],
+            tool_calls=[{**_llm_call_envelope(), "run_id": str(run.id)}],
         )
 
         assert record.role == "audit"
@@ -1676,7 +1696,7 @@ class TestRunDiagnosticsAuditMessagesAtomic:
         drafts = tuple(
             RunDiagnosticsAuditDraft(
                 content=f"diagnostics call {i}",
-                tool_calls=({"_kind": "llm_call_audit", "run_id": str(run.id), "call": {}},),
+                tool_calls=({**_llm_call_envelope(), "run_id": str(run.id)},),
             )
             for i in range(3)
         )

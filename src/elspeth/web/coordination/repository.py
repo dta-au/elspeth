@@ -93,6 +93,7 @@ from elspeth.web.sessions.models import (
     library_entries_table,
     proposal_blob_effect_receipts_table,
     proposal_events_table,
+    quota_provider_attempts_table,
     review_attestations_table,
     review_requests_table,
     run_events_table,
@@ -101,6 +102,7 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     session_read_admissions_table,
     sessions_table,
+    token_usage_ledger_table,
     web_instances_table,
 )
 from elspeth.web.sessions.proposal_blob_effects import BlobSnapshotPayload, blob_record_snapshot_payload, proposal_blob_arguments_hash
@@ -769,6 +771,14 @@ class _RepositorySessionMutations:
             # from, so the join column differs from the four above.
             or connection.execute(
                 select(library_entries_table.c.entry_id).where(library_entries_table.c.published_from_session_id == session_id).limit(1)
+            ).first()
+            # Usage must survive archival so deleting a session cannot reset
+            # its owner's daily quota. Soft archival still hides the session.
+            or connection.execute(
+                select(token_usage_ledger_table.c.entry_id).where(token_usage_ledger_table.c.session_id == session_id).limit(1)
+            ).first()
+            or connection.execute(
+                select(quota_provider_attempts_table.c.attempt_id).where(quota_provider_attempts_table.c.session_id == session_id).limit(1)
             ).first()
         )
         if not durable_history_exists:

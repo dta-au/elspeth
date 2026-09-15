@@ -393,7 +393,11 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        rollback_permitted: false. Preserve/export evidence before cutover.
 #  41 → Approved prompt artifact anchor replaces the fallback-template digest.
 #        Covers system prompt and ordered effective queries; delete/recreate.
-SQLITE_SCHEMA_EPOCH = 41
+#  42 → Admission evidence v2 persists per-principal token quota usage and limits.
+#        Its decoder rejects stored v1 run_web_plugin_policy evidence, so even
+#        an unchanged table layout requires a pre-1.0 delete/recreate boundary.
+#        Deploy with Sessions epoch 58; never relabel old evidence as v2.
+SQLITE_SCHEMA_EPOCH = 42
 
 schema_identity_table = create_schema_identity_table(metadata)
 

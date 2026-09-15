@@ -15,6 +15,7 @@ from pydantic import Field as PydanticField
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.contexts import LifecycleContext, SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder
@@ -121,7 +122,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:63808df43872bd80"
+    source_file_hash: str | None = "sha256:66f332f1ced031e2"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -283,7 +284,7 @@ class LLMSource(BaseSource):
             else "openrouter"
         )
         self._limiter = ctx.rate_limit_registry.get_limiter(limiter_name) if ctx.rate_limit_registry is not None else None
-        self._provider = self._create_provider(recorder)
+        self._provider = self._create_provider(recorder, llm_call_governance=ctx.llm_call_governance)
         try:
             self._tracer = create_langfuse_tracer(transform_name=self.name, tracing_config=self._tracing_config)
             if isinstance(self._tracing_config, AzureAITracingConfig):
@@ -509,7 +510,7 @@ class LLMSource(BaseSource):
             system_prompt=self._system_prompt,
         )
 
-    def _create_provider(self, recorder: PluginAuditWriterAdapter) -> LLMProvider:
+    def _create_provider(self, recorder: PluginAuditWriterAdapter, *, llm_call_governance: LLMCallGovernance | None = None) -> LLMProvider:
         if self._run_id is None:
             raise FrameworkBugError("LLMSource run identity is unavailable during provider construction")
         common = {
@@ -517,6 +518,7 @@ class LLMSource(BaseSource):
             "run_id": self._run_id,
             "telemetry_emit": self._telemetry_emit,
             "limiter": self._limiter,
+            "llm_call_governance": llm_call_governance,
         }
         if isinstance(self._config, AzureOpenAILLMSourceConfig):
             return AzureLLMProvider(

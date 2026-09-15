@@ -52,9 +52,11 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Session epoch 56 adds sparse proposal arguments and structured validation
     # errors. These changes deploy together as the pair (56, 40).
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
-    assert SESSION_SCHEMA_EPOCH == 57
+    # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
+    assert SESSION_SCHEMA_EPOCH == 58
     # Epoch 41 renames the approved prompt artifact anchor.
-    assert SQLITE_SCHEMA_EPOCH == 41
+    # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
+    assert SQLITE_SCHEMA_EPOCH == 42
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:

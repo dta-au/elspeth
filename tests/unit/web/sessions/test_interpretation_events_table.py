@@ -198,7 +198,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_57() -> None:
+def test_current_session_schema_epoch_is_58() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -228,7 +228,8 @@ def test_current_session_schema_epoch_is_57() -> None:
     # 56: sparse proposal arguments and structured validation errors.
     # 57: approved prompt artifact replaces the unused fallback hash anchor;
     # paired with Landscape41. Existing approvals are not reinterpreted.
-    assert SESSION_SCHEMA_EPOCH == 57
+    # 58: 64-bit quota limits and nullable token-ledger usage measures.
+    assert SESSION_SCHEMA_EPOCH == 58
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

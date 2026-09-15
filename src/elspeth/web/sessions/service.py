@@ -32,7 +32,13 @@ from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.blobs import BlobForkPlanEntry, BlobGuidedOperationWriteFence, fork_blob_id
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
-from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
+from elspeth.contracts.chargeable_admission import (
+    AdmissionRefusalReason,
+    ChargeableAdmissionDecision,
+    ChargeableAdmissionPolicy,
+    ChargeableAdmissionRefused,
+    ChargeableOperation,
+)
 from elspeth.contracts.composer_audit import ComposerToolStatus, PipelineDispatchAuditPayload
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -97,7 +103,18 @@ from elspeth.web.coordination.contracts import (
     SessionOperationFenceLost,
     SessionOperationKind,
 )
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.quota_authority import (
+    ProviderAttempt,
+    QuotaExceeded,
+    TokenUsageEntry,
+    TokenUsageSource,
+    begin_provider_attempt_on_connection,
+    llm_call_usage_entries,
+    record_token_usage_on_connection,
+    settle_provider_attempt_on_connection,
+)
 from elspeth.web.coordination.repository import (
     PostgresSessionOperationRepository,
     SessionDerivedCustodyError,
@@ -122,6 +139,7 @@ from elspeth.web.sessions.archive_quarantine import (
     retire_archive_quarantine,
     stage_archive_quarantine,
 )
+from elspeth.web.sessions.audit_checkpoint import uncheckpointed_envelopes
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.dead_site_supersession import supersede_dead_site_pending_interpretation_events
 from elspeth.web.sessions.guided_audit import (
@@ -4381,6 +4399,11 @@ def _record_auto_commit_revocation_on_connection(
     return _proposal_event_record_from_row(row)
 
 
+def _refuse_unrecorded_quota_exceeded(outcome: QuotaExceeded) -> None:
+    """The recorder a service gets when none is wired: a quota refusal nobody audits fails closed (R4)."""
+    raise AuditIntegrityError(f"quota_exceeded refusal for identity {outcome.identity_id} has no auth audit writer wired")
+
+
 class SessionServiceImpl:
     """Concrete async session service backed by worker-dispatched SQLAlchemy Core."""
 
@@ -4403,6 +4426,7 @@ class SessionServiceImpl:
         session_operation_lease_seconds: int = 30,
         runtime_preflight: SessionRuntimePreflight | None = None,
         chargeable_admission_policy: ChargeableAdmissionPolicy | None = None,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = _refuse_unrecorded_quota_exceeded,
     ) -> None:
         from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 
@@ -4421,6 +4445,7 @@ class SessionServiceImpl:
         self._chargeable_admission_policy = chargeable_admission_policy or ChargeableAdmissionPolicy(
             secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash
         )
+        self._quota_exceeded_recorder = quota_exceeded_recorder
         if owner_instance_id is not None and (type(owner_instance_id) is not str or not owner_instance_id.strip()):
             raise ValueError("owner_instance_id must be a nonblank exact string")
         if type(session_operation_lease_seconds) is not int or not 1 <= session_operation_lease_seconds <= 3600:
@@ -10055,23 +10080,66 @@ class SessionServiceImpl:
         )
 
     async def assess_run_start_admission(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
-        return cast(
-            "RunStartPermitRecord",
-            await self._run_sync(
-                self._session_operation_authority.mutate,
-                session_operation_context,
-                lambda transaction: transaction.runs.assess_start_admission(run_id=run_id, policy=self._chargeable_admission_policy),
-            ),
+        return await self._audited_start_admission(
+            run_id,
+            session_operation_context=session_operation_context,
+            admit=lambda transaction: transaction.runs.assess_start_admission(run_id=run_id, policy=self._chargeable_admission_policy),
         )
 
     async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+        return await self._audited_start_admission(
+            run_id,
+            session_operation_context=session_operation_context,
+            admit=lambda transaction: transaction.runs.issue_start_permit(run_id=run_id, policy=self._chargeable_admission_policy),
+        )
+
+    async def _audited_start_admission(
+        self,
+        run_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        admit: Callable[[SessionOperationMutationTransaction], RunStartPermitRecord],
+    ) -> RunStartPermitRecord:
+        """Decide one permit; write ``quota_exceeded`` before commit only when THIS call refused on quota.
+
+        The run facet appends the run's terminal ``failed`` event exactly once,
+        when a refusal is first recorded (``_RepositoryRunMutations._record_admission_refusal``).
+        A terminal event that already exists before ``admit`` runs therefore marks
+        a replayed refusal, which is not audited a second time. The EXECUTE fence
+        admits one holder, so no concurrent decision can race this read.
+        """
+        session = await self.get_session(UUID(session_operation_context.fence.session_id))
+        already_terminal = any(event.event_type in SESSION_TERMINAL_RUN_STATUS_VALUES for event in await self.list_run_events(run_id))
+
+        def _decide(transaction: SessionOperationMutationTransaction) -> RunStartPermitRecord:
+            permit = admit(transaction)
+            refusal = permit.execution_refusal or permit.admission_decision
+            if not already_terminal and refusal is not None and refusal.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED:
+                self._quota_exceeded_recorder(self._quota_exceeded_outcome(session, refusal, operation=ChargeableOperation.RUN))
+            return permit
+
         return cast(
             "RunStartPermitRecord",
-            await self._run_sync(
-                self._session_operation_authority.mutate,
-                session_operation_context,
-                lambda transaction: transaction.runs.issue_start_permit(run_id=run_id, policy=self._chargeable_admission_policy),
-            ),
+            await self._run_sync(self._session_operation_authority.mutate, session_operation_context, _decide),
+        )
+
+    @staticmethod
+    def _quota_exceeded_outcome(
+        session: SessionRecord, decision: ChargeableAdmissionDecision, *, operation: ChargeableOperation
+    ) -> QuotaExceeded:
+        evidence = decision.evidence
+        if decision.refusal_reason is not AdmissionRefusalReason.QUOTA_EXCEEDED or evidence.dimension is None or evidence.usage is None:
+            raise AuditIntegrityError("Only a measured quota_exceeded decision has a quota_exceeded audit row")
+        return QuotaExceeded(
+            identity_id=session.user_id,
+            provider=session.auth_provider_type,
+            operation=operation.value,
+            dimension=evidence.dimension,
+            cap=evidence.cap,
+            ceiling=evidence.ceiling,
+            usage=evidence.usage,
+            identity_policy_id=evidence.identity_policy_id,
+            container_policy_id=evidence.container_policy_id,
         )
 
     async def observe_run_start_permit_for_cleanup(
@@ -10089,7 +10157,7 @@ class SessionServiceImpl:
     async def assess_chargeable_operation(
         self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
     ) -> ChargeableAdmissionDecision:
-        return cast(
+        decision = cast(
             "ChargeableAdmissionDecision",
             await self._run_sync(
                 self._session_operation_authority.mutate,
@@ -10099,6 +10167,129 @@ class SessionServiceImpl:
                 ),
             ),
         )
+        if decision.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED:
+            # A Composer or auto-title refusal writes no sessions row, so its
+            # audit row follows the read-only admission transaction and still
+            # precedes the caller learning of the refusal (R4).
+            session = await self.get_session(UUID(session_operation_context.fence.session_id))
+            await self._run_sync(self._quota_exceeded_recorder, self._quota_exceeded_outcome(session, decision, operation=operation))
+        return decision
+
+    async def record_token_usage(
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        source: TokenUsageSource,
+        run_id: UUID | None,
+        entries: tuple[TokenUsageEntry, ...],
+    ) -> tuple[str, ...]:
+        """Charge provider calls whose evidence is not a Composer audit cohort (Task I1).
+
+        Auto-title spends under COMPOSE authority; a run's LLM calls are charged
+        under the run's EXECUTE authority. Composer cohorts are charged inside
+        their own audit transaction and never come through here.
+        """
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        expected_kind = SessionOperationKind.EXECUTE if source == "run" else SessionOperationKind.COMPOSE
+        if session_operation_context.operation_kind is not expected_kind:
+            raise ValueError(f"source={source!r} token usage requires {expected_kind.value} authority")
+        if not entries:
+            return ()
+        sid = session_operation_context.fence.session_id
+
+        def _sync() -> tuple[str, ...]:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    session_operation_context,
+                    session_id=sid,
+                    expected_kind=expected_kind,
+                    now=self._guided_database_now(conn),
+                )
+                if (
+                    run_id is not None
+                    and conn.execute(select(runs_table.c.session_id).where(runs_table.c.id == str(run_id))).scalar_one_or_none() != sid
+                ):
+                    raise AuditIntegrityError("Run token usage names a run outside the operation's session")
+                return record_token_usage_on_connection(
+                    conn,
+                    session_id=sid,
+                    source=source,
+                    run_id=None if run_id is None else str(run_id),
+                    entries=entries,
+                    recorded_at=database_now(conn),
+                )
+
+        return cast("tuple[str, ...]", await self._run_sync(_sync))
+
+    async def begin_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None = None
+    ) -> ProviderAttempt:
+        """Admit a provider dispatch and retain pending evidence before sending it."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        expected_kind = SessionOperationKind.EXECUTE if source == "run" else SessionOperationKind.COMPOSE
+        if session_operation_context.operation_kind is not expected_kind:
+            raise ValueError(f"source={source!r} provider attempts require {expected_kind.value} authority")
+        sid = session_operation_context.fence.session_id
+
+        def _sync() -> ProviderAttempt:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                self._require_session_operation_context_on_connection(
+                    conn, session_operation_context, session_id=sid, expected_kind=expected_kind, now=database_now(conn)
+                )
+                return begin_provider_attempt_on_connection(
+                    conn,
+                    session_operation_context=session_operation_context,
+                    source=source,
+                    policy=self._chargeable_admission_policy,
+                    run_id=None if run_id is None else str(run_id),
+                )
+
+        try:
+            return cast("ProviderAttempt", await self._run_sync(_sync))
+        except ChargeableAdmissionRefused as exc:
+            if exc.decision.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED:
+                session = await self.get_session(UUID(sid))
+                await self._run_sync(
+                    self._quota_exceeded_recorder,
+                    self._quota_exceeded_outcome(session, exc.decision, operation=ChargeableOperation(source)),
+                )
+            raise
+
+    async def finish_provider_attempt(self, *, session_operation_context: SessionOperationContext, call: ComposerLLMCall) -> None:
+        """Persist actual terminal call evidence and settle its ledger atomically."""
+        from elspeth.web.composer.audit import llm_call_audit_envelope
+
+        if call.call_id is None:
+            raise AuditIntegrityError("A provider checkpoint requires its pending attempt identity")
+        await self.add_messages_atomic(
+            UUID(session_operation_context.fence.session_id),
+            (AuditMessageDraft(role="audit", content="Provider call result recorded.", tool_calls=(llm_call_audit_envelope(call),)),),
+            writer_principal="compose_loop",
+            session_operation_context=session_operation_context,
+        )
+
+    async def settle_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+    ) -> None:
+        """Settle non-Composer provider evidence under its original session lease."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        expected_kind = session_operation_context.operation_kind
+        if expected_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.EXECUTE}:
+            raise ValueError("Provider settlement requires COMPOSE or EXECUTE authority")
+        sid = session_operation_context.fence.session_id
+
+        def _sync() -> None:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                self._require_session_operation_context_on_connection(
+                    conn, session_operation_context, session_id=sid, expected_kind=expected_kind, now=database_now(conn)
+                )
+                settle_provider_attempt_on_connection(conn, session_id=sid, attempt_id=attempt_id, entry=entry)
+
+        await self._run_sync(_sync)
 
     async def request_run_cancellation(
         self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType
@@ -10696,6 +10887,9 @@ class SessionServiceImpl:
         )
         if audit_rows and sequence_no is None:
             raise AuditIntegrityError("Guided audit cohort has no reserved sequence")
+        pending_envelopes = uncheckpointed_envelopes(conn, session_id=session_id, envelopes=tuple(row.envelope for row in audit_rows))
+        pending_ids = {id(envelope) for envelope in pending_envelopes}
+        audit_rows = tuple(row for row in audit_rows if id(row.envelope) in pending_ids)
         records: list[ChatMessageRecord] = []
         for audit_row in audit_rows:
             if sequence_no is None:  # pragma: no cover - guarded above
@@ -10730,6 +10924,13 @@ class SessionServiceImpl:
                 )
             )
             sequence_no += 1
+        entries = llm_call_usage_entries(tuple(audit_row.envelope for audit_row in audit_rows if audit_row.kind == "llm"))
+        if entries:
+            # Task I1 Composer adapter (guided): the calls this cohort audits are
+            # charged in the transaction that makes their audit rows durable.
+            record_token_usage_on_connection(
+                conn, session_id=session_id, source="composer", run_id=None, entries=entries, recorded_at=database_now(conn)
+            )
         return tuple(records)
 
     async def seed_or_complete_guided_start_operation(
@@ -14275,8 +14476,18 @@ class SessionServiceImpl:
                         expected_session_id=sid,
                         caller="add_messages_atomic",
                     )
-            base_seq = self._reserve_sequence_range(conn, sid, count=len(drafts))
-            for offset, draft in enumerate(drafts):
+            active_drafts: list[AuditMessageDraft] = []
+            for draft in drafts:
+                if draft.tool_calls:
+                    envelopes = uncheckpointed_envelopes(conn, session_id=sid, envelopes=draft.tool_calls)
+                    if not envelopes and draft.role == "audit":
+                        continue
+                    draft = replace(draft, tool_calls=envelopes)
+                active_drafts.append(draft)
+            if not active_drafts:
+                return
+            base_seq = self._reserve_sequence_range(conn, sid, count=len(active_drafts))
+            for offset, draft in enumerate(active_drafts):
                 self._insert_chat_message(
                     conn,
                     session_id=sid,
@@ -14289,11 +14500,20 @@ class SessionServiceImpl:
                     tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
                     sequence_no=base_seq + offset,
                     writer_principal=writer_principal,
-                    composition_state_id=effective_state_ids[offset],
+                    composition_state_id=draft.composition_state_id if draft.composition_state_id is not None else csid,
                     tool_call_id=draft.tool_call_id,
                     parent_assistant_id=draft.parent_assistant_id,
                     created_at=now,
                     session_operation_context=session_operation_context,
+                )
+            entries = llm_call_usage_entries(
+                tuple(envelope for draft in active_drafts if draft.tool_calls is not None for envelope in draft.tool_calls)
+            )
+            if entries:
+                # Task I1 Composer adapter (compose loop, turn cohort, planner
+                # evidence): charged in the transaction that makes the audit rows durable.
+                record_token_usage_on_connection(
+                    conn, session_id=sid, source="composer", run_id=None, entries=entries, recorded_at=database_now(conn)
                 )
             with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as session_mutations:
                 session_mutations.mark_session_updated(updated_at=now)

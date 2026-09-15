@@ -33,6 +33,7 @@ from elspeth.web.schema_probe import postgres_engine_kwargs
 
 if TYPE_CHECKING:
     from elspeth.web.config import WebSettings
+    from elspeth.web.coordination.quota_authority import QuotaExceeded
 
 
 _slog = structlog.get_logger(__name__)
@@ -251,6 +252,12 @@ class AuthAuditWriter(Protocol):
         console_request_id: str | None,
     ) -> None: ...
 
+    # R13/R14 (identity sprint Tasks I1, I2): no ``request``. A quota refusal
+    # is decided inside an admission transaction, below every HTTP handler,
+    # and the row is written before that transaction commits (R4).
+    def record_quota_exceeded(self, outcome: QuotaExceeded) -> None:
+        """Write the Landscape ``quota_exceeded`` row for a committed quota refusal."""
+
 
 AdminActivationCause = Literal["admin_activation", "pre_provision", "bootstrap"]
 """How an ``identity_activated`` admin row came to be written.
@@ -285,6 +292,7 @@ class AuthAuditOperation(StrEnum):
     IDENTITY_DISABLED = "identity_disabled"
     ROLE_CHANGED = "role_changed"
     RELATIONSHIP_CHANGED = "relationship_changed"
+    QUOTA_EXCEEDED = "quota_exceeded"
 
 
 def _bounded_text(value: str | None, *, max_length: int = MAX_AUTH_AUDIT_TEXT_LENGTH) -> str | None:
@@ -1174,6 +1182,38 @@ class AuthAuditRecorder:
                     "note": _bounded_text(note),
                 },
                 **provenance.request_columns,
+            )
+
+    def record_quota_exceeded(self, outcome: QuotaExceeded) -> None:
+        """Write the ``quota_exceeded`` row: dimension, cap, ceiling in force and measured usage (spec :834).
+
+        Anchored on the refused identity. ``user_id``/``username`` stay NULL
+        because the refusal is the authority's own act, joined to the person's
+        trail by ``identity_id`` exactly as ``record_identity_dormant`` is, and no
+        request column is invented for a refusal decided below the handler.
+        """
+        with self._open_landscape(AuthAuditOperation.QUOTA_EXCEEDED) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="quota_exceeded",
+                outcome="failure",
+                provider=outcome.provider,
+                identity_id=outcome.identity_id,
+                user_id=None,
+                username=None,
+                failure_category=f"quota_exceeded_{outcome.dimension}",
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "system",
+                    "operation": outcome.operation,
+                    "dimension": outcome.dimension,
+                    "cap": outcome.cap,
+                    "ceiling": outcome.ceiling,
+                    "usage": outcome.usage,
+                    "identity_policy_id": outcome.identity_policy_id,
+                    "container_policy_id": outcome.container_policy_id,
+                },
             )
 
 

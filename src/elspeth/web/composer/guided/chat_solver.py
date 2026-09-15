@@ -85,6 +85,7 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.progress import emit_progress, model_call_progress_event, tool_batch_progress_event
+from elspeth.web.composer.provider_quota import quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 from elspeth.web.composer.source_inspection import SourceInspectionFacts
@@ -2782,6 +2783,7 @@ def _deferred_management_outcome_from_message(message: Any) -> DeferredIntentMan
     return GuidedChatProseOutcome(assistant_message=prose)
 
 
+@quota_provider_calls
 async def maybe_manage_deferred_intent_chat(
     *,
     request: DeferredIntentManagementChatRequest,
@@ -3165,6 +3167,7 @@ async def _bounded_acompletion(kwargs: dict[str, Any], timeout_seconds: float) -
     return await asyncio.wait_for(_litellm_acompletion(**kwargs), timeout=timeout_seconds)
 
 
+@quota_provider_calls
 async def maybe_resolve_step_1_source_chat(
     *,
     model: str,
@@ -4236,6 +4239,7 @@ type Step2SinkChatOutcome = (
 )
 
 
+@quota_provider_calls
 async def maybe_resolve_step_2_sink_chat(
     *,
     model: str,
@@ -4833,6 +4837,7 @@ async def maybe_resolve_step_2_sink_chat(
     return GuidedChatEmptyOutcome()
 
 
+@quota_provider_calls
 async def solve_step_chat(
     *,
     model: str,

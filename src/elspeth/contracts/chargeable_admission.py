@@ -22,6 +22,7 @@ class AdmissionRefusalReason(StrEnum):
     IDENTITY_MISSING = "identity_missing"
     QUOTA_POLICY_MISSING = "quota_policy_missing"
     TOKEN_ACCOUNTING_UNAVAILABLE = "token_accounting_unavailable"
+    QUOTA_EXCEEDED = "quota_exceeded"
     POLICY_GENERATION_CHANGED = "policy_generation_changed"
 
 
@@ -30,17 +31,23 @@ class QuotaDisposition(StrEnum):
     NOT_CONFIGURED = "not_configured"
     POLICY_MISSING = "policy_missing"
     ACCOUNTING_UNAVAILABLE = "accounting_unavailable"
+    WITHIN_CAP = "within_cap"
+    EXCEEDED = "exceeded"
 
 
 class AdmissionPolicyEvidence(BaseModel):
     """Sanitized decision facts; absence is never represented as measured zero."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     identity_policy_id: str | None = Field(default=None, min_length=1)
     container_policy_id: str | None = Field(default=None, min_length=1)
     quota_disposition: QuotaDisposition
     secret_wiring_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dimension: Literal["tokens"] | None = None
+    cap: int | None = Field(default=None, gt=0)
+    ceiling: int | None = Field(default=None, gt=0)
+    usage: int | None = Field(default=None, ge=0)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -51,6 +58,17 @@ class AdmissionPolicyEvidence(BaseModel):
 
     @model_validator(mode="after")
     def _assessed_policy_presence(self) -> AdmissionPolicyEvidence:
+        measured = self.quota_disposition in {QuotaDisposition.WITHIN_CAP, QuotaDisposition.EXCEEDED}
+        if measured:
+            if self.dimension != "tokens" or self.usage is None or (self.cap is None and self.ceiling is None):
+                raise ValueError("Measured quota evidence requires dimension, usage and a limit")
+            if (self.cap is None) != (self.identity_policy_id is None) or (self.ceiling is None) != (self.container_policy_id is None):
+                raise ValueError("Measured quota limits require matching policy IDs")
+            limit = min(value for value in (self.cap, self.ceiling) if value is not None)
+            if (self.usage >= limit) != (self.quota_disposition is QuotaDisposition.EXCEEDED):
+                raise ValueError("Quota disposition contradicts measured usage and limit")
+        elif any(value is not None for value in (self.dimension, self.cap, self.ceiling, self.usage)):
+            raise ValueError("Unmeasured quota evidence cannot carry measured limits or usage")
         if self.quota_disposition is QuotaDisposition.ACCOUNTING_UNAVAILABLE and (
             self.identity_policy_id is None and self.container_policy_id is None
         ):
@@ -63,7 +81,7 @@ class AdmissionPolicyEvidence(BaseModel):
 
 
 class ChargeableAdmissionDecision(BaseModel):
-    """A closed refusal or an explicit no-token-quota allowance."""
+    """A closed refusal or a measured or explicitly unconfigured allowance."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     evidence: AdmissionPolicyEvidence
@@ -76,10 +94,11 @@ class ChargeableAdmissionDecision(BaseModel):
     @model_validator(mode="after")
     def _consistent_decision(self) -> ChargeableAdmissionDecision:
         disposition = self.evidence.quota_disposition
-        if self.refusal_reason is None and disposition is not QuotaDisposition.NOT_CONFIGURED:
-            raise ValueError("Only explicitly unconfigured token quotas admit chargeable work")
-        if disposition is QuotaDisposition.NOT_CONFIGURED and self.refusal_reason is not None:
-            raise ValueError("An unconfigured quota allowance cannot carry a refusal")
+        allowed_dispositions = {QuotaDisposition.NOT_CONFIGURED, QuotaDisposition.WITHIN_CAP}
+        if self.refusal_reason is None and disposition not in allowed_dispositions:
+            raise ValueError("Only unconfigured or within-cap token quotas admit chargeable work")
+        if disposition in allowed_dispositions and self.refusal_reason is not None:
+            raise ValueError("A quota allowance cannot carry a refusal")
         if self.refusal_reason is not None:
             expected_disposition = {
                 AdmissionRefusalReason.IDENTITY_DISABLED: QuotaDisposition.NOT_ASSESSED,
@@ -88,6 +107,7 @@ class ChargeableAdmissionDecision(BaseModel):
                 AdmissionRefusalReason.POLICY_GENERATION_CHANGED: QuotaDisposition.NOT_ASSESSED,
                 AdmissionRefusalReason.QUOTA_POLICY_MISSING: QuotaDisposition.POLICY_MISSING,
                 AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE: QuotaDisposition.ACCOUNTING_UNAVAILABLE,
+                AdmissionRefusalReason.QUOTA_EXCEEDED: QuotaDisposition.EXCEEDED,
             }[self.refusal_reason]
             if disposition is not expected_disposition:
                 raise ValueError("Admission refusal contradicts quota assessment")

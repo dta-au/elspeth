@@ -33,7 +33,7 @@ from uuid import UUID
 import structlog
 from opentelemetry import metrics
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError, OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -41,9 +41,10 @@ from elspeth.config_loading import load_settings_from_config_dict, load_settings
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionRefused, ChargeableOperation
 from elspeth.contracts.cli import ProgressEvent
-from elspeth.contracts.enums import NodeStateStatus, RunStatus, is_llm_authored_creation_modality
+from elspeth.contracts.enums import CallType, NodeStateStatus, RunStatus, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -68,7 +69,7 @@ from elspeth.core.config import load_bounded_pipeline_yaml
 from elspeth.core.events import EventBus
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_lifecycle_repository import is_valid_sha256_hex
-from elspeth.core.landscape.schema import node_states_table
+from elspeth.core.landscape.schema import calls_table, node_states_table, nodes_table, operations_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.core.secrets import SecretResolutionError
 from elspeth.engine.orchestrator.core import Orchestrator
@@ -99,6 +100,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
 from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding
 from elspeth.web.execution.accounting import load_run_accounting_from_db
@@ -806,6 +808,71 @@ _RUN_RESULT_STATUS_TO_SESSION_STATUS: dict[RunStatus, SessionRunStatus] = {
     RunStatus.FAILED: "failed",
     RunStatus.EMPTY: "empty",
 }
+
+
+def _run_token_usage_entries(landscape_db: LandscapeDB, *, landscape_run_id: str) -> tuple[TokenUsageEntry, ...]:
+    """The run's LLM calls in creation order, as token-ledger entries (Task I1 run adapter).
+
+    Reads the Landscape ``calls`` token columns (epoch 40): ``call_type='llm'``
+    rows are the logical LLM calls, parented by a node state or by an operation;
+    transport rows never carry the charge (sso-design.md:855). The model is the
+    calling node's configured ``model`` (Azure configures ``deployment_name``),
+    and the plugin name when the node configures neither. Missing usage stays
+    unknown even for errors: a dispatched timeout may already have been billed.
+    Call identity and creation time preserve replay and UTC-day attribution.
+    """
+    measures = (
+        calls_table.c.call_id,
+        calls_table.c.created_at,
+        calls_table.c.status,
+        calls_table.c.prompt_tokens,
+        calls_table.c.completion_tokens,
+        calls_table.c.cached_prompt_tokens,
+        calls_table.c.reasoning_tokens,
+        nodes_table.c.plugin_name,
+        nodes_table.c.config_json,
+    )
+    with landscape_db.read_only_connection() as conn:
+        state_calls = conn.execute(
+            select(*measures)
+            .select_from(
+                calls_table.join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id).join(
+                    nodes_table,
+                    and_(nodes_table.c.node_id == node_states_table.c.node_id, nodes_table.c.run_id == node_states_table.c.run_id),
+                )
+            )
+            .where(node_states_table.c.run_id == landscape_run_id, calls_table.c.call_type == CallType.LLM.value)
+        ).all()
+        operation_calls = conn.execute(
+            select(*measures)
+            .select_from(
+                calls_table.join(operations_table, calls_table.c.operation_id == operations_table.c.operation_id).join(
+                    nodes_table,
+                    and_(nodes_table.c.node_id == operations_table.c.node_id, nodes_table.c.run_id == operations_table.c.run_id),
+                )
+            )
+            .where(operations_table.c.run_id == landscape_run_id, calls_table.c.call_type == CallType.LLM.value)
+        ).all()
+    entries: list[TokenUsageEntry] = []
+    for row in sorted([*state_calls, *operation_calls], key=lambda call: (call.created_at, call.call_id)):
+        config = json.loads(row.config_json)
+        model = row.plugin_name
+        for key in ("model", "deployment_name"):
+            if key in config and config[key] is not None:
+                model = config[key]
+                break
+        entries.append(
+            TokenUsageEntry(
+                model=model,
+                prompt_tokens=row.prompt_tokens,
+                completion_tokens=row.completion_tokens,
+                cached_prompt_tokens=row.cached_prompt_tokens,
+                reasoning_tokens=row.reasoning_tokens,
+                call_id=row.call_id,
+                recorded_at=row.created_at.replace(tzinfo=UTC) if row.created_at.tzinfo is None else row.created_at,
+            )
+        )
+    return tuple(entries)
 
 
 def _session_status_from_run_result_status(status: RunStatus) -> SessionRunStatus:
@@ -3235,6 +3302,16 @@ class ExecutionServiceImpl:
                 checkpoint_manager=checkpoint_manager,
                 checkpoint_config=checkpoint_config,
                 telemetry_manager=telemetry_manager,
+                llm_call_governance=LLMCallGovernance(
+                    before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease),
+                    after_call=partial(
+                        self._settle_run_llm_call,
+                        run_uuid,
+                        session_operation_lease,
+                        landscape_db=landscape_db,
+                        landscape_run_id=run_id,
+                    ),
+                ),
             )
 
             # B2 fix: ALWAYS pass shutdown_event — suppresses signal handler
@@ -3379,6 +3456,8 @@ class ExecutionServiceImpl:
                         rows_quarantined=result.rows_quarantined,
                         failure_samples=samples_text,
                     )
+            # R14 (Task I1): charge the run's LLM calls before its terminal status.
+            self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=result.run_id)
             # Cancelled-race recovery: catch only the narrow subclass.  See
             # IllegalRunTransitionError docstring for why bare ValueError must
             # propagate (Tier-1 invariant breaches must not be masked).
@@ -3576,6 +3655,8 @@ class ExecutionServiceImpl:
                 success=False,
                 session_operation_lease=session_operation_lease,
             )
+            # R14 (Task I1): calls made before the shutdown are spent.
+            self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=run_id)
             session_operation_lease.guard_external_effect()
             self._call_async(
                 self._session_service.update_run_status(
@@ -3768,6 +3849,7 @@ class ExecutionServiceImpl:
                     try:
                         status_update_exc_class = self._persist_failed_run_status(
                             run_uuid,
+                            landscape_db=landscape_db,
                             error=_operator_failure_diagnostic(
                                 class_chain=_exception_class_chain(exc),
                                 exc_message=_operator_exc_message(exc),
@@ -3901,12 +3983,74 @@ class ExecutionServiceImpl:
             self._broadcaster.cleanup_run(run_id)
         return None
 
+    def _admit_run_llm_call(self, run_uuid: UUID, session_operation_lease: SessionOperationLease) -> str:
+        """Persist an admitted pending attempt before the provider can spend."""
+        session_operation_lease.guard_external_effect()
+        attempt = self._call_async(
+            self._session_service.begin_provider_attempt(
+                session_operation_context=session_operation_lease.context,
+                source="run",
+                run_id=run_uuid,
+            )
+        )
+        return attempt.attempt_id
+
+    def _settle_run_llm_call(
+        self,
+        run_uuid: UUID,
+        session_operation_lease: SessionOperationLease,
+        attempt_id: str,
+        call_id: str,
+        *,
+        landscape_db: LandscapeDB,
+        landscape_run_id: str,
+    ) -> None:
+        """Settle one pending attempt using its committed Landscape outcome."""
+        session_operation_lease.guard_external_effect()
+        entries = tuple(
+            entry for entry in _run_token_usage_entries(landscape_db, landscape_run_id=landscape_run_id) if entry.call_id == call_id
+        )
+        if len(entries) != 1:
+            raise AuditIntegrityError(f"Run {run_uuid} provider outcome must identify exactly one durable LLM call")
+        self._call_async(
+            self._session_service.settle_provider_attempt(
+                session_operation_context=session_operation_lease.context,
+                attempt_id=attempt_id,
+                entry=entries[0],
+            )
+        )
+
+    def _record_run_token_usage(
+        self,
+        run_uuid: UUID,
+        session_operation_lease: SessionOperationLease,
+        *,
+        landscape_db: LandscapeDB | None,
+        landscape_run_id: str,
+    ) -> None:
+        """Charge the run's LLM calls to the run owner's token ledger under the run's EXECUTE authority (R14)."""
+        if landscape_db is None:
+            return
+        entries = _run_token_usage_entries(landscape_db, landscape_run_id=landscape_run_id)
+        if not entries:
+            return
+        session_operation_lease.guard_external_effect()
+        self._call_async(
+            self._session_service.record_token_usage(
+                session_operation_context=session_operation_lease.context,
+                source="run",
+                run_id=run_uuid,
+                entries=entries,
+            )
+        )
+
     def _persist_failed_run_status(
         self,
         run_uuid: UUID,
         *,
         error: str,
         session_operation_lease: SessionOperationLease,
+        landscape_db: LandscapeDB | None,
     ) -> str | None:
         """Best-effort failed-status persistence for exception recovery.
 
@@ -3925,6 +4069,9 @@ class ExecutionServiceImpl:
                     session_operation_context=session_operation_context,
                 )
             )
+            # R14 (Task I1): the failed run's calls are spent. After the status
+            # write, so a ledger failure degrades to the same transient report.
+            self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=str(run_uuid))
         except (SQLAlchemyError, OSError) as status_err:
             # Narrow catch (canonical pattern, commits b8ba2214/127417cb):
             # SQLAlchemyError family + OSError only. Programmer bugs in

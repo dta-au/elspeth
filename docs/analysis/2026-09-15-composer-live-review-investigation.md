@@ -21,10 +21,13 @@ The frontend uses successful mode probes and readable approval labels, and
 displays saved model/profile choices and discard/merge consequences independently
 of planner prose. Planner guidance distinguishes adapted prompts from verbatim
 text. Formatting remains an explicit authoring choice; audited outputs are not
-silently rewritten. Session/Landscape epochs advance together to 57/41, with the
+silently rewritten. These repairs introduced Session/Landscape epochs 57/41, with the
 deployment procedure in the session DB reset runbook. No live database reset is
 part of this implementation. Integration evidence is tracked under
 `elspeth-3983cd84f1` and `.claude/lanes/composer-followons/`.
+
+The subsequently requested [quota repair](2026-09-15-quota-enforcement-repair.md)
+advances the same release to Session/Landscape epochs 58/42.
 
 The sections below preserve the initial investigation and its original measured
 state, before implementation.

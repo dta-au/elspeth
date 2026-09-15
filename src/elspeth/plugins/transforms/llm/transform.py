@@ -29,6 +29,7 @@ from pydantic import Field as PydanticField
 
 from elspeth.contracts import Determinism, TransformErrorReason, TransformResult, propagate_contract
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, ContentPart, ImagePart, TextPart, parts_hash
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.coordination import CoordinationToken
@@ -1205,7 +1206,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:af6f330640914b16"
+    source_file_hash: str | None = "sha256:6dff3f2acaa59b19"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1742,7 +1743,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         self._limiter = ctx.rate_limit_registry.get_limiter(limiter_name) if ctx.rate_limit_registry is not None else None
 
         # Create provider now that recorder/telemetry are available
-        self._provider = self._create_provider()
+        self._provider = self._create_provider(llm_call_governance=ctx.llm_call_governance)
 
         # Initialize Azure AI tracing (process-level OpenTelemetry auto-instrumentation).
         # Must happen after provider creation — the OpenAI SDK must be available.
@@ -1767,7 +1768,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 cause=exc,
             ) from exc
 
-    def _create_provider(self) -> LLMProvider:
+    def _create_provider(self, *, llm_call_governance: LLMCallGovernance | None = None) -> LLMProvider:
         """Instantiate the provider with all required dependencies.
 
         Uses isinstance narrowing on self._config to safely access
@@ -1787,6 +1788,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+                llm_call_governance=llm_call_governance,
             )
         elif isinstance(self._config, OpenRouterConfig):
             return OpenRouterLLMProvider(
@@ -1798,6 +1800,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+                llm_call_governance=llm_call_governance,
             )
         elif isinstance(self._config, BedrockConfig):
             return BedrockLLMProvider(
@@ -1807,6 +1810,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+                llm_call_governance=llm_call_governance,
             )
         elif isinstance(self._config, GatewayConfig):
             # GatewayConfig.api_key already carries the resolved bearer value
@@ -1828,6 +1832,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+                llm_call_governance=llm_call_governance,
             )
         else:
             raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")

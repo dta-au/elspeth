@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
     from elspeth.web.composer.pipeline_proposal import PipelineProposal, ProposalBase
+    from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry, TokenUsageSource
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
@@ -4740,6 +4741,29 @@ class SessionServiceProtocol(Protocol):
     async def assess_chargeable_operation(
         self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
     ) -> ChargeableAdmissionDecision: ...
+
+    async def record_token_usage(
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        source: TokenUsageSource,
+        run_id: UUID | None,
+        entries: tuple[TokenUsageEntry, ...],
+    ) -> tuple[str, ...]:
+        """Charge auto-title (COMPOSE) or run (EXECUTE) provider calls to the session owner's token ledger."""
+
+    async def begin_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None = None
+    ) -> ProviderAttempt:
+        """Admit and persist pending provider evidence before dispatch."""
+
+    async def finish_provider_attempt(self, *, session_operation_context: SessionOperationContext, call: ComposerLLMCall) -> None:
+        """Checkpoint terminal provider audit and settle its ledger atomically."""
+
+    async def settle_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+    ) -> None:
+        """Settle non-Composer provider evidence under COMPOSE or EXECUTE authority."""
 
     async def request_run_cancellation(
         self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType

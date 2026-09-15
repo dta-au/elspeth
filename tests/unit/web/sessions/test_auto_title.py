@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -10,17 +11,66 @@ from litellm import ModelResponse
 from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
     ChargeableAdmissionDecision,
+    ChargeableAdmissionRefused,
     ChargeableOperation,
     QuotaDisposition,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions.telemetry import _FakeCounter
+
+_DISPATCHED_AT = datetime(2026, 9, 15, 23, 59, 59, tzinfo=UTC)
+
+
+class _TitleClock:
+    @staticmethod
+    def now(tz: object) -> datetime:
+        assert tz is UTC
+        return _DISPATCHED_AT
+
+
+@pytest.fixture(autouse=True)
+def _freeze_dispatch_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_auto_title, "datetime", _TitleClock)
 
 
 class _TitleService:
     def __init__(self) -> None:
         self.updates: list[tuple[object, str]] = []
+        self.usage: list[tuple[str, object, tuple[TokenUsageEntry, ...]]] = []
+
+    async def begin_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, source: str, run_id: object = None
+    ) -> ProviderAttempt:
+        assert source == "auto_title"
+        assert run_id is None
+        decision = await self.assess_chargeable_operation(
+            session_operation_context=session_operation_context, operation=ChargeableOperation.AUTO_TITLE
+        )
+        if not decision.allowed:
+            raise ChargeableAdmissionRefused(decision)
+        return ProviderAttempt(attempt_id="title-attempt", started_at=datetime.now(UTC))
+
+    async def settle_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+    ) -> None:
+        assert attempt_id == "title-attempt"
+        await self.record_token_usage(
+            session_operation_context=session_operation_context, source="auto_title", run_id=None, entries=(entry,)
+        )
+
+    async def record_token_usage(
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        source: str,
+        run_id: object,
+        entries: tuple[TokenUsageEntry, ...],
+    ) -> tuple[str, ...]:
+        del session_operation_context
+        self.usage.append((source, run_id, entries))
+        return tuple(f"entry-{index}" for index in range(len(entries)))
 
     async def assess_chargeable_operation(
         self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
@@ -543,3 +593,117 @@ async def test_auto_title_cancellation_propagates_after_accounting(monkeypatch) 
         )
     assert caught.value is cancellation
     assert counter.calls == [(1, {"exception_class": "CancelledError"}, None)]
+
+
+# ── Task I1: the auto-title token-ledger adapter ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_title_charges_a_returned_completion_even_when_the_title_is_rejected(monkeypatch) -> None:
+    """R14 (sso-design.md:1161): a completion the gate discards was still spent."""
+    response = ModelResponse(
+        model="openai/returned",
+        choices=[{"index": 0, "message": {"role": "assistant", "content": _LIVE_LEAK_COMPLETION}}],
+        usage={"prompt_tokens": 21, "completion_tokens": 4, "total_tokens": 25},
+    )
+    service, _failed, _rejected = await _run_auto_title(monkeypatch, response)
+    assert service.updates == []
+    assert service.usage == [
+        (
+            "auto_title",
+            None,
+            (
+                TokenUsageEntry(
+                    model="openai/returned",
+                    prompt_tokens=21,
+                    completion_tokens=4,
+                    cached_prompt_tokens=None,
+                    reasoning_tokens=None,
+                    recorded_at=_DISPATCHED_AT,
+                    call_id="title-attempt",
+                ),
+            ),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_title_charges_an_unreported_completion_as_unknown_never_zero(monkeypatch) -> None:
+    service, _failed, _rejected = await _run_auto_title(monkeypatch, _completion_without_finish("Useful Pipeline Title"))
+    assert service.updates != []
+    assert service.usage == [
+        (
+            "auto_title",
+            None,
+            (
+                TokenUsageEntry(
+                    model="openai/test",
+                    prompt_tokens=None,
+                    completion_tokens=None,
+                    cached_prompt_tokens=None,
+                    reasoning_tokens=None,
+                    recorded_at=_DISPATCHED_AT,
+                    call_id="title-attempt",
+                ),
+            ),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_title_provider_timeout_charges_unknown_usage(monkeypatch) -> None:
+    async def _raise_timeout(**_kwargs: object) -> object:
+        raise TimeoutError("title generation timed out")
+
+    monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", _FakeCounter())
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _raise_timeout)
+    service = _TitleService()
+    await _auto_title.maybe_auto_title_session(
+        service=service,
+        session_id=_TEST_SESSION_ID,
+        user_message="Build a CSV pipeline",
+        model="openai/test",
+        temperature=None,
+        seed=None,
+        session_operation_context=_TEST_CONTEXT,
+    )
+    assert service.usage == [
+        (
+            "auto_title",
+            None,
+            (
+                TokenUsageEntry(
+                    model="openai/test",
+                    prompt_tokens=None,
+                    completion_tokens=None,
+                    cached_prompt_tokens=None,
+                    reasoning_tokens=None,
+                    recorded_at=_DISPATCHED_AT,
+                    call_id="title-attempt",
+                ),
+            ),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported", [False, True])
+async def test_auto_title_malformed_response_preserves_reported_or_unknown_usage(monkeypatch, reported: bool) -> None:
+    """Malformed response does not prove no billable work happened."""
+    response = (
+        ModelResponse(choices=[], usage={"prompt_tokens": 9, "completion_tokens": 0, "total_tokens": 9})
+        if reported
+        else ModelResponse(choices=[])
+    )
+    service, failed, _rejected = await _run_auto_title(monkeypatch, response)
+    assert failed.calls == [(1, {"exception_class": "MalformedResponseError"}, None)]
+    expected = TokenUsageEntry(
+        model="openai/test",
+        prompt_tokens=9 if reported else None,
+        completion_tokens=0 if reported else None,
+        cached_prompt_tokens=None,
+        reasoning_tokens=None,
+        recorded_at=_DISPATCHED_AT,
+        call_id="title-attempt",
+    )
+    assert service.usage == [("auto_title", None, (expected,))]

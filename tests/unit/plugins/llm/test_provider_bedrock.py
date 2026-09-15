@@ -21,6 +21,7 @@ from litellm.exceptions import (
 )
 from litellm.types.utils import ModelResponse, Usage
 
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -68,9 +69,50 @@ class FakeAuditRecorder:
     def record_operation_call(self, **call: Any) -> SimpleNamespace:
         self.operation_calls.append(call)
         return SimpleNamespace(
+            call_id=f"operation-call-{len(self.operation_calls)}",
             request_ref=f"operation-request-{len(self.operation_calls)}",
             response_ref=f"operation-response-{len(self.operation_calls)}",
         )
+
+
+@pytest.mark.parametrize("preflight", [False, True])
+@pytest.mark.parametrize("refused", [False, True])
+def test_governance_guards_bedrock_and_settles_once(preflight: bool, refused: bool) -> None:
+    recorder = FakeAuditRecorder()
+    events: list[str] = []
+
+    def before() -> str:
+        events.append("before")
+        if refused:
+            raise RuntimeError("quota refused")
+        return "attempt-bedrock"
+
+    def after(attempt_id: str, call_id: str) -> None:
+        assert attempt_id == "attempt-bedrock"
+        assert call_id == "operation-call-1"
+        assert len(recorder.operation_calls) == 1
+        events.append("after")
+
+    provider = BedrockLLMProvider(
+        region_name=None,
+        recorder=recorder,
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        llm_call_governance=LLMCallGovernance(before_call=before, after_call=after),
+    )
+    with patch("litellm.completion", return_value=_response()) as completion:
+        if refused:
+            with pytest.raises(RuntimeError, match="quota refused"):
+                if preflight:
+                    provider.runtime_preflight(operation_id="op-1", model=MODEL, coordination_token=_LEADER_TOKEN)
+                else:
+                    _execute_for_operation(provider)
+        elif preflight:
+            provider.runtime_preflight(operation_id="op-1", model=MODEL, coordination_token=_LEADER_TOKEN)
+        else:
+            _execute_for_operation(provider)
+        assert completion.call_count == (0 if refused else 1)
+    assert events == (["before"] if refused else ["before", "after"])
 
 
 @dataclass

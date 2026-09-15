@@ -125,6 +125,7 @@ from elspeth.web.composer.provider_discovery_response import (
     schema_projection_failure,
     surface_projection_failure,
 )
+from elspeth.web.composer.provider_quota import quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse
@@ -3780,6 +3781,7 @@ async def _plan_pipeline_inner(
         selected_schema_contracts.append(contract_payload)
         return contract_payload
 
+    @quota_provider_calls
     async def call_model(
         *,
         model_override: str | None = None,

@@ -535,11 +535,11 @@ class WebSettings(BaseModel):
     # activated identity can never hold unbounded spend on the container's
     # shared LLM credential. Required for an IdP deployment; None is only
     # coherent for local auth.
-    quota_default_tokens_per_day: int | None = Field(default=None, gt=0)
-    quota_default_storage_bytes: int | None = Field(default=None, gt=0)
+    quota_default_tokens_per_day: int | None = Field(default=None, gt=0, le=2**63 - 1)
+    quota_default_storage_bytes: int | None = Field(default=None, gt=0, le=2**63 - 1)
     # Optional container ceiling rows, distinct from the per-identity level.
-    quota_container_tokens_per_day: int | None = Field(default=None, gt=0)
-    quota_container_storage_bytes: int | None = Field(default=None, gt=0)
+    quota_container_tokens_per_day: int | None = Field(default=None, gt=0, le=2**63 - 1)
+    quota_container_storage_bytes: int | None = Field(default=None, gt=0, le=2**63 - 1)
     # The marking stamped into exports, library rows and audit metadata, so
     # the same artifact appearing in two containers is detectable later.
     compartment_id: str | None = None

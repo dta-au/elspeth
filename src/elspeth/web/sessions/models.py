@@ -18,6 +18,7 @@ from typing import Literal
 
 from sqlalchemy import (
     DDL,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -332,7 +333,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 # Coupled cut: sparse proposal display and structured stored validation errors.
 # 57 → Approved prompt artifact anchor replaces the fallback-template digest.
 #      Pre-1.0 delete/recreate; old approvals must not be reinterpreted.
-SESSION_SCHEMA_EPOCH = 57
+# 58: quota policy quantities require 64-bit storage; unavailable provider
+# token counts remain NULL rather than becoming invented zero usage.
+SESSION_SCHEMA_EPOCH = 58
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3842,14 +3845,14 @@ quota_policies_table = Table(
         ForeignKey("identities.identity_id", ondelete="RESTRICT"),
         nullable=True,
     ),
-    Column("tokens_per_day", Integer, nullable=False),
+    Column("tokens_per_day", BigInteger, nullable=False),
     # A standing LEVEL, not a daily rate. Usage is SUM(blobs.size_bytes)
     # joined through sessions.identity_id over live rows, evaluated at each
     # byte-admitting site. The bound is eventually consistent, not exact: the
     # existing blob lock is keyed on session_id alone, so two sessions of one
     # identity do not serialise against each other.
-    Column("storage_bytes", Integer, nullable=False),
-    Column("dual_control_above_tokens", Integer, nullable=True),
+    Column("storage_bytes", BigInteger, nullable=False),
+    Column("dual_control_above_tokens", BigInteger, nullable=True),
     # NULLABLE beside a closed actor vocabulary: the container ceiling row is
     # derived from configuration and has no granting identity. A non-null FK
     # with an invented placeholder identity would put a fake row in the very
@@ -3913,12 +3916,41 @@ token_usage_ledger_table = Table(
     ),
     Column("run_id", String, nullable=True),
     Column("model", String, nullable=False),
-    Column("prompt_tokens", Integer, nullable=False),
-    Column("completion_tokens", Integer, nullable=False),
+    Column("prompt_tokens", Integer, nullable=True),
+    Column("completion_tokens", Integer, nullable=True),
     Column("cached_prompt_tokens", Integer, nullable=True),
     Column("reasoning_tokens", Integer, nullable=True),
     Column("recorded_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(_TOKEN_USAGE_SOURCE_CHECK, name="ck_token_usage_ledger_source"),
+)
+
+quota_provider_attempts_table = Table(
+    "quota_provider_attempts",
+    metadata,
+    Column("attempt_id", String, primary_key=True),
+    Column("identity_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False),
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="RESTRICT"), nullable=False),
+    Column("source", String, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("settled_at", DateTime(timezone=True), nullable=True),
+    Column("operation_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("lease_token", String, nullable=False),
+    Column("run_id", String, nullable=True),
+    CheckConstraint("source IN ('composer', 'run', 'auto_title')", name="ck_quota_provider_attempts_source"),
+    Column("ledger_entry_id", String, ForeignKey("token_usage_ledger.entry_id", ondelete="RESTRICT"), nullable=True),
+    CheckConstraint(
+        "(settled_at IS NULL AND ledger_entry_id IS NULL) OR (settled_at IS NOT NULL AND ledger_entry_id IS NOT NULL)",
+        name="ck_quota_provider_attempts_settlement",
+    ),
+    CheckConstraint(
+        "(source = 'run' AND run_id IS NOT NULL) OR (source <> 'run' AND run_id IS NULL)",
+        name="ck_quota_provider_attempts_run",
+    ),
+    CheckConstraint("operation_epoch > 0", name="ck_quota_provider_attempts_epoch"),
+)
+Index(
+    "ix_quota_provider_attempts_identity_started", quota_provider_attempts_table.c.identity_id, quota_provider_attempts_table.c.started_at
 )
 # The quota question is "how much has this identity spent in the current UTC
 # day", so the index carries both columns in that order.

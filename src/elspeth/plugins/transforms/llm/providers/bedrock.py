@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from pydantic import Field, field_validator
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.value_source import ValueSource
@@ -93,6 +94,8 @@ class _LiteLLMSDKAdapter:
             # Precedence is explicit: a caller's own aws_region_name wins, and
             # the configured region fills in only when the call names none.
             kwargs["aws_region_name"] = self._region_name
+        # The engine owns retries, so each attempt crosses admission and audit.
+        kwargs["num_retries"] = 0
         return litellm.completion(**kwargs)
 
     def close(self) -> None:
@@ -126,6 +129,7 @@ class BedrockLLMProvider:
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
         approved_prompt_artifact_hash: str | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         self._region_name = region_name
         self._recorder = recorder
@@ -133,6 +137,7 @@ class BedrockLLMProvider:
         self._telemetry_emit = telemetry_emit
         self._limiter = limiter
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
+        self._llm_call_governance = llm_call_governance
         self._llm_clients: dict[str, AuditedLLMClient] = {}
         self._llm_clients_lock = Lock()
         self._underlying_client: _LiteLLMSDKAdapter | None = None
@@ -201,6 +206,7 @@ class BedrockLLMProvider:
             underlying_client=self._get_underlying_client(),
             provider="bedrock",
             limiter=self._limiter,
+            llm_call_governance=self._llm_call_governance,
         )
         redacted_error: LLMClientError | None = None
         try:
@@ -235,6 +241,7 @@ class BedrockLLMProvider:
                     underlying_client=self._get_underlying_client(),
                     provider="bedrock",
                     limiter=self._limiter,
+                    llm_call_governance=self._llm_call_governance,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

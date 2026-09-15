@@ -491,11 +491,11 @@ deployment refuses to start rather than inventing one.
 
 Both must be greater than zero.
 
-Two further settings, `quota_container_tokens_per_day` and
-`quota_container_storage_bytes`, are accepted and validated but **not yet
-enforced**: no runtime path reads either in this release. Do not treat them as
-a container-wide spend ceiling — setting them changes nothing today. The
-per-identity defaults above are the control that exists.
+The optional `quota_container_tokens_per_day` setting is enforced as a
+container-wide ceiling for every chargeable LLM operation. The optional
+`quota_container_storage_bytes` setting is accepted and validated but is not
+yet enforced. The per-identity defaults above remain the normal identity-level
+control.
 
 ### The compartment marking
 

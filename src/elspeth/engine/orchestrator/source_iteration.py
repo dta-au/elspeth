@@ -151,6 +151,7 @@ class SourceIterationDriver:
             rate_limit_registry=source_ctx.rate_limit_registry,
             concurrency_config=source_ctx.concurrency_config,
             shutdown_event=source_ctx.shutdown_event,
+            llm_call_governance=source_ctx.llm_call_governance,
             contract=source_ctx.contract,
             telemetry_emit=source_ctx.telemetry_emit,
             coordination_token=source_ctx.coordination_token,

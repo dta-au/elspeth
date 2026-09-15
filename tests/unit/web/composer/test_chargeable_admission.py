@@ -1,5 +1,6 @@
 """Public provider entries refuse before either planner or text model work."""
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any, cast
 from unittest.mock import patch
@@ -11,10 +12,12 @@ from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
     AdmissionRefusalReason,
     ChargeableAdmissionDecision,
+    ChargeableAdmissionRefused,
     ChargeableOperation,
     QuotaDisposition,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.composer import provider_quota
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE
 from elspeth.web.composer.guided.protocol import GuidedStep
@@ -57,6 +60,12 @@ class _AdmissionService:
         assert session_operation_context == _CONTEXT
         self.operations.append(operation)
         return self.decision
+
+    async def begin_provider_attempt(self, *, session_operation_context: SessionOperationContext, source: str) -> None:
+        assert session_operation_context == _CONTEXT
+        assert source == "auto_title"
+        self.operations.append(ChargeableOperation.AUTO_TITLE)
+        raise ChargeableAdmissionRefused(self.decision)
 
 
 @pytest.mark.asyncio
@@ -142,10 +151,19 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
     service = composer_service_without_sessions_service
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
-    with patch.object(service, "_call_text_llm_with_audit", autospec=True, return_value="Explanation") as provider:
+
+    async def explain(*args: object, **kwargs: object) -> str:
+        scope = provider_quota._SCOPE.get()
+        assert scope is not None
+        assert scope.service is authority
+        assert scope.context is _CONTEXT
+        return "Explanation"
+
+    with patch.object(service, "_call_text_llm_with_audit", autospec=True, side_effect=explain) as provider:
         assert await service.explain_run_diagnostics({}, session_operation_context=_CONTEXT) == "Explanation"
     provider.assert_awaited_once()
     assert authority.operations == [ChargeableOperation.COMPOSER]
+    assert provider_quota._SCOPE.get() is None
 
 
 @pytest.mark.asyncio
@@ -218,6 +236,14 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     service = composer_service_with_real_sessions
     sessions = service._sessions_service
     assert sessions is not None
+
+    async def assert_scoped_planner(*args: object, **kwargs: object) -> None:
+        scope = provider_quota._SCOPE.get()
+        assert scope is not None
+        assert scope.service is sessions
+        assert scope.context is _CONTEXT
+        raise _PlannerReached
+
     authority = _AdmissionService(None if allowed else AdmissionRefusalReason.IDENTITY_DISABLED)
     state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     message_id = "00000000-0000-0000-0000-000000000002"
@@ -263,8 +289,8 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     with (
         patch.object(sessions, "assess_chargeable_operation", new=authority.assess_chargeable_operation),
         patch.object(sessions, "get_composer_preferences", autospec=True, return_value=preferences),
-        patch("elspeth.web.composer.service.plan_pipeline", autospec=True, side_effect=_PlannerReached) as planner,
-        patch.object(service, "_run_advisor_checkpoint", autospec=True, side_effect=_PlannerReached) as advisor,
+        patch("elspeth.web.composer.service.plan_pipeline", autospec=True, side_effect=assert_scoped_planner) as planner,
+        patch.object(service, "_run_advisor_checkpoint", autospec=True, side_effect=assert_scoped_planner) as advisor,
         pytest.raises(_PlannerReached if allowed else ComposerAdmissionRefused),
     ):
         if entry == "rootless":
@@ -312,3 +338,46 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     assert authority.operations == [ChargeableOperation.COMPOSER]
     assert planner.await_count == int(allowed and entry != "signoff")
     assert advisor.await_count == int(allowed and entry == "signoff")
+    assert provider_quota._SCOPE.get() is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_diagnostics_restore_separate_session_scopes(
+    composer_service_without_sessions_service: ComposerServiceImpl,
+) -> None:
+    service = composer_service_without_sessions_service
+    authority = _AdmissionService(None)
+    service._sessions_service = cast(SessionServiceProtocol, authority)
+    second_context = SessionOperationContext(
+        fence=SessionOperationFence(session_id="second-session", operation_id="second-operation", lease_token="token", operation_epoch=1),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+    reached = asyncio.Event()
+    contexts: list[SessionOperationContext] = []
+
+    async def admit(*, session_operation_context: SessionOperationContext, operation: ChargeableOperation) -> ChargeableAdmissionDecision:
+        return authority.decision
+
+    async def explain(*args: object, **kwargs: object) -> str:
+        initial = provider_quota._SCOPE.get()
+        assert initial is not None
+        assert initial.service is authority
+        contexts.append(initial.context)
+        if len(contexts) == 2:
+            reached.set()
+        await asyncio.wait_for(reached.wait(), timeout=2)
+        await asyncio.sleep(0)
+        assert provider_quota._SCOPE.get() is initial
+        return initial.context.fence.session_id
+
+    with (
+        patch.object(authority, "assess_chargeable_operation", new=admit),
+        patch.object(service, "_call_text_llm_with_audit", autospec=True, side_effect=explain),
+    ):
+        results = await asyncio.gather(
+            service.explain_run_diagnostics({}, session_operation_context=_CONTEXT),
+            service.explain_run_diagnostics({}, session_operation_context=second_context),
+        )
+    assert results == [_SESSION_ID, "second-session"]
+    assert contexts == [_CONTEXT, second_context]
+    assert provider_quota._SCOPE.get() is None

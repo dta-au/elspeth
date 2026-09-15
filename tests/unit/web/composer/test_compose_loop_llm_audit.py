@@ -447,7 +447,7 @@ async def test_text_only_success_records_llm_call_metadata() -> None:
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.")
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
         result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     # New contract (post elspeth-861b0c58f5): model prose preserved verbatim,
@@ -478,7 +478,7 @@ async def test_success_records_provider_cost_from_usage_metadata() -> None:
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.", cost=0.0037)
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response):
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
         result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     call = result.llm_calls[0]
@@ -501,7 +501,7 @@ async def test_success_records_provider_reasoning_metadata() -> None:
         thinking_blocks=thinking_blocks,
     )
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response):
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
         result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     call = result.llm_calls[0]
@@ -518,7 +518,7 @@ async def test_malformed_provider_cost_is_recorded_as_unavailable() -> None:
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.", cost="not-a-number")
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response):
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
         result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     call = result.llm_calls[0]
@@ -535,7 +535,7 @@ async def test_unset_sampling_is_omitted_and_reflected_in_audit() -> None:
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.")
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
         result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     request_kwargs = mock_acomp.call_args.kwargs
@@ -569,7 +569,7 @@ async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
     )
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, side_effect=[tool_turn, final_turn]),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=[tool_turn, final_turn]),
         patch("elspeth.web.composer.tool_batch.execute_tool", return_value=tool_result),
         patch.object(service, "_cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
     ):
@@ -590,7 +590,7 @@ async def test_deadline_timeout_records_llm_call_on_convergence_error() -> None:
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm", side_effect=timeout_llm),
+        patch("litellm.acompletion", side_effect=timeout_llm),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
         await service.compose("Hello", [], state, session_id=session_id)
@@ -608,7 +608,7 @@ async def test_bad_request_records_redacted_llm_call_on_service_error() -> None:
     bad_request = LiteLLMBadRequestError(message="bad request leaked detail", model="bad", llm_provider="test")
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, side_effect=bad_request),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=bad_request),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
         await service.compose("Hello", [], _empty_state(), session_id=session_id)
@@ -628,7 +628,7 @@ async def test_unclassified_provider_exception_records_api_error_call() -> None:
 
     with (
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=ValueError("unexpected codec failure"),
         ),
@@ -650,7 +650,7 @@ async def test_empty_choices_records_malformed_response() -> None:
     empty_response = _FakeLLMResponse(choices=[], usage=SimpleNamespace(prompt_tokens=3, completion_tokens=None, total_tokens=3))
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=empty_response),
+        patch("litellm.acompletion", new_callable=AsyncMock, return_value=empty_response),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
         await service.compose("Hello", [], _empty_state(), session_id=session_id)
@@ -709,7 +709,7 @@ async def test_malformed_nonempty_response_records_malformed_not_success(case: s
     )
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=malformed),
+        patch("litellm.acompletion", new_callable=AsyncMock, return_value=malformed),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
         await service.compose("Hello", [], _empty_state(), session_id=session_id)
@@ -727,7 +727,7 @@ async def test_cancelled_model_call_records_cancelled_status() -> None:
     cancelled = asyncio.CancelledError()
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, side_effect=cancelled),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=cancelled),
         pytest.raises(asyncio.CancelledError) as exc_info,
     ):
         await service.compose("Hello", [], _empty_state(), session_id=session_id)

@@ -6,7 +6,7 @@ from sqlalchemy import select, update
 from typer.testing import CliRunner
 
 from elspeth.cli import app
-from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy, ChargeableOperation, QuotaDisposition
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy, ChargeableOperation, QuotaDisposition
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -75,9 +75,15 @@ def test_cli_quota_policy_is_not_disabled_by_absent_issuance_defaults(tmp_path, 
             context, lambda tx: tx.session.assess_chargeable_operation(policy=policy, operation=ChargeableOperation.COMPOSER)
         )
         if explicit_quota:
-            assert decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
+            # An explicit operator policy remains authoritative even when the
+            # boot settings do not issue new identity policies.  An empty
+            # ledger is measured zero, so the first operation is admitted;
+            # ``TOKEN_ACCOUNTING_UNAVAILABLE`` is reserved for unknown or
+            # pending provider evidence.
+            assert decision.refusal_reason is None
             assert decision.evidence.identity_policy_id == quota_id
-            assert decision.evidence.quota_disposition is QuotaDisposition.ACCOUNTING_UNAVAILABLE
+            assert decision.evidence.quota_disposition is QuotaDisposition.WITHIN_CAP
+            assert decision.evidence.usage == 0
             # A revoked policy no longer applies: absence remains an explicit,
             # measured allowance, not a permanently enabled global switch.
             from datetime import UTC, datetime

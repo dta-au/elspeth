@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -71,6 +72,7 @@ class FakeAuditRecorder:
     def record_operation_call(self, **call: Any) -> SimpleNamespace:
         self.operation_calls.append(call)
         return SimpleNamespace(
+            call_id=f"operation-call-{len(self.operation_calls)}",
             request_ref=f"operation-request-{len(self.operation_calls)}",
             response_ref=f"operation-response-{len(self.operation_calls)}",
         )
@@ -151,6 +153,69 @@ def _install_cached_http_client(
 ) -> None:
     provider._http_clients[audit_parent.cache_key] = cast("AuditedHTTPClient", http_client)
     provider._http_client_refs[audit_parent.cache_key] = 0
+
+
+@pytest.mark.parametrize("mode", ["success", "unknown", "malformed", "refused"])
+@pytest.mark.parametrize("preflight", [False, True])
+def test_governance_admits_before_dispatch_and_settles_recorded_outcomes(
+    audit_recorder: FakeAuditRecorder, telemetry_emit: FakeTelemetryEmit, mode: str, preflight: bool
+) -> None:
+    events: list[str] = []
+
+    def before() -> str:
+        events.append("before")
+        if mode == "refused":
+            raise RuntimeError("quota refused")
+        return "attempt-1"
+
+    def after(attempt_id: str, call_id: str) -> None:
+        assert attempt_id == "attempt-1"
+        assert call_id == f"operation-call-{len(audit_recorder.operation_calls)}"
+        assert audit_recorder.operation_calls[-1]["call_type"] is CallType.LLM
+        events.append("after")
+
+    provider = OpenRouterLLMProvider(
+        api_key="test-key",
+        recorder=audit_recorder,
+        run_id="run-1",
+        telemetry_emit=telemetry_emit,
+        llm_call_governance=LLMCallGovernance(before_call=before, after_call=after),
+    )
+    response = _make_http_response()
+    if mode == "unknown":
+        body = response.json()
+        del body["usage"]
+        response = httpx.Response(200, json=body, request=response.request)
+    elif mode == "malformed":
+        response = httpx.Response(200, json={"usage": {"prompt_tokens": 10, "completion_tokens": 5}}, request=response.request)
+    http_client = FakeHTTPClient(response=response)
+
+    def invoke() -> None:
+        if preflight:
+            provider.runtime_preflight(operation_id="op-1", model="gpt-4o", coordination_token=_LEADER_TOKEN)
+        else:
+            provider.execute_query(
+                [ChatMessage(role="user", content="hello")],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=32,
+                audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+            )
+
+    with _provider_http_client(provider, http_client):
+        if mode == "refused":
+            with pytest.raises(RuntimeError, match="quota refused"):
+                invoke()
+        elif mode == "malformed":
+            with pytest.raises(LLMClientError):
+                invoke()
+        else:
+            invoke()
+    assert events == (["before"] if mode == "refused" else ["before", "after"])
+    assert len(http_client.post_calls) == (0 if mode == "refused" else 1)
+    assert len(audit_recorder.operation_calls) == (0 if mode == "refused" else 1)
+    if mode == "unknown":
+        assert audit_recorder.operation_calls[0]["token_usage"].prompt_tokens is None
 
 
 @pytest.fixture()

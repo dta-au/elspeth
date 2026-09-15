@@ -172,11 +172,13 @@ class ComposerLLMCall:
     max_completion_tokens_requested: int | None = None
     planner_policy_hash: str | None = None
     planner_call_ordinal: int | None = None
+    call_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not ComposerLLMCallStatus:
             raise TypeError(f"status must be ComposerLLMCallStatus, got {type(self.status).__name__}: {self.status!r}")
         _require_non_empty_str(self.model_requested, "model_requested")
+        _require_non_empty_str(self.call_id, "call_id", optional=True)
         _require_non_empty_str(self.model_returned, "model_returned", optional=True)
         _require_non_empty_str(self.provider_request_id, "provider_request_id", optional=True)
         # An empty/whitespace finish_reason is not "the provider said nothing"

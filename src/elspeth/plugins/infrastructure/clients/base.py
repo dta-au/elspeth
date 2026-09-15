@@ -5,13 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from elspeth.contracts import CallType
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 
 if TYPE_CHECKING:
-    from elspeth.contracts import Call, CallStatus, CallType
+    from elspeth.contracts import Call, CallStatus
     from elspeth.contracts.audit_protocols import CallRecorder
     from elspeth.contracts.call_data import CallPayload
     from elspeth.contracts.contexts import LimiterProtocol
@@ -70,6 +72,7 @@ class AuditedClientBase:
         coordination_token: CoordinationToken | None = None,
         member_token: WorkerMembershipToken | None = None,
         work_item: TokenWorkItem | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         """Initialize audited client.
 
@@ -96,6 +99,13 @@ class AuditedClientBase:
         self._coordination_token = coordination_token
         self._member_token = member_token
         self._work_item = work_item
+        self._llm_call_governance = llm_call_governance
+
+    def _before_llm_call(self) -> str | None:
+        """Check host admission immediately before a chargeable dispatch."""
+        if self._llm_call_governance is not None:
+            return self._llm_call_governance.before_call()
+        return None
 
     def _require_coordination_token(self) -> CoordinationToken:
         if not isinstance(self._coordination_token, CoordinationToken):
@@ -154,6 +164,7 @@ class AuditedClientBase:
         latency_ms: float | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        llm_call_attempt: str | None = None,
     ) -> Call:
         """Record a call under the configured audit parent.
 
@@ -165,7 +176,7 @@ class AuditedClientBase:
         that never went through an interpretation surface.
         """
         if self._operation_id is not None:
-            return self._execution.record_operation_call(
+            call = self._execution.record_operation_call(
                 coordination_token=self._require_coordination_token(),
                 operation_id=self._operation_id,
                 call_index=call_index,
@@ -178,9 +189,14 @@ class AuditedClientBase:
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=token_usage,
             )
+            if call_type is CallType.LLM and self._llm_call_governance is not None:
+                if llm_call_attempt is None:
+                    raise FrameworkBugError("Governed LLM audit outcome has no admitted attempt")
+                self._llm_call_governance.after_call(llm_call_attempt, call.call_id)
+            return call
         if self._state_id is None:
             raise FrameworkBugError("Audited client has neither state_id nor operation_id")
-        return self._execution.record_call(
+        call = self._execution.record_call(
             member_token=self._require_member_token(),
             work_item=self._require_work_item(),
             state_id=self._state_id,
@@ -194,6 +210,11 @@ class AuditedClientBase:
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
         )
+        if call_type is CallType.LLM and self._llm_call_governance is not None:
+            if llm_call_attempt is None:
+                raise FrameworkBugError("Governed LLM audit outcome has no admitted attempt")
+            self._llm_call_governance.after_call(llm_call_attempt, call.call_id)
+        return call
 
     def _acquire_rate_limit(self) -> None:
         """Acquire rate limit permission before making external call.

@@ -29,6 +29,7 @@ from elspeth.contracts.events import TelemetryEvent
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
     from elspeth.contracts.audit_protocols import PluginAuditWriter
+    from elspeth.contracts.call_governance import LLMCallGovernance
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.identity import TokenInfo
@@ -229,6 +230,9 @@ class LifecycleContext(Protocol):
 
     @property
     def run_id(self) -> str: ...
+
+    @property
+    def llm_call_governance(self) -> LLMCallGovernance | None: ...
 
     @property
     def node_id(self) -> str | None: ...  # [R1] Set by orchestrator before on_start()

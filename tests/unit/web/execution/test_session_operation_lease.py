@@ -1672,6 +1672,27 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
         exact_envelope_bound = _binding_nodes(function, live_nodes, name="restore_execution_envelope") == ()
         for call in (candidate for candidate in live_nodes if isinstance(candidate, ast.Call)):
             if (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "Orchestrator"
+                and all(_binding_nodes(function, live_nodes, name=name) == () for name in ("Orchestrator", "LLMCallGovernance", "partial"))
+            ):
+                expected = ast.parse(
+                    "LLMCallGovernance("
+                    "before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease), "
+                    "after_call=partial(self._settle_run_llm_call, run_uuid, session_operation_lease, "
+                    "landscape_db=landscape_db, landscape_run_id=run_id))",
+                    mode="eval",
+                ).body
+                for keyword in call.keywords:
+                    if keyword.arg == "llm_call_governance" and ast.dump(keyword.value) == ast.dump(expected):
+                        assert isinstance(keyword.value, ast.Call)
+                        for callback in keyword.value.keywords:
+                            assert isinstance(callback.value, ast.Call)
+                            edge = callback.value.args[0]
+                            assert isinstance(edge, ast.Attribute)
+                            pending.append(members[edge.attr])
+                            admitted.add(id(edge))
+            if (
                 isinstance(call.func, ast.Attribute)
                 and isinstance(call.func.value, ast.Name)
                 and call.func.value.id == "self"
@@ -1751,10 +1772,23 @@ _EXECUTION_EFFECT_NAMES = frozenset(
         "read_blob_content",
         "_fetch_blob_contents",
         "finalize_run_output_blobs",
+        "record_token_usage",
+        "begin_provider_attempt",
+        "settle_provider_attempt",
     }
 )
 _EXECUTION_GATE_CALL_NAMES = _EXECUTION_EFFECT_NAMES | {"_persist_and_broadcast_run_event", "_finalize_output_blobs"}
-_SESSION_SERVICE_EFFECTS = frozenset({"create_run", "update_run_status", "append_run_event", "record_blob_inline_resolutions"})
+_SESSION_SERVICE_EFFECTS = frozenset(
+    {
+        "create_run",
+        "update_run_status",
+        "append_run_event",
+        "record_blob_inline_resolutions",
+        "record_token_usage",
+        "begin_provider_attempt",
+        "settle_provider_attempt",
+    }
+)
 _BLOB_SERVICE_EFFECTS = frozenset({"get_blob", "link_blob_to_run", "read_blob_content", "finalize_run_output_blobs"})
 
 
@@ -1789,6 +1823,9 @@ def _caller_lease_escapes(member: _FunctionNode) -> bool:
         "self._settle_admission_refusal": 1,
         "self._materialize_durable_cancellation": 1,
         "self._record_recovery_refusal": 1,
+        "self._record_run_token_usage": 1,
+        "self._admit_run_llm_call": 1,
+        "self._settle_run_llm_call": 1,
     }
     keyword_consumers = {
         "self._broadcast_progress_event",
@@ -1807,6 +1844,10 @@ def _caller_lease_escapes(member: _FunctionNode) -> bool:
             position = positional_consumers.get(ast.unparse(consumer.func))
             if position is not None and len(consumer.args) > position and consumer.args[position] is node:
                 continue
+            if isinstance(consumer.func, ast.Name) and consumer.func.id == "partial" and consumer.args:
+                position = positional_consumers.get(ast.unparse(consumer.args[0]))
+                if position is not None and len(consumer.args) > position + 1 and consumer.args[position + 1] is node:
+                    continue
         if isinstance(consumer, ast.keyword) and consumer.arg == "session_operation_lease":
             call = parents[consumer]
             if isinstance(call, ast.Call):
@@ -1859,21 +1900,27 @@ def _has_transferred_lease_context(
         return False
     position = parameters.index(matching[0]) - 1  # self is supplied by attribute dispatch
     callers = [
-        (member, candidate)
+        (member, candidate, candidate.args if isinstance(candidate.func, ast.Attribute) else candidate.args[1:])
         for member in owner.body
         if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
         for candidate in _reachable_function_nodes(member)
         if isinstance(candidate, ast.Call)
-        and isinstance(candidate.func, ast.Attribute)
-        and isinstance(candidate.func.value, ast.Name)
-        and candidate.func.value.id == "self"
-        and candidate.func.attr == scope.name
+        and (
+            ast.unparse(candidate.func) == f"self.{scope.name}"
+            or (
+                isinstance(candidate.func, ast.Name)
+                and candidate.func.id == "partial"
+                and candidate.args
+                and ast.unparse(candidate.args[0]) == f"self.{scope.name}"
+                and scope.name in {"_admit_run_llm_call", "_settle_run_llm_call"}
+            )
+        )
     ]
     return bool(callers) and all(
         position >= 0
-        and len(candidate.args) > position
-        and isinstance(candidate.args[position], ast.Name)
-        and candidate.args[position].id == "session_operation_lease"
+        and len(arguments) > position
+        and isinstance(arguments[position], ast.Name)
+        and arguments[position].id == "session_operation_lease"
         and not any(keyword.arg == name for keyword in candidate.keywords)
         and any(parameter.arg == "session_operation_lease" for parameter in (*member.args.args, *member.args.kwonlyargs))
         and len(_binding_nodes(member, _walk_function_body_without_nested_functions(member), name="session_operation_lease")) == 1
@@ -1891,7 +1938,7 @@ def _has_transferred_lease_context(
             and node.value.id == "session_operation_lease"
             for node in ast.walk(member)
         )
-        for member, candidate in callers
+        for member, candidate, arguments in callers
     )
 
 
@@ -1997,7 +2044,7 @@ def _execution_effect_findings(owner: ast.ClassDef) -> _ExecutionEffectFindings:
         and isinstance(node.value, ast.Name)
         and node.value.id == "self"
         and node.attr in class_member_names
-        and not (isinstance(parent.get(node), ast.Call) and cast(ast.Call, parent[node]).func is node)
+        and not is_direct_callable_edge(node)
     )
     return _ExecutionEffectFindings(
         reachable=reachable,
@@ -2012,6 +2059,28 @@ def _execution_effect_findings(owner: ast.ClassDef) -> _ExecutionEffectFindings:
         escaped_local_helpers=escaped_local_helpers,
         escaped_class_helpers=escaped_class_helpers,
     )
+
+
+@pytest.mark.parametrize("mutation", ["none", "lease", "constructor"])
+def test_provider_quota_callback_edges_require_exact_governance_and_transferred_lease(mutation: str) -> None:
+    owner = _class_node(ExecutionServiceImpl)
+    governance = next(
+        node
+        for node in ast.walk(owner)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "LLMCallGovernance"
+    )
+    if mutation == "constructor":
+        governance.func.id = "UnrelatedCallbackContainer"
+    elif mutation == "lease":
+        callback = governance.keywords[0].value
+        assert isinstance(callback, ast.Call)
+        callback.args[2] = ast.Name(id="other_lease", ctx=ast.Load())
+    findings = _execution_effect_findings(owner)
+    if mutation == "none":
+        assert findings.escaped_class_helpers == ()
+        assert findings.context_offenders == ()
+    else:
+        assert "_admit_run_llm_call" in findings.escaped_class_helpers
 
 
 def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_context() -> None:

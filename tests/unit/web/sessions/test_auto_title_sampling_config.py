@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -12,10 +13,12 @@ import elspeth.web.sessions._auto_title as at
 from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
     ChargeableAdmissionDecision,
+    ChargeableAdmissionRefused,
     ChargeableOperation,
     QuotaDisposition,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 
 _TEST_SESSION_ID = uuid4()
 _TEST_CONTEXT = SessionOperationContext(
@@ -32,6 +35,39 @@ _TEST_CONTEXT = SessionOperationContext(
 class _TitleService:
     def __init__(self) -> None:
         self.updates: list[tuple[object, str]] = []
+        self.usage: list[tuple[str, object, tuple[TokenUsageEntry, ...]]] = []
+
+    async def begin_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, source: str, run_id: object = None
+    ) -> ProviderAttempt:
+        assert source == "auto_title"
+        assert run_id is None
+        decision = await self.assess_chargeable_operation(
+            session_operation_context=session_operation_context, operation=ChargeableOperation.AUTO_TITLE
+        )
+        if not decision.allowed:
+            raise ChargeableAdmissionRefused(decision)
+        return ProviderAttempt(attempt_id="title-attempt", started_at=datetime.now(UTC))
+
+    async def settle_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+    ) -> None:
+        assert attempt_id == "title-attempt"
+        await self.record_token_usage(
+            session_operation_context=session_operation_context, source="auto_title", run_id=None, entries=(entry,)
+        )
+
+    async def record_token_usage(
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        source: str,
+        run_id: object,
+        entries: tuple[TokenUsageEntry, ...],
+    ) -> tuple[str, ...]:
+        del session_operation_context
+        self.usage.append((source, run_id, entries))
+        return tuple(f"entry-{index}" for index in range(len(entries)))
 
     async def assess_chargeable_operation(
         self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation

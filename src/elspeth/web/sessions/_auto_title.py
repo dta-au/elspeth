@@ -19,9 +19,8 @@ Landscape audit entry is emitted — this is UI metadata, not a pipeline
 decision. See docs/guides/data-trust-and-error-handling.md §The Three-Tier
 Trust Model for the rationale.
 
-Known gap: each first-message call is paid LLM traffic that bypasses
-``composer_rate_limit_per_minute``. For demo-scale traffic this is
-noise; production deployments should add a per-user-per-day cap.
+Every dispatched call is included in the identity's daily token ledger;
+missing usage remains unknown and subsequent admission fails closed.
 """
 
 from __future__ import annotations
@@ -29,16 +28,19 @@ from __future__ import annotations
 import asyncio
 import unicodedata
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 from litellm.exceptions import APIError as LiteLLMAPIError
 from opentelemetry import metrics
 
-from elspeth.contracts.chargeable_admission import ChargeableOperation
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer.llm_response_parsing import safe_response_model, token_usage_from_response
 from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
+from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.validation import _redact_sensitive_content, reject_credential_shaped_content
 
 if TYPE_CHECKING:
@@ -263,6 +265,38 @@ def _admit_auto_title_completion(response: object) -> _AdmittedAutoTitleCompleti
     return _AdmittedAutoTitleCompletion(content=content, finish_reason=admitted_finish_reason)
 
 
+async def _charge_auto_title_response(
+    service: SessionServiceProtocol,
+    session_operation_context: SessionOperationContext,
+    *,
+    model: str,
+    response: object,
+    attempt_id: str,
+    recorded_at: datetime,
+) -> None:
+    """Charge one returned auto-title completion to the token ledger (R14, Task I1).
+
+    A returned completion is spend whether or not it makes a usable title, and
+    unreported usage is charged as unknown, never as zero. A timeout or malformed
+    response does not prove that the provider did not perform billable work.
+    """
+    usage = token_usage_from_response(response)
+    returned_model = safe_response_model(response)
+    await service.settle_provider_attempt(
+        session_operation_context=session_operation_context,
+        attempt_id=attempt_id,
+        entry=TokenUsageEntry(
+            model=model if returned_model is None else returned_model,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            cached_prompt_tokens=usage.cached_prompt_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            recorded_at=recorded_at,
+            call_id=attempt_id,
+        ),
+    )
+
+
 async def maybe_auto_title_session(
     *,
     service: SessionServiceProtocol,
@@ -292,15 +326,6 @@ async def maybe_auto_title_session(
         return
     if session_operation_context.fence.session_id != str(session_id):
         raise AuditIntegrityError("Auto-title session authority targets a different session")
-    decision = await service.assess_chargeable_operation(
-        session_operation_context=session_operation_context,
-        operation=ChargeableOperation.AUTO_TITLE,
-    )
-    if not decision.allowed:
-        if decision.refusal_reason is None:
-            raise AuditIntegrityError("Refused auto-title admission has no refusal reason")
-        _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": decision.refusal_reason.value})
-        return
     kwargs: dict[str, object] = {
         "model": model,
         "messages": [
@@ -315,9 +340,20 @@ async def maybe_auto_title_session(
         kwargs["seed"] = seed
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
     try:
+        attempt = await service.begin_provider_attempt(session_operation_context=session_operation_context, source="auto_title")
+    except ChargeableAdmissionRefused as exc:
+        if exc.decision.refusal_reason is None:
+            raise AuditIntegrityError("Refused auto-title admission has no refusal reason") from exc
+        _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": exc.decision.refusal_reason.value})
+        return
+    response: object | None = None
+    try:
         response = await _litellm_acompletion(**kwargs)
         admitted = _admit_auto_title_completion(response)
     except asyncio.CancelledError as exc:
+        await _charge_auto_title_response(
+            service, session_operation_context, model=model, response=exc, attempt_id=attempt.attempt_id, recorded_at=datetime.now(UTC)
+        )
         _record_auto_title_failure(exc)
         raise
     except (LiteLLMAPIError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
@@ -325,8 +361,19 @@ async def maybe_auto_title_session(
         # scheduling failures, but those failures still need an operational
         # signal so "provider declined" does not look identical to "feature
         # silently broke."
+        await _charge_auto_title_response(
+            service,
+            session_operation_context,
+            model=model,
+            response=exc if response is None else response,
+            attempt_id=attempt.attempt_id,
+            recorded_at=datetime.now(UTC),
+        )
         _record_auto_title_failure(exc)
         return
+    await _charge_auto_title_response(
+        service, session_operation_context, model=model, response=response, attempt_id=attempt.attempt_id, recorded_at=datetime.now(UTC)
+    )
     if admitted.content is None:
         return
     candidate = _admit_title_candidate(admitted.content)

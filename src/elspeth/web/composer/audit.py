@@ -237,6 +237,10 @@ class BufferingRecorder(
             self._invocations.append(invocation)
 
     def record_llm_call(self, call: ComposerLLMCall) -> None:
+        from elspeth.web.composer.provider_quota import retain_provider_audit
+
+        if not retain_provider_audit(call):
+            return
         with self._lock:
             self._llm_calls.append(call)
 
@@ -314,6 +318,7 @@ def audit_envelope(invocation: ComposerToolInvocation) -> dict[str, object]:
 
 
 _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
+    "call_id",
     "model_requested",
     "model_returned",
     "status",

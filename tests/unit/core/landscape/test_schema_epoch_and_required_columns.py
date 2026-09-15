@@ -47,7 +47,8 @@ def test_epoch_is_forty() -> None:
     # Epoch 39 binds recoverable web starts to immutable permit subjects.
     # Epoch 40 adds nullable call usage and persisted admission policy evidence.
     # Epoch 41 renames the approved prompt artifact anchor.
-    assert SQLITE_SCHEMA_EPOCH == 41
+    # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
+    assert SQLITE_SCHEMA_EPOCH == 42
 
 
 def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from elspeth.contracts import (
     TransformProtocol,
 )
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import NodeID
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins, plugin_node_scope
@@ -85,11 +86,13 @@ class RunContextFactory:
         rate_limit_registry: RateLimitRegistry | None,
         concurrency_config: RuntimeConcurrencyConfig | None,
         processor_factory: ProcessorFactory,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         self._ceremony = ceremony
         self._rate_limit_registry = rate_limit_registry
         self._concurrency_config = concurrency_config
         self._processor_factory = processor_factory
+        self._llm_call_governance = llm_call_governance
 
     def initialize_run_context(
         self,
@@ -144,6 +147,7 @@ class RunContextFactory:
 
         # Create context with the PluginAuditWriter
         ctx = PluginContext(
+            llm_call_governance=self._llm_call_governance,
             run_id=run_id,
             config=config.config,
             landscape=factory.plugin_audit_writer(),

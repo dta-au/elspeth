@@ -1671,6 +1671,9 @@ def _create_app(
         # The fence rows this replica writes name the same identity the wire
         # shows, so a 409 from one replica pairs with the 2xx from the other.
         owner_instance_id=instance_id,
+        # R14 refusals write their Landscape quota_exceeded row through the one
+        # auth audit engine this app owns (Task I1).
+        quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
     )
     app.state.session_service = session_service
 

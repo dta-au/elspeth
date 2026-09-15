@@ -16,7 +16,8 @@ def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
     # one rather than reusing a number already spent.
     # Paired with Landscape40: identity ownership and admission evidence.
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
-    assert SESSION_SCHEMA_EPOCH == 57
+    # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
+    assert SESSION_SCHEMA_EPOCH == 58
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

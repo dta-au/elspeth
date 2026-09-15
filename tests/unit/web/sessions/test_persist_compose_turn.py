@@ -6,6 +6,7 @@ Uses the shared ``engine`` fixture and ``_make_session`` helper from
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid5
 
@@ -14,8 +15,11 @@ import structlog
 from sqlalchemy import insert, text
 
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.composer.audit import llm_call_audit_envelope
+from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions._persist_payload import StatePayload
 from elspeth.web.sessions.models import session_operation_fences_table
@@ -55,6 +59,22 @@ def _make_session(conn, *, session_id: str) -> None:
             operation_epoch=context.fence.operation_epoch,
             lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
             released_at=None,
+        )
+    )
+
+
+def _llm_call_envelope() -> dict[str, object]:
+    """A real ``llm_call_audit`` envelope: the Task I1 ledger adapter reads every call field the writer emits."""
+    return llm_call_audit_envelope(
+        build_llm_call_record(
+            model_requested="test/model",
+            messages=[{"role": "user", "content": "prompt"}],
+            tools=None,
+            status=ComposerLLMCallStatus.SUCCESS,
+            started_at=datetime(2026, 9, 13, tzinfo=UTC),
+            started_ns=time.monotonic_ns(),
+            temperature=None,
+            seed=None,
         )
     )
 
@@ -1166,8 +1186,8 @@ async def test_add_messages_atomic_persists_cohort_in_one_sequence_block(service
     await service.add_messages_atomic(
         session_uuid,
         (
-            AuditMessageDraft(role="audit", content="a", tool_calls=({"_kind": "llm_call_audit"},)),
-            AuditMessageDraft(role="audit", content="b", tool_calls=({"_kind": "llm_call_audit"},)),
+            AuditMessageDraft(role="audit", content="a", tool_calls=(_llm_call_envelope(),)),
+            AuditMessageDraft(role="audit", content="b", tool_calls=(_llm_call_envelope(),)),
             AuditMessageDraft(role="audit", content="c", tool_calls=({"_kind": "audit"},)),
         ),
         writer_principal="compose_loop",

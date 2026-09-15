@@ -529,9 +529,9 @@ files:
   src/elspeth/plugins/transforms/llm/providers/bedrock.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/llm/providers/gateway.py:
-    dict[str, Any]: 9
-  src/elspeth/plugins/transforms/llm/providers/openrouter.py:
     dict[str, Any]: 8
+  src/elspeth/plugins/transforms/llm/providers/openrouter.py:
+    dict[str, Any]: 7
   src/elspeth/plugins/transforms/llm/templates.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 4
@@ -901,6 +901,8 @@ files:
     dict[str, object]: 1
   src/elspeth/web/coordination/membership_authority.py:
     dict[str, Any]: 1
+  src/elspeth/web/coordination/quota_authority.py:
+    Mapping[str, Any]: 2
   src/elspeth/web/coordination/repository.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 2
@@ -972,6 +974,8 @@ files:
   src/elspeth/web/sessions/archive_quarantine.py:
     dict[str, Any]: 1
     dict[str, object]: 2
+  src/elspeth/web/sessions/audit_checkpoint.py:
+    Mapping[str, Any]: 2
   src/elspeth/web/sessions/guided_audit.py:
     dict[str, Any]: 3
   src/elspeth/web/sessions/guided_operations.py:
@@ -1028,10 +1032,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 872
+  Mapping[str, Any]: 876
   Mapping[str, object]: 298
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1136
+  dict[str, Any]: 1134
   dict[str, object]: 403
-  soft: 2722
+  soft: 2724

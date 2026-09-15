@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.contexts import RateLimitRegistryProtocol
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import CallType as CallTypeEnum
@@ -124,6 +125,7 @@ class PluginContext:
     rate_limit_registry: RateLimitRegistryProtocol | None = None
     concurrency_config: RuntimeConcurrencyConfig | None = None
     shutdown_event: threading.Event | None = None
+    llm_call_governance: LLMCallGovernance | None = None
 
     # Additional metadata
     node_id: str | None = field(default=None)
@@ -185,6 +187,7 @@ class PluginContext:
         rate_limit_registry: RateLimitRegistryProtocol | None = None,
         concurrency_config: RuntimeConcurrencyConfig | None = None,
         shutdown_event: threading.Event | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
         node_id: str | None = None,
         token: TokenInfo | None = None,
         batch_token_ids: tuple[str, ...] | None = None,
@@ -229,6 +232,7 @@ class PluginContext:
         self.rate_limit_registry = rate_limit_registry
         self.concurrency_config = concurrency_config
         self.shutdown_event = shutdown_event
+        self.llm_call_governance = llm_call_governance
         self.node_id = node_id
         self.token = token
         self.batch_token_ids = batch_token_ids
@@ -256,6 +260,7 @@ class PluginContext:
             rate_limit_registry=self.rate_limit_registry,
             concurrency_config=self.concurrency_config,
             shutdown_event=self.shutdown_event,
+            llm_call_governance=self.llm_call_governance,
             node_id=self.node_id,
             token=self.token,
             batch_token_ids=self.batch_token_ids,

@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import func, insert, select, update
 from tests.fixtures.identities import ensure_test_identity
 
-from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy, QuotaDisposition
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationKind, StartPermitState
 from elspeth.web.coordination.repository import SessionDerivedCustodyError
@@ -324,7 +324,7 @@ def test_inactive_owner_refusal_commits_terminal_run_and_event(engine, access_st
 
 
 @pytest.mark.parametrize("with_policy", [False, True])
-def test_enabled_quota_never_treats_empty_ledger_as_zero(engine, with_policy):
+def test_enabled_quota_measures_empty_ledger_as_zero(engine, with_policy):
     authority, context, run, _ = _admission(engine)
     if with_policy:
         with engine.begin() as conn:
@@ -341,9 +341,12 @@ def test_enabled_quota_never_treats_empty_ledger_as_zero(engine, with_policy):
             )
     policy = ChargeableAdmissionPolicy(identity_token_quota_configured=True, secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
     permit = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=policy))
-    expected = AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE if with_policy else AdmissionRefusalReason.QUOTA_POLICY_MISSING
+    expected = None if with_policy else AdmissionRefusalReason.QUOTA_POLICY_MISSING
     assert permit.admission_decision.refusal_reason is expected
     assert permit.admission_decision.evidence.identity_policy_id == ("quota-alice" if with_policy else None)
+    if with_policy:
+        assert permit.admission_decision.evidence.quota_disposition is QuotaDisposition.WITHIN_CAP
+        assert permit.admission_decision.evidence.usage == 0
 
 
 def test_recovery_refuses_disabled_owner_without_rewriting_original_permit(engine):

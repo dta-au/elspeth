@@ -7,14 +7,18 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
-to 57 for durable Composer progress, request lifecycle leases, identity owner
+to 58 for durable Composer progress, request lifecycle leases, identity owner
 foreign keys, approval revocation provenance, run admission decisions, sparse
-proposal arguments, structured validation errors and approved prompt artifact provenance.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 41 for immutable web
+proposal arguments, structured validation errors, approved prompt artifact provenance,
+64-bit quota policy limits and nullable token-ledger prompt/completion measures
+(unknown usage is NULL, never zero).
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 42 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
 approved prompt artifact link on LLM calls. The artifact identifies effective
 query templates and the system prompt; it no longer hashes an unused fallback.
+Epoch 42 requires admission evidence v2 with per-principal token quota usage
+and limits; stored v1 evidence is incompatible and must not be relabelled.
 These
 changes share one paired cutover; the intermediate ACA epochs are not a
 separate deployment requirement.
@@ -22,7 +26,7 @@ separate deployment requirement.
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 57 and Landscape databases below epoch 41 must be recreated together.
+epoch 58 and Landscape databases below epoch 42 must be recreated together.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service

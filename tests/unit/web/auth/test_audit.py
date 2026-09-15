@@ -1048,3 +1048,46 @@ def test_the_two_dormancy_rows_are_distinguishable_from_each_other_and_from_a_re
         ("success", "dormant"),
         ("failure", "dormant"),
     ]
+
+
+def test_quota_exceeded_row_carries_dimension_cap_ceiling_and_usage(tmp_path: Any) -> None:
+    """R14 (spec :834, :1297): the row names the dimension, the cap, the ceiling in force and the measured usage.
+
+    Read from the LANDSCAPE engine: ``auth_events`` is a Landscape table
+    (core/landscape/schema.py:2542), never a sessions table.
+    """
+    from elspeth.web.coordination.quota_authority import QuotaExceeded
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_quota_exceeded(
+        QuotaExceeded(
+            identity_id="identity-1",
+            provider="local",
+            operation="composer",
+            dimension="tokens",
+            cap=1000,
+            ceiling=5000,
+            usage=1000,
+            identity_policy_id="quota-identity",
+            container_policy_id="quota-container",
+        )
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome, row.provider, row.identity_id, row.failure_category) == (
+        "quota_exceeded",
+        "failure",
+        "local",
+        "identity-1",
+        "quota_exceeded_tokens",
+    )
+    assert (row.user_id, row.username, row.request_id, row.client_host, row.user_agent) == (None, None, None, None, None)
+    assert _metadata(row) == {
+        "actor": "system",
+        "operation": "composer",
+        "dimension": "tokens",
+        "cap": 1000,
+        "ceiling": 5000,
+        "usage": 1000,
+        "identity_policy_id": "quota-identity",
+        "container_policy_id": "quota-container",
+    }

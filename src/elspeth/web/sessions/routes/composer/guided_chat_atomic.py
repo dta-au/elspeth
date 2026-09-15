@@ -55,6 +55,7 @@ from elspeth.web.composer.guided.state_machine import (
     TerminalState,
 )
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.provider_quota import composer_quota_scope
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content, inspect_selected_ready_session_blob
 from elspeth.web.sessions._guided_step_chat import (
     GuidedStepChatOnlyResult,
@@ -1540,28 +1541,29 @@ async def post_guided_chat_schema8(
                         if frozen.guided.step is GuidedStep.STEP_2_SINK
                         else None
                     )
-                    provider_outcome = await provider_runner(
-                        session_id=session_id,
-                        user=user,
-                        step=frozen.guided.step,
-                        guided=frozen.guided,
-                        state=frozen.state,
-                        message=body.message,
-                        settings=settings,
-                        catalog=catalog,
-                        plugin_snapshot=plugin_snapshot,
-                        secret_service=request.app.state.scoped_secret_resolver,
-                        recorder=recorder,
-                        progress=progress_sink,
-                        current_turn=frozen.current_turn,
-                        current_payload=frozen.current_payload,
-                        existing_upload=existing_upload,
-                        # Same per-session tracker the freeform batch and
-                        # planner surfaces write; a Step-2 get_plugin_schema
-                        # success recorded here saves the NEXT planner
-                        # request a re-fetch (F2).
-                        mark_schema_loaded=mark_schema_loaded,
-                    )
+                    with composer_quota_scope(service, reserved.session_operation_context):
+                        provider_outcome = await provider_runner(
+                            session_id=session_id,
+                            user=user,
+                            step=frozen.guided.step,
+                            guided=frozen.guided,
+                            state=frozen.state,
+                            message=body.message,
+                            settings=settings,
+                            catalog=catalog,
+                            plugin_snapshot=plugin_snapshot,
+                            secret_service=request.app.state.scoped_secret_resolver,
+                            recorder=recorder,
+                            progress=progress_sink,
+                            current_turn=frozen.current_turn,
+                            current_payload=frozen.current_payload,
+                            existing_upload=existing_upload,
+                            # Same per-session tracker the freeform batch and
+                            # planner surfaces write; a Step-2 get_plugin_schema
+                            # success recorded here saves the NEXT planner
+                            # request a re-fetch (F2).
+                            mark_schema_loaded=mark_schema_loaded,
+                        )
                     chat_result = provider_outcome.chat
                     source_resolution = provider_outcome.resolution if type(provider_outcome) is Step1SourceResolvedResult else None
                     source_plugin_reselection = (

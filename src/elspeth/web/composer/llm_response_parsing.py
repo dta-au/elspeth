@@ -55,6 +55,7 @@ from elspeth.web.composer.bounded_json import (
     JsonTraversalBudget,
     require_bounded_text,
 )
+from elspeth.web.composer.provider_quota import bind_provider_attempt
 
 if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
@@ -878,7 +879,7 @@ def build_llm_call_record(
         model_returned = response_metadata.model_returned
         finish_reason = response_metadata.finish_reason
         provider_request_id = response_metadata.provider_request_id
-    return ComposerLLMCall(
+    call = ComposerLLMCall(
         model_requested=model_requested,
         model_returned=model_returned,
         status=status,
@@ -910,6 +911,7 @@ def build_llm_call_record(
         planner_policy_hash=planner_policy_hash,
         planner_call_ordinal=planner_call_ordinal,
     )
+    return bind_provider_attempt(call)
 
 
 def attach_llm_calls(

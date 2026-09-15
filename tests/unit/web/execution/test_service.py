@@ -44,7 +44,13 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from elspeth.contracts import CallType, NodeStateStatus, NodeType
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, ChargeableAdmissionDecision, QuotaDisposition
+from elspeth.contracts.chargeable_admission import (
+    AdmissionPolicyEvidence,
+    AdmissionRefusalReason,
+    ChargeableAdmissionDecision,
+    ChargeableAdmissionRefused,
+    QuotaDisposition,
+)
 from elspeth.contracts.enums import CreationModality, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
 from elspeth.contracts.freeze import deep_thaw
@@ -82,6 +88,7 @@ from elspeth.web.blobs.protocol import (
 )
 from elspeth.web.coordination.contracts import StartPermitState
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.execution.envelope import RunExecutionInput, validate_run_execution_input
@@ -138,7 +145,7 @@ from elspeth.web.sessions.protocol import (
     SessionServiceProtocol,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
-from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, make_landscape_db
 from tests.helpers.session_fences import (
     RecordingSessionOperationAuthority,
     adopt_execute_lease,
@@ -11612,3 +11619,60 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
         assert [resolution.field_path for resolution in resolutions] == [f"node:classify.options.{field_path}"]
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
+
+
+def test_per_call_quota_admission_persists_pending_under_transferred_lease(
+    service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    run_uuid = uuid4()
+    attempt = ProviderAttempt(attempt_id="provider-attempt", started_at=datetime.now(UTC))
+    mock_session_service.begin_provider_attempt.return_value = attempt
+    assert service._admit_run_llm_call(run_uuid, _execute_lease()) == attempt.attempt_id
+    mock_session_service.begin_provider_attempt.assert_awaited_once_with(
+        session_operation_context=_execute_lease().context, source="run", run_id=run_uuid
+    )
+
+
+def test_per_call_quota_refusal_propagates_before_dispatch(
+    service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    refusal = ChargeableAdmissionRefused(
+        ChargeableAdmissionDecision(
+            refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
+            evidence=AdmissionPolicyEvidence(
+                quota_disposition=QuotaDisposition.ACCOUNTING_UNAVAILABLE, identity_policy_id="policy", secret_wiring_hash="a" * 64
+            ),
+        )
+    )
+    mock_session_service.begin_provider_attempt.side_effect = refusal
+    with pytest.raises(ChargeableAdmissionRefused) as caught:
+        service._admit_run_llm_call(uuid4(), _execute_lease())
+    assert caught.value is refusal
+    mock_session_service.settle_provider_attempt.assert_not_awaited()
+
+
+def test_per_call_settlement_uses_exact_durable_call_identity(
+    service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    entry = TokenUsageEntry(
+        model="model",
+        prompt_tokens=3,
+        completion_tokens=2,
+        cached_prompt_tokens=None,
+        reasoning_tokens=None,
+        call_id="actual-call",
+        recorded_at=datetime.now(UTC),
+    )
+    db = make_landscape_db()
+    with patch("elspeth.web.execution.service._run_token_usage_entries", return_value=(entry,)):
+        service._settle_run_llm_call(uuid4(), _execute_lease(), "pending-attempt", "actual-call", landscape_db=db, landscape_run_id="run")
+        with pytest.raises(AuditIntegrityError, match="exactly one durable LLM call"):
+            service._settle_run_llm_call(
+                uuid4(), _execute_lease(), "pending-attempt", "unknown-call", landscape_db=db, landscape_run_id="run"
+            )
+    mock_session_service.settle_provider_attempt.assert_awaited_once_with(
+        session_operation_context=_execute_lease().context, attempt_id="pending-attempt", entry=entry
+    )

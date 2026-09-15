@@ -48,7 +48,7 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_57(engine) -> None:
+def test_blob_inline_resolutions_schema_epoch_is_58(engine) -> None:
     # 51: the multi-replica session-operation substrate landed on top of
     # mainline's 50 (elspeth-4d6c0dd0f5).
     # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
@@ -60,9 +60,10 @@ def test_blob_inline_resolutions_schema_epoch_is_57(engine) -> None:
     # 55: identity ownership and approval/admission provenance.
     # 56: sparse proposal arguments and structured validation errors.
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
-    assert SESSION_SCHEMA_EPOCH == 57
+    # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
+    assert SESSION_SCHEMA_EPOCH == 58
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 57
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 58
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

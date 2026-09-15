@@ -25,6 +25,7 @@ from elspeth.web.sessions.models import (
     identities_table,
     library_entries_table,
     quota_policies_table,
+    quota_provider_attempts_table,
     review_attestations_table,
     review_requests_table,
     sessions_table,
@@ -101,6 +102,7 @@ def test_workflow_tables_exist(engine) -> None:
         "library_entries",
         "quota_policies",
         "token_usage_ledger",
+        "quota_provider_attempts",
     } <= names
 
 
@@ -359,6 +361,32 @@ class TestArchiveKeepsGovernanceHistory:
     """
 
     @pytest.mark.asyncio
+    async def test_pending_provider_attempt_survives_soft_archival(self, engine, service) -> None:
+        session = await service.create_session("alice", "Interrupted provider", "local")
+        attempt_id = str(uuid.uuid4())
+        with engine.begin() as conn:
+            conn.execute(
+                insert(quota_provider_attempts_table).values(
+                    attempt_id=attempt_id,
+                    identity_id="alice",
+                    session_id=str(session.id),
+                    source="composer",
+                    started_at=NOW,
+                    operation_id="interrupted-operation",
+                    operation_epoch=1,
+                    lease_token="expired-test-lease",
+                )
+            )
+
+        await service.archive_session(session.id)
+        assert (await service.get_session(session.id)).archived_at is not None
+        with engine.connect() as conn:
+            row = conn.execute(
+                select(quota_provider_attempts_table.c.settled_at).where(quota_provider_attempts_table.c.attempt_id == attempt_id)
+            ).one()
+        assert row.settled_at is None
+
+    @pytest.mark.asyncio
     async def test_an_approval_is_durable_history(self, engine, service) -> None:
         session = await service.create_session("alice", "Approved work", "local")
         with engine.begin() as conn:
@@ -441,12 +469,8 @@ class TestArchiveKeepsGovernanceHistory:
         assert (await service.get_session(session.id)).archived_at is not None
 
     @pytest.mark.asyncio
-    async def test_token_accounting_alone_is_not_durable_history(self, engine, service) -> None:
-        """Excluded deliberately: an accounting index is not audit truth.
-
-        Landscape ``calls`` is. If a spend row kept a session alive, every
-        session that ever prompted the model would become unarchivable.
-        """
+    async def test_token_accounting_survives_soft_archival(self, engine, service) -> None:
+        """Archival must work without deleting the owner's accounted spend."""
         session = await service.create_session("alice", "Just spend", "local")
         with engine.begin() as conn:
             identity_id = _identity(conn)
@@ -463,9 +487,12 @@ class TestArchiveKeepsGovernanceHistory:
                 )
             )
 
-        # RESTRICT on its session FK means the delete branch raises rather
-        # than silently discarding the row. That is the honest outcome for a
-        # table the predicate deliberately ignores: the archive does not
-        # succeed by throwing away accounting.
-        with pytest.raises(IntegrityError):
-            await service.archive_session(session.id)
+        await service.archive_session(session.id)
+        assert (await service.get_session(session.id)).archived_at is not None
+        with engine.connect() as conn:
+            usage = conn.execute(
+                select(token_usage_ledger_table.c.prompt_tokens, token_usage_ledger_table.c.completion_tokens).where(
+                    token_usage_ledger_table.c.session_id == str(session.id)
+                )
+            ).one()
+        assert tuple(usage) == (10, 5)

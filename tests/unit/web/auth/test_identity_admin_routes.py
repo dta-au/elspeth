@@ -94,6 +94,9 @@ class _RecordingAuditWriter:
     def record_relationship_changed(self, request: Request | None, **kwargs: Any) -> None:
         self._note("record_relationship_changed", request, kwargs)
 
+    def record_quota_exceeded(self, outcome: Any) -> None:
+        return None
+
     def only(self, method: str) -> _AuditCall:
         matches = [call for call in self.calls if call.method == method]
         assert len(matches) == 1, [call.method for call in self.calls]

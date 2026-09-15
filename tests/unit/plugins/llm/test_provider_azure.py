@@ -13,6 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -64,9 +65,57 @@ class FakeAuditRecorder:
     def record_operation_call(self, **call: Any) -> SimpleNamespace:
         self.operation_calls.append(call)
         return SimpleNamespace(
+            call_id=f"operation-call-{len(self.operation_calls)}",
             request_ref=f"operation-request-{len(self.operation_calls)}",
             response_ref=f"operation-response-{len(self.operation_calls)}",
         )
+
+
+@pytest.mark.parametrize("preflight", [False, True])
+@pytest.mark.parametrize("refused", [False, True])
+def test_governance_guards_sdk_and_settles_error_once(preflight: bool, refused: bool) -> None:
+    recorder = FakeAuditRecorder()
+    events: list[str] = []
+
+    def before() -> str:
+        events.append("before")
+        if refused:
+            raise RuntimeError("quota refused")
+        return "attempt-azure"
+
+    def after(attempt_id: str, call_id: str) -> None:
+        assert attempt_id == "attempt-azure"
+        assert call_id == "operation-call-1"
+        assert len(recorder.operation_calls) == 1
+        events.append("after")
+
+    def create(**kwargs: Any) -> None:
+        events.append("sdk")
+        raise ValueError("provider failed")
+
+    provider = AzureLLMProvider(
+        endpoint="https://test.openai.azure.com",
+        api_key="test-key",
+        api_version="2024-02-01",
+        deployment_name="test-model",
+        recorder=recorder,
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        llm_call_governance=LLMCallGovernance(before_call=before, after_call=after),
+    )
+    provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    with pytest.raises(RuntimeError if refused else LLMClientError, match="quota refused" if refused else "LLM provider request failed"):
+        if preflight:
+            provider.runtime_preflight(operation_id="op-1", model="test-model", coordination_token=_LEADER_TOKEN)
+        else:
+            provider.execute_query(
+                [ChatMessage(role="user", content="hello")],
+                model="test-model",
+                temperature=0.0,
+                max_tokens=32,
+                audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+            )
+    assert events == (["before"] if refused else ["before", "sdk", "after"])
 
 
 @dataclass
