@@ -12,12 +12,14 @@ lives here and nowhere else:
   ``RepositoryRunDiagnosticsAuditAuthority.append_audit_messages``), auto-title
   (``SessionServiceImpl.record_token_usage`` from ``_auto_title.py``) and run
   finalisation (the same service method from ``execution/service.py``).
-* ``RepositoryQuotaAuthority.daily_token_total`` sums one identity's UTC day.
-  NULL measures mean the provider reported no usage: unknown, never zero, so a
-  day containing one returns ``None`` and admission refuses with
-  ``token_accounting_unavailable``. Durable pending attempts also make the
-  day unknown, except concurrent attempts under the same validated live fence.
-  Completed calls are charged on their audit timestamp's UTC day.
+* ``RepositoryQuotaAuthority.daily_token_total`` sums one identity's UTC day,
+  while ``container_daily_token_total`` sums all identity-attributed usage in
+  the container. NULL measures mean the provider reported no usage: unknown,
+  never zero, so a day containing one returns ``None`` and admission refuses
+  with ``token_accounting_unavailable``. Durable pending attempts also make
+  the applicable day unknown, except concurrent attempts under the same
+  validated live fence. Completed calls are charged on their audit timestamp's
+  UTC day.
 * ``RepositoryQuotaAuthority.active_policy`` locks and returns the identity
   policy row and the container ceiling row in force.
 
@@ -253,6 +255,65 @@ def utc_day_start(now: datetime) -> datetime:
     return now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def _daily_token_total_on_connection(
+    connection: Connection,
+    *,
+    identity_id: str | None,
+    day_start_utc: datetime,
+    live_operation_context: SessionOperationContext | None,
+) -> int | None:
+    """Measure one identity or all identity-attributed usage for a UTC day."""
+    pending = quota_provider_attempts_table.c
+    pending_conditions = [
+        pending.started_at >= day_start_utc,
+        pending.started_at < day_start_utc + timedelta(days=1),
+        pending.settled_at.is_(None),
+    ]
+    if identity_id is None:
+        pending_conditions.append(pending.identity_id.is_not(None))
+    else:
+        pending_conditions.append(pending.identity_id == identity_id)
+    pending_query = select(pending.attempt_id).where(*pending_conditions)
+    if live_operation_context is not None:
+        fence = live_operation_context.fence
+        pending_query = pending_query.where(
+            ~and_(
+                pending.session_id == fence.session_id,
+                pending.operation_id == fence.operation_id,
+                pending.operation_epoch == fence.operation_epoch,
+                pending.lease_token == fence.lease_token,
+            )
+        )
+    if connection.execute(pending_query.limit(1)).first() is not None:
+        return None
+
+    ledger = token_usage_ledger_table.c
+    measured = cast(func.coalesce(ledger.prompt_tokens, 0), BigInteger) + cast(func.coalesce(ledger.completion_tokens, 0), BigInteger)
+    unknown = case((or_(ledger.prompt_tokens.is_(None), ledger.completion_tokens.is_(None)), 1), else_=0)
+    ledger_conditions = [
+        ledger.recorded_at >= day_start_utc,
+        ledger.recorded_at < day_start_utc + timedelta(days=1),
+    ]
+    if identity_id is None:
+        # NULL ledger identities are boot-probe rows and spend on no identity's
+        # behalf; a container ceiling covers identity-attributed usage only.
+        ledger_conditions.append(ledger.identity_id.is_not(None))
+    else:
+        ledger_conditions.append(ledger.identity_id == identity_id)
+    row = connection.execute(
+        select(
+            func.count().label("row_count"),
+            func.coalesce(func.sum(unknown), 0).label("unknown_count"),
+            func.coalesce(func.sum(measured), 0).label("measured_total"),
+        ).where(*ledger_conditions)
+    ).one()
+    if row.row_count == 0:
+        return 0
+    if row.unknown_count:
+        return None
+    return int(row.measured_total)
+
+
 def token_usage_entry_from_llm_call_envelope(envelope: Mapping[str, Any]) -> TokenUsageEntry | None:
     """Derive the ledger entry for one persisted ``llm_call_audit`` envelope.
 
@@ -426,48 +487,29 @@ class RepositoryQuotaAuthority:
         """``prompt + completion`` over ``[day_start_utc, day_start_utc + 1 day)``; ``None`` when any row is unknown."""
         if utc_day_start(day_start_utc) != day_start_utc or day_start_utc.utcoffset() != timedelta(0):
             raise ValueError("day_start_utc must be a UTC midnight")
-        pending = quota_provider_attempts_table.c
-        pending_query = select(pending.attempt_id).where(
-            pending.identity_id == identity_id,
-            pending.started_at >= day_start_utc,
-            pending.started_at < day_start_utc + timedelta(days=1),
-            pending.settled_at.is_(None),
+        return _daily_token_total_on_connection(
+            _resolve_mutation_connection(connection_token),
+            identity_id=identity_id,
+            day_start_utc=day_start_utc,
+            live_operation_context=live_operation_context,
         )
-        if live_operation_context is not None:
-            fence = live_operation_context.fence
-            pending_query = pending_query.where(
-                ~and_(
-                    pending.session_id == fence.session_id,
-                    pending.operation_id == fence.operation_id,
-                    pending.operation_epoch == fence.operation_epoch,
-                    pending.lease_token == fence.lease_token,
-                )
-            )
-        if _resolve_mutation_connection(connection_token).execute(pending_query.limit(1)).first() is not None:
-            return None
-        ledger = token_usage_ledger_table.c
-        measured = cast(func.coalesce(ledger.prompt_tokens, 0), BigInteger) + cast(func.coalesce(ledger.completion_tokens, 0), BigInteger)
-        unknown = case((or_(ledger.prompt_tokens.is_(None), ledger.completion_tokens.is_(None)), 1), else_=0)
-        row = (
-            _resolve_mutation_connection(connection_token)
-            .execute(
-                select(
-                    func.count().label("row_count"),
-                    func.coalesce(func.sum(unknown), 0).label("unknown_count"),
-                    func.coalesce(func.sum(measured), 0).label("measured_total"),
-                ).where(
-                    ledger.identity_id == identity_id,
-                    ledger.recorded_at >= day_start_utc,
-                    ledger.recorded_at < day_start_utc + timedelta(days=1),
-                )
-            )
-            .one()
+
+    @staticmethod
+    def container_daily_token_total(
+        connection_token: str,
+        *,
+        day_start_utc: datetime,
+        live_operation_context: SessionOperationContext | None = None,
+    ) -> int | None:
+        """Sum known token usage for every identity in the container's UTC day."""
+        if utc_day_start(day_start_utc) != day_start_utc or day_start_utc.utcoffset() != timedelta(0):
+            raise ValueError("day_start_utc must be a UTC midnight")
+        return _daily_token_total_on_connection(
+            _resolve_mutation_connection(connection_token),
+            identity_id=None,
+            day_start_utc=day_start_utc,
+            live_operation_context=live_operation_context,
         )
-        if row.row_count == 0:
-            return 0
-        if row.unknown_count:
-            return None
-        return int(row.measured_total)
 
     @staticmethod
     def active_policy(connection_token: str, *, identity_id: str) -> ActiveQuotaPolicies:

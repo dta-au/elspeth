@@ -84,13 +84,25 @@ class RepositoryChargeableAdmissionAuthority:
                     secret_wiring_hash=policy.secret_wiring_hash,
                 ),
             )
-        usage = RepositoryQuotaAuthority.daily_token_total(
-            connection_token,
-            identity_id=session.user_id,
-            day_start_utc=utc_day_start(database_now(conn)),
-            live_operation_context=live_operation_context,
+        day_start_utc = utc_day_start(database_now(conn))
+        identity_usage = (
+            RepositoryQuotaAuthority.daily_token_total(
+                connection_token,
+                identity_id=session.user_id,
+                day_start_utc=day_start_utc,
+                live_operation_context=live_operation_context,
+            )
+            if identity_policy is not None
+            else None
         )
-        if usage is None:
+        container_usage = (
+            RepositoryQuotaAuthority.container_daily_token_total(
+                connection_token, day_start_utc=day_start_utc, live_operation_context=live_operation_context
+            )
+            if container_policy is not None
+            else None
+        )
+        if (identity_policy is not None and identity_usage is None) or (container_policy is not None and container_usage is None):
             return ChargeableAdmissionDecision(
                 refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
                 evidence=AdmissionPolicyEvidence(
@@ -102,8 +114,23 @@ class RepositoryChargeableAdmissionAuthority:
             )
         cap = identity_policy.tokens_per_day if identity_policy is not None else None
         ceiling = container_policy.tokens_per_day if container_policy is not None else None
-        limit = min(value for value in (cap, ceiling) if value is not None)
-        exceeded = usage >= limit
+        identity_exceeded = identity_policy is not None and identity_usage is not None and identity_usage >= identity_policy.tokens_per_day
+        container_exceeded = (
+            container_policy is not None and container_usage is not None and container_usage >= container_policy.tokens_per_day
+        )
+        exceeded = identity_exceeded or container_exceeded
+        if identity_exceeded:
+            usage = identity_usage
+        elif container_exceeded:
+            usage = container_usage
+        elif identity_policy is not None and (
+            container_policy is None or identity_policy.tokens_per_day <= container_policy.tokens_per_day
+        ):
+            usage = identity_usage
+        else:
+            usage = container_usage
+        if usage is None:
+            raise AuditIntegrityError("Measured quota policy has no usage total")
         return ChargeableAdmissionDecision(
             refusal_reason=AdmissionRefusalReason.QUOTA_EXCEEDED if exceeded else None,
             evidence=AdmissionPolicyEvidence(

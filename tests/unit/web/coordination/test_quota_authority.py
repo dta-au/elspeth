@@ -12,7 +12,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, inspect, select, update
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, FencedSession, FencedSessionWithPolicy
 
@@ -44,6 +44,16 @@ from elspeth.web.sessions.models import quota_policies_table, sessions_table, to
 
 DAY = datetime(2026, 9, 13, tzinfo=UTC)
 NO_REQUIRED_POLICY = ChargeableAdmissionPolicy(secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
+
+
+def test_container_quota_scans_have_timestamp_leading_indexes(fenced_session: FencedSession) -> None:
+    indexes = {
+        table_name: {index["name"]: tuple(index["column_names"]) for index in inspect(fenced_session.engine).get_indexes(table_name)}
+        for table_name in ("quota_provider_attempts", "token_usage_ledger")
+    }
+
+    assert indexes["quota_provider_attempts"]["ix_quota_provider_attempts_started_identity"] == ("started_at", "identity_id")
+    assert indexes["token_usage_ledger"]["ix_token_usage_ledger_recorded_identity"] == ("recorded_at", "identity_id")
 
 
 def _entry(
@@ -384,6 +394,37 @@ def test_r14_container_ceiling_binds_when_it_is_the_lower_bound(
     decision = _assess(fenced)
     assert decision.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED
     assert (decision.evidence.cap, decision.evidence.ceiling, decision.evidence.usage) == (IDENTITY_TOKENS_PER_DAY, 600, 600)
+
+
+def test_r14_container_ceiling_aggregates_usage_across_identities(
+    fenced_session_with_policy: FencedSessionWithPolicy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fenced = fenced_session_with_policy
+    conn = _resolve_mutation_connection(fenced.connection_token)
+    _pin_database_clock(monkeypatch, DAY + timedelta(hours=12))
+    _record(fenced, _entry(300, 300), at=DAY + timedelta(hours=1))
+    ensure_test_identity(conn, identity_id="bob")
+    conn.execute(
+        insert(token_usage_ledger_table).values(
+            entry_id="bob-container-entry",
+            identity_id="bob",
+            source="composer",
+            session_id=None,
+            run_id=None,
+            model="openai/gpt-test",
+            prompt_tokens=300,
+            completion_tokens=300,
+            cached_prompt_tokens=None,
+            reasoning_tokens=None,
+            recorded_at=DAY + timedelta(hours=2),
+        )
+    )
+    _set_tokens_per_day(fenced, fenced.container_policy_id, 1000)
+
+    decision = _assess(fenced)
+
+    assert decision.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED
+    assert decision.evidence.usage == 1200
 
 
 @pytest.mark.parametrize(("clock", "refused"), [(DAY - timedelta(microseconds=1), True), (DAY, False)])

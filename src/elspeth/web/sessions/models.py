@@ -335,7 +335,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #      Pre-1.0 delete/recreate; old approvals must not be reinterpreted.
 # 58: quota policy quantities require 64-bit storage; unavailable provider
 # token counts remain NULL rather than becoming invented zero usage.
-SESSION_SCHEMA_EPOCH = 58
+# 59: timestamp-leading quota scan indexes support container-wide daily
+# admission checks alongside the identity-leading indexes.
+SESSION_SCHEMA_EPOCH = 59
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3952,10 +3954,18 @@ quota_provider_attempts_table = Table(
 Index(
     "ix_quota_provider_attempts_identity_started", quota_provider_attempts_table.c.identity_id, quota_provider_attempts_table.c.started_at
 )
+Index(
+    "ix_quota_provider_attempts_started_identity", quota_provider_attempts_table.c.started_at, quota_provider_attempts_table.c.identity_id
+)
 # The quota question is "how much has this identity spent in the current UTC
 # day", so the index carries both columns in that order.
 Index(
     "ix_token_usage_ledger_identity_recorded",
     token_usage_ledger_table.c.identity_id,
     token_usage_ledger_table.c.recorded_at,
+)
+Index(
+    "ix_token_usage_ledger_recorded_identity",
+    token_usage_ledger_table.c.recorded_at,
+    token_usage_ledger_table.c.identity_id,
 )

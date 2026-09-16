@@ -3195,7 +3195,8 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     assert SessionOperationKind.BLOB_READ.value == "blob_read"
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
-    assert SESSION_SCHEMA_EPOCH == 58
+    # Epoch 59 adds timestamp-leading indexes for container quota scans.
+    assert SESSION_SCHEMA_EPOCH == 59
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"
