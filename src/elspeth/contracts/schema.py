@@ -30,7 +30,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.identifiers import is_valid_field_name, validate_field_name, validate_field_names
@@ -474,6 +474,32 @@ def _normalize_field_spec(spec: Any, *, index: int) -> str | Mapping[str, Any]:
     )
 
 
+def _coerce_field_definition(value: Any) -> Any:
+    """Accept an authored field spec, or pass an already-built definition through."""
+    if isinstance(value, FieldDefinition):
+        return value
+    return FieldDefinition.parse(value)
+
+
+# Both authoring surfaces write a field as the string "name: type" — YAML, and
+# the composer, whose COMPOSER_SCHEMA_EXAMPLE/COMPOSER_SCHEMA_DESCRIPTION
+# (plugins/infrastructure/config_base.py) mandate exactly that form.
+# ``FieldDefinition.parse`` accepts it; ``SchemaConfig.from_dict`` relies on
+# that.  Pydantic, left alone, emits the PARSED shape into the JSON Schema, so a
+# *validation-mode* schema describes the parser's OUTPUT rather than its INPUT.
+# ``web.plugin_policy.validation`` runs that schema over AUTHORED options with
+# Draft202012Validator BEFORE any parser sees them, so the documented string form
+# was refused at path ``schema/fields`` as ``profile_unavailable`` on every
+# profile-bound node — the gate rejecting the one shape its own help text
+# instructs authors to write.  Declaring the input type keeps the emitted schema
+# honest about what a caller may write.  Runtime acceptance is unchanged:
+# ``from_dict`` already parsed both forms.
+AuthoredFieldDefinition = Annotated[
+    FieldDefinition,
+    BeforeValidator(_coerce_field_definition, json_schema_input_type=str | FieldDefinition),
+]
+
+
 @dataclass(frozen=True, slots=True)
 class SchemaConfig:
     """Configuration for a plugin's data schema.
@@ -532,7 +558,7 @@ class SchemaConfig:
     """
 
     mode: Literal["fixed", "flexible", "observed"]
-    fields: tuple[FieldDefinition, ...] | None = None
+    fields: tuple[AuthoredFieldDefinition, ...] | None = None
     guaranteed_fields: tuple[str, ...] | None = None
     required_fields: tuple[str, ...] | None = None
     audit_fields: tuple[str, ...] | None = None

@@ -65,7 +65,14 @@
             "anyOf": [
               {
                 "items": {
-                  "$ref": "#/$defs/FieldDefinition"
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "$ref": "#/$defs/FieldDefinition"
+                    }
+                  ]
                 },
                 "type": "array"
               },
