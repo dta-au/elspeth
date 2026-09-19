@@ -338,7 +338,6 @@ class RepositoryQuotaPolicyAuthority:
         identities = identities_table.c
         for locked_id in sorted({actor.identity_id, identity_id}):
             conn.execute(select(identities.identity_id).where(identities.identity_id == locked_id).with_for_update()).one_or_none()
-        now = database_now(conn)
         actor_row = conn.execute(
             select(identities.access_state, identities.kind, identities.provider).where(identities.identity_id == actor.identity_id)
         ).one_or_none()
@@ -352,6 +351,7 @@ class RepositoryQuotaPolicyAuthority:
             )
             .with_for_update()
         ).all()
+        now = database_now(conn)
         if (
             actor_row is None
             or actor_row.access_state != "active"

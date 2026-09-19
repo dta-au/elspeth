@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import Engine, insert, select
+from sqlalchemy import Engine, func, insert, select, text, update
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.identity_authority import IdentityAdminActor
-from elspeth.web.coordination.quota_policy_authority import RepositoryQuotaPolicyAuthority
+from elspeth.web.coordination.quota_policy_authority import QuotaSetterNotAdmin, RepositoryQuotaPolicyAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, identity_roles_table, quota_policies_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -116,3 +118,67 @@ def test_policy_replace_then_revoke_keeps_single_live_row_and_audits(pg_engine: 
         rows = conn.execute(select(quota_policies_table).where(quota_policies_table.c.identity_id == "alice")).all()
     assert len(rows) == 2 and all(row.revoked_at is not None for row in rows)
     assert changes == [first, second, revoked]
+
+
+@pytest.mark.parametrize("action", ["set", "revoke"])
+def test_admin_grant_expiring_during_role_lock_wait_refuses_quota_change(pg_engine: Engine, action: str) -> None:
+    authority = RepositoryQuotaPolicyAuthority(pg_engine)
+    actor = IdentityAdminActor(identity_id="root", on_behalf_of=None, console_request_id=None)
+    events = []
+    if action == "revoke":
+        authority.set_identity_policy(
+            actor=actor,
+            identity_id="alice",
+            dimension="tokens",
+            value=500,
+            default_tokens_per_day=None,
+            default_storage_bytes=2000,
+            record=lambda _change: None,
+        )
+
+    def attempt() -> str:
+        try:
+            if action == "set":
+                authority.set_identity_policy(
+                    actor=actor,
+                    identity_id="alice",
+                    dimension="tokens",
+                    value=700,
+                    default_tokens_per_day=None,
+                    default_storage_bytes=2000,
+                    record=events.append,
+                )
+            else:
+                authority.revoke_identity_policy(actor=actor, identity_id="alice", record=events.append)
+        except QuotaSetterNotAdmin:
+            return "refused"
+        return "changed"
+
+    probe = text(
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND CAST(:blocker AS integer) = ANY(pg_blocking_pids(pid))"
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool, pg_engine.connect() as holder:
+        with holder.begin():
+            holder.execute(
+                select(identity_roles_table.c.role_id).where(identity_roles_table.c.role_id == "root-admin").with_for_update()
+            ).one()
+            blocker = int(holder.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+            pending = pool.submit(attempt)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                assert not pending.done(), "quota change finished before admin-role lock released"
+                with pg_engine.connect() as observer:
+                    if observer.execute(probe, {"blocker": blocker}).scalar_one() >= 1:
+                        break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("quota change never waited on the admin-role row")
+            holder.execute(
+                update(identity_roles_table).where(identity_roles_table.c.role_id == "root-admin").values(expires_at=func.clock_timestamp())
+            )
+        assert pending.result(timeout=30) == "refused"
+
+    assert events == []
+    with pg_engine.connect() as conn:
+        policies = conn.execute(select(quota_policies_table).where(quota_policies_table.c.identity_id == "alice")).all()
+    assert (len(policies), [row.revoked_at is None for row in policies]) == ((0, []) if action == "set" else (1, [True]))
