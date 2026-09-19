@@ -238,6 +238,73 @@ def _config(**overrides: object) -> LandscapeExportSettings:
     return config.model_copy(update=overrides)
 
 
+@pytest.mark.parametrize("legacy_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
+def test_new_legacy_signed_snapshot_is_refused_before_content_store_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_version: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with LandscapeDB.in_memory() as db:
+        _insert_terminal_run(db)
+        seat = _export_seat(db, worker_id="legacy-sign-refusal")
+        store = _MemoryContentStore()
+        config = _config(
+            signing_mode="hmac_sha256",
+            signer_key_id="legacy-key",
+            signing_secret_ref="LEGACY_KEY",
+            exporter_version=legacy_version,
+        )
+
+        with pytest.raises(ValueError, match="legacy signed export"):
+            prepare_audit_export_snapshot(
+                db,
+                coordination_token=seat,
+                config=config,
+                signing_key=b"legacy-key",
+                content_store=store,
+            )
+        assert store.put_count == 0
+
+
+def test_registered_legacy_signed_snapshot_remains_replayable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seed a historical auth-v1 winner, then exercise today's replay path."""
+    monkeypatch.chdir(tmp_path)
+    with LandscapeDB.in_memory() as db:
+        _insert_terminal_run(db)
+        seat = _export_seat(db, worker_id="legacy-sign-replay")
+        store = _MemoryContentStore()
+        config = _config(signing_mode="hmac_sha256", signer_key_id="legacy-key", signing_secret_ref="LEGACY_KEY")
+
+        # Recreate a registered old-format winner using the historical
+        # producer condition. The second call uses the current guard.
+        with patch(
+            "elspeth.engine.orchestrator.audit_export_effects.AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION",
+            "landscape-exporter-auth-v1",
+        ):
+            historical = prepare_audit_export_snapshot(
+                db,
+                coordination_token=seat,
+                config=config,
+                signing_key=b"legacy-key",
+                content_store=store,
+            )
+        old_put_count = store.put_count
+
+        replay = prepare_audit_export_snapshot(
+            db,
+            coordination_token=seat,
+            config=config,
+            signing_key=b"legacy-key",
+            content_store=store,
+        )
+        assert replay.snapshot_id == historical.snapshot_id
+        assert store.put_count == old_put_count
+        records = [json.loads(line) for chunk in replay.reader.iter_verified_chunks() for line in chunk.splitlines()]
+        assert (
+            next(record for record in records if record["record_type"] == "audit_export_config")["public_config"]["exporter_version"]
+            == "landscape-exporter-auth-v1"
+        )
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     (
@@ -601,6 +668,8 @@ def test_hmac_snapshot_streaming_derivation_and_production_verification(
                 signing_mode="hmac_sha256",
                 signer_key_id="audit-key-v1",
                 signing_secret_ref="AUDIT_EXPORT_TEST_KEY",
+                exporter_version="landscape-exporter-auth-v2",
+                compartment_id="test-compartment",
             ),
             signing_key=b"integration-signing-key",
             content_store=store,
@@ -632,6 +701,8 @@ def test_single_export_rotation_policy_refuses_a_different_signer_winner(
                 signer_key_id="audit-key-v1",
                 signing_secret_ref="AUDIT_EXPORT_TEST_KEY_V1",
                 signer_rotation_policy="single_export",
+                exporter_version="landscape-exporter-auth-v2",
+                compartment_id="test-compartment",
             ),
             signing_key=b"first-signing-key",
             content_store=store,
@@ -646,6 +717,8 @@ def test_single_export_rotation_policy_refuses_a_different_signer_winner(
                     signer_key_id="audit-key-v2",
                     signing_secret_ref="AUDIT_EXPORT_TEST_KEY_V2",
                     signer_rotation_policy="single_export",
+                    exporter_version="landscape-exporter-auth-v2",
+                    compartment_id="test-compartment",
                 ),
                 signing_key=b"second-signing-key",
                 content_store=store,
@@ -831,6 +904,8 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
                 signing_mode="hmac_sha256" if signed else "unsigned",
                 signer_key_id="audit-key-v1" if signed else "UNSIGNED",
                 signing_secret_ref="AUDIT_EXPORT_TEST_KEY" if signed else None,
+                exporter_version="landscape-exporter-auth-v2" if signed else "landscape-exporter-auth-v1",
+                compartment_id="test-compartment" if signed else None,
             ),
             signing_key=b"integration-signing-key" if signed else None,
             content_store=store,

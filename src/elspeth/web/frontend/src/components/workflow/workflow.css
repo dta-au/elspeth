@@ -1,0 +1,88 @@
+.workflow-mailbox-badge {
+  border-radius: var(--radius-md);
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--color-text);
+  background: var(--color-surface-hover);
+}
+
+.workflow-mailbox-dialog {
+  max-height: min(90vh, 900px);
+  overflow-y: auto;
+}
+
+.workflow-request-dialog {
+  max-height: min(90vh, 900px);
+  overflow-y: auto;
+}
+
+.workflow-mailbox-sent,
+.workflow-inspect {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.workflow-mailbox-tabs,
+.workflow-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin-block: var(--space-sm);
+}
+
+.workflow-mailbox-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.workflow-mailbox-list li,
+.workflow-sent-review {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.workflow-mailbox-item {
+  display: grid;
+  gap: var(--space-xs);
+  width: 100%;
+  padding: var(--space-md);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.workflow-mailbox-item:hover,
+.workflow-mailbox-item:focus-visible {
+  background: var(--color-surface-hover);
+}
+
+.workflow-new {
+  color: var(--color-accent);
+  font-weight: 700;
+}
+
+.workflow-inspect-reference {
+  overflow-wrap: anywhere;
+}
+
+.workflow-inspect-content {
+  max-height: 45vh;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  padding: var(--space-sm);
+}
+
+.workflow-inspect-content pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.workflow-field {
+  display: grid;
+  gap: var(--space-xs);
+  margin-block: var(--space-md);
+}
+
+.workflow-approval-readiness {
+  border-top: 1px solid var(--color-border);
+  margin-top: var(--space-md);
+  padding-top: var(--space-md);
+}

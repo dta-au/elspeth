@@ -52,6 +52,15 @@ defines product behavior. Kubernetes Workstream K is independent delivery.
   Landscape exports carry `compartment_id`. The September 13 I3/I6/I7/I9/I10/I11
   task files contain contrary defaults; reconcile their predicates, tests,
   audit expectations and cutover prose before applying their code excerpts.
+- A reviewer attestation requires an open review request for the exact state
+  and reviewer; it remains a ledger entry, not a run gate. Compartment ingress
+  records chat-pasted text when it creates a composition state, as well as
+  explicit YAML paste/import and library fork. These are further operator
+  rulings from 2026-09-19.
+- The one-time cutover export preserves the administrator-entered `username`
+  and `organisation_id` alongside provider, subject and identity ID. The CSV
+  stays with the protected database archive so re-admission can restore both
+  values (operator ruling 2026-09-20).
 - Keep the release code and the deployment cutover distinct. The code may
   prepare a new schema and runbook; the operator controls database recreation,
   countersigning, key-held judge signing, and any live deployment.
@@ -75,12 +84,13 @@ defines product behavior. Kubernetes Workstream K is independent delivery.
    binding and run-start refusal. A later rejection must retire earlier
    approved rows for that state before the run gate can read them; audit the
    rejection, retirement and supersession outcomes.
-5. **I4 and I5 — reviews and library.** Implement reviewer requests and
+5. **I4 and I5 — reviews and library.** Implement request-bound reviewer
    attestations without a run gate, plus frozen library publication,
    curation, browsing and provenance-preserving fork. Share the audited
    request-scoped inspect predicate with approvals.
 6. **I6 and I7 — compartment and scoped reads.** Mark the five specified
-   outputs, record ingress, implement workflow inspection, the approver audit
+   outputs, record YAML and state-creating chat ingress, implement workflow
+   inspection, the approver audit
    view and delegated curator administration. Version signed export
    derivation if required by its closed contract; do not silently omit it.
 7. **I9 and the Phase 3 admin UI — frontend.** Complete identity/role/edge

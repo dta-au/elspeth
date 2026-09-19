@@ -15,6 +15,7 @@ import structlog
 
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.compartments import ChatIngressInput, compartment_ingress_record
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_commit import (
     PipelineCommitConfig,
@@ -40,11 +41,13 @@ from .._helpers import (
     Request,
     SessionServiceProtocol,
     UserIdentity,
+    _chat_ingress_inputs,
     _initial_composition_state,
     _persist_tool_invocations,
     _state_data_from_composer_state,
     _state_from_record,
     asyncio,
+    merge_composer_meta_updates,
 )
 
 _GUIDED_ATOMIC_SETTLEMENT_COMPLETED = "_elspeth_guided_atomic_settlement_completed"
@@ -149,6 +152,24 @@ async def _proposal_user_message_content(
     )
 
 
+async def _proposal_chat_ingress_inputs(
+    service: SessionServiceProtocol,
+    proposal: CompositionProposalRecord,
+    *,
+    own_compartment_id: str | None,
+) -> list[ChatIngressInput]:
+    """Retain all durable human inputs through this proposal's originating turn."""
+    if proposal.user_message_id is None:
+        return []
+    messages = await service.get_messages(proposal.session_id, limit=None)
+    for index, message in enumerate(messages):
+        if message.id == proposal.user_message_id:
+            if message.role != "user":
+                raise HTTPException(status_code=409, detail="Stored proposal references a non-user originating message.")
+            return list(_chat_ingress_inputs(messages[: index + 1], own_compartment_id=own_compartment_id))
+    raise HTTPException(status_code=409, detail="Stored proposal references an originating message that could not be recovered.")
+
+
 async def settle_pipeline_proposal_under_compose_lock(
     *,
     request: Request,
@@ -207,6 +228,20 @@ async def settle_pipeline_proposal_under_compose_lock(
     current_record = await service.get_current_state(proposal.session_id)
     current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state()
     user_message_content = await _proposal_user_message_content(service, proposal)
+    if composer_meta is None:
+        previous_meta = current_record.composer_meta if current_record is not None else None
+        chat_ingress_inputs = await _proposal_chat_ingress_inputs(
+            service, proposal, own_compartment_id=request.app.state.settings.compartment_id
+        )
+        composer_meta = merge_composer_meta_updates(
+            previous_meta,
+            {
+                "ingress": compartment_ingress_record(user_message_content, own_compartment_id=request.app.state.settings.compartment_id),
+                "chat_ingress_inputs": chat_ingress_inputs,
+            }
+            if user_message_content is not None
+            else {},
+        )
     plugin_snapshot = request.app.state.plugin_snapshot_factory(user)
     policy_catalog = PolicyCatalogView(
         request.app.state.catalog_service,

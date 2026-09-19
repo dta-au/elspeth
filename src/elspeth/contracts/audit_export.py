@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
 AUDIT_EXPORT_DERIVATION_VERSION: Final = "audit-export-derivation-v1"
 AUDIT_EXPORT_AUTH_EXPORTER_VERSION: Final = "landscape-exporter-auth-v1"
+AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION: Final = "landscape-exporter-auth-v2"
+_AUTH_EXPORTER_VERSIONS: Final = frozenset({AUDIT_EXPORT_AUTH_EXPORTER_VERSION, AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION})
 AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v2"
 AUDIT_EXPORT_MANIFEST_SCHEMA: Final = "elspeth.audit-export-manifest.v2"
 AUDIT_EXPORT_MAX_CHUNKS: Final = 100_000
@@ -48,6 +50,7 @@ type AuditExportObjectKind = Literal["data_chunk", "final_manifest"]
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _UTC_MICROSECOND_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_COMPARTMENT_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 _NAMESPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 _EXPORT_TERMINAL_STATUSES: Final = frozenset({"completed", "completed_with_failures", "empty"})
 _EXPORT_TERMINAL: Final = frozenset({RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.EMPTY})
@@ -318,7 +321,8 @@ def _validate_public_config(payload: object) -> None:
         raise TypeError("public config must be an exact dict")
     if "exporter_version" not in payload:
         raise ValueError("public config is missing exporter_version")
-    is_auth_version = payload["exporter_version"] == AUDIT_EXPORT_AUTH_EXPORTER_VERSION
+    is_auth_version = payload["exporter_version"] in _AUTH_EXPORTER_VERSIONS
+    is_compartment_version = payload["exporter_version"] == AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION
     fields = frozenset(
         {
             "chunking_algorithm_version",
@@ -334,9 +338,13 @@ def _validate_public_config(payload: object) -> None:
     )
     if is_auth_version:
         fields = fields | {"auth_events"}
+    if is_compartment_version:
+        fields = fields | {"compartment_id"}
     obj = _object(payload, fields=fields, path="public config")
     if is_auth_version:
         _string(obj["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
+    if is_compartment_version:
+        validate_compartment_id(obj["compartment_id"])
     _string(obj["chunking_algorithm_version"], "chunking_algorithm_version")
     _string(obj["export_format"], "export_format", allowed=frozenset({"json", "csv"}))
     _string(obj["exporter_version"], "exporter_version")
@@ -738,6 +746,13 @@ def validate_credential_free_identifier(value: str, field_name: str) -> str:
     return value
 
 
+def validate_compartment_id(value: object) -> str:
+    """Validate the bounded identifier carried in signed public markings."""
+    if type(value) is not str or _COMPARTMENT_ID.fullmatch(value) is None:
+        raise ValueError("compartment_id must match [a-z0-9][a-z0-9-]{0,62}")
+    return value
+
+
 def validate_content_namespace(value: str) -> str:
     if type(value) is not str or _NAMESPACE.fullmatch(value) is None or ".." in value.split("/"):
         raise ValueError("namespace must be a bounded credential-free relative namespace")
@@ -869,6 +884,7 @@ class AuditExportDerivationConfig:
     signer_key_id: str
     signing_key: bytes | None
     auth_events: Literal["omitted", "deployment_snapshot"] = "omitted"
+    compartment_id: str | None = None
 
     def __post_init__(self) -> None:
         _string(self.source_run_id, "source_run_id")
@@ -877,8 +893,12 @@ class AuditExportDerivationConfig:
         _string(self.export_format, "export_format", allowed=frozenset({"json", "csv"}))
         _string(self.exporter_version, "exporter_version")
         _string(self.auth_events, "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
-        if self.exporter_version != AUDIT_EXPORT_AUTH_EXPORTER_VERSION and self.auth_events != "omitted":
+        if self.exporter_version not in _AUTH_EXPORTER_VERSIONS and self.auth_events != "omitted":
             raise ValueError(f"auth_events deployment_snapshot requires {AUDIT_EXPORT_AUTH_EXPORTER_VERSION}")
+        if self.exporter_version == AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            validate_compartment_id(self.compartment_id)
+        elif self.compartment_id is not None:
+            raise ValueError("compartment_id requires landscape-exporter-auth-v2")
         if self.serialization_version != AUDIT_EXPORT_SERIALIZATION_VERSION:
             raise ValueError(f"serialization_version must equal {AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
         _string(self.chunking_algorithm_version, "chunking_algorithm_version")
@@ -915,8 +935,10 @@ class AuditExportDerivationConfig:
             "signer_key_id": self.signer_key_id,
             "signing_mode": self.signing_mode,
         }
-        if self.exporter_version == AUDIT_EXPORT_AUTH_EXPORTER_VERSION:
+        if self.exporter_version in _AUTH_EXPORTER_VERSIONS:
             payload["auth_events"] = self.auth_events
+        if self.exporter_version == AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            payload["compartment_id"] = self.compartment_id
         return payload
 
 
@@ -1075,7 +1097,7 @@ class AuditExportAuthEventCoverageValidator:
             public_config = config_record["public_config"]
             _validate_public_config(public_config)
             assert isinstance(public_config, dict)
-            if public_config["exporter_version"] != AUDIT_EXPORT_AUTH_EXPORTER_VERSION:
+            if public_config["exporter_version"] not in _AUTH_EXPORTER_VERSIONS:
                 raise ValueError("auth event coverage requires current public config version")
             self.config_policy = _string(public_config["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
             self.public_config_hash = H(C("audit-export-public-config-v1", cast(ClosedAuditExportJSON, public_config)))
@@ -1137,7 +1159,7 @@ def _coverage_checked_records(
     config: AuditExportDerivationConfig,
 ) -> Iterator[Mapping[str, object]]:
     """Check signed coverage against the actual emitted stream in bounded memory."""
-    if config.exporter_version != AUDIT_EXPORT_AUTH_EXPORTER_VERSION:
+    if config.exporter_version not in _AUTH_EXPORTER_VERSIONS:
         yield from records
         return
     validator = AuditExportAuthEventCoverageValidator(config.source_completed_at, config.auth_events)
@@ -1158,6 +1180,9 @@ def derive_audit_export_bundle(
     This pure boundary is intentionally target/store independent. Persistence
     code may spool the returned complete-frame chunks before registering the
     immutable winner; no formula here includes a target, effect, or store ID.
+    It can re-derive legacy landscape-exporter-auth-v1 bytes for verification
+    and replay. Production export entry points refuse new signed auth-v1
+    artifacts; this helper does not authorize their publication.
     """
     if type(config) is not AuditExportDerivationConfig:
         raise TypeError("config must be exact AuditExportDerivationConfig")

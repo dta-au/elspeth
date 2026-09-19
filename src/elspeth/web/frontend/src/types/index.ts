@@ -1162,6 +1162,12 @@ export interface ApiError {
   status: number;
   detail: string;
   error_type?: string;
+  /** The server's current approval state when another approver won the decision race. */
+  current_state?: string;
+  /** Server-measured identity storage refusal, distinct from a file-size 413. */
+  storage_quota?: StorageQuotaRefusal;
+  /** Source names on a library publish refusal that needs profile-bound input. */
+  sources?: string[];
   /** Server correlation id (RequestIdMiddleware). Present on fail-closed
    *  audit-integrity 500s so the banner can name a support reference. */
   request_id?: string;
@@ -1210,6 +1216,12 @@ export interface ApiError {
   validation_errors?: ValidationError[];
   errors?: ApiStructuredError[];
   snapshot_fingerprint?: string;
+}
+
+export interface StorageQuotaRefusal {
+  cap: number | null;
+  ceiling: number | null;
+  usage: number;
 }
 
 /**

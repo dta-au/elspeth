@@ -94,7 +94,9 @@ def test_omission_disclosure_is_not_a_claim_that_no_events_exist(spooled: bool) 
             )
         return derive_audit_export_bundle(items, config)
 
-    settings = LandscapeExportSettings(format="json", per_chunk_record_limit=1000, per_chunk_byte_limit=1048576)
+    settings = LandscapeExportSettings(
+        format="json", per_chunk_record_limit=1000, per_chunk_byte_limit=1048576, exporter_version="landscape-exporter-auth-v1"
+    )
     config_record = {"record_type": "audit_export_config", "public_config": settings.public_snapshot_config()}
     bundle = derive([_golden_record(), config_record, coverage])
     assert bundle.public_export_config_hash == derive_public_export_config_hash(settings.public_snapshot_config())
@@ -166,6 +168,30 @@ def test_literal_public_config_and_registry_key_vectors() -> None:
     assert C("audit-export-registry-key-v1", REGISTRY_KEY) == REGISTRY_KEY_BYTES
     assert H(REGISTRY_KEY_BYTES) == REGISTRY_KEY_HASH
     assert derive_registry_key_hash(REGISTRY_KEY) == REGISTRY_KEY_HASH
+
+
+@pytest.mark.parametrize("compartment_id", ["a", "0", "research-a", "a" * 63])
+def test_auth_v2_compartment_identifier_is_accepted_at_derivation_boundaries(compartment_id: str) -> None:
+    config = replace(
+        _golden_config(),
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id=compartment_id,
+    )
+    assert derive_public_export_config_hash(config.public_snapshot_config())
+
+
+@pytest.mark.parametrize("compartment_id", ["", " ", "Research-A", "-research", "research_a", "research a", "research\n", "é", "a" * 64])
+def test_auth_v2_compartment_identifier_is_rejected_at_derivation_boundaries(compartment_id: str) -> None:
+    public_config = {
+        **PUBLIC_CONFIG,
+        "exporter_version": "landscape-exporter-auth-v2",
+        "auth_events": "omitted",
+        "compartment_id": compartment_id,
+    }
+    with pytest.raises(ValueError, match="compartment_id"):
+        derive_public_export_config_hash(public_config)
+    with pytest.raises(ValueError, match="compartment_id"):
+        replace(_golden_config(), exporter_version="landscape-exporter-auth-v2", compartment_id=compartment_id)
 
 
 @pytest.mark.parametrize(

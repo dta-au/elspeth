@@ -1,5 +1,7 @@
 ### Task I11: Cutover mechanics — the operator's instructions for the workflow-epoch window
 
+> **Current execution note (2026-09-19):** The 2026-09-19 [execution map](../2026-09-19-identity-workflow-finalization.md) supersedes epoch numerals, addressed-only prose and any live-testing gate below. The delivery is a single recreate-path operator handoff with cohort export/re-admission and a signed-export `compartment_id` compatibility record; destructive cutover, key-held signing and deployment remain operator actions. Recompute final epochs from the completed tree.
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I10. Runs before: K8. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered last in Workstream I (I10 → I11). Spec: §Rollout order step 6

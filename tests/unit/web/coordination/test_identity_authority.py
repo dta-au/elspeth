@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select, update
 
-from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.auth.models import AuthenticationError, IdentityClaims
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
@@ -56,6 +56,7 @@ from elspeth.web.coordination.identity_authority import (
     RoleChanged,
     RoleForbiddenForIdentity,
     RoleNotFound,
+    ServiceIdentityProvisioningUnavailable,
     local_identity_retirer,
 )
 from elspeth.web.sessions.engine import create_session_engine
@@ -274,6 +275,40 @@ def test_actor_text_fields_must_be_nonblank_exact_strings(field: str) -> None:
         IdentityAdminActor(**values)
 
 
+def test_login_claims_refuse_service_provider_at_construction() -> None:
+    with pytest.raises(AuthenticationError, match="provider"):
+        _claims("svc-example", provider="service")
+
+
+@pytest.mark.parametrize("entry", ["ensure", "bootstrap"])
+def test_identity_authority_refuses_mutated_service_claims_before_writing(engine, authority, entry: str) -> None:
+    claims = _claims("svc-example")
+    object.__setattr__(claims, "provider", "service")
+    recorder = _Recorder()
+    with pytest.raises(AuthenticationError, match="provider"):
+        if entry == "ensure":
+            authority.ensure_identity(
+                claims=claims,
+                activate=False,
+                quota_tokens_per_day=_TOKENS,
+                quota_storage_bytes=_STORAGE,
+                identity_dormancy_days=_DORMANCY_DAYS,
+                record_admission=recorder,
+                record_rebound=_noop,
+                record_dormant=_noop,
+            )
+        else:
+            authority.bootstrap_admin(
+                claims=claims,
+                note="invalid service login",
+                quota_tokens_per_day=_TOKENS,
+                quota_storage_bytes=_STORAGE,
+                record=recorder,
+            )
+    assert authority.read_identity_by_natural_key(provider="service", subject="svc-example") is None
+    assert recorder.outcomes == []
+
+
 def test_the_summary_view_has_no_raw_claims_column() -> None:
     """Forensics only, never returned by any API (spec §identities)."""
     assert "raw_claims_json" not in {field.name for field in fields(IdentitySummary)}
@@ -284,6 +319,7 @@ def test_every_refusal_is_an_exact_typed_subclass() -> None:
         AdminAuthorityRequired,
         IdentityNotFound,
         IdentityAlreadyExists,
+        ServiceIdentityProvisioningUnavailable,
         IdentityNotPending,
         IdentityNotDisabled,
         IdentityAlreadyDisabled,
@@ -548,6 +584,34 @@ def test_console_fields_are_admitted_on_a_service_actor_and_recorded(engine, aut
     assert outcome.actor_identity_id == service
 
 
+@pytest.mark.parametrize(
+    ("on_behalf_of", "console_request_id"),
+    [(None, None), ("ops@example.com", None), (None, "req-7")],
+)
+def test_service_admin_mutation_requires_both_console_provenance_fields(
+    engine, authority, on_behalf_of: str | None, console_request_id: str | None
+) -> None:
+    root = _bootstrap(authority)
+    service = _insert_service_identity(engine)
+    _grant(authority, _actor(root.record.identity_id), service, "admin")
+    recorder = _Recorder()
+    with pytest.raises(AdminAuthorityRequired):
+        authority.pre_provision_identity(
+            actor=_actor(service, on_behalf_of=on_behalf_of, console_request_id=console_request_id),
+            provider="local",
+            subject="unaudited-console-write",
+            username=None,
+            organisation_id=None,
+            role="user",
+            note="via console",
+            quota_tokens_per_day=None,
+            quota_storage_bytes=None,
+            record=recorder,
+        )
+    assert authority.read_identity_by_natural_key(provider="local", subject="unaudited-console-write") is None
+    assert recorder.outcomes == []
+
+
 def test_a_service_identity_may_hold_only_admin_or_oversight(engine, authority) -> None:
     root = _bootstrap(authority)
     service = _insert_service_identity(engine)
@@ -597,6 +661,78 @@ def test_pre_provision_with_role_none_writes_no_role_row(engine, authority) -> N
     outcome = _provision(authority, _actor(root.record.identity_id), "grace", role="none")
     assert _role_rows(engine, outcome.record.identity_id) == []
     assert outcome.role is None
+
+
+@pytest.mark.parametrize("role", ["approver", "none"])
+def test_pre_provision_refuses_service_provider_without_minting_human_identity(engine, authority, role: str) -> None:
+    root = _bootstrap(authority)
+    recorder = _Recorder()
+    with pytest.raises(ServiceIdentityProvisioningUnavailable):
+        authority.pre_provision_identity(
+            actor=_actor(root.record.identity_id),
+            provider="service",
+            subject="svc-example",
+            username=None,
+            organisation_id=None,
+            role=role,
+            note="service principal",
+            quota_tokens_per_day=_TOKENS,
+            quota_storage_bytes=_STORAGE,
+            record=recorder,
+        )
+    assert authority.read_identity_by_natural_key(provider="service", subject="svc-example") is None
+    assert recorder.outcomes == []
+
+
+def test_malformed_service_provider_actor_cannot_write_as_human_admin(engine, authority) -> None:
+    root = _bootstrap(authority)
+    service = _insert_service_identity(engine)
+    _grant(authority, _actor(root.record.identity_id), service, "admin")
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == service).values(kind="human"))
+    with pytest.raises(AdminAuthorityRequired):
+        _provision(authority, _actor(service), "new-person")
+    assert authority.read_identity_by_natural_key(provider="local", subject="new-person") is None
+
+
+@pytest.mark.parametrize("role", ["approver", "none"])
+def test_malformed_service_provider_cannot_be_activated_or_granted_workload_role(engine, authority, role: str) -> None:
+    root = _bootstrap(authority)
+    service = _insert_service_identity(engine)
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == service).values(kind="human", access_state="pending"))
+    with pytest.raises(RoleForbiddenForIdentity):
+        authority.activate_identity(
+            actor=_actor(root.record.identity_id),
+            identity_id=service,
+            role=role,
+            note="re-admit",
+            quota_tokens_per_day=_TOKENS,
+            quota_storage_bytes=_STORAGE,
+            record=_noop,
+        )
+    assert _identity_row(engine, service).access_state == "pending"
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == service).values(access_state="active"))
+    with pytest.raises(RoleForbiddenForIdentity):
+        _grant(authority, _actor(root.record.identity_id), service, "approver")
+    assert _role_rows(engine, service) == []
+
+
+def test_malformed_service_provider_cannot_be_enabled_but_can_be_disabled_and_revoked(engine, authority) -> None:
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    service = _insert_service_identity(engine)
+    grant = _grant(authority, actor, service, "oversight")
+    with engine.begin() as conn:
+        conn.execute(update(identities_table).where(identities_table.c.identity_id == service).values(kind="human"))
+    authority.disable_identity(actor=actor, identity_id=service, reason="repair malformed identity", record=_noop)
+    authority.revoke_role(actor=actor, role_id=grant.role_id, note="repair malformed identity", record=_noop)
+    assert _identity_row(engine, service).access_state == "disabled"
+    assert _role_rows(engine, service)[0].revoked_at is not None
+    with pytest.raises(RoleForbiddenForIdentity):
+        authority.enable_identity(actor=actor, identity_id=service, note="unsafe re-enable", record=_noop)
+    assert _identity_row(engine, service).access_state == "disabled"
 
 
 def test_pre_provision_refuses_a_taken_natural_key(authority) -> None:
@@ -790,7 +926,12 @@ def test_a_service_admin_cannot_disable_the_last_human_admin(engine, authority) 
     service = _insert_service_identity(engine)
     _grant(authority, _actor(root.record.identity_id), service, "admin")
     with pytest.raises(LastActiveAdminProtected):
-        authority.disable_identity(actor=_actor(service), identity_id=root.record.identity_id, reason="takeover", record=_noop)
+        authority.disable_identity(
+            actor=_actor(service, on_behalf_of="ops@example.com", console_request_id="req-takeover"),
+            identity_id=root.record.identity_id,
+            reason="takeover",
+            record=_noop,
+        )
     assert _identity_row(engine, root.record.identity_id).access_state == "active"
     # The reverse is container sovereignty: the human admin may disable the service identity.
     authority.disable_identity(actor=_actor(root.record.identity_id), identity_id=service, reason="console retired", record=_noop)

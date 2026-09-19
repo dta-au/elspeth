@@ -7,11 +7,12 @@ so that mypy can verify field names and types at construction sites.
 
 from __future__ import annotations
 
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 class AuditExportPublicConfig(TypedDict):
     auth_events: Literal["omitted", "deployment_snapshot"]
+    compartment_id: NotRequired[str]
     chunking_algorithm_version: str
     export_format: str
     exporter_version: str

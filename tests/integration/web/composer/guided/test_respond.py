@@ -9,6 +9,7 @@ covered separately as their schema-8 response handlers are implemented.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 from collections.abc import Awaitable, Callable, Mapping
@@ -2954,6 +2955,27 @@ class TestStep2IntraStep:
 
         assert revised.status_code == 200, revised.json()
         body = revised.json()
+        assert body["composition_state"]["composer_meta"]["ingress"] == {
+            "text_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": [],
+        }
+        user_rows = [
+            message
+            for message in asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+            if message.role == "user"
+        ]
+        assert body["composition_state"]["composer_meta"]["chat_ingress_inputs"] == [
+            {
+                "message_id": str(user_rows[0].id),
+                "text_sha256": hashlib.sha256(user_rows[0].content.encode("utf-8")).hexdigest(),
+                "foreign_compartment_ids": [],
+            },
+            {
+                "message_id": str(user_rows[-1].id),
+                "text_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+                "foreign_compartment_ids": [],
+            },
+        ]
         assert body["next_turn"]["type"] == "propose_pipeline"
         successor_id = body["next_turn"]["payload"]["proposal_id"]
         assert successor_id != old_proposal_id
@@ -3523,6 +3545,10 @@ class TestStep2IntraStep:
         )
 
         assert declined.status_code == 200, declined.json()
+        assert declined.json()["composition_state"]["composer_meta"]["ingress"] == {
+            "text_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": [],
+        }
         guided = _full_guided_session(declined.json())
         history = guided["chat_history"]
         assert len(history) == len(before["chat_history"]) + 2
@@ -3584,6 +3610,10 @@ class TestStep2IntraStep:
 
         assert corrected.status_code == 200, corrected.json()
         body = corrected.json()
+        assert body["composition_state"]["composer_meta"]["ingress"] == {
+            "text_sha256": hashlib.sha256(feedback.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": [],
+        }
         guided = _full_guided_session(body)
         history = guided["chat_history"]
         assert len(history) == len(before["chat_history"]) + 2
@@ -3734,6 +3764,10 @@ class TestStep2IntraStep:
             },
         )
         assert edited.status_code == 200, edited.json()
+        assert edited.json()["composition_state"]["composer_meta"]["ingress"] == {
+            "text_sha256": hashlib.sha256(b"Change the selected source settings.").hexdigest(),
+            "foreign_compartment_ids": [],
+        }
         assert edited.json()["guided_session"]["step"] == "step_1_source"
 
     def test_competing_respond_answers_fast_coded_conflict_during_planner_settlement(
@@ -5408,6 +5442,19 @@ class TestStep2IntraStep:
         assert body["terminal"]["kind"] == "completed"
         assert body["next_turn"] is None
         assert body["composition_state"]["outputs"]
+        user_rows = [
+            message
+            for message in asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+            if message.role == "user"
+        ]
+        assert body["composition_state"]["composer_meta"]["chat_ingress_inputs"] == [
+            {
+                "message_id": str(message.id),
+                "text_sha256": hashlib.sha256(message.content.encode("utf-8")).hexdigest(),
+                "foreign_compartment_ids": [],
+            }
+            for message in user_rows
+        ]
         events = asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id)))
         replayed = composer_test_client.post(
             f"/api/sessions/{session_id}/guided/respond",

@@ -1,5 +1,13 @@
 ### Task I6: Compartment marking
 
+> **Current execution note (2026-09-19):** The
+> [execution map](../2026-09-19-identity-workflow-finalization.md)
+> supersedes the decision here to omit signed Landscape exports: the
+> operator requires `compartment_id` in those exports. Ingress also includes
+> user text pasted into Composer chat when it creates a composition state,
+> not only YAML import and library fork. Preserve older-format verification
+> while versioning the signed format. Re-anchor source and epoch references.
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I4, I5. Runs before: I7. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered after I5 (it edits I5's `seed_state_from_runtime_yaml`, I5's library

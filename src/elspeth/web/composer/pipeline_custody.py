@@ -10,7 +10,7 @@ deterministic ``source.blob_id``.
 from __future__ import annotations
 
 import hmac
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -52,6 +52,7 @@ from elspeth.web.blobs.service import (
 )
 from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.tools._common import PendingCustodyBlobView
+from elspeth.web.coordination.quota_authority import QuotaExceeded, refuse_unrecorded_quota_exceeded
 from elspeth.web.sessions.locking import _run_lock_cleanup
 from elspeth.web.sessions.protocol import SessionOperationAuthority
 
@@ -282,6 +283,7 @@ def finalize_pipeline_custody_on_connection(
     staged: StagedInlineCustody,
     max_storage_per_session: int,
     write_fence: BlobGuidedOperationWriteFence | None,
+    quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
 ) -> InlineCustodyPublication:
     """Commit prepared metadata inside the originating message/proposal cohort.
 
@@ -307,6 +309,7 @@ def finalize_pipeline_custody_on_connection(
         staged=staged,
         max_storage_per_session=max_storage_per_session,
         write_fence=write_fence,
+        quota_exceeded_recorder=quota_exceeded_recorder,
     )
     if str(row.id) != str(preparation.blob_id):
         raise AuditIntegrityError("Inline custody settled a blob id different from the prepared proposal")

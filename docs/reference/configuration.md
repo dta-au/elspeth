@@ -369,7 +369,7 @@ consulted.
 |-------|------|----------|---------|-------------|
 | `auth_provider` | string | No | `"local"` | `local`, `entra`, `google`, `oidc`, or `vanguard`. Selects the profile that decides every other rule in this section |
 | `registration_mode` | string | No | `"open"` | `open`, `email_verified`, or `closed`. Governs **local** self-registration only. Under any identity provider it is accepted and inert: an SSO first login is always pending an administrator regardless of this value |
-| `workflow_governance` | string | No | `"off"` | `off` or `on`. Declares the workflow-governance mode for later approval, review, and library authorities. With `on`, readiness refuses local authentication with `registration_mode: open` (R11) and requires a non-blank `compartment_id`. The configured value remains `on` when readiness fails |
+| `workflow_governance` | string | No | `"off"` | `off` or `on`. Declares the workflow-governance mode for later approval, review, and library authorities. With `on`, readiness refuses local authentication with `registration_mode: open` (R11) and requires a valid `compartment_id`. The configured value remains `on` when readiness fails |
 | `dev_admin_user` | string | `local` only | - | Names the one local-auth user granted the in-app user-management surface (`/api/auth/admin/users`). Unset removes that surface entirely. Setting it under any identity provider refuses at load: `dev_admin_user requires auth_provider=local; IdP deployments must not carry it`. A blank value is refused too |
 
 `registration_mode: email_verified` on a non-local host (anything other than
@@ -385,7 +385,7 @@ consulted.
 | `sso_client_secret` | secret | Yes (every IdP) | - | The client secret for that registration. Held server-side only; never sent to the browser. Supply by reference from a secret store, never as an environment literal |
 | `sso_transaction_secret` | secret | Yes (every IdP) | - | Seals the login transaction cookie carrying the PKCE verifier, state, and nonce. Independent of `secret_key`, so rotating one does not invalidate the other. Generate with `openssl rand -base64 32` and place the value in a secret store; supply by reference, never as an environment literal |
 | `public_base_url` | string | Yes (every IdP) | - | This deployment's externally visible origin. Must be a bare origin — scheme, host, and optional port, with no path, query, or fragment — and must be public HTTPS unless it is an HTTP loopback address for local development. A trailing slash is stripped |
-| `compartment_id` | string | Yes (every IdP; also when workflow governance is on) | - | Operator-declared marking for this container's identities and artifacts. A non-blank value is required by readiness when workflow governance is on because library rows and audit metadata carry the marking |
+| `compartment_id` | string | Yes (every IdP; also when workflow governance is on) | - | Operator-declared marking for this container's identities and artifacts. It must match `[a-z0-9][a-z0-9-]{0,62}`; readiness requires it when workflow governance is on because library rows and audit metadata carry the marking |
 | `quota_default_tokens_per_day` | int | Yes (every IdP) | - | Daily LLM token allowance written into each identity's quota policy row at activation. Must be greater than 0 |
 | `quota_default_storage_bytes` | int | Yes (every IdP) | - | Blob storage allowance written into the same row. Must be greater than 0 |
 
@@ -2259,7 +2259,8 @@ compatibility record rather than relying on a structural probe alone.
 | `signer_key_id` | string | `UNSIGNED` | Credential-free public signer key ID/version recorded in snapshot identity |
 | `signing_secret_ref` | string | - | Exact environment-variable name containing the HMAC key; required for `hmac_sha256` |
 | `signer_rotation_policy` | string | `multi_version` | `multi_version` allows a new signer identity for a new snapshot; `single_export` refuses a different signer identity for the same export lineage |
-| `exporter_version` | string | `landscape-exporter-v1` | Export implementation identity |
+| `exporter_version` | string | `landscape-exporter-auth-v2` | Closed export format with a signed compartment marking; `landscape-exporter-auth-v1` remains available to verify or resume older exports |
+| `compartment_id` | string | - | Deployment marking matching `[a-z0-9][a-z0-9-]{0,62}`, required for an enabled auth-v2 export. Web execution uses the operator's `WebSettings.compartment_id`, overriding pipeline-authored values; CLI export settings must supply it explicitly |
 | `serialization_version` | string | `audit-export-v2` | Canonical record serialization identity |
 | `chunking_algorithm_version` | string | `record-framing-v1` | Chunk-boundary algorithm identity |
 | `include_raw_error_rows` | bool | `false` | Include bounded raw error rows when policy permits |
@@ -2276,6 +2277,8 @@ compatibility record rather than relying on a structural probe alone.
 | `content_store.policy_version` | string | required | Retention/durability policy version |
 | `content_store.retention_days` | int | required | Retention period |
 | `content_store.durability` | string | required | `fsync` or `replicated` |
+
+Auth-v2 binds `compartment_id` into the signed `audit_export_config.public_config` record and its public configuration hash. The cryptographic derivation algorithm remains `audit-export-derivation-v1`; older auth-v1 artifacts retain their original exact verification contract. To resume an existing auth-v1 snapshot, select `landscape-exporter-auth-v1` explicitly. Creating a new signed auth-v1 snapshot is refused. New signed CLI exports must select auth-v2 and supply `compartment_id` explicitly.
 
 Enabled export is deliberately all-explicit: total capacity must fit within
 `chunk_limit × per_chunk_*_limit`, and the spool must already be a private

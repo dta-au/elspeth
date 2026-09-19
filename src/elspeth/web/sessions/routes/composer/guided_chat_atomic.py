@@ -18,6 +18,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.web.compartments import chat_ingress_input, compartment_ingress_record
 from elspeth.web.composer.guided.audit import emit_intent_cancelled
 from elspeth.web.composer.guided.chat_solver import (
     DeferredIntentManagementChatRequest,
@@ -116,6 +117,7 @@ from .._helpers import (
     CompositionStateRecord,
     UserIdentity,
     _cancel_on_client_disconnect,
+    _chat_ingress_inputs,
     _composer_heartbeat_cancel_of,
     _composer_heartbeat_failed_progress_event,
     _composer_progress_sink,
@@ -2280,6 +2282,21 @@ async def post_guided_chat_schema8(
                         reason="advisory_chat",
                     )
                     existing_meta["guided_session"] = resulting_guided.to_dict()
+                    existing_meta["ingress"] = compartment_ingress_record(
+                        originating_message.content,
+                        own_compartment_id=settings.compartment_id,
+                    )
+                    existing_meta["chat_ingress_inputs"] = [
+                        *_chat_ingress_inputs(
+                            await service.get_messages(session_id, limit=None),
+                            own_compartment_id=settings.compartment_id,
+                        ),
+                        chat_ingress_input(
+                            message_id=str(originating_message.message_id),
+                            text=originating_message.content,
+                            own_compartment_id=settings.compartment_id,
+                        ),
+                    ]
                     state_dict = resulting_state.to_dict()
                     is_valid: bool
                     validation_errors: tuple[CompositionValidationError, ...] | None

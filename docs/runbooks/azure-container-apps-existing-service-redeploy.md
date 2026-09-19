@@ -267,6 +267,16 @@ appropriate to the change.
 > **LIVE:** the console-log query by revision name that shows no new
 > unhandled startup or runtime failure.
 
+An epoch-crossing candidate needs the database owner to drain the old
+revision, export the stopped Sessions store's identity/grant/edge cohort,
+archive and recreate both stores, and rerun the schema Job from the
+[cold-install runbook](azure-container-apps-cold-install.md). Then apply the
+candidate revision and complete the
+[identity workflow cutover handoff](identity-workflow-cutover.md): bootstrap,
+re-admit, check authenticated behavior, and send the notice before ordinary
+traffic resumes. This image-only path assumes already-current schemas and
+cannot turn a `STALE` doctor result into an initialized store.
+
 ## Rollback
 
 Rollback is permitted only when the compatibility record for this candidate

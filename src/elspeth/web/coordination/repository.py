@@ -43,7 +43,12 @@ from elspeth.contracts.blobs import (
     names_same_blob,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
-from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
+from elspeth.contracts.chargeable_admission import (
+    AdmissionRefusalReason,
+    ChargeableAdmissionDecision,
+    ChargeableAdmissionPolicy,
+    ChargeableOperation,
+)
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationEventRecord,
@@ -56,6 +61,14 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.web.composer.redaction import assert_guided_custody_persistable
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
+from elspeth.web.coordination.approval_authority import (
+    ApprovalGateInputs,
+    ApprovalSupersession,
+    RepositoryApprovalAuthority,
+    evaluate_approval_gate,
+    refuse_unrecorded_approval_supersession,
+    supersede_open_approvals,
+)
 from elspeth.web.coordination.chargeable_admission_authority import RepositoryChargeableAdmissionAuthority
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
@@ -73,6 +86,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
     _resolve_mutation_connection,
     _unregister_mutation_connection,
 )
+from elspeth.web.coordination.quota_authority import QuotaExceeded, RepositoryQuotaAuthority, refuse_unrecorded_quota_exceeded
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
@@ -498,7 +512,14 @@ def _validate_archive_manifest_identity(
 class _RepositoryMutationState:
     """Shared private state for one short-lived fenced transaction."""
 
-    __slots__ = ("_connection_token", "_database_now", "_operation_context", "_session_id")
+    __slots__ = (
+        "_approval_supersession_recorder",
+        "_connection_token",
+        "_database_now",
+        "_operation_context",
+        "_quota_exceeded_recorder",
+        "_session_id",
+    )
 
     def __init__(
         self,
@@ -507,11 +528,15 @@ class _RepositoryMutationState:
         session_id: str,
         database_now: datetime,
         operation_context: SessionOperationContext | None = None,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
     ) -> None:
         self._connection_token = _register_mutation_connection(connection)
         self._session_id = session_id
         self._database_now = database_now
         self._operation_context = operation_context
+        self._quota_exceeded_recorder = quota_exceeded_recorder
+        self._approval_supersession_recorder = approval_supersession_recorder
 
     def _require_active(self) -> None:
         _resolve_mutation_connection(self._connection_token)
@@ -891,6 +916,12 @@ class _RepositoryCompositionStateMutations:
             session_id=state._session_id,
             build_state_record=lambda: record,
             now=state._database_now,
+        )
+        supersede_open_approvals(
+            connection,
+            session_id=state._session_id,
+            now=state._database_now,
+            record=state._approval_supersession_recorder,
         )
         return record
 
@@ -1295,6 +1326,12 @@ class _RepositoryInterpretationMutations:
                 build_state_record=lambda: appended_record,
                 now=state._database_now,
             )
+            supersede_open_approvals(
+                connection,
+                session_id=state._session_id,
+                now=state._database_now,
+                record=state._approval_supersession_recorder,
+            )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(command.event_id))).one()
         return self._event_record(row)
 
@@ -1473,6 +1510,32 @@ class _RepositoryRunMutations:
             raise AuditIntegrityError("run mutation is not authorized for this operation kind")
         return context
 
+    def check_approval_binding(self, *, state_id: UUID, approval: ApprovalGateInputs) -> AdmissionRefusalReason | None:
+        """Preflight the exact state under the same EXECUTE fence as run creation.
+
+        The durable permit repeats this check after pending-run creation and
+        on recovery, so a decision changed between transactions cannot admit
+        the worker.
+        """
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(state_id, field_name="state_id")
+        if not isinstance(approval, ApprovalGateInputs):
+            raise TypeError("approval must be ApprovalGateInputs")
+        conn = _resolve_mutation_connection(state._connection_token)
+        owned_state = conn.execute(
+            select(composition_states_table.c.id)
+            .where(composition_states_table.c.id == str(state_id), composition_states_table.c.session_id == state._session_id)
+            .with_for_update()
+        ).one_or_none()
+        if owned_state is None:
+            raise SessionDerivedCustodyError
+        approved = RepositoryApprovalAuthority.approved_bindings(
+            state._connection_token, session_id=state._session_id, state_id=str(state_id)
+        )
+        return evaluate_approval_gate(approved=approved, compiled=approval.binding)
+
     def create_pending_run(
         self,
         *,
@@ -1559,24 +1622,28 @@ class _RepositoryRunMutations:
             saga_state=RunSagaState.START_INTENT if execution_input is not None else RunSagaState.DRAFT,
         )
 
-    def assess_start_admission(self, *, run_id: UUID, policy: ChargeableAdmissionPolicy) -> RunStartPermitRecord:
+    def assess_start_admission(
+        self, *, run_id: UUID, policy: ChargeableAdmissionPolicy, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord:
         state = self.__state
         state._require_active()
         context = self._require_execute()
         state._validate_uuid(run_id, field_name="run_id")
         permit = RepositoryRunStartPermitAuthority.assess(
-            state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy
+            state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy, approval=approval
         )
         self._record_admission_refusal(run_id, permit)
         return permit
 
-    def issue_start_permit(self, *, run_id: UUID, policy: ChargeableAdmissionPolicy) -> RunStartPermitRecord:
+    def issue_start_permit(
+        self, *, run_id: UUID, policy: ChargeableAdmissionPolicy, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord:
         state = self.__state
         state._require_active()
         context = self._require_execute()
         state._validate_uuid(run_id, field_name="run_id")
         permit = RepositoryRunStartPermitAuthority.issue(
-            state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy
+            state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy, approval=approval
         )
         self._record_admission_refusal(run_id, permit)
         return permit
@@ -2226,6 +2293,13 @@ class _RepositoryBlobMutations:
             from elspeth.contracts.blobs import BlobQuotaExceededError
 
             raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=replacement.size_bytes - actual.size_bytes,
+            operation="blob_replacement",
+            record=state._quota_exceeded_recorder,
+        )
 
         owner_instance_id = connection.execute(
             select(session_operation_fences_table.c.owner_instance_id)
@@ -2378,6 +2452,13 @@ class _RepositoryBlobMutations:
             from elspeth.contracts.blobs import BlobQuotaExceededError
 
             raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=exact.replacement_blob.size_bytes - actual.size_bytes,
+            operation="blob_replacement",
+            record=state._quota_exceeded_recorder,
+        )
         advanced = connection.execute(
             update(blob_replacement_cleanups_table)
             .where(and_(*self._blob_replacement_plan_predicates(exact)))
@@ -2559,6 +2640,13 @@ class _RepositoryBlobMutations:
                     current_bytes=current_total,
                     limit_bytes=max_storage_per_session,
                 )
+            RepositoryQuotaAuthority.admit_storage_bytes(
+                state._connection_token,
+                session_id=state._session_id,
+                additional_bytes=size_bytes - row.size_bytes,
+                operation="run_output_finalize",
+                record=state._quota_exceeded_recorder,
+            )
         result = connection.execute(
             update(blobs_table)
             .where(
@@ -2673,6 +2761,13 @@ class _RepositoryBlobMutations:
                 current_bytes=current_total,
                 limit_bytes=max_storage_per_session,
             )
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=record.size_bytes,
+            operation="blob_create",
+            record=state._quota_exceeded_recorder,
+        )
         connection.execute(
             insert(blobs_table).values(
                 id=str(record.id),
@@ -3627,6 +3722,13 @@ class _RepositoryBlobMutations:
                 current_bytes=current_total,
                 limit_bytes=max_storage_per_session,
             )
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=size_bytes - state._require_blob(blob_id).size_bytes,
+            operation="run_output_finalize",
+            record=state._quota_exceeded_recorder,
+        )
         result = connection.execute(
             update(blobs_table)
             .where(
@@ -3763,12 +3865,16 @@ class _RepositoryMutationTransaction:
         session_id: str,
         database_now: datetime,
         operation_context: SessionOperationContext | None = None,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
     ) -> None:
         state = _RepositoryMutationState(
             connection,
             session_id=session_id,
             database_now=database_now,
             operation_context=operation_context,
+            quota_exceeded_recorder=quota_exceeded_recorder,
+            approval_supersession_recorder=approval_supersession_recorder,
         )
         try:
             self.__state = state
@@ -4502,8 +4608,16 @@ class _SessionOperationAuthorityRepository:
     _locked_pair_transaction, _require_active_locked_fork_pair, __active_locked_fork_pair_count = __build_locked_fork_pair_controls()
     del __build_locked_fork_pair_controls
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+    ) -> None:
         self._engine = engine
+        self._quota_exceeded_recorder = quota_exceeded_recorder
+        self._approval_supersession_recorder = approval_supersession_recorder
 
     def _locked_transaction(self, session_id: str) -> AbstractContextManager[Connection]:
         """The dialect's same-session locked transaction (process + transaction lock).
@@ -5151,6 +5265,8 @@ class _SessionOperationAuthorityRepository:
                 session_id=fence.session_id,
                 database_now=database_now,
                 operation_context=context,
+                quota_exceeded_recorder=self._quota_exceeded_recorder,
+                approval_supersession_recorder=self._approval_supersession_recorder,
             )
             try:
                 return mutation(transaction)
@@ -5627,10 +5743,20 @@ class _SessionOperationAuthorityRepository:
 class PostgresSessionOperationRepository(_SessionOperationAuthorityRepository):
     """Distributed authority using PostgreSQL row locks and database time."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+    ) -> None:
         if engine.dialect.name != "postgresql":
             raise ValueError("PostgresSessionOperationRepository requires PostgreSQL")
-        super().__init__(engine)
+        super().__init__(
+            engine,
+            quota_exceeded_recorder=quota_exceeded_recorder,
+            approval_supersession_recorder=approval_supersession_recorder,
+        )
 
     @contextmanager
     def _locked_transaction(self, session_id: str) -> Iterator[Connection]:

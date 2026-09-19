@@ -18,6 +18,7 @@ from elspeth.contracts.advisory_locks import ELSPETH_AUDIT_EXPORT_LOCK_CLASSID
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
+    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_DERIVATION_VERSION,
     AuditExportAuthEventCoverageValidator,
     AuditExportContentDescriptor,
@@ -74,7 +75,7 @@ def _verify_snapshot_graph(
     cumulative_bytes = 0
     coverage = (
         AuditExportAuthEventCoverageValidator(_timestamp(snapshot.source_completed_at))
-        if snapshot.exporter_version == AUDIT_EXPORT_AUTH_EXPORTER_VERSION
+        if snapshot.exporter_version in (AUDIT_EXPORT_AUTH_EXPORTER_VERSION, AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION)
         else None
     )
     for chunk in chunks:

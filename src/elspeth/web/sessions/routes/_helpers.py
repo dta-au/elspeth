@@ -59,6 +59,7 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobQuotaExceededError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService as CatalogServiceProtocol
+from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, chat_ingress_input
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -1673,8 +1674,18 @@ def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[Compos
             history_message = ComposerHistoryMessage(role=message.role, content=_composer_history_content(message))
             if message.role == "user" and message.writer_principal in {"route_user_message", "session_fork"}:
                 history_message["_elspeth_user_authored"] = True
+                history_message["_elspeth_user_message_id"] = str(message.id)
             history.append(history_message)
     return history
+
+
+def _chat_ingress_inputs(messages: Sequence[ChatMessageRecord], *, own_compartment_id: str | None) -> list[ChatIngressInput]:
+    """Collect exact persisted human inputs in transcript order, without their text."""
+    return [
+        chat_ingress_input(str(message.id), message.content, own_compartment_id=own_compartment_id)
+        for message in messages
+        if message.role == "user" and message.writer_principal in {"route_user_message", "session_fork"}
+    ]
 
 
 def _composer_persisted_validation(
@@ -3073,6 +3084,8 @@ async def _handle_convergence_error(
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
     session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
 ) -> dict[str, object]:
     """Build 422 response body and persist partial state for convergence errors.
 
@@ -3179,6 +3192,12 @@ async def _handle_convergence_error(
                 initial_version=None,
                 telemetry_source="convergence",
                 prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -3247,6 +3266,8 @@ async def _handle_plugin_crash(
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
     session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for plugin crashes.
 
@@ -3329,6 +3350,12 @@ async def _handle_plugin_crash(
                 initial_version=None,
                 telemetry_source="plugin_crash",
                 prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -3409,6 +3436,8 @@ async def _handle_runtime_preflight_failure(
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
     session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for runtime-preflight failures.
 
@@ -3570,6 +3599,12 @@ async def _handle_runtime_preflight_failure(
                 initial_version=None,
                 telemetry_source="runtime_preflight",
                 prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
             )
             partial_record = await service.save_composition_state(
                 session_id,

@@ -12,6 +12,7 @@ import { HeaderSessionSwitcher } from "@/components/sessions/HeaderSessionSwitch
 import { HeaderVersionSelector } from "@/components/header/HeaderVersionSelector";
 import { ModelChip } from "@/components/chat/ModelChip";
 import { UserMenu } from "@/components/common/UserMenu";
+import { MailboxBadge } from "@/components/workflow/MailboxBadge";
 import { WordMark } from "@/components/ui";
 
 interface AppHeaderProps {
@@ -19,12 +20,18 @@ interface AppHeaderProps {
   onSignOut: () => void;
   /** Forwarded to UserMenu; present only for the env-flagged dev admin. */
   onOpenUserManagement?: () => void;
+  onOpenMailbox?: () => void;
+  onOpenIdentityAdmin?: () => void;
+  onOpenLibrary?: () => void;
 }
 
 export function AppHeader({
   onOpenSettings,
   onSignOut,
   onOpenUserManagement,
+  onOpenMailbox,
+  onOpenIdentityAdmin,
+  onOpenLibrary,
 }: AppHeaderProps): JSX.Element {
   return (
     <header className="app-header" role="banner">
@@ -42,10 +49,14 @@ export function AppHeader({
         <ModelChip />
       </div>
       <div className="app-header-right">
+        {onOpenMailbox !== undefined && <MailboxBadge onOpen={onOpenMailbox} />}
         <UserMenu
           onOpenSettings={onOpenSettings}
           onSignOut={onSignOut}
           onOpenUserManagement={onOpenUserManagement}
+          onOpenMailbox={onOpenMailbox}
+          onOpenIdentityAdmin={onOpenIdentityAdmin}
+          onOpenLibrary={onOpenLibrary}
         />
       </div>
     </header>

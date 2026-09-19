@@ -1,5 +1,12 @@
 ### Task I1: Token usage ledger and R14 daily enforcement
 
+> **Current execution note (2026-09-19):** Durable provider attempts, UTC-day
+> identity and container token aggregation, and chargeable admission already
+> landed in `e3bd9562a` and `e1a389211`. Verify the full acceptance list
+> before closing any combined quota issue; I2 storage and admin policy routes
+> remain unfinished. See the
+> [current execution map](../2026-09-19-identity-workflow-finalization.md).
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I8. Runs before: I2. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered after I0 (the nullable ledger measures and `SESSION_SCHEMA_EPOCH` 57)

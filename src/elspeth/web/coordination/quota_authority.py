@@ -31,15 +31,17 @@ into the Landscape ``quota_exceeded`` row (``AuthAuditWriter.record_quota_exceed
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, final
 
 from sqlalchemy import BigInteger, and_, case, cast, func, insert, or_, select, update
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.blobs import IdentityStorageQuotaExceededError, StorageAccountingUnavailableError
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy, ChargeableAdmissionRefused
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -50,6 +52,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
     _unregister_mutation_connection,
 )
 from elspeth.web.sessions.models import (
+    blobs_table,
     quota_policies_table,
     quota_provider_attempts_table,
     runs_table,
@@ -514,25 +517,136 @@ class RepositoryQuotaAuthority:
     @staticmethod
     def active_policy(connection_token: str, *, identity_id: str) -> ActiveQuotaPolicies:
         """Lock and return the identity's unrevoked policy and the unrevoked container ceiling."""
-        conn = _resolve_mutation_connection(connection_token)
-        policy = quota_policies_table.c
-        identity = conn.execute(
-            select(policy.policy_id, policy.tokens_per_day, policy.storage_bytes)
-            .where(policy.identity_id == identity_id, policy.revoked_at.is_(None))
-            .with_for_update()
-        ).one_or_none()
-        container = conn.execute(
-            select(policy.policy_id, policy.tokens_per_day, policy.storage_bytes)
-            .where(policy.identity_id.is_(None), policy.revoked_at.is_(None))
-            .with_for_update()
-        ).one_or_none()
-        return ActiveQuotaPolicies(
-            identity=None
-            if identity is None
-            else QuotaPolicyRow(policy_id=identity.policy_id, tokens_per_day=identity.tokens_per_day, storage_bytes=identity.storage_bytes),
-            container=None
-            if container is None
-            else QuotaPolicyRow(
-                policy_id=container.policy_id, tokens_per_day=container.tokens_per_day, storage_bytes=container.storage_bytes
-            ),
+        return _active_policy_rows(_resolve_mutation_connection(connection_token), identity_id=identity_id, for_update=True)
+
+    @staticmethod
+    def admit_storage_bytes(
+        connection_token: str,
+        *,
+        session_id: str,
+        additional_bytes: int,
+        operation: StorageAdmissionOperation,
+        record: Callable[[QuotaExceeded], None],
+    ) -> StorageAdmission:
+        return admit_storage_bytes_on_connection(
+            _resolve_mutation_connection(connection_token),
+            session_id=session_id,
+            additional_bytes=additional_bytes,
+            operation=operation,
+            record=record,
         )
+
+
+StorageAdmissionOperation = Literal["blob_create", "inline_custody", "run_output_finalize", "blob_replacement", "session_fork"]
+_STORAGE_ADMISSION_OPERATIONS = frozenset({"blob_create", "inline_custody", "run_output_finalize", "blob_replacement", "session_fork"})
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class StorageAdmission:
+    identity_id: str
+    additional_bytes: int
+    usage: int | None
+    cap: int | None
+    ceiling: int | None
+
+
+def refuse_unrecorded_quota_exceeded(outcome: QuotaExceeded) -> None:
+    """A quota refusal without a Landscape recorder fails closed."""
+    raise AuditIntegrityError(f"quota_exceeded refusal for identity {outcome.identity_id} has no auth audit writer wired")
+
+
+def _active_policy_rows(connection: Connection, *, identity_id: str, for_update: bool) -> ActiveQuotaPolicies:
+    policy = quota_policies_table.c
+    identity_query = select(policy.policy_id, policy.tokens_per_day, policy.storage_bytes).where(
+        policy.identity_id == identity_id, policy.revoked_at.is_(None)
+    )
+    container_query = select(policy.policy_id, policy.tokens_per_day, policy.storage_bytes).where(
+        policy.identity_id.is_(None), policy.revoked_at.is_(None)
+    )
+    if for_update:
+        identity_query = identity_query.with_for_update()
+        container_query = container_query.with_for_update()
+    identity = connection.execute(identity_query).one_or_none()
+    container = connection.execute(container_query).one_or_none()
+    return ActiveQuotaPolicies(
+        identity=None
+        if identity is None
+        else QuotaPolicyRow(policy_id=identity.policy_id, tokens_per_day=identity.tokens_per_day, storage_bytes=identity.storage_bytes),
+        container=None
+        if container is None
+        else QuotaPolicyRow(policy_id=container.policy_id, tokens_per_day=container.tokens_per_day, storage_bytes=container.storage_bytes),
+    )
+
+
+def admit_storage_bytes_on_connection(
+    connection: Connection,
+    *,
+    session_id: str,
+    additional_bytes: int,
+    operation: StorageAdmissionOperation,
+    record: Callable[[QuotaExceeded], None],
+) -> StorageAdmission:
+    """Admit net growth against live identity and container storage, without a policy lock."""
+    if operation not in _STORAGE_ADMISSION_OPERATIONS:
+        raise ValueError(f"Invalid storage admission operation {operation!r}")
+    if type(additional_bytes) is not int:
+        raise TypeError("additional_bytes must be an exact int")
+    if not callable(record):
+        raise TypeError("record must be callable")
+    try:
+        owner = connection.execute(
+            select(sessions_table.c.user_id, sessions_table.c.auth_provider_type).where(sessions_table.c.id == session_id)
+        ).one_or_none()
+        if owner is None:
+            raise AuditIntegrityError("Storage admission names a session that does not exist")
+        if additional_bytes <= 0:
+            return StorageAdmission(identity_id=owner.user_id, additional_bytes=additional_bytes, usage=None, cap=None, ceiling=None)
+        policies = _active_policy_rows(connection, identity_id=owner.user_id, for_update=False)
+        if policies.identity is None:
+            # An explicitly revoked identity allowance suspends byte growth.
+            # A never-issued identity can still use a container-only regime.
+            previously_issued = connection.execute(
+                select(quota_policies_table.c.policy_id)
+                .where(quota_policies_table.c.identity_id == owner.user_id, quota_policies_table.c.revoked_at.is_not(None))
+                .limit(1)
+            ).first()
+            if previously_issued is not None:
+                raise StorageAccountingUnavailableError(session_id)
+        if policies.identity is None and policies.container is None:
+            return StorageAdmission(identity_id=owner.user_id, additional_bytes=additional_bytes, usage=None, cap=None, ceiling=None)
+        usage = connection.execute(
+            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))
+            .select_from(blobs_table.join(sessions_table, sessions_table.c.id == blobs_table.c.session_id))
+            .where(sessions_table.c.user_id == owner.user_id)
+        ).scalar_one()
+    except SQLAlchemyError as exc:
+        raise StorageAccountingUnavailableError(session_id) from exc
+    if type(usage) is not int:
+        raise AuditIntegrityError(f"Tier 1: identity storage total must be an exact integer, got {type(usage).__name__}")
+    cap = policies.identity.storage_bytes if policies.identity is not None else None
+    ceiling = policies.container.storage_bytes if policies.container is not None else None
+    limit = min(bound for bound in (cap, ceiling) if bound is not None)
+    if usage + additional_bytes > limit:
+        record(
+            QuotaExceeded(
+                identity_id=owner.user_id,
+                provider=owner.auth_provider_type,
+                operation=operation,
+                dimension="storage",
+                cap=cap,
+                ceiling=ceiling,
+                usage=usage,
+                identity_policy_id=policies.identity.policy_id if policies.identity is not None else None,
+                container_policy_id=policies.container.policy_id if policies.container is not None else None,
+            )
+        )
+        raise IdentityStorageQuotaExceededError(
+            session_id,
+            identity_id=owner.user_id,
+            cap=cap,
+            ceiling=ceiling,
+            usage=usage,
+            additional_bytes=additional_bytes,
+        )
+    return StorageAdmission(identity_id=owner.user_id, additional_bytes=additional_bytes, usage=usage, cap=cap, ceiling=ceiling)

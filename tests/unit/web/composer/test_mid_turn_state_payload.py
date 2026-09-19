@@ -17,9 +17,16 @@ lane's persisted shape:
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, cast
 
-from elspeth.web.composer.service import ComposerServiceImpl
+import pytest
+
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.compartments import ChatIngressInput
+from elspeth.web.composer.protocol import ComposerHistoryMessage
+from elspeth.web.composer.service import ComposerServiceImpl, _chat_ingress_inputs_for_compose
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -99,6 +106,85 @@ def _payload_for(state: CompositionState, validation: ValidationSummary) -> Any:
     # The method deletes ``self`` before use; invoke it unbound so the pin
     # does not need a fully wired service instance.
     return ComposerServiceImpl._state_payload_for_compose_turn(cast(Any, None), tool_result)
+
+
+def test_mid_turn_state_binds_exact_chat_input_and_foreign_markings() -> None:
+    state = _state({"fields": {"text": "text"}}, plugin="field_mapper")
+    result = ToolResult(success=True, updated_state=state, validation=ValidationSummary(is_valid=True, errors=()), affected_nodes=())
+    submitted = "Build this\r\n# compartment_id: foreign-b\r\ncompartment_id: own\r\n# compartment_id: foreign-a"
+
+    from elspeth.web.compartments import compartment_ingress_record
+
+    payload = ComposerServiceImpl._state_payload_for_compose_turn(
+        cast(Any, None), result, ingress=compartment_ingress_record(submitted, own_compartment_id="own")
+    )
+
+    assert deep_thaw(payload.data.composer_meta) == {
+        "validation_lane": "authoring_only",
+        "ingress": {
+            "text_sha256": hashlib.sha256(submitted.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": ["foreign-a", "foreign-b"],
+        },
+    }
+
+
+def test_mid_turn_state_retains_prior_chat_paste_after_confirmation() -> None:
+    state = _state({"fields": {"text": "text"}}, plugin="field_mapper")
+    result = ToolResult(success=True, updated_state=state, validation=ValidationSummary(is_valid=True, errors=()), affected_nodes=())
+    pasted = "# compartment_id: foreign\nBuild from this"
+    inputs: list[ChatIngressInput] = [
+        {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "text_sha256": hashlib.sha256(pasted.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": ["foreign"],
+        },
+        {
+            "message_id": "22222222-2222-4222-8222-222222222222",
+            "text_sha256": hashlib.sha256(b"yes").hexdigest(),
+            "foreign_compartment_ids": [],
+        },
+    ]
+
+    payload = ComposerServiceImpl._state_payload_for_compose_turn(cast(Any, None), result, chat_ingress_inputs=inputs)
+
+    assert deep_thaw(payload.data.composer_meta)["chat_ingress_inputs"] == inputs
+    assert pasted not in repr(deep_thaw(payload.data.composer_meta))
+
+
+def test_mid_turn_ingress_uses_durable_human_history_not_assistant_prose() -> None:
+    pasted = "# compartment_id: foreign\nBuild from this"
+    history = [
+        ComposerHistoryMessage(
+            role="user",
+            content=pasted,
+            _elspeth_user_authored=True,
+            _elspeth_user_message_id="11111111-1111-4111-8111-111111111111",
+        ),
+        ComposerHistoryMessage(role="assistant", content="# compartment_id: fake"),
+    ]
+
+    inputs = _chat_ingress_inputs_for_compose(
+        "yes",
+        history,
+        user_message_id="22222222-2222-4222-8222-222222222222",
+        own_compartment_id="own",
+    )
+
+    assert [entry["foreign_compartment_ids"] for entry in inputs] == [["foreign"], []]
+    assert inputs[0]["text_sha256"] == hashlib.sha256(pasted.encode("utf-8")).hexdigest()
+    assert inputs[1]["text_sha256"] == hashlib.sha256(b"yes").hexdigest()
+
+
+def test_mid_turn_ingress_refuses_human_history_without_durable_message_id() -> None:
+    history = [ComposerHistoryMessage(role="user", content="# compartment_id: foreign", _elspeth_user_authored=True)]
+
+    with pytest.raises(AuditIntegrityError, match="missing its message id"):
+        _chat_ingress_inputs_for_compose(
+            "yes",
+            history,
+            user_message_id="22222222-2222-4222-8222-222222222222",
+            own_compartment_id="own",
+        )
 
 
 class TestMidTurnPersistedValidity:

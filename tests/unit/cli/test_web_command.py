@@ -481,6 +481,41 @@ class TestComposerUsersBootstrapAdmin:
         assert (activated["on_behalf_of"], activated["console_request_id"]) == (None, None)
         assert events[0].request_id is None and events[0].client_host is None
 
+    def test_bootstrap_admin_preserves_operator_username_and_organisation(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, "--username", "Ada Operator", "--organisation-id", "agency-17")
+        assert result.exit_code == 0, result.output
+
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    select(
+                        identities_table.c.subject,
+                        identities_table.c.username,
+                        identities_table.c.organisation_id,
+                        identities_table.c.access_state,
+                    )
+                ).all()
+            assert [tuple(row) for row in rows] == [("ada", "Ada Operator", "agency-17", "active")]
+        finally:
+            engine.dispose()
+
+    def test_bootstrap_admin_stamps_configured_compartment(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__COMPARTMENT_ID", "alpha")
+        result = self._invoke(tmp_path)
+        assert result.exit_code == 0, result.output
+        events = _auth_event_rows(f"sqlite:///{tmp_path / 'runs' / 'audit.db'}")
+        assert [json.loads(row.metadata_json)["compartment_id"] for row in events] == ["alpha", "alpha"]
+
+    def test_bootstrap_admin_rejects_malformed_compartment_before_audit_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__COMPARTMENT_ID", "Alpha")
+        result = self._invoke(tmp_path)
+        assert result.exit_code == 1
+        assert "compartment_id" in result.output
+        assert not (tmp_path / "runs" / "audit.db").exists()
+
     def test_bootstrap_admin_is_refused_once_an_admin_exists(self, tmp_path: Path) -> None:
         assert self._invoke(tmp_path).exit_code == 0
         second = self._invoke(tmp_path, subject="bob")

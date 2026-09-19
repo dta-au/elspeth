@@ -31,6 +31,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
+    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_MAX_CHUNKS,
     AUDIT_EXPORT_MAX_TOTAL_BYTES,
     AUDIT_EXPORT_MAX_TOTAL_RECORDS,
@@ -321,11 +322,12 @@ class LandscapeExporter:
         *,
         include_raw_error_rows: bool = False,
         auth_events: Literal["omitted", "deployment_snapshot"] = "omitted",
+        compartment_id: str | None = None,
         row_batch_size: int = 500,
         read_model: ExportReadModel | None = None,
         signer_key_id: str | None = None,
         export_format: str = "json",
-        exporter_version: str = AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
+        exporter_version: str | None = None,
         serialization_version: str = AUDIT_EXPORT_SERIALIZATION_VERSION,
         chunking_algorithm_version: str = "record-framing-v1",
         per_chunk_byte_limit: int = 64 * 1024 * 1024,
@@ -367,13 +369,23 @@ class LandscapeExporter:
         self._include_raw_error_rows = include_raw_error_rows
         if auth_events not in ("omitted", "deployment_snapshot"):
             raise ValueError("auth_events must be omitted or deployment_snapshot")
-        if exporter_version != AUDIT_EXPORT_AUTH_EXPORTER_VERSION and auth_events != "omitted":
+        resolved_exporter_version = exporter_version
+        if resolved_exporter_version is None:
+            resolved_exporter_version = (
+                AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION if compartment_id is not None else AUDIT_EXPORT_AUTH_EXPORTER_VERSION
+            )
+        if (
+            resolved_exporter_version not in (AUDIT_EXPORT_AUTH_EXPORTER_VERSION, AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION)
+            and auth_events != "omitted"
+        ):
             raise ValueError("Legacy exporter cannot include deployment auth events")
         self._auth_events = auth_events
+        self._compartment_id = compartment_id
         self._row_batch_size = row_batch_size
         self._signer_key_id = signer_key_id
         self._export_format = export_format
-        self._exporter_version = exporter_version
+        self._exporter_version = resolved_exporter_version
+        self._exporter_version_explicit = exporter_version is not None
         self._serialization_version = serialization_version
         self._chunking_algorithm_version = chunking_algorithm_version
         self._per_chunk_byte_limit = per_chunk_byte_limit
@@ -519,7 +531,9 @@ class LandscapeExporter:
     def _configured_records(self, run_id: str, config: AuditExportDerivationConfig) -> Iterator[ExportRecord]:
         scoped = copy(self)
         scoped._auth_events = config.auth_events
+        scoped._compartment_id = config.compartment_id
         scoped._exporter_version = config.exporter_version
+        scoped._exporter_version_explicit = True
         scoped._include_raw_error_rows = config.include_raw_error_rows
         scoped._signing_key = config.signing_key
         scoped._signer_key_id = config.signer_key_id
@@ -576,11 +590,14 @@ class LandscapeExporter:
                 source_status=source_status,
                 source_completed_at=completed_text,
                 export_format=self._export_format,  # type: ignore[arg-type]
-                exporter_version=self._exporter_version,
+                exporter_version=(
+                    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION if sign and not self._exporter_version_explicit else self._exporter_version
+                ),
                 serialization_version=self._serialization_version,
                 chunking_algorithm_version=self._chunking_algorithm_version,
                 include_raw_error_rows=self._include_raw_error_rows,
                 auth_events=self._auth_events,
+                compartment_id=self._compartment_id,
                 per_chunk_byte_limit=self._per_chunk_byte_limit,
                 per_chunk_record_limit=self._per_chunk_record_limit,
                 signing_mode=signing_mode,  # type: ignore[arg-type]
@@ -608,6 +625,8 @@ class LandscapeExporter:
                     f"derivation config signing_mode {derivation_config.signing_mode!r} contradicts the "
                     f"requested export (sign={sign} requires signing_mode {expected_signing_mode!r})"
                 )
+        if sign and derivation_config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("legacy signed export may only be verified or resumed from an existing snapshot")
         return derivation_config
 
     def iter_unsigned_run_records(self, run_id: str) -> Iterator[ExportRecord]:
@@ -672,7 +691,7 @@ class LandscapeExporter:
         }
         yield run_record
 
-        if self._exporter_version == AUDIT_EXPORT_AUTH_EXPORTER_VERSION:
+        if self._exporter_version in (AUDIT_EXPORT_AUTH_EXPORTER_VERSION, AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION):
             if self._signing_key is not None and self._signer_key_id is None:
                 raise ValueError("Signed export requires an explicit signer_key_id")
             public_config: AuditExportConfigRecord = {
@@ -692,6 +711,10 @@ class LandscapeExporter:
                     "signing_mode": "hmac_sha256" if self._signing_key is not None else "unsigned",
                 },
             }
+            if self._exporter_version == AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+                if self._compartment_id is None or not self._compartment_id.strip():
+                    raise ValueError("compartment_id is required for landscape-exporter-auth-v2")
+                public_config["public_config"]["compartment_id"] = self._compartment_id
             yield public_config
             selected_count = 0
             cutoff = run.completed_at

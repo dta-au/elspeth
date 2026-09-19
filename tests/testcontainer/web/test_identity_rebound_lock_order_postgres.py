@@ -150,7 +150,12 @@ def _one_concurrent_round(
 
     def admin_disable() -> None:
         barrier.wait(timeout=30)
-        disabling.disable_identity(actor=_actor(service), identity_id=target_id, reason="concurrent", record=_noop)
+        disabling.disable_identity(
+            actor=IdentityAdminActor(identity_id=service, on_behalf_of="ops@example.com", console_request_id="req-concurrent"),
+            identity_id=target_id,
+            reason="concurrent",
+            record=_noop,
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = (pool.submit(rebound_login), pool.submit(admin_disable))

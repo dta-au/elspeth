@@ -1,5 +1,10 @@
 ### Task I10: Workflow-governance suite (fire + mutation per refusal)
 
+> **Current execution note (2026-09-19):** The 2026-09-19 [execution map](../2026-09-19-identity-workflow-finalization.md) supersedes pinned baseline and contrary decision tests below. Prove role-based non-author approval at inbox, inspect and decide; prove later same-state rejection retires earlier approval and blocks run admission; prove supersession audit events and signed-export `compartment_id`, with positive and mutation controls.
+> Also prove that an attestation without an open exact-state review request is
+> refused, and that state-creating Composer chat paste records compartment
+> ingress evidence.
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I8, I9. Runs before: I11. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered after I9 and before I11 (see the master's Workstream layout and ordering), with the direct edge I8 → I10

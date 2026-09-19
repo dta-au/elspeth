@@ -33,6 +33,7 @@ import { ExplainDialog } from "./ExplainDialog";
 import { AuditReadinessRow, type RowPresentation } from "./AuditReadinessRow";
 import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
 import { matchingAuditReadinessSnapshot } from "@/lib/auditReadinessFreshness";
+import { ApprovalReadinessRow } from "@/components/workflow/ApprovalReadinessRow";
 import {
   projectMatchingSnapshotToExecution,
   useAuditReadinessSync,
@@ -271,6 +272,7 @@ export function AuditReadinessPanel({
   );
   const loadSnapshot = useAuditReadinessStore((s) => s.loadSnapshot);
   const setValidationResult = useExecutionStore((s) => s.setValidationResult);
+  const pendingApproval = useExecutionStore((s) => s.pendingApproval);
   const showAdvanced = useShowAdvanced();
 
   // Phase 5a Task 7: when an inline_blob source is bound to the active
@@ -407,6 +409,7 @@ export function AuditReadinessPanel({
   // Collapsed view — single summary line when nothing is actionable.
   if (!showExpanded) {
     return (
+      <>
       <section
         aria-label="Audit readiness"
         className="audit-readiness audit-readiness--collapsed"
@@ -433,6 +436,8 @@ export function AuditReadinessPanel({
           </span>
         </Button>
       </section>
+      <ApprovalReadinessRow sessionId={activeSessionId} stateId={compositionState.id} pendingApproval={pendingApproval} />
+      </>
     );
   }
 
@@ -631,6 +636,7 @@ export function AuditReadinessPanel({
             );
           })}
         </ul>
+        <ApprovalReadinessRow sessionId={activeSessionId} stateId={compositionState.id} pendingApproval={pendingApproval} />
       </section>
 
       {selectedRowId && (

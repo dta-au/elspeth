@@ -5,7 +5,11 @@ Layer: L0 (contracts). No upward imports.
 
 from __future__ import annotations
 
-from typing import Final, Literal
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Final, Literal, final
+
+from elspeth.contracts.freeze import freeze_fields
 
 AuthProviderType = Literal["local", "oidc", "entra", "vanguard", "google"]
 """Closed discriminator for the ways a browser can authenticate.
@@ -92,3 +96,62 @@ reconstruct who asked.  Pinned here, at L0, so the writer and every reader
 name the same keys; the writer records both on every admin mutation, ``None``
 when the actor is a human administrator acting for themselves.
 """
+
+AuthAuditEventType = Literal[
+    # Authentication.
+    "login",
+    "token_issued",
+    "auth_failure",
+    "logout",
+    # Admission and authority. Every one of these is an admin mutation whose
+    # row is written synchronously, before the response.
+    "identity_activated",
+    "identity_disabled",
+    "identity_enabled",
+    "role_granted",
+    "role_revoked",
+    "relationship_asserted",
+    "relationship_revoked",
+    # Workflow governance.
+    "approval_requested",
+    "approval_decided",
+    "review_requested",
+    "review_request_cancelled",
+    "review_attested",
+    "library_published",
+    "library_accepted",
+    "library_rejected",
+    "library_deprecated",
+    "library_recalled",
+    "quota_set",
+    "quota_exceeded",
+]
+"""Closed vocabulary of auditable authentication and authority events.
+
+The CHECK constraint backing this is closed too, so a missing value refuses
+the audited mutation. Authorization denials use ``auth_failure`` with a
+failure category; business-rule refusals retain their own categories.
+"""
+
+AuthAuditOutcome = Literal["success", "failure"]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class AuthAuditEventInput:
+    """One validated event in a single Landscape audit transaction."""
+
+    event_type: AuthAuditEventType
+    outcome: AuthAuditOutcome
+    provider: AuthProviderType
+    user_id: str | None
+    username: str | None
+    failure_category: str | None
+    request_id: str | None
+    client_host: str | None
+    user_agent: str | None
+    metadata: Mapping[str, object]
+    identity_id: str | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "metadata")

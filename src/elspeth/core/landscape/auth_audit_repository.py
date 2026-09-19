@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal, get_args
+from typing import get_args
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.auth import AuthAuditEventInput, AuthAuditEventType, AuthAuditOutcome, AuthProviderType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
 from elspeth.core.ids import generate_id
@@ -16,54 +16,6 @@ from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.schema import auth_events_table
-
-AuthAuditEventType = Literal[
-    # Authentication.
-    "login",
-    "token_issued",
-    "auth_failure",
-    "logout",
-    # Admission and authority. Every one of these is an admin mutation whose
-    # row is written synchronously, before the response.
-    "identity_activated",
-    "identity_disabled",
-    "identity_enabled",
-    "role_granted",
-    "role_revoked",
-    "relationship_asserted",
-    "relationship_revoked",
-    # Workflow governance.
-    "approval_requested",
-    "approval_decided",
-    "review_requested",
-    "review_request_cancelled",
-    "review_attested",
-    "library_published",
-    "library_accepted",
-    "library_rejected",
-    "library_deprecated",
-    "library_recalled",
-    "quota_set",
-    "quota_exceeded",
-]
-"""Closed vocabulary of auditable authentication and authority events.
-
-The CHECK constraint backing this is closed too, so a MISSING value is a
-self-inflicted outage: R4 refuses the mutation whose audit write failed, and
-the write fails on the constraint. The list therefore has to be right while
-the epoch is open — adding one afterwards is a table rewrite and a second
-service-stop window.
-
-Authorization denials deliberately have no member here. ``auth_failure``
-exists, ``failure_category`` is an unconstrained ``String(64)`` and
-``metadata_json`` is free-form, so ``{route, required_role}`` under
-``failure_category='authz_denied'`` is writable with no schema change. And
-business-rule refusals keep their own categories rather than being filed as
-authorization denials: an authorized caller hitting a rule is not an
-escalation attempt, and conflating the two poisons the audit view.
-"""
-
-AuthAuditOutcome = Literal["success", "failure"]
 
 # Derived, not restated: a runtime guard that repeats its own contract drifts
 # from it silently, and this one decides whether an audit row is written at
@@ -187,6 +139,29 @@ class AuthAuditRepository:
             context=f"record_auth_event event_type={event_type} outcome={outcome}",
         )
         return event_id
+
+    def record_auth_events(self, events: tuple[AuthAuditEventInput, ...]) -> tuple[str, ...]:
+        """Commit a related event set atomically in one Landscape transaction."""
+        if type(events) is not tuple or not events or any(type(event) is not AuthAuditEventInput for event in events):
+            raise TypeError("auth audit batch requires a nonempty tuple of exact event inputs")
+        records = [
+            self._auth_event_values(
+                event_type=event.event_type,
+                outcome=event.outcome,
+                provider=event.provider,
+                user_id=event.user_id,
+                username=event.username,
+                failure_category=event.failure_category,
+                request_id=event.request_id,
+                client_host=event.client_host,
+                user_agent=event.user_agent,
+                metadata=event.metadata,
+                identity_id=event.identity_id,
+            )
+            for event in events
+        ]
+        self._insert_auth_events([values for _event_id, values in records], context="record_auth_events_batch")
+        return tuple(event_id for event_id, _values in records)
 
     def record_login_success_and_token_issued(
         self,

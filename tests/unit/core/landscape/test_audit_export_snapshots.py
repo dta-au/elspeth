@@ -277,6 +277,54 @@ def test_reader_rejects_resigned_false_auth_event_coverage(monkeypatch: pytest.M
         )
 
 
+def test_reader_verifies_compartment_marking_and_refuses_resigned_omission(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.core.landscape.execution.audit_export_snapshots import _verify_snapshot_graph
+
+    store = _MemoryContentStore()
+    config = replace(
+        _derivation_config(signed=True),
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="research-a",
+    )
+    config_record = {"record_type": "audit_export_config", "public_config": config.public_snapshot_config()}
+    coverage = {
+        "record_type": "auth_event_coverage",
+        "policy": "omitted",
+        "selection_cutoff": None,
+        "selected_count": None,
+        "reason": "not_requested",
+        "selection_basis": None,
+    }
+    valid = _candidate(store, records=[{"record_type": "run"}, config_record, coverage], signed=True, config=config)
+    _verify_snapshot_graph(
+        valid.snapshot,
+        valid.chunks,
+        resolve_registered=store.content.__getitem__,
+        signed_manifest_verifier=_signed_manifest_verifier,
+        record_signature_verifier=_record_signature_verifier,
+    )
+
+    # Even a signer that re-signs every byte cannot remove the required v2
+    # field and have the registered reader accept the artifact.
+    missing = {key: value for key, value in config.public_snapshot_config().items() if key != "compartment_id"}
+    with monkeypatch.context() as producer:
+        producer.setattr("elspeth.contracts.audit_export._coverage_checked_records", lambda records, config: iter(records))
+        forged = _candidate(
+            store,
+            records=[{"record_type": "run"}, {"record_type": "audit_export_config", "public_config": missing}, coverage],
+            signed=True,
+            config=config,
+        )
+    with pytest.raises(AuditIntegrityError, match="coverage"):
+        _verify_snapshot_graph(
+            forged.snapshot,
+            forged.chunks,
+            resolve_registered=store.content.__getitem__,
+            signed_manifest_verifier=_signed_manifest_verifier,
+            record_signature_verifier=_record_signature_verifier,
+        )
+
+
 def _repository(db: LandscapeDB) -> AuditExportSnapshotRepository:
     return AuditExportSnapshotRepository(db.engine)
 

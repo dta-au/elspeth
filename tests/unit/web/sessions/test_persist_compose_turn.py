@@ -23,13 +23,23 @@ from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions._persist_payload import StatePayload
 from elspeth.web.sessions.models import session_operation_fences_table
-from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.service import SessionServiceImpl, _valid_compartment_ingress_metadata
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.conftest import _make_session as _make_session_row
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _TEST_FENCE_NAMESPACE = UUID("6794cf0c-4b9d-40b9-ad19-d6f9afff30dd")
+
+
+def test_guided_checkpoint_ingress_requires_exact_digest_and_sorted_markings() -> None:
+    valid = {"text_sha256": "a" * 64, "foreign_compartment_ids": ["foreign-a", "foreign-b"]}
+    assert _valid_compartment_ingress_metadata(valid)
+    assert not _valid_compartment_ingress_metadata({**valid, "text_sha256": "A" * 64})
+    assert not _valid_compartment_ingress_metadata({**valid, "foreign_compartment_ids": ["foreign-b", "foreign-a"]})
+    assert not _valid_compartment_ingress_metadata({**valid, "foreign_compartment_ids": ["foreign-a", "foreign-a"]})
+    assert not _valid_compartment_ingress_metadata({**valid, "foreign_compartment_ids": ["foreign_a"]})
+    assert not _valid_compartment_ingress_metadata({**valid, "pasted_text": "sensitive"})
 
 
 def _test_compose_context(session_id: str) -> SessionOperationContext:

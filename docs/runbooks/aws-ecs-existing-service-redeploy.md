@@ -39,6 +39,12 @@ still exists. Otherwise keep traffic drained and repair forward.
   for an explicitly approved fresh database reported as `MISSING`; `STALE` is
   a stop.
 
+An epoch-crossing identity release uses the database-owner archive/recreate
+path in the [identity workflow cutover handoff](identity-workflow-cutover.md)
+before this image/config procedure. The stopped store's cohort export and
+post-initialization re-admission are part of that window; this redeploy does
+not perform them.
+
 Set only operator-selected, non-secret inputs:
 
 ```bash

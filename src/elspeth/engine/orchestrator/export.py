@@ -64,6 +64,9 @@ def prepare_audit_export_binding(
     sink_name = settings.landscape.export.sink
     if sink_name is None:
         raise ValueError("Export sink name is None")
+    # This precedes sink admission and snapshot I/O. Fresh CLI runs validate
+    # earlier, before run start; direct and resume callers still fail closed.
+    settings.landscape.export.public_snapshot_config()
     binding = sink_factory(sink_name)
     sink_name, sink, modes = _validate_audit_export_binding_provenance(settings, binding)
     admission = validate_pipeline_sink_effect_capabilities(

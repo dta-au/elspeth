@@ -351,6 +351,54 @@ class BlobQuotaExceededError(BlobError):
         _guard_frozen_attr(self, name, value)
 
 
+class IdentityStorageQuotaExceededError(BlobQuotaExceededError):
+    """The identity's live blobs would exceed its cap or the container ceiling."""
+
+    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {"session_id", "current_bytes", "limit_bytes", "identity_id", "cap", "ceiling", "usage", "additional_bytes"}
+    )
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        identity_id: str,
+        cap: int | None,
+        ceiling: int | None,
+        usage: int,
+        additional_bytes: int,
+    ) -> None:
+        bounds = [bound for bound in (cap, ceiling) if bound is not None]
+        if not bounds:
+            raise ValueError("IdentityStorageQuotaExceededError requires a cap or ceiling")
+        limit = min(bounds)
+        BlobError.__init__(
+            self,
+            f"Identity {identity_id} blob storage ({usage} bytes) plus {additional_bytes} bytes would exceed its storage quota ({limit} bytes)",
+        )
+        self.session_id = session_id
+        self.current_bytes = usage
+        self.limit_bytes = limit
+        self.identity_id = identity_id
+        self.cap = cap
+        self.ceiling = ceiling
+        self.usage = usage
+        self.additional_bytes = additional_bytes
+
+
+class StorageAccountingUnavailableError(BlobError):
+    """A byte admitting write cannot establish its storage accounting."""
+
+    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset({"session_id"})
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"Storage accounting for session {session_id} is unavailable; the blob write is refused")
+        self.session_id = session_id
+
+    def __setattr__(self, name: str, value: object) -> None:
+        _guard_frozen_attr(self, name, value)
+
+
 class BlobStateError(BlobError):
     """Raised when a blob's status precludes the requested operation."""
 

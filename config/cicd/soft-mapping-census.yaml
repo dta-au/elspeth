@@ -31,6 +31,8 @@ files:
     dict[str, object]: 1
   src/elspeth/contracts/audit_protocols.py:
     Mapping[str, object]: 1
+  src/elspeth/contracts/auth.py:
+    Mapping[str, object]: 1
   src/elspeth/contracts/barrier_scalars.py:
     dict[str, Any]: 7
   src/elspeth/contracts/call_data.py:
@@ -667,7 +669,8 @@ files:
   src/elspeth/web/app.py:
     dict[str, object]: 2
   src/elspeth/web/auth/audit.py:
-    dict[str, object]: 4
+    Mapping[str, object]: 7
+    dict[str, object]: 5
   src/elspeth/web/auth/id_token.py:
     boundary: 2
   src/elspeth/web/auth/local.py:
@@ -1033,9 +1036,9 @@ files:
     dict[str, object]: 2
 totals:
   Mapping[str, Any]: 876
-  Mapping[str, object]: 298
+  Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1134
-  dict[str, object]: 403
-  soft: 2724
+  dict[str, object]: 404
+  soft: 2733

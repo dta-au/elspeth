@@ -45,6 +45,7 @@ def _settings(deployment_target: str, state_mode: str) -> Any:
         landscape_url=landscape_url,
         session_db_url=session_url,
         landscape_passphrase=None,
+        compartment_id="alpha",
         get_landscape_url=lambda: landscape_url,
         get_session_db_url=lambda: session_url,
     )
@@ -59,6 +60,7 @@ def test_from_settings_schema_policy_follows_resolved_state_mode(
     recorder = AuthAuditRecorder.from_settings(_settings(deployment_target, state_mode))
 
     assert recorder.create_tables is expected
+    assert recorder.compartment_id == "alpha"
 
 
 def test_from_settings_external_mode_retains_raw_explicit_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -414,6 +416,7 @@ def test_identity_retirement_is_recorded_as_an_operator_disable_with_its_cause(m
             "cause": "credential_deleted",
             "retired_subject": "ada#retired-identity-1",
             "reason": "local credential deleted",
+            "compartment_id": None,
         },
     )
 
@@ -645,6 +648,110 @@ def _metadata(row: Any) -> dict[str, Any]:
     import json
 
     return json.loads(row.metadata_json)
+
+
+def test_compartment_stamped_on_paired_login_request_and_no_request_rows(tmp_path: Any) -> None:
+    url = f"sqlite:///{tmp_path / 'compartment-audit.db'}"
+    recorder = AuthAuditRecorder(landscape_url=url, landscape_passphrase=None, create_tables=True, compartment_id="alpha")
+    recorder.record_login_success_and_token_issued(
+        _request(),
+        provider="local",
+        user_id="alice",
+        username="alice",
+        access_token=_issued_token(),
+    )
+    recorder.record_identity_enabled(
+        _request(),
+        provider="local",
+        identity_id="identity-1",
+        username="alice",
+        actor_identity_id="admin-1",
+        note="returned",
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    recorder.record_identity_retired(
+        provider="local",
+        identity_id="identity-1",
+        username="alice",
+        retired_subject="retired",
+        reason="deleted",
+    )
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["login", "token_issued", "identity_enabled", "identity_disabled"]
+    assert [_metadata(row)["compartment_id"] for row in rows] == ["alpha"] * 4
+
+
+def test_unconfigured_auth_audit_still_has_explicit_null_compartment(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_login_failure(_request(), provider="local", username="unknown", failure_category="invalid_credentials")
+    (row,) = _durable_rows(url)
+    assert _metadata(row)["compartment_id"] is None
+
+
+def test_auth_audit_rejects_a_caller_compartment_override() -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    repository = create_autospec(AuthAuditRepository, instance=True)
+    proxy = audit_module._CompartmentStampedAuthAudit(repository, "alpha")
+    with pytest.raises(AuditIntegrityError, match="cannot override"):
+        proxy.record_auth_event(
+            event_type="logout",
+            outcome="success",
+            provider="local",
+            user_id="alice",
+            username="alice",
+            failure_category=None,
+            request_id=None,
+            client_host=None,
+            user_agent=None,
+            metadata={"compartment_id": "foreign"},
+        )
+    repository.record_auth_event.assert_not_called()
+
+
+def test_approval_supersession_writes_cause_and_trigger_to_landscape(tmp_path: Any) -> None:
+    from datetime import UTC, datetime
+
+    from elspeth.web.coordination.approval_authority import ApprovalBinding, ApprovalRecord, ApprovalSupersession
+
+    now = datetime(2026, 9, 19, tzinfo=UTC)
+    approval = ApprovalRecord(
+        approval_id="approval-1",
+        session_id="session-1",
+        state_id="state-1",
+        binding=ApprovalBinding("config", "canonical", "manifest", "catalog", "generation", "policy"),
+        requested_by_identity_id="author",
+        approver_identity_id="addressed",
+        requested_at=now,
+        decided_at=now,
+        decision="superseded",
+        request_note="please review",
+        decision_seen_at=None,
+        decided_by_identity_id="original-decider",
+        decision_note=None,
+        revoked_by_identity_id=None,
+        revocation_actor_kind=None,
+        revocation_event_id=None,
+    )
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_approval_superseded(
+        ApprovalSupersession(
+            approval=approval,
+            provider="local",
+            actor_identity_id="rejecting-decider",
+            cause="later_rejection",
+            trigger_approval_id="approval-2",
+        )
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.identity_id, row.provider) == ("approval_decided", "rejecting-decider", "local")
+    assert {key: _metadata(row)[key] for key in ("approval_id", "decision", "cause", "trigger_approval_id")} == {
+        "approval_id": "approval-1",
+        "decision": "superseded",
+        "cause": "later_rejection",
+        "trigger_approval_id": "approval-2",
+    }
 
 
 _PROVENANCE: dict[str, object] = {"on_behalf_of": None, "console_request_id": None}
@@ -892,7 +999,7 @@ def test_logout_writes_a_request_bound_row(tmp_path: Any) -> None:
         "ada",
     )
     assert (row.request_id, row.client_host, row.user_agent) == ("request-id", "127.0.0.1", "bounded-agent")
-    assert _metadata(row) == {"method": "POST", "path": "/api/auth/login"}
+    assert _metadata(row) == {"method": "POST", "path": "/api/auth/login", "compartment_id": None}
 
 
 def test_an_admin_mutation_audit_failure_propagates_and_is_logged_by_operation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1090,4 +1197,172 @@ def test_quota_exceeded_row_carries_dimension_cap_ceiling_and_usage(tmp_path: An
         "usage": 1000,
         "identity_policy_id": "quota-identity",
         "container_policy_id": "quota-container",
+        "compartment_id": None,
     }
+
+
+def test_storage_quota_exceeded_row_names_storage_and_measured_usage(tmp_path: Any) -> None:
+    from elspeth.web.coordination.quota_authority import QuotaExceeded
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_quota_exceeded(
+        QuotaExceeded(
+            identity_id="identity-1",
+            provider="oidc",
+            operation="session_fork",
+            dimension="storage",
+            cap=100,
+            ceiling=None,
+            usage=90,
+            identity_policy_id="storage-identity",
+            container_policy_id=None,
+        )
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome, row.provider, row.identity_id, row.failure_category) == (
+        "quota_exceeded",
+        "failure",
+        "oidc",
+        "identity-1",
+        "quota_exceeded_storage",
+    )
+    assert _metadata(row) == {
+        "actor": "system",
+        "operation": "session_fork",
+        "dimension": "storage",
+        "cap": 100,
+        "ceiling": None,
+        "usage": 90,
+        "identity_policy_id": "storage-identity",
+        "container_policy_id": None,
+        "compartment_id": None,
+    }
+
+
+def test_review_rows_anchor_on_actor_and_identify_authorizing_request(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_review_requested(
+        _request(),
+        provider="local",
+        request_id="req-1",
+        session_id="sess-1",
+        state_id="state-1",
+        requested_by_identity_id="alice",
+        reviewer_identity_id="bob",
+        note="please look",
+    )
+    recorder.record_review_request_cancelled(
+        None,
+        provider="local",
+        request_id="req-1",
+        session_id="sess-1",
+        state_id="state-1",
+        requested_by_identity_id="alice",
+    )
+    recorder.record_review_attested(
+        _request(),
+        provider="local",
+        attestation_id="att-1",
+        authorizing_request_id="req-2",
+        session_id="sess-1",
+        state_id="state-1",
+        payload_digest="sha256:" + "ab" * 32,
+        reviewer_identity_id="bob",
+        author_identity_id="alice",
+        verdict="changes_requested",
+        note="rename the sink",
+    )
+
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["review_requested", "review_request_cancelled", "review_attested"]
+    assert [row.identity_id for row in rows] == ["alice", "alice", "bob"]
+    assert all((row.outcome, row.provider, row.user_id, row.username) == ("success", "local", None, None) for row in rows)
+    assert (rows[0].request_id, rows[0].client_host, rows[0].user_agent) == ("request-id", "127.0.0.1", "bounded-agent")
+    assert (rows[1].request_id, rows[1].client_host, rows[1].user_agent) == (None, None, None)
+    requested, cancelled, attested = (_metadata(row) for row in rows)
+    assert (requested["actor"], requested["request_id"], requested["session_id"], requested["state_id"]) == (
+        "alice",
+        "req-1",
+        "sess-1",
+        "state-1",
+    )
+    assert (requested["reviewer_identity_id"], requested["note"]) == ("bob", "please look")
+    assert (cancelled["actor"], cancelled["request_id"]) == ("alice", "req-1")
+    assert (
+        attested["actor"],
+        attested["attestation_id"],
+        attested["authorizing_request_id"],
+        attested["author_identity_id"],
+        attested["verdict"],
+        attested["note"],
+    ) == ("bob", "att-1", "req-2", "alice", "changes_requested", "rename the sink")
+    assert (attested["session_id"], attested["state_id"], attested["payload_digest"]) == (
+        "sess-1",
+        "state-1",
+        "sha256:" + "ab" * 32,
+    )
+    assert all({key: _metadata(row)[key] for key in _PROVENANCE} == _PROVENANCE for row in rows)
+
+
+def test_library_rows_anchor_on_publisher_and_keep_source_compartment_distinct(tmp_path: Any) -> None:
+    url = f"sqlite:///{tmp_path / 'library-audit.db'}"
+    recorder = AuthAuditRecorder(landscape_url=url, landscape_passphrase=None, create_tables=True, compartment_id="audit-alpha")
+    recorder.record_library_published(
+        _request(),
+        provider="oidc",
+        entry_id="entry-1",
+        publisher_identity_id="alice",
+        actor_identity_id="alice",
+        payload_digest="a" * 64,
+        entry_compartment_id="source-beta",
+        title="classify tickets",
+        version=1,
+        published_from_session_id="session-1",
+    )
+    curation = {
+        "entry_id": "entry-1",
+        "publisher_identity_id": "alice",
+        "actor_identity_id": "carol",
+        "payload_digest": "a" * 64,
+        "entry_compartment_id": "source-beta",
+    }
+    recorder.record_library_accepted(_request(), provider="oidc", note=None, **curation)
+    recorder.record_library_rejected(None, provider="oidc", note="x" * 4096, **curation)
+    recorder.record_library_deprecated(_request(), provider="oidc", note="superseded", **curation)
+    recorder.record_library_recalled(_request(), provider="oidc", note=None, **curation)
+
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == [
+        "library_published",
+        "library_accepted",
+        "library_rejected",
+        "library_deprecated",
+        "library_recalled",
+    ]
+    assert all(
+        (row.outcome, row.provider, row.identity_id, row.user_id, row.username) == ("success", "oidc", "alice", None, None) for row in rows
+    )
+    metadata = [_metadata(row) for row in rows]
+    assert [(item["actor"], item["entry_compartment_id"], item["compartment_id"]) for item in metadata] == [
+        ("alice", "source-beta", "audit-alpha"),
+        ("carol", "source-beta", "audit-alpha"),
+        ("carol", "source-beta", "audit-alpha"),
+        ("carol", "source-beta", "audit-alpha"),
+        ("carol", "source-beta", "audit-alpha"),
+    ]
+    assert (
+        metadata[0]["entry_id"],
+        metadata[0]["payload_digest"],
+        metadata[0]["title"],
+        metadata[0]["version"],
+        metadata[0]["published_from_session_id"],
+    ) == (
+        "entry-1",
+        "a" * 64,
+        "classify tickets",
+        1,
+        "session-1",
+    )
+    assert [item["note"] for item in metadata[1:]] == [None, "x" * 512, "superseded", None]
+    assert rows[2].request_id is None
+    assert all({key: item[key] for key in _PROVENANCE} == _PROVENANCE for item in metadata)

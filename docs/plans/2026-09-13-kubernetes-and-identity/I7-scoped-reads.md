@@ -1,5 +1,7 @@
 ### Task I7: Scoped reads — workflow inspect, approver audit view, delegated administration
 
+> **Current execution note (2026-09-19):** The 2026-09-19 [execution map](../2026-09-19-identity-workflow-finalization.md) supersedes the addressed-only approval predicate below. Any active non-author approver with a live grant may inspect an open request; the addressed identity only affects inbox order. Reuse the same predicate at inbox, inspect and decide, and re-anchor source references.
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I6. Runs before: I9. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered after I6 (I0 → I8 → I1 → I2 → I3 → {I4 ∥ I5} → I6 → I7); I9 follows it.

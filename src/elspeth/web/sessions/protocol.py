@@ -32,7 +32,12 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
-from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
+from elspeth.contracts.chargeable_admission import (
+    AdmissionRefusalReason,
+    ChargeableAdmissionDecision,
+    ChargeableAdmissionPolicy,
+    ChargeableOperation,
+)
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -52,6 +57,7 @@ from elspeth.web.composer.guided.deferred_intents import (
 )
 from elspeth.web.composer.guided.protocol import TurnType
 from elspeth.web.composer.guided.state_machine import GUIDED_MAX_CHAT_TURNS, ComponentTarget
+from elspeth.web.coordination.approval_authority import ApprovalGateInputs
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
@@ -276,6 +282,8 @@ CompositionStateProvenance = Literal[
 
 AuditAccessWriterPrincipal = Literal["audit_grade_view", "admin_tool", "workflow_inspect"]
 AUDIT_GRADE_VIEW_WRITER_PRINCIPAL: Literal["audit_grade_view"] = "audit_grade_view"
+WORKFLOW_INSPECT_WRITER_PRINCIPAL: Literal["workflow_inspect"] = "workflow_inspect"
+WORKFLOW_INSPECT_REQUEST_PATH_TEMPLATE = "/api/workflow/inspect/{session_id}/{state_id}"
 AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST: frozenset[str] = frozenset(
     {
         "include_tool_rows",
@@ -3252,12 +3260,17 @@ class InterpretationUnsupportedChoiceError(InterpretationResolveError):
 
 
 class AuditAccessLogWriteError(RuntimeError):
-    """Audit-grade transcript access could not be recorded.
+    """Required access disclosure could not be recorded.
 
     ``include_tool_rows=true`` exposes audit-grade transcript rows. If
     that access cannot be written to ``audit_access_log`` first, callers
-    must fail closed and return no transcript rows.
+    must fail closed and return no transcript rows. Workflow inspection has
+    the same requirement before exposing another identity's composition.
     """
+
+
+class WorkflowInspectDenied(RuntimeError):
+    """The caller has no live request-scoped authority to inspect a state."""
 
 
 class ToolCallIDMismatchError(RuntimeError):
@@ -3307,7 +3320,7 @@ class SessionArchiveDisposition(StrEnum):
 
 
 class AuditAccessLogAuthority(Protocol):
-    """Handle-free authority for one audit-grade transcript access row."""
+    """Handle-free authority for audited transcript and workflow reads."""
 
     def record_audit_grade_view(
         self,
@@ -3317,6 +3330,15 @@ class AuditAccessLogAuthority(Protocol):
         auth_provider_type: AuthProviderType,
         request_path: str,
         query_args: Mapping[str, str],
+        ip_address: str | None,
+    ) -> AuditAccessLogRecord: ...
+
+    def record_workflow_inspect(
+        self,
+        *,
+        session_id: str,
+        state_id: str,
+        requesting_principal: str,
         ip_address: str | None,
     ) -> AuditAccessLogRecord: ...
 
@@ -3430,9 +3452,15 @@ class SessionOperationInterpretationMutations(Protocol):
 class SessionOperationRunMutations(Protocol):
     """Run mutations available inside one exact EXECUTE operation fence."""
 
-    def issue_start_permit(self, *, run_id: UUID, policy: ChargeableAdmissionPolicy) -> RunStartPermitRecord: ...
+    def check_approval_binding(self, *, state_id: UUID, approval: ApprovalGateInputs) -> AdmissionRefusalReason | None: ...
 
-    def assess_start_admission(self, *, run_id: UUID, policy: ChargeableAdmissionPolicy) -> RunStartPermitRecord: ...
+    def issue_start_permit(
+        self, *, run_id: UUID, policy: ChargeableAdmissionPolicy, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord: ...
+
+    def assess_start_admission(
+        self, *, run_id: UUID, policy: ChargeableAdmissionPolicy, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord: ...
 
     def observe_start_permit_for_cleanup(self, *, run_id: UUID) -> RunStartPermitRecord: ...
 
@@ -4728,10 +4756,21 @@ class SessionServiceProtocol(Protocol):
         execution_input: RunExecutionInput | None = None,
     ) -> RunRecord: ...
 
-    async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord: ...
+    async def check_approval_binding(
+        self,
+        session_id: UUID,
+        state_id: UUID,
+        *,
+        approval: ApprovalGateInputs,
+        session_operation_context: SessionOperationContext,
+    ) -> AdmissionRefusalReason | None: ...
+
+    async def issue_run_start_permit(
+        self, run_id: UUID, *, session_operation_context: SessionOperationContext, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord: ...
 
     async def assess_run_start_admission(
-        self, run_id: UUID, *, session_operation_context: SessionOperationContext
+        self, run_id: UUID, *, session_operation_context: SessionOperationContext, approval: ApprovalGateInputs | None = None
     ) -> RunStartPermitRecord: ...
 
     async def observe_run_start_permit_for_cleanup(

@@ -226,6 +226,7 @@ class _FakeReadinessService:
 @dataclass(slots=True)
 class _FakeSettings:
     shareable_link_lifetime_seconds: int = 30 * 24 * 3600
+    compartment_id: str | None = None
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -576,6 +577,46 @@ async def test_mark_ready_for_review_happy_path(
     payload = signer.verify(response.token)
     assert payload.session_id == session_record.id
     assert payload.payload_digest == response.payload_digest
+
+
+@pytest.mark.asyncio
+async def test_share_snapshot_marks_compartment_and_changes_digest(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    service._settings.compartment_id = "alpha"
+    first = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+    )
+    first_blob = json.loads(payload_store.retrieve(first.payload_digest.removeprefix("sha256:")))
+    assert first_blob["compartment_id"] == "alpha"
+
+    service._settings.compartment_id = "beta"
+    second = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+    )
+    second_blob = json.loads(payload_store.retrieve(second.payload_digest.removeprefix("sha256:")))
+    assert second_blob["compartment_id"] == "beta"
+    assert first.payload_digest != second.payload_digest
 
 
 @pytest.mark.asyncio
@@ -1722,6 +1763,8 @@ async def test_resolve_token_reports_absent_username_for_pre_field_blob(
     )
     blob = json.loads(payload_store.retrieve(marked.payload_digest.removeprefix("sha256:")))
     del blob["created_by_username"]
+    # Historical immutable blobs also predate compartment marking.
+    blob.pop("compartment_id", None)
     legacy_hex = payload_store.store(canonical_json(blob).encode())
     now = datetime.now(UTC)
     legacy_token = signer.sign(

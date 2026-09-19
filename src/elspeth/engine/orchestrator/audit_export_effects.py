@@ -18,6 +18,8 @@ from uuid import uuid4
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
+    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_DERIVATION_VERSION,
     AuditExportContentDescriptor,
     AuditExportContentStore,
@@ -165,6 +167,7 @@ def _derivation_config(
         chunking_algorithm_version=config.chunking_algorithm_version,
         include_raw_error_rows=config.include_raw_error_rows,
         auth_events=config.auth_events,
+        compartment_id=config.compartment_id,
         per_chunk_byte_limit=_required_limit(config.per_chunk_byte_limit, "per_chunk_byte_limit"),
         per_chunk_record_limit=_required_limit(config.per_chunk_record_limit, "per_chunk_record_limit"),
         signing_mode=config.signing_mode,
@@ -331,6 +334,11 @@ def prepare_audit_export_snapshot(
     """
     if type(config) is not LandscapeExportSettings:
         raise TypeError("config must be exact LandscapeExportSettings")
+    if config.signing_mode == "hmac_sha256" and config.exporter_version not in (
+        AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
+        AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
+    ):
+        raise ValueError("legacy signed export may only be verified from an existing snapshot")
     run_id = coordination_token.run_id
     # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
     # Protocol, so the check admits any object carrying the right attribute names
@@ -357,6 +365,8 @@ def prepare_audit_export_snapshot(
             config.assert_signer_rotation_allowed(existing_signer_key_id=existing_signer_key_id)
         winner = snapshots.find_winner(read_model.connection, key)
         if winner is None:
+            if config.signing_mode == "hmac_sha256" and config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+                raise ValueError("legacy signed export may only be resumed from an existing snapshot")
             witness = read_model.get_export_terminal_witness(run_id)
             derivation = _derivation_config(witness, config, signing_key)
             exporter = LandscapeExporter(
@@ -364,6 +374,7 @@ def prepare_audit_export_snapshot(
                 signing_key=signing_key,
                 include_raw_error_rows=config.include_raw_error_rows,
                 auth_events=config.auth_events,
+                compartment_id=config.compartment_id,
                 read_model=read_model,
                 signer_key_id=config.signer_key_id,
                 export_format=config.format,

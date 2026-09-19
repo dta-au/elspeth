@@ -2283,3 +2283,14 @@ class TestWorkflowGovernanceSwitch:
     def test_governance_without_compartment_is_constructible_for_readiness(self) -> None:
         settings = _settings(registration_mode="closed", workflow_governance="on")
         assert settings.compartment_id is None
+
+
+class TestCompartmentId:
+    @pytest.mark.parametrize("value", ["a", "0", "alpha", "compartment-a", "a" * 63])
+    def test_accepts_bounded_lowercase_shape(self, value: str) -> None:
+        assert _settings(compartment_id=value).compartment_id == value
+
+    @pytest.mark.parametrize("value", ["Alpha", "-alpha", "alpha_beta", "alpha beta", "alpha\n", "a" * 64])
+    def test_rejects_bad_shape(self, value: str) -> None:
+        with pytest.raises(ValidationError, match="compartment_id must match"):
+            _settings(compartment_id=value)

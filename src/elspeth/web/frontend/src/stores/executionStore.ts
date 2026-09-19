@@ -111,6 +111,8 @@ interface ExecutionState {
   isExecuting: boolean;
   wsDisconnected: boolean;
   error: string | null;
+  /** Last exact-state approval refusal from execute; also shown beside readiness. */
+  pendingApproval: string | null;
   /**
    * Unacknowledged terminal outcome of the active run (elspeth-3a7b7c7b37).
    * Set inside applyRunEvent's terminal branch (WS, the primary source),
@@ -441,6 +443,7 @@ const initialExecutionState = {
   isExecuting: false,
   wsDisconnected: false,
   error: null as string | null,
+  pendingApproval: null as string | null,
   lastRunOutcome: null as RunOutcome | null,
   runDisclosureAckBySession: {} as Record<string, boolean>,
 };
@@ -458,6 +461,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       validationResult: null,
       validationError: null,
       error: null,
+      pendingApproval: null,
     });
     try {
       const result =
@@ -516,7 +520,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     }
     const requestSeq = ++executionRequestSeq;
     const stateId = useSessionStore.getState().compositionState?.id;
-    set({ isExecuting: true, error: null });
+    set({ isExecuting: true, error: null, pendingApproval: null });
     try {
       const { run_id } =
         fanoutAck === undefined && secretAck === undefined && stateId === undefined
@@ -586,6 +590,13 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
           pendingSecretFanoutAck: fanoutAck ?? null,
           error: null,
         });
+        return null;
+      }
+      if (apiErr.status === 409 && (apiErr.error_type === "approval_required" || apiErr.error_type === "approval_binding_mismatch")) {
+        const message = apiErr.error_type === "approval_required"
+          ? "Approval is required before this pipeline can run."
+          : "The approval no longer matches this pipeline. Request a new approval.";
+        set({ isExecuting: false, error: message, pendingApproval: message });
         return null;
       }
       if (
@@ -1058,7 +1069,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   },
 
   clearValidation() {
-    set({ validationResult: null, validationError: null });
+    set({ validationResult: null, validationError: null, pendingApproval: null });
   },
 
   reset() {

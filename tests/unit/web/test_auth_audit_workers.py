@@ -175,3 +175,62 @@ def test_completed_failure_is_observed_when_cancellation_wins_waiter_race() -> N
     asyncio.run(scenario())
     gc.collect()
     assert messages == []
+
+
+def test_shutdown_does_not_create_a_default_executor() -> None:
+    """Lifespan's Runner must not inherit a default executor to join at close."""
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        assert loop._default_executor is None
+        assert await async_workers.run_sync_in_worker(lambda: "ready") == "ready"
+        await async_workers.shutdown_async_workers()
+        assert loop._default_executor is None
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_propagates_worker_failure_without_default_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FailedExecutor:
+        def shutdown(self, wait: bool) -> None:
+            assert wait is True
+            raise RuntimeError("shutdown failed")
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(async_workers, "_SHARED_EXECUTOR", FailedExecutor())
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            await async_workers.shutdown_async_workers()
+        assert loop._default_executor is None
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_shutdown_leaves_thread_draining(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    class HeldExecutor:
+        def shutdown(self, wait: bool) -> None:
+            assert wait is True
+            started.set()
+            assert release.wait(5)
+            completed.set()
+
+    async def scenario() -> None:
+        monkeypatch.setattr(async_workers, "_SHARED_EXECUTOR", HeldExecutor())
+        shutdown = asyncio.create_task(async_workers.shutdown_async_workers())
+        try:
+            await _wait_until(started.is_set)
+            assert not shutdown.done()
+            shutdown.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await shutdown
+            assert not completed.is_set()
+        finally:
+            release.set()
+            await _wait_until(completed.is_set)
+        assert asyncio.get_running_loop()._default_executor is None
+
+    asyncio.run(scenario())

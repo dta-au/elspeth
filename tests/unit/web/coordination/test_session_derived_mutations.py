@@ -13,14 +13,17 @@ from tests.fixtures.identities import ensure_test_identity
 from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.coordination.approval_authority import ApprovalBinding, ApprovalTransactionAuthority, RepositoryApprovalAuthority
 from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.repository import SessionDerivedCustodyError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions.models import (
+    approvals_table,
     blob_inline_resolutions_table,
     blob_run_links_table,
     blobs_table,
     composition_states_table,
+    identity_roles_table,
     proposal_blob_effect_receipts_table,
     run_events_table,
     runs_table,
@@ -172,6 +175,75 @@ def test_composition_state_facet_allocates_versions_and_preserves_owned_lineage(
     assert [row.version for row in rows] == [1, 2]
     assert rows[0].sources == {"_version": 1, "data": {"orders": {"plugin": "csv", "options": {"path": "orders.csv"}}}}
     assert rows[1].derived_from_state_id == str(first.id)
+
+
+def test_state_advance_audits_approval_supersession_and_rolls_back_on_audit_failure(engine: Engine) -> None:
+    outcomes: list = []
+    authority = SQLiteLocalSessionOperationAuthority(engine, approval_supersession_recorder=outcomes.append)
+    session = _create(authority, title="approval supersession")
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    first = authority.mutate(context, lambda transaction: transaction.composition_states.append_state(_state_creation()))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="approver")
+        conn.execute(
+            insert(identity_roles_table).values(
+                role_id="approver-role",
+                identity_id="approver",
+                role="approver",
+                granted_by_identity_id="alice",
+                granted_at=datetime.now(UTC),
+            )
+        )
+    binding = ApprovalBinding("config", "canonical", "manifest", "catalog", "generation", "policy")
+    approval = ApprovalTransactionAuthority(engine).run(
+        str(session.id),
+        lambda token: RepositoryApprovalAuthority.request(
+            token,
+            session_id=str(session.id),
+            state_id=str(first.id),
+            binding=binding,
+            requested_by="alice",
+            approver="approver",
+            note=None,
+            record=lambda _record: None,
+        ),
+    )
+
+    def fail_audit(_outcome: object) -> None:
+        raise AuditIntegrityError("test audit failure")
+
+    refusing = SQLiteLocalSessionOperationAuthority(engine, approval_supersession_recorder=fail_audit)
+    with pytest.raises(AuditIntegrityError, match="test audit failure"):
+        refusing.mutate(
+            context, lambda transaction: transaction.composition_states.append_state(_state_creation(derived_from_state_id=first.id))
+        )
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(approvals_table.c.decision).where(approvals_table.c.approval_id == approval.approval_id)).scalar_one()
+            is None
+        )
+        assert (
+            conn.execute(
+                select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session.id))
+            ).scalar_one()
+            == 1
+        )
+
+    second = authority.mutate(
+        context, lambda transaction: transaction.composition_states.append_state(_state_creation(derived_from_state_id=first.id))
+    )
+    assert second.version == 2
+    assert [(outcome.approval.approval_id, outcome.cause) for outcome in outcomes] == [(approval.approval_id, "new_state")]
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(approvals_table.c.decision).where(approvals_table.c.approval_id == approval.approval_id)).scalar_one()
+            == "superseded"
+        )
 
 
 def test_composition_state_facet_rejects_wrong_kind_and_foreign_lineage_without_consuming_version(engine: Engine) -> None:

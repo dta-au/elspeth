@@ -34,6 +34,9 @@ import { RunOutcomeNotice } from "./components/execution/RunOutcomeNotice";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferencesPanel";
 import { UserAdminDialog } from "./components/settings/UserAdminDialog";
+import { AdminDialog } from "./components/admin/AdminDialog";
+import { MailboxDialog } from "./components/workflow/MailboxDialog";
+import { LibraryDialog } from "./components/library/LibraryDialog";
 import { HelloWorldTutorial } from "./components/tutorial";
 import {
   REQUEST_RUN_EVENT,
@@ -41,6 +44,7 @@ import {
   dispatchArtifactViewIntent,
 } from "./lib/composer-events";
 import { useAuthStore } from "./stores/authStore";
+import { useMailboxStore } from "./stores/mailboxStore";
 import { initStoreSubscriptions, requestValidate } from "./stores/subscriptions";
 import { useSessionStore } from "./stores/sessionStore";
 import { isGuidedBuildActive } from "./components/chat/guided/guidedBuildActive";
@@ -121,8 +125,18 @@ function App() {
   const logout = useAuthStore((s) => s.logout);
   const authUser = useAuthStore((s) => s.user);
   const [showUserAdmin, setShowUserAdmin] = useState(false);
+  const [showIdentityAdmin, setShowIdentityAdmin] = useState(false);
+  const [showMailbox, setShowMailbox] = useState(false);
+  const [showLibrary, setShowLibrary] = useState(false);
+  const identityAdminRole = useMailboxStore((state) => state.summary?.roles.includes("admin") ?? false);
   const openUserAdmin = useCallback(() => setShowUserAdmin(true), []);
   const closeUserAdmin = useCallback(() => setShowUserAdmin(false), []);
+  const openIdentityAdmin = useCallback(() => setShowIdentityAdmin(true), []);
+  const closeIdentityAdmin = useCallback(() => setShowIdentityAdmin(false), []);
+  const openMailbox = useCallback(() => setShowMailbox(true), []);
+  const closeMailbox = useCallback(() => setShowMailbox(false), []);
+  const openLibrary = useCallback(() => setShowLibrary(true), []);
+  const closeLibrary = useCallback(() => setShowLibrary(false), []);
   const openComposerSettings = useCallback(
     () => setShowComposerSettings(true),
     [],
@@ -144,6 +158,22 @@ function App() {
   // preserved across the entire shared-view lifecycle.
   const sharedToken = useSharedToken();
   const { isAuthenticated } = useAuth();
+
+  useEffect(() => {
+    if (!isAuthenticated || sharedToken !== null) return;
+    return useMailboxStore.getState().startPolling();
+  }, [isAuthenticated, sharedToken]);
+
+  useEffect(() => {
+    if (isAuthenticated) return;
+    setShowMailbox(false);
+    setShowIdentityAdmin(false);
+    setShowLibrary(false);
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (!identityAdminRole) setShowIdentityAdmin(false);
+  }, [identityAdminRole]);
 
   // Sync URL hash ↔ session/tab state for deep linking & back/forward
   const { redirectToast } = useHashRouter({
@@ -748,6 +778,9 @@ function App() {
         <AppHeader
           onOpenSettings={openComposerSettings}
           onSignOut={logout}
+          onOpenMailbox={openMailbox}
+          onOpenIdentityAdmin={openIdentityAdmin}
+          onOpenLibrary={openLibrary}
           onOpenUserManagement={
             authUser?.dev_admin === true ? openUserAdmin : undefined
           }
@@ -849,6 +882,11 @@ function App() {
             onClose={closeUserAdmin}
             currentUsername={authUser.username}
           />
+        )}
+        {showMailbox && <MailboxDialog onClose={closeMailbox} />}
+        {showLibrary && <LibraryDialog onClose={closeLibrary} />}
+        {showIdentityAdmin && identityAdminRole && authUser !== null && (
+          <AdminDialog onClose={closeIdentityAdmin} currentIdentityId={authUser.user_id} />
         )}
         <CommandPalette
           isOpen={showPalette}

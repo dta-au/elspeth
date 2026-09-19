@@ -59,11 +59,19 @@ that topology.
 
 ## Release compatibility
 
-The schema-incompatible 0.8.0 upgrade from 0.7.1 is not an in-place session
-database migration. Before a direct 0.7.1→0.8.0 upgrade, archive required
-evidence, drain and stop the old service, recreate the session database at the
-new epoch, and repair forward. Do not start 0.7.1 against the recreated 0.8.0
-session database.
+Every pre-1.0 schema-epoch crossing uses archive/export, service stop,
+recreation and forward repair. For a predecessor with identity administration,
+follow the [identity workflow cutover handoff](identity-workflow-cutover.md):
+export the stopped Sessions store's identity, grant and approver-edge cohort
+before dropping it; recreate both stale stores; initialize the final candidate
+schema; re-admit the eligible cohort; and send the notice after verifying
+admission. The SQLite path uses the
+[session DB reset runbook](staging-session-db-recreation.md) for file and
+sidecar custody. The external PostgreSQL path uses a database-owner
+archive/drop/recreate and then §Initialize external schemas once with
+schema-owner URLs, returning to runtime URLs before traffic. There is no
+in-place VM rebuild. Do not start the previous release against recreated
+stores.
 
 ## Install the immutable release
 

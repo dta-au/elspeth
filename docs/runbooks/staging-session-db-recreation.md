@@ -173,6 +173,13 @@ recreate fresh state, and retry. The release acceptance record must cite the
 session-epoch-59/Landscape-epoch-42 record when binding candidate and rollback
 decisions.
 
+For a later candidate that has used identity administration, the window also
+needs the [identity workflow cutover handoff](identity-workflow-cutover.md):
+export the stopped store's identity, grant and approver-edge cohort before the
+drop; re-admit eligible people after initialization; and issue the notice only
+after that re-admission succeeds. Measure the candidate's final epochs at its
+exact commit rather than carrying forward the 0.8.1 values above.
+
 Deployments crossing the 0.7.0 boundary from an older release must also account
 for the historical epoch-21 to epoch-22 Landscape reset described below.
 
@@ -275,6 +282,19 @@ this delivery is bound to a window that recreates the stores:
 
 `shareable_link_signing_key` is deliberately not derived — it keeps its own
 independent Secrets Manager binding — and is unaffected by this boundary.
+
+### Identity workflow cohort for a later schema cutover
+
+When the predecessor Sessions store has an `identities` table, follow the
+[identity workflow cutover handoff](identity-workflow-cutover.md) for the
+stopped-store mapping, grants and approver-edge export, the restored-ID
+record, role/edge re-admission, governance readiness, and operator notice.
+Every old bearer session is refused after recreation because its subject is
+an old `identity_id` absent from the new store. A successful login after
+re-admission does not recover Composer secrets, sessions, approvals, reviews,
+library entries or old session links to payload files. Pre-window signed
+Landscape exports remain evidence; verify the candidate's signed export
+includes `compartment_id` before declaring compatibility.
 
 ## Historical Cutover: 0.7.0 (two-DB reset)
 
@@ -730,6 +750,27 @@ if [ "$FOUND_DB_ARTIFACT" -eq 1 ]; then
     echo "Archived existing DB artifact set to $SNAPSHOT_DIR"
 fi
 
+# The archive is evidence, not the restoration input. For a predecessor
+# identity store, pause here while the operator exports its cohort from the
+# stopped live DB, as described in identity-workflow-cutover.md. The reset
+# cannot continue until all three export files exist. A pre-identity store
+# has no cohort to export and is handled by the older pending-account path.
+if [ -e "$DB_PATH" ]; then
+    IDENTITY_TABLE=$(sqlite3 "$DB_PATH" "SELECT name FROM sqlite_master WHERE type='table' AND name='identities';")
+    if [ "$IDENTITY_TABLE" = identities ]; then
+        echo "Export the identity cohort now; see docs/runbooks/identity-workflow-cutover.md."
+        read -r -p "After export and row-total comparison succeed, type EXPORTED to continue: " EXPORT_CONFIRM
+        if [ "$EXPORT_CONFIRM" != EXPORTED ]; then
+            echo "REFUSING: identity cohort export was not confirmed." >&2
+            exit 1
+        fi
+        sudo test -f "$SNAPSHOT_DIR/identity-mapping.pre.csv"
+        sudo test -f "$SNAPSHOT_DIR/identity-grants.pre.csv"
+        sudo test -f "$SNAPSHOT_DIR/identity-relationships.pre.csv"
+        sudo test -f "$SNAPSHOT_DIR/identity-export.complete"
+    fi
+fi
+
 for artifact in "${DB_ARTIFACTS[@]}"; do
     sudo rm -f "$artifact"
 done
@@ -790,7 +831,7 @@ B1 interpretation-surfacing fix is in the deployed build). Any of these in
 the journal means the deploy is not clean — stop and inspect before
 handing staging back to users.
 
-Before handing staging back to users, verify the `user_secrets` outcome the operator chose in the preconditions. Confirm the affected composer/provider flow reports the expected missing-secret state and that the operator has re-entered or reseeded any required staging secrets. Never reopen the predecessor archive in the current release. On the 0.8.0 cutover, also settle the identity lockout at this point: every local account is `pending` until an operator activates it, per [Every local account lands `pending` after this reset](#every-local-account-lands-pending-after-this-reset).
+Before handing staging back to users, verify the `user_secrets` outcome the operator chose in the preconditions. Confirm the affected composer/provider flow reports the expected missing-secret state and that the operator has re-entered or reseeded any required staging secrets. Never reopen the predecessor archive in the current release. On the 0.8.0 cutover, every local account is `pending` until an operator activates it, per [Every local account lands `pending` after this reset](#every-local-account-lands-pending-after-this-reset). On a later identity-workflow cutover, finish the [cohort re-admission and notice](identity-workflow-cutover.md#recreate-and-re-admit-within-the-window) before handing the service back.
 
 At the **end of the deploy window**, destroy or secure the archive directories created above. Each is a long-lived copy of live encrypted secret material. It is only inert if `settings.secret_key` was **rotated** during this deploy; if the key was reused, the archive is decryptable with the running app's key, so an unattended snapshot directory is equivalent to leaving a readable copy of every staging secret on disk. Deriving the encryption key from `settings.secret_key` rather than using it raw does not change that conclusion: the derivation is deterministic and unsalted, so holding `settings.secret_key` still yields the key the archived rows were written under. If evidence retention requires keeping an archive, rotate `settings.secret_key` or move the archive to access-controlled storage.
 

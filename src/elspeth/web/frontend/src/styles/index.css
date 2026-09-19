@@ -37,6 +37,9 @@
 @import "../components/workspace/workspace.css";
 @import "../components/chat/chat.css";
 @import "../components/chat/guided/guided.css";
+@import "../components/library/library.css";
+@import "../components/admin/admin.css";
+@import "../components/workflow/workflow.css";
 
 /* Overrides: @media (prefers-contrast: more) and (forced-colors: active).
    MUST import LAST so its rules apply on top of every component file above. */

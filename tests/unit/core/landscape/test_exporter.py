@@ -668,6 +668,8 @@ def _make_exporter(
     """Create an exporter with in-memory recorder fakes."""
     return LandscapeExporter(
         _fake_landscape_db(),
+        exporter_version="landscape-exporter-auth-v2" if signing_key is not None else "landscape-exporter-auth-v1",
+        compartment_id="test-compartment" if signing_key is not None else None,
         signing_key=signing_key,
         signer_key_id="test-signer-v1" if signing_key is not None else None,
         include_raw_error_rows=include_raw_error_rows,
@@ -807,7 +809,7 @@ class TestConstructor:
         read_model = _make_export_read_model()
 
         with patch("elspeth.core.landscape.exporter.RecorderFactory", autospec=True) as recorder_factory:
-            exporter = LandscapeExporter(db, read_model=read_model)
+            exporter = LandscapeExporter(db, read_model=read_model, exporter_version="landscape-exporter-auth-v1")
 
         recorder_factory.assert_not_called()
         assert not hasattr(read_model, "run_lifecycle")
@@ -1268,7 +1270,7 @@ class TestExportRunStreaming:
     def test_first_record_yields_before_later_query_families(self) -> None:
         """Pulling the first record must not touch nodes/edges/rows/batches/artifacts."""
         read_model = _SpyReadModel(_make_export_read_model(nodes=[_NODE], edges=[_EDGE], rows=[_make_row(0)]))
-        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model)
+        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, exporter_version="landscape-exporter-auth-v1")
 
         iterator = exporter.export_run("run-1")
         first = next(iterator)
@@ -1300,7 +1302,9 @@ class TestExportRunStreaming:
         # generator matches iter_rows_for_run's signature exactly, so no
         # suppression is needed now that the method is written out.
         read_model.iter_rows_for_run = counting_iter
-        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, row_batch_size=1)
+        exporter = LandscapeExporter(
+            _fake_landscape_db(), read_model=read_model, row_batch_size=1, exporter_version="landscape-exporter-auth-v1"
+        )
 
         iterator = exporter.export_run("run-1")
         first_row = next(record for record in iterator if record["record_type"] == "row")
@@ -1346,6 +1350,8 @@ def _make_derivation_config(
     signer_key_id: str,
     signing_key: bytes | None,
     source_run_id: str = "run-1",
+    exporter_version: str = "landscape-exporter-v1",
+    compartment_id: str | None = None,
 ) -> Any:
     from elspeth.contracts.audit_export import (
         AUDIT_EXPORT_SERIALIZATION_VERSION,
@@ -1357,7 +1363,7 @@ def _make_derivation_config(
         source_status="completed",
         source_completed_at="2026-01-15T13:00:00.000000Z",
         export_format="json",
-        exporter_version="landscape-exporter-v1",
+        exporter_version=exporter_version,
         serialization_version=AUDIT_EXPORT_SERIALIZATION_VERSION,
         chunking_algorithm_version="record-framing-v1",
         include_raw_error_rows=False,
@@ -1366,6 +1372,7 @@ def _make_derivation_config(
         signing_mode=signing_mode,  # type: ignore[arg-type]
         signer_key_id=signer_key_id,
         signing_key=signing_key,
+        compartment_id=compartment_id,
     )
 
 
@@ -1374,7 +1381,13 @@ def _unsigned_config() -> Any:
 
 
 def _hmac_config() -> Any:
-    return _make_derivation_config(signing_mode="hmac_sha256", signer_key_id="explicit-signer-v1", signing_key=b"explicit-key")
+    return _make_derivation_config(
+        signing_mode="hmac_sha256",
+        signer_key_id="explicit-signer-v1",
+        signing_key=b"explicit-key",
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
+    )
 
 
 class TestDerivationConfigSignEnforcement:
@@ -1428,6 +1441,34 @@ class TestDerivationConfigSignEnforcement:
         bundle = exporter.derive_run_bundle("run-1", sign=True, derivation_config=_hmac_config())
         assert bundle.final_manifest["signature"] is not None
         assert "signature" in bundle.record_objects[0]
+        assert (
+            next(record for record in bundle.record_objects if record["record_type"] == "audit_export_config")["public_config"][
+                "compartment_id"
+            ]
+            == "test-compartment"
+        )
+
+    @pytest.mark.parametrize("legacy_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
+    def test_signed_legacy_derivation_config_is_rejected_by_both_public_producers(self, legacy_version: str) -> None:
+        legacy_config = _make_derivation_config(
+            signing_mode="hmac_sha256",
+            signer_key_id="explicit-signer-v1",
+            signing_key=b"explicit-key",
+            exporter_version=legacy_version,
+        )
+        exporter = _make_exporter(signing_key=b"test-key")
+        with pytest.raises(ValueError, match="legacy signed export"):
+            exporter.derive_run_bundle("run-1", sign=True, derivation_config=legacy_config)
+
+        instance_exporter = LandscapeExporter(
+            _fake_landscape_db(),
+            signing_key=b"test-key",
+            signer_key_id="test-signer-v1",
+            read_model=_make_export_read_model(),
+            derivation_config=legacy_config,
+        )
+        with pytest.raises(ValueError, match="legacy signed export"):
+            list(instance_exporter.export_run("run-1", sign=True))
 
     def test_mismatched_source_run_id_still_fails_closed(self) -> None:
         exporter = _make_exporter()

@@ -68,6 +68,7 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
+from elspeth.web.compartments import is_compartment_id
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.telemetry_phase8 import (
@@ -221,6 +222,8 @@ class _BlobShape(TypedDict):
     # recipient who has no login and no way to resolve it. Absent on blobs minted
     # before this key existed — see the class docstring.
     created_by_username: NotRequired[str]
+    # Added after share blobs became immutable: old signed blobs omit it.
+    compartment_id: NotRequired[str | None]
 
 
 # Closed-set producer-side guard. The digest only proves bytes-on-disk
@@ -240,6 +243,7 @@ _BLOB_KEYS: Final[frozenset[str]] = frozenset(
         "audit_readiness",
         "created_by_user_id",
         "created_by_username",
+        "compartment_id",
     }
 )
 
@@ -279,12 +283,13 @@ def _build_snapshot(
     audit_readiness: AuditReadinessSnapshot,
     created_by_user_id: str,
     created_by_username: str,
+    compartment_id: str | None,
 ) -> _Snapshot:
     """Build the canonical-JSON snapshot blob and compute its content-address.
 
     The blob shape is the same one ``SharedInspectResponse`` deserialises
     on the resolve path — pipeline_metadata, composition_snapshot, yaml,
-    audit_readiness, created_by_user_id, created_by_username, created_at.
+    audit_readiness, created_by_user_id, created_by_username, compartment_id.
     This is the contractual wire shape for the share artifact.
 
     Both attribution fields are frozen into the blob: the identity id
@@ -322,6 +327,8 @@ def _build_snapshot(
     public_audit_readiness = _public_audit_readiness(audit_readiness)
     audit_readiness_dict = public_audit_readiness.model_dump(mode="json")
     audit_readiness_dict["checked_at"] = state_record.created_at.isoformat()
+    if compartment_id is not None and not is_compartment_id(compartment_id):
+        raise ValueError("shareable-review compartment_id does not match the configured shape")
     blob: _BlobShape = {
         "pipeline_metadata": pipeline_metadata,
         "composition_snapshot": composition_dict,
@@ -329,6 +336,7 @@ def _build_snapshot(
         "audit_readiness": audit_readiness_dict,
         "created_by_user_id": created_by_user_id,
         "created_by_username": created_by_username,
+        "compartment_id": compartment_id,
     }
     # Producer-side drift guard. ``_BlobShape: TypedDict`` is a static
     # type — Python does not enforce it at runtime. Without this assert,
@@ -499,6 +507,7 @@ class ShareableReviewService:
             audit_readiness=audit_readiness,
             created_by_user_id=user_id,
             created_by_username=username,
+            compartment_id=self._settings.compartment_id,
         )
 
         # Stamp expiry now so the same value lands in both the audit row

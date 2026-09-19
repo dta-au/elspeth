@@ -8,6 +8,7 @@ import {
 import { Button } from "@/components/ui";
 import { useTheme } from "@/hooks/useTheme";
 import { useAuthStore } from "@/stores/authStore";
+import { useMailboxStore } from "@/stores/mailboxStore";
 import type { UserProfile } from "@/types/index";
 
 interface UserMenuProps {
@@ -16,6 +17,9 @@ interface UserMenuProps {
   /** Present only when the signed-in user is the env-flagged dev admin
    *  (/api/auth/me dev_admin); absent, the item is not rendered. */
   onOpenUserManagement?: () => void;
+  onOpenMailbox?: () => void;
+  onOpenIdentityAdmin?: () => void;
+  onOpenLibrary?: () => void;
 }
 
 /**
@@ -68,6 +72,9 @@ export function UserMenu({
   onOpenSettings,
   onSignOut,
   onOpenUserManagement,
+  onOpenMailbox,
+  onOpenIdentityAdmin,
+  onOpenLibrary,
 }: UserMenuProps): JSX.Element {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -78,6 +85,7 @@ export function UserMenu({
   // via GET /api/auth/me — so no props flow through AppHeader and no new
   // fetch consumer is added (elspeth-312238838a).
   const user = useAuthStore((s) => s.user);
+  const isIdentityAdmin = useMailboxStore((state) => state.summary?.roles.includes("admin") ?? false);
   const themeLabel =
     resolvedTheme === "dark" ? "Switch to light theme" : "Switch to dark theme";
 
@@ -129,6 +137,24 @@ export function UserMenu({
     setOpen(false);
     onOpenUserManagement?.();
   }, [onOpenUserManagement]);
+
+  const onMailbox = useCallback(() => {
+    triggerRef.current?.focus();
+    setOpen(false);
+    onOpenMailbox?.();
+  }, [onOpenMailbox]);
+
+  const onIdentityAdmin = useCallback(() => {
+    triggerRef.current?.focus();
+    setOpen(false);
+    onOpenIdentityAdmin?.();
+  }, [onOpenIdentityAdmin]);
+
+  const onLibrary = useCallback(() => {
+    triggerRef.current?.focus();
+    setOpen(false);
+    onOpenLibrary?.();
+  }, [onOpenLibrary]);
 
   const onSignOutClick = useCallback(() => {
     setOpen(false);
@@ -234,6 +260,15 @@ export function UserMenu({
               Composer preferences
             </Button>
           </li>
+          {user !== null && onOpenMailbox !== undefined && <li className="user-menu-item">
+            <Button variant="bare" onClick={onMailbox} className="user-menu-action">Mailbox</Button>
+          </li>}
+          {user !== null && onOpenLibrary !== undefined && <li className="user-menu-item">
+            <Button variant="bare" onClick={onLibrary} className="user-menu-action">Shared library</Button>
+          </li>}
+          {user !== null && isIdentityAdmin && onOpenIdentityAdmin !== undefined && <li className="user-menu-item">
+            <Button variant="bare" onClick={onIdentityAdmin} className="user-menu-action">Identity administration</Button>
+          </li>}
           {onOpenUserManagement !== undefined && (
             <li className="user-menu-item">
               <Button

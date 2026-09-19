@@ -268,6 +268,7 @@ def test_postgres_public_signed_export_uses_one_repeatable_read_snapshot(postgre
         postgres_db,
         signing_key=b"snapshot-signing-key",
         signer_key_id="snapshot-signer-v1",
+        compartment_id="research-a",
     ).export_run("pg-export", sign=True)
     first = next(records)
     assert first["record_type"] == "run"
@@ -287,6 +288,10 @@ def test_postgres_public_signed_export_uses_one_repeatable_read_snapshot(postgre
         )
 
     remaining = list(records)
+    assert (
+        next(record for record in remaining if record["record_type"] == "audit_export_config")["public_config"]["compartment_id"]
+        == "research-a"
+    )
     assert not [record for record in remaining if record["record_type"] == "secret_resolution"]
     with postgres_db.engine.connect() as connection:
         assert connection.scalar(select(runs_table.c.settings_json).where(runs_table.c.run_id == "pg-export")) == '{"version": 2}'

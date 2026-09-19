@@ -166,10 +166,12 @@ Rows are in execution order within each workstream.
   eligibility (the addressed approver sorts first, but every active non-author
   approver may inspect and decide), required a later rejection to retire
   earlier approvals for that state, required an audit event for supersession,
-  and required `compartment_id` in signed Landscape exports. The I3/I6/I7/I9/I10/I11
+  required `compartment_id` in signed Landscape exports, bound reviewer
+  attestations to an open exact-state request, and included chat-pasted
+  state-creating text in compartment ingress evidence. The I3/I4/I6/I7/I9/I10/I11
   defaults and code excerpts below that conflict with these rulings are
   superseded by the [current identity execution map](../2026-09-19-identity-workflow-finalization.md).
-- **Historical open-decision list (raised 2026-09-14/15):** the four identity
+- **Historical open-decision list (raised 2026-09-14/15):** the six identity
   subjects resolved above are no longer open. Other questions in this list
   still need disposition before their affected tasks ship; each task states
   its earlier default for comparison.

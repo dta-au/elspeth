@@ -1,0 +1,88 @@
+.identity-admin-dialog {
+  max-height: min(90vh, 900px);
+  overflow-y: auto;
+}
+
+.identity-admin-section,
+.identity-admin-form {
+  display: grid;
+  gap: var(--space-md);
+}
+
+.identity-admin-section {
+  padding-top: var(--space-md);
+}
+
+.identity-admin-advisory {
+  border: 1px solid var(--color-warning);
+  border-radius: var(--radius-lg);
+  padding: var(--space-sm) var(--space-md);
+  margin: 0;
+}
+
+.identity-admin-tabs,
+.identity-admin-toolbar,
+.identity-admin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space-sm);
+}
+
+.identity-admin-tab {
+  padding: var(--space-sm);
+  color: var(--color-text-secondary);
+  border-bottom: 2px solid transparent;
+}
+
+.identity-admin-tab[aria-selected="true"] {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent);
+}
+
+.identity-admin-field {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.identity-admin-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-sm);
+}
+
+.identity-admin-form {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+}
+
+.identity-admin-form h3 {
+  margin: 0;
+}
+
+.identity-admin-table-scroll {
+  overflow-x: auto;
+}
+
+.identity-admin-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.identity-admin-table th,
+.identity-admin-table td {
+  padding: var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+}
+
+.identity-admin-table code {
+  overflow-wrap: anywhere;
+}
+
+.identity-admin-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+}
