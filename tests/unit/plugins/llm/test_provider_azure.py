@@ -118,6 +118,43 @@ def test_governance_guards_sdk_and_settles_error_once(preflight: bool, refused: 
     assert events == (["before"] if refused else ["before", "sdk", "after"])
 
 
+@pytest.mark.parametrize(
+    ("content", "finish_reason", "error_type", "error_message"),
+    [
+        ("   ", "stop", ContentPolicyError, "empty content"),
+        ("partial", "content_filter", LLMClientError, "unusable finish reason"),
+    ],
+)
+def test_runtime_preflight_rejects_unusable_completion(
+    content: str, finish_reason: str, error_type: type[LLMClientError], error_message: str
+) -> None:
+    recorder = FakeAuditRecorder()
+    provider = AzureLLMProvider(
+        endpoint="https://test.openai.azure.com/",
+        api_key="test-key",
+        api_version="2024-10-21",
+        deployment_name="test-model",
+        recorder=recorder,
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        approved_prompt_artifact_hash="a" * 64,
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish_reason)],
+        model="test-model",
+        usage=None,
+        model_dump=lambda: {"choices": [{"message": {"content": content}, "finish_reason": finish_reason}], "model": "test-model"},
+    )
+    provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
+
+    with pytest.raises(error_type, match=error_message):
+        provider.runtime_preflight(operation_id="op-1", model="test-model", coordination_token=_LEADER_TOKEN)
+
+    assert len(recorder.operation_calls) == 1
+    assert recorder.operation_calls[0]["approved_prompt_artifact_hash"] is None
+    assert provider._llm_clients == {}
+
+
 @dataclass
 class FakeTelemetryEmit:
     events: list[Any] = field(default_factory=list)
