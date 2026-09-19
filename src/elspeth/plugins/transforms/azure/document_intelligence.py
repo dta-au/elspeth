@@ -6,8 +6,7 @@ poll), and enriches the row with extracted content and structured facets.
 
 All HTTP flows through AuditedHTTPClient (full request/response audit, header
 fingerprinting so the api-key is never stored raw, telemetry, rate limiting).
-GA api-version 2024-11-30. See
-docs/specs/2026-06-30-azure-document-intelligence-transform-design.md.
+GA api-version 2024-11-30.
 
 SECURITY:
 - A SAS token embedded in a ``urlSource`` value is forwarded to Azure and
@@ -295,7 +294,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:5136c0d00660fc0e"
+    source_file_hash: str | None = "sha256:54b0ec728b7c5519"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -643,14 +642,26 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     ) -> Mapping[str, Any] | TransformResult:
         client = self._get_http_client(state_id, token_id=token_id, ctx=ctx)
         poll_deadline = started_at + self._poll_timeout_seconds
-        # Floor the interval at poll_interval_seconds so a Tier-3 ``Retry-After: 0`` (or any
-        # value below the configured floor) cannot spin a hot poll loop; cap at poll_max.
+        # Wait before the first GET. Honor Azure's Retry-After when present;
+        # the configured poll cap bounds our backoff, not Azure's requested delay.
+        first_delay = max(retry_after or 0.0, self._poll_interval_seconds)
+        if first_delay > 0:
+            now = time.monotonic()
+            if now >= poll_deadline:
+                return self._poll_timeout_result(started_at)
+            if self._shutdown.wait(timeout=min(first_delay, poll_deadline - now)):
+                return self._shutdown_result(started_at)
+
+        # Floor subsequent intervals at poll_interval_seconds so a Tier-3
+        # Retry-After: 0 cannot spin a hot poll loop; cap our backoff at poll_max.
         initial_interval = retry_after if retry_after is not None else self._poll_interval_seconds
         interval = min(max(initial_interval, self._poll_interval_seconds), self._poll_max_interval_seconds)
 
         while True:
             if self._shutdown.is_set():
                 return self._shutdown_result(started_at)
+            if time.monotonic() >= poll_deadline:
+                return self._poll_timeout_result(started_at)
 
             def do_call() -> Any:
                 return client.get(operation_url, timeout=self._request_timeout_seconds)
@@ -660,6 +671,8 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
             )
             if isinstance(resp, TransformResult):
                 return resp
+            if time.monotonic() >= poll_deadline:
+                return self._poll_timeout_result(started_at)
 
             data = self._parse_json_strict(resp)
             if isinstance(data, TransformResult):
@@ -684,7 +697,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
             if status in ("notStarted", "running"):
                 now = time.monotonic()
                 if now >= poll_deadline:
-                    return TransformResult.error({"reason": "poll_timeout", "elapsed_seconds": now - started_at}, retryable=False)
+                    return self._poll_timeout_result(started_at)
                 sleep_seconds = min(interval, poll_deadline - now)
                 if sleep_seconds > 0 and self._shutdown.wait(timeout=sleep_seconds):
                     return self._shutdown_result(started_at)
@@ -716,6 +729,9 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
 
     def _shutdown_result(self, started_at: float) -> TransformResult:
         return TransformResult.error({"reason": "shutdown_requested", "elapsed_seconds": time.monotonic() - started_at}, retryable=False)
+
+    def _poll_timeout_result(self, started_at: float) -> TransformResult:
+        return TransformResult.error({"reason": "poll_timeout", "elapsed_seconds": time.monotonic() - started_at}, retryable=False)
 
     def _retry_timeout_result(self, status_code: int, started_at: float) -> TransformResult:
         return TransformResult.error(
