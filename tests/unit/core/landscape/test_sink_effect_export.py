@@ -41,7 +41,7 @@ def test_export_preserves_abandoned_intent_and_safe_effect_history(
         coordination_token=leader_coordination_token(factory, effect.run_id),
     )
 
-    records = list(LandscapeExporter(db)._iter_records(effect.run_id))
+    records = list(LandscapeExporter(db, compartment_id="test-compartment")._iter_records(effect.run_id))
     stream_records = [record for record in records if record["record_type"] == "sink_effect_stream"]
     effect_records = [record for record in records if record["record_type"] == "sink_effect"]
     member_records = [record for record in records if record["record_type"] == "sink_effect_member"]
@@ -102,7 +102,11 @@ def test_attempt_export_uses_stable_per_effect_call_indexes(
         coordination_token=leader_coordination_token(factory, effect.run_id),
     )
 
-    attempts = [record for record in LandscapeExporter(db)._iter_records(effect.run_id) if record["record_type"] == "sink_effect_attempt"]
+    attempts = [
+        record
+        for record in LandscapeExporter(db, compartment_id="test-compartment")._iter_records(effect.run_id)
+        if record["record_type"] == "sink_effect_attempt"
+    ]
 
     assert [(record["attempt_id"], record["attempt_index"]) for record in attempts] == [
         (first.attempt_id, 0),

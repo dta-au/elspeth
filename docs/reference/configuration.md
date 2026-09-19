@@ -2259,8 +2259,8 @@ compatibility record rather than relying on a structural probe alone.
 | `signer_key_id` | string | `UNSIGNED` | Credential-free public signer key ID/version recorded in snapshot identity |
 | `signing_secret_ref` | string | - | Exact environment-variable name containing the HMAC key; required for `hmac_sha256` |
 | `signer_rotation_policy` | string | `multi_version` | `multi_version` allows a new signer identity for a new snapshot; `single_export` refuses a different signer identity for the same export lineage |
-| `exporter_version` | string | `landscape-exporter-auth-v2` | Closed export format with a signed compartment marking; `landscape-exporter-auth-v1` remains available to verify or resume older exports |
-| `compartment_id` | string | - | Deployment marking matching `[a-z0-9][a-z0-9-]{0,62}`, required for an enabled auth-v2 export. Web execution uses the operator's `WebSettings.compartment_id`, overriding pipeline-authored values; CLI export settings must supply it explicitly |
+| `exporter_version` | string | `landscape-exporter-auth-v2` | The only supported closed export format |
+| `compartment_id` | string | required when enabled | Deployment marking matching `[a-z0-9][a-z0-9-]{0,62}`, required for every enabled export, signed or unsigned, including resume. Web execution uses the operator's `WebSettings.compartment_id`, overriding pipeline-authored values; CLI export settings must supply it explicitly |
 | `serialization_version` | string | `audit-export-v2` | Canonical record serialization identity |
 | `chunking_algorithm_version` | string | `record-framing-v1` | Chunk-boundary algorithm identity |
 | `include_raw_error_rows` | bool | `false` | Include bounded raw error rows when policy permits |
@@ -2278,7 +2278,7 @@ compatibility record rather than relying on a structural probe alone.
 | `content_store.retention_days` | int | required | Retention period |
 | `content_store.durability` | string | required | `fsync` or `replicated` |
 
-Auth-v2 binds `compartment_id` into the signed `audit_export_config.public_config` record and its public configuration hash. The cryptographic derivation algorithm remains `audit-export-derivation-v1`; older auth-v1 artifacts retain their original exact verification contract. To resume an existing auth-v1 snapshot, select `landscape-exporter-auth-v1` explicitly. Creating a new signed auth-v1 snapshot is refused. New signed CLI exports must select auth-v2 and supply `compartment_id` explicitly.
+Auth-v2 binds `compartment_id` into the `audit_export_config.public_config` record and its public configuration hash for every export. With `signing_mode: hmac_sha256`, the marking is also covered by the signed manifest and record signatures. `landscape-exporter-auth-v1` is not accepted for new exports, verification, or resume. The cryptographic derivation algorithm label remains `audit-export-derivation-v1`; it is a separate version domain.
 
 Enabled export is deliberately all-explicit: total capacity must fit within
 `chunk_limit × per_chunk_*_limit`, and the spool must already be a private
@@ -2288,8 +2288,9 @@ snapshot objects.
 **Signing and rotation:** `signer_key_id` is a public, credential-free identity
 that includes the operator's key version. It participates in snapshot identity,
 so rotating a key means selecting a new key ID and secret reference together.
-`multi_version` preserves verification of old snapshots under their recorded
-IDs; `single_export` refuses an identity change within that export lineage.
+`multi_version` preserves verification of prior auth-v2 snapshots under their
+recorded signer IDs; `single_export` refuses an identity change within that
+export lineage.
 The value of `signing_secret_ref` is only the environment variable name. Key
 bytes, secret values, hashes of weak key material, and low-entropy key-derived identifiers
 are never persisted. See [Environment

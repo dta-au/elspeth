@@ -379,6 +379,7 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
     web_settings = SimpleNamespace(
         deployment_target="default",
         deployment_state_mode="sqlite-single",
+        workflow_governance="off",
         landscape_url=settings.landscape.url,
         landscape_passphrase=None,
         payload_store_path=settings.payload_store.base_path,

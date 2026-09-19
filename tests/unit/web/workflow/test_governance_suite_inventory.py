@@ -298,8 +298,8 @@ CATALOG: Final[tuple[Item, ...]] = (
         "signed Landscape export compartment marking",
         (Pin(EXPORT, "test_signed_web_export_refuses_missing_operator_marking"),),
         (
-            Pin(EXPORT, "test_web_export_upgrades_legacy_authored_version_to_marked_version"),
-            Pin(EXPORT_CONTRACT, "test_auth_v2_compartment_identifier_is_accepted_at_derivation_boundaries"),
+            Pin(EXPORT, "test_operator_marking_is_injected_before_strict_model_validation"),
+            Pin(EXPORT_CONTRACT, "test_compartment_identifier_is_accepted_at_derivation_boundaries"),
         ),
     ),
 )

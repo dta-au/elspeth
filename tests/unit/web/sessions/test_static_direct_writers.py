@@ -2084,6 +2084,113 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 # ``_REVIEWED_ALLOWLIST`` above.
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
+    # Identity workflow tests seed versioned composition states directly so
+    # approvals, reviews, permits, and scoped reads exercise real FK parents.
+    ReviewedWriter(
+        path="tests/testcontainer/web/test_approval_authority_postgres.py",
+        enclosing_symbol="_seed",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="PostgreSQL approval contention fixture: version-1 state addressed by the request.",
+    ),
+    ReviewedWriter(
+        path="tests/testcontainer/web/test_review_authority_postgres.py",
+        enclosing_symbol="_seed",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="PostgreSQL review contention fixture: version-1 state covered by the open request.",
+    ),
+    ReviewedWriter(
+        path="tests/testcontainer/web/test_workflow_inspect_postgres.py",
+        enclosing_symbol="_seed",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="PostgreSQL scoped-inspection fixture: version-1 state linking the workflow rows.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_approval_authority.py",
+        enclosing_symbol="_seed",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Approval authority fixture: version-1 state to which decisions bind.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_approval_authority.py",
+        enclosing_symbol="test_failed_rejection_audit_batch_rolls_back_decision_and_retirement",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Rollback test: state whose rejection and supersession audit batch must roll back.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_approval_authority.py",
+        enclosing_symbol="test_inbox_includes_role_eligible_requests_with_addressed_first",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Role-based inbox test: one state per seeded session for addressed-first ordering.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_r2_execute_gate.py",
+        enclosing_symbol="test_approval_for_a_different_state_cannot_admit_this_run",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Execute gate test: distinct version-2 state that the prior approval must not admit.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_review_authority.py",
+        enclosing_symbol="authority",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Review authority fixture: version-1 state covered by reviewer attestations.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_review_authority.py",
+        enclosing_symbol="test_addressed_request_only_admits_its_reviewer_and_cancelled_request_admits_none",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Reviewer eligibility test: distinct version-2 state rejects the earlier request.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_workflow_inspect_authority.py",
+        enclosing_symbol="seeded",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Scoped-inspection fixture: version-1 state linking approvals and attestations.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/workflow/test_approval_routes.py",
+        enclosing_symbol="_seed",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Approval route fixture: version-1 state to which the request is addressed.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/workflow/test_approval_routes.py",
+        enclosing_symbol="test_closed_request_reports_terminal_state_after_new_state",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Closed-request route test: new version-2 state supersedes the earlier request.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/workflow/test_mailbox_routes.py",
+        enclosing_symbol="_request",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Mailbox route fixture: version-1 state linked to the seeded approval or review request.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/workflow/test_review_routes.py",
+        enclosing_symbol="app",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Review route fixture: versioned states used to check exact request coverage.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/workflow/test_workflow_inspect_routes.py",
+        enclosing_symbol="app",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose="Workflow-inspection route fixture: version-1 state linking scoped audit rows.",
+    ),
     ReviewedWriter(
         path="tests/testcontainer/web/test_chargeable_admission_postgres.py",
         enclosing_symbol="_admit",

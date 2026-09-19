@@ -169,6 +169,9 @@ def export_landscape(
     from elspeth.engine.orchestrator.audit_export_effects import execute_audit_export_effect, prepare_audit_export_snapshot
 
     export_config = settings.landscape.export
+    if not export_config.enabled:
+        raise ValueError("audit export is not enabled in settings")
+    export_config.public_snapshot_config()
 
     if type(worker_id) is not str or not worker_id.strip():
         raise ValueError("audit export worker_id must be a non-empty exact string")
@@ -396,6 +399,7 @@ def resume_audit_export(
     export_config = settings.landscape.export
     if not export_config.enabled:
         raise ValueError("audit export is not enabled in settings; nothing to resume")
+    export_config.public_snapshot_config()
 
     factory = RecorderFactory(db, payload_store=payload_store)
     run = factory.run_lifecycle.get_run(run_id)
@@ -406,6 +410,11 @@ def resume_audit_export(
         assert refusal.reason is not None and refusal.cause is not None
         raise NonResumableRunError(run_id, refusal.reason, cause=refusal.cause)
     assert run is not None
+    from elspeth.core.landscape.execution.audit_export_snapshots import AuditExportSnapshotRepository
+
+    with db.read_only_connection() as connection:
+        if AuditExportSnapshotRepository.has_unsupported_version_for_run(connection, run_id):
+            raise ValueError("audit-export lineage contains unsupported exporter_version")
     target_refusal = _audit_export_resume_target_refusal(
         run,
         settings,

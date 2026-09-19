@@ -30,7 +30,6 @@ from elspeth.contracts import (
     TokenParent,
 )
 from elspeth.contracts.audit_export import (
-    AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
     AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_MAX_CHUNKS,
     AUDIT_EXPORT_MAX_TOTAL_BYTES,
@@ -41,6 +40,7 @@ from elspeth.contracts.audit_export import (
     AuditExportTerminalWitness,
     derive_audit_export_bundle,
     stream_audit_export_bundle_to_spool,
+    validate_compartment_id,
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.export_records import (
@@ -304,7 +304,7 @@ class LandscapeExporter:
 
     Example:
         db = LandscapeDB.from_url("sqlite:///audit.db")
-        exporter = LandscapeExporter(db)
+        exporter = LandscapeExporter(db, compartment_id="my-compartment")
 
         # Export to JSON lines
         for record in exporter.export_run(run_id):
@@ -369,23 +369,15 @@ class LandscapeExporter:
         self._include_raw_error_rows = include_raw_error_rows
         if auth_events not in ("omitted", "deployment_snapshot"):
             raise ValueError("auth_events must be omitted or deployment_snapshot")
-        resolved_exporter_version = exporter_version
-        if resolved_exporter_version is None:
-            resolved_exporter_version = (
-                AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION if compartment_id is not None else AUDIT_EXPORT_AUTH_EXPORTER_VERSION
-            )
-        if (
-            resolved_exporter_version not in (AUDIT_EXPORT_AUTH_EXPORTER_VERSION, AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION)
-            and auth_events != "omitted"
-        ):
-            raise ValueError("Legacy exporter cannot include deployment auth events")
+        resolved_exporter_version = AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION if exporter_version is None else exporter_version
+        if resolved_exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
         self._auth_events = auth_events
         self._compartment_id = compartment_id
         self._row_batch_size = row_batch_size
         self._signer_key_id = signer_key_id
         self._export_format = export_format
         self._exporter_version = resolved_exporter_version
-        self._exporter_version_explicit = exporter_version is not None
         self._serialization_version = serialization_version
         self._chunking_algorithm_version = chunking_algorithm_version
         self._per_chunk_byte_limit = per_chunk_byte_limit
@@ -533,7 +525,6 @@ class LandscapeExporter:
         scoped._auth_events = config.auth_events
         scoped._compartment_id = config.compartment_id
         scoped._exporter_version = config.exporter_version
-        scoped._exporter_version_explicit = True
         scoped._include_raw_error_rows = config.include_raw_error_rows
         scoped._signing_key = config.signing_key
         scoped._signer_key_id = config.signer_key_id
@@ -590,9 +581,7 @@ class LandscapeExporter:
                 source_status=source_status,
                 source_completed_at=completed_text,
                 export_format=self._export_format,  # type: ignore[arg-type]
-                exporter_version=(
-                    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION if sign and not self._exporter_version_explicit else self._exporter_version
-                ),
+                exporter_version=self._exporter_version,
                 serialization_version=self._serialization_version,
                 chunking_algorithm_version=self._chunking_algorithm_version,
                 include_raw_error_rows=self._include_raw_error_rows,
@@ -625,8 +614,9 @@ class LandscapeExporter:
                     f"derivation config signing_mode {derivation_config.signing_mode!r} contradicts the "
                     f"requested export (sign={sign} requires signing_mode {expected_signing_mode!r})"
                 )
-        if sign and derivation_config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
-            raise ValueError("legacy signed export may only be verified or resumed from an existing snapshot")
+        if derivation_config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        validate_compartment_id(derivation_config.compartment_id)
         return derivation_config
 
     def iter_unsigned_run_records(self, run_id: str) -> Iterator[ExportRecord]:
@@ -669,6 +659,10 @@ class LandscapeExporter:
         Raises:
             ValueError: If run_id is not found
         """
+        if self._exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        compartment_id = validate_compartment_id(self._compartment_id)
+
         # Run metadata
         run = self._read_model.get_run(run_id)
         if run is None:
@@ -691,53 +685,47 @@ class LandscapeExporter:
         }
         yield run_record
 
-        if self._exporter_version in (AUDIT_EXPORT_AUTH_EXPORTER_VERSION, AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION):
-            if self._signing_key is not None and self._signer_key_id is None:
-                raise ValueError("Signed export requires an explicit signer_key_id")
-            public_config: AuditExportConfigRecord = {
-                "record_type": "audit_export_config",
-                "public_config": {
-                    "auth_events": self._auth_events,
-                    "chunking_algorithm_version": self._chunking_algorithm_version,
-                    "export_format": self._export_format,
-                    "exporter_version": self._exporter_version,
-                    "include_raw_error_rows": self._include_raw_error_rows,
-                    "per_chunk_byte_limit": self._per_chunk_byte_limit,
-                    "per_chunk_record_limit": self._per_chunk_record_limit,
-                    "serialization_version": self._serialization_version,
-                    "signer_key_id": self._signer_key_id
-                    if self._signer_key_id is not None and self._signing_key is not None
-                    else "UNSIGNED",
-                    "signing_mode": "hmac_sha256" if self._signing_key is not None else "unsigned",
-                },
-            }
-            if self._exporter_version == AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
-                if self._compartment_id is None or not self._compartment_id.strip():
-                    raise ValueError("compartment_id is required for landscape-exporter-auth-v2")
-                public_config["public_config"]["compartment_id"] = self._compartment_id
-            yield public_config
-            selected_count = 0
-            cutoff = run.completed_at
-            if cutoff is None and self._auth_events == "deployment_snapshot":
-                raise AuditIntegrityError("Auth coverage requires completed run timestamp")
-            if cutoff is not None and cutoff.tzinfo is None:
-                cutoff = cutoff.replace(tzinfo=UTC)
-            if self._auth_events == "deployment_snapshot":
-                assert cutoff is not None
-                for auth_event in self._read_model.iter_auth_events(cutoff, batch_size=self._row_batch_size):
-                    selected_count += 1
-                    yield auth_event
-            coverage: AuthEventCoverageExportRecord = {
-                "record_type": "auth_event_coverage",
-                "policy": self._auth_events,
-                "selection_cutoff": cutoff.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                if self._auth_events == "deployment_snapshot" and cutoff is not None
-                else None,
-                "selection_basis": "visible_rows_at_or_before_run_completion" if self._auth_events == "deployment_snapshot" else None,
-                "selected_count": selected_count if self._auth_events == "deployment_snapshot" else None,
-                "reason": "deployment_snapshot" if self._auth_events == "deployment_snapshot" else "not_requested",
-            }
-            yield coverage
+        if self._signing_key is not None and self._signer_key_id is None:
+            raise ValueError("Signed export requires an explicit signer_key_id")
+        public_config: AuditExportConfigRecord = {
+            "record_type": "audit_export_config",
+            "public_config": {
+                "auth_events": self._auth_events,
+                "compartment_id": compartment_id,
+                "chunking_algorithm_version": self._chunking_algorithm_version,
+                "export_format": self._export_format,
+                "exporter_version": self._exporter_version,
+                "include_raw_error_rows": self._include_raw_error_rows,
+                "per_chunk_byte_limit": self._per_chunk_byte_limit,
+                "per_chunk_record_limit": self._per_chunk_record_limit,
+                "serialization_version": self._serialization_version,
+                "signer_key_id": self._signer_key_id if self._signer_key_id is not None and self._signing_key is not None else "UNSIGNED",
+                "signing_mode": "hmac_sha256" if self._signing_key is not None else "unsigned",
+            },
+        }
+        yield public_config
+        selected_count = 0
+        cutoff = run.completed_at
+        if cutoff is None and self._auth_events == "deployment_snapshot":
+            raise AuditIntegrityError("Auth coverage requires completed run timestamp")
+        if cutoff is not None and cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        if self._auth_events == "deployment_snapshot":
+            assert cutoff is not None
+            for auth_event in self._read_model.iter_auth_events(cutoff, batch_size=self._row_batch_size):
+                selected_count += 1
+                yield auth_event
+        coverage: AuthEventCoverageExportRecord = {
+            "record_type": "auth_event_coverage",
+            "policy": self._auth_events,
+            "selection_cutoff": cutoff.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            if self._auth_events == "deployment_snapshot" and cutoff is not None
+            else None,
+            "selection_basis": "visible_rows_at_or_before_run_completion" if self._auth_events == "deployment_snapshot" else None,
+            "selected_count": selected_count if self._auth_events == "deployment_snapshot" else None,
+            "reason": "deployment_snapshot" if self._auth_events == "deployment_snapshot" else "not_requested",
+        }
+        yield coverage
 
         policy_evidence = self._read_model.get_web_plugin_policy_evidence(run_id)
         if policy_evidence is not None:

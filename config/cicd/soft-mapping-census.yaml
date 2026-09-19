@@ -931,6 +931,8 @@ files:
     dict[str, object]: 2
   src/elspeth/web/execution/envelope.py:
     Mapping[str, Any]: 1
+  src/elspeth/web/execution/export_marking.py:
+    dict[str, Any]: 2
   src/elspeth/web/execution/failure_samples.py:
     dict[str, object]: 1
   src/elspeth/web/execution/fanout_guard.py:
@@ -1039,6 +1041,6 @@ totals:
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1134
+  dict[str, Any]: 1136
   dict[str, object]: 404
-  soft: 2733
+  soft: 2735

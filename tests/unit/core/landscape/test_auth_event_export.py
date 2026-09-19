@@ -40,11 +40,34 @@ def test_default_export_declares_auth_history_omitted() -> None:
     with LandscapeDB.in_memory() as db:
         _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
         _event(db, "event")
-        records = list(LandscapeExporter(db).export_run("run", sign=False))
+        records = list(LandscapeExporter(db, compartment_id="research-a").export_run("run", sign=False))
+        public_config = next(row["public_config"] for row in records if row["record_type"] == "audit_export_config")
+        assert public_config["compartment_id"] == "research-a"
         coverage = [row for row in records if row["record_type"] == "auth_event_coverage"]
         assert len(coverage) == 1
         assert coverage[0]["policy"] == "omitted"
         assert coverage[0]["selected_count"] is None
+
+
+@pytest.mark.parametrize("signed", [False, True])
+def test_both_export_signing_modes_bind_compartment_in_public_config(signed: bool) -> None:
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        exporter = LandscapeExporter(
+            db,
+            signing_key=b"test-compartment-export-key" if signed else None,
+            signer_key_id="test" if signed else None,
+            compartment_id="research-a",
+        )
+        records = list(exporter.export_run("run", sign=signed))
+        config_record = next(row for row in records if row["record_type"] == "audit_export_config")
+        public_config = config_record["public_config"]
+        assert public_config["exporter_version"] == "landscape-exporter-auth-v2"
+        assert public_config["compartment_id"] == "research-a"
+        assert public_config["signing_mode"] == ("hmac_sha256" if signed else "unsigned")
+        bundle = exporter.derive_run_bundle("run", sign=signed)
+        assert bundle.public_export_config_hash == derive_public_export_config_hash(public_config)
+        assert ("signature" in config_record) is signed
 
 
 def test_signed_deployment_export_includes_stored_history_and_empty_coverage() -> None:
@@ -103,30 +126,33 @@ def test_signed_compartment_export_binds_marking_in_verifiable_public_config() -
         assert signature != hmac.new(key, canonical_json(tampered_record).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def test_signed_compartment_export_refuses_missing_marking() -> None:
+@pytest.mark.parametrize("signed", [False, True])
+def test_compartment_export_refuses_missing_marking(signed: bool) -> None:
     with LandscapeDB.in_memory() as db:
         _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
-        exporter = LandscapeExporter(
-            db,
-            signing_key=b"test-compartment-export-key",
-            signer_key_id="test",
-        )
         with pytest.raises(ValueError, match="compartment_id"):
-            list(exporter.export_run("run", sign=True))
+            exporter = LandscapeExporter(
+                db,
+                signing_key=b"test-compartment-export-key" if signed else None,
+                signer_key_id="test" if signed else None,
+            )
+            list(exporter.export_run("run", sign=signed))
 
 
 @pytest.mark.parametrize("legacy_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
-def test_new_signed_export_refuses_explicit_legacy_version(legacy_version: str) -> None:
+@pytest.mark.parametrize("signed", [False, True])
+def test_export_refuses_explicit_legacy_version(legacy_version: str, signed: bool) -> None:
     with LandscapeDB.in_memory() as db:
         _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
-        exporter = LandscapeExporter(
-            db,
-            signing_key=b"test-compartment-export-key",
-            signer_key_id="test",
-            exporter_version=legacy_version,
-        )
-        with pytest.raises(ValueError, match="legacy signed export"):
-            list(exporter.export_run("run", sign=True))
+        with pytest.raises(ValueError, match="exporter_version"):
+            exporter = LandscapeExporter(
+                db,
+                signing_key=b"test-compartment-export-key" if signed else None,
+                signer_key_id="test" if signed else None,
+                exporter_version=legacy_version,
+                compartment_id="research-a",
+            )
+            list(exporter.export_run("run", sign=signed))
 
 
 @pytest.mark.parametrize("signed", [False, True])

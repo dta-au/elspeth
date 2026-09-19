@@ -225,6 +225,7 @@ def test_settings_phase_loads_exact_yaml_without_host_expansion_and_detaches_evi
 
     result = load_runtime_settings(
         materialized,
+        operator_settings=None,
         secret_service=None,
         user_id=None,
         load_yaml=load_yaml,
@@ -256,6 +257,7 @@ def test_settings_phase_reframes_missing_parts_but_retains_raw_check_detail() ->
 
     result = load_runtime_settings(
         _materialized(),
+        operator_settings=None,
         secret_service=None,
         user_id=None,
         load_yaml=_autospec_callable(load_bounded_pipeline_yaml),
@@ -276,6 +278,7 @@ def test_settings_phase_reframes_missing_parts_but_retains_raw_check_detail() ->
 def test_settings_phase_converts_only_expected_non_pydantic_errors(error: Exception) -> None:
     result = load_runtime_settings(
         _materialized(),
+        operator_settings=None,
         secret_service=None,
         user_id=None,
         load_yaml=_autospec_callable(load_bounded_pipeline_yaml),
@@ -294,6 +297,7 @@ def test_settings_phase_propagates_unexpected_exceptions() -> None:
     with pytest.raises(RuntimeError, match="loader invariant"):
         load_runtime_settings(
             _materialized(),
+            operator_settings=None,
             secret_service=None,
             user_id=None,
             load_yaml=_autospec_callable(load_bounded_pipeline_yaml),

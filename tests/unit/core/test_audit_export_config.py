@@ -14,8 +14,7 @@ from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_MAX_TOTAL_BYTES,
     AUDIT_EXPORT_MAX_TOTAL_RECORDS,
 )
-from elspeth.core.config import ElspethSettings, LandscapeExportSettings, LandscapeSettings
-from elspeth.engine.orchestrator.export import prepare_audit_export_binding
+from elspeth.core.config import LandscapeExportSettings
 
 
 def test_auth_event_policy_is_closed_and_default_omission_is_explicit() -> None:
@@ -28,21 +27,19 @@ def test_auth_event_policy_is_closed_and_default_omission_is_explicit() -> None:
     assert included.public_snapshot_config()["auth_events"] == "deployment_snapshot"
     with pytest.raises(ValidationError, match="auth_events"):
         LandscapeExportSettings(**_enabled_config(auth_events="all"))
-    legacy = LandscapeExportSettings(**_enabled_config(exporter_version="landscape-exporter-auth-v1", compartment_id=None))
-    assert "compartment_id" not in legacy.public_snapshot_config()
+    with pytest.raises(ValidationError, match="exporter_version"):
+        LandscapeExportSettings(**_enabled_config(exporter_version="landscape-exporter-auth-v1", compartment_id=None))
     with pytest.raises(ValidationError, match="exporter_version"):
         LandscapeExportSettings(**_enabled_config(exporter_version="landscape-exporter-v1", auth_events="deployment_snapshot"))
 
 
-def test_missing_compartment_refuses_before_export_sink_admission() -> None:
-    export = LandscapeExportSettings(**_enabled_config(compartment_id=None))
-    settings = ElspethSettings.model_construct(landscape=LandscapeSettings.model_construct(export=export))
-
-    def unexpected_sink_factory(_name: str) -> None:
-        pytest.fail("export sink was admitted before compartment marking")
-
-    with pytest.raises(ValueError, match="compartment_id"):
-        prepare_audit_export_binding(settings, unexpected_sink_factory)
+@pytest.mark.parametrize("signed", [False, True])
+def test_missing_compartment_refuses_enabled_export_at_config_parse(signed: bool) -> None:
+    config = _enabled_config(compartment_id=None)
+    if signed:
+        config.update(signing_mode="hmac_sha256", signer_key_id="test-signer", signing_secret_ref="TEST_SIGNER_KEY")
+    with pytest.raises(ValidationError, match="compartment_id"):
+        LandscapeExportSettings(**config)
 
 
 @pytest.mark.parametrize("compartment_id", ["a", "0", "research-a", "a" * 63])
@@ -57,18 +54,13 @@ def test_export_compartment_rejects_malformed_public_marking_identifier(compartm
         LandscapeExportSettings(**_enabled_config(compartment_id=compartment_id))
 
 
-def test_explicit_legacy_signed_settings_remain_parseable_for_winner_replay() -> None:
-    export = LandscapeExportSettings(
-        **_enabled_config(
-            signing_mode="hmac_sha256",
-            signer_key_id="legacy-key",
-            signing_secret_ref="LEGACY_KEY",
-            exporter_version="landscape-exporter-auth-v1",
-            compartment_id=None,
-        )
-    )
-    assert export.public_snapshot_config()["exporter_version"] == "landscape-exporter-auth-v1"
-    assert "compartment_id" not in export.public_snapshot_config()
+@pytest.mark.parametrize("signed", [False, True])
+def test_explicit_auth_v1_settings_are_rejected(signed: bool) -> None:
+    config = _enabled_config(exporter_version="landscape-exporter-auth-v1")
+    if signed:
+        config.update(signing_mode="hmac_sha256", signer_key_id="legacy-key", signing_secret_ref="LEGACY_KEY")
+    with pytest.raises(ValidationError, match="exporter_version"):
+        LandscapeExportSettings(**config)
 
 
 def _enabled_config(**overrides: object) -> dict[str, object]:

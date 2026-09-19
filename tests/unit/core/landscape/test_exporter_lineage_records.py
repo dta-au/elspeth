@@ -86,7 +86,7 @@ def test_fork_coalesce_export_round_trips_lineage_path_and_group_records() -> No
         merged_contract=minimal_contract,
     )
 
-    exporter = LandscapeExporter(db)
+    exporter = LandscapeExporter(db, compartment_id="test-compartment")
     records = list(exporter._iter_records(setup.run_id))
 
     token_records = {r["token_id"]: r for r in records if r["record_type"] == "token"}
@@ -135,7 +135,7 @@ def test_collect_release_export_carries_the_written_release_fact() -> None:
         output_contracts=[contract],
     )
 
-    records = list(LandscapeExporter(db)._iter_records(setup.run_id))
+    records = list(LandscapeExporter(db, compartment_id="test-compartment")._iter_records(setup.run_id))
     by_group = {g["group_id"]: g for g in records if g["record_type"] == "group_record"}
     assert by_group[committed.release_group_id]["closes_group_id"] == expand_group_id
     assert by_group[expand_group_id]["closes_group_id"] is None

@@ -4,7 +4,7 @@ Date: 2026-09-02. Revision 2.15 (2026-09-19): design and implementation status, 
 
 ## Current residual status [rev2.14]
 
-- **Audit export:** the current signed format explicitly distinguishes omitted auth history from an included empty selection. CLI/operator export can include deployment history visible in its read snapshot through run completion; Web execution refuses that deployment-wide scope, including recovery. Export preserves stored facts and does not manufacture historical identity snapshots.
+- **Audit export:** `landscape-exporter-auth-v2` is the sole export and verification contract. Every enabled signed or unsigned export carries a valid compartment marking; old version settings and stored lineages are refused on fresh export, verification, and resume. The format distinguishes omitted auth history from an included empty selection. CLI/operator export can include deployment history visible in its read snapshot through run completion; Web execution refuses that deployment-wide scope, including recovery. Export preserves stored facts and does not manufacture historical identity snapshots.
 - **Prepared schema window:** the current release source has Landscape epoch **42** and Sessions epoch **59**. These include the earlier identity and admission shapes, nullable token measures, 64-bit quota policy limits, pending provider attempts and container-wide quota indexes. The named trigger is the operator's deployment of this prepared 0.8.1 schema pair under the existing archive/recreate runbook with `rollback_permitted: false`. Preparing the code does not execute the cutover.
 - **Identity lifecycle:** configured admin seeding uses retained human-admin history; operator recovery remains a separate zero-active-admin operation. Authentication audit reuses an application-lifetime Landscape engine. Identity withdrawal reaches approval revocation and chargeable admission; the detailed behavior and remaining requirements are stated below.
 - **Token quota posture:** production provider attempts now settle into the token ledger, and admission compares the current UTC-day total with independently applicable identity and container limits. A known empty day measures zero; pending attempts or unknown reported usage make the total unavailable and refuse chargeable work. Required missing policy slots also refuse. Only an active identity with neither configured policy requirements nor an applicable active identity/container policy receives the explicit no-quota allowance. This is eventual enforcement: a call admitted below a limit may finish above it, and concurrent admitted calls may finish together. Identity-wide storage admission remains unfinished.
@@ -881,19 +881,22 @@ test keeps pinning that none of these boundaries widens to `str`.
   CLI ownership close that engine on shutdown or failed initialization;
   engine construction is no longer nested inside the Sessions admission lock
   (elspeth-290ef95744).
-- **Auth export [rev2.13, elspeth-4699ddccc3]:** current producer
-  `landscape-exporter-auth-v1` signs both `audit_export_config` and
-  `auth_event_coverage`. The default `auth_events=omitted` carries a null
-  selected count/cutoff and `reason=not_requested`; it does not assert there
+- **Auth export [rev2.13, updated for the auth-v2 cutover]:** the sole producer
+  `landscape-exporter-auth-v2` emits both `audit_export_config` and
+  `auth_event_coverage` in signed and unsigned exports. A valid
+  `compartment_id` is required in the public configuration record and its
+  hash; HMAC signing covers that marking when enabled. The default
+  `auth_events=omitted` carries a null selected count/cutoff and
+  `reason=not_requested`; it does not assert there
   were no events. `deployment_snapshot` includes the deployment's event
   rows visible in one read transaction with `occurred_at <= run.completed_at`.
   Its coverage records the actual selected count, including zero, and
   `selection_basis=visible_rows_at_or_before_run_completion`. Bounded keyset
   pages share that snapshot; later commits and post-completion events are
-  outside its stated scope. Producer and registered reader check the signed
-  public configuration hash and coverage count/policy/cutoff. Legacy v1/v2
-  readers retain their old contracts; absence of coverage in an old bundle
-  is unknown coverage, never an included-empty claim.
+  outside its stated scope. Producer and registered reader check the public
+  configuration hash and coverage count/policy/cutoff. Retired exporter
+  versions are not read or replayed; a stored old-version lineage refuses
+  rederivation and resume before publication.
   CLI/operator settings may request this deployment-wide history. Web workers
   refuse it independently of the export enabled flag, including restored
   execution envelopes: session download authority does not authorize other
@@ -1472,27 +1475,26 @@ structure.
   cannot move. So: every container has an operator-set `compartment_id`
   (WebSettings) stamped into the public YAML metadata block, the shareable
   snapshot, every `library_entries` row, every `auth_events.metadata_json`,
-  and every signed Landscape export — **none of those five stampings exists
-  [rev2.12]**; egress is already recorded
+  and every signed Landscape export — those five stampings were absent at
+  rev2.12 and are now delivered; egress is recorded
   (`export_yaml`); ingress is recorded as a Tier-1 event when a composition
   state is created from user-pasted text, carrying the sha256 of the text
   and any foreign marking it contains (recording, which the composer
   invariants permit; never authoring). Membership discipline, fewer people
   in fewer compartments, is the actual control.
 
-  **On the five stampings [rev2.12].** `compartment_id` occurs in exactly
+  **Historical finding on the five stampings [rev2.12].** At that revision,
+  `compartment_id` occurred in exactly
   four places in the tree: the setting itself, a boolean "is it configured"
   in a config report, its name in `_COMMON_IDP_REQUIRED`, and the
   `library_entries.compartment_id` column. One of the five sites has a
   column; none has a writer. This passage is the document's line between
   what compartmentation *enforces* and what it merely *records*, and it puts
-  marking-and-recording on the enforced side — so telling an operator that
-  cross-compartment movement is detectable after the fact asserts a control
-  that is one column and no code. The paragraph's conclusion survives intact,
-  and is in fact strengthened: membership discipline is not merely the
-  actual control, it is currently the ONLY one. Cost is writers, not a
-  window. (What does hold: `compartment_id` genuinely is required unless
-  local, via `_COMMON_IDP_REQUIRED`.)
+  marking-and-recording on the enforced side — so at rev2.12, telling an
+  operator that cross-compartment movement was detectable after the fact
+  asserted a control that was only one column and no code. The missing
+  writers have since been delivered. Membership discipline remains the
+  primary control; markings and ingress evidence make movement observable.
 - **Data plane [rev2.2].** Compartmentation is enforced over identity and
   everything keyed on it (sessions, user secrets, blobs, outputs, audit),
   and only *inferred* over data. Nothing stops an operator configuring the

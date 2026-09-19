@@ -1,4 +1,4 @@
-"""Fresh CLI runs refuse legacy signed exports before pipeline side effects."""
+"""Fresh CLI runs refuse unmarked and retired audit-export contracts early."""
 
 from pathlib import Path
 
@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 from elspeth.cli import app, bootstrap_and_run
 
 
-def _legacy_signed_settings(tmp_path: Path) -> Path:
+def _export_settings(tmp_path: Path, *, signed: bool, exporter_version: str, compartment_id: str | None = None) -> Path:
     (tmp_path / "input.csv").write_text("id\n1\n")
     settings_path = tmp_path / "settings.yaml"
     settings_path.write_text(
@@ -44,10 +44,11 @@ def _legacy_signed_settings(tmp_path: Path) -> Path:
                         "enabled": True,
                         "sink": "archive",
                         "format": "json",
-                        "exporter_version": "landscape-exporter-auth-v1",
-                        "signing_mode": "hmac_sha256",
-                        "signer_key_id": "legacy-key",
-                        "signing_secret_ref": "AUDIT_EXPORT_TEST_KEY",
+                        "exporter_version": exporter_version,
+                        "compartment_id": compartment_id,
+                        "signing_mode": "hmac_sha256" if signed else "unsigned",
+                        "signer_key_id": "test-key" if signed else "UNSIGNED",
+                        **({"signing_secret_ref": "AUDIT_EXPORT_TEST_KEY"} if signed else {}),
                         "total_record_limit": 10_000,
                         "total_byte_limit": 10_485_760,
                         "chunk_limit": 100,
@@ -71,14 +72,38 @@ def _legacy_signed_settings(tmp_path: Path) -> Path:
     return settings_path
 
 
-def test_run_refuses_signed_auth_v1_before_run_or_content_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("signed", [False, True])
+def test_run_publishes_marked_auth_v2_export(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: bool) -> None:
     monkeypatch.chdir(tmp_path)
-    settings_path = _legacy_signed_settings(tmp_path)
+    monkeypatch.setenv("AUDIT_EXPORT_TEST_KEY", "test-secret")
+    settings_path = _export_settings(
+        tmp_path, signed=signed, exporter_version="landscape-exporter-auth-v2", compartment_id="test-compartment"
+    )
+
+    result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "landscape.db").exists()
+    export_path = tmp_path / "audit-export.json"
+    assert export_path.exists()
+    export_text = export_path.read_text()
+    algorithm = "hmac_sha256" if signed else "unsigned"
+    assert '"compartment_id":"test-compartment"' in export_text
+    assert f'"signature_algorithm":"{algorithm}"' in export_text
+
+
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("exporter_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
+def test_run_refuses_legacy_exporter_before_run_or_content_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: bool, exporter_version: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    settings_path = _export_settings(tmp_path, signed=signed, exporter_version=exporter_version, compartment_id="test-compartment")
 
     result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
 
     assert result.exit_code == 1, result.output
-    assert "legacy signed export" in result.output
+    assert "exporter_version" in result.output
     assert not (tmp_path / "landscape.db").exists()
     assert not (tmp_path / "output.json").exists()
     assert not (tmp_path / "audit-export.json").exists()
@@ -86,11 +111,14 @@ def test_run_refuses_signed_auth_v1_before_run_or_content_writes(tmp_path: Path,
     assert not (tmp_path / ".elspeth" / "audit-export-content-store").exists()
 
 
-def test_dependency_bootstrap_refuses_signed_auth_v1_before_run_or_content_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("signed", [False, True])
+def test_dependency_bootstrap_refuses_unmarked_export_before_run_or_content_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: bool
+) -> None:
     monkeypatch.chdir(tmp_path)
-    settings_path = _legacy_signed_settings(tmp_path)
+    settings_path = _export_settings(tmp_path, signed=signed, exporter_version="landscape-exporter-auth-v2")
 
-    with pytest.raises(ValueError, match="legacy signed export"):
+    with pytest.raises(ValueError, match="compartment_id"):
         bootstrap_and_run(settings_path)
 
     assert not (tmp_path / "landscape.db").exists()
@@ -100,12 +128,13 @@ def test_dependency_bootstrap_refuses_signed_auth_v1_before_run_or_content_write
     assert not (tmp_path / ".elspeth" / "audit-export-content-store").exists()
 
 
-def test_run_refuses_missing_auth_v2_compartment_before_run_or_content_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("compartment_id", [None, "bad\nmarker"])
+def test_run_refuses_missing_or_invalid_compartment_before_run_or_content_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: bool, compartment_id: str | None
+) -> None:
     monkeypatch.chdir(tmp_path)
-    settings_path = _legacy_signed_settings(tmp_path)
-    config = yaml.safe_load(settings_path.read_text())
-    config["landscape"]["export"]["exporter_version"] = "landscape-exporter-auth-v2"
-    settings_path.write_text(yaml.safe_dump(config))
+    settings_path = _export_settings(tmp_path, signed=signed, exporter_version="landscape-exporter-auth-v2", compartment_id=compartment_id)
 
     result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
 

@@ -217,7 +217,8 @@ def _config(**overrides: object) -> LandscapeExportSettings:
         format="json",
         signing_mode="unsigned",
         signer_key_id="UNSIGNED",
-        exporter_version="landscape-exporter-auth-v1",
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
         serialization_version="audit-export-v2",
         chunking_algorithm_version="record-framing-v1",
         total_record_limit=10_000,
@@ -239,8 +240,9 @@ def _config(**overrides: object) -> LandscapeExportSettings:
 
 
 @pytest.mark.parametrize("legacy_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
-def test_new_legacy_signed_snapshot_is_refused_before_content_store_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_version: str
+@pytest.mark.parametrize("signed", [False, True])
+def test_unsupported_version_snapshot_is_refused_before_content_store_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_version: str, signed: bool
 ) -> None:
     monkeypatch.chdir(tmp_path)
     with LandscapeDB.in_memory() as db:
@@ -248,25 +250,25 @@ def test_new_legacy_signed_snapshot_is_refused_before_content_store_write(
         seat = _export_seat(db, worker_id="legacy-sign-refusal")
         store = _MemoryContentStore()
         config = _config(
-            signing_mode="hmac_sha256",
-            signer_key_id="legacy-key",
-            signing_secret_ref="LEGACY_KEY",
+            signing_mode="hmac_sha256" if signed else "unsigned",
+            signer_key_id="legacy-key" if signed else "UNSIGNED",
+            signing_secret_ref="LEGACY_KEY" if signed else None,
             exporter_version=legacy_version,
         )
 
-        with pytest.raises(ValueError, match="legacy signed export"):
+        with pytest.raises(ValueError, match="exporter_version"):
             prepare_audit_export_snapshot(
                 db,
                 coordination_token=seat,
                 config=config,
-                signing_key=b"legacy-key",
+                signing_key=b"legacy-key" if signed else None,
                 content_store=store,
             )
         assert store.put_count == 0
 
 
-def test_registered_legacy_signed_snapshot_remains_replayable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Seed a historical auth-v1 winner, then exercise today's replay path."""
+def test_unsupported_version_cannot_replay_registered_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller cannot reinterpret a registered v2 winner as auth-v1."""
     monkeypatch.chdir(tmp_path)
     with LandscapeDB.in_memory() as db:
         _insert_terminal_run(db)
@@ -274,35 +276,95 @@ def test_registered_legacy_signed_snapshot_remains_replayable(tmp_path: Path, mo
         store = _MemoryContentStore()
         config = _config(signing_mode="hmac_sha256", signer_key_id="legacy-key", signing_secret_ref="LEGACY_KEY")
 
-        # Recreate a registered old-format winner using the historical
-        # producer condition. The second call uses the current guard.
-        with patch(
-            "elspeth.engine.orchestrator.audit_export_effects.AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION",
-            "landscape-exporter-auth-v1",
-        ):
-            historical = prepare_audit_export_snapshot(
-                db,
-                coordination_token=seat,
-                config=config,
-                signing_key=b"legacy-key",
-                content_store=store,
-            )
-        old_put_count = store.put_count
-
-        replay = prepare_audit_export_snapshot(
+        historical = prepare_audit_export_snapshot(
             db,
             coordination_token=seat,
             config=config,
             signing_key=b"legacy-key",
             content_store=store,
         )
-        assert replay.snapshot_id == historical.snapshot_id
+        old_put_count = store.put_count
+
+        with pytest.raises(ValueError, match="exporter_version"):
+            prepare_audit_export_snapshot(
+                db,
+                coordination_token=seat,
+                config=config.model_copy(update={"exporter_version": "landscape-exporter-auth-v1"}),
+                signing_key=b"legacy-key",
+                content_store=store,
+            )
+        assert historical.snapshot_id
         assert store.put_count == old_put_count
-        records = [json.loads(line) for chunk in replay.reader.iter_verified_chunks() for line in chunk.splitlines()]
-        assert (
-            next(record for record in records if record["record_type"] == "audit_export_config")["public_config"]["exporter_version"]
-            == "landscape-exporter-auth-v1"
+
+
+def test_registered_auth_v1_lineage_refuses_resume_and_rederivation_before_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An old row must not disappear behind a version-scoped v2 key lookup."""
+    from elspeth.engine.orchestrator.export import resume_audit_export
+
+    monkeypatch.chdir(tmp_path)
+    with LandscapeDB.in_memory() as db:
+        _insert_terminal_run(db)
+        seat = _export_seat(db, worker_id="seed-v2")
+        store = _MemoryContentStore()
+        resolver = AuditExportContentStoreResolver()
+        resolver.register(store)
+        config = _config()
+        prepare_audit_export_snapshot(
+            db,
+            coordination_token=seat,
+            config=config,
+            signing_key=None,
+            content_store=store,
+            content_store_resolver=resolver,
         )
+        RecorderFactory(db).run_coordination.release_seat(token=seat)
+        _set_export_status_row(db, "run-export", "failed", "old publication failed")
+        # Simulate a pre-cutover sealed row by changing only the version.
+        # The test restores the immutability trigger immediately; production
+        # still cannot update a registered snapshot.
+        with db.engine.begin() as connection:
+            connection.exec_driver_sql("DROP TRIGGER trg_audit_export_snapshot_immutable")
+            connection.execute(audit_export_snapshots_table.update().values(exporter_version="landscape-exporter-auth-v1"))
+            connection.exec_driver_sql(
+                "CREATE TRIGGER trg_audit_export_snapshot_immutable BEFORE UPDATE ON audit_export_snapshots "
+                "BEGIN SELECT RAISE(ABORT, 'sealed audit export snapshot is immutable'); END"
+            )
+        prior_put_count = store.put_count
+        sink_options = {"path": str(tmp_path / "audit.jsonl"), "format": "jsonl", "mode": "write", "schema": {"mode": "observed"}}
+
+        def unexpected_sink_factory(_sink_name: str) -> None:
+            pytest.fail("old lineage must refuse before sink construction")
+
+        with pytest.raises(ValueError, match="unsupported exporter_version"):
+            resume_audit_export(
+                db,
+                "run-export",
+                _resume_settings_bundle(sink_options, config),
+                unexpected_sink_factory,
+                payload_store=object(),
+                audit_export_content_store=store,
+                audit_export_content_store_resolver=resolver,
+                worker_id="resume-old-lineage",
+            )
+        with db.read_only_connection() as connection:
+            assert connection.scalar(select(runs_table.c.export_status).where(runs_table.c.run_id == "run-export")) == "failed"
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 1
+            assert connection.scalar(select(func.count()).select_from(sink_effects_table)) == 0
+        assert store.put_count == prior_put_count
+
+        direct_seat = _export_seat(db, worker_id="direct-old-lineage")
+        with pytest.raises(ValueError, match="unsupported exporter_version"):
+            prepare_audit_export_snapshot(
+                db,
+                coordination_token=direct_seat,
+                config=config,
+                signing_key=None,
+                content_store=store,
+                content_store_resolver=resolver,
+            )
+        assert store.put_count == prior_put_count
+        with db.read_only_connection() as connection:
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 1
 
 
 @pytest.mark.parametrize(
@@ -904,8 +966,8 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
                 signing_mode="hmac_sha256" if signed else "unsigned",
                 signer_key_id="audit-key-v1" if signed else "UNSIGNED",
                 signing_secret_ref="AUDIT_EXPORT_TEST_KEY" if signed else None,
-                exporter_version="landscape-exporter-auth-v2" if signed else "landscape-exporter-auth-v1",
-                compartment_id="test-compartment" if signed else None,
+                exporter_version="landscape-exporter-auth-v2",
+                compartment_id="test-compartment",
             ),
             signing_key=b"integration-signing-key" if signed else None,
             content_store=store,

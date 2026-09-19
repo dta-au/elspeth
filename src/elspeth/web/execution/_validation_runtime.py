@@ -21,6 +21,7 @@ from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.config import WebSettings
 from elspeth.web.execution._validation_model import (
     GraphedRuntime,
     InstantiatedRuntime,
@@ -30,6 +31,7 @@ from elspeth.web.execution._validation_model import (
     PhaseReport,
     _blocked_readiness,
 )
+from elspeth.web.execution.export_marking import operator_marked_config_dict
 from elspeth.web.execution.schemas import (
     CHECK_GATE_FAN_OUT_ADVISORY,
     CHECK_IDENTITY_NODE_ADVISORY,
@@ -177,6 +179,7 @@ def _settings_failure(
 def load_runtime_settings(
     materialized: MaterializedYaml,
     *,
+    operator_settings: WebSettings | None,
     secret_service: WebSecretResolver | None,
     user_id: str | None,
     load_yaml: _YamlLoader,
@@ -201,6 +204,12 @@ def load_runtime_settings(
         elif secret_service is None and "secret_ref" in pipeline_yaml:
             config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
             settings_config = redact_secret_refs_for_validation(config_dict)
+
+        if operator_settings is not None:
+            authored_config = settings_config if settings_config is not None else _load_yaml_mapping(load_yaml, pipeline_yaml)
+            marked_config = operator_marked_config_dict(authored_config, operator_settings)
+            if marked_config is not authored_config or settings_config is not None:
+                settings_config = marked_config
 
         if settings_config is None:
             runtime_settings = load_settings_yaml(pipeline_yaml, expand_env_vars=False)

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
 from elspeth.cli import app
@@ -23,11 +24,19 @@ runner = CliRunner()
 _COMPLETED_AT = datetime(2026, 7, 16, 7, 8, 9, 123456, tzinfo=UTC)
 
 
-def _write_settings(tmp_path: Path, db_path: Path, *, export_enabled: bool = True, signed_legacy: bool = False) -> Path:
-    signing_mode = "hmac_sha256" if signed_legacy else "unsigned"
-    signer_key_id = "legacy-key" if signed_legacy else "UNSIGNED"
-    signing_secret = "    signing_secret_ref: AUDIT_EXPORT_TEST_KEY\n" if signed_legacy else ""
-    exporter_version = "    exporter_version: landscape-exporter-auth-v1\n" if signed_legacy else ""
+def _write_settings(
+    tmp_path: Path,
+    db_path: Path,
+    *,
+    export_enabled: bool = True,
+    signed: bool = False,
+    exporter_version: str = "landscape-exporter-auth-v2",
+    compartment_id: str | None = "test-compartment",
+) -> Path:
+    signing_mode = "hmac_sha256" if signed else "unsigned"
+    signer_key_id = "test-key" if signed else "UNSIGNED"
+    signing_secret = "    signing_secret_ref: AUDIT_EXPORT_TEST_KEY\n" if signed else ""
+    compartment_marking = f"    compartment_id: {compartment_id}\n" if compartment_id is not None else ""
     export_block = f"""
   export:
     enabled: true
@@ -35,7 +44,8 @@ def _write_settings(tmp_path: Path, db_path: Path, *, export_enabled: bool = Tru
     format: json
     signing_mode: {signing_mode}
     signer_key_id: {signer_key_id}
-{signing_secret}{exporter_version}    total_record_limit: 10000
+{signing_secret}    exporter_version: {exporter_version}
+{compartment_marking}    total_record_limit: 10000
     total_byte_limit: 10485760
     chunk_limit: 100
     per_chunk_record_limit: 100
@@ -112,10 +122,11 @@ def _make_landscape_db_with_run(
 
 
 class TestExportResumeCommand:
-    def test_dry_run_reports_eligible_failed_export(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("signed", [False, True])
+    def test_dry_run_reports_eligible_failed_export(self, tmp_path: Path, signed: bool) -> None:
         db_path = tmp_path / "landscape.db"
         _make_landscape_db_with_run(db_path)
-        settings_file = _write_settings(tmp_path, db_path)
+        settings_file = _write_settings(tmp_path, db_path, signed=signed)
 
         result = runner.invoke(app, ["export-resume", "run-export", "-s", str(settings_file)])
 
@@ -164,11 +175,13 @@ class TestExportResumeCommand:
         assert result.exit_code == 1, f"Expected exit 1, got {result.exit_code}. Output: {result.output}"
         assert "not found" in result.output
 
-    def test_execute_invokes_engine_resume_driver(self, tmp_path: Path, monkeypatch) -> None:
+    @pytest.mark.parametrize("signed", [False, True])
+    def test_execute_invokes_engine_resume_driver(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: bool) -> None:
         monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("AUDIT_EXPORT_TEST_KEY", "test-secret")
         db_path = tmp_path / "landscape.db"
         _make_landscape_db_with_run(db_path)
-        settings_file = _write_settings(tmp_path, db_path)
+        settings_file = _write_settings(tmp_path, db_path, signed=signed)
         payload_dir = tmp_path / ".elspeth" / "payloads"
         payload_dir.mkdir(parents=True)
         payload_dir.chmod(0o700)
@@ -186,22 +199,48 @@ class TestExportResumeCommand:
         assert call.args[1] == "run-export"
         assert call.kwargs["worker_id"].startswith("worker:run-export:")
         assert call.kwargs["audit_export_content_store"].content_store_id == "audit-store-v1"
+        assert call.args[2].landscape.export.exporter_version == "landscape-exporter-auth-v2"
+        assert call.args[2].landscape.export.compartment_id == "test-compartment"
 
-    def test_legacy_signed_settings_reach_export_resume_driver(self, tmp_path: Path, monkeypatch) -> None:
+    @pytest.mark.parametrize("signed", [False, True])
+    @pytest.mark.parametrize("legacy_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
+    @pytest.mark.parametrize("execute", [False, True])
+    def test_legacy_settings_refused_before_export_resume_driver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: bool, legacy_version: str, execute: bool
+    ) -> None:
         monkeypatch.chdir(tmp_path)
         db_path = tmp_path / "landscape.db"
         _make_landscape_db_with_run(db_path)
-        settings_file = _write_settings(tmp_path, db_path, signed_legacy=True)
-        payload_dir = tmp_path / ".elspeth" / "payloads"
-        payload_dir.mkdir(parents=True)
-        payload_dir.chmod(0o700)
+        settings_file = _write_settings(tmp_path, db_path, signed=signed, exporter_version=legacy_version)
 
         with patch("elspeth.engine.orchestrator.export.resume_audit_export") as resume:
-            result = runner.invoke(app, ["export-resume", "run-export", "-s", str(settings_file), "--execute"])
+            result = runner.invoke(app, ["export-resume", "run-export", "-s", str(settings_file), *(["--execute"] if execute else [])])
 
-        assert result.exit_code == 0, result.output
-        resume.assert_called_once()
-        assert resume.call_args.args[2].landscape.export.exporter_version == "landscape-exporter-auth-v1"
+        assert result.exit_code == 1, result.output
+        assert "exporter_version" in result.output
+        resume.assert_not_called()
+        assert not (tmp_path / "audit-export.json").exists()
+        assert not (tmp_path / ".elspeth" / "audit-export-content-store").exists()
+
+    @pytest.mark.parametrize("signed", [False, True])
+    @pytest.mark.parametrize("compartment_id", [None, "Invalid_A"])
+    @pytest.mark.parametrize("execute", [False, True])
+    def test_unmarked_or_invalid_compartment_refused_before_export_resume_driver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: bool, compartment_id: str | None, execute: bool
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        db_path = tmp_path / "landscape.db"
+        _make_landscape_db_with_run(db_path)
+        settings_file = _write_settings(tmp_path, db_path, signed=signed, compartment_id=compartment_id)
+
+        with patch("elspeth.engine.orchestrator.export.resume_audit_export") as resume:
+            result = runner.invoke(app, ["export-resume", "run-export", "-s", str(settings_file), *(["--execute"] if execute else [])])
+
+        assert result.exit_code == 1, result.output
+        assert "compartment_id" in result.output
+        resume.assert_not_called()
+        assert not (tmp_path / "audit-export.json").exists()
+        assert not (tmp_path / ".elspeth" / "audit-export-content-store").exists()
 
     def test_execute_reports_export_failure(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.chdir(tmp_path)

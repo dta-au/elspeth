@@ -34,8 +34,7 @@ Frozen-at-mark-time discipline (load-bearing):
   evidence blob, then derives the current public projection in memory. It
   never re-calls ``ReadinessService.compute_snapshot``. This means:
     - Live state drift cannot change the response. Composition, YAML, and
-      readiness are sanitized through the current public boundary, including
-      when the authenticated evidence predates that boundary.
+      readiness are sanitized through the current public boundary.
     - The ``payload_digest`` authenticates the immutable mark-time evidence,
       including the readiness panel; resolve-time projection does not rewrite
       the stored blob.
@@ -58,7 +57,7 @@ import json
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, NotRequired, Protocol, TypedDict, cast
+from typing import Any, Final, Protocol, TypedDict, cast
 from uuid import UUID
 
 from sqlalchemy import desc, select
@@ -92,6 +91,7 @@ from elspeth.web.shareable_reviews.models import (
     SharedInspectResponse,
 )
 from elspeth.web.shareable_reviews.signer import (
+    InvalidToken,
     ShareTokenPayload,
     ShareTokenSigner,
 )
@@ -192,38 +192,17 @@ class _ReadinessServiceLike(Protocol):
 
 
 class _BlobShape(TypedDict):
-    """Wire-shape contract for the canonical-JSON snapshot blob.
-
-    ``_build_snapshot`` produces every key below; ``resolve_token``
-    consumes them. Outstanding share artifacts are immutable signed bytes
-    that we can never rewrite, so the two directions are not symmetric:
-
-    * ADDING a key is safe only when the consumer reads it as
-      ``NotRequired`` — blobs minted before the key existed resolve
-      against the same code and must not crash. The producer still emits
-      it unconditionally, which is why ``_BLOB_KEYS`` (the producer-side
-      closed set) lists it.
-    * REMOVING or retyping a key is breaking, because outstanding blobs
-      still carry the old shape. That needs a new signer payload version
-      landed side by side, not an in-place edit.
-
-    ``created_by_username`` is the worked example: it was added after
-    ``created_by_user_id`` stopped being a human-readable username and
-    became an opaque identity id, and pre-existing blobs have no such key.
-    """
+    """Exact canonical-JSON shape produced and consumed by this release."""
 
     pipeline_metadata: Any  # CompositionObject (dict[str, JsonValue])
     composition_snapshot: Any  # CompositionObject
     yaml: str
     audit_readiness: Any  # AuditReadinessSnapshot.model_dump output
     created_by_user_id: str
-    # Attribution for the human reader of the shared view. ``created_by_user_id``
-    # is the opaque identity id the token signature binds; it means nothing to a
-    # recipient who has no login and no way to resolve it. Absent on blobs minted
-    # before this key existed — see the class docstring.
-    created_by_username: NotRequired[str]
-    # Added after share blobs became immutable: old signed blobs omit it.
-    compartment_id: NotRequired[str | None]
+    # The recipient needs the frozen human-readable username; the opaque id
+    # alone does not identify the sender to someone without directory access.
+    created_by_username: str
+    compartment_id: str | None
 
 
 # Closed-set producer-side guard. The digest only proves bytes-on-disk
@@ -231,10 +210,8 @@ class _BlobShape(TypedDict):
 # missing key (the buggy bytes round-trip cleanly through the digest).
 # ``_assert_blob_shape`` catches that class of drift at the producer so
 # the bug surfaces in the owner's request instead of several frames away
-# in the reviewer's Pydantic construction. Update both ``_BlobShape`` AND
-# this constant in the same commit, observing the add/remove asymmetry in
-# the ``_BlobShape`` docstring. This set is what the PRODUCER must emit,
-# so a ``NotRequired`` consumer-side key still belongs here.
+# in the reviewer's Pydantic construction. Both producer and reader enforce
+# this exact shape; update ``_BlobShape`` and this set together.
 _BLOB_KEYS: Final[frozenset[str]] = frozenset(
     {
         "pipeline_metadata",
@@ -350,11 +327,7 @@ def _build_snapshot(
         extra = actual_keys - _BLOB_KEYS
         raise RuntimeError(
             f"shareable-review snapshot blob shape drift: missing={sorted(missing)!r} extra={sorted(extra)!r}. "
-            "Update _BlobShape and _BLOB_KEYS together. Do NOT bump the signer payload version to "
-            "add a key: the version gates token acceptance (signer.py rejects any version != 1), so "
-            "bumping it invalidates every outstanding link while doing nothing about blob shape. "
-            "Blobs are content-addressed and immutable, so readers tolerate an older shape by "
-            "treating a new key as optional on read."
+            "Update _BlobShape and _BLOB_KEYS together."
         )
     canonical_str = canonical_json(blob)
     canonical_bytes = canonical_str.encode("utf-8")
@@ -649,9 +622,8 @@ class ShareableReviewService:
         # any tampering on the filesystem path raises IntegrityError
         # before we get here.
         blob_dict = self._parse_blob(blob_bytes)
-        # A valid digest authenticates the immutable evidence blob, but legacy
-        # blobs may predate the public projection. Reconstruct the frozen state
-        # and project it in memory; never rewrite the content-addressed bytes.
+        # A valid digest authenticates the immutable evidence blob. Reconstruct
+        # the frozen state and project it without rewriting those bytes.
         composition_state = CompositionState.from_dict(blob_dict["composition_snapshot"])
         public_composition = CompositionStateResponse.model_validate(generate_public_composition_dict(composition_state))
         public_yaml = generate_public_yaml(composition_state)
@@ -661,13 +633,6 @@ class ShareableReviewService:
         # ``model_validate_json`` activates Pydantic's JSON validators
         # which DO coerce wire-format primitives back to native types.
         audit_readiness = _public_audit_readiness(AuditReadinessSnapshot.model_validate_json(json.dumps(blob_dict["audit_readiness"])))
-        # Membership test rather than a defaulting read: the absence of this
-        # key is a declared state of the wire shape (a snapshot minted before
-        # the producer carried a username), not a value we are papering over.
-        # Those bytes are signed and content-addressed, so backfilling
-        # attribution into them is not available — re-minting would change the
-        # payload_digest the outstanding token binds.
-        created_by_username = blob_dict["created_by_username"] if "created_by_username" in blob_dict else None
         return SharedInspectResponse(
             session_id=str(payload.session_id),
             state_id=str(payload.state_id),
@@ -676,11 +641,7 @@ class ShareableReviewService:
             yaml=public_yaml,
             audit_readiness=audit_readiness,
             created_by_user_id=blob_dict["created_by_user_id"],
-            # ``None`` here means "this snapshot predates the field"; the
-            # frontend falls back to the opaque id, which is degraded but
-            # honest, and self-limiting because every share token expires
-            # within ``shareable_link_lifetime_seconds`` of being minted.
-            created_by_username=created_by_username,
+            created_by_username=blob_dict["created_by_username"],
             # ``created_at`` lives in the token envelope rather than the blob —
             # the blob is content-addressed and must not carry mint-time data.
             created_at=payload.created_at,
@@ -733,8 +694,18 @@ class ShareableReviewService:
 
         Tier-1 input: the blob came out of OUR payload store, integrity
         verified by digest. Any decode failure here is a corruption event.
-        Returning the ``_BlobShape`` TypedDict gives downstream callers a
-        typed surface; the ``cast`` reflects "we trust the canonicalisation
-        round-trip" rather than re-validating each key.
+        The current release accepts only the producer's exact key set. A
+        signed token for an older blob shape does not enable a fallback reader.
         """
-        return cast(_BlobShape, json.loads(blob_bytes.decode("utf-8")))
+        try:
+            parsed = json.loads(blob_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InvalidToken("share snapshot decode failed") from exc
+        if type(parsed) is not dict or frozenset(parsed) != _BLOB_KEYS:
+            raise InvalidToken("unsupported share snapshot shape")
+        if type(parsed["created_by_username"]) is not str or not parsed["created_by_username"].strip():
+            raise InvalidToken("share snapshot username is invalid")
+        compartment_id = parsed["compartment_id"]
+        if compartment_id is not None and not is_compartment_id(compartment_id):
+            raise InvalidToken("share snapshot compartment is invalid")
+        return cast(_BlobShape, parsed)

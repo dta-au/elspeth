@@ -123,7 +123,7 @@ class TestExportReimport:
         ]
         run_id, db, _payload_store, _sink = _run_pipeline(tmp_path, source_data)
 
-        exporter = LandscapeExporter(db)
+        exporter = LandscapeExporter(db, compartment_id="test-compartment")
         records = list(exporter.export_run(run_id))
 
         record_types = {r["record_type"] for r in records}
@@ -142,7 +142,7 @@ class TestExportReimport:
         source_data = [{"id": "row_1", "value": 100}]
         run_id, db, _payload_store, _sink = _run_pipeline(tmp_path, source_data)
 
-        exporter = LandscapeExporter(db)
+        exporter = LandscapeExporter(db, compartment_id="test-compartment")
         grouped = exporter.export_run_grouped(run_id)
 
         # Verify grouping structure
@@ -201,7 +201,7 @@ class TestExportReimport:
         assert len(direct_transform_errors) == 1
 
         # Get counts from export
-        exporter = LandscapeExporter(db)
+        exporter = LandscapeExporter(db, compartment_id="test-compartment")
         grouped = exporter.export_run_grouped(run_id)
 
         # Compare counts

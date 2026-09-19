@@ -45,8 +45,6 @@ export function decideApproval(id: string, decision: "approved" | "rejected", no
   return post(`/api/approvals/${segment(id)}/decide`, { decision, note: noteOrNull(note) });
 }
 
-export const withdrawApproval = (id: string): Promise<ApprovalView> => post(`/api/approvals/${segment(id)}/withdraw`);
-
 export function requestReview(sessionId: string, body: { state_id: string; reviewer_identity_id?: string | null; note: string | null }): Promise<ReviewRequestView> {
   return post(`/api/sessions/${segment(sessionId)}/reviews`, {
     state_id: body.state_id,
@@ -58,8 +56,6 @@ export function requestReview(sessionId: string, body: { state_id: string; revie
 export function attestReview(id: string, verdict: ReviewVerdict, note: string | null): Promise<ReviewAttestationView> {
   return post(`/api/reviews/${segment(id)}/attest`, { verdict, note: noteOrNull(note) });
 }
-
-export const cancelReview = (id: string): Promise<ReviewRequestView> => post(`/api/reviews/${segment(id)}/cancel`);
 
 export function fetchWorkflowInspect(sessionId: string, stateId: string): Promise<WorkflowInspect> {
   return get(`/api/workflow/inspect/${segment(sessionId)}/${segment(stateId)}`);

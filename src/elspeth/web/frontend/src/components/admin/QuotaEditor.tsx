@@ -14,7 +14,7 @@ function parseCap(value: string): number | null {
 }
 
 /** Edit one quota dimension; the server preserves the other inside its audit transaction. */
-export function QuotaEditor({ identityId }: { identityId: string }): JSX.Element {
+export function QuotaEditor({ identityId, onSaved }: { identityId: string; onSaved?: (quota: IdentityQuota) => void }): JSX.Element {
   const [quota, setQuota] = useState<IdentityQuota | null>(null);
   const [dimension, setDimension] = useState<QuotaDimension>("tokens");
   const [value, setValue] = useState("");
@@ -43,6 +43,7 @@ export function QuotaEditor({ identityId }: { identityId: string }): JSX.Element
     setSaved(false);
     try {
       const result = await workflow.setIdentityQuota(identityId, dimension, cap);
+      onSaved?.(result);
       setQuota(result);
       setValue("");
       setSaved(true);

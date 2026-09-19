@@ -192,6 +192,7 @@ def _make_settings(*, fmt: str = "json", sign: bool = False, sink: str = "output
         sinks={sink: SimpleNamespace(options={})},
         landscape=SimpleNamespace(
             export=SimpleNamespace(
+                enabled=True,
                 format=fmt,
                 sign=sign,
                 signing_secret_ref="ELSPETH_SIGNING_KEY" if sign else None,

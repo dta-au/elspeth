@@ -1119,6 +1119,26 @@ sites:
   disposition: not_authorable
   note: Reached only from the audit-export snapshot path over a landscape.export section the composer
     never emits (yaml_generator.py:352-353).
+- key: ecafd8c5d4c0b9c0
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.public_snapshot_config
+  exception: ValueError
+  message: compartment_id is required for landscape-exporter-auth-v2
+  ordinal: 0
+  disposition: not_authorable
+  note: The compartment marking is operator-owned landscape.export configuration, not a Composer state
+    field. Composer-generated YAML has no landscape key (test_yaml_generator.py::TestGenerateYaml::test_landscape_key_never_emitted),
+    and this method checks the effective export configuration only when preparing an audit export.
+- key: ee977902a402f1ec
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.public_snapshot_config
+  exception: ValueError
+  message: exporter_version must be landscape-exporter-auth-v2
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export.exporter_version is set by deployment export policy; Composer-generated YAML
+    has no landscape key (test_yaml_generator.py::TestGenerateYaml::test_landscape_key_never_emitted).
+    This snapshot-shaping check cannot be reached with a Composer-authored exporter version.
 - key: 4d555848b9c24105
   path: src/elspeth/core/config.py
   qualname: LandscapeExportSettings.validate_signing_secret_ref

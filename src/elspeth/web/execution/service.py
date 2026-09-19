@@ -1139,7 +1139,7 @@ class ExecutionServiceImpl:
         config; the authored settings alone are not the run's config.
         """
         from elspeth.core.secrets import resolve_secret_refs
-        from elspeth.web.execution.export_marking import apply_operator_export_marking
+        from elspeth.web.execution.export_marking import apply_operator_export_marking, operator_marked_config_dict
         from elspeth.web.operator_telemetry import apply_operator_pipeline_telemetry
 
         catalog_sha = self._openrouter_catalog_sha256
@@ -1224,7 +1224,7 @@ class ExecutionServiceImpl:
                     blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes) for blob_id, record in records_by_id.items()
                 },
             )
-        settings = load_settings_from_config_dict(executable_config, expand_env_vars=False)
+        settings = load_settings_from_config_dict(operator_marked_config_dict(executable_config, self._settings), expand_env_vars=False)
         settings = apply_operator_pipeline_telemetry(settings, self._settings)
         effective_export = apply_operator_export_marking(settings.landscape.export, self._settings)
         settings = settings.model_copy(update={"landscape": settings.landscape.model_copy(update={"export": effective_export})})
@@ -2165,14 +2165,18 @@ class ExecutionServiceImpl:
             raise TypeError("YamlGenerator.generate_yaml() must produce a mapping for runtime preparation")
         # Export policy has an operator-owned compartment binding. Validate
         # the effective version and marking before creating a Sessions run;
-        # otherwise a signed export without a compartment returns HTTP 202 and
+        # otherwise an export without a compartment returns HTTP 202 and
         # fails later in the background worker after admission side effects.
         landscape_config = executable_config["landscape"] if "landscape" in executable_config else None
         if type(landscape_config) is dict and "export" in landscape_config:
-            from elspeth.web.execution.export_marking import apply_operator_export_marking
+            from elspeth.web.execution.export_marking import apply_operator_export_marking, operator_marked_config_dict
 
-            preliminary_settings = load_settings_from_config_dict(executable_config, expand_env_vars=False)
+            preliminary_settings = load_settings_from_config_dict(
+                operator_marked_config_dict(executable_config, self._settings), expand_env_vars=False
+            )
             effective_export = apply_operator_export_marking(preliminary_settings.landscape.export, self._settings)
+            if effective_export.auth_events == "deployment_snapshot":
+                raise ValueError("landscape.export.auth_events=deployment_snapshot is not permitted in Web execution")
             if effective_export.enabled:
                 effective_export.public_snapshot_config()
         frozen_run_settings = FrozenRunSettings(
@@ -3061,18 +3065,21 @@ class ExecutionServiceImpl:
                 )
             if raw_eligibility_config is None:
                 raise TypeError("Pipeline YAML must produce a mapping before sink effect eligibility")
+            from elspeth.web.execution.export_marking import operator_marked_config_dict
+
+            effective_eligibility_config = operator_marked_config_dict(raw_eligibility_config, self._settings)
             validate_sink_effect_eligibility_from_raw_config(
-                raw_eligibility_config,
+                effective_eligibility_config,
                 purpose=SinkEffectExecutionPurpose.RESUME if resume_existing else SinkEffectExecutionPurpose.FRESH,
             )
-            export_settings = validate_landscape_export_settings_from_raw_config(raw_eligibility_config)
+            export_settings = validate_landscape_export_settings_from_raw_config(effective_eligibility_config)
             # Session download authority does not grant access to deployment-wide
             # authentication history, including for restored or operator-authored runs.
             if export_settings.auth_events == "deployment_snapshot":
                 raise ValueError("landscape.export.auth_events=deployment_snapshot is not permitted in Web execution")
             if export_settings.enabled:
                 validate_sink_effect_eligibility_from_raw_config(
-                    raw_eligibility_config,
+                    effective_eligibility_config,
                     purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
                 )
 
@@ -3427,9 +3434,12 @@ class ExecutionServiceImpl:
             # Operator ${VAR} expansion remains available on the CLI loader,
             # load_settings().
             if resolved_dict is None:
-                settings = load_settings_from_yaml_string(pipeline_yaml, expand_env_vars=False)
+                if effective_eligibility_config is raw_eligibility_config:
+                    settings = load_settings_from_yaml_string(pipeline_yaml, expand_env_vars=False)
+                else:
+                    settings = load_settings_from_config_dict(effective_eligibility_config, expand_env_vars=False)
             else:
-                settings = load_settings_from_config_dict(resolved_dict, expand_env_vars=False)
+                settings = load_settings_from_config_dict(operator_marked_config_dict(resolved_dict, self._settings), expand_env_vars=False)
 
             # AWS ECS web execution is governed by operator-owned telemetry
             # routing. Apply the fixed task-local policy before graph/config

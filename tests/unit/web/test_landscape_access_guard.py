@@ -206,4 +206,5 @@ def test_real_web_tree_has_only_the_reviewed_direct_call_map() -> None:
         ("src/elspeth/web/execution/recovery.py", "from_url"),
         ("src/elspeth/web/landscape_access.py", "from_url"),
         ("src/elspeth/web/sessions/routes/runs.py", "from_url"),
+        ("src/elspeth/web/sessions/routes/workflow/audit_view.py", "from_url"),
     )

@@ -43,6 +43,7 @@ from elspeth.web.composer.state import (
     CompositionState,
 )
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
+from elspeth.web.config import WebSettings
 from elspeth.web.execution._validation_authoring import (
     _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
 )
@@ -643,6 +644,7 @@ def _validate_pipeline_impl(
         ledger,
         load_runtime_settings(
             provider_validated,
+            operator_settings=settings if isinstance(settings, WebSettings) else None,
             secret_service=secret_service,
             user_id=user_id,
             load_yaml=dependencies.load_yaml,

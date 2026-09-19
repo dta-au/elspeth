@@ -117,25 +117,6 @@ describe("SharedInspectView", () => {
     );
   });
 
-  it("falls back to the identity id when the snapshot predates the username", async () => {
-    // Snapshots minted before the backend froze a username are immutable
-    // signed blobs, so `created_by_username` is null forever for them. The
-    // deliberate choice is a degraded-but-honest identifier the reviewer can
-    // quote back to the sender, rather than an unattributed banner.
-    const legacy: SharedInspectResponse = {
-      ..._validResponse,
-      created_by_username: null,
-    };
-    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(legacy);
-    render(<SharedInspectView token="abc" />);
-    await waitFor(() =>
-      expect(screen.getByTestId("shared-inspect-loaded")).toBeInTheDocument(),
-    );
-    expect(screen.getByTestId("shared-inspect-shared-by")).toHaveTextContent(
-      legacy.created_by_user_id,
-    );
-  });
-
   it("renders the 401 error path for tampered/expired tokens", async () => {
     vi.spyOn(api, "fetchSharedInspect").mockRejectedValueOnce({
       status: 401,

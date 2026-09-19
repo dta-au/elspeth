@@ -35,6 +35,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectInputKind,
     SinkEffectReconcileResult,
 )
+from elspeth.core.config import LandscapeExportSettings
 from elspeth.engine.orchestrator.core import Orchestrator
 from elspeth.engine.orchestrator.export import export_landscape
 from elspeth.engine.orchestrator.preflight import (
@@ -160,6 +161,32 @@ _AUDIT_CONTENT_STORE = _DurableAuditContentStore()
 _AUDIT_CONTENT_STORE_RESOLVER = AuditExportContentStoreResolver()
 _AUDIT_CONTENT_STORE_RESOLVER.register(_AUDIT_CONTENT_STORE)
 _AUDIT_STORE_POLICY = SimpleNamespace(content_store_id="archive-primary-v1", namespace="audit-export")
+
+
+def _marked_export_settings(sink: str, *, signed: bool = False) -> LandscapeExportSettings:
+    return LandscapeExportSettings(
+        enabled=True,
+        sink=sink,
+        format="json",
+        compartment_id="test-compartment",
+        signing_mode="hmac_sha256" if signed else "unsigned",
+        signer_key_id="test-key" if signed else "UNSIGNED",
+        signing_secret_ref="AUDIT_EXPORT_TEST_KEY" if signed else None,
+        total_record_limit=10_000,
+        total_byte_limit=10_000_000,
+        chunk_limit=100,
+        per_chunk_record_limit=1_000,
+        per_chunk_byte_limit=1_000_000,
+        spool_root=".elspeth/audit-export-spool/preflight-test",
+        content_store={
+            "content_store_id": "archive-primary-v1",
+            "namespace": "audit-export",
+            "root": ".elspeth/audit-export-content-store/preflight-test",
+            "policy_version": "v1",
+            "retention_days": 30,
+            "durability": "fsync",
+        },
+    )
 
 
 def test_preflight_rejects_legacy_sink_before_lifecycle_or_io() -> None:
@@ -1129,15 +1156,7 @@ def test_real_runtime_factory_carries_adapter_resolved_mode_with_exact_sink(
     _web_sinks, web_modes, _web_admission = preflight_runtime_sink_effects(settings, bundle)  # type: ignore[arg-type]
     export_settings = SimpleNamespace(
         sinks=settings.sinks,
-        landscape=SimpleNamespace(
-            export=SimpleNamespace(
-                enabled=True,
-                sink="output",
-                sign=False,
-                include_raw_error_rows=False,
-                format="json",
-            )
-        ),
+        landscape=SimpleNamespace(export=_marked_export_settings("output")),
     )
     export_binding, _export_admission = prepare_audit_export_binding(
         export_settings,  # type: ignore[arg-type]
@@ -1476,15 +1495,7 @@ def test_audit_export_preflights_fresh_sink_before_node_or_lifecycle_or_io() -> 
     sink = LegacyObservableSink()
     export_settings = SimpleNamespace(
         sinks={"audit-output": SimpleNamespace(options={})},
-        landscape=SimpleNamespace(
-            export=SimpleNamespace(
-                sign=False,
-                include_raw_error_rows=False,
-                sink="audit-output",
-                format="json",
-                content_store=_AUDIT_STORE_POLICY,
-            )
-        ),
+        landscape=SimpleNamespace(export=_marked_export_settings("audit-output")),
     )
 
     with pytest.raises(SinkEffectCapabilityError, match="effect protocol"):
@@ -1541,16 +1552,7 @@ def test_export_admission_precedes_pending_events_telemetry_and_signing_key_read
     factory = SimpleNamespace(run_lifecycle=MagicMock(spec=["set_export_status"]))
     settings = SimpleNamespace(
         sinks={"audit-output": SimpleNamespace(options={})},
-        landscape=SimpleNamespace(
-            export=SimpleNamespace(
-                enabled=True,
-                sign=True,
-                include_raw_error_rows=False,
-                sink="audit-output",
-                format="json",
-                content_store=_AUDIT_STORE_POLICY,
-            )
-        ),
+        landscape=SimpleNamespace(export=_marked_export_settings("audit-output", signed=True)),
     )
     monkeypatch.setattr("elspeth.engine.orchestrator.export.os", _EnvGuardOs())
 
@@ -1710,15 +1712,7 @@ def test_audit_export_requires_export_input_kind_and_rejects_pipeline_only_sink(
     sink = pipeline_type()
     export_settings = SimpleNamespace(
         sinks={"audit-output": SimpleNamespace(options={})},
-        landscape=SimpleNamespace(
-            export=SimpleNamespace(
-                sign=False,
-                include_raw_error_rows=False,
-                sink="audit-output",
-                format="json",
-                content_store=_AUDIT_STORE_POLICY,
-            )
-        ),
+        landscape=SimpleNamespace(export=_marked_export_settings("audit-output")),
     )
     with pytest.raises(SinkEffectCapabilityError, match="audit_export_snapshot"):
         export_landscape(

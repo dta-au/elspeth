@@ -18,7 +18,6 @@ from uuid import uuid4
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
-    AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
     AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_DERIVATION_VERSION,
     AuditExportContentDescriptor,
@@ -334,11 +333,9 @@ def prepare_audit_export_snapshot(
     """
     if type(config) is not LandscapeExportSettings:
         raise TypeError("config must be exact LandscapeExportSettings")
-    if config.signing_mode == "hmac_sha256" and config.exporter_version not in (
-        AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
-        AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
-    ):
-        raise ValueError("legacy signed export may only be verified from an existing snapshot")
+    if config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+        raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+    config.public_snapshot_config()
     run_id = coordination_token.run_id
     # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
     # Protocol, so the check admits any object carrying the right attribute names
@@ -361,12 +358,12 @@ def prepare_audit_export_snapshot(
     witness: AuditExportTerminalWitness | None = None
     spool: BinaryIO | None = None
     with open_export_read_transaction(db.engine) as read_model:
+        if snapshots.has_unsupported_version_for_run(read_model.connection, run_id):
+            raise ValueError("audit-export lineage contains unsupported exporter_version")
         for existing_signer_key_id in snapshots.find_lineage_signer_key_ids(read_model.connection, key):
             config.assert_signer_rotation_allowed(existing_signer_key_id=existing_signer_key_id)
         winner = snapshots.find_winner(read_model.connection, key)
         if winner is None:
-            if config.signing_mode == "hmac_sha256" and config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
-                raise ValueError("legacy signed export may only be resumed from an existing snapshot")
             witness = read_model.get_export_terminal_witness(run_id)
             derivation = _derivation_config(witness, config, signing_key)
             exporter = LandscapeExporter(

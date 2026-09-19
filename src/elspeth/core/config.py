@@ -1601,7 +1601,7 @@ class LandscapeExportSettings(BaseModel):
     signer_key_id: str = "UNSIGNED"
     signing_secret_ref: str | None = None
     signer_rotation_policy: Literal["multi_version", "single_export"] = "multi_version"
-    exporter_version: Literal["landscape-exporter-auth-v1", "landscape-exporter-auth-v2"] = "landscape-exporter-auth-v2"
+    exporter_version: Literal["landscape-exporter-auth-v2"] = "landscape-exporter-auth-v2"
     auth_events: Literal["omitted", "deployment_snapshot"] = "omitted"
     compartment_id: str | None = None
     serialization_version: str = Field(default="audit-export-v2", min_length=1, max_length=64)
@@ -1655,8 +1655,6 @@ class LandscapeExportSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_snapshot_policy(self) -> "LandscapeExportSettings":
-        if self.exporter_version == "landscape-exporter-auth-v1" and self.compartment_id is not None:
-            raise ValueError("compartment_id requires landscape-exporter-auth-v2")
         if self.signing_mode == "unsigned":
             if self.signer_key_id != "UNSIGNED":
                 raise ValueError("unsigned signing requires the typed UNSIGNED signer identity")
@@ -1676,6 +1674,7 @@ class LandscapeExportSettings(BaseModel):
             ("per_chunk_byte_limit", self.per_chunk_byte_limit),
             ("spool_root", self.spool_root),
             ("content_store", self.content_store),
+            ("compartment_id", self.compartment_id),
         )
         if self.enabled:
             missing = [name for name, value in required if value is None]
@@ -1705,6 +1704,8 @@ class LandscapeExportSettings(BaseModel):
 
     def public_snapshot_config(self) -> dict[str, object]:
         """Return exactly the target-independent snapshot-shaping fields."""
+        if self.exporter_version != "landscape-exporter-auth-v2":
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
         if self.per_chunk_byte_limit is None or self.per_chunk_record_limit is None:
             raise ValueError("audit export chunk limits are not configured")
         public_config = {
@@ -1719,10 +1720,9 @@ class LandscapeExportSettings(BaseModel):
             "signing_mode": self.signing_mode,
         }
         public_config["auth_events"] = self.auth_events
-        if self.exporter_version == "landscape-exporter-auth-v2":
-            if self.compartment_id is None:
-                raise ValueError("compartment_id is required for landscape-exporter-auth-v2")
-            public_config["compartment_id"] = self.compartment_id
+        if self.compartment_id is None:
+            raise ValueError("compartment_id is required for landscape-exporter-auth-v2")
+        public_config["compartment_id"] = self.compartment_id
         return public_config
 
     def assert_signer_rotation_allowed(self, *, existing_signer_key_id: str) -> None:

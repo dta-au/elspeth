@@ -462,7 +462,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_linear(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             token_ids = {t["token_id"] for t in grouped["token"]}
@@ -481,7 +481,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_linear(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             token_ids = {t["token_id"] for t in grouped["token"]}
@@ -497,7 +497,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_fork(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             state_ids = {s["state_id"] for s in grouped.get("node_state", [])}
@@ -513,7 +513,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_linear(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             token_ids = {t["token_id"] for t in grouped["token"]}
@@ -529,7 +529,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_linear(tmp_path, source_data)
 
         try:
-            exporter = LandscapeExporter(db)
+            exporter = LandscapeExporter(db, compartment_id="test-compartment")
             first = list(exporter.export_run(run_id))
             second = list(exporter.export_run(run_id))
 
@@ -548,7 +548,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_fork(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             assert len(grouped.get("routing_event", [])) > 0, "Fork pipeline should produce routing_event records"
@@ -569,7 +569,7 @@ class TestExporterBatchQueryIntegrity:
             direct_states = factory.query.get_all_node_states_for_run(run_id)
             direct_outcomes = factory.query.get_all_token_outcomes_for_run(run_id)
 
-            grouped = _group_records(list(LandscapeExporter(db).export_run(run_id)))
+            grouped = _group_records(list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id)))
 
             assert len(grouped["row"]) == len(direct_rows), f"row count: export={len(grouped['row'])} vs db={len(direct_rows)}"
             assert len(grouped["token"]) == len(direct_tokens), f"token count: export={len(grouped['token'])} vs db={len(direct_tokens)}"
@@ -606,7 +606,7 @@ class TestExporterBatchQueryIntegrity:
             )
             assert target_run_id != sibling_run_id
 
-            grouped = _group_records(list(LandscapeExporter(db).export_run(target_run_id)))
+            grouped = _group_records(list(LandscapeExporter(db, compartment_id="test-compartment").export_run(target_run_id)))
 
             expected_record_types = {
                 "artifact",
@@ -678,14 +678,14 @@ class TestExporterRowBatchStreaming:
         try:
             run_id = self._build_seeded_fork_run(db, tmp_path)
 
-            baseline = list(LandscapeExporter(db).export_run(run_id))
+            baseline = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(baseline)
             for record_type in self._ROW_FAMILY_RECORD_TYPES:
                 assert grouped.get(record_type), f"equivalence fixture must exercise record type: {record_type}"
             assert len(grouped["row"]) >= 4, "fixture must span multiple row batches at small batch sizes"
 
             for batch_size in (1, 2, 3):
-                chunked = list(LandscapeExporter(db, row_batch_size=batch_size).export_run(run_id))
+                chunked = list(LandscapeExporter(db, compartment_id="test-compartment", row_batch_size=batch_size).export_run(run_id))
                 assert chunked == baseline, f"row_batch_size={batch_size} changed the export stream"
         finally:
             db.close()
@@ -697,9 +697,15 @@ class TestExporterRowBatchStreaming:
             run_id = self._build_seeded_fork_run(db, tmp_path)
             key = b"row-batch-equivalence-key"
 
-            signed_default = list(LandscapeExporter(db, signing_key=key, signer_key_id="row-batch-key").export_run(run_id, sign=True))
+            signed_default = list(
+                LandscapeExporter(db, signing_key=key, signer_key_id="row-batch-key", compartment_id="test-compartment").export_run(
+                    run_id, sign=True
+                )
+            )
             signed_batched = list(
-                LandscapeExporter(db, signing_key=key, signer_key_id="row-batch-key", row_batch_size=1).export_run(run_id, sign=True)
+                LandscapeExporter(
+                    db, signing_key=key, signer_key_id="row-batch-key", compartment_id="test-compartment", row_batch_size=1
+                ).export_run(run_id, sign=True)
             )
 
             # Every data record — signature included — must match; only the

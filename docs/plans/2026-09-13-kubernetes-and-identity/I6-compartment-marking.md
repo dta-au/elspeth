@@ -2,11 +2,12 @@
 
 > **Current execution note (2026-09-19):** The
 > [execution map](../2026-09-19-identity-workflow-finalization.md)
-> supersedes the decision here to omit signed Landscape exports: the
-> operator requires `compartment_id` in those exports. Ingress also includes
-> user text pasted into Composer chat when it creates a composition state,
-> not only YAML import and library fork. Preserve older-format verification
-> while versioning the signed format. Re-anchor source and epoch references.
+> extends the original I6 draft. Ingress includes user text pasted into
+> Composer chat when it creates a composition state, as well as YAML import
+> and library fork. Every enabled Landscape export uses the compartment-marked
+> auth-v2 contract, signed or unsigned, including verification and resume;
+> auth-v1 is not retained. Historical source and epoch references below still
+> need re-anchoring when a step is executed.
 
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I4, I5. Runs before: I7. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
@@ -90,20 +91,17 @@ What the spec asks for and what this task delivers:
    (`sessions/service.py:1912-1953`), which a sha256 and compartment ids
    cannot. `merge_composer_meta_updates` (`routes/_helpers.py:958`) carries
    the key forward, so every descendant state names the text its lineage was
-   seeded from until the next seed replaces it. Chat compose turns do not
-   record ingress (open question).
-7. **Signed Landscape exports: NOT delivered.** The export's signed
-   configuration is a closed contract: `_validate_public_config`
-   (`contracts/audit_export.py:316`) calls `_object` with an exact `fields` set (:239), which
-   refuses any key outside the exact set; it is hashed as
-   `audit-export-public-config-v1` (:1081, :1148) and mirrored by
-   `AuditExportDerivationConfig` (:855) and `AuditExportPublicConfig`
-   (`contracts/export_records.py:13`). The only other carriers are the run
-   record's persisted `settings_json` and the `run_web_plugin_policy` row,
-   both Landscape columns that I0's constraint forbids changing. Stamping
-   signed exports needs a derivation-version change or the next Landscape
-   window (elspeth-ff89d2bea0); this task does not make it, says so in the
-   changelog and docs, and raises it as an open question.
+   seeded from until the next seed replaces it. Composer chat also records
+   ingress when pasted user text creates a composition state.
+7. **Landscape exports: delivered in the auth-v2 contract.** The closed
+   `audit_export_config.public_config` carries `compartment_id` for every
+   enabled signed or unsigned export. The public configuration hash binds
+   that marking to snapshot identity; HMAC signatures bind the signed record
+   stream and manifest. Producer, registered reader, CLI fresh run, Web
+   execution and resume require auth-v2 and a valid marking. Auth-v1 export
+   and replay are refused, including when an old snapshot row exists for the
+   run. The `audit-export-derivation-v1` label describes a separate
+   cryptographic version domain and remains unchanged.
 
 The sessions DB mutation-authority manifest gains no writer:
 every composition-state insert still goes through the reviewed
@@ -1169,7 +1167,7 @@ with
 - [ ] **Step 16: Run the shareable-review suites to verify they pass.**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && pytest tests/unit/web/shareable_reviews tests/integration/web/test_shareable_reviews_routes.py tests/integration/web/test_completion_flow_e2e.py -n 0 > /tmp/i6-share.log 2>&1; echo exit=$?`
-Expected: `exit=0`. `test_shared_route_projects_legacy_signed_blob_without_rewriting_evidence` still passes (legacy blobs lack the key; the producer-side `_BLOB_KEYS` check applies only to new mints).
+Expected: `exit=0`. The signed share-blob reader requires the current closed key set; a blob missing `compartment_id` or `created_by_username` is rejected after signature and digest verification.
 
 - [ ] **Step 17: Write the failing download and ingress tests.**
 
@@ -1495,7 +1493,7 @@ Expected: `exit=0` (Docker required; without `-m testcontainer` the selection is
 with
 
 ```markdown
-| `compartment_id` | string | Yes (every IdP) | - | Operator-declared marking for this container's identities and artifacts. Lowercase letters, digits and hyphens, 1 to 63 characters, not starting with a hyphen (`^[a-z0-9][a-z0-9-]{0,62}$`); validated non-blank. Stamped into every `auth_events.metadata_json`, the first line of the YAML download (`# compartment_id: <id>`), the shareable-review snapshot and every library entry; a pasted YAML import records the foreign markings it contains. Signed Landscape run exports do not carry it yet. Required by readiness whenever `workflow_governance` is `on` |
+| `compartment_id` | string | Yes (every IdP) | - | Operator-declared marking for this container's identities and artifacts. Lowercase letters, digits and hyphens, 1 to 63 characters, not starting with a hyphen (`^[a-z0-9][a-z0-9-]{0,62}$`); validated non-blank. Stamped into every `auth_events.metadata_json`, the first line of the YAML download (`# compartment_id: <id>`), shareable-review snapshots, library entries and every signed or unsigned Landscape export. YAML import and chat-pasted state creation record foreign markings. Required by readiness whenever `workflow_governance` is `on` |
 ```
 
 `docs/guides/identity-providers.md`: replace :507-514
@@ -1526,11 +1524,13 @@ it cannot carry whitespace or `#`. ELSPETH stamps it into:
 - the shareable-review snapshot;
 - every published library entry (the `library_entries.compartment_id`
   column; the entry's `payload_digest` is deliberately the same in every
-  compartment, which is what makes the same pipeline detectable across them).
+  compartment, which is what makes the same pipeline detectable across them);
+- every signed or unsigned Landscape export through its auth-v2 public
+  configuration record.
 
-Importing pasted YAML records, on the new composition state, the sha256 of the
-pasted text and every `compartment_id` marking in it that is not this
-deployment's own. Signed Landscape run exports do not carry the marking yet.
+Importing pasted YAML or creating a composition state from user text pasted
+into Composer chat records the sha256 of the text and every `compartment_id`
+marking in it that is not this deployment's own.
 ```
 
 `CHANGELOG.md`: directly before the line `- **Coordination deadlines are decided from fresh post-lock database time.**` (:40 on HEAD; below any bullets I0, I8 and I1 to I5 added under `## 0.8.1 - 2026-09-10`), insert
@@ -1542,7 +1542,9 @@ deployment's own. Signed Landscape run exports do not carry the marking yet.
   authentication audit row, the first line of the YAML download, the
   shareable-review snapshot and library entries, and a pasted YAML import
   records the text's sha256 and any foreign marking on the new composition
-  state. Signed Landscape run exports do not carry it yet.
+  state. User text pasted into Composer chat records the same ingress when
+  it creates a composition state. Signed and unsigned Landscape exports
+  carry the marking in their auth-v2 public configuration record.
 
 ```
 

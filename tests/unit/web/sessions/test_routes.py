@@ -1358,7 +1358,12 @@ def test_manual_canonical_pipeline_accept_records_origin_chat_ingress(tmp_path, 
         )
     )
     app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
-    app.state.composer_service = SimpleNamespace(surface_pending_interpretation_reviews=AsyncMock(return_value=None))
+    app.state.composer_service = SimpleNamespace(
+        surface_pending_interpretation_reviews=AsyncMock(
+            spec=ComposerService.surface_pending_interpretation_reviews,
+            return_value=None,
+        )
+    )
     assert row.pipeline_metadata is not None
 
     response = TestClient(app).post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
@@ -1384,7 +1389,12 @@ def test_manual_pipeline_accept_retains_prior_chat_paste(tmp_path, monkeypatch: 
         )
     )
     app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
-    app.state.composer_service = SimpleNamespace(surface_pending_interpretation_reviews=AsyncMock(return_value=None))
+    app.state.composer_service = SimpleNamespace(
+        surface_pending_interpretation_reviews=AsyncMock(
+            spec=ComposerService.surface_pending_interpretation_reviews,
+            return_value=None,
+        )
+    )
     assert row.pipeline_metadata is not None
 
     response = TestClient(app).post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
@@ -6205,7 +6215,7 @@ class TestMessageRoutes:
         """Concurrent sends must not compose against an in-flight partial transcript."""
         composer = _BlockingRecordingComposer()
 
-        app, _ = _make_app(tmp_path)
+        app, session_service = _make_app(tmp_path)
         app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -6233,10 +6243,17 @@ class TestMessageRoutes:
 
         assert first_resp.status_code == 200
         assert second_resp.status_code == 200
+        persisted = await session_service.get_messages(uuid.UUID(session_id), limit=None)
+        first_user_message = next(message for message in persisted if message.role == "user" and message.content == "First")
         assert [call["message"] for call in composer.calls] == ["First", "Second"]
         assert composer.calls[0]["chat_messages"] == []
         assert composer.calls[1]["chat_messages"] == [
-            {"role": "user", "content": "First", "_elspeth_user_authored": True},
+            {
+                "role": "user",
+                "content": "First",
+                "_elspeth_user_authored": True,
+                "_elspeth_user_message_id": str(first_user_message.id),
+            },
             {"role": "assistant", "content": "Reply to first"},
         ]
 

@@ -1289,6 +1289,43 @@ sinks:
     load_settings.assert_called_once()
 
 
+@pytest.mark.parametrize("authored_compartment", [None, "forged"])
+def test_web_validation_stamps_operator_export_before_settings_model_load(authored_compartment: str | None) -> None:
+    state = _make_state(outputs=(_make_output(),))
+    settings = _make_settings().model_copy(update={"compartment_id": "operator-a"})
+    yaml_generator = _FakeYamlGenerator(
+        "sources:\n  primary:\n    plugin: csv\n    on_success: primary\n    options: {}\nsinks:\n  primary:\n    plugin: csv\n    options: {}\n"
+    )
+    parsed_config = {
+        "sources": {"primary": {"plugin": "csv", "on_success": "primary", "options": {}}},
+        "sinks": {"primary": {"plugin": "csv", "options": {}}},
+        "landscape": {"export": {"enabled": True, "compartment_id": authored_compartment}},
+    }
+    catalog = create_catalog_service()
+
+    with (
+        patch("elspeth.web.execution.validation.load_bounded_pipeline_yaml", return_value=parsed_config),
+        patch(
+            "elspeth.web.execution.validation.load_settings_from_config_dict",
+            side_effect=ValueError("stop after operator marking"),
+        ) as load_settings,
+    ):
+        result = validation_module.validate_pipeline(
+            state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(catalog),
+            profile_registry=None,
+            catalog=catalog,
+            session_id="test-session",
+        )
+
+    assert result.is_valid is False
+    assert "stop after operator marking" in result.errors[0].message
+    assert load_settings.call_args.args[0]["landscape"]["export"]["compartment_id"] == "operator-a"
+    assert parsed_config["landscape"]["export"]["compartment_id"] == authored_compartment
+
+
 def test_validation_pipeline_delegates_to_injected_impl_with_its_dependencies() -> None:
     """The pipeline threads its captured dependencies into the injected impl
     and converts a PhaseTermination escape into that termination's result —

@@ -142,7 +142,7 @@ class TestRegisterNodeDsnSanitization:
         self._register_database_node(factory, {"url": self._DSN})
 
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
-        records = list(LandscapeExporter(db).export_run("run-1"))
+        records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run("run-1"))
         node_records = [r for r in records if r["record_type"] == "node"]
         assert node_records, "expected the registered node in the export"
         assert "s3cr3t-pw" not in json.dumps(node_records)

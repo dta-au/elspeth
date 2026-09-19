@@ -7416,7 +7416,7 @@ class TestExecuteTransformNoRetry:
             expected_lease_owner=ctx.require_member_token().worker_id,
         )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
-        export_records = list(LandscapeExporter(setup.db).export_run(setup.run_id))
+        export_records = list(LandscapeExporter(setup.db, compartment_id="test-compartment").export_run(setup.run_id))
         transform_error_export = next(record for record in export_records if record["record_type"] == "transform_error")
         exported_error_payload = json.loads(transform_error_export["error_details_json"])
         assert exported_error_payload["error"] == "<redacted-secret>"
@@ -7515,7 +7515,7 @@ class TestExecuteTransformNoRetry:
         with setup.db.engine.begin() as conn:
             conn.execute(update(token_work_items_table).where(token_work_items_table.c.run_id == setup.run_id).values(status="terminal"))
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
-        export_records = list(LandscapeExporter(setup.db).export_run(setup.run_id))
+        export_records = list(LandscapeExporter(setup.db, compartment_id="test-compartment").export_run(setup.run_id))
         transform_error_export = next(record for record in export_records if record["record_type"] == "transform_error")
         exported_error_payload = json.loads(transform_error_export["error_details_json"])
         assert exported_error_payload == transform_error_payload
@@ -7651,7 +7651,7 @@ class TestExecuteTransformNoRetry:
             expected_lease_owner=ctx.require_member_token().worker_id,
         )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
-        export_records = list(LandscapeExporter(setup.db).export_run(setup.run_id))
+        export_records = list(LandscapeExporter(setup.db, compartment_id="test-compartment").export_run(setup.run_id))
         transform_error_export = next(record for record in export_records if record["record_type"] == "transform_error")
         exported_error_payload = json.loads(transform_error_export["error_details_json"])
         assert exported_error_payload == result.reason

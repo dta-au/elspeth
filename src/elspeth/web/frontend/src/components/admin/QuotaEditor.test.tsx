@@ -40,6 +40,17 @@ describe("QuotaEditor", () => {
     expect(await screen.findByText(/Storage: 2.9 KB/)).toBeInTheDocument();
   });
 
+  it("reports the saved quota to the parent row", async () => {
+    const updated = { ...quota, tokens_per_day: 750 };
+    const onSaved = vi.fn();
+    vi.mocked(workflow.setIdentityQuota).mockResolvedValue(updated);
+    render(<QuotaEditor identityId="member" onSaved={onSaved} />);
+    await screen.findByText(/Tokens per day: 500/);
+    await userEvent.type(screen.getByLabelText("New cap"), "750");
+    await userEvent.click(screen.getByRole("button", { name: "Save cap" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledExactlyOnceWith(updated));
+  });
+
   it("rejects noninteger and out-of-range values before calling the API", async () => {
     render(<QuotaEditor identityId="member" />);
     await screen.findByText(/Tokens per day: 500/);

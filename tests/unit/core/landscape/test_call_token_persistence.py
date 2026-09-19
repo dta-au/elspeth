@@ -72,7 +72,7 @@ def test_call_usage_round_trip(operation: bool, usage: TokenUsage) -> None:
     # Exercise both call projections against a caller-owned snapshot; terminal
     # run admission is separately covered by the public exporter contracts.
     with open_export_read_transaction(db.engine) as read_model:
-        records = list(LandscapeExporter(db, read_model=read_model).iter_unsigned_run_records("run-1"))
+        records = list(LandscapeExporter(db, read_model=read_model, compartment_id="test-compartment").iter_unsigned_run_records("run-1"))
     exported = [record for record in records if record["record_type"] == "call"]
     assert len(exported) == 1
     assert exported[0]["prompt_tokens"] == usage.prompt_tokens

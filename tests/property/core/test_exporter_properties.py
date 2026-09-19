@@ -273,6 +273,7 @@ def _make_exporter(signing_key: bytes | None = None) -> LandscapeExporter:
         _shared_landscape_db(),
         signing_key=signing_key,
         signer_key_id="property-signer-v1" if signing_key is not None else None,
+        compartment_id="test-compartment",
     )
 
 
@@ -285,9 +286,35 @@ def _make_exporter_with_data(
     Patches _iter_records to yield simple test records; the signing/manifest
     pipeline under test is independent of how records are sourced.
     """
-    test_records = [{"record_type": f"test_{i}", "data": f"value_{i}", "index": i} for i in range(num_records)]
-
     signing_mode = "hmac_sha256" if signing_key is not None else "unsigned"
+    derivation_config = AuditExportDerivationConfig(
+        source_run_id="run-1",
+        source_status="completed",
+        source_completed_at="2026-01-15T13:00:00.000000Z",
+        export_format="json",
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
+        serialization_version="audit-export-v2",
+        chunking_algorithm_version="record-framing-v1",
+        include_raw_error_rows=False,
+        per_chunk_byte_limit=1_048_576,
+        per_chunk_record_limit=1_000,
+        signing_mode=signing_mode,
+        signer_key_id="property-signer-v1" if signing_key is not None else "UNSIGNED",
+        signing_key=signing_key,
+    )
+    test_records = [
+        *({"record_type": f"test_{i}", "data": f"value_{i}", "index": i} for i in range(num_records)),
+        {"record_type": "audit_export_config", "public_config": derivation_config.public_snapshot_config()},
+        {
+            "record_type": "auth_event_coverage",
+            "policy": "omitted",
+            "selection_cutoff": None,
+            "selected_count": None,
+            "reason": "not_requested",
+            "selection_basis": None,
+        },
+    ]
     exporter = LandscapeExporter(
         _shared_landscape_db(),
         # The records and terminal witness are synthetic in this property
@@ -297,21 +324,8 @@ def _make_exporter_with_data(
         read_model=RecorderFactoryExportReadModel(RecorderFactory(_shared_landscape_db())),
         signing_key=signing_key,
         signer_key_id="property-signer-v1" if signing_key is not None else None,
-        derivation_config=AuditExportDerivationConfig(
-            source_run_id="run-1",
-            source_status="completed",
-            source_completed_at="2026-01-15T13:00:00.000000Z",
-            export_format="json",
-            exporter_version="landscape-exporter-v1",
-            serialization_version="audit-export-v2",
-            chunking_algorithm_version="record-framing-v1",
-            include_raw_error_rows=False,
-            per_chunk_byte_limit=1_048_576,
-            per_chunk_record_limit=1_000,
-            signing_mode=signing_mode,
-            signer_key_id="property-signer-v1" if signing_key is not None else "UNSIGNED",
-            signing_key=signing_key,
-        ),
+        compartment_id="test-compartment",
+        derivation_config=derivation_config,
     )
 
     # Patch _iter_records to return our test data

@@ -30,9 +30,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink_effects import AuditExportSignedManifestInput
 
 AUDIT_EXPORT_DERIVATION_VERSION: Final = "audit-export-derivation-v1"
-AUDIT_EXPORT_AUTH_EXPORTER_VERSION: Final = "landscape-exporter-auth-v1"
 AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION: Final = "landscape-exporter-auth-v2"
-_AUTH_EXPORTER_VERSIONS: Final = frozenset({AUDIT_EXPORT_AUTH_EXPORTER_VERSION, AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION})
 AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v2"
 AUDIT_EXPORT_MANIFEST_SCHEMA: Final = "elspeth.audit-export-manifest.v2"
 AUDIT_EXPORT_MAX_CHUNKS: Final = 100_000
@@ -132,6 +130,8 @@ class AuditExportSnapshotRegistryKey:
         ):
             if type(value) is not str or not value:
                 raise ValueError(f"{field_name} must be a non-empty exact string")
+        if self.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
         if type(self.export_format) is not AuditExportFormat:
             raise TypeError("export_format must be exact AuditExportFormat")
         if type(self.signing_mode) is not AuditExportSigningMode:
@@ -167,6 +167,8 @@ class AuditExportSnapshotRegistryKey:
 def _validate_snapshot_bundle(snapshot: AuditExportSnapshot, chunks: tuple[AuditExportSnapshotChunk, ...]) -> None:
     if type(snapshot) is not AuditExportSnapshot:
         raise TypeError("snapshot must be exact AuditExportSnapshot")
+    if snapshot.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+        raise AuditIntegrityError("audit-export snapshot exporter_version must be landscape-exporter-auth-v2")
     if not chunks or any(type(chunk) is not AuditExportSnapshotChunk for chunk in chunks):
         raise ValueError("chunks must be a non-empty exact AuditExportSnapshotChunk tuple")
     if len(chunks) != snapshot.chunk_count:
@@ -321,8 +323,7 @@ def _validate_public_config(payload: object) -> None:
         raise TypeError("public config must be an exact dict")
     if "exporter_version" not in payload:
         raise ValueError("public config is missing exporter_version")
-    is_auth_version = payload["exporter_version"] in _AUTH_EXPORTER_VERSIONS
-    is_compartment_version = payload["exporter_version"] == AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION
+    _string(payload["exporter_version"], "exporter_version", allowed=frozenset({AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION}))
     fields = frozenset(
         {
             "chunking_algorithm_version",
@@ -334,20 +335,15 @@ def _validate_public_config(payload: object) -> None:
             "serialization_version",
             "signer_key_id",
             "signing_mode",
+            "auth_events",
+            "compartment_id",
         }
     )
-    if is_auth_version:
-        fields = fields | {"auth_events"}
-    if is_compartment_version:
-        fields = fields | {"compartment_id"}
     obj = _object(payload, fields=fields, path="public config")
-    if is_auth_version:
-        _string(obj["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
-    if is_compartment_version:
-        validate_compartment_id(obj["compartment_id"])
+    _string(obj["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
+    validate_compartment_id(obj["compartment_id"])
     _string(obj["chunking_algorithm_version"], "chunking_algorithm_version")
     _string(obj["export_format"], "export_format", allowed=frozenset({"json", "csv"}))
-    _string(obj["exporter_version"], "exporter_version")
     _boolean(obj["include_raw_error_rows"], "include_raw_error_rows")
     _integer(obj["per_chunk_byte_limit"], "per_chunk_byte_limit", minimum=1, maximum=AUDIT_EXPORT_MAX_CHUNK_BYTES)
     _integer(
@@ -376,7 +372,7 @@ def _validate_registry_key(payload: object) -> None:
     )
     obj = _object(payload, fields=fields, path="registry key")
     _string(obj["export_format"], "export_format", allowed=frozenset({"json", "csv"}))
-    _string(obj["exporter_version"], "exporter_version")
+    _string(obj["exporter_version"], "exporter_version", allowed=frozenset({AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION}))
     _hash(obj["public_export_config_hash"], "public_export_config_hash")
     _string(obj["serialization_version"], "serialization_version")
     signer = _string(obj["signer_key_id"], "signer_key_id")
@@ -893,12 +889,9 @@ class AuditExportDerivationConfig:
         _string(self.export_format, "export_format", allowed=frozenset({"json", "csv"}))
         _string(self.exporter_version, "exporter_version")
         _string(self.auth_events, "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
-        if self.exporter_version not in _AUTH_EXPORTER_VERSIONS and self.auth_events != "omitted":
-            raise ValueError(f"auth_events deployment_snapshot requires {AUDIT_EXPORT_AUTH_EXPORTER_VERSION}")
-        if self.exporter_version == AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
-            validate_compartment_id(self.compartment_id)
-        elif self.compartment_id is not None:
-            raise ValueError("compartment_id requires landscape-exporter-auth-v2")
+        if self.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        validate_compartment_id(self.compartment_id)
         if self.serialization_version != AUDIT_EXPORT_SERIALIZATION_VERSION:
             raise ValueError(f"serialization_version must equal {AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
         _string(self.chunking_algorithm_version, "chunking_algorithm_version")
@@ -935,10 +928,8 @@ class AuditExportDerivationConfig:
             "signer_key_id": self.signer_key_id,
             "signing_mode": self.signing_mode,
         }
-        if self.exporter_version in _AUTH_EXPORTER_VERSIONS:
-            payload["auth_events"] = self.auth_events
-        if self.exporter_version == AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
-            payload["compartment_id"] = self.compartment_id
+        payload["auth_events"] = self.auth_events
+        payload["compartment_id"] = self.compartment_id
         return payload
 
 
@@ -1097,8 +1088,6 @@ class AuditExportAuthEventCoverageValidator:
             public_config = config_record["public_config"]
             _validate_public_config(public_config)
             assert isinstance(public_config, dict)
-            if public_config["exporter_version"] not in _AUTH_EXPORTER_VERSIONS:
-                raise ValueError("auth event coverage requires current public config version")
             self.config_policy = _string(public_config["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
             self.public_config_hash = H(C("audit-export-public-config-v1", cast(ClosedAuditExportJSON, public_config)))
         elif kind == "auth_event_coverage":
@@ -1159,9 +1148,6 @@ def _coverage_checked_records(
     config: AuditExportDerivationConfig,
 ) -> Iterator[Mapping[str, object]]:
     """Check signed coverage against the actual emitted stream in bounded memory."""
-    if config.exporter_version not in _AUTH_EXPORTER_VERSIONS:
-        yield from records
-        return
     validator = AuditExportAuthEventCoverageValidator(config.source_completed_at, config.auth_events)
     for record in records:
         validator.observe(record)
@@ -1180,9 +1166,7 @@ def derive_audit_export_bundle(
     This pure boundary is intentionally target/store independent. Persistence
     code may spool the returned complete-frame chunks before registering the
     immutable winner; no formula here includes a target, effect, or store ID.
-    It can re-derive legacy landscape-exporter-auth-v1 bytes for verification
-    and replay. Production export entry points refuse new signed auth-v1
-    artifacts; this helper does not authorize their publication.
+    All derivations use the compartment-marked auth-v2 public config.
     """
     if type(config) is not AuditExportDerivationConfig:
         raise TypeError("config must be exact AuditExportDerivationConfig")

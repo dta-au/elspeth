@@ -366,10 +366,10 @@ def test_shared_route_and_persistence_expose_only_public_projection(
     assert private_source_path not in repr(audit_row)
 
 
-def test_shared_route_projects_legacy_signed_blob_without_rewriting_evidence(
+def test_shared_route_projects_signed_blob_without_rewriting_evidence(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:
-    """A valid outstanding token cannot bypass the current public projection."""
+    """A valid signed token cannot bypass the current public projection."""
     client, session_id = audit_readiness_client_with_state
     marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
     assert marked.status_code == 200, marked.text
@@ -378,8 +378,8 @@ def test_shared_route_projects_legacy_signed_blob_without_rewriting_evidence(
     signed_payload = service._signer.verify(marked.json()["token"])
     stored = json.loads(payload_store.retrieve(signed_payload.payload_digest.removeprefix("sha256:")))
 
-    private_path = "/srv/elspeth/blobs/alice/legacy-http.csv"
-    private_index = "/srv/elspeth/indexes/alice/legacy-http"
+    private_path = "/srv/elspeth/blobs/alice/private-http.csv"
+    private_index = "/srv/elspeth/indexes/alice/private-http"
     blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
     stored["composition_snapshot"]["sources"]["source"]["options"].update(
         {
@@ -394,11 +394,11 @@ def test_shared_route_projects_legacy_signed_blob_without_rewriting_evidence(
         "lookup": {"path": "north", "file": "case.txt", "mode": "bind_source"},
         "provider_config": {"persist_directory": private_index},
     }
-    stored["yaml"] = f"legacy_path: {private_path}\nlegacy_blob: {blob_id}\n"
+    stored["yaml"] = f"private_path: {private_path}\nprivate_blob: {blob_id}\n"
     stored["audit_readiness"]["rows"][-1]["detail"] = "23 secret(s) in your inventory"
-    legacy_bytes = canonical_json(stored).encode()
-    digest_hex = payload_store.store(legacy_bytes)
-    legacy_token = service._signer.sign(
+    signed_bytes = canonical_json(stored).encode()
+    digest_hex = payload_store.store(signed_bytes)
+    signed_token = service._signer.sign(
         replace(
             signed_payload,
             nonce_hex="cd" * 16,
@@ -406,7 +406,7 @@ def test_shared_route_projects_legacy_signed_blob_without_rewriting_evidence(
         )
     )
 
-    response = client.get(f"/api/sessions/shared/{legacy_token}")
+    response = client.get(f"/api/sessions/shared/{signed_token}")
 
     assert response.status_code == 200, response.text
     serialized = response.text
@@ -415,7 +415,7 @@ def test_shared_route_projects_legacy_signed_blob_without_rewriting_evidence(
     expected_lookup = {"path": "north", "file": "case.txt", "mode": "bind_source"}
     assert response.json()["composition_snapshot"]["nodes"][0]["options"]["lookup"] == expected_lookup
     assert yaml.safe_load(response.json()["yaml"])["transforms"][0]["options"]["lookup"] == expected_lookup
-    assert payload_store.retrieve(digest_hex) == legacy_bytes
+    assert payload_store.retrieve(digest_hex) == signed_bytes
 
 
 def test_get_shared_inspect_recipient_is_not_creator(
