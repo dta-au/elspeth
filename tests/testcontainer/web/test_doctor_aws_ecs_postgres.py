@@ -15,11 +15,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL, make_url
 from typer.testing import CliRunner
 
 from elspeth.cli import app
+from elspeth.contracts.advisory_locks import ELSPETH_SCHEMA_INIT_LOCK_CLASSID
 from elspeth.web.schema_probe import SchemaState, probe_landscape_schema, probe_session_schema
 from elspeth.web.sessions.engine import create_session_engine
 
@@ -117,7 +118,7 @@ def _doctor_environment(tmp_path: Path, databases: _DatabasePair) -> dict[str, s
     return environment
 
 
-def _assert_all_green_report(stdout: str) -> list[dict[str, Any]]:
+def _read_report(stdout: str) -> list[dict[str, Any]]:
     payload = json.loads(stdout)
     assert isinstance(payload, list)
     assert payload
@@ -126,8 +127,45 @@ def _assert_all_green_report(stdout: str) -> list[dict[str, Any]]:
     names = [item.get("name") for item in report]
     assert all(isinstance(name, str) for name in names)
     assert len(names) == len(set(names))
+    assert all(type(item.get("ok")) is bool for item in report)
+    return report
+
+
+def _assert_all_green_report(stdout: str) -> list[dict[str, Any]]:
+    report = _read_report(stdout)
     assert all(item.get("ok") is True for item in report)
     return report
+
+
+def _assert_schema_busy_report(stdout: str) -> list[dict[str, Any]]:
+    report = _read_report(stdout)
+    failures = [item for item in report if not item["ok"]]
+    assert failures, "a failed CLI must explain its failure"
+    for item in failures:
+        assert item["name"] in {"session_schema", "landscape_schema"}, item
+        assert item["detail"] == "another schema initialization is in progress; wait for it to finish and rerun", item
+    return report
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        [{"name": "landscape_schema", "ok": True, "detail": "current"}],
+        [{"name": "landscape_schema", "ok": False, "detail": "schema is stale"}],
+        [{"name": "session_tls", "ok": False, "detail": "another schema initialization is in progress; wait for it to finish and rerun"}],
+        [
+            {
+                "name": "landscape_schema",
+                "ok": None,
+                "detail": "another schema initialization is in progress; wait for it to finish and rerun",
+            }
+        ],
+    ],
+    ids=["no-failure", "different-schema-error", "different-check", "malformed-status"],
+)
+def test_busy_report_assertion_rejects_other_outcomes(report: list[dict[str, Any]]) -> None:
+    with pytest.raises(AssertionError):
+        _assert_schema_busy_report(json.dumps(report))
 
 
 def _assert_trust_and_transport_green(report: list[dict[str, Any]]) -> None:
@@ -203,10 +241,12 @@ def _stop_processes(processes: list[subprocess.Popen[str]]) -> None:
             process.wait(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
 
 
+@pytest.mark.parametrize("hold_landscape_lock", [False, True], ids=["concurrent", "bounded-busy"])
 def test_concurrent_doctor_init_schema_cli_runs_are_safe(
     tmp_path: Path,
     database_pair: _DatabasePair,
     aws_rds_trust_subprocess_env: dict[str, str],
+    hold_landscape_lock: bool,
 ) -> None:
     environment = _doctor_environment(tmp_path, database_pair)
     overrides = dict(aws_rds_trust_subprocess_env)
@@ -224,6 +264,13 @@ def test_concurrent_doctor_init_schema_cli_runs_are_safe(
         "--init-schema",
         "--json",
     ]
+    lock_engine = create_engine(database_pair.landscape_url)
+    lock_holder = lock_engine.connect()
+    if hold_landscape_lock:
+        lock_holder.execute(
+            text("SELECT pg_catalog.pg_advisory_xact_lock(:classid, pg_catalog.hashtext('elspeth_schema_init'))"),
+            {"classid": ELSPETH_SCHEMA_INIT_LOCK_CLASSID},
+        )
     processes = [
         subprocess.Popen(
             command,
@@ -240,11 +287,30 @@ def test_concurrent_doctor_init_schema_cli_runs_are_safe(
             stdout, stderr = process.communicate(timeout=_PROCESS_TIMEOUT_SECONDS)
             completed.append((process.returncode, stdout, stderr))
 
+        # A bounded busy result is the documented outcome if a peer still
+        # holds the lock. Release the deliberate holder only after both CLI
+        # processes finish, then prove the operator's explicit retry works.
+        lock_holder.rollback()
+        retry_needed = False
         for returncode, stdout, stderr in completed:
-            assert returncode == 0, f"stdout:\n{stdout}\nstderr:\n{stderr}"
-            report = _assert_all_green_report(stdout)
+            assert returncode in (0, 1), f"stdout:\n{stdout}\nstderr:\n{stderr}"
+            if returncode == 0:
+                assert not hold_landscape_lock, "the held schema lock must prevent initialization"
+                report = _assert_all_green_report(stdout)
+            else:
+                report = _assert_schema_busy_report(stdout)
+                retry_needed = True
+                if hold_landscape_lock:
+                    assert any(item["name"] == "landscape_schema" and item["ok"] is False for item in report)
             _assert_trust_and_transport_green(report)
             _assert_private_database_values_absent(stdout + stderr, database_pair, environment)
+        if retry_needed:
+            retry = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=_PROCESS_TIMEOUT_SECONDS)
+            assert retry.returncode == 0, f"stdout:\n{retry.stdout}\nstderr:\n{retry.stderr}"
+            _assert_trust_and_transport_green(_assert_all_green_report(retry.stdout))
+            _assert_private_database_values_absent(retry.stdout + retry.stderr, database_pair, environment)
         _assert_schemas_current(database_pair)
     finally:
         _stop_processes(processes)
+        lock_holder.close()
+        lock_engine.dispose()

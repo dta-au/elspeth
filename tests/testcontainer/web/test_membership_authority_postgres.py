@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import Engine, select
+from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.web.coordination.contracts import InstanceState, SessionOperationContext, SessionOperationKind
@@ -30,6 +31,7 @@ from elspeth.web.coordination.membership_authority import (
 )
 from elspeth.web.coordination.membership_lifecycle import RegisteredWebInstanceMembership
 from elspeth.web.coordination.repository import SessionOperationConflictError
+from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import session_operation_fences_table, web_instances_table
 from elspeth.web.sessions.protocol import CompositionStateData, RunRecord
@@ -44,11 +46,30 @@ _PAST_BOTH_LEASES_SECONDS = 4.0
 
 
 @pytest.fixture()
-def deployment(
+def membership_database_url(
     external_deployment_postgres_url: str,
+) -> Iterator[str]:
+    """Global recovery must see only this test's runs, even after another test fails."""
+    database = f"membership_{uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    try:
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+        try:
+            yield make_url(external_deployment_postgres_url).set(database=database).render_as_string(hide_password=False)
+        finally:
+            with control.connect() as conn:
+                conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+    finally:
+        control.dispose()
+
+
+@pytest.fixture()
+def deployment(
+    membership_database_url: str,
 ) -> Iterator[tuple[Engine, Engine, SessionServiceImpl, SessionServiceImpl]]:
-    first_engine = create_session_engine(external_deployment_postgres_url)
-    second_engine = create_session_engine(external_deployment_postgres_url)
+    first_engine = create_session_engine(membership_database_url)
+    second_engine = create_session_engine(membership_database_url)
     initialize_session_schema(first_engine)
     first = SessionServiceImpl(
         first_engine,
@@ -137,6 +158,67 @@ def _acquire_as(service: SessionServiceImpl, session_id: UUID) -> SessionOperati
         owner_instance_id=service.session_operation_owner_instance_id,
         lease_seconds=service.session_operation_lease_seconds,
     )
+
+
+@pytest.mark.asyncio
+async def test_deployment_recovery_is_isolated_from_other_test_runs(deployment, external_deployment_postgres_url: str) -> None:
+    """A prior test's released run must not enter the membership proof's sweep."""
+    engine = create_session_engine(external_deployment_postgres_url)
+    try:
+        initialize_session_schema(engine)
+        service = SessionServiceImpl(
+            engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.pg-membership-unrelated"),
+            owner_instance_id=f"membership-unrelated-{uuid4()}",
+        )
+        owner_id = str(uuid4())
+        with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=owner_id)
+        session = await service.create_session(owner_id, "Unrelated run", "local")
+        context: SessionOperationContext | None = None
+        try:
+            context = _acquire_as(service, session.id)
+            state = await service.save_composition_state(
+                session.id,
+                CompositionStateData(is_valid=True),
+                provenance="session_seed",
+                session_operation_context=context,
+            )
+            service.session_operation_authority.release(context)
+            context = None
+            context = service.session_operation_authority.acquire(
+                session_id=session.id,
+                operation_kind=SessionOperationKind.EXECUTE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=300,
+            )
+            run = await service.create_run(session.id, state.id, session_operation_context=context)
+            await service.update_run_status(run.id, "running", session_operation_context=context)
+            service.session_operation_authority.release(context)
+            context = None
+            candidates = RepositoryGlobalRunRecoveryAuthority(engine).list_recoverable_run_records()
+            assert run.id in {record.id for record in candidates}
+            _first_engine, _second_engine, _first, second = deployment
+            assert await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered") == []
+            assert (await service.get_run(run.id)).status == "running"
+        finally:
+            if context is not None:
+                service.session_operation_authority.release(context)
+            cleanup = service.session_operation_authority.acquire(
+                session_id=session.id,
+                operation_kind=SessionOperationKind.EXECUTE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=300,
+            )
+            try:
+                for owned_run in await service.list_runs_for_session(session.id):
+                    if owned_run.status in {"pending", "running"}:
+                        await service.update_run_status(owned_run.id, "cancelled", session_operation_context=cleanup)
+            finally:
+                service.session_operation_authority.release(cleanup)
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.asyncio

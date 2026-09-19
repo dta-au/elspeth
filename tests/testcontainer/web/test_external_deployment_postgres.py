@@ -17,6 +17,7 @@ import importlib
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -381,30 +382,39 @@ def _assert_ddl_denied(url: str) -> None:
 
 @pytest.mark.usefixtures("aws_rds_trust_test_override")
 @pytest.mark.parametrize(
-    ("target", "query_delay"),
-    [pytest.param(target, 0.0, id=target) for target in _RUNTIME_CONTRACT_TARGETS]
-    + [pytest.param("kubernetes", 0.006, id="kubernetes-network-latency")],
+    ("target", "query_delay", "hold_first_probe"),
+    [pytest.param(target, 0.0, False, id=target) for target in _RUNTIME_CONTRACT_TARGETS]
+    + [
+        pytest.param("kubernetes", 0.006, False, id="kubernetes-network-latency"),
+        pytest.param("kubernetes", 0.0, True, id="kubernetes-transient-probe-timeout"),
+    ],
 )
 def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
     tmp_path: Path,
     database_pair: _DatabasePair,
     target: str,
     query_delay: float,
+    hold_first_probe: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_probe = readiness._probe_database_engine
+    entered = threading.Event()
+    release = threading.Event()
 
     def latency(*_args: object) -> None:
         time.sleep(query_delay)
 
     def delayed_probe(engine: Engine, *, kind: Literal["session", "landscape"]) -> tuple[readiness.ReadinessCheck, ...]:
+        if hold_first_probe and kind == "session" and not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=15), "test did not release the first readiness probe"
         event.listen(engine, "before_cursor_execute", latency)
         try:
             return original_probe(engine, kind=kind)
         finally:
             event.remove(engine, "before_cursor_execute", latency)
 
-    if query_delay:
+    if query_delay or hold_first_probe:
         # A modest per-query roundtrip cost must fit the unchanged readiness
         # deadline; this fails when every table is reflected independently.
         monkeypatch.setattr(readiness, "_probe_database_engine", delayed_probe)
@@ -444,7 +454,36 @@ def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
         before_landscape = tuple(sorted(inspect(landscape_owner).get_table_names()))
         web_app = create_app(settings)
         with TestClient(web_app) as client:
-            response = client.get("/api/ready")
+            try:
+                response = client.get("/api/ready")
+                if hold_first_probe:
+                    assert entered.is_set()
+                    assert response.status_code == 503
+                    by_name = {check["name"]: check for check in response.json()["checks"]}
+                    assert by_name["session_db"]["detail"] == "probe timed out"
+                    assert by_name["session_schema"]["ok"] is False
+            finally:
+                release.set()
+            # Readiness deliberately fails closed on a transient probe timeout.
+            # Wait for a fresh successful probe without relaxing its deadline or
+            # retrying a schema/auth/filesystem refusal. The cache expires in 2s.
+            deadline = time.monotonic() + 10
+            transient_details = {
+                "probe timed out",
+                "probe already in flight",
+                "probe failed (OperationalError)",
+                "not checked: connectivity probe failed",
+            }
+            while response.status_code == 503 and time.monotonic() < deadline:
+                failed_checks = [check for check in response.json()["checks"] if not check["ok"]]
+                if not failed_checks or any(
+                    check["name"] not in {"session_db", "session_schema", "landscape_db", "landscape_schema"}
+                    or check["detail"] not in transient_details
+                    for check in failed_checks
+                ):
+                    break
+                time.sleep(0.1)
+                response = client.get("/api/ready")
 
         assert response.status_code == 200, response.text
         assert response.json()["ready"] is True
