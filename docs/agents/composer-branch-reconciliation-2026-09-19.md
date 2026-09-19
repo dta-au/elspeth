@@ -31,9 +31,17 @@ restored. All six distinct checks from the Phase 5 frontend review file
 metadata isolation, exact unusual error strings, required fields on a later
 error, and fail-closed later-version decoding.
 
-The retained donor branches and worktrees remain available for inspection.
+On 2026-09-19, all 14 donor worktrees were removed after a fresh status,
+process-use, ignored-file and blob-reachability check. Of 205 changed donor
+files, 190 matched release or integration history. Exact copies of the other
+15 files and a hash manifest are retained locally under
+`.claude/lanes/composer-donor-cleanup-20260919/`; the three non-cache ignored
+evaluation scenarios were byte-identical in the main checkout. Donor branch
+refs remain available. The integration worktree was retained.
+
 The integration branch changes only the decision-panel frontend files, the
-adapted decoder boundary test, and this reconciliation note.
+adapted decoder boundary test, this reconciliation note, and the separate
+[landing plan](../plans/2026-09-19-composer-landing.md).
 
 ## Verification on the integration branch
 
