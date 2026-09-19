@@ -2257,3 +2257,29 @@ class TestInstanceId:
         monkeypatch.setenv("ELSPETH_WEB__INSTANCE_ID", "")
         with pytest.raises(ValidationError, match="instance_id"):
             web_config.settings_from_env()
+
+
+class TestWorkflowGovernanceSwitch:
+    def test_defaults_to_off(self) -> None:
+        assert _settings().workflow_governance == "off"
+
+    def test_accepts_on(self) -> None:
+        assert _settings(workflow_governance="on").workflow_governance == "on"
+
+    @pytest.mark.parametrize("value", ["true", "1", "ON", "yes", "", "enforce"])
+    def test_rejects_other_spellings(self, value: str) -> None:
+        with pytest.raises(ValidationError, match="Input should be 'off' or 'on'"):
+            _settings(workflow_governance=value)
+
+    @pytest.mark.usefixtures("required_web_env")
+    def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__WORKFLOW_GOVERNANCE", "on")
+        assert web_config.settings_from_env().workflow_governance == "on"
+
+    def test_open_local_governance_is_constructible_for_readiness(self) -> None:
+        settings = _settings(auth_provider="local", registration_mode="open", workflow_governance="on")
+        assert (settings.registration_mode, settings.workflow_governance) == ("open", "on")
+
+    def test_governance_without_compartment_is_constructible_for_readiness(self) -> None:
+        settings = _settings(registration_mode="closed", workflow_governance="on")
+        assert settings.compartment_id is None

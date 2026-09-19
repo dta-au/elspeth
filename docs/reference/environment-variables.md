@@ -69,6 +69,7 @@ Used to HMAC-sign exported audit records for integrity verification. Only requir
 | `ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS` | Pin `secrets.vault_url` to exact vaults | unset (approved-suffix check only) |
 | `DATABASE_URL` | CLI/MCP audit database connection | `sqlite:///./data/audit.db` |
 | `ELSPETH_WEB__REGISTRATION_MODE` | Local-auth registration mode: `open`, `email_verified`, or `closed` | `open` |
+| `ELSPETH_WEB__WORKFLOW_GOVERNANCE` | Workflow-governance mode and readiness prerequisites: `off` or `on` | `off` |
 | `ELSPETH_WEB__PUBLIC_BASE_URL` | Public origin used to generate email-verification links on non-local hosts | unset |
 
 ### ELSPETH_ALLOW_RAW_SECRETS
@@ -98,6 +99,18 @@ Non-local `email_verified` deployments must also set
 `ELSPETH_WEB__PUBLIC_BASE_URL` to a public origin, for example
 `https://elspeth.example.gov.au`. The value must be an origin only: no path,
 query, or fragment.
+
+### ELSPETH_WEB__WORKFLOW_GOVERNANCE
+
+Set to `on` to request workflow governance. This setting currently checks
+readiness prerequisites; the approval, review, and library authorities consume
+it when those workflow tasks land. Under local authentication, set
+`ELSPETH_WEB__REGISTRATION_MODE=closed` or `email_verified`; open local
+registration with governance on fails `/api/ready` because one person can
+create multiple identities and defeat author-is-not-approver checks. Also set
+`ELSPETH_WEB__COMPARTMENT_ID` to a non-blank container marking. Readiness
+names an absent marking or unsafe registration while the configured value
+stays `on`; a supplied blank marking is rejected during settings validation.
 
 ---
 

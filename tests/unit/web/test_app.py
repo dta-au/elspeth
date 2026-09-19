@@ -585,6 +585,20 @@ class TestHealthEndpoint:
 
 
 class TestReadinessEndpoint:
+    def test_open_local_governance_returns_named_http_503(self, tmp_path: Path) -> None:
+        app = create_app(_settings(tmp_path, workflow_governance="on", compartment_id="compartment-a"))
+
+        response = TestClient(app).get("/api/ready")
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["ready"] is False
+        auth_mode = next(check for check in payload["checks"] if check["name"] == "auth_mode")
+        assert auth_mode["ok"] is False
+        assert "workflow_governance=on" in auth_mode["detail"]
+        assert "auth_provider=local" in auth_mode["detail"]
+        assert "registration_mode=open" in auth_mode["detail"]
+
     def test_ready_returns_200_with_exact_nine_check_json(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path))
         checks = tuple(ReadinessCheck(name, True, "ok") for name in READINESS_CHECK_NAMES)

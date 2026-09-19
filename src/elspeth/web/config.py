@@ -555,6 +555,11 @@ class WebSettings(BaseModel):
     # already re-pended comes back on its own.
     identity_dormancy_days: int = Field(default=90, gt=0)
     identity_pending_retention_days: int = Field(default=90, gt=0)
+    # Workflow-governance mode for the later approval, review, and library
+    # authorities. Readiness already checks the unsafe local-registration
+    # combination and missing compartment, so an operator receives a named
+    # /api/ready failure instead of a load error.
+    workflow_governance: Literal["off", "on"] = "off"
 
     # JWKS cache tuning (OIDC / Entra). Defaults match the provider
     # defaults; operators may lower or raise them. Raising the failure
