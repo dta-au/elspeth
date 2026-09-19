@@ -4436,11 +4436,9 @@ class TestCopyBlobsForFork:
         assert len(orphan_counter.calls) == 1
         amount, attrs, context = orphan_counter.calls[0]
         assert amount == 1
-        assert attrs == {
-            "orphan_blob_id": str(failing_id),
-            "target_session_id": str(target_session_id),
-            "exc_type": "OSError",
-        }
+        # Exact blob identity belongs in the cleanup evidence above, never
+        # in process-global metric dimensions served by /metrics.
+        assert attrs == {"exc_type": "OSError"}
         assert context is None
 
     @pytest.mark.asyncio
