@@ -281,8 +281,11 @@
 
 .graph-view-shell {
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: 100%;
   height: 100%;
+  min-height: 0;
 }
 
 /* Empty canvas (elspeth-1f4b60a492): composes the shared .empty-state
@@ -348,7 +351,47 @@
      canvas box rather than an arbitrary ancestor. */
   position: relative;
   width: 100%;
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.graph-failure-policies {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--color-border-strong);
+  background: var(--color-surface-paper);
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+}
+
+.graph-failure-policies summary {
+  padding: var(--space-sm) var(--space-md);
+  cursor: pointer;
+  font-weight: var(--font-weight-semibold);
+}
+
+.graph-failure-policies-scroll {
+  max-height: 12rem;
+  overflow: auto;
+}
+
+.graph-failure-policies table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.graph-failure-policies th,
+.graph-failure-policies td {
+  padding: var(--space-xs) var(--space-md);
+  border-top: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+.graph-failure-policies-model {
+  display: block;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: normal;
 }
 
 /* The role="img" scope: contains ONLY the React Flow diagram. The live

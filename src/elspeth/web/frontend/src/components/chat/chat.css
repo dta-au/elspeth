@@ -13,26 +13,6 @@
      .inline-run-results*, .run-outputs-panel*, .run-output-artifact*,
      .narrative-results*. */
 
-.chat-panel-policy-summary {
-  padding: var(--space-sm) var(--space-md);
-  border-top: 1px solid var(--color-border-strong);
-  background-color: var(--color-bubble-system);
-  font-size: var(--font-size-sm);
-  line-height: var(--line-height-snug);
-  overflow-wrap: anywhere;
-  max-height: 12rem;
-  overflow-y: auto;
-}
-
-.chat-panel-policy-summary ul {
-  margin: var(--space-xs) 0 0;
-  padding-left: var(--space-lg);
-}
-
-.chat-panel-policy-summary li + li {
-  margin-top: var(--space-xs);
-}
-
 /* ---------------------------------------------------------------------------
    Chat Bubble Base Styles
    --------------------------------------------------------------------------- */

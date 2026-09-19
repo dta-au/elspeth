@@ -322,6 +322,37 @@ describe("GraphView", () => {
     expect(screen.getByText("llm_transform")).toBeInTheDocument();
   });
 
+  it("shows saved failure handling and LLM selection in the Graph tab", () => {
+    useSessionStore.setState({
+      compositionState: makeState({
+        sources: {
+          source: {
+            plugin: "csv", options: {}, on_success: "classify", on_validation_failure: "discard",
+          },
+        },
+        nodes: [makeNode({
+          id: "classify", plugin: "llm", options: { profile: "sonnet" },
+          on_error: "quarantine", on_success: "results",
+        })],
+        outputs: [{ name: "results", plugin: "csv", options: {}, on_write_failure: "discard" }],
+      }),
+    });
+
+    render(<GraphView />);
+    const policies = screen.getByText("Failure handling").closest("details");
+    expect(policies).toHaveAttribute("open");
+    const table = within(policies as HTMLElement).getByRole("table");
+    expect(within(table).getByRole("row", { name: /Source: source/ })).toHaveTextContent(
+      "Row fails validationDiscard row (audit recorded)",
+    );
+    expect(within(table).getByRole("row", { name: /Node: classify/ })).toHaveTextContent(
+      "profile sonnetRow processing failsSend to quarantine",
+    );
+    expect(within(table).getByRole("row", { name: /Output: results/ })).toHaveTextContent(
+      "Row write failsDiscard row (audit recorded)",
+    );
+  });
+
   it("renders a pending proposal pill when proposal affects graph", () => {
     useSessionStore.setState({
       compositionState: makeState({

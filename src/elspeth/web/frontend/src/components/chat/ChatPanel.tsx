@@ -32,7 +32,6 @@ import {
   toInlineSourceProvenance,
 } from "@/api/client";
 import { MessageBubble } from "./MessageBubble";
-import { PipelinePolicySummary } from "./PipelinePolicySummary";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
 import { dedupeGuidedUserMessages } from "./guidedReplay";
 import type { ChatTurn as GuidedWireChatTurn } from "@/types/guided";
@@ -2438,7 +2437,6 @@ export function ChatPanel({
       ) : (
         <>
           {revisionScope}
-          <PipelinePolicySummary state={compositionState} />
           <ChatInput
             onSend={onSend}
             uploadPromptSentence={uploadedSourcePromptSentence}
@@ -3716,7 +3714,6 @@ export function ChatPanel({
       </div>
 
       {/* Input */}
-      <PipelinePolicySummary state={compositionState} />
       <ChatInput
         onSend={handleSend}
         disabled={isComposing}

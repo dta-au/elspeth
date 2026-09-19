@@ -60,6 +60,7 @@ import type { CompositionState } from "@/types/index";
 
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
+import { GraphFailurePolicies } from "./GraphFailurePolicies";
 
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
@@ -2213,6 +2214,7 @@ export function GraphView() {
             />
           )}
         </div>
+        {compositionState && <GraphFailurePolicies state={compositionState} />}
         {selectedConfig && (
           <NodeConfigPanel
             config={selectedConfig}
