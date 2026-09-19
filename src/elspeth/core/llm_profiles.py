@@ -21,6 +21,7 @@ from elspeth.core.llm_provider_validation import (
     validate_gateway_capabilities,
     validate_gateway_contract_major,
     validate_gateway_endpoint,
+    validate_openrouter_profile_base_url,
 )
 from elspeth.core.url_validation import validate_credential_safe_https_url
 
@@ -110,6 +111,7 @@ class LLMProfileSettings(BaseModel):
     model: str = Field(min_length=1, max_length=512, repr=False)
     credential_scope: CredentialScope | None = Field(default=None, repr=False)
     credential_ref: str | None = Field(default=None, repr=False)
+    base_url: str | None = Field(default=None, repr=False)
     region_name: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", repr=False)
     endpoint: str | None = Field(default=None, repr=False)
     deployment_name: str | None = Field(default=None, min_length=1, max_length=256, repr=False)
@@ -132,7 +134,7 @@ class LLMProfileSettings(BaseModel):
         if self.provider == "bedrock":
             if self.credential_scope is not None or self.credential_ref is not None:
                 raise ValueError("Bedrock profiles use the keyless AWS credential chain")
-            if self.endpoint is not None or self.deployment_name is not None or self.api_version is not None:
+            if any(value is not None for value in (self.base_url, self.endpoint, self.deployment_name, self.api_version)):
                 raise ValueError("Bedrock profile contains fields owned by another provider")
             validate_bedrock_model(self.model)
         else:
@@ -140,10 +142,14 @@ class LLMProfileSettings(BaseModel):
                 raise ValueError("credentialed profile requires explicit scope and reference")
             if SECRET_REF_PATTERN.fullmatch(self.credential_ref) is None:
                 raise ValueError("credential reference has invalid syntax")
+            if self.provider != "openrouter" and self.base_url is not None:
+                raise ValueError(f"{self.provider} profile contains fields owned by another provider")
             if self.provider == "openrouter" and any(
                 value is not None for value in (self.region_name, self.endpoint, self.deployment_name, self.api_version)
             ):
                 raise ValueError("OpenRouter profile contains unsupported provider fields")
+            if self.provider == "openrouter" and self.base_url is not None:
+                validate_openrouter_profile_base_url(self.base_url)
             if self.provider == "azure":
                 if self.endpoint is None or self.deployment_name is None:
                     raise ValueError("Azure profile requires operator endpoint and deployment")
@@ -186,7 +192,10 @@ class RuntimeLLMProfile:
                 ("deployment_name", settings.deployment_name),
                 ("api_version", settings.api_version),
             ),
-            "openrouter": (("timeout_seconds", settings.timeout_seconds),),
+            "openrouter": (
+                ("base_url", settings.base_url),
+                ("timeout_seconds", settings.timeout_seconds),
+            ),
             "gateway": (
                 ("endpoint", settings.endpoint),
                 ("contract_major", settings.contract_major),

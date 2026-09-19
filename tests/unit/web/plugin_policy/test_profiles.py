@@ -16,6 +16,7 @@ from elspeth.contracts.aws_s3 import (
 from elspeth.contracts.aws_textract import textract_profiled_binding_fingerprint
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
+from elspeth.core.llm_profiles import lower_llm_profile_options
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
 from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager
@@ -59,6 +60,73 @@ def _isolated_manager_with_llm_source() -> PluginManager:
 def test_openrouter_profile_requires_explicit_scoped_credential() -> None:
     with pytest.raises(ValidationError):
         _settings(llm_profiles={"tutorial": {"provider": "openrouter", "model": "openai/gpt-5-mini"}}, default_llm_profile="tutorial")
+
+
+@pytest.mark.parametrize("base_url", ["http://127.0.0.1:8199/v1", "http://[::1]:8199/v1", "https://llm.example.com/v1"])
+def test_openrouter_profile_can_bind_an_openai_compatible_endpoint(base_url: str) -> None:
+    settings = _settings(
+        llm_profiles={
+            "chaosllm": {
+                "provider": "openrouter",
+                "model": "chaosllm/fake-gpt-4",
+                "base_url": base_url,
+                "credential_scope": "server",
+                "credential_ref": "CHAOSLLM_API_KEY",
+            }
+        },
+        default_llm_profile="chaosllm",
+    )
+
+    profile = RuntimeWebPluginConfig.from_settings(settings).llm_profiles[0][1]
+
+    assert dict(profile.provider_options) == {
+        "base_url": base_url,
+        "timeout_seconds": 60.0,
+    }
+    executable, audit_safe = lower_llm_profile_options("chaosllm", profile, {"prompt_template": "{{ row.text }}"})
+    assert executable["base_url"] == base_url
+    assert audit_safe == {"profile": "chaosllm", "prompt_template": "{{ row.text }}"}
+
+
+@pytest.mark.parametrize("port", ["invalid", "-1", "65536"])
+def test_openrouter_profile_rejects_invalid_endpoint_port(port: str) -> None:
+    with pytest.raises(ValidationError, match="base_url must have a valid port"):
+        _settings(
+            llm_profiles={
+                "invalid": {
+                    "provider": "openrouter",
+                    "model": "openai/gpt-5-mini",
+                    "base_url": f"https://llm.example.com:{port}/v1",
+                    "credential_scope": "server",
+                    "credential_ref": "OPENROUTER_API_KEY",
+                }
+            },
+            default_llm_profile="invalid",
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url,error",
+    [
+        ("http://llm.example.com/v1", "must use HTTPS"),
+        ("https://user:password@llm.example.com/v1", "must not contain embedded credentials"),
+        ("https:///v1", "must include a hostname"),
+    ],
+)
+def test_openrouter_profile_rejects_unsafe_endpoint(base_url: str, error: str) -> None:
+    with pytest.raises(ValidationError, match=error):
+        _settings(
+            llm_profiles={
+                "chaosllm": {
+                    "provider": "openrouter",
+                    "model": "chaosllm/fake-gpt-4",
+                    "base_url": base_url,
+                    "credential_scope": "server",
+                    "credential_ref": "CHAOSLLM_API_KEY",
+                }
+            },
+            default_llm_profile="chaosllm",
+        )
 
 
 @pytest.mark.parametrize(
@@ -1795,6 +1863,7 @@ def test_gateway_profile_rejects_user_credential_scope() -> None:
 @pytest.mark.parametrize(
     "field_overrides",
     [
+        {"base_url": "https://llm.example.com/v1"},
         {"region_name": "ap-southeast-2"},
         {"deployment_name": "some-deployment"},
         {"api_version": "2024-01-01"},

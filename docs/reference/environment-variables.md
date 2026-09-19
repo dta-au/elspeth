@@ -319,6 +319,7 @@ with `-` or `_`).
 | `model` | all | Bedrock: LiteLLM `bedrock/<model-id>` form. Azure: must equal `deployment_name`. |
 | `credential_scope` | openrouter, azure | `server` or `user`. Required for these providers; forbidden for Bedrock. |
 | `credential_ref` | openrouter, azure | Uppercase secret name (for example `OPENROUTER_API_KEY`). Required for these providers; forbidden for Bedrock. |
+| `base_url` | openrouter | Optional OpenAI-compatible API base URL. HTTPS is required except for an explicit loopback HTTP endpoint such as `http://127.0.0.1:8199/v1`. |
 | `region_name` | bedrock | Optional; the ambient AWS region applies when omitted. Forbidden for OpenRouter and Azure. |
 | `endpoint`, `deployment_name`, `api_version` | azure | `endpoint` (HTTPS, credential-free) and `deployment_name` are required for Azure; all three are forbidden for other providers. |
 | `timeout_seconds` | openrouter | Only OpenRouter profiles accept an explicit timeout (default 60, max 300 seconds). |
@@ -351,7 +352,8 @@ profile (collapse each value to a single line in an environment file):
 ```bash
 ELSPETH_WEB__LLM_PROFILES='{
   "bedrock-haiku": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "region_name": "ap-southeast-2"},
-  "sonnet": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "credential_scope": "server", "credential_ref": "OPENROUTER_API_KEY"}
+  "sonnet": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "credential_scope": "server", "credential_ref": "OPENROUTER_API_KEY"},
+  "chaosllm": {"provider": "openrouter", "model": "chaosllm/fake-gpt-4", "base_url": "http://127.0.0.1:8199/v1", "credential_scope": "server", "credential_ref": "CHAOSLLM_API_KEY"}
 }'
 ELSPETH_WEB__DEFAULT_LLM_PROFILE=sonnet
 ```

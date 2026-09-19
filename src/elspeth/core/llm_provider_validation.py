@@ -17,6 +17,23 @@ GATEWAY_SUPPORTED_CAPABILITIES = frozenset({"text", "tools", "json_object", "jso
 GATEWAY_SUPPORTED_CONTRACT_MAJORS = frozenset({1})
 
 
+def validate_openrouter_profile_base_url(value: str) -> str:
+    """Validate an operator OpenRouter-compatible profile endpoint.
+
+    The plugin's OpenRouter config performs the additional wire-normalization
+    checks when it is constructed. Profile admission still needs to reject a
+    credential-bearing remote HTTP endpoint before the web service advertises
+    the profile; loopback HTTP is the intentional local ChaosLLM/dev-server
+    exception.
+    """
+    validated = validate_credential_safe_https_url(value, field_name="base_url", allow_http_loopback=True)
+    try:
+        _ = urlsplit(validated).port
+    except ValueError as exc:
+        raise ValueError("base_url must have a valid port") from exc
+    return validated
+
+
 def validate_bedrock_model(value: str) -> str:
     """Validate the LiteLLM Bedrock model identifier convention."""
     if value != value.strip() or not value.startswith("bedrock/") or not value.removeprefix("bedrock/"):
