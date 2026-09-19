@@ -131,6 +131,16 @@
         "tier": "common"
       },
       {
+        "default": 268435456,
+        "description": "Maximum Azure blob bytes accepted",
+        "kind": "number-int",
+        "label": "Max Object Bytes",
+        "name": "max_object_bytes",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
         "description": "CSV parsing options (delimiter, has_header, encoding)",
         "kind": "json-object",
         "label": "CSV Options",

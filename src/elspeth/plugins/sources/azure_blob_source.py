@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import enum
+import hashlib
 import io
 import itertools
 import json
@@ -57,6 +58,8 @@ if TYPE_CHECKING:
     from azure.storage.blob import BlobClient
 
 logger = structlog.get_logger(__name__)
+
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 
 
 def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
@@ -228,6 +231,13 @@ class AzureBlobSourceConfig(DataPluginConfig):
     format: Literal["csv", "json", "jsonl"] = Field(
         default="csv",
         description="Data format: csv, json (array), or jsonl (newline-delimited)",
+    )
+    max_object_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        gt=0,
+        le=1024 * 1024 * 1024,
+        strict=True,
+        description="Maximum Azure blob bytes accepted",
     )
     csv_options: CSVOptions = Field(
         default_factory=CSVOptions,
@@ -412,7 +422,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bd862175b264fc46"
+    source_file_hash: str | None = "sha256:2a0ed119eba86aeb"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -420,8 +430,7 @@ class AzureBlobSource(BaseSource):
         "authentication method. The source preserves container and blob audit identity while normalizing and validating rows."
     )
     usage_when_not_to_use: str = (
-        "Do not use for Composer uploads, prefix or whole-container reads, event streams, or workloads requiring unbounded "
-        "whole-object materialization."
+        "Do not use for Composer uploads, prefix or whole-container reads, event streams, or objects larger than max_object_bytes."
     )
     example_use: str = """sources:
   azure_input:
@@ -449,6 +458,7 @@ class AzureBlobSource(BaseSource):
                 composer_hints=(
                     "Configure exactly one auth path: connection_string, sas_token+account_url, managed identity+account_url, or service principal+account_url.",
                     "Choose format explicitly; csv uses csv_options, while json/jsonl use json_options and optional data_key.",
+                    "Set max_object_bytes to the largest approved input blob; downloads beyond that limit fail before parsing.",
                     "For headerless CSV set csv_options.has_header=false and provide columns; columns is invalid for headered CSV or non-CSV blobs.",
                     "If you have been asked to generate source rows yourself, do not pick `azure_blob` — this source reads pre-existing storage blobs, not LLM-authored content. Switch to a local-blob source (`csv`, `json`, or `text`) via `create_blob` plus `set_source_from_blob`.",
                     "Never synthesise an Azure container name, blob path, account URL, or credential for content you authored — the audit trail must reference a real, addressable blob.",
@@ -467,6 +477,7 @@ class AzureBlobSource(BaseSource):
         self._container = cfg.container
         self._blob_path = cfg.blob_path
         self._format = cfg.format
+        self._max_object_bytes = cfg.max_object_bytes
         self._csv_options = cfg.csv_options
         self._json_options = cfg.json_options
         self._columns = cfg.columns
@@ -535,7 +546,18 @@ class AzureBlobSource(BaseSource):
     def _download_blob_payload(self) -> object | _AzureBlobDownloadFailure:
         """Return the provider payload or a sanitized, explicit failure."""
         try:
-            return self._get_blob_client().download_blob().readall()
+            downloader = self._get_blob_client().download_blob()
+            payload = bytearray()
+            while True:
+                remaining = self._max_object_bytes - len(payload)
+                chunk = downloader.read(min(_DOWNLOAD_CHUNK_BYTES, remaining + 1))
+                if type(chunk) is not bytes:
+                    raise TypeError("Azure blob downloader.read() must return exact bytes")
+                if not chunk:
+                    return bytes(payload)
+                if len(chunk) > remaining:
+                    return _AzureBlobDownloadFailure(provider_error_type="AzureBlobSizeLimitExceeded")
+                payload.extend(chunk)
         except ImportError:
             raise
         except _azure_provider_exception_types() as error:
@@ -593,7 +615,7 @@ class AzureBlobSource(BaseSource):
                 "container": self._container,
                 "blob_path": self._blob_path,
             },
-            response_data={"size_bytes": len(blob_data)},
+            response_data={"size_bytes": len(blob_data), "content_hash": hashlib.sha256(blob_data).hexdigest()},
             latency_ms=latency_ms,
             provider="azure_blob_storage",
         )

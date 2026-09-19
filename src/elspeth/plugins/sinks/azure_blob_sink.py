@@ -14,10 +14,11 @@ Three-tier trust model:
 from __future__ import annotations
 
 import base64
+import codecs
 import csv
 import io
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 
 from jinja2 import StrictUndefined, TemplateSyntaxError
@@ -389,7 +390,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:577c2fdf00a680c4"
+    source_file_hash: str | None = "sha256:93a9850ffde729d1"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -538,6 +539,12 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
             timestamp=ctx.run_started_at.isoformat(),
         )
 
+    def _effect_target(self, ctx: RestrictedSinkEffectContext) -> str:
+        account_name = self._get_container_client().account_name
+        if type(account_name) is not str or not account_name:
+            raise RemoteObjectPreconditionError("Azure container client has no storage account identity")
+        return f"azure://{account_name}/{self._container}/{self._effect_blob_path(ctx)}"
+
     @staticmethod
     def _observation_from_properties(properties: BlobProperties) -> RemoteObjectObservation:
         # ADR-032: the SDK object's class is not the control. Every field read
@@ -620,7 +627,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectInspection:
         blob_path = self._effect_blob_path(ctx)
-        target = f"azure://{self._container}/{blob_path}"
+        target = self._effect_target(ctx)
         observation = self._observe_effect_target(blob_path)
         # No rejection here: an existing blob's content identity is not yet
         # known (the staged body doesn't exist until prepare_effect). The
@@ -678,7 +685,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             raise TypeError("AzureBlobSink effects require pipeline member input")
         rows, accepted, diverted, diversion_attribution = self._preflight_effect_members(request.effect_input)
-        content = self._serialize_rows(rows)
+        body_chunks = self._serialize_csv(rows) if self._format == "csv" else (self._serialize_rows(rows),)
         evidence = request.inspection.evidence
         predecessor: ArtifactDescriptor | None = None
         predecessor_declared = evidence["predecessor_declared"]
@@ -697,7 +704,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
             effect_id=request.effect_id,
             provider="azure_blob",
             inspection=request.inspection,
-            body_chunks=(content,),
+            body_chunks=body_chunks,
             format_name=self._format,
             max_bytes=self._max_blob_bytes,
             accepted_ordinals=accepted,
@@ -709,7 +716,10 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         )
 
     def _blob_path_from_target(self, target: str) -> str:
-        prefix = f"azure://{self._container}/"
+        account_name = self._get_container_client().account_name
+        if type(account_name) is not str or not account_name:
+            raise RemoteObjectPreconditionError("Azure container client has no storage account identity")
+        prefix = f"azure://{account_name}/{self._container}/"
         blob_path = target.removeprefix(prefix)
         if not blob_path or prefix + blob_path != target:
             raise RemoteObjectPreconditionError("Azure effect target does not match configured container")
@@ -736,7 +746,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         restage_remote_object(
             plan,
             provider="azure_blob",
-            body_chunks=(self._serialize_rows(rows),),
+            body_chunks=self._serialize_csv(rows) if self._format == "csv" else (self._serialize_rows(rows),),
             max_bytes=self._max_blob_bytes,
             accepted_ordinals=accepted,
             diverted_ordinals=diverted,
@@ -749,7 +759,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     ) -> SinkEffectCommitResult:
         evidence, stage = validate_remote_plan(plan, provider="azure_blob", require_stage=True)
         require_commit_authority(evidence, overwrite=self._overwrite)
-        expected_target = f"azure://{self._container}/{self._effect_blob_path(ctx)}"
+        expected_target = self._effect_target(ctx)
         if evidence.target != expected_target:
             raise RemoteObjectPreconditionError("Azure effect target diverges from the configured run target")
         blob_client = self._get_container_client().get_blob_client(self._blob_path_from_target(evidence.target))
@@ -797,7 +807,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectReconcileResult:
         evidence, _stage = validate_remote_plan(plan, provider="azure_blob", require_stage=False)
-        expected_target = f"azure://{self._container}/{self._effect_blob_path(ctx)}"
+        expected_target = self._effect_target(ctx)
         if evidence.target != expected_target:
             raise RemoteObjectPreconditionError("Azure effect target diverges from the configured run target")
         observation = self._observe_effect_target(self._blob_path_from_target(evidence.target))
@@ -815,7 +825,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
             Serialized bytes content.
         """
         if self._format == "csv":
-            return self._serialize_csv(rows)
+            return b"".join(self._serialize_csv(rows))
         elif self._format == "json":
             return self._serialize_json(rows)
         elif self._format == "jsonl":
@@ -882,15 +892,13 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         display_fields = [display_map[field] if field in display_map else field for field in data_fields]
         return data_fields, display_fields
 
-    def _serialize_csv(self, rows: list[dict[str, Any]]) -> bytes:
-        """Serialize rows to CSV bytes.
+    def _serialize_csv(self, rows: list[dict[str, Any]]) -> Iterator[bytes]:
+        """Encode CSV incrementally so the stage enforces max_blob_bytes.
 
         Validates that all rows conform to the established fieldnames BEFORE
-        any serialization occurs. This prevents partial serialization failures
-        that would leave the buffer in an inconsistent state.
+        any serialization occurs. The codec is shared across rows so encodings
+        with a byte-order mark emit it exactly once.
         """
-        output = io.StringIO()
-
         data_fields, display_fields = self._get_field_names_and_display(rows)
 
         # Preflight validation: reject extra fields before serialization.
@@ -909,15 +917,14 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
                         f"AzureBlobSink CSV row {i} has fields the fixed schema does not declare: {extra}."
                     )
 
+        output = io.StringIO()
         writer = csv.DictWriter(
             output,
             fieldnames=data_fields,
             delimiter=self._csv_options.delimiter,
         )
+        encoder = codecs.getincrementalencoder(self._csv_options.encoding)()
 
-        # Encoder wrap: ONLY the csv/codec machinery runs inside this try, so
-        # the typed error can never absorb the schema/config ValueErrors
-        # raised above — those are upstream bugs and must crash.
         try:
             if self._csv_options.include_header:
                 if display_fields != data_fields:
@@ -925,13 +932,33 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
                     header_writer.writerow(display_fields)
                 else:
                     writer.writeheader()
-
-            for row in rows:
-                writer.writerow(row)
-
-            return output.getvalue().encode(self._csv_options.encoding)
+                header_chunk = encoder.encode(output.getvalue())
+                output.seek(0)
+                output.truncate(0)
+            else:
+                header_chunk = b""
         except (ValueError, TypeError, csv.Error, UnicodeError) as exc:
             raise AzureBlobRecordSerializationError(str(exc)) from exc
+        if header_chunk:
+            yield header_chunk
+
+        for row in rows:
+            try:
+                writer.writerow(row)
+                chunk = encoder.encode(output.getvalue())
+                output.seek(0)
+                output.truncate(0)
+            except (ValueError, TypeError, csv.Error, UnicodeError) as exc:
+                raise AzureBlobRecordSerializationError(str(exc)) from exc
+            if chunk:
+                yield chunk
+
+        try:
+            final_chunk = encoder.encode("", final=True)
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise AzureBlobRecordSerializationError(str(exc)) from exc
+        if final_chunk:
+            yield final_chunk
 
     def _serialize_json(self, rows: list[dict[str, Any]]) -> bytes:
         """Serialize rows to JSON array bytes."""

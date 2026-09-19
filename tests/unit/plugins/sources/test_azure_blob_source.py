@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -79,9 +80,14 @@ class _SourceContextFake:
 @dataclass(slots=True)
 class _BlobDownloadFake:
     data: object
+    offset: int = 0
 
-    def readall(self) -> object:
-        return self.data
+    def read(self, size: int) -> object:
+        if type(self.data) is not bytes:
+            return self.data
+        chunk = self.data[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
 
 
 @dataclass(slots=True)
@@ -1083,6 +1089,30 @@ class TestAzureBlobSourceAuditAndErrors:
             list(source.load(ctx))
         assert ctx.record_call.call_count == 0
 
+    def test_download_limit_rejects_oversized_blob_before_parsing(self) -> None:
+        source = _make_source(_base_config(max_object_bytes=5))
+        ctx = _SourceContextFake()
+
+        with patch(PATCH_AUTH, return_value=_fake_blob_service(b"id\n123\n")), pytest.raises(RuntimeError, match="Failed to download blob"):
+            list(source.load(ctx))
+
+        ctx.record_call.assert_called_once()
+        call = ctx.record_call.call_args.kwargs
+        assert call["status"].value == "error"
+        assert call["error"] == {"type": "AzureBlobSizeLimitExceeded"}
+
+    def test_download_at_limit_records_distinct_hashes_for_equal_size_blobs(self) -> None:
+        responses: list[dict[str, Any]] = []
+        for data in (b"id\n1\n", b"id\n2\n"):
+            source = _make_source(_base_config(max_object_bytes=len(data)))
+            ctx = _SourceContextFake()
+            with patch(PATCH_AUTH, return_value=_fake_blob_service(data)):
+                list(source.load(ctx))
+            responses.append(ctx.record_call.call_args.kwargs["response_data"])
+
+        assert responses[0]["size_bytes"] == responses[1]["size_bytes"] == 5
+        assert responses[0]["content_hash"] != responses[1]["content_hash"]
+
     @pytest.mark.parametrize(
         ("blob_format", "blob_path", "blob_bytes"),
         [
@@ -1116,7 +1146,10 @@ class TestAzureBlobSourceAuditAndErrors:
             "container": "test-container",
             "blob_path": blob_path,
         }
-        assert call_kwargs["response_data"] == {"size_bytes": len(blob_bytes)}
+        assert call_kwargs["response_data"] == {
+            "size_bytes": len(blob_bytes),
+            "content_hash": hashlib.sha256(blob_bytes).hexdigest(),
+        }
         assert call_kwargs["provider"] == "azure_blob_storage"
 
     def test_field_resolution_returned_for_csv(self, ctx: PluginContext) -> None:

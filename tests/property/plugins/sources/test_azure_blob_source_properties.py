@@ -33,9 +33,12 @@ PATCH_AUTH = "elspeth.plugins.infrastructure.azure_auth.AzureAuthConfig.create_b
 class _BlobDownload:
     def __init__(self, data: bytes) -> None:
         self._data = data
+        self._offset = 0
 
-    def readall(self) -> bytes:
-        return self._data
+    def read(self, size: int) -> bytes:
+        chunk = self._data[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
 
 class _BlobClientFake:
@@ -111,7 +114,7 @@ def _base_config(**overrides: Any) -> dict[str, Any]:
 
 
 def _mock_blob_download(data: bytes) -> _BlobServiceClientFake:
-    """Create a service client fake that returns data from download_blob().readall()."""
+    """Create a service client fake that returns data from download_blob().read()."""
     return _BlobServiceClientFake(data)
 
 

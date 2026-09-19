@@ -4,7 +4,36 @@ Verifies that non-finite floats are rejected at serialization time
 rather than producing non-standard JSON blobs.
 """
 
+import csv
+import io
+
 import pytest
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16"])
+def test_csv_streaming_preserves_single_header_and_encoding_marker(encoding: str) -> None:
+    from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSink
+    from tests.fixtures.base_classes import inject_write_failure
+
+    sink = inject_write_failure(
+        AzureBlobSink(
+            {
+                "container": "test-container",
+                "blob_path": "test.csv",
+                "format": "csv",
+                "connection_string": "DefaultEndpointsProtocol=https;AccountName=fake;AccountKey=ZmFrZQ==;EndpointSuffix=core.windows.net",
+                "schema": {"mode": "observed"},
+                "csv_options": {"encoding": encoding},
+            }
+        )
+    )
+    rows = [{"id": 1, "name": "Ada"}, {"id": 2, "name": "Grace"}]
+    expected_text = io.StringIO()
+    writer = csv.DictWriter(expected_text, fieldnames=["id", "name"])
+    writer.writeheader()
+    writer.writerows(rows)
+
+    assert b"".join(sink._serialize_csv(rows)) == expected_text.getvalue().encode(encoding)
 
 
 class TestAzureBlobSinkNonFiniteRejection:
