@@ -326,6 +326,7 @@ from elspeth.web.sessions.protocol import (
     TrustModeAutoCommitRevokedError,
     decode_stored_composition_validation_errors,
     serialize_composition_validation_errors,
+    validate_guided_failure_diagnostics,
 )
 from elspeth.web.sessions.protocol import (
     InterpretationResolveError as InterpretationResolveError,
@@ -4042,6 +4043,7 @@ class _GuidedSessionMutations:
                     response_hash=response_hash,
                     failure_code=None,
                     unproducible_output_fields=None,
+                    failure_diagnostics=None,
                     settled_at=now,
                     updated_at=now,
                     **locator_values,
@@ -4085,6 +4087,7 @@ class _GuidedSessionMutations:
         actor: str,
         failure_audit_cohort: GuidedFailureAuditCohort,
         unproducible_output_fields: tuple[str, ...],
+        failure_diagnostics: tuple[str, ...] = (),
     ) -> GuidedOperationFailed:
         service, connection, fence, row, now = self.__state._require_exact()
         service._validate_guided_actor(actor)
@@ -4094,6 +4097,11 @@ class _GuidedSessionMutations:
             raise AuditIntegrityError("failed guided operation event must carry exactly one failure audit cohort commitment")
         if type(unproducible_output_fields) is not tuple or any(type(field) is not str for field in unproducible_output_fields):
             raise ValueError("unproducible_output_fields must be an exact string tuple")
+        failed = GuidedOperationFailed(
+            failure_code=failure_code,
+            unproducible_output_fields=unproducible_output_fields,
+            failure_diagnostics=failure_diagnostics,
+        )
         try:
             changed = connection.execute(
                 update(guided_operations_table)
@@ -4117,6 +4125,7 @@ class _GuidedSessionMutations:
                     response_hash=None,
                     failure_code=failure_code,
                     unproducible_output_fields=(list(unproducible_output_fields) if unproducible_output_fields else None),
+                    failure_diagnostics=list(failure_diagnostics) if failure_diagnostics else None,
                     settled_at=now,
                     updated_at=now,
                 )
@@ -4150,10 +4159,7 @@ class _GuidedSessionMutations:
             self.__state._close()
             raise
         self.__state._close()
-        return GuidedOperationFailed(
-            failure_code=failure_code,
-            unproducible_output_fields=unproducible_output_fields,
-        )
+        return failed
 
     def mark_session_updated(self, *, updated_at: datetime) -> None:
         """Bump ``sessions.updated_at`` after this operation appended rows to its session.
@@ -5212,6 +5218,7 @@ class SessionServiceImpl:
                 "response_hash",
                 "failure_code",
                 "unproducible_output_fields",
+                "failure_diagnostics",
             )
         ):
             raise AuditIntegrityError("Tier 1: in-progress guided operation retained terminal residue")
@@ -5232,6 +5239,17 @@ class SessionServiceImpl:
         if type(raw_fields) is not list or not raw_fields or any(type(field) is not str for field in raw_fields):
             raise AuditIntegrityError("Tier 1: guided operation has malformed unproducible output fields")
         return tuple(raw_fields)
+
+    @staticmethod
+    def _guided_failure_diagnostics(row: RowMapping) -> tuple[str, ...]:
+        raw_notes = row["failure_diagnostics"]
+        if raw_notes is None:
+            return ()
+        if type(raw_notes) is not list or not raw_notes:
+            raise AuditIntegrityError("Tier 1: guided operation has malformed failure diagnostics")
+        notes = tuple(raw_notes)
+        validate_guided_failure_diagnostics(notes)
+        return notes
 
     @staticmethod
     def _validate_guided_terminal_bundle(row: RowMapping) -> None:
@@ -5257,6 +5275,7 @@ class SessionServiceImpl:
             if type(row["settled_at"]) is not datetime:
                 raise AuditIntegrityError("Tier 1: failed guided operation is missing settled_at")
             SessionServiceImpl._guided_failure_unproducible_output_fields(row)
+            SessionServiceImpl._guided_failure_diagnostics(row)
             return
         if status != "completed":
             raise AuditIntegrityError("Tier 1: guided operation terminal decoder received a non-terminal row")
@@ -5265,6 +5284,7 @@ class SessionServiceImpl:
             or row["lease_expires_at"] is not None
             or row["failure_code"] is not None
             or row["unproducible_output_fields"] is not None
+            or row["failure_diagnostics"] is not None
         ):
             raise AuditIntegrityError("Tier 1: completed guided operation retained terminal residue")
         if type(row["settled_at"]) is not datetime:
@@ -5327,6 +5347,7 @@ class SessionServiceImpl:
             return GuidedOperationFailed(
                 failure_code=cast("GuidedOperationFailureCode", row["failure_code"]),
                 unproducible_output_fields=SessionServiceImpl._guided_failure_unproducible_output_fields(row),
+                failure_diagnostics=SessionServiceImpl._guided_failure_diagnostics(row),
             )
         response_hash = cast("str", row["response_hash"])
         result_kind = row["result_kind"]
@@ -6016,7 +6037,13 @@ class SessionServiceImpl:
         failure_code: GuidedOperationFailureCode,
         actor: str,
         session_operation_context: SessionOperationContext,
+        failure_diagnostics: tuple[str, ...] = (),
     ) -> GuidedOperationFailed:
+        """Settle under the live fence with caller-admitted, operator-safe facts.
+
+        Diagnostics are internal evidence, never raw exception text or provider
+        output. Fork routes admit static reasons and structured custody facts.
+        """
         sid = str(fence.session_id)
 
         def _sync() -> GuidedOperationFailed:
@@ -6034,6 +6061,7 @@ class SessionServiceImpl:
                     actor=actor,
                     failure_audit_cohort=GuidedFailureAuditCohort.empty(),
                     unproducible_output_fields=(),
+                    failure_diagnostics=failure_diagnostics,
                 )
 
         return cast("GuidedOperationFailed", await self._run_sync(_sync))
@@ -6044,8 +6072,13 @@ class SessionServiceImpl:
         *,
         failure_code: GuidedOperationFailureCode,
         actor: str,
+        failure_diagnostics: tuple[str, ...] = (),
     ) -> GuidedOperationFailed:
-        """Fail a fork only while its exact parent, child, and guided fences live."""
+        """Fail while parent, child, and guided fences live, retaining safe facts.
+
+        As in ``fail_guided_operation``, callers must admit diagnostic content;
+        this method validates the carrier shape, not arbitrary text provenance.
+        """
         if type(authority) is not SessionForkAuthority:
             raise TypeError("authority must be an exact SessionForkAuthority")
         parent_id = authority.parent.parent_context.fence.session_id
@@ -6064,6 +6097,7 @@ class SessionServiceImpl:
                         actor=actor,
                         failure_audit_cohort=GuidedFailureAuditCohort.empty(),
                         unproducible_output_fields=(),
+                        failure_diagnostics=failure_diagnostics,
                     )
 
         return cast("GuidedOperationFailed", await self._run_sync(_sync))
@@ -14301,6 +14335,7 @@ class SessionServiceImpl:
                             response_hash=child_response_hash,
                             failure_code=None,
                             unproducible_output_fields=None,
+                            failure_diagnostics=None,
                             created_at=now,
                             updated_at=now,
                             settled_at=now,

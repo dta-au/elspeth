@@ -282,8 +282,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # 56 couples sparse proposal display with structured stored validation errors.
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
-    # Epoch 59 adds timestamp-leading indexes for container quota scans.
-    assert SESSION_SCHEMA_EPOCH == 59
+    # Epoch 60 preserves guided fork failure diagnostics.
+    assert SESSION_SCHEMA_EPOCH == 60
     expected_tables = frozenset(
         {
             "web_instances",

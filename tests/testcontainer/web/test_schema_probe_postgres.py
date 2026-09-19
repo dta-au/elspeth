@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 import structlog
-from sqlalchemy import Connection, Engine, create_engine, event, inspect, select, text, update
+from sqlalchemy import Connection, Engine, create_engine, event, func, insert, inspect, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
@@ -107,6 +107,83 @@ def test_fresh_create_reaches_current(postgres_engine: Engine, kind: str) -> Non
         assert probe_landscape_schema(postgres_engine) is SchemaState.MISSING
         init_landscape_schema(postgres_engine)
         assert probe_landscape_schema(postgres_engine) is SchemaState.CURRENT
+
+
+@pytest.mark.parametrize(
+    "diagnostics,accepted",
+    [
+        (None, True),
+        (["settlement_failed"], True),
+        (["cleanup_failed"] * 32, True),
+        ([], False),
+        ({}, False),
+        ("diagnostic", False),
+        (1, False),
+        (True, False),
+        (["diagnostic"] * 33, False),
+    ],
+)
+def test_postgres_failure_diagnostics_shape_and_immutability(postgres_engine: Engine, diagnostics, accepted: bool) -> None:
+    init_session_schema(postgres_engine)
+    _seed_postgres_trigger_rows(postgres_engine, session_id="diagnostics", include_completion=False)
+    statement = insert(guided_operations_table).values(
+        session_id="diagnostics",
+        operation_id="diagnostic-failure",
+        kind="session_fork",
+        status="failed",
+        request_hash="a" * 64,
+        attempt=1,
+        failure_code="integrity_error",
+        failure_diagnostics=diagnostics,
+        created_at=func.now(),
+        updated_at=func.now(),
+        settled_at=func.now(),
+    )
+    if not accepted:
+        with pytest.raises(DBAPIError), postgres_engine.begin() as conn:
+            conn.execute(statement)
+        return
+    with postgres_engine.begin() as conn:
+        conn.execute(statement)
+        assert (
+            conn.execute(
+                select(guided_operations_table.c.failure_diagnostics).where(guided_operations_table.c.operation_id == "diagnostic-failure")
+            ).scalar_one()
+            == diagnostics
+        )
+    with pytest.raises(DBAPIError, match="immutable"), postgres_engine.begin() as conn:
+        conn.execute(
+            update(guided_operations_table)
+            .where(guided_operations_table.c.operation_id == "diagnostic-failure")
+            .values(failure_diagnostics=["replacement"])
+        )
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_postgres_failure_diagnostics_rejects_nonfailed_residue(postgres_engine: Engine, completed: bool) -> None:
+    init_session_schema(postgres_engine)
+    _seed_postgres_trigger_rows(postgres_engine, session_id="diagnostics", include_completion=False)
+    statement = insert(guided_operations_table).values(
+        session_id="diagnostics",
+        operation_id="diagnostic-residue",
+        kind="guided_start",
+        status="completed" if completed else "in_progress",
+        request_hash="a" * 64,
+        attempt=1,
+        failure_diagnostics=["settlement_failed"],
+        created_at=func.now(),
+        updated_at=func.now(),
+        lease_token=None if completed else "lease",
+        lease_expires_at=None if completed else func.now(),
+        settled_at=func.now() if completed else None,
+        result_kind="composition_state" if completed else None,
+        result_state_id="diagnostics-state" if completed else None,
+        response_hash="b" * 64 if completed else None,
+    )
+    with postgres_engine.begin() as conn:
+        conn.execute(statement.values(operation_id="diagnostic-control", failure_diagnostics=None))
+    with pytest.raises(DBAPIError, match="ck_guided_operations_status_bundle"), postgres_engine.begin() as conn:
+        conn.execute(statement)
 
 
 def test_a_drifted_check_constraint_names_itself_on_postgresql(postgres_engine: Engine) -> None:

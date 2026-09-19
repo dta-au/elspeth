@@ -492,6 +492,7 @@ def test_operation_decoders_reject_kind_locator_drift_and_status_residue() -> No
         "response_hash": "a" * 64,
         "failure_code": None,
         "unproducible_output_fields": None,
+        "failure_diagnostics": None,
         "lease_token": None,
         "lease_expires_at": None,
         "settled_at": datetime.now(UTC),
@@ -526,6 +527,7 @@ def test_operation_decoders_reject_kind_locator_drift_and_status_residue() -> No
                     "response_hash": None,
                     "failure_code": None,
                     "unproducible_output_fields": None,
+                    "failure_diagnostics": None,
                 },
             )
         )
@@ -547,6 +549,7 @@ def test_failed_operation_decoder_rejects_malformed_output_field_enrichment(raw_
         "response_hash": None,
         "failure_code": "invalid_provider_response",
         "unproducible_output_fields": raw_fields,
+        "failure_diagnostics": None,
         "lease_token": None,
         "lease_expires_at": None,
         "settled_at": datetime.now(UTC),
@@ -2641,3 +2644,45 @@ async def test_failed_operation_replays_typed_unproducible_output_fields(file_en
             )
         ).scalar_one()
     assert stored == ["amount_aud", "client"]
+
+
+@pytest.mark.asyncio
+async def test_failure_diagnostics_replay_from_new_service_and_resist_stale_settlement(file_engine) -> None:
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    claimed = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id="diagnostic-failure",
+        kind="session_fork",
+        request_hash="c" * 64,
+        actor="worker-a",
+        lease_seconds=30,
+    )
+    assert isinstance(claimed, GuidedOperationClaimed)
+    diagnostics = ("Guided fork settlement parent is missing",)
+    failed = await service.fail_guided_operation(
+        claimed.fence, failure_code="integrity_error", actor="worker-a", failure_diagnostics=diagnostics
+    )
+    with pytest.raises(GuidedOperationFenceLostError):
+        await service.fail_guided_operation(
+            claimed.fence, failure_code="operation_failed", actor="stale-worker", failure_diagnostics=("loser",)
+        )
+    replay = await _service(file_engine).get_guided_operation(
+        session_id=session_id, operation_id="diagnostic-failure", kind="session_fork", request_hash="c" * 64
+    )
+    assert replay == failed == GuidedOperationFailed(failure_code="integrity_error", failure_diagnostics=diagnostics)
+    with file_engine.connect() as conn:
+        stored = conn.execute(select(guided_operations_table.c.failure_diagnostics)).scalar_one()
+    assert stored == list(diagnostics)
+
+
+@pytest.mark.parametrize("diagnostics", [["note"], ("",), (1,), ("x" * 513,), ("note",) * 33])
+def test_failure_diagnostics_reject_malformed_or_unbounded_carriers(diagnostics: object) -> None:
+    with pytest.raises(AuditIntegrityError, match="diagnostic"):
+        GuidedOperationFailed(failure_code="integrity_error", failure_diagnostics=cast(Any, diagnostics))
+
+
+@pytest.mark.parametrize("raw_diagnostics", [[], {}, "note", [1], [""], ["x" * 513], ["note"] * 33])
+def test_failure_diagnostics_decoder_rejects_malformed_storage(raw_diagnostics: object) -> None:
+    with pytest.raises(AuditIntegrityError, match="diagnostic"):
+        SessionServiceImpl._guided_failure_diagnostics(cast(Any, {"failure_diagnostics": raw_diagnostics}))

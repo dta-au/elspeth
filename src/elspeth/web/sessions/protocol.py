@@ -302,6 +302,8 @@ PROPOSAL_LIFECYCLE_STATUS_VALUES: frozenset[str] = frozenset(get_args(ProposalLi
 PROPOSAL_EVENT_TYPE_VALUES: frozenset[str] = frozenset(get_args(ProposalEventType))
 GUIDED_OPERATION_KIND_VALUES: frozenset[str] = frozenset(get_args(GuidedOperationKind))
 GUIDED_OPERATION_FAILURE_CODE_VALUES: frozenset[str] = frozenset(get_args(GuidedOperationFailureCode))
+GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS = 32
+GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH = 512
 CHAT_MESSAGE_WRITER_PRINCIPAL_VALUES: frozenset[str] = frozenset(get_args(ChatMessageWriterPrincipal))
 COMPOSITION_STATE_PROVENANCE_VALUES: frozenset[str] = frozenset(get_args(CompositionStateProvenance))
 SESSION_RUN_STATUS_VALUES: frozenset[str] = frozenset(get_args(SessionRunStatus))
@@ -586,12 +588,25 @@ class GuidedOperationFailed:
 
     failure_code: GuidedOperationFailureCode
     unproducible_output_fields: tuple[str, ...] = ()
+    # Internal operator evidence only; never included in the public failure envelope.
+    failure_diagnostics: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.failure_code not in GUIDED_OPERATION_FAILURE_CODE_VALUES:
             raise AuditIntegrityError("guided operation failure code is outside the closed vocabulary")
         if type(self.unproducible_output_fields) is not tuple or any(type(field) is not str for field in self.unproducible_output_fields):
             raise AuditIntegrityError("guided operation failure output fields must be an exact string tuple")
+        validate_guided_failure_diagnostics(self.failure_diagnostics)
+
+
+def validate_guided_failure_diagnostics(notes: tuple[str, ...]) -> None:
+    """Validate owned diagnostic facts; callers must exclude raw exception text."""
+    if (
+        type(notes) is not tuple
+        or len(notes) > GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS
+        or any(type(note) is not str or not 1 <= len(note) <= GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH for note in notes)
+    ):
+        raise AuditIntegrityError("guided operation failure diagnostics must be a bounded exact string tuple")
 
 
 type GuidedOperationOutcome = (
@@ -3991,6 +4006,7 @@ class SessionServiceProtocol(Protocol):
         failure_code: GuidedOperationFailureCode,
         actor: str,
         session_operation_context: SessionOperationContext,
+        failure_diagnostics: tuple[str, ...] = (),
     ) -> GuidedOperationFailed: ...
 
     async def fail_guided_operation_with_audit(
@@ -4900,6 +4916,7 @@ class SessionServiceProtocol(Protocol):
         *,
         failure_code: GuidedOperationFailureCode,
         actor: str,
+        failure_diagnostics: tuple[str, ...] = (),
     ) -> GuidedOperationFailed: ...
 
     async def cancel_all_orphaned_runs(

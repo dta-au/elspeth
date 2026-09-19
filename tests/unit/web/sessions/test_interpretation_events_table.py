@@ -198,7 +198,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_59() -> None:
+def test_current_session_schema_epoch_is_60() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -230,7 +230,8 @@ def test_current_session_schema_epoch_is_59() -> None:
     # paired with Landscape41. Existing approvals are not reinterpreted.
     # 58: 64-bit quota limits and nullable token-ledger usage measures.
     # 59: timestamp-leading indexes for container quota scans.
-    assert SESSION_SCHEMA_EPOCH == 59
+    # 60: durable guided fork failure diagnostics.
+    assert SESSION_SCHEMA_EPOCH == 60
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

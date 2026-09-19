@@ -337,7 +337,8 @@ from elspeth.core.schema_identity import create_schema_identity_table
 # token counts remain NULL rather than becoming invented zero usage.
 # 59: timestamp-leading quota scan indexes support container-wide daily
 # admission checks alongside the identity-leading indexes.
-SESSION_SCHEMA_EPOCH = 59
+# 60: terminal guided operations preserve fork failure diagnostics.
+SESSION_SCHEMA_EPOCH = 60
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1007,6 +1008,7 @@ guided_operations_table = Table(
     Column("response_hash", String(64), nullable=True),
     Column("failure_code", String(128), nullable=True),
     Column("unproducible_output_fields", JSON(none_as_null=True), nullable=True),
+    Column("failure_diagnostics", JSON(none_as_null=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     Column("settled_at", DateTime(timezone=True), nullable=True),
@@ -1108,13 +1110,25 @@ guided_operations_table = Table(
         name="ck_guided_operations_unproducible_output_fields_shape",
     ).ddl_if(dialect="postgresql"),
     CheckConstraint(
+        "failure_diagnostics IS NULL OR "
+        "(json_type(failure_diagnostics) = 'array' AND "
+        "json_array_length(failure_diagnostics) > 0 AND json_array_length(failure_diagnostics) <= 32)",
+        name="ck_guided_operations_failure_diagnostics_shape",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "failure_diagnostics IS NULL OR "
+        "(json_typeof(failure_diagnostics) = 'array'::text AND "
+        "json_array_length(failure_diagnostics) > 0 AND json_array_length(failure_diagnostics) <= 32)",
+        name="ck_guided_operations_failure_diagnostics_shape",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
         "(status = 'in_progress' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL "
         "AND settled_at IS NULL AND result_kind IS NULL "
         "AND result_message_id IS NULL AND response_hash IS NULL AND failure_code IS NULL "
-        "AND unproducible_output_fields IS NULL) OR "
+        "AND unproducible_output_fields IS NULL AND failure_diagnostics IS NULL) OR "
         "(status = 'completed' AND lease_token IS NULL AND lease_expires_at IS NULL "
         "AND settled_at IS NOT NULL AND result_kind IS NOT NULL AND response_hash IS NOT NULL AND failure_code IS NULL "
-        "AND unproducible_output_fields IS NULL) OR "
+        "AND unproducible_output_fields IS NULL AND failure_diagnostics IS NULL) OR "
         "(status = 'failed' AND lease_token IS NULL AND lease_expires_at IS NULL "
         "AND settled_at IS NOT NULL AND result_kind IS NULL AND result_state_id IS NULL "
         "AND result_message_id IS NULL AND result_session_id IS NULL AND proposal_id IS NULL "

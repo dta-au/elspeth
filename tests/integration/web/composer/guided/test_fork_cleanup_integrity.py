@@ -7,10 +7,12 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import select
 from structlog.testing import capture_logs
 
-from elspeth.contracts.blobs import BlobContentMissingError, BlobIntegrityError
+from elspeth.contracts.blobs import BlobContentMissingError, BlobForkCleanupError, BlobForkCleanupResult, BlobIntegrityError
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.sessions.models import guided_operations_table
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -85,6 +87,132 @@ def test_cleanup_integrity_failure_propagates_instead_of_a_coded_terminal_failur
     residue = [entry for entry in cap_logs if entry.get("event") == "session.fork_blob_cleanup_failed"]
     assert len(residue) == 1
     assert residue[0]["exc_class"] == "AuditIntegrityError"
+    with service._engine.connect() as conn:
+        row = conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).one()
+    assert row.failure_diagnostics == [
+        "ForkFailure[RuntimeError]: phase=settlement",
+        f"RecoveryFailed[AuditIntegrityError]: fork blob cleanup failed for child {residue[0]['child_session_id']}",
+    ]
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "Guided fork settlement parent is missing",
+        "Guided fork settlement child failed staged custody validation",
+        "Guided fork settlement lost archived-to-active compare-and-swap",
+    ],
+)
+def test_settlement_integrity_diagnostic_is_durable_for_replay_forensics(
+    composer_test_client: TestClient,
+    diagnostic: str,
+) -> None:
+    """A fork settlement integrity raise must survive terminal settlement.
+
+    The operation row currently keeps only ``integrity_error``; that makes
+    settlement failures indistinguishable from staging failures after the
+    request has returned and the process-local exception is gone.
+    """
+    client = composer_test_client
+    session_id, from_message_id = _fork_target(client)
+    service = client.app.state.session_service
+    operation_id = str(uuid4())
+    payload = {
+        "operation_id": operation_id,
+        "from_message_id": str(from_message_id),
+        "new_message_content": "Build the edited request.",
+    }
+
+    with patch.object(
+        service,
+        "settle_guided_fork_operation",
+        side_effect=AuditIntegrityError(diagnostic),
+    ):
+        response = client.post(
+            f"/api/sessions/{session_id}/fork",
+            json=payload,
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["failure_code"] == "integrity_error"
+    assert diagnostic not in response.text
+    replay = client.post(f"/api/sessions/{session_id}/fork", json=payload)
+    assert replay.status_code == response.status_code
+    assert replay.json() == response.json()
+    with service._engine.connect() as conn:
+        operation = conn.execute(
+            select(guided_operations_table).where(
+                guided_operations_table.c.session_id == session_id,
+                guided_operations_table.c.operation_id == operation_id,
+            )
+        ).one()
+
+    assert operation.failure_code == "integrity_error"
+    assert operation.failure_diagnostics == [diagnostic]
+
+
+@pytest.mark.parametrize("error_count", [1, 40])
+def test_cleanup_notes_survive_settlement_without_raw_exception_detail(composer_test_client: TestClient, error_count: int) -> None:
+    client = composer_test_client
+    session_id, message_id = _fork_target(client)
+    service = client.app.state.session_service
+    blob_service = client.app.state.blob_service
+    operation_id = str(uuid4())
+    blob_id = uuid4()
+    secret = "storage-password-must-not-be-retained"  # secret-scan: allow-this-line
+    payload = {"operation_id": operation_id, "from_message_id": str(message_id), "new_message_content": "Edited request"}
+    with (
+        patch.object(service, "settle_guided_fork_operation", side_effect=RuntimeError(secret)),
+        patch.object(
+            blob_service,
+            "cleanup_blobs_for_fork",
+            return_value=BlobForkCleanupResult(
+                deleted_ids=(), errors=(BlobForkCleanupError(blob_id=blob_id, exc_type="OSError", detail=secret),) * error_count
+            ),
+        ),
+    ):
+        response = client.post(f"/api/sessions/{session_id}/fork", json=payload)
+    replay = client.post(f"/api/sessions/{session_id}/fork", json=payload)
+    assert response.status_code == replay.status_code == 500
+    assert response.json() == replay.json()
+    assert secret not in response.text
+    with service._engine.connect() as conn:
+        row = conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).one()
+    assert row.failure_code == "operation_failed"
+    assert len(row.failure_diagnostics) == min(1 + error_count, 32)
+    if error_count == 40:
+        assert row.failure_diagnostics[-1] == "DiagnosticsOmitted: 10 additional notes"
+    assert secret not in "\n".join(row.failure_diagnostics)
+    assert row.failure_diagnostics[0] == "ForkFailure[RuntimeError]: phase=settlement"
+    assert row.failure_diagnostics[1].startswith(f"RecoveryFailed[OSError]: could not delete fork blob {blob_id} from child ")
+
+
+@pytest.mark.parametrize(
+    "diagnostic,expected",
+    [
+        ("private stored field value", "ForkFailure[AuditIntegrityError]: phase=staging"),
+        (
+            "fork guided correction_messages.message_id references a message outside copied slice",
+            "fork guided correction_messages.message_id references a message outside copied slice",
+        ),
+    ],
+)
+def test_staging_failure_preserves_safe_phase_for_replay(composer_test_client: TestClient, diagnostic: str, expected: str) -> None:
+    client = composer_test_client
+    session_id, message_id = _fork_target(client)
+    service = client.app.state.session_service
+    operation_id = str(uuid4())
+    payload = {"operation_id": operation_id, "from_message_id": str(message_id), "new_message_content": "Edited request"}
+    with patch.object(service, "fork_session", side_effect=AuditIntegrityError(diagnostic)) as staging:
+        response = client.post(f"/api/sessions/{session_id}/fork", json=payload)
+        replay = client.post(f"/api/sessions/{session_id}/fork", json=payload)
+        assert staging.call_count == 1
+    assert response.status_code == replay.status_code == 500
+    assert response.json() == replay.json()
+    with service._engine.connect() as conn:
+        row = conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).one()
+    assert row.failure_code == "integrity_error"
+    assert row.failure_diagnostics == [expected]
 
 
 @pytest.mark.parametrize(
@@ -125,6 +253,14 @@ def test_blob_cleanup_integrity_failure_propagates_instead_of_a_coded_terminal_f
     replay = client.post(f"/api/sessions/{session_id}/fork", json=payload)
     assert replay.status_code == 500
     assert replay.json()["detail"]["failure_code"] == "integrity_error"
+
+    with service._engine.connect() as conn:
+        row = conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).one()
+    assert len(row.failure_diagnostics) == 2
+    assert row.failure_diagnostics[0] == "ForkFailure[RuntimeError]: phase=settlement"
+    assert row.failure_diagnostics[1].startswith(f"RecoveryFailed[{type(integrity_failure).__name__}]: fork blob cleanup failed for child ")
+    assert row.failure_diagnostics[1].endswith(f" (blob {integrity_failure.blob_id})")
+    assert "/managed/blobs/missing" not in "\n".join(row.failure_diagnostics)
 
 
 class _UnrenderableCleanupError(OSError):
@@ -168,3 +304,11 @@ def test_ordinary_cleanup_failure_still_surfaces_the_primary_coded_failure(
     residue = [entry for entry in cap_logs if entry.get("event") == "session.fork_blob_cleanup_failed"]
     assert len(residue) == 1
     assert residue[0]["exc_class"] == type(cleanup_error).__name__
+    with service._engine.connect() as conn:
+        row = conn.execute(
+            select(guided_operations_table).where(guided_operations_table.c.operation_id == residue[0]["operation_id"])
+        ).one()
+    assert row.failure_diagnostics == [
+        "ForkFailure[RuntimeError]: phase=settlement",
+        f"RecoveryFailed[{type(cleanup_error).__name__}]: fork blob cleanup failed for child {residue[0]['child_session_id']}",
+    ]

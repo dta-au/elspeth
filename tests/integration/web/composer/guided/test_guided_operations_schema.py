@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 import structlog
-from sqlalchemy import delete, insert, inspect, text, update
+from sqlalchemy import delete, insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
@@ -21,7 +21,7 @@ from elspeth.web.sessions.models import (
     metadata,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS, CompositionStateData
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
@@ -476,6 +476,66 @@ def test_completed_and_failed_terminal_bundles_are_accepted(engine) -> None:
                 )
             )
         )
+
+
+@pytest.mark.parametrize("diagnostics", [None, ["settlement_failed"], ["cleanup_failed"] * GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS])
+def test_failure_diagnostics_round_trip_and_terminal_immutability(engine, diagnostics) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            insert(guided_operations_table).values(
+                **_operation(
+                    status="failed",
+                    lease_token=None,
+                    lease_expires_at=None,
+                    failure_code="integrity_error",
+                    settled_at=NOW,
+                    failure_diagnostics=diagnostics,
+                )
+            )
+        )
+        assert connection.execute(select(guided_operations_table.c.failure_diagnostics)).scalar_one() == diagnostics
+    with pytest.raises(IntegrityError, match="terminal rows are immutable"), engine.begin() as connection:
+        connection.execute(update(guided_operations_table).values(failure_diagnostics=["replacement"]))
+    with engine.connect() as connection:
+        assert connection.execute(select(guided_operations_table.c.failure_diagnostics)).scalar_one() == diagnostics
+
+
+@pytest.mark.parametrize("diagnostics", [[], {}, "diagnostic", 1, True, ["diagnostic"] * (GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS + 1)])
+def test_failure_diagnostics_rejects_invalid_shape_and_count(engine, diagnostics) -> None:
+    with pytest.raises(IntegrityError, match="ck_guided_operations_failure_diagnostics_shape"), engine.begin() as connection:
+        connection.execute(
+            insert(guided_operations_table).values(
+                **_operation(
+                    status="failed",
+                    lease_token=None,
+                    lease_expires_at=None,
+                    failure_code="integrity_error",
+                    settled_at=NOW,
+                    failure_diagnostics=diagnostics,
+                )
+            )
+        )
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_failure_diagnostics_rejects_nonfailed_residue(engine, completed) -> None:
+    values = _operation(failure_diagnostics=["settlement_failed"])
+    if completed:
+        values.update(
+            status="completed",
+            lease_token=None,
+            lease_expires_at=None,
+            settled_at=NOW,
+            result_kind="composition_state",
+            result_state_id=STATE_ID,
+            response_hash=RESPONSE_HASH,
+        )
+    with engine.begin() as connection:
+        connection.execute(
+            insert(guided_operations_table).values(**(values | {"operation_id": "diagnostic-control", "failure_diagnostics": None}))
+        )
+    with pytest.raises(IntegrityError, match="ck_guided_operations_status_bundle"), engine.begin() as connection:
+        connection.execute(insert(guided_operations_table).values(**values))
 
 
 def test_stale_conflict_is_a_current_closed_terminal_failure_code(engine) -> None:

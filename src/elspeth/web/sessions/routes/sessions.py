@@ -30,6 +30,8 @@ from elspeth.web.coordination.contracts import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import (
+    GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS,
+    GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH,
     GuidedForkSettlementCommand,
     GuidedOperationFailureCode,
     GuidedOperationFence,
@@ -84,6 +86,59 @@ from ._helpers import (
 # in AuditIntegrityError instead of an unbounded retry (mirrors the guided
 # START loop's bound in routes/composer/guided.py).
 _FORK_FENCE_REJOIN_ATTEMPTS = 5
+
+# Only these application-authored literals may cross from exception text to
+# durable diagnostics. Other exceptions may contain SQL parameters or secrets.
+_FORK_STATIC_DIAGNOSTICS = frozenset(
+    {
+        "Guided fork settlement requires exactly one retained frozen blob plan",
+        "Guided fork settlement child blob ids do not exactly match the frozen plan",
+        "Guided fork settlement child blob status, hash, or size does not match the frozen plan",
+        "Guided fork settlement parent blob custody no longer matches the frozen plan",
+        "Guided fork settlement state retains parent blob custody",
+        "Guided fork settlement child is not bound to the exact operation fence",
+        "Guided fork settlement parent is missing",
+        "Guided fork settlement child failed staged custody validation",
+        "Guided fork settlement staged current state changed",
+        "Guided fork settlement child checkpoint is malformed",
+        "Guided fork settlement edited message failed staged custody validation",
+        "Guided fork settlement lost edited-message compare-and-swap",
+        "Guided fork settlement could not remove superseded staged state",
+        "Guided fork settlement could not bind replacement state",
+        "Guided fork settlement lost archived-to-active compare-and-swap",
+        "Guided fork start authority has no final child state",
+        "fork guided metadata is not an exact schema-10 object",
+        "fork guided schema-10 authority is malformed",
+        "fork guided proposal reference/history coupling is malformed",
+        "fork guided message maps have different source keysets",
+        "fork guided root_intent_message_id references a message outside copied slice",
+        "fork guided deferred_intents.originating_message_id references a message outside copied slice",
+        "fork guided correction_messages.message_id references a message outside copied slice",
+        "fork guided planner lineage must identify user messages",
+        "fork guided deferred intent message content hash mismatch",
+        "fork guided correction message content hash mismatch",
+        "fork guided topology rewind has malformed unanswered history",
+    }
+)
+
+
+def _fork_failure_diagnostic(exc: Exception, *, phase: str) -> str:
+    """Admit only known static integrity reasons; never render a foreign error."""
+    if type(exc) is AuditIntegrityError and len(exc.args) == 1 and type(exc.args[0]) is str and exc.args[0] in _FORK_STATIC_DIAGNOSTICS:
+        return exc.args[0]
+    return f"ForkFailure[{type(exc).__name__}]: phase={phase}"
+
+
+def _bounded_fork_diagnostics(notes: list[str]) -> tuple[str, ...]:
+    """Keep primary evidence first and explicitly account for omitted residue."""
+    if len(notes) > GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS:
+        retained = GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS - 1
+        notes = [*notes[:retained], f"DiagnosticsOmitted: {len(notes) - retained} additional notes"]
+    marker = "... [truncated]"
+    return tuple(
+        note if len(note) <= GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH else note[: GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH - len(marker)] + marker
+        for note in notes
+    )
 
 
 def _copied_blob_for_inline_marker(
@@ -958,6 +1013,7 @@ def register_session_routes(router: APIRouter) -> None:
             child_lease: SessionOperationLease | None = None
             staged = None
             close_primary: BaseException | None = None
+            failure_phase = "reservation"
             try:
                 try:
                     reserved = await reserve_or_replay_guided_operation(
@@ -1001,6 +1057,7 @@ def register_session_routes(router: APIRouter) -> None:
                         lease_seconds=service.session_operation_lease_seconds,
                     )
 
+                failure_phase = "staging"
                 _, staging_cancellation = await _await_fork_authority_adoption(_stage_and_adopt_child_authority())
                 if staged is None or child_lease is None:
                     raise AuditIntegrityError("Fork staging completed without adopted child authority")
@@ -1022,6 +1079,7 @@ def register_session_routes(router: APIRouter) -> None:
                         session_operation_context=parent_operation_lease.context,
                     )
 
+                failure_phase = "blob_copy"
                 source_blobs = {
                     entry.source_blob_id: await blob_service.get_blob(
                         entry.source_blob_id,
@@ -1051,6 +1109,7 @@ def register_session_routes(router: APIRouter) -> None:
                     for parent_blob in await blob_service.list_blobs(session_id, limit=None)
                     for ref in (str(parent_blob.id), parent_blob.storage_path)
                 )
+                failure_phase = "state_rewrite"
                 rewritten_state = _rewrite_fork_state_blob_custody(
                     staged.state,
                     blob_map,
@@ -1062,6 +1121,7 @@ def register_session_routes(router: APIRouter) -> None:
                 )
                 response = ForkSessionResponse(session_id=staged.session.id)
                 await _checkpoint()
+                failure_phase = "settlement"
                 await service.settle_guided_fork_operation(
                     GuidedForkSettlementCommand(
                         authority=staged.authority,
@@ -1087,6 +1147,7 @@ def register_session_routes(router: APIRouter) -> None:
                 continue
             except Exception as primary_exc:
                 close_primary = primary_exc
+                failure_diagnostics = [_fork_failure_diagnostic(primary_exc, phase=failure_phase)]
                 failure_code: GuidedOperationFailureCode = (
                     "quota_exceeded"
                     if isinstance(primary_exc, BlobQuotaExceededError)
@@ -1095,10 +1156,8 @@ def register_session_routes(router: APIRouter) -> None:
                     else "operation_failed"
                 )
                 if isinstance(primary_exc, AuditIntegrityError):
-                    # The ONLY carrier of what failed is ``str(primary_exc)``:
-                    # ``fail_guided_operation`` durably records a code, not a
-                    # message, and ``raise_guided_operation_failure`` answers
-                    # with a fixed envelope. For pre-staging custody detection
+                    # The public failure envelope intentionally excludes internal
+                    # diagnostics. For pre-staging custody detection
                     # (inside ``fork_session``, no child row yet) and for the
                     # rewrite-boundary backstop, that message NAMES the
                     # offending composer_meta key -- the whole point of failing
@@ -1134,6 +1193,7 @@ def register_session_routes(router: APIRouter) -> None:
                             failure_code=failure_code,
                             actor="composer_route",
                             session_operation_context=parent_lease.context,
+                            failure_diagnostics=_bounded_fork_diagnostics(failure_diagnostics),
                         )
                     except (GuidedOperationFenceLostError, SessionOperationFenceLost) as failure_fence_error:
                         close_primary = failure_fence_error
@@ -1179,6 +1239,12 @@ def register_session_routes(router: APIRouter) -> None:
                         )
                         cleanup_integrity_exc = integrity_exc
                         failure_code = "integrity_error"
+                        cleanup_note = (
+                            f"RecoveryFailed[{type(integrity_exc).__name__}]: fork blob cleanup failed for child {staged.session.id}"
+                        )
+                        if isinstance(integrity_exc, (BlobContentMissingError, BlobIntegrityError)):
+                            cleanup_note += f" (blob {integrity_exc.blob_id})"
+                        failure_diagnostics.append(cleanup_note)
                     except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
                         # The exception note alone is not a record: the tail
                         # below surfaces the PRIMARY failure through
@@ -1187,9 +1253,9 @@ def register_session_routes(router: APIRouter) -> None:
                         # the chained context, so notes on primary_exc reach
                         # nobody. Leaked fork blobs are operator-actionable
                         # residue and get an explicit last-resort record.
-                        primary_exc.add_note(
-                            f"RecoveryFailed[{type(cleanup_exc).__name__}]: fork blob cleanup failed for child {staged.session.id}"
-                        )
+                        note = f"RecoveryFailed[{type(cleanup_exc).__name__}]: fork blob cleanup failed for child {staged.session.id}"
+                        primary_exc.add_note(note)
+                        failure_diagnostics.append(note)
                         _log_last_resort_diagnostic(
                             slog.error,
                             "session.fork_blob_cleanup_failed",
@@ -1199,7 +1265,17 @@ def register_session_routes(router: APIRouter) -> None:
                             exc_class=type(cleanup_exc).__name__,
                         )
                     else:
+                        omitted_notes = 0
                         for error in cleanup.errors:
+                            # Keep raw detail on the local exception only. Durable
+                            # evidence uses the owned class and custody identifiers.
+                            if len(failure_diagnostics) < GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS:
+                                failure_diagnostics.append(
+                                    f"RecoveryFailed[{error.exc_type}]: could not delete fork blob {error.blob_id} "
+                                    f"from child {staged.session.id}"
+                                )
+                            else:
+                                omitted_notes += 1
                             primary_exc.add_note(
                                 f"RecoveryFailed[{error.exc_type}]: could not delete fork blob {error.blob_id} "
                                 f"from child {staged.session.id} ({error.detail})"
@@ -1213,6 +1289,8 @@ def register_session_routes(router: APIRouter) -> None:
                                 exc_class=error.exc_type,
                                 blob_id=str(error.blob_id),
                             )
+                        if omitted_notes:
+                            failure_diagnostics[-1] = f"DiagnosticsOmitted: {omitted_notes + 1} additional notes"
                     # The failed child is retained as archived audit evidence.
                     # Only its copied blobs are compensatable; deleting the
                     # session would also destroy the frozen plan envelope.
@@ -1229,6 +1307,7 @@ def register_session_routes(router: APIRouter) -> None:
                         staged.authority,
                         failure_code=failure_code,
                         actor="composer_route",
+                        failure_diagnostics=_bounded_fork_diagnostics(failure_diagnostics),
                     )
                 except (GuidedOperationFenceLostError, SessionOperationFenceLost) as failure_fence_error:
                     close_primary = failure_fence_error

@@ -33,8 +33,8 @@ _SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 _SESSION_METADATA_CREATE_LOCK = Lock()
 
 # Coupled cut: sparse proposal display, structured stored validation errors,
-# and timestamp-leading quota scan indexes.
-_COORDINATION_HARD_CUT_EPOCH = 59
+# timestamp-leading quota scan indexes, and durable fork failure diagnostics.
+_COORDINATION_HARD_CUT_EPOCH = 60
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
