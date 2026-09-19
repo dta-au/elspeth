@@ -1448,7 +1448,10 @@ def test_inline_snapshot_refuses_modality_swap_with_identical_bytes() -> None:
         creating_composer_skill_hash=None,
         creating_arguments_hash=None,
     )
-    snapshot = SessionInlineBlobSnapshot(refs=frozenset(), records={blob_id: (record, content)})
+    source_records = {blob_id: (record, content)}
+    snapshot = SessionInlineBlobSnapshot(refs=frozenset(), records=source_records)
+    source_records.clear()
+    assert snapshot.content(blob_id) == (record, content)
     row = SimpleNamespace(
         session_id=str(session_id),
         status="ready",

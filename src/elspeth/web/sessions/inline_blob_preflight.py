@@ -15,7 +15,7 @@ from sqlalchemy import Connection, select
 from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord, BlobStateError
 from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
@@ -86,6 +86,9 @@ class SessionInlineBlobSnapshot:
 
     refs: frozenset[BlobInlineRef]
     records: Mapping[UUID, tuple[BlobRecord, bytes]] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "records")
 
     def content(self, blob_id: UUID) -> tuple[BlobRecord, bytes]:
         return self.records[blob_id]
