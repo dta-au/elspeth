@@ -18,14 +18,14 @@ from typing import Any
 import pytest
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import Engine, update
+from sqlalchemy import Engine, event, update
 
 from elspeth.web.auth.identity_admin_routes import create_identity_admin_router
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.routes import create_auth_router
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
-from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
+from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, RoleGrant
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
@@ -437,6 +437,20 @@ async def test_pre_provision_creates_an_active_row_before_first_login(harness: _
     assert call.kwargs["cause"] == "pre_provision"
 
 
+async def test_pre_provision_service_provider_is_refused_without_audit_or_identity(harness: _Harness) -> None:
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        response = await client.post(
+            "/api/auth/admin/identities",
+            headers=root,
+            json={"provider": "service", "subject": "svc-example", "role": "approver", "note": "console"},
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["refusal"] == "service_identity_provisioning_unavailable"
+    assert harness.authority.read_identity_by_natural_key(provider="service", subject="svc-example") is None
+    assert harness.audit.calls == []
+
+
 async def test_disable_and_enable_round_trip_with_their_rows(harness: _Harness) -> None:
     bob_id = _active(harness, "bob")
     async with _client(harness.app) as client:
@@ -580,3 +594,219 @@ async def test_bodies_are_strict(harness: _Harness) -> None:
         empty_note = await client.post("/api/auth/admin/identities/x/activate", headers=root, json={"role": "user", "note": ""})
         assert empty_note.status_code == 422
     assert harness.audit.calls == []
+
+
+# ── delegated curator administration ────────────────────────────────────
+
+
+def _govern(harness: _Harness) -> None:
+    harness.app.state.settings = harness.app.state.settings.model_copy(update={"registration_mode": "closed", "workflow_governance": "on"})
+
+
+async def _approver_role(client: AsyncClient, root: dict[str, str], identity_id: str) -> str:
+    response = await client.post("/api/auth/admin/roles", headers=root, json={"identity_id": identity_id, "role": "approver"})
+    assert response.status_code == 201, response.text
+    return str(response.json()["role_id"])
+
+
+async def _edge(client: AsyncClient, root: dict[str, str], actor_id: str, target_id: str) -> str:
+    response = await client.post(
+        "/api/auth/admin/relationships",
+        headers=root,
+        json={"from_identity_id": actor_id, "to_identity_id": target_id, "relationship_type": "approver"},
+    )
+    assert response.status_code == 201, response.text
+    return str(response.json()["relationship_id"])
+
+
+def _curator_grants(harness: _Harness, identity_id: str) -> list[RoleGrant]:
+    return [
+        grant
+        for grant in harness.authority.list_roles(identity_id=identity_id, include_revoked=True, limit=50, offset=0)
+        if grant.role == "curator"
+    ]
+
+
+async def test_approver_appoints_curator_over_direct_report_and_records_audit(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        _govern(harness)
+        response = await client.post(
+            "/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator", "note": "library gate"}
+        )
+    assert response.status_code == 201, response.text
+    assert (response.json()["identity_id"], response.json()["granted_by_identity_id"]) == (carol_id, bob_id)
+    calls = [call for call in harness.audit.calls if call.method == "record_role_changed" and call.kwargs["role"] == "curator"]
+    assert len(calls) == 1
+    assert calls[0].kwargs["actor_identity_id"] == bob_id
+    assert calls[0].request_bound
+
+
+async def test_delegated_grant_requires_live_direct_edge_and_role(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        role_id = await _approver_role(client, root, bob_id)
+        _govern(harness)
+        missing = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+        edge_id = await _edge(client, root, bob_id, carol_id)
+        revoked = await client.post(f"/api/auth/admin/relationships/{edge_id}/revoke", headers=root, json={})
+        assert revoked.status_code == 200, revoked.text
+        no_edge = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+        await _edge(client, root, bob_id, carol_id)
+        revoked_role = await client.post(f"/api/auth/admin/roles/{role_id}/revoke", headers=root, json={})
+        assert revoked_role.status_code == 200, revoked_role.text
+        no_role = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+    assert (missing.status_code, no_edge.status_code, no_role.status_code) == (404, 404, 404)
+    assert _curator_grants(harness, carol_id) == []
+
+
+async def test_delegated_arm_rejects_other_roles_scope_and_console_provenance(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        _govern(harness)
+        for body in (
+            {"identity_id": carol_id, "role": "reviewer"},
+            {"identity_id": carol_id, "role": "curator", "scope": "team-a"},
+            {"identity_id": carol_id, "role": "curator", "on_behalf_of": "console"},
+        ):
+            response = await client.post("/api/auth/admin/roles", headers=bob, json=body)
+            assert response.status_code == 404, response.text
+    assert _curator_grants(harness, carol_id) == []
+
+
+async def test_delegated_grant_governance_off_and_no_role_body_validation(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        hidden = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": "x", "role": "not-a-role"})
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        off = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+    assert hidden.status_code == 404
+    assert off.status_code == 409
+    assert off.json()["detail"]["refusal"] == "workflow_governance_off"
+
+
+async def test_delegated_grant_respects_admin_conflict(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, harness.root_identity_id)
+        _govern(harness)
+        response = await client.post(
+            "/api/auth/admin/roles", headers=bob, json={"identity_id": harness.root_identity_id, "role": "curator"}
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"]["refusal"] == "role_forbidden_for_identity"
+
+
+async def test_delegated_grant_locks_before_reading_database_clock(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+    seen: list[str] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        seen.append(statement)
+
+    event.listen(harness.engine, "before_cursor_execute", capture)
+    try:
+        harness.authority.grant_curator_as_approver(
+            actor_identity_id=bob_id, identity_id=carol_id, expires_at=None, note=None, record=lambda _event: None
+        )
+    finally:
+        event.remove(harness.engine, "before_cursor_execute", capture)
+    clocks = [index for index, statement in enumerate(seen) if "CURRENT_TIMESTAMP" in statement]
+    reads = [
+        index for index, statement in enumerate(seen) if statement.lstrip().upper().startswith("SELECT") and "FROM identit" in statement
+    ]
+    assert len(clocks) == 1
+    assert reads and max(reads) < clocks[0], seen
+
+
+async def test_revoked_admin_row_still_takes_population_lock_first(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        admin = await client.post("/api/auth/admin/roles", headers=root, json={"identity_id": carol_id, "role": "admin"})
+        assert admin.status_code == 201, admin.text
+        revoked = await client.post(f"/api/auth/admin/roles/{admin.json()['role_id']}/revoke", headers=root, json={})
+        assert revoked.status_code == 200, revoked.text
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+    seen: list[str] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        seen.append(statement)
+
+    event.listen(harness.engine, "before_cursor_execute", capture)
+    try:
+        harness.authority.grant_curator_as_approver(
+            actor_identity_id=bob_id, identity_id=carol_id, expires_at=None, note=None, record=lambda _event: None
+        )
+    finally:
+        event.remove(harness.engine, "before_cursor_execute", capture)
+    population = next((index for index, statement in enumerate(seen) if "FROM identity_roles JOIN identities" in statement), None)
+    first_identity = next(index for index, statement in enumerate(seen) if "FROM identities" in statement and "JOIN" not in statement)
+    assert population is not None and population < first_identity, seen
+
+
+async def test_malformed_service_provider_cannot_delegate_or_receive_curator(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        _govern(harness)
+        with harness.engine.begin() as conn:
+            conn.execute(update(identities_table).where(identities_table.c.identity_id == bob_id).values(provider="service"))
+        actor = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+        with harness.engine.begin() as conn:
+            conn.execute(update(identities_table).where(identities_table.c.identity_id == bob_id).values(provider="local"))
+            conn.execute(update(identities_table).where(identities_table.c.identity_id == carol_id).values(provider="service"))
+        target = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+    assert actor.status_code == 404
+    assert target.status_code == 409
+    assert target.json()["detail"]["refusal"] == "role_forbidden_for_identity"
+    assert _curator_grants(harness, carol_id) == []
+
+
+async def test_delegated_curator_audit_failure_rolls_back_grant(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+
+    def reject_audit(_event: Any) -> None:
+        raise RuntimeError("audit unavailable")
+
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        harness.authority.grant_curator_as_approver(
+            actor_identity_id=bob_id, identity_id=carol_id, expires_at=None, note=None, record=reject_audit
+        )
+    assert _curator_grants(harness, carol_id) == []

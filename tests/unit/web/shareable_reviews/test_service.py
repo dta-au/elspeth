@@ -226,6 +226,7 @@ class _FakeReadinessService:
 @dataclass(slots=True)
 class _FakeSettings:
     shareable_link_lifetime_seconds: int = 30 * 24 * 3600
+    compartment_id: str | None = None
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -576,6 +577,46 @@ async def test_mark_ready_for_review_happy_path(
     payload = signer.verify(response.token)
     assert payload.session_id == session_record.id
     assert payload.payload_digest == response.payload_digest
+
+
+@pytest.mark.asyncio
+async def test_share_snapshot_marks_compartment_and_changes_digest(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    service._settings.compartment_id = "alpha"
+    first = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+    )
+    first_blob = json.loads(payload_store.retrieve(first.payload_digest.removeprefix("sha256:")))
+    assert first_blob["compartment_id"] == "alpha"
+
+    service._settings.compartment_id = "beta"
+    second = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+    )
+    second_blob = json.loads(payload_store.retrieve(second.payload_digest.removeprefix("sha256:")))
+    assert second_blob["compartment_id"] == "beta"
+    assert first.payload_digest != second.payload_digest
 
 
 @pytest.mark.asyncio
@@ -1550,7 +1591,7 @@ async def test_resolve_token_returns_frozen_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_resolve_token_projects_legacy_signed_blob_without_mutating_evidence(
+async def test_resolve_token_projects_signed_blob_without_mutating_evidence(
     session_engine_with_row,
     payload_store,
     signer,
@@ -1558,7 +1599,7 @@ async def test_resolve_token_projects_legacy_signed_blob_without_mutating_eviden
     state_record,
     session_operation_context: SessionOperationContext,
 ):
-    """Outstanding pre-fix blobs are projected only after signature/digest verification."""
+    """Signed blobs are projected only after signature/digest verification."""
     service, *_ = _build_service(
         engine=session_engine_with_row,
         payload_store=payload_store,
@@ -1568,14 +1609,14 @@ async def test_resolve_token_projects_legacy_signed_blob_without_mutating_eviden
         validation=_ok_validation(),
         readiness=_readiness_snapshot(session_record.id),
     )
-    private_path = "/srv/elspeth/blobs/alice/legacy.csv"
-    private_output = "/srv/elspeth/outputs/alice/legacy.csv"
-    private_index = "/srv/elspeth/indexes/alice/legacy"
+    private_path = "/srv/elspeth/blobs/alice/private.csv"
+    private_output = "/srv/elspeth/outputs/alice/private.csv"
+    private_index = "/srv/elspeth/indexes/alice/private"
     blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
-    legacy_readiness = _readiness_snapshot(session_record.id)
-    secret_row = legacy_readiness.rows[-1].model_copy(update={"detail": "17 secret(s) in your inventory"})
-    legacy_readiness = legacy_readiness.model_copy(update={"rows": (*legacy_readiness.rows[:-1], secret_row)})
-    legacy_blob = {
+    signed_readiness = _readiness_snapshot(session_record.id)
+    secret_row = signed_readiness.rows[-1].model_copy(update={"detail": "17 secret(s) in your inventory"})
+    signed_readiness = signed_readiness.model_copy(update={"rows": (*signed_readiness.rows[:-1], secret_row)})
+    signed_blob = {
         "pipeline_metadata": {"name": "Legacy", "description": ""},
         "composition_snapshot": {
             "version": 3,
@@ -1618,12 +1659,14 @@ async def test_resolve_token_projects_legacy_signed_blob_without_mutating_eviden
                 }
             ],
         },
-        "yaml": f"legacy_path: {private_path}\nlegacy_blob: {blob_id}\n",
-        "audit_readiness": legacy_readiness.model_dump(mode="json"),
+        "yaml": f"private_path: {private_path}\nprivate_blob: {blob_id}\n",
+        "audit_readiness": signed_readiness.model_dump(mode="json"),
         "created_by_user_id": "alice",
+        "created_by_username": "Alice",
+        "compartment_id": None,
     }
-    legacy_bytes = canonical_json(legacy_blob).encode()
-    digest_hex = payload_store.store(legacy_bytes)
+    signed_bytes = canonical_json(signed_blob).encode()
+    digest_hex = payload_store.store(signed_bytes)
     token = signer.sign(
         ShareTokenPayload(
             version=1,
@@ -1645,7 +1688,7 @@ async def test_resolve_token_projects_legacy_signed_blob_without_mutating_eviden
     expected_lookup = {"path": "north", "file": "case.txt", "mode": "bind_source"}
     assert resolved.composition_snapshot.nodes[0].options["lookup"] == expected_lookup
     assert yaml.safe_load(resolved.yaml)["transforms"][0]["options"]["lookup"] == expected_lookup
-    assert payload_store.retrieve(digest_hex) == legacy_bytes
+    assert payload_store.retrieve(digest_hex) == signed_bytes
 
 
 @pytest.mark.asyncio
@@ -1689,22 +1732,17 @@ async def test_mark_ready_freezes_username_alongside_the_opaque_identity(
 
 
 @pytest.mark.asyncio
-async def test_resolve_token_reports_absent_username_for_pre_field_blob(
+@pytest.mark.parametrize("missing_key", ["created_by_username", "compartment_id"])
+async def test_resolve_token_rejects_obsolete_signed_blob_shape(
     session_engine_with_row,
     payload_store,
     signer,
     session_record,
     state_record,
     session_operation_context,
+    missing_key: str,
 ):
-    """A snapshot minted before the username key resolves with ``None``.
-
-    The legacy blob here is the real producer's output with the key
-    removed, so it stays the exact shape an outstanding share artifact has.
-    Those bytes are signed and content-addressed: backfilling attribution
-    into them is not an option, so resolve reports the absence and the
-    frontend decides what to show.
-    """
+    """An old signed shape cannot enter the current public projection."""
     service, *_ = _build_service(
         engine=session_engine_with_row,
         payload_store=payload_store,
@@ -1721,10 +1759,10 @@ async def test_resolve_token_reports_absent_username_for_pre_field_blob(
         session_operation_context=session_operation_context,
     )
     blob = json.loads(payload_store.retrieve(marked.payload_digest.removeprefix("sha256:")))
-    del blob["created_by_username"]
-    legacy_hex = payload_store.store(canonical_json(blob).encode())
+    del blob[missing_key]
+    obsolete_hex = payload_store.store(canonical_json(blob).encode())
     now = datetime.now(UTC)
-    legacy_token = signer.sign(
+    obsolete_token = signer.sign(
         ShareTokenPayload(
             version=1,
             session_id=session_record.id,
@@ -1732,15 +1770,13 @@ async def test_resolve_token_reports_absent_username_for_pre_field_blob(
             created_at=now,
             expires_at=now + timedelta(days=1),
             nonce_hex="ab" * 16,
-            payload_digest=f"sha256:{legacy_hex}",
+            payload_digest=f"sha256:{obsolete_hex}",
             created_by_user_id=session_record.user_id,
         )
     )
 
-    resolved = await service.resolve_token(token=legacy_token, requesting_user_id="bob")
-
-    assert resolved.created_by_username is None
-    assert resolved.created_by_user_id == session_record.user_id
+    with pytest.raises(InvalidToken, match="unsupported share snapshot shape"):
+        await service.resolve_token(token=obsolete_token, requesting_user_id="bob")
 
 
 @pytest.mark.asyncio

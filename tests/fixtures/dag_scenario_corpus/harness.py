@@ -21,7 +21,6 @@ from sqlalchemy import select
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import RunStatus
 from elspeth.contracts.audit_export import (
-    AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
     AUDIT_EXPORT_MAX_CHUNK_BYTES,
     AUDIT_EXPORT_MAX_CHUNK_RECORDS,
     AUDIT_EXPORT_SERIALIZATION_VERSION,
@@ -147,6 +146,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
 from tests.fixtures.landscape import expire_lease, expire_worker
 
 EXPECTED_RUN_ERROR_TYPES: Mapping[str, type[BaseException]] = MappingProxyType({"CoalesceCollisionError": CoalesceCollisionError})
+CORPUS_EXPORT_COMPARTMENT_ID = "dag-corpus"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2160,11 +2160,12 @@ def _validate_portable_manifest(records: list[dict[str, Any]]) -> None:
         source_status=str(run["status"]),
         source_completed_at=expected_completed_at,
         export_format="json",
-        exporter_version=AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
+        exporter_version="landscape-exporter-auth-v2",
         serialization_version=AUDIT_EXPORT_SERIALIZATION_VERSION,
         chunking_algorithm_version="record-framing-v1",
         include_raw_error_rows=False,
         auth_events="omitted",
+        compartment_id="dag-corpus",
         per_chunk_byte_limit=AUDIT_EXPORT_MAX_CHUNK_BYTES,
         per_chunk_record_limit=AUDIT_EXPORT_MAX_CHUNK_RECORDS,
         signing_mode="unsigned",
@@ -2225,7 +2226,8 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
             "auth_events": "omitted",
             "chunking_algorithm_version": "record-framing-v1",
             "export_format": "json",
-            "exporter_version": AUDIT_EXPORT_AUTH_EXPORTER_VERSION,
+            "exporter_version": "landscape-exporter-auth-v2",
+            "compartment_id": "dag-corpus",
             "include_raw_error_rows": False,
             "per_chunk_byte_limit": AUDIT_EXPORT_MAX_CHUNK_BYTES,
             "per_chunk_record_limit": AUDIT_EXPORT_MAX_CHUNK_RECORDS,
@@ -2843,7 +2845,7 @@ def _run_expected_error_case(
 
         export_reason = "Audit export requires an immutable export-terminal run"
         try:
-            list(LandscapeExporter(db).export_run(failed_run.run_id))
+            list(LandscapeExporter(db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(failed_run.run_id))
         except ValueError as export_exc:
             if type(export_exc) is not ValueError or str(export_exc) != export_reason:
                 raise
@@ -2914,7 +2916,7 @@ def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> 
             durable_records,
             source="durable",
         )
-        records = list(LandscapeExporter(db).export_run(result.run_id))
+        records = list(LandscapeExporter(db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(result.run_id))
         _validate_portable_material_matches_durable(durable_records, records)
         _validate_portable_manifest(records)
         portable_projection = _stable_projection(records, source="portable")
@@ -3122,7 +3124,7 @@ def _exact_recovery_views(
     durable_records = _public_durable_records(db, run_id=run_id, payload_store=payload_store)
     _validate_durable_sink_effect_material(durable_records)
     durable_projection = _stable_projection(durable_records, source="durable recovery")
-    portable_records = list(LandscapeExporter(db).export_run(run_id))
+    portable_records = list(LandscapeExporter(db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(run_id))
     _validate_portable_material_matches_durable(durable_records, portable_records)
     _validate_portable_manifest(portable_records)
     portable_projection = _stable_projection(portable_records, source="portable recovery")
@@ -3512,7 +3514,7 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
                 run_id=run_id,
                 payload_store=reopened_store,
             )
-            portable_records_before = list(LandscapeExporter(reopened_db).export_run(run_id))
+            portable_records_before = list(LandscapeExporter(reopened_db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(run_id))
             durable_records_sha256_before = _canonical_sha256(durable_records_before)
             portable_export_sha256_before = _canonical_sha256(portable_records_before)
             output_tree_sha256_before = _output_tree_sha256(fresh_rendered)
@@ -3576,7 +3578,7 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
                     run_id=run_id,
                     payload_store=second_store,
                 )
-                portable_records_after = list(LandscapeExporter(after_db).export_run(run_id))
+                portable_records_after = list(LandscapeExporter(after_db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(run_id))
                 after_audit = _audit_evidence(
                     portable_records_after,
                     portable_projection=_stable_projection(portable_records_after, source="post-refusal portable export"),
@@ -4901,7 +4903,7 @@ def _parallel_sink_finalization_recovery_case(
         durable_records = _public_durable_records(reopened_db, run_id=run_id, payload_store=reopened_store)
         _validate_durable_sink_effect_material(durable_records)
         durable_projection = _stable_projection(durable_records, source="durable")
-        portable_records = list(LandscapeExporter(reopened_db).export_run(run_id))
+        portable_records = list(LandscapeExporter(reopened_db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(run_id))
         _validate_portable_material_matches_durable(durable_records, portable_records)
         _validate_portable_manifest(portable_records)
         portable_projection = _stable_projection(portable_records, source="portable")

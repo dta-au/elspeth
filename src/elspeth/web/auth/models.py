@@ -11,6 +11,7 @@ for upstream provider availability failures.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import get_args
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.web.validation import has_visible_content
@@ -122,7 +123,14 @@ class IdentityClaims:
     email: str | None = None
     organisation_id: str | None = None
 
+    def validate_provider(self) -> None:
+        """Keep service principals out of the browser-login claims contract."""
+        candidate: object = self.provider
+        if type(candidate) is not str or candidate not in get_args(AuthProviderType):
+            raise AuthenticationError("auth provider must be a known login provider")
+
     def __post_init__(self) -> None:
+        self.validate_provider()
         # ``(provider, subject)`` is the identity key. A blank subject would
         # collapse every identity from one provider onto a single row, so it
         # is refused here as well as by the database.

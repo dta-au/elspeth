@@ -6,7 +6,12 @@ from sqlalchemy import select, update
 from typer.testing import CliRunner
 
 from elspeth.cli import app
-from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy, ChargeableOperation, QuotaDisposition
+from elspeth.contracts.chargeable_admission import (
+    AdmissionRefusalReason,
+    ChargeableAdmissionPolicy,
+    ChargeableOperation,
+    QuotaDisposition,
+)
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -84,8 +89,8 @@ def test_cli_quota_policy_is_not_disabled_by_absent_issuance_defaults(tmp_path, 
             assert decision.evidence.identity_policy_id == quota_id
             assert decision.evidence.quota_disposition is QuotaDisposition.WITHIN_CAP
             assert decision.evidence.usage == 0
-            # A revoked policy no longer applies: absence remains an explicit,
-            # measured allowance, not a permanently enabled global switch.
+            # Revocation suspends a previously issued allowance until an
+            # administrator reissues it, even when boot defaults are absent.
             from datetime import UTC, datetime
 
             with engine.begin() as conn:
@@ -93,10 +98,16 @@ def test_cli_quota_policy_is_not_disabled_by_absent_issuance_defaults(tmp_path, 
             decision = authority.mutate(
                 context, lambda tx: tx.session.assess_chargeable_operation(policy=policy, operation=ChargeableOperation.COMPOSER)
             )
-        assert decision.allowed
-        assert decision.evidence.identity_policy_id is None
-        assert decision.evidence.container_policy_id is None
-        assert decision.evidence.quota_disposition is QuotaDisposition.NOT_CONFIGURED
+            assert decision.refusal_reason is AdmissionRefusalReason.QUOTA_POLICY_MISSING
+            assert decision.evidence.quota_disposition is QuotaDisposition.POLICY_MISSING
+            assert decision.evidence.identity_policy_id is None
+            assert decision.evidence.container_policy_id is None
+            assert decision.evidence.usage is None
+        else:
+            assert decision.allowed
+            assert decision.evidence.identity_policy_id is None
+            assert decision.evidence.container_policy_id is None
+            assert decision.evidence.quota_disposition is QuotaDisposition.NOT_CONFIGURED
         authority.release(context)
     finally:
         engine.dispose()

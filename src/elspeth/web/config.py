@@ -33,6 +33,7 @@ from elspeth.web.auth.urls import (
     DiscoveredEndpoints,
     validate_discovered_endpoints,
 )
+from elspeth.web.compartments import COMPARTMENT_ID_PATTERN, is_compartment_id
 from elspeth.web.composer.reasoning import ReasoningEffort
 from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings, AWSTextractProfileSettings
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
@@ -555,6 +556,11 @@ class WebSettings(BaseModel):
     # already re-pended comes back on its own.
     identity_dormancy_days: int = Field(default=90, gt=0)
     identity_pending_retention_days: int = Field(default=90, gt=0)
+    # Workflow-governance mode for the later approval, review, and library
+    # authorities. Readiness already checks the unsafe local-registration
+    # combination and missing compartment, so an operator receives a named
+    # /api/ready failure instead of a load error.
+    workflow_governance: Literal["off", "on"] = "off"
 
     # JWKS cache tuning (OIDC / Entra). Defaults match the provider
     # defaults; operators may lower or raise them. Raising the failure
@@ -668,6 +674,13 @@ class WebSettings(BaseModel):
         if not v.strip():
             raise ValueError("must not be blank (omit the field or set to a non-empty value)")
         return v
+
+    @field_validator("compartment_id")
+    @classmethod
+    def _validate_compartment_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_compartment_id(value):
+            raise ValueError(f"compartment_id must match {COMPARTMENT_ID_PATTERN}")
+        return value
 
     @field_validator("deployment_aws_region")
     @classmethod

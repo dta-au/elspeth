@@ -262,6 +262,7 @@ class TestLandscapeSettingsAlignment:
             "signing_secret_ref",
             "signer_rotation_policy",
             "exporter_version",
+            "compartment_id",
             "serialization_version",
             "chunking_algorithm_version",
             "include_raw_error_rows",

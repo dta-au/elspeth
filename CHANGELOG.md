@@ -44,6 +44,10 @@ drained and repair this release forward.
   explicit inclusion policy and bounded event snapshot. Omitted history and
   an included empty set are distinct. Web exports refuse deployment-wide
   history, and no historical identity snapshot is invented from current rows.
+- **Workflow-governance readiness switch.** An off-by-default setting now
+  refuses `/api/ready` when governance is requested with open local
+  registration or without a compartment marking. The switch prepares the
+  configuration boundary for later approval, review, and library authorities.
 
 - **Coordination deadlines are decided from fresh post-lock database time.**
   Lease deadlines are now issued after locked admission rather than from a

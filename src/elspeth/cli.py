@@ -711,6 +711,14 @@ def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object
             )
 
 
+def _require_marked_export(config: ElspethSettings) -> None:
+    """Reject unmarked export settings before run or resume side effects."""
+    export_config = config.landscape.export
+    if not export_config.enabled:
+        return
+    export_config.public_snapshot_config()
+
+
 @app.command()
 def run(
     settings: str = typer.Option(
@@ -758,6 +766,7 @@ def run(
 
             _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
         config, secret_resolutions = _load_settings_with_secrets(settings_path)
+        _require_marked_export(config)
     except FileNotFoundError:
         typer.echo(f"Error: Settings file not found: {settings}", err=True)
         raise typer.Exit(1) from None
@@ -1586,6 +1595,7 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
 
     _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
     config, secret_resolutions = _load_settings_with_secrets(settings_path)
+    _require_marked_export(config)
 
     plugins = _instantiate_plugins_for_runtime_preflight(config)
     execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
@@ -1979,6 +1989,12 @@ def _composer_auth_audit_recorder(landscape_url: str) -> AuthAuditRecorder:
     from sqlalchemy.engine.url import make_url
 
     from elspeth.web.auth.audit import AuthAuditRecorder
+    from elspeth.web.compartments import is_compartment_id
+
+    compartment_id = os.environ.get("ELSPETH_WEB__COMPARTMENT_ID")
+    if compartment_id is not None and not is_compartment_id(compartment_id):
+        typer.echo("Error: compartment_id must match [a-z0-9][a-z0-9-]{0,62}", err=True)
+        raise typer.Exit(1)
 
     parsed = make_url(landscape_url)
     sqlite_landscape = parsed.drivername.split("+", 1)[0] == "sqlite"
@@ -1994,6 +2010,7 @@ def _composer_auth_audit_recorder(landscape_url: str) -> AuthAuditRecorder:
         # Mirrors AuthAuditRecorder.from_settings: only a SQLite Landscape is
         # created on first write; an external store is provisioned by doctor.
         create_tables=sqlite_landscape,
+        compartment_id=compartment_id,
     )
 
 
@@ -2215,6 +2232,7 @@ def composer_users_bootstrap_admin(
     provider: str = typer.Argument(..., help="Identity provider of the subject: local, oidc, entra, vanguard or google."),
     subject: str = typer.Argument(..., help="The IdP subject (``sub``) of the person who becomes the first admin."),
     username: str | None = typer.Option(None, "--username", help="Username for a row that does not exist yet; defaults to the subject."),
+    organisation_id: str | None = typer.Option(None, "--organisation-id", help="Organisation ID for a row that does not exist yet."),
     note: str = typer.Option(..., "--note", help="Why this bootstrap is happening; written to the activation's audit row."),
     data_dir: Path = typer.Option(Path("data"), "--data-dir", help="Web data directory."),
     session_db_url: str | None = typer.Option(
@@ -2262,7 +2280,12 @@ def composer_users_bootstrap_admin(
     # Narrowed by the closed-set check above; the Literal cannot be
     # constructed from a str any other way.
     provider_type = cast("AuthProviderType", provider)
-    claims = IdentityClaims(provider=provider_type, subject=subject, username=subject if username is None else username)
+    claims = IdentityClaims(
+        provider=provider_type,
+        subject=subject,
+        username=subject if username is None else username,
+        organisation_id=organisation_id,
+    )
     resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
     session_engine = _composer_session_engine(resolved_session_db_url)
     recorder = _composer_auth_audit_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url))
@@ -3461,6 +3484,12 @@ def export_resume(
             err=True,
         )
         raise typer.Exit(1)
+
+    try:
+        _require_marked_export(settings_config)
+    except ValueError as exc:
+        typer.echo(f"Configuration error: {exc}", err=True)
+        raise typer.Exit(1) from None
 
     # Resolve database URL (same discipline as `resume`)
     if database:

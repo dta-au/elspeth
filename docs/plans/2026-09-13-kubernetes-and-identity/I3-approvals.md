@@ -1,5 +1,7 @@
 ### Task I3: Approvals — request, decide, withdraw, supersede, and the R2 execute gate
 
+> **Current execution note (2026-09-19):** The 2026-09-19 [execution map](../2026-09-19-identity-workflow-finalization.md) supersedes this task's baseline and decision examples: any active non-author approver may inspect and decide an open request, with the addressed approver first in the inbox. A later rejection retires prior approvals for the same state before run admission, and every supersession emits an audit event. Re-anchor code excerpts against Sessions epoch 59 and the current tree. The integrated permit gate assesses chargeable quota first and preserves that truthful quota disposition in schema-version-3 approval refusals; the older examples below that expect `NOT_ASSESSED` on an approval refusal are stale.
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I2. Runs before: I4, I5. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered after I8 (the `workflow_governance` switch) and I1 (the

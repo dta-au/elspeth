@@ -218,7 +218,7 @@ def _archive_repeat_run_files(case: HarnessCaseSpec, runtime_root: Path) -> Path
 def _portable_records(database_path: Path, run_id: str) -> list[dict[str, Any]]:
     db = LandscapeDB(f"sqlite:///{database_path}")
     try:
-        return list(LandscapeExporter(db).export_run(run_id))
+        return list(LandscapeExporter(db, compartment_id="dag-corpus").export_run(run_id))
     finally:
         db.close()
 
@@ -2314,6 +2314,40 @@ def test_linear_happy_path_has_exact_production_evidence(
     assert evidence.audit.source_operation_count == 1
 
 
+@pytest.mark.parametrize(
+    ("export_compartment", "error_type", "error_message"),
+    [
+        ("other-corpus", AssertionError, "portable audit_export_config integrity: public_config differs"),
+        (None, ValueError, "compartment_id must match"),
+    ],
+)
+def test_exact_corpus_export_rejects_changed_or_missing_compartment_marking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    export_compartment: str | None,
+    error_type: type[Exception],
+    error_message: str,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    install_corpus_plugin_manager(monkeypatch)
+    monkeypatch.setattr(corpus_harness, "CORPUS_EXPORT_COMPARTMENT_ID", export_compartment)
+
+    with pytest.raises(error_type, match=error_message):
+        corpus_harness.run_scenario_case(scenario, case, tmp_path)
+
+
+def test_semantic_run_settings_keep_auth_v2_and_unset_compartment(tmp_path: Path) -> None:
+    _scenario, case = _declared_case("linear", "happy-path")
+    settings = corpus_harness.render_settings(case, tmp_path).settings.model_dump(mode="json")
+    semantic = corpus_harness._semantic_run_settings(settings)
+    landscape_settings = semantic["landscape"]
+    assert isinstance(landscape_settings, dict)
+    export_settings = landscape_settings["export"]
+    assert isinstance(export_settings, dict)
+    assert export_settings["exporter_version"] == "landscape-exporter-auth-v2"
+    assert export_settings["compartment_id"] is None
+
+
 def test_exact_runtime_projection_linear_matches_declared_durable_and_export(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3034,6 +3068,38 @@ def test_checkpoint_full_history_pin_rejects_observed_semantic_settings_hash_dri
             runtime_root=tmp_path,
             settings=rendered.settings,
         )
+
+
+def test_checkpoint_full_history_pin_covers_non_run_audit_material_outside_frozen_surface(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.fixtures.dag_scenario_corpus.oracle_freeze import canonical_bytes, frozen_surface
+
+    scenario, case = _declared_case("checkpoint-deterministic-resume", "reopen-resume")
+    assert isinstance(case.expected, SummaryRunExpectation)
+    assert case.expected.resumed_full_projection_sha256 is not None
+    install_corpus_plugin_manager(monkeypatch)
+    evidence = corpus_harness.run_scenario_case(scenario, case, tmp_path)
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    operation = next(record for record in projection.audit_records if record.record_type == "operation")
+    material = json.loads(operation.material)
+    assert material["status"] == "completed"
+    material["status"] = "failed"
+    mutated_record = operation.model_copy(update={"material": json.dumps(material, sort_keys=True, separators=(",", ":"))})
+    mutated_projection = projection.model_copy(
+        update={"audit_records": tuple(mutated_record if record is operation else record for record in projection.audit_records)}
+    )
+    mutated_evidence = evidence.model_copy(
+        update={"runtime": evidence.runtime.model_copy(update={"durable_projection": mutated_projection})}
+    )
+    assert canonical_bytes(frozen_surface(mutated_evidence)) == canonical_bytes(frozen_surface(evidence))
+    rendered = corpus_harness.render_settings(case, tmp_path)
+    assert (
+        corpus_harness.stable_run_projection_sha256(mutated_projection, runtime_root=tmp_path, settings=rendered.settings)
+        != case.expected.resumed_full_projection_sha256
+    )
 
 
 def test_checkpoint_full_history_pin_rejects_consistent_node_identity_suffix_drift(

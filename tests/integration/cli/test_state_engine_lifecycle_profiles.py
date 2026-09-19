@@ -44,6 +44,7 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.transforms.passthrough import PassThrough
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.progress import ProgressBroadcaster
@@ -190,6 +191,7 @@ payload_store:
     web_settings = SimpleNamespace(
         deployment_target="default",
         deployment_state_mode="sqlite-single",
+        workflow_governance="off",
         landscape_url=settings.landscape.url,
         landscape_passphrase=None,
         payload_store_path=settings.payload_store.base_path,
@@ -356,7 +358,7 @@ payload_store:
         run_id = str(launched_run_id)
         assert launched_run_id == run_uuid
         assert len(submitted) == 1
-        assert await asyncio.to_thread(leader_blocked.wait, 10), "ExecutionService leader never paused before a fork-branch claim"
+        assert await run_sync_in_worker(leader_blocked.wait, 10), "ExecutionService leader never paused before a fork-branch claim"
 
         db = LandscapeDB.from_url(settings.landscape.url)
     except BaseException:
@@ -387,7 +389,7 @@ payload_store:
             output_b_path: output_b_path.read_bytes() if output_b_path.exists() else b"",
         }
         cli_task = asyncio.create_task(
-            asyncio.to_thread(
+            run_sync_in_worker(
                 CliRunner().invoke,
                 app,
                 [

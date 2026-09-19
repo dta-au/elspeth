@@ -57,6 +57,7 @@ from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
     CompletionGateIntegrityError,
     ExecuteRequestValidationError,
+    ExecutionApprovalRequired,
     ExecutionReadinessError,
     PipelineValidationError,
     RunSessionIntegrityError,
@@ -1063,6 +1064,15 @@ def create_execution_router() -> APIRouter:
             # server-side audit/telemetry, never through the HTTP
             # response body.
             raise HTTPException(status_code=404, detail="State not found") from None
+        except ExecutionApprovalRequired as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_type": exc.reason.value,
+                    "detail": f"Run admission refused: {exc.reason.value}",
+                    "binding": exc.binding.as_json(),
+                },
+            ) from exc
         except BlobNotFoundError:
             # IDOR contract (mirrors StateAccessError above): the
             # nonexistent-blob and cross-session-blob branches MUST

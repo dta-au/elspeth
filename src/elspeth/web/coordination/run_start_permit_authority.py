@@ -13,16 +13,28 @@ from sqlalchemy.engine import Row
 from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
     AdmissionRefusalReason,
+    ApprovalDisposition,
     ChargeableAdmissionDecision,
     ChargeableAdmissionPolicy,
     QuotaDisposition,
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.coordination.approval_authority import (
+    ApprovalGateInputs,
+    RepositoryApprovalAuthority,
+    evaluate_approval_gate,
+)
 from elspeth.web.coordination.chargeable_admission_authority import RepositoryChargeableAdmissionAuthority
 from elspeth.web.coordination.contracts import SessionOperationContext, StartPermitState
 from elspeth.web.coordination.mutation_connection_registry import _resolve_mutation_connection
-from elspeth.web.sessions.models import run_execution_inputs_table, run_start_permits_table, runs_table, session_operation_fences_table
+from elspeth.web.sessions.models import (
+    composition_states_table,
+    run_execution_inputs_table,
+    run_start_permits_table,
+    runs_table,
+    session_operation_fences_table,
+)
 from elspeth.web.sessions.protocol import RunStartPermitRecord
 
 
@@ -35,25 +47,70 @@ class RepositoryRunStartPermitAuthority:
 
     @staticmethod
     def _assess(
-        connection_token: str, *, run_id: str, context: SessionOperationContext, now: datetime, policy: ChargeableAdmissionPolicy
+        connection_token: str,
+        *,
+        run_id: str,
+        context: SessionOperationContext,
+        now: datetime,
+        policy: ChargeableAdmissionPolicy,
+        approval: ApprovalGateInputs | None = None,
     ) -> tuple[Row[Any], ChargeableAdmissionDecision]:
+        if policy.workflow_governance_on and not isinstance(approval, ApprovalGateInputs):
+            raise AuditIntegrityError("Governed run admission requires approval input")
         conn = _resolve_mutation_connection(connection_token)
         decision = RepositoryChargeableAdmissionAuthority.assess(connection_token, session_id=context.fence.session_id, policy=policy)
         run = conn.execute(select(runs_table).where(runs_table.c.id == run_id).with_for_update()).one()
         if run.session_id != context.fence.session_id:
             raise AuditIntegrityError("Run permit session custody mismatch")
+        state = conn.execute(
+            select(composition_states_table.c.id)
+            .where(composition_states_table.c.id == run.state_id, composition_states_table.c.session_id == run.session_id)
+            .with_for_update()
+        ).one_or_none()
+        if state is None:
+            raise AuditIntegrityError("Run permit composition state custody mismatch")
+        if decision.allowed and policy.workflow_governance_on:
+            assert approval is not None
+            approved = RepositoryApprovalAuthority.approved_bindings(connection_token, session_id=run.session_id, state_id=run.state_id)
+            reason = evaluate_approval_gate(approved=approved, compiled=approval.binding)
+            approval_disposition = {
+                None: ApprovalDisposition.MATCHED,
+                AdmissionRefusalReason.APPROVAL_REQUIRED: ApprovalDisposition.REQUIRED,
+                AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH: ApprovalDisposition.BINDING_MISMATCH,
+            }[reason]
+            evidence = AdmissionPolicyEvidence(
+                **{
+                    **decision.evidence.model_dump(),
+                    "schema_version": 3,
+                    "approval_disposition": approval_disposition,
+                    "approval_binding_hash": stable_hash(approval.binding.as_json()),
+                }
+            )
+            decision = ChargeableAdmissionDecision(refusal_reason=reason, evidence=evidence)
         row = conn.execute(select(run_start_permits_table).where(run_start_permits_table.c.run_id == run_id).with_for_update()).one()
         if row.start_state in {"refused", "cancelled_before_permit"} or row.execution_refusal is not None:
             return row, decision
         if row.start_state == "start_permitted":
             previous = RepositoryRunStartPermitAuthority._record(row)
             assert previous.admission_decision is not None
-            if decision.allowed and previous.admission_decision.evidence.secret_wiring_hash != policy.secret_wiring_hash:
+            prior_evidence = previous.admission_decision.evidence
+            current_evidence = decision.evidence
+            generation_changed = (
+                prior_evidence.secret_wiring_hash != policy.secret_wiring_hash
+                or prior_evidence.schema_version != current_evidence.schema_version
+                or prior_evidence.approval_binding_hash != current_evidence.approval_binding_hash
+            )
+            if decision.allowed and generation_changed:
+                refusal_evidence = (
+                    current_evidence
+                    if current_evidence.schema_version == 3
+                    else AdmissionPolicyEvidence(
+                        quota_disposition=QuotaDisposition.NOT_ASSESSED, secret_wiring_hash=policy.secret_wiring_hash
+                    )
+                )
                 decision = ChargeableAdmissionDecision(
                     refusal_reason=AdmissionRefusalReason.POLICY_GENERATION_CHANGED,
-                    evidence=AdmissionPolicyEvidence(
-                        quota_disposition=QuotaDisposition.NOT_ASSESSED, secret_wiring_hash=policy.secret_wiring_hash
-                    ),
+                    evidence=refusal_evidence,
                 )
         if not decision.allowed:
             if row.start_state == "pending":
@@ -91,17 +148,33 @@ class RepositoryRunStartPermitAuthority:
 
     @staticmethod
     def assess(
-        connection_token: str, *, run_id: str, context: SessionOperationContext, now: datetime, policy: ChargeableAdmissionPolicy
+        connection_token: str,
+        *,
+        run_id: str,
+        context: SessionOperationContext,
+        now: datetime,
+        policy: ChargeableAdmissionPolicy,
+        approval: ApprovalGateInputs | None = None,
     ) -> RunStartPermitRecord:
         """Persist refusals before restoration without authorizing a start."""
-        row, _ = RepositoryRunStartPermitAuthority._assess(connection_token, run_id=run_id, context=context, now=now, policy=policy)
+        row, _ = RepositoryRunStartPermitAuthority._assess(
+            connection_token, run_id=run_id, context=context, now=now, policy=policy, approval=approval
+        )
         return RepositoryRunStartPermitAuthority._record(row)
 
     @staticmethod
     def issue(
-        connection_token: str, *, run_id: str, context: SessionOperationContext, now: datetime, policy: ChargeableAdmissionPolicy
+        connection_token: str,
+        *,
+        run_id: str,
+        context: SessionOperationContext,
+        now: datetime,
+        policy: ChargeableAdmissionPolicy,
+        approval: ApprovalGateInputs | None = None,
     ) -> RunStartPermitRecord:
-        row, decision = RepositoryRunStartPermitAuthority._assess(connection_token, run_id=run_id, context=context, now=now, policy=policy)
+        row, decision = RepositoryRunStartPermitAuthority._assess(
+            connection_token, run_id=run_id, context=context, now=now, policy=policy, approval=approval
+        )
         conn = _resolve_mutation_connection(connection_token)
         if row.start_state == "pending":
             run = conn.execute(select(runs_table).where(runs_table.c.id == run_id)).one()

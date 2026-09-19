@@ -1,5 +1,13 @@
 ### Task I4: Review requests and reviewer attestations
 
+> **Current execution note (2026-09-19):** The operator requires every
+> attestation to be bound to an open review request for the exact state and
+> reviewer. An addressed request covers its addressee; an unaddressed request
+> covers any eligible active reviewer other than the author. The attestation
+> remains a ledger entry, not a run gate. Follow the
+> [current execution map](../2026-09-19-identity-workflow-finalization.md)
+> where the examples below differ.
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I3. Runs before: I6. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered after I3 (it registers its router beside I3's in `web/app.py` and

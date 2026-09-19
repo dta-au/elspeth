@@ -81,6 +81,7 @@ def build_rejection_records(tool_outcomes: tuple[_ToolOutcome, ...]) -> tuple[Re
 
 
 if TYPE_CHECKING:
+    from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord
     from elspeth.web.composer.service import ComposerServiceImpl
 
 
@@ -100,6 +101,8 @@ async def persist_turn_audit(
     persisted_assistant_message_id: str | None,
     persisted_assistant_content: str | None,
     assistant_row_uses_current_dispatch: bool,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -251,7 +254,7 @@ async def persist_turn_audit(
                 ),
             ),
             composition_state_payload=(
-                phase3_self._state_payload_for_compose_turn(tool_outcome.response)
+                phase3_self._state_payload_for_compose_turn(tool_outcome.response, ingress=ingress, chat_ingress_inputs=chat_ingress_inputs)
                 if tool_outcome.post_version > tool_outcome.pre_version
                 else None
             ),

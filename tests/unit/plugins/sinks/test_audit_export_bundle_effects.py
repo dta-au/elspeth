@@ -55,7 +55,8 @@ def _snapshot(
         source_status="completed",
         source_completed_at=COMPLETED_AT,
         export_format="csv",
-        exporter_version="landscape-exporter-v2",
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
         serialization_version="audit-export-v2",
         chunking_algorithm_version="complete-frame-v1",
         include_raw_error_rows=False,
@@ -65,7 +66,19 @@ def _snapshot(
         signer_key_id="audit-key-v1" if signed else "UNSIGNED",
         signing_key=b"audit-test-key" if signed else None,
     )
-    bundle = derive_audit_export_bundle(records, config)
+    current_records: tuple[dict[str, object], ...] = (
+        {"record_type": "audit_export_config", "public_config": config.public_snapshot_config()},
+        {
+            "record_type": "auth_event_coverage",
+            "policy": "omitted",
+            "selection_cutoff": None,
+            "selection_basis": None,
+            "selected_count": None,
+            "reason": "not_requested",
+        },
+        *records,
+    )
+    bundle = derive_audit_export_bundle(current_records, config)
     chunks = tuple(
         AuditExportSnapshotChunkInput(
             ordinal=chunk.ordinal,
@@ -242,7 +255,13 @@ def test_prepare_pins_exact_csv_files_manifest_and_aggregate_hash(tmp_path: Path
     plan = _prepare(tmp_path / "audit", snapshot)
     stage = _stage(plan)
 
-    assert sorted(path.name for path in stage.iterdir()) == ["audit_manifest.v2.json", "node.csv", "run.csv"]
+    assert sorted(path.name for path in stage.iterdir()) == [
+        "audit_export_config.csv",
+        "audit_manifest.v2.json",
+        "auth_event_coverage.csv",
+        "node.csv",
+        "run.csv",
+    ]
     assert (stage / "audit_manifest.v2.json").read_bytes() == manifest_bytes
     assert not manifest_bytes.endswith(b"\n")
     with (stage / "run.csv").open(newline="", encoding="utf-8") as stream:
@@ -250,8 +269,14 @@ def test_prepare_pins_exact_csv_files_manifest_and_aggregate_hash(tmp_path: Path
     assert rows[0]["formula"] == "'=1+1"
 
     files = list(plan.safe_evidence["files"])
-    assert [entry["relative_path"] for entry in files] == ["audit_manifest.v2.json", "node.csv", "run.csv"]
-    manifest_entry = files[0]
+    assert [entry["relative_path"] for entry in files] == [
+        "audit_export_config.csv",
+        "audit_manifest.v2.json",
+        "auth_event_coverage.csv",
+        "node.csv",
+        "run.csv",
+    ]
+    manifest_entry = files[1]
     assert manifest_entry == {
         "content_hash": snapshot.signed_manifest.content_hash,
         "relative_path": "audit_manifest.v2.json",

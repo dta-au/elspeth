@@ -41,7 +41,7 @@ _ADJUDICATION_CANDIDATES = {
     # Same closed-union discrimination as review_interpretations, at the
     # compiled-id identity seam (elspeth-ba01834a57): the strict materializer
     # returns CompositionState | InterpretationReviewPending, both owned types.
-    "validation.py": ["R5:_identity_state_for_compiled_ids"],
+    "validation.py": ["R5:_identity_state_for_compiled_ids", "R5:_validate_pipeline_impl"],
 }
 
 _EXPECTED_SUPPRESSION_OBSERVATIONS = {

@@ -5,6 +5,7 @@ from dataclasses import replace as _replace_dataclass
 
 from elspeth.contracts.errors import GuidedCustodyIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
 from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -42,6 +43,7 @@ from ._helpers import (
     WebRateLimiter,
     _BadRequestLLMError,
     _cancel_on_client_disconnect,
+    _chat_ingress_inputs,
     _composer_chat_history,
     _composer_conversation_messages,
     _composer_conversation_or_llm_audit_messages,
@@ -137,6 +139,7 @@ def register_message_routes(router: APIRouter) -> None:
         session = await _verify_session_ownership(session_id, user, request)
         service: SessionServiceProtocol = request.app.state.session_service
         settings = request.app.state.settings
+        chat_ingress = compartment_ingress_record(body.content, own_compartment_id=settings.compartment_id)
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
         async with (
             compose_lock,
@@ -234,6 +237,7 @@ def register_message_routes(router: APIRouter) -> None:
                 writer_principal="route_user_message",
                 session_operation_context=compose_operation_lease.context,
             )
+            chat_ingress_inputs = _chat_ingress_inputs(records, own_compartment_id=settings.compartment_id)
             progress_registry = _get_composer_progress_registry(request)
             progress_sink = await _composer_progress_sink(
                 progress_registry,
@@ -389,6 +393,8 @@ def register_message_routes(router: APIRouter) -> None:
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
                         session_operation_context=compose_operation_lease.context,
+                        ingress=chat_ingress,
+                        chat_ingress_inputs=chat_ingress_inputs,
                     )
                     raise HTTPException(status_code=422, detail=response_body) from exc
                 except LiteLLMAuthError as exc:
@@ -554,6 +560,8 @@ def register_message_routes(router: APIRouter) -> None:
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
                         session_operation_context=compose_operation_lease.context,
+                        ingress=chat_ingress,
+                        chat_ingress_inputs=chat_ingress_inputs,
                     )
                     await _publish_progress(
                         progress_sink,
@@ -620,6 +628,8 @@ def register_message_routes(router: APIRouter) -> None:
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
                         session_operation_context=compose_operation_lease.context,
+                        ingress=chat_ingress,
+                        chat_ingress_inputs=chat_ingress_inputs,
                     )
                     raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                 except PipelinePlannerError as exc:
@@ -763,7 +773,11 @@ def register_message_routes(router: APIRouter) -> None:
                 # first-class column) so any save must propagate it forward — failing
                 # to include it would silently drop the guided session from the DB on
                 # every freeform compose turn that mutates state.
-                _post_compose_updates: dict[str, Any] = {"repair_turns_used": result.repair_turns_used}
+                _post_compose_updates: dict[str, Any] = {
+                    "repair_turns_used": result.repair_turns_used,
+                    "ingress": chat_ingress,
+                    "chat_ingress_inputs": chat_ingress_inputs,
+                }
                 if _post_compose_guided is not None:
                     _post_compose_updates["guided_session"] = _post_compose_guided.to_dict()
                 _post_compose_meta = merge_composer_meta_updates(
@@ -873,6 +887,8 @@ def register_message_routes(router: APIRouter) -> None:
                             profile_registry=profile_registry,
                             catalog=request.app.state.catalog_service,
                             session_operation_context=compose_operation_lease.context,
+                            ingress=chat_ingress,
+                            chat_ingress_inputs=chat_ingress_inputs,
                         )
                         raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                     await _publish_progress(

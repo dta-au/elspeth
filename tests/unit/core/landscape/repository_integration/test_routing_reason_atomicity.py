@@ -371,7 +371,11 @@ def test_spawned_identical_writers_converge_and_export_exact_reason(tmp_path: Pa
         claim = claim_test_work_item(factory, member_token=member, token_id=TOKEN_ID, node_id=GATE_ID)
         factory.scheduler.mark_terminal(member_token=member, work_item_id=claim.work_item_id, expected_lease_owner=member.worker_id)
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID))
-        routing_exports = [record for record in LandscapeExporter(db).export_run(RUN_ID) if record["record_type"] == "routing_event"]
+        routing_exports = [
+            record
+            for record in LandscapeExporter(db, compartment_id="test-compartment").export_run(RUN_ID)
+            if record["record_type"] == "routing_event"
+        ]
         assert len(routing_exports) == 1
         assert routing_exports[0]["event_id"] == rows[0].event_id
         assert routing_exports[0]["reason_hash"] == expected_ref
@@ -874,7 +878,11 @@ def test_sqlite_backup_restore_preserves_exported_reason_and_retry_identity(tmp_
         claim = claim_test_work_item(factory, member_token=member, token_id=TOKEN_ID, node_id=GATE_ID)
         factory.scheduler.mark_terminal(member_token=member, work_item_id=claim.work_item_id, expected_lease_owner=member.worker_id)
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID))
-        source_export = [record for record in LandscapeExporter(db).export_run(RUN_ID) if record["record_type"] == "routing_event"]
+        source_export = [
+            record
+            for record in LandscapeExporter(db, compartment_id="test-compartment").export_run(RUN_ID)
+            if record["record_type"] == "routing_event"
+        ]
 
     backup_path = tmp_path / "audit.backup.db"
     with sqlite3.connect(source_db_path) as source, sqlite3.connect(backup_path) as backup:
@@ -888,7 +896,9 @@ def test_sqlite_backup_restore_preserves_exported_reason_and_retry_identity(tmp_
     restored_store = FilesystemPayloadStore(restored_payload_dir)
     with LandscapeDB.from_url(f"sqlite:///{restored_db_path}", create_tables=False) as restored_db:
         restored_export = [
-            record for record in LandscapeExporter(restored_db).export_run(RUN_ID) if record["record_type"] == "routing_event"
+            record
+            for record in LandscapeExporter(restored_db, compartment_id="test-compartment").export_run(RUN_ID)
+            if record["record_type"] == "routing_event"
         ]
         assert restored_export == source_export
         assert event.reason_ref is not None

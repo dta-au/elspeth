@@ -266,6 +266,9 @@ export async function parseResponse<T>(
     // responses.
     let detail = response.statusText;
     let errorType: string | undefined;
+    let currentState: string | undefined;
+    let storageQuota: ApiError["storage_quota"];
+    let sources: string[] | undefined;
     let requestId: string | undefined;
     let failureCode: string | undefined;
     let componentId: string | undefined;
@@ -294,8 +297,23 @@ export async function parseResponse<T>(
 
       errorType = firstStringField(
         [body, nestedDetail],
-        ["error_type", "error_code", "code", "kind"],
+        ["error_type", "error_code", "refusal", "code", "kind"],
       );
+      currentState = firstStringField([body, nestedDetail], ["current_state"]);
+      if (response.status === 413 && errorType === "storage_quota_exceeded") {
+        const dimension = firstDefined(ownField(nestedDetail, "dimension"), ownField(body, "dimension"));
+        const cap = firstDefined(ownField(nestedDetail, "cap"), ownField(body, "cap"));
+        const ceiling = firstDefined(ownField(nestedDetail, "ceiling"), ownField(body, "ceiling"));
+        const usage = firstDefined(ownField(nestedDetail, "usage"), ownField(body, "usage"));
+        const validLimit = (value: unknown): value is number | null => value === null || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+        if (dimension === "storage" && validLimit(cap) && validLimit(ceiling) && typeof usage === "number" && Number.isSafeInteger(usage) && usage >= 0) {
+          storageQuota = { cap, ceiling, usage };
+        }
+      }
+      const rawSources = firstDefined(ownField(body, "sources"), ownField(nestedDetail, "sources"));
+      sources = Array.isArray(rawSources) && rawSources.every((source): source is string => typeof source === "string")
+        ? rawSources
+        : undefined;
 
       requestId = firstStringField([body, nestedDetail], ["request_id"]);
       failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
@@ -445,6 +463,9 @@ export async function parseResponse<T>(
       status: response.status,
       detail,
       error_type: errorType,
+      current_state: currentState,
+      storage_quota: storageQuota,
+      sources,
       request_id: requestId,
       failure_code: failureCode,
       component_id: componentId,

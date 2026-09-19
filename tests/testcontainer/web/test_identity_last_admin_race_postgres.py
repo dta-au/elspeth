@@ -187,7 +187,7 @@ def test_two_replicas_disabling_the_last_two_admins_leave_exactly_one(external_d
             barrier.wait(timeout=10)
             try:
                 authority.disable_identity(
-                    actor=_actor(actor_id),
+                    actor=IdentityAdminActor(identity_id=actor_id, on_behalf_of="ops@example.com", console_request_id="req-race"),
                     identity_id=target_id,
                     reason="race",
                     record=_rendezvous(observer, arrived, index),

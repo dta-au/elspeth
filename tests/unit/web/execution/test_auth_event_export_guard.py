@@ -47,6 +47,7 @@ class _ReachedSettingsLoad(Exception):
 @pytest.mark.parametrize("enabled", [False, True])
 def test_web_auth_event_export_authorization(request: pytest.FixtureRequest, frozen: bool, auth_events: str, enabled: bool) -> None:
     execution_service = cast(ExecutionServiceImpl, request.getfixturevalue("service"))
+    execution_service._settings.compartment_id = "test-compartment"
     if frozen:
         execution_service._trained_operator_mode = False
     config = {
@@ -54,6 +55,7 @@ def test_web_auth_event_export_authorization(request: pytest.FixtureRequest, fro
         "landscape": {
             "export": {
                 "enabled": enabled,
+                "compartment_id": "test-compartment",
                 "sink": "audit",
                 "format": "json",
                 "auth_events": auth_events,

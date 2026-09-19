@@ -1,5 +1,12 @@
 ### Task I2: Storage quota R13 at every byte-admitting site
 
+> **Current execution note (2026-09-19):** This is active delivery work.
+> Re-anchor the call graph against Sessions epoch 59 and the current source;
+> its old epoch-57 assertion and positional line numbers are stale. Preserve
+> the zero-net-byte replay exemption and cover replacement growth as well as
+> the four named byte-admission categories. See the
+> [current execution map](../2026-09-19-identity-workflow-finalization.md).
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I1. Runs before: I3. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered after I1 (I0 → I8 → I1 → I2 → I3). I2 consumes I1's `QuotaExceeded`, `ActiveQuotaPolicies`, `QuotaPolicyRow`, the policy lookup behind `RepositoryQuotaAuthority.active_policy`, `AuthAuditRecorder.record_quota_exceeded` and the `fenced_session` / `pg_fenced` fixtures. I8's `workflow_governance` switch is not read: R13 enforces whenever an active storage policy row exists, the posture I1 gives R14. Spec: R13 (`docs/specs/2026-09-02-pluggable-sso-design.md:1127-1156`), D18 (:77), D24 (:81), the `quota_exceeded` metadata rule (:834-835) and §Testing → Workflow governance (:1283-1298: a fire and a mutation-derivation test per refusal, and a storage refusal at each R13 site asserting the row's dimension, cap, ceiling and usage).

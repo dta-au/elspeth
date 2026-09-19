@@ -5,6 +5,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { Button, Input } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
+import { IdentityStorageTotal } from "./IdentityStorageTotal";
 import type { BlobMetadata, BlobCategory } from "@/types/api";
 
 interface BlobManagerProps {
@@ -127,6 +128,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         <span className="blob-manager-title">
           Files ({blobs.length})
         </span>
+        <IdentityStorageTotal refreshKey={`${activeSessionId}:${blobs.map((blob) => `${blob.id}:${blob.size_bytes}`).join(",")}`} />
         {/* Label-only, and its accessible name IS its visible text
             (elspeth-29eef452a8). The label used to read "+ Upload" against an
             aria-label of "Upload file": a typed plus sign is a glyph drawn in

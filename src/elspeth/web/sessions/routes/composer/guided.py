@@ -14,6 +14,7 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import get_sink_config_model, get_source_config_model
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.compartments import chat_ingress_input, compartment_ingress_record
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin, build_component_review_turn
 from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE, WorkflowProfileKind, profile_for_kind
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, GUIDED_GOAL_ACKNOWLEDGEMENT, Turn, validate_current_turn
@@ -137,6 +138,7 @@ from .._helpers import (
     TurnRecordResponse,
     TurnType,
     UserIdentity,
+    _chat_ingress_inputs,
     _composer_heartbeat_cancel_of,
     _composer_progress_sink,
     _failure_log_request_id,
@@ -1761,7 +1763,26 @@ async def post_guided_start(
                     metadata_=state_d["metadata"],
                     is_valid=persisted_is_valid,
                     validation_errors=persisted_errors,
-                    composer_meta={"guided_session": seeded_guided.to_dict()},
+                    composer_meta={
+                        "guided_session": seeded_guided.to_dict(),
+                        "ingress": compartment_ingress_record(
+                            root_message.content,
+                            own_compartment_id=request.app.state.settings.compartment_id,
+                        ),
+                        "chat_ingress_inputs": [
+                            *_chat_ingress_inputs(
+                                await service.get_messages(session_id, limit=None),
+                                own_compartment_id=request.app.state.settings.compartment_id,
+                            ),
+                            chat_ingress_input(
+                                message_id=str(root_message.message_id),
+                                text=root_message.content,
+                                own_compartment_id=request.app.state.settings.compartment_id,
+                            ),
+                        ],
+                    }
+                    if root_message is not None
+                    else {"guided_session": seeded_guided.to_dict()},
                 )
                 seed_outcome = await _await_guided_atomic_settlement(
                     service.seed_or_complete_guided_start_operation(
@@ -2137,7 +2158,24 @@ async def post_guided_convert(
                 actor=user.user_id,
             )
             new_state = _replace(new_state, guided_session=seeded_guided)
-            new_composer_meta = {"guided_session": seeded_guided.to_dict()}
+            new_composer_meta = {
+                "guided_session": seeded_guided.to_dict(),
+                "ingress": compartment_ingress_record(
+                    root_message.content,
+                    own_compartment_id=request.app.state.settings.compartment_id,
+                ),
+                "chat_ingress_inputs": [
+                    *_chat_ingress_inputs(
+                        await service.get_messages(session_id, limit=None),
+                        own_compartment_id=request.app.state.settings.compartment_id,
+                    ),
+                    chat_ingress_input(
+                        message_id=str(root_message.message_id),
+                        text=root_message.content,
+                        own_compartment_id=request.app.state.settings.compartment_id,
+                    ),
+                ],
+            }
             state_d = new_state.to_dict()
             persisted_is_valid, persisted_errors = _guided_persisted_validity(new_state, catalog=catalog)
             state_data = CompositionStateData(
@@ -3217,7 +3255,34 @@ async def post_guided_respond(
             metadata_=state_dict["metadata"],
             is_valid=state_record.is_valid,
             validation_errors=state_record.validation_errors,
-            composer_meta={"guided_session": rewound_guided.to_dict()},
+            composer_meta={
+                "guided_session": rewound_guided.to_dict(),
+                **(
+                    {
+                        "ingress": compartment_ingress_record(
+                            correction_feedback,
+                            own_compartment_id=request.app.state.settings.compartment_id,
+                        )
+                    }
+                    if correction_feedback is not None
+                    else (
+                        {
+                            key: state_record.composer_meta[key]
+                            for key in ("ingress", "chat_ingress_inputs")
+                            if key in state_record.composer_meta
+                        }
+                        if state_record.composer_meta is not None
+                        else {}
+                    )
+                ),
+                **(
+                    {"chat_ingress_inputs": state_record.composer_meta["chat_ingress_inputs"]}
+                    if correction_feedback is not None
+                    and state_record.composer_meta is not None
+                    and "chat_ingress_inputs" in state_record.composer_meta
+                    else {}
+                ),
+            },
         )
         emit_turn_answered(
             recorder,
@@ -3851,6 +3916,11 @@ async def post_guided_respond(
                         settled_is_valid, settled_validation_errors = _guided_persisted_validity(settled_state, catalog=catalog)
                         settled_meta = dict(current_meta)
                         settled_meta["guided_session"] = settled_guided.to_dict()
+                        if user_instruction is not None:
+                            settled_meta["ingress"] = compartment_ingress_record(
+                                user_instruction,
+                                own_compartment_id=request.app.state.settings.compartment_id,
+                            )
                         settled_payloads = (
                             pending_payloads
                             if any(payload.payload_id == prepared_current.payload_id for payload in pending_payloads)
@@ -4347,7 +4417,24 @@ async def post_guided_respond(
                                 metadata_=state_dict["metadata"],
                                 is_valid=is_valid,
                                 validation_errors=validation_errors,
-                                composer_meta={"guided_session": successor_guided.to_dict()},
+                                composer_meta={
+                                    "guided_session": successor_guided.to_dict(),
+                                    "ingress": compartment_ingress_record(
+                                        correction_message.content,
+                                        own_compartment_id=request.app.state.settings.compartment_id,
+                                    ),
+                                    "chat_ingress_inputs": [
+                                        *_chat_ingress_inputs(
+                                            await service.get_messages(session_id, limit=None),
+                                            own_compartment_id=request.app.state.settings.compartment_id,
+                                        ),
+                                        chat_ingress_input(
+                                            message_id=str(correction_message.message_id),
+                                            text=correction_message.content,
+                                            own_compartment_id=request.app.state.settings.compartment_id,
+                                        ),
+                                    ],
+                                },
                             )
                             emit_turn_answered(
                                 recorder,
@@ -4533,7 +4620,10 @@ async def post_guided_respond(
                             metadata_=reviewed_dict["metadata"],
                             is_valid=state_record.is_valid,
                             validation_errors=state_record.validation_errors,
-                            composer_meta={"guided_session": final_guided.to_dict()},
+                            composer_meta={
+                                **{key: existing_meta[key] for key in ("ingress", "chat_ingress_inputs") if key in existing_meta},
+                                "guided_session": final_guided.to_dict(),
+                            },
                         )
                         settlement = await service.settle_guided_state_operation(
                             GuidedStateOperationCommand(
@@ -4802,7 +4892,24 @@ async def post_guided_respond(
                                 metadata_=state_dict["metadata"],
                                 is_valid=is_valid,
                                 validation_errors=validation_errors,
-                                composer_meta={"guided_session": successor_guided.to_dict()},
+                                composer_meta={
+                                    "guided_session": successor_guided.to_dict(),
+                                    "ingress": compartment_ingress_record(
+                                        correction_message.content,
+                                        own_compartment_id=request.app.state.settings.compartment_id,
+                                    ),
+                                    "chat_ingress_inputs": [
+                                        *_chat_ingress_inputs(
+                                            await service.get_messages(session_id, limit=None),
+                                            own_compartment_id=request.app.state.settings.compartment_id,
+                                        ),
+                                        chat_ingress_input(
+                                            message_id=str(correction_message.message_id),
+                                            text=correction_message.content,
+                                            own_compartment_id=request.app.state.settings.compartment_id,
+                                        ),
+                                    ],
+                                },
                             )
                             emit_turn_answered(
                                 recorder,
@@ -5050,7 +5157,10 @@ async def post_guided_respond(
                                 preflight_exception_policy="raise",
                                 initial_version=state.version,
                                 telemetry_source="convergence",
-                                composer_meta={"guided_session": completed_guided.to_dict()},
+                                composer_meta={
+                                    **{key: existing_meta[key] for key in ("ingress", "chat_ingress_inputs") if key in existing_meta},
+                                    "guided_session": completed_guided.to_dict(),
+                                },
                             ),
                             state=cancellation_state,
                         )
@@ -5421,7 +5531,10 @@ async def post_guided_respond(
                                 metadata_=state_dict["metadata"],
                                 is_valid=is_valid,
                                 validation_errors=validation_errors,
-                                composer_meta={"guided_session": resulting_guided.to_dict()},
+                                composer_meta={
+                                    **{key: existing_meta[key] for key in ("ingress", "chat_ingress_inputs") if key in existing_meta},
+                                    "guided_session": resulting_guided.to_dict(),
+                                },
                             )
                             stage_response = GuidedResponseDescriptor(
                                 kind="guided_respond",

@@ -50,6 +50,7 @@ _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Bare Final (not Final[str]) so mypy infers the Literal type and TypedDict
 # indexing through this constant type-checks at the history boundary.
 COMPOSER_HISTORY_USER_AUTHORED_KEY: Final = "_elspeth_user_authored"
+COMPOSER_HISTORY_USER_MESSAGE_ID_KEY: Final = "_elspeth_user_message_id"
 
 # Canonical request-tool kind policy. ``InterpretationKind`` is the closed
 # persistence/event vocabulary; this tuple is the subset the planner may send
@@ -122,6 +123,7 @@ class ComposerHistoryMessage(TypedDict):
     role: str
     content: str
     _elspeth_user_authored: NotRequired[Literal[True]]
+    _elspeth_user_message_id: NotRequired[str]
 
 
 # User-facing assistant text for planner-staged pipeline proposals. Shared
@@ -1355,6 +1357,9 @@ class ComposerSettings(Protocol):
 
     @property
     def composer_model(self) -> str: ...
+
+    @property
+    def compartment_id(self) -> str | None: ...
 
     @property
     def composer_endpoint_base_url(self) -> str | None: ...

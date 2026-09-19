@@ -1,5 +1,7 @@
 ### Task I9: Frontend — mailbox, completion bar, readiness row, admin UI, library, quota status
 
+> **Current execution note (2026-09-19):** The 2026-09-19 [execution map](../2026-09-19-identity-workflow-finalization.md) supersedes the addressed-only approval UI rules below. Show all open requests an active non-author approver can decide, with addressed requests first; keep inspect, decision and badge eligibility consistent. A later same-state rejection blocks an earlier approval from admitting a run.
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: I7. Runs before: I10. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Ordered after I7 (I0 → I8 → I1 → I2 → I3 → {I4 ∥ I5} → I6 → I7 → I9); I10

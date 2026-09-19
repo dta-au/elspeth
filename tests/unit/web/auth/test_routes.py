@@ -1583,7 +1583,7 @@ class TestLogout:
         assert event.identity_id == pyjwt.decode(token, options={"verify_signature": False})["sub"]
         assert event.request_id == "logout-1"
         assert event.user_agent == "pytest-client"
-        assert json.loads(event.metadata_json) == {"method": "POST", "path": "/api/auth/logout"}
+        assert json.loads(event.metadata_json) == {"method": "POST", "path": "/api/auth/logout", "compartment_id": None}
 
     @pytest.mark.asyncio
     async def test_logout_without_a_bearer_is_refused_and_writes_nothing(self, tmp_path) -> None:

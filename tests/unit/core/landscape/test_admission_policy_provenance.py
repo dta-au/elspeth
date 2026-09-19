@@ -40,7 +40,7 @@ def test_final_decision_round_trip_and_export(assessed: bool) -> None:
     assert repo.get_web_plugin_policy_evidence("policy") == evidence
     with open_export_read_transaction(db.engine) as reader:
         assert reader.get_web_plugin_policy_evidence("policy") == evidence
-        records = list(LandscapeExporter(db, read_model=reader).iter_unsigned_run_records("policy"))
+        records = list(LandscapeExporter(db, read_model=reader, compartment_id="test-compartment").iter_unsigned_run_records("policy"))
     policies = [record for record in records if record["record_type"] == "web_plugin_policy"]
     assert len(policies) == 1
     assert policies[0]["admission_decision_json"] == (decision.model_dump_json() if decision is not None else None)

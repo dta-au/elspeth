@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -821,6 +822,99 @@ def test_unique_future_catalog_intent_is_private_atomic_retryable_and_restart_du
     assert refreshed.status_code == 200, refreshed.json()
     restarted_guided = _guided(restarted, session_id)
     assert restarted_guided.deferred_intents == guided.deferred_intents
+
+
+def test_second_deferred_intent_checkpoint_retains_both_chat_inputs_and_goal(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    first_text = "Keep a passthrough transform for the later topology stage."
+    second_text = "Keep two passthrough transforms for the later topology stage."
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _provider(_action(count=1)))
+    first = _post(client, session_id, operation_id=str(uuid4()), turn_token=turn["turn_token"], message=first_text)
+    assert first.status_code == 200, first.json()
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _provider(_action(count=2)))
+    second = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=first.json()["next_turn"]["turn_token"],
+        message=second_text,
+    )
+    assert second.status_code == 200, second.json()
+
+    guided = _guided(client, session_id)
+    assert len(guided.deferred_intents) == 2
+    first_row, second_row = _non_root_user_rows(client, session_id)
+    assert [first_row[1], second_row[1]] == [first_text, second_text]
+    current = asyncio.run(client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert current is not None and current.composer_meta is not None
+    assert deep_thaw(current.composer_meta["chat_ingress_inputs"]) == [
+        {
+            "message_id": guided.root_intent_message_id,
+            "text_sha256": hashlib.sha256(_SEED_INTENT.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": [],
+        },
+        {
+            "message_id": first_row[0],
+            "text_sha256": hashlib.sha256(first_text.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": [],
+        },
+        {
+            "message_id": second_row[0],
+            "text_sha256": hashlib.sha256(second_text.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": [],
+        },
+    ]
+
+
+def test_deferred_intent_rejects_malformed_chat_ingress_inputs(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    with client.app.state.session_engine.connect() as connection:
+        state_count_before = connection.execute(
+            select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == session_id)
+        ).scalar_one()
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _provider(_action()))
+    service = client.app.state.session_service
+    real_settle = service.settle_guided_state_operation
+
+    async def corrupt_command(command, *, payload_store=None, session_operation_context):
+        metadata = deep_thaw(command.state.composer_meta)
+        metadata["chat_ingress_inputs"][0]["text_sha256"] = "not-a-sha256-digest"
+        return await real_settle(
+            replace(command, state=replace(command.state, composer_meta=metadata)),
+            payload_store=payload_store,
+            session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+        )
+
+    monkeypatch.setattr(service, "settle_guided_state_operation", corrupt_command)
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=turn["turn_token"],
+        message="Keep a passthrough transform for the later topology stage.",
+    )
+
+    assert response.status_code == 500, response.json()
+    assert response.json()["detail"]["failure_code"] == "integrity_error"
+    with client.app.state.session_engine.connect() as connection:
+        assert (
+            connection.execute(
+                select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == session_id)
+            ).scalar_one()
+            == state_count_before
+        )
 
 
 def test_cancel_requires_explicit_user_authority_then_removes_only_the_named_intent_and_replays_exactly(

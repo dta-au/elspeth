@@ -36,6 +36,7 @@ def _audit_export_config(*, signed: bool) -> dict[str, object]:
         "signer_key_id": "integration-test-key-v1" if signed else "UNSIGNED",
         "signing_secret_ref": "ELSPETH_SIGNING_KEY" if signed else None,
         "signer_rotation_policy": "multi_version",
+        "compartment_id": "test-compartment",
         "total_record_limit": 10_000,
         "total_byte_limit": 10_000_000,
         "chunk_limit": 100,
@@ -358,7 +359,9 @@ class TestSignedExportDeterminism:
 
         # Export the SAME run twice with signing
         signing_key = b"test-determinism-key-12345"
-        exporter = LandscapeExporter(db, signing_key=signing_key, signer_key_id="integration-test-key-v1")
+        exporter = LandscapeExporter(
+            db, signing_key=signing_key, signer_key_id="integration-test-key-v1", compartment_id="test-compartment"
+        )
 
         final_hashes = []
         for _ in range(2):

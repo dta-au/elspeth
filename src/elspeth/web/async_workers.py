@@ -105,9 +105,14 @@ def _get_shared_executor() -> ThreadPoolExecutor:
 
 
 async def shutdown_async_workers() -> None:
-    """Drain both worker pools (called at app lifespan shutdown)."""
+    """Drain both worker pools (called at app lifespan shutdown).
+
+    A dedicated shutdown pool avoids creating the event loop's default
+    executor, whose own Runner-close join has no explicit selector tick in
+    constrained runtimes. ``_await_worker_future`` supplies that tick while
+    the two process-wide pools drain.
+    """
     global _SHARED_EXECUTOR
-    loop = asyncio.get_running_loop()
     executors = []
     if _SHARED_EXECUTOR is not None:
         executors.append(_SHARED_EXECUTOR)
@@ -115,7 +120,17 @@ async def shutdown_async_workers() -> None:
     audit_executor = _AUTH_AUDIT_WORKERS.detach_executor()
     if audit_executor is not None:
         executors.append(audit_executor)
-    await asyncio.gather(*(loop.run_in_executor(None, executor.shutdown, True) for executor in executors))
+    if not executors:
+        return
+    shutdown_pool = ThreadPoolExecutor(max_workers=len(executors), thread_name_prefix="async-worker-shutdown")
+    try:
+        futures = [shutdown_pool.submit(executor.shutdown, True) for executor in executors]
+        for future in futures:
+            await _await_worker_future(future, cancel_queued=False)
+    finally:
+        # Cancellation cannot stop a shutdown already running in a thread;
+        # it continues in this private pool while the caller is cancelled.
+        shutdown_pool.shutdown(wait=False)
 
 
 def outstanding_admissions() -> int:

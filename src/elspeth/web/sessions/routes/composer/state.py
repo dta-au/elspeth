@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import replace
 from typing import NotRequired, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -16,6 +17,7 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
+from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.state import CompositionState, SourceSpec
 from elspeth.web.composer.yaml_generator import (
@@ -39,6 +41,7 @@ from elspeth.web.sessions.protocol import (
     GuidedCompositionStateResult,
     GuidedOperationResult,
     GuidedOperationSettlementConflictError,
+    SessionRecord,
 )
 from elspeth.web.sessions.routes.guided_operations import (
     GuidedOperationExpired,
@@ -86,6 +89,7 @@ from .._helpers import (
     datetime,
     generate_public_yaml,
     get_current_user,
+    merge_composer_meta_updates,
     record_session_completed,
     record_session_switched,
     slog,
@@ -95,6 +99,18 @@ router = APIRouter()
 
 _STATE_REVERT_SURFACE_PROVENANCE = "state_revert"
 _E2E_SEED_SURFACE_PROVENANCE = "e2e_seed"
+
+
+class LibraryForkFacts(TypedDict):
+    entry_id: str
+    payload_digest: str
+    published_from_session_id: str | None
+    compartment_id: str
+    version: int
+
+
+class LibraryForkMetaUpdates(TypedDict):
+    library_fork: LibraryForkFacts
 
 
 async def _surface_reverted_interpretation_reviews(
@@ -819,6 +835,22 @@ async def import_state_yaml(
 ) -> CompositionStateResponse:
     """Seed a session's composition state from exported runtime YAML."""
     session = await _verify_session_ownership(session_id, user, request)
+    return await seed_state_from_runtime_yaml(session=session, body=body, request=request, user=user)
+
+
+async def seed_state_from_runtime_yaml(
+    *,
+    session: SessionRecord,
+    body: ImportStateYamlRequest,
+    request: Request,
+    user: UserIdentity,
+    composer_meta_updates: LibraryForkMetaUpdates | None = None,
+) -> CompositionStateResponse:
+    """Seed through the YAML import validators, stamping exact text ingress.
+
+    Library forks use this same path and attach their source provenance to
+    the first state write. No second state or alternate graph importer exists.
+    """
     service: SessionServiceProtocol = request.app.state.session_service
     # Everything that can raise before the body runs is resolved BEFORE the
     # lease exists: the lease self-renews until closed, and only the
@@ -914,6 +946,12 @@ async def import_state_yaml(
                 model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
                 provider=_YAML_IMPORT_SURFACE_PROVENANCE,
                 composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
+            )
+            ingress = compartment_ingress_record(body.yaml, own_compartment_id=request.app.state.settings.compartment_id)
+            seed_meta_updates = {"ingress": ingress} if composer_meta_updates is None else {**composer_meta_updates, "ingress": ingress}
+            state_data = replace(
+                state_data,
+                composer_meta=merge_composer_meta_updates(state_data.composer_meta, seed_meta_updates),
             )
             response_state = await service.save_composition_state_with_interpretations(
                 session.id,
@@ -1291,7 +1329,8 @@ async def get_state_yaml(
         # lives here rather than in ``generate_public_yaml`` because the MCP,
         # share, and acceptance-import consumers of that function must keep bare
         # bytes (see its docstring).
-        yaml_str = public_export_redaction_header(export_state) + generate_public_yaml(export_state)
+        compartment_header = compartment_marking_header(request.app.state.settings.compartment_id)
+        yaml_str = compartment_header + public_export_redaction_header(export_state) + generate_public_yaml(export_state)
 
         # Audit-first and fence-first: a failed or stale COMPOSE authority
         # returns no YAML and emits no completion telemetry.

@@ -42,7 +42,7 @@ from sqlalchemy.exc import (
 )
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
-from elspeth.contracts import CallType, NodeStateStatus, NodeType
+from elspeth.contracts import CallType, NodeStateStatus, NodeType, SinkProtocol, SourceProtocol
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
@@ -69,13 +69,16 @@ from elspeth.contracts.sink_effects import (
 from elspeth.core.config import (
     CheckpointSettings,
     ConcurrencySettings,
+    LandscapeExportSettings,
     RateLimitSettings,
     TelemetrySettings,
+    load_bounded_pipeline_yaml,
 )
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import run_attributions_table, runs_table
+from elspeth.engine.orchestrator.types import PipelineConfig
 from elspeth.telemetry.manager import TelemetryManager
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
@@ -86,6 +89,7 @@ from elspeth.web.blobs.protocol import (
     BlobServiceProtocol,
     BlobStateError,
 )
+from elspeth.web.coordination.approval_authority import ApprovalGateInputs
 from elspeth.web.coordination.contracts import StartPermitState
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
@@ -95,6 +99,7 @@ from elspeth.web.execution.envelope import RunExecutionInput, validate_run_execu
 from elspeth.web.execution.errors import (
     BlobRowsSourceAdmissionError,
     CompletionGateIntegrityError,
+    ExecutionApprovalRequired,
     ExecutionReadinessError,
     PipelineValidationError,
 )
@@ -119,6 +124,7 @@ from elspeth.web.execution.service import (
     _MAX_FRAME_PATH_PARTS,
     ExecutionServiceImpl,
     InlineBlobPromptSurfaceAdmissionError,
+    _build_web_plugin_policy_evidence,
     _discover_blob_rows_sources,
 )
 from elspeth.web.execution.validation import validate_pipeline as _real_validate_pipeline
@@ -152,6 +158,7 @@ from tests.helpers.session_fences import (
     close_adopted_lease,
     make_blob_read_context,
 )
+from tests.unit.core.test_audit_export_config import _enabled_config
 
 # ── Fixtures ───────────────────────────────────────────────────────────
 
@@ -166,6 +173,8 @@ class _WebSettingsStub:
         self.deployment_target = "default"
         self.auth_provider = "local"
         self.deployment_state_mode = "sqlite-single"
+        self.workflow_governance = "off"
+        self.compartment_id: str | None = None
         self.landscape_url = "sqlite:///test_audit.db"
         self.payload_store_path = Path("/tmp/test_payloads")
         self.landscape_passphrase = None
@@ -450,14 +459,21 @@ def mock_settings() -> _WebSettingsStub:
     return _WebSettingsStub()
 
 
-def _mock_pipeline_settings() -> SimpleNamespace:
+class _ModelCopyNamespace(SimpleNamespace):
+    """Settings test double with Pydantic's immutable update shape."""
+
+    def model_copy(self, *, update: dict[str, Any]) -> _ModelCopyNamespace:
+        return type(self)(**{**vars(self), **update})
+
+
+def _mock_pipeline_settings() -> _ModelCopyNamespace:
     """Return settings-shaped test data for patched pipeline loading.
 
     _run_pipeline() now builds the same runtime infrastructure as the CLI path,
     so tests that patch YAML loading must still provide real config-contract
     objects for the runtime conversion boundary.
     """
-    return SimpleNamespace(
+    return _ModelCopyNamespace(
         sources={},
         transforms=[],
         aggregations=[],
@@ -469,7 +485,7 @@ def _mock_pipeline_settings() -> SimpleNamespace:
         scopes=[],
         max_bound_region_depth=5,
         queues={},
-        landscape=SimpleNamespace(export=SimpleNamespace(enabled=False, sink=None)),
+        landscape=_ModelCopyNamespace(export=SimpleNamespace(enabled=False, sink=None)),
         rate_limit=RateLimitSettings(enabled=False),
         concurrency=ConcurrencySettings(),
         checkpoint=CheckpointSettings(enabled=False),
@@ -775,7 +791,9 @@ def mock_session_service() -> MagicMock:
     )
     svc.assess_chargeable_operation.return_value = admission
 
-    async def issue_run_start_permit(run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+    async def issue_run_start_permit(
+        run_id: UUID, *, session_operation_context: SessionOperationContext, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord:
         return RunStartPermitRecord(
             run_id=str(run_id),
             state=StartPermitState.START_PERMITTED,
@@ -789,7 +807,9 @@ def mock_session_service() -> MagicMock:
 
     svc.issue_run_start_permit.side_effect = issue_run_start_permit
 
-    async def assess_run_start_admission(run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+    async def assess_run_start_admission(
+        run_id: UUID, *, session_operation_context: SessionOperationContext, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord:
         return RunStartPermitRecord(
             run_id=str(run_id),
             state=StartPermitState.PENDING,
@@ -991,6 +1011,81 @@ def service(
 
 
 class TestExecutionFlow:
+    @pytest.mark.parametrize("authored_compartment", [None, "forged"])
+    @pytest.mark.parametrize("signing_mode", ["unsigned", "hmac_sha256"])
+    @pytest.mark.asyncio
+    async def test_operator_export_marking_precedes_web_model_load_and_preserves_authored_yaml(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        authored_compartment: str | None,
+        signing_mode: str,
+    ) -> None:
+        service._settings.compartment_id = "operator-a"
+        authored_export = _enabled_config(compartment_id=authored_compartment)
+        if signing_mode == "hmac_sha256":
+            authored_export.update(signing_mode=signing_mode, signer_key_id="signer-a", signing_secret_ref="SIGNER_KEY")
+        authored_config = {"source": {"plugin": "csv", "options": {}}, "landscape": {"export": authored_export}}
+        cast(_YamlGeneratorStub, service._yaml_generator).result = json.dumps(authored_config)
+        effective_export = LandscapeExportSettings.model_validate({**authored_export, "compartment_id": "operator-a"})
+        parsed = SimpleNamespace(landscape=SimpleNamespace(export=effective_export))
+
+        with (
+            patch("elspeth.web.execution.service.load_settings_from_config_dict", return_value=parsed) as load_settings,
+            patch.object(service, "_run_pipeline"),
+        ):
+            await _execute(service, session_id=uuid4())
+
+        loaded_export = load_settings.call_args.args[0]["landscape"]["export"]
+        assert loaded_export["compartment_id"] == "operator-a"
+        assert mock_session_service.create_run.await_args.kwargs["pipeline_yaml"] is not None
+        saved_yaml = load_bounded_pipeline_yaml(mock_session_service.create_run.await_args.kwargs["pipeline_yaml"])
+        assert saved_yaml["landscape"]["export"]["compartment_id"] == authored_compartment
+
+    @pytest.mark.parametrize("signing_mode", ["unsigned", "hmac_sha256"])
+    @pytest.mark.asyncio
+    async def test_export_missing_operator_compartment_refuses_before_run(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, signing_mode: str
+    ) -> None:
+        export = LandscapeExportSettings.model_construct(enabled=True, signing_mode=signing_mode, compartment_id=None)
+        cast(_YamlGeneratorStub, service._yaml_generator).result = json.dumps(
+            {"source": {"plugin": "csv", "options": {}}, "landscape": {"export": {"enabled": True}}}
+        )
+        parsed = SimpleNamespace(landscape=SimpleNamespace(export=export))
+
+        with (
+            patch("elspeth.web.execution.service.load_settings_from_config_dict", return_value=parsed),
+            patch.object(service, "_run_pipeline"),
+            pytest.raises(ValueError, match="compartment_id"),
+        ):
+            await _execute(service, session_id=uuid4())
+
+        mock_session_service.create_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_web_export_refuses_deployment_auth_coverage_before_run(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock
+    ) -> None:
+        service._settings.compartment_id = "operator-a"
+        cast(_YamlGeneratorStub, service._yaml_generator).result = json.dumps(
+            {
+                "sources": {"input": {"plugin": "csv", "on_success": "output", "options": {}}},
+                "sinks": {
+                    "output": {"plugin": "csv", "on_write_failure": "discard", "options": {}},
+                    "archive": {"plugin": "csv", "on_write_failure": "discard", "options": {}},
+                },
+                "landscape": {"export": _enabled_config(compartment_id=None, auth_events="deployment_snapshot")},
+            }
+        )
+
+        with (
+            patch.object(service, "_run_pipeline"),
+            pytest.raises(ValueError, match="auth_events=deployment_snapshot"),
+        ):
+            await _execute(service, session_id=uuid4())
+
+        mock_session_service.create_run.assert_not_awaited()
+
     def test_queued_run_rejects_rotated_plugin_binding_before_runtime_config_use(self, service: ExecutionServiceImpl) -> None:
         base = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
 
@@ -3578,12 +3673,15 @@ class TestExecutionFanoutGuard:
 class TestWebRuntimeInfrastructure:
     """Regression coverage for web execution's orchestrator runtime wiring."""
 
+    @pytest.mark.parametrize("resume_existing", [False, True])
     def test_raw_pipeline_and_export_eligibility_precede_secret_resolution_without_shape_skip(
         self,
         service: ExecutionServiceImpl,
+        resume_existing: bool,
     ) -> None:
         from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError, SinkEffectExecutionPurpose
 
+        service._settings.compartment_id = "operator-a"
         pipeline_yaml = """
 sinks:
   pipeline:
@@ -3615,7 +3713,9 @@ landscape:
         service._secret_service = secret_service
         purposes: list[SinkEffectExecutionPurpose] = []
 
-        def validate(_raw: object, *, purpose: SinkEffectExecutionPurpose) -> dict[str, object]:
+        def validate(raw: object, *, purpose: SinkEffectExecutionPurpose) -> dict[str, object]:
+            assert type(raw) is dict
+            assert raw["landscape"]["export"]["compartment_id"] == "operator-a"
             purposes.append(purpose)
             if purpose is SinkEffectExecutionPurpose.AUDIT_EXPORT:
                 raise SinkEffectCapabilityError("export lane rejected")
@@ -3629,9 +3729,19 @@ landscape:
             patch("elspeth.core.secrets.resolve_secret_refs") as resolve_secret_refs,
             pytest.raises(SinkEffectCapabilityError, match="export lane"),
         ):
-            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), user_id="alice", session_operation_lease=_execute_lease())
+            service._run_pipeline(
+                str(uuid4()),
+                pipeline_yaml,
+                threading.Event(),
+                user_id="alice",
+                session_operation_lease=_execute_lease(),
+                resume_existing=resume_existing,
+            )
 
-        assert purposes == [SinkEffectExecutionPurpose.FRESH, SinkEffectExecutionPurpose.AUDIT_EXPORT]
+        assert purposes == [
+            SinkEffectExecutionPurpose.RESUME if resume_existing else SinkEffectExecutionPurpose.FRESH,
+            SinkEffectExecutionPurpose.AUDIT_EXPORT,
+        ]
         secret_service.list_refs.assert_not_called()
         resolve_secret_refs.assert_not_called()
 
@@ -4080,6 +4190,10 @@ class TestB2ShutdownEvent:
         resolver = object()
 
         with (
+            patch(
+                "elspeth.web.execution.export_marking.apply_operator_export_marking",
+                return_value=export_settings,
+            ),
             patch(
                 "elspeth.core.audit_export_content_store.create_audit_export_content_store",
                 return_value=(store, resolver),
@@ -6078,6 +6192,271 @@ class TestStructuralFramePath:
         assert "/home/" not in rendered
         assert ".claude" not in rendered
         assert len(rendered.split("/")) <= _MAX_FRAME_PATH_PARTS
+
+
+def _governed_approval_inputs(service: ExecutionServiceImpl) -> ApprovalGateInputs:
+    snapshot = service._plugin_snapshot_for_user("author", operation="approval test")
+    return ApprovalGateInputs(
+        evidence=_build_web_plugin_policy_evidence(snapshot=snapshot, policy=service._web_plugin_policy),
+        config_hash="a" * 64,
+        canonical_version="sha256-rfc8785-v1",
+        openrouter_catalog_sha256="b" * 64,
+        runtime_val_manifest_sha256="c" * 64,
+    )
+
+
+class TestGovernedExecutionAdmission:
+    def test_config_mismatch_refuses_before_blob_rows_payload_staging(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock
+    ) -> None:
+        service._settings.workflow_governance = "on"
+        run_id = uuid4()
+        owner_session = uuid4()
+        content = b"row source content"
+        blob_id = uuid4()
+        entry = _blob_rows_entry(content, blob_id=blob_id)
+        config = json.loads(_blob_rows_pipeline_yaml([entry]))
+        snapshot = service._plugin_snapshot_for_user("author", operation="approval test")
+        frozen = FrozenRunSettings(plugin_snapshot=snapshot, executable_config=config, audit_safe_config=config)
+        envelope = SimpleNamespace(
+            settings=frozen,
+            secret_resolver=None,
+            env_ref_names=(),
+            blob_inputs=[SimpleNamespace(reference=SimpleNamespace(blob_id=blob_id), retained=object())],
+        )
+        mock_session_service.get_run.return_value = _run_record_stub(
+            id=run_id, session_id=owner_session, status="running", landscape_run_id=str(run_id)
+        )
+        mock_session_service.assess_run_start_admission.side_effect = [
+            SimpleNamespace(state=StartPermitState.PENDING, execution_refusal=None),
+            SimpleNamespace(state=StartPermitState.REFUSED, execution_refusal=AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH),
+        ]
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=owner_session)
+        service._blob_service = blob_service
+        pipeline_config = PipelineConfig(
+            sources={"main": MagicMock(spec=SourceProtocol)},
+            transforms=[],
+            sinks={"primary": MagicMock(spec=SinkProtocol)},
+            config={"changed": True},
+        )
+
+        with (
+            patch.object(service, "_approval_inputs_from_frozen", return_value=_governed_approval_inputs(service)),
+            patch.object(service, "_require_current_binding_generation"),
+            patch.object(service, "_settle_admission_refusal", new_callable=AsyncMock) as settle,
+            patch("elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository.observe", return_value=None),
+            patch("elspeth.web.execution.service.open_landscape_db"),
+            patch("elspeth.web.execution.service.FilesystemPayloadStore") as payload_store,
+            patch("elspeth.web.execution.service.read_retained_input", return_value=content),
+            patch("elspeth.web.execution.service.load_settings_from_config_dict", return_value=_mock_pipeline_settings()),
+            patch("elspeth.web.execution.service.build_validated_runtime_graph") as graph,
+            patch("elspeth.web.execution.service.assemble_and_validate_pipeline_config", return_value=pipeline_config),
+            patch("elspeth.web.execution.service.audit_safe_resolved_config", return_value={"changed": True}),
+        ):
+            graph.return_value = SimpleNamespace(plugin_bundle=_plugin_bundle_stub(), graph=_execution_graph_stub())
+            payload_store.return_value.store.return_value = entry["payload_ref"]
+            outcome = service._run_pipeline(
+                str(run_id),
+                _blob_rows_pipeline_yaml([entry]),
+                threading.Event(),
+                frozen,
+                "author",
+                session_operation_lease=_execute_lease(),
+                durable_admission=True,
+                restored_envelope=cast(Any, envelope),
+            )
+
+        assert outcome is None
+        assert mock_session_service.assess_run_start_admission.await_count == 2
+        settle.assert_awaited_once()
+        payload_store.return_value.store.assert_not_called()
+
+    def test_inline_content_is_compiled_from_verified_bytes(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
+        del mock_session_service
+        content = b"Verified user prompt"
+        blob_id = uuid4()
+        session_id = uuid4()
+        digest = hashlib.sha256(content).hexdigest()
+        service.set_openrouter_catalog_snapshot(sha256="b" * 64, source="bundled")
+        blob_service = create_autospec(BlobServiceProtocol, instance=True)
+        blob_service.get_blob.return_value = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=session_id,
+            content_hash=digest,
+            size_bytes=len(content),
+            mime_type="text/plain",
+            status="ready",
+            creation_modality=CreationModality.VERBATIM,
+        )
+        blob_service.read_blob_content.return_value = content
+        service._blob_service = blob_service
+        marker = {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": digest}
+        config = {
+            "source": {"plugin": "csv", "options": {}},
+            "transforms": [{"name": "classify", "plugin": "llm", "options": {"prompt_template": marker}}],
+        }
+        snapshot = service._plugin_snapshot_for_user("author", operation="approval test")
+        frozen = FrozenRunSettings(plugin_snapshot=snapshot, executable_config=config, audit_safe_config=config)
+        loaded: list[dict[str, Any]] = []
+
+        def load(config_dict: dict[str, Any], *, expand_env_vars: bool) -> _ModelCopyNamespace:
+            assert expand_env_vars is False
+            loaded.append(config_dict)
+            return _mock_pipeline_settings()
+
+        with (
+            patch("elspeth.web.execution.service.load_settings_from_config_dict", side_effect=load),
+            patch("elspeth.web.operator_telemetry.apply_operator_pipeline_telemetry", side_effect=lambda settings, _web: settings),
+            patch(
+                "elspeth.web.execution.export_marking.apply_operator_export_marking",
+                return_value=_mock_pipeline_settings().landscape.export,
+            ),
+            patch("elspeth.web.execution.service.audit_safe_resolved_config", side_effect=lambda *_args, **_kwargs: loaded[-1]),
+            patch("elspeth.web.execution.service.runtime_val_manifest_sha256", return_value="c" * 64),
+        ):
+            inputs = service._approval_inputs_from_frozen(
+                frozen,
+                user_id="author",
+                session_id=session_id,
+                session_operation_context=_execute_lease().context,
+            )
+
+        assert loaded[0]["transforms"][0]["options"]["prompt_template"] == content.decode()
+        assert inputs.config_hash == stable_hash(loaded[0])
+        blob_service.get_blob.assert_awaited_once()
+        blob_service.read_blob_content.assert_awaited_once()
+
+    def test_inline_content_hash_drift_refuses_approval_compilation(self, service: ExecutionServiceImpl) -> None:
+        content = b"Original user prompt"
+        blob_id = uuid4()
+        session_id = uuid4()
+        digest = hashlib.sha256(content).hexdigest()
+        service.set_openrouter_catalog_snapshot(sha256="b" * 64, source="bundled")
+        blob_service = create_autospec(BlobServiceProtocol, instance=True)
+        blob_service.get_blob.return_value = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=session_id,
+            content_hash=digest,
+            size_bytes=len(content),
+            mime_type="text/plain",
+            status="ready",
+            creation_modality=CreationModality.VERBATIM,
+        )
+        blob_service.read_blob_content.return_value = b"Changed user prompt"
+        service._blob_service = blob_service
+        config = {
+            "source": {"plugin": "csv", "options": {}},
+            "transforms": [
+                {
+                    "name": "classify",
+                    "plugin": "llm",
+                    "options": {"prompt_template": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": digest}},
+                }
+            ],
+        }
+        snapshot = service._plugin_snapshot_for_user("author", operation="approval test")
+        frozen = FrozenRunSettings(plugin_snapshot=snapshot, executable_config=config, audit_safe_config=config)
+        with pytest.raises(BlobIntegrityError):
+            service._approval_inputs_from_frozen(
+                frozen,
+                user_id="author",
+                session_id=session_id,
+                session_operation_context=_execute_lease().context,
+            )
+
+    @pytest.mark.asyncio
+    async def test_missing_approval_refuses_before_run_creation(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, tmp_path: Path
+    ) -> None:
+        service._settings.workflow_governance = "on"
+        service._settings.data_dir = tmp_path
+        source = tmp_path / "input.csv"
+        source.write_bytes(b"name\nAda\n")
+        cast(_YamlGeneratorStub, service._yaml_generator).result = json.dumps(
+            {"source": {"plugin": "csv", "options": {"path": str(source)}}}
+        )
+        approval = _governed_approval_inputs(service)
+        mock_session_service.check_approval_binding.return_value = AdmissionRefusalReason.APPROVAL_REQUIRED
+
+        with (
+            patch.object(service, "_approval_inputs_from_frozen", return_value=approval),
+            pytest.raises(ExecutionApprovalRequired) as exc_info,
+        ):
+            await _execute(service, session_id=uuid4(), user_id="author")
+
+        assert exc_info.value.reason is AdmissionRefusalReason.APPROVAL_REQUIRED
+        assert exc_info.value.binding == approval.binding
+        mock_session_service.check_approval_binding.assert_awaited_once()
+        mock_session_service.create_run.assert_not_awaited()
+        assert not (tmp_path / "retained-run-inputs").exists()
+
+    @pytest.mark.asyncio
+    async def test_approval_rechecked_after_retaining_source_bytes(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, tmp_path: Path
+    ) -> None:
+        service._settings.workflow_governance = "on"
+        service._settings.data_dir = tmp_path
+        source = tmp_path / "input.csv"
+        source.write_bytes(b"name\nAda\n")
+        cast(_YamlGeneratorStub, service._yaml_generator).result = json.dumps(
+            {"source": {"plugin": "csv", "options": {"path": str(source)}}}
+        )
+        approval = _governed_approval_inputs(service)
+        mock_session_service.check_approval_binding.side_effect = [
+            None,
+            AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH,
+        ]
+
+        with (
+            patch.object(service, "_approval_inputs_from_frozen", return_value=approval),
+            pytest.raises(ExecutionApprovalRequired) as exc_info,
+        ):
+            await _execute(service, session_id=uuid4(), user_id="author")
+
+        assert exc_info.value.reason is AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH
+        assert mock_session_service.check_approval_binding.await_count == 2
+        assert (tmp_path / "retained-run-inputs").is_dir()
+        mock_session_service.create_run.assert_not_awaited()
+
+    def test_worker_rechecks_approval_before_permit_issue(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
+        service._settings.workflow_governance = "on"
+        approval = _governed_approval_inputs(service)
+        snapshot = service._plugin_snapshot_for_user("author", operation="approval test")
+        frozen = FrozenRunSettings(
+            plugin_snapshot=snapshot,
+            executable_config={"source": {"plugin": "csv", "options": {}}},
+            audit_safe_config={"source": {"plugin": "csv", "options": {}}},
+        )
+        mock_session_service.assess_run_start_admission.return_value = SimpleNamespace(
+            state=StartPermitState.REFUSED, execution_refusal=None
+        )
+        mock_session_service.assess_run_start_admission.side_effect = None
+        with (
+            patch.object(service, "_approval_inputs_from_frozen", return_value=approval),
+            patch.object(service, "_settle_admission_refusal", new_callable=AsyncMock) as settle,
+        ):
+            outcome = service._run_pipeline(
+                str(uuid4()),
+                _TEST_PIPELINE_YAML,
+                threading.Event(),
+                frozen,
+                "author",
+                session_operation_lease=_execute_lease(),
+                durable_admission=True,
+            )
+        assert outcome is None
+        assert mock_session_service.assess_run_start_admission.await_args.kwargs["approval"] is approval
+        mock_session_service.issue_run_start_permit.assert_not_awaited()
+        settle.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_off_mode_keeps_existing_run_start_calls(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
+        service._settings.workflow_governance = "off"
+        with patch.object(service, "_run_pipeline"):
+            await _execute(service, session_id=uuid4(), user_id="author")
+        mock_session_service.check_approval_binding.assert_not_awaited()
+        mock_session_service.create_run.assert_awaited_once()
 
 
 # ── Cancel Mechanism ───────────────────────────────────────────────────

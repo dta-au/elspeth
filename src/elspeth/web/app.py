@@ -64,6 +64,7 @@ from elspeth.web.auth.identity_admin_routes import create_identity_admin_router
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.protocol import AuthProvider
+from elspeth.web.auth.quota_routes import create_quota_router
 from elspeth.web.auth.routes import create_auth_router
 from elspeth.web.auth.session_token import (
     DEFAULT_MAX_REFRESH_CHAIN_HOURS,
@@ -81,6 +82,7 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
+from elspeth.web.coordination.approval_authority import ApprovalTransactionAuthority
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry, SessionComposerProgressAuthority
@@ -92,6 +94,7 @@ from elspeth.web.coordination.identity_authority import (
     RepositoryIdentityAuthority,
     local_identity_retirer,
 )
+from elspeth.web.coordination.library_authority import RepositoryLibraryAuthority
 from elspeth.web.coordination.membership_authority import (
     RepositoryWebInstanceMembershipAuthority,
     web_instance_identity_from_settings,
@@ -101,10 +104,13 @@ from elspeth.web.coordination.membership_lifecycle import (
     SingleProcessWebInstanceMembership,
     WebInstanceMembership,
 )
+from elspeth.web.coordination.quota_policy_authority import RepositoryQuotaPolicyAuthority
 from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAuthority
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+from elspeth.web.coordination.review_authority import RepositoryReviewAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
+from elspeth.web.coordination.workflow_scope_reader import RepositoryWorkflowScopeReader
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.deployment_profiles import deployment_startup_profile, read_platform_identity, resolve_instance_id
@@ -157,6 +163,13 @@ from elspeth.web.sessions.protocol import (
     StaleComposeStateError,
 )
 from elspeth.web.sessions.routes import create_session_router
+from elspeth.web.sessions.routes.composer.state import seed_state_from_runtime_yaml
+from elspeth.web.sessions.routes.workflow.approvals import create_approvals_router
+from elspeth.web.sessions.routes.workflow.audit_view import create_workflow_audit_view_router
+from elspeth.web.sessions.routes.workflow.inspect import create_workflow_inspect_router
+from elspeth.web.sessions.routes.workflow.library import create_library_router
+from elspeth.web.sessions.routes.workflow.mailbox import create_mailbox_router
+from elspeth.web.sessions.routes.workflow.reviews import create_reviews_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority
@@ -638,6 +651,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         payload_store_path = settings.get_payload_store_path()
     payload_store = FilesystemPayloadStore(payload_store_path)
     app.state.payload_store = payload_store
+    app.state.library_authority = RepositoryLibraryAuthority(app.state.session_engine, payload_store=payload_store)
     # ``shareable_link_signing_key`` is a ``SecretBytes`` (DC-2 FIX-L —
     # masks repr to prevent plaintext leakage in tracebacks/logs).
     # ``.get_secret_value()`` returns the raw bytes the HMAC primitive needs.
@@ -1520,6 +1534,11 @@ def _create_app(
     # on app.state for the identity routes.
     identity_authority = RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
     app.state.identity_authority = identity_authority
+    app.state.quota_policy_authority = RepositoryQuotaPolicyAuthority(session_engine)
+    app.state.approval_authority = ApprovalTransactionAuthority(session_engine)
+    app.state.review_authority = RepositoryReviewAuthority(session_engine)
+    app.state.workflow_scope_reader = RepositoryWorkflowScopeReader(session_engine)
+    app.state.library_state_seeder = seed_state_from_runtime_yaml
 
     def recovery_principal_is_active(identity_id: str) -> bool:
         record = identity_authority.read_identity(identity_id=identity_id)
@@ -1577,9 +1596,17 @@ def _create_app(
 
     session_operation_authority: SessionOperationAuthority
     if session_engine.dialect.name == "sqlite":
-        session_operation_authority = SQLiteLocalSessionOperationAuthority(session_engine)
+        session_operation_authority = SQLiteLocalSessionOperationAuthority(
+            session_engine,
+            quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+            approval_supersession_recorder=audit_recorder.record_approval_superseded,
+        )
     elif session_engine.dialect.name == "postgresql":
-        session_operation_authority = PostgresSessionOperationRepository(session_engine)
+        session_operation_authority = PostgresSessionOperationRepository(
+            session_engine,
+            quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+            approval_supersession_recorder=audit_recorder.record_approval_superseded,
+        )
     else:
         raise NotImplementedError(f"Session operation authority is not implemented for dialect {session_engine.dialect.name}")
     audit_access_log_authority = RepositoryAuditAccessLogAuthority(session_engine)
@@ -1595,6 +1622,7 @@ def _create_app(
         settings.data_dir,
         settings.max_blob_storage_per_session_bytes,
         session_operation_authority=session_operation_authority,
+        quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
     )
 
     # --- Secret service ---
@@ -1656,6 +1684,7 @@ def _create_app(
         chargeable_admission_policy=ChargeableAdmissionPolicy(
             identity_token_quota_configured=settings.quota_default_tokens_per_day is not None,
             container_token_quota_configured=settings.quota_container_tokens_per_day is not None,
+            workflow_governance_on=settings.workflow_governance == "on",
             secret_wiring_hash=runtime_secret_wiring_policy(settings.secret_wiring_allowlist).canonical_hash,
         ),
         data_dir=settings.data_dir,
@@ -1674,6 +1703,7 @@ def _create_app(
         # R14 refusals write their Landscape quota_exceeded row through the one
         # auth audit engine this app owns (Task I1).
         quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+        approval_supersession_recorder=audit_recorder.record_approval_superseded,
     )
     app.state.session_service = session_service
 
@@ -1783,6 +1813,13 @@ def _create_app(
     app.include_router(create_auth_router())
     app.include_router(create_dev_admin_router())
     app.include_router(create_identity_admin_router())
+    app.include_router(create_quota_router())
+    app.include_router(create_approvals_router())
+    app.include_router(create_workflow_inspect_router())
+    app.include_router(create_workflow_audit_view_router())
+    app.include_router(create_reviews_router())
+    app.include_router(create_library_router())
+    app.include_router(create_mailbox_router())
     app.include_router(create_session_router())
     app.include_router(create_preferences_router())
     app.include_router(create_tutorial_run_router())

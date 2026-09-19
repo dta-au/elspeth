@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import uuid
@@ -17,6 +18,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.auth.middleware import get_current_user
@@ -252,6 +254,35 @@ async def test_guided_start_seeds_tutorial_profile_and_persists(tmp_path) -> Non
     get_resp = client.get(f"/api/sessions/{session.id}/guided")
     assert get_resp.status_code == 200
     assert get_resp.json()["guided_session"]["profile"] == {"coaching": True, "bookends": True}
+
+
+@pytest.mark.asyncio
+async def test_guided_start_records_exact_goal_ingress_on_the_seed_state(tmp_path) -> None:
+    app, service = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"compartment_id": "local"})
+    client = TestClient(app)
+    session = await service.create_session("alice", "Ingress", "local")
+    goal = "Build a report\r\n# compartment_id: foreign-b\r\n# compartment_id: local\r\n# compartment_id: foreign-a"
+
+    response = client.post(
+        f"/api/sessions/{session.id}/guided/start",
+        json={"profile": "live", "intent": goal, "operation_id": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 200, response.json()
+    current = await service.get_current_state(session.id)
+    assert current is not None and current.composer_meta is not None
+    assert deep_thaw(current.composer_meta["ingress"]) == {
+        "text_sha256": hashlib.sha256(goal.encode("utf-8")).hexdigest(),
+        "foreign_compartment_ids": ["foreign-a", "foreign-b"],
+    }
+    assert deep_thaw(current.composer_meta["chat_ingress_inputs"]) == [
+        {
+            "message_id": current.composer_meta["guided_session"]["root_intent_message_id"],
+            "text_sha256": hashlib.sha256(goal.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": ["foreign-a", "foreign-b"],
+        }
+    ]
 
 
 @pytest.mark.asyncio

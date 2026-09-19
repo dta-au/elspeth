@@ -8,6 +8,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import ComposerRuntimePreflightError
 from elspeth.web.composer.required_controls import (
     merge_required_control_affected_components,
@@ -47,11 +48,13 @@ from .._helpers import (
     deep_thaw,
     execute_tool,
     get_current_user,
+    merge_composer_meta_updates,
     run_sync_in_worker,
     slog,
 )
 from .pipeline_settlement import (
     _await_with_deferred_cancellation,
+    _proposal_chat_ingress_inputs,
     _proposal_user_message_content,
     settle_pipeline_proposal_under_compose_lock,
 )
@@ -376,6 +379,20 @@ async def accept_composition_proposal(
             current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state()
             arguments = cast(dict[str, Any], deep_thaw(proposal.arguments_json))
             user_message_content = await _proposal_user_message_content(service, proposal)
+            chat_ingress_inputs = await _proposal_chat_ingress_inputs(
+                service, proposal, own_compartment_id=request.app.state.settings.compartment_id
+            )
+            proposal_composer_meta = merge_composer_meta_updates(
+                current_record.composer_meta if current_record is not None else None,
+                {
+                    "ingress": compartment_ingress_record(
+                        user_message_content, own_compartment_id=request.app.state.settings.compartment_id
+                    ),
+                    "chat_ingress_inputs": chat_ingress_inputs,
+                }
+                if user_message_content is not None
+                else {},
+            )
             _ensure_inline_blob_proposal_context(
                 proposal,
                 arguments,
@@ -404,6 +421,7 @@ async def accept_composition_proposal(
                             preflight_exception_policy="raise",
                             initial_version=current_state.version,
                             telemetry_source="compose",
+                            composer_meta=proposal_composer_meta,
                         ),
                         proposal=proposal,
                     )
@@ -590,6 +608,7 @@ async def accept_composition_proposal(
                             preflight_exception_policy="raise",
                             initial_version=current_state.version,
                             telemetry_source="compose",
+                            composer_meta=proposal_composer_meta,
                         ),
                         proposal=proposal,
                     )
@@ -609,6 +628,7 @@ async def accept_composition_proposal(
                         preflight_exception_policy="raise",
                         initial_version=current_state.version,
                         telemetry_source="compose",
+                        composer_meta=proposal_composer_meta,
                     ),
                     proposal=proposal,
                 )

@@ -1,5 +1,10 @@
 ### Task I0: One schema pass: token ledger nullability
 
+> **Current execution note (2026-09-19):** This schema outcome already exists
+> in Sessions epoch 59; the old 56-to-57 patch and Landscape 40 assumption
+> below must not be applied. See the
+> [current execution map](../2026-09-19-identity-workflow-finalization.md).
+
 > Part of the [Kubernetes and Identity Workflow master plan](2026-09-13-kubernetes-and-identity-master-plan.md). Read its [Global Constraints](2026-09-13-kubernetes-and-identity-master-plan.md#global-constraints) first: they apply to every task. Runs after: nothing (a workstream start). Runs before: I8. Full ordering: [Workstream layout and ordering](2026-09-13-kubernetes-and-identity-master-plan.md#workstream-layout-and-ordering). Open operator decisions: [Self-review notes](2026-09-13-kubernetes-and-identity-master-plan.md#self-review-notes).
 
 Everything the identity workflow sprint needs in the sessions schema already

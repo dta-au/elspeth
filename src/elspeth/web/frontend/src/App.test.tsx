@@ -14,6 +14,7 @@ import { resetStore } from "@/test/store-helpers";
 import { useSessionStore } from "./stores/sessionStore";
 import { useExecutionStore } from "./stores/executionStore";
 import { useAuthStore } from "./stores/authStore";
+import { useMailboxStore } from "./stores/mailboxStore";
 import { usePreferencesStore } from "./stores/preferencesStore";
 import {
   OPEN_GRAPH_MODAL_EVENT,
@@ -338,6 +339,7 @@ describe("App banner roles", () => {
         dev_admin: false,
       } as never,
     } as never);
+    useMailboxStore.getState().reset();
     localStorage.clear();
     window.history.replaceState(null, "", "/");
     // Restore the default (backend up, composer available) after any
@@ -356,6 +358,28 @@ describe("App banner roles", () => {
     workspaceMountSpy.mockClear();
     workspaceCapabilitiesSpy.mockClear();
     artifactWorkspacePropsSpy.mockClear();
+  });
+
+  it("mounts mailbox and live-role identity administration from the account menu", async () => {
+    useMailboxStore.setState({ summary: {
+      governance: "on", roles: ["admin"], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0,
+    } });
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(screen.getByRole("button", { name: "Mailbox" }));
+    expect(screen.getByRole("dialog", { name: "Mailbox" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Close mailbox" }));
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(screen.getByRole("button", { name: "Shared library" }));
+    expect(screen.getByRole("dialog", { name: "Shared library" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Close shared library" }));
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(screen.getByRole("button", { name: "Identity administration" }));
+    expect(screen.getByRole("dialog", { name: "Identity administration" })).toBeInTheDocument();
+    act(() => useMailboxStore.setState({ summary: {
+      governance: "on", roles: [], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0,
+    } }));
+    expect(screen.queryByRole("dialog", { name: "Identity administration" })).not.toBeInTheDocument();
   });
 
   it("uses role=alert for the backend-unavailable banner (hard outage)", async () => {

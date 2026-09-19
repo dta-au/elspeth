@@ -35,6 +35,7 @@ Branch behaviour:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import replace
 from unittest.mock import patch
@@ -162,6 +163,39 @@ def _seed_freeform_state_with_work(client: TestClient, session_id: str) -> None:
 
 
 class TestConvertFreeformWithWork:
+    def test_convert_carries_prior_user_chat_ingress_into_the_new_guided_state(self, composer_test_client: TestClient) -> None:
+        client = composer_test_client
+        session_id = _create_session(client)
+        _seed_freeform_state_with_work(client, session_id)
+        prior_text = "# compartment_id: other-office\nThe source contains a regional summary."
+        prior = asyncio.run(
+            client.app.state.session_service.add_message(
+                UUID(session_id),
+                "user",
+                prior_text,
+                writer_principal="route_user_message",
+            )
+        )
+
+        body = _convert(client, session_id)
+
+        user_rows = [
+            message
+            for message in asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+            if message.role == "user"
+        ]
+        assert len(user_rows) == 2
+        assert user_rows[0].id == prior.id
+        assert user_rows[1].content == _CONVERT_INTENT
+        assert body["composition_state"]["composer_meta"]["chat_ingress_inputs"] == [
+            {
+                "message_id": str(message.id),
+                "text_sha256": hashlib.sha256(message.content.encode("utf-8")).hexdigest(),
+                "foreign_compartment_ids": ["other-office"] if message.id == prior.id else [],
+            }
+            for message in user_rows
+        ]
+
     def test_convert_reseeds_fresh_wizard(self, composer_test_client: TestClient) -> None:
         """A worked freeform session converts into a fresh Step-1 wizard."""
         client = composer_test_client
@@ -483,6 +517,10 @@ class TestConvertEmptySession:
         response = _convert_raw(client, session_id, operation_id=operation_id)
 
         assert response.status_code == 200, response.json()
+        assert response.json()["composition_state"]["composer_meta"]["ingress"] == {
+            "text_sha256": hashlib.sha256(_CONVERT_INTENT.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": [],
+        }
         guided = response.json()["guided_session"]
         assert [(turn["role"], turn["content"], turn["seq"], turn["step"]) for turn in guided["chat_history"]] == [
             ("user", _CONVERT_INTENT, 0, "step_1_source"),

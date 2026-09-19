@@ -29,6 +29,7 @@ local paths after ownership checks pass.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -804,6 +805,16 @@ def public_export_redaction(state: CompositionState) -> PublicExportRedaction:
     return {"sources": sources, "outputs": outputs}
 
 
+def sources_reading_uploaded_blobs(state: CompositionState) -> tuple[str, ...]:
+    """Name sources with live upload bindings in the same state used for export."""
+    export_state = reattach_guided_blob_refs_for_public_export(state)
+    return tuple(
+        source_name
+        for source_name, source in export_state.sources.items()
+        if any(key in source.options and source.options[key] is not None for key in _PUBLIC_SOURCE_LINKAGE_KEYS)
+    )
+
+
 # The marker prose uses category labels, not raw option-key names: the
 # custody-egress guards over sibling consumers assert that the literal key
 # tokens never appear anywhere in a serialised public artifact, and an
@@ -874,3 +885,8 @@ def generate_public_yaml(state: CompositionState) -> str:
     """
     doc = generate_public_pipeline_dict(state)
     return yaml.dump(doc, default_flow_style=False, sort_keys=False)
+
+
+def public_projection_digest(state: CompositionState) -> str:
+    """Return the content address of the exact UTF-8 public YAML projection."""
+    return hashlib.sha256(generate_public_yaml(state).encode("utf-8")).hexdigest()

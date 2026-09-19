@@ -35,6 +35,8 @@ from elspeth.web.blobs.protocol import (
     BlobQuotaExceededError,
     BlobRecord,
     BlobStateError,
+    IdentityStorageQuotaExceededError,
+    StorageAccountingUnavailableError,
     StorageMimeType,
 )
 from elspeth.web.blobs.schemas import BlobMetadataResponse, CreateInlineBlobRequest
@@ -251,6 +253,20 @@ def create_blobs_router() -> APIRouter:
                     source_description="uploaded",
                     session_operation_context=lease.context,
                 )
+            except IdentityStorageQuotaExceededError as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "error_type": "storage_quota_exceeded",
+                        "detail": str(exc),
+                        "dimension": "storage",
+                        "cap": exc.cap,
+                        "ceiling": exc.ceiling,
+                        "usage": exc.usage,
+                    },
+                ) from None
+            except StorageAccountingUnavailableError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from None
             except BlobQuotaExceededError as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from None
             return _blob_response(record)
@@ -314,6 +330,20 @@ def create_blobs_router() -> APIRouter:
                     source_description="created inline",
                     session_operation_context=lease.context,
                 )
+            except IdentityStorageQuotaExceededError as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "error_type": "storage_quota_exceeded",
+                        "detail": str(exc),
+                        "dimension": "storage",
+                        "cap": exc.cap,
+                        "ceiling": exc.ceiling,
+                        "usage": exc.usage,
+                    },
+                ) from None
+            except StorageAccountingUnavailableError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from None
             except BlobQuotaExceededError as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from None
             return _blob_response(record)

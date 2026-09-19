@@ -215,6 +215,7 @@ class _ControllableExecutor:
 
 class _ExecutionSettings:
     auth_provider = "local"
+    workflow_governance = "off"
     data_dir = Path("/tmp/execution-lease-gate")
     landscape_passphrase = None
     # Deny-by-default secret wiring (WebSettings.secret_wiring_allowlist): the
@@ -667,13 +668,14 @@ async def test_submitted_worker_retains_exact_lease_until_every_terminal_outcome
     elif worker_outcome != "already_done":
         executor.future.set_result(None)
 
-    await asyncio.wait_for(asyncio.to_thread(authority.release_called.wait, 2), timeout=2)
+    await asyncio.wait_for(run_sync_in_worker(authority.release_called.wait, 2), timeout=2)
     for _ in range(100):
         if lease.closed:
             break
         await asyncio.sleep(0.01)
     assert lease.closed
     assert authority.release_calls == [lease.context]
+    await asyncio.wait_for(service.shutdown(), timeout=2)
 
 
 @pytest.mark.asyncio
@@ -736,9 +738,9 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
     authority.renew_called.clear()
     authority.renew_error = loss
 
-    await asyncio.wait_for(asyncio.to_thread(authority.renew_called.wait, 2), timeout=2)
+    await asyncio.wait_for(run_sync_in_worker(authority.renew_called.wait, 2), timeout=2)
     assert authority.renew_called.is_set()
-    await asyncio.wait_for(asyncio.to_thread(worker_shutdown_event.wait, 2), timeout=2)
+    await asyncio.wait_for(run_sync_in_worker(worker_shutdown_event.wait, 2), timeout=2)
     assert executor.future.running() or not executor.future.done()
     assert authority.release_calls == [], "renewal loss signals cancellation but completion still owns the lease"
     await asyncio.sleep(0.02)
@@ -757,6 +759,9 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
         await asyncio.sleep(0.01)
     assert lease.closed
     assert authority.release_calls == [], "a proven-lost lease closes without releasing a successor's authority"
+    with pytest.raises(ExceptionGroup) as cleanup_failure:
+        await asyncio.wait_for(service.shutdown(), timeout=2)
+    assert cleanup_failure.value.exceptions == (loss,)
 
 
 @pytest.mark.asyncio
@@ -1305,6 +1310,27 @@ def _is_exact_worker_delegation_edge(call: ast.Call, callback: ast.AST) -> bool:
     )
 
 
+def _is_exact_approval_binding_worker_edge(call: ast.Call, callback: ast.AST) -> bool:
+    """The pre-create approval compiler runs on a worker with the transferred context."""
+    expected_keywords = {"user_id", "session_id", "session_operation_context"}
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "run_sync_in_worker"
+        and len(call.args) == 2
+        and call.args[0] is callback
+        and isinstance(call.args[1], ast.Name)
+        and call.args[1].id == "frozen_run_settings"
+        and isinstance(callback, ast.Attribute)
+        and isinstance(callback.value, ast.Name)
+        and callback.value.id == "self"
+        and callback.attr == "_approval_inputs_from_frozen"
+        and len(call.keywords) == len(expected_keywords)
+        and set(keywords) == expected_keywords
+        and all(isinstance(value, ast.Name) and value.id == name for name, value in keywords.items())
+    )
+
+
 def _unique_local_callable(function: _FunctionNode, name: str, enclosing: dict[int, _FunctionNode]) -> _FunctionNode | None:
     scope: _FunctionNode | None = function
     while scope is not None:
@@ -1636,7 +1662,7 @@ class _ExecutionReachability:
 
     reachable: tuple[_FunctionNode, ...]
     admitted_callback_edges: frozenset[int]
-    """``id()`` of every ``ast.Name`` load admitted as a callback-delegation edge (not a direct call)."""
+    """IDs of exact local or owned method callbacks admitted for inspection."""
 
 
 def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
@@ -1721,6 +1747,11 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
                 for edge in call.args
                 if exact_worker_bound and isinstance(edge, ast.Name) and _is_exact_worker_delegation_edge(call, edge)
             )
+            if function.name == "_execute_locked" and exact_worker_bound:
+                for edge in call.args:
+                    if isinstance(edge, ast.Attribute) and _is_exact_approval_binding_worker_edge(call, edge):
+                        pending.append(members[edge.attr])
+                        admitted.add(id(edge))
             thread_edges = [edge for edge in call.args if _is_exact_asyncio_thread_edge(call, edge, function, enclosing, parent)]
             for edge in thread_edges:
                 assert isinstance(edge, ast.Name)
@@ -2523,6 +2554,48 @@ def _worker_delegation_case(
 )
 def test_worker_delegation_edge_admits_only_the_sole_local_callable(case_id: str, case: _EdgeControlCase) -> None:
     _assert_edge_control(case)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["none", "other_worker", "rebound_worker", "other_helper", "missing_context", "wrong_context", "extra_argument"],
+)
+def test_approval_binding_worker_edge_admits_only_exact_transferred_context(mutation: str) -> None:
+    owner = _class_node(ExecutionServiceImpl)
+    locked = next(member for member in owner.body if isinstance(member, ast.AsyncFunctionDef) and member.name == "_execute_locked")
+    handoffs = [
+        call
+        for call in ast.walk(locked)
+        if isinstance(call, ast.Call)
+        and call.args
+        and isinstance(call.args[0], ast.Attribute)
+        and call.args[0].attr == "_approval_inputs_from_frozen"
+    ]
+    assert len(handoffs) == 2
+    target = handoffs[0]
+    if mutation == "other_worker":
+        target.func = ast.Name(id="run_in_thread", ctx=ast.Load())
+    elif mutation == "rebound_worker":
+        locked.body.insert(0, ast.parse("run_sync_in_worker = self._runner").body[0])
+    elif mutation == "other_helper":
+        callback = target.args[0]
+        assert isinstance(callback, ast.Attribute)
+        callback.attr = "_plugin_snapshot_for_user"
+    elif mutation == "missing_context":
+        target.keywords = [keyword for keyword in target.keywords if keyword.arg != "session_operation_context"]
+    elif mutation == "wrong_context":
+        context = next(keyword for keyword in target.keywords if keyword.arg == "session_operation_context")
+        context.value = ast.Name(id="other_context", ctx=ast.Load())
+    elif mutation == "extra_argument":
+        target.args.append(ast.Name(id="unreviewed_argument", ctx=ast.Load()))
+
+    findings = _execution_effect_findings(owner)
+    if mutation == "none":
+        assert findings.escaped_class_helpers == ()
+        assert findings.context_offenders == ()
+    else:
+        escaped = "_plugin_snapshot_for_user" if mutation == "other_helper" else "_approval_inputs_from_frozen"
+        assert escaped in findings.escaped_class_helpers
 
 
 @pytest.mark.parametrize(

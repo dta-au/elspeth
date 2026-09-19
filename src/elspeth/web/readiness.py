@@ -312,6 +312,25 @@ def _check_blob_dir(settings: WebSettings) -> _ProbeResult:
     return _validate_directory("blob_dir", path)
 
 
+def _workflow_governance_refusal(settings: WebSettings, provider: str) -> str | None:
+    """Name unsafe governance settings without weakening enforcement."""
+    if settings.workflow_governance != "on":
+        return None
+    if provider == "local" and settings.registration_mode == "open":
+        return (
+            "workflow_governance=on is refused with auth_provider=local and registration_mode=open (R11): "
+            "one person can hold many local identities, so every author-is-not-approver rule is defeatable; "
+            "set registration_mode=closed or email_verified, or set workflow_governance=off"
+        )
+    if not configured_auth_settings(settings)["compartment_id"]:
+        return "workflow_governance=on requires compartment_id: library rows and audit metadata carry the compartment marking"
+    return None
+
+
+def _governance_suffix(settings: WebSettings) -> str:
+    return "; workflow governance on" if settings.workflow_governance == "on" else ""
+
+
 def _check_auth_mode(settings: WebSettings) -> ReadinessCheck:
     """Report whether the ACTIVE profile has everything it needs.
 
@@ -330,7 +349,10 @@ def _check_auth_mode(settings: WebSettings) -> ReadinessCheck:
     # statically; readiness is a total boundary if state is corrupted/mocked.
     provider = str(settings.auth_provider)
     if provider == "local":
-        return ReadinessCheck("auth_mode", True, "local authentication configured")
+        refusal = _workflow_governance_refusal(settings, provider)
+        if refusal is not None:
+            return ReadinessCheck("auth_mode", False, refusal)
+        return ReadinessCheck("auth_mode", True, f"local authentication configured{_governance_suffix(settings)}")
     if provider not in PROFILE_REGISTRY:
         return ReadinessCheck(
             "auth_mode",
@@ -342,7 +364,10 @@ def _check_auth_mode(settings: WebSettings) -> ReadinessCheck:
     missing = [name for name in profile.required_settings if not configured[name]]
     if missing:
         return ReadinessCheck("auth_mode", False, f"{provider} configuration incomplete: missing {', '.join(missing)}")
-    return ReadinessCheck("auth_mode", True, f"{provider} authentication configured")
+    refusal = _workflow_governance_refusal(settings, provider)
+    if refusal is not None:
+        return ReadinessCheck("auth_mode", False, refusal)
+    return ReadinessCheck("auth_mode", True, f"{provider} authentication configured{_governance_suffix(settings)}")
 
 
 def _finalize(checks: tuple[ReadinessCheck, ...]) -> ReadinessReport:

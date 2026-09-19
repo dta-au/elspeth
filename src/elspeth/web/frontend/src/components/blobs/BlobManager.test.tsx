@@ -6,6 +6,8 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { BlobManager } from "./BlobManager";
 import type { BlobMetadata } from "@/types/api";
 
+vi.mock("@/api/workflow", () => ({ fetchMyQuota: vi.fn().mockReturnValue(new Promise(() => {})) }));
+
 function makeBlob(overrides: Partial<BlobMetadata> = {}): BlobMetadata {
   return {
     id: "blob-1",

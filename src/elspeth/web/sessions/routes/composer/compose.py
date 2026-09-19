@@ -4,6 +4,7 @@ import sys
 from dataclasses import replace as _replace_dataclass
 
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
 from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -34,6 +35,7 @@ from .._helpers import (
     WebRateLimiter,
     _BadRequestLLMError,
     _cancel_on_client_disconnect,
+    _chat_ingress_inputs,
     _composer_chat_history,
     _composer_conversation_messages,
     _composer_heartbeat_cancel_of,
@@ -144,6 +146,8 @@ async def recompose(
             )
 
         last_user_content = conversation_records[-1].content
+        chat_ingress = compartment_ingress_record(last_user_content, own_compartment_id=settings.compartment_id)
+        chat_ingress_inputs = _chat_ingress_inputs(records, own_compartment_id=settings.compartment_id)
         request_id = str(conversation_records[-1].id)
         progress_registry = _get_composer_progress_registry(request)
         progress_sink = await _composer_progress_sink(
@@ -223,6 +227,8 @@ async def recompose(
                     profile_registry=profile_registry,
                     catalog=request.app.state.catalog_service,
                     session_operation_context=compose_operation_lease.context,
+                    ingress=chat_ingress,
+                    chat_ingress_inputs=chat_ingress_inputs,
                 )
                 raise HTTPException(status_code=422, detail=response_body) from exc
             except LiteLLMAuthError as exc:
@@ -351,6 +357,8 @@ async def recompose(
                     profile_registry=profile_registry,
                     catalog=request.app.state.catalog_service,
                     session_operation_context=compose_operation_lease.context,
+                    ingress=chat_ingress,
+                    chat_ingress_inputs=chat_ingress_inputs,
                 )
                 await _publish_progress(
                     progress_sink,
@@ -399,6 +407,8 @@ async def recompose(
                     profile_registry=profile_registry,
                     catalog=request.app.state.catalog_service,
                     session_operation_context=compose_operation_lease.context,
+                    ingress=chat_ingress,
+                    chat_ingress_inputs=chat_ingress_inputs,
                 )
                 raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
             except PipelinePlannerError as exc:
@@ -513,7 +523,11 @@ async def recompose(
                     transition_consumed=True,
                 )
 
-            _post_compose_updates: dict[str, Any] = {"repair_turns_used": result.repair_turns_used}
+            _post_compose_updates: dict[str, Any] = {
+                "repair_turns_used": result.repair_turns_used,
+                "ingress": chat_ingress,
+                "chat_ingress_inputs": chat_ingress_inputs,
+            }
             if _post_compose_guided is not None:
                 _post_compose_updates["guided_session"] = _post_compose_guided.to_dict()
             _post_compose_meta = merge_composer_meta_updates(
@@ -623,6 +637,8 @@ async def recompose(
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
                         session_operation_context=compose_operation_lease.context,
+                        ingress=chat_ingress,
+                        chat_ingress_inputs=chat_ingress_inputs,
                     )
                     raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                 await _publish_progress(

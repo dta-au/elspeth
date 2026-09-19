@@ -106,23 +106,36 @@ class _MemoryContentStore:
 
 
 def _candidate(store: _MemoryContentStore) -> AuditExportSnapshotCandidate:
+    config = AuditExportDerivationConfig(
+        source_run_id="pg-export",
+        source_status="completed",
+        source_completed_at=COMPLETED_AT_TEXT,
+        export_format="json",
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
+        serialization_version="audit-export-v2",
+        chunking_algorithm_version="complete-frame-v1",
+        include_raw_error_rows=False,
+        per_chunk_record_limit=100,
+        per_chunk_byte_limit=1024,
+        signing_mode="unsigned",
+        signer_key_id="UNSIGNED",
+        signing_key=None,
+    )
     bundle = derive_audit_export_bundle(
-        [{"record_type": "run"}],
-        AuditExportDerivationConfig(
-            source_run_id="pg-export",
-            source_status="completed",
-            source_completed_at=COMPLETED_AT_TEXT,
-            export_format="json",
-            exporter_version="landscape-exporter-v2",
-            serialization_version="audit-export-v2",
-            chunking_algorithm_version="complete-frame-v1",
-            include_raw_error_rows=False,
-            per_chunk_record_limit=100,
-            per_chunk_byte_limit=1024,
-            signing_mode="unsigned",
-            signer_key_id="UNSIGNED",
-            signing_key=None,
-        ),
+        [
+            {"record_type": "audit_export_config", "public_config": config.public_snapshot_config()},
+            {
+                "record_type": "auth_event_coverage",
+                "policy": "omitted",
+                "selection_cutoff": None,
+                "selection_basis": None,
+                "selected_count": None,
+                "reason": "not_requested",
+            },
+            {"record_type": "run"},
+        ],
+        config,
     )
     for chunk in bundle.chunks:
         assert (
@@ -148,7 +161,7 @@ def _candidate(store: _MemoryContentStore) -> AuditExportSnapshotCandidate:
         source_completed_at=COMPLETED_AT,
         exported_at=COMPLETED_AT,
         registry_key_hash=bundle.registry_key_hash,
-        exporter_version="landscape-exporter-v2",
+        exporter_version=config.exporter_version,
         serialization_version="audit-export-v2",
         export_format=AuditExportFormat.JSON,
         signing_mode=AuditExportSigningMode.UNSIGNED,
@@ -158,7 +171,7 @@ def _candidate(store: _MemoryContentStore) -> AuditExportSnapshotCandidate:
         chunking_algorithm_version="complete-frame-v1",
         per_chunk_record_limit=100,
         per_chunk_byte_limit=1024,
-        record_count=1,
+        record_count=len(bundle.record_frames),
         total_bytes=sum(chunk.descriptor.size_bytes for chunk in bundle.chunks),
         chunk_count=1,
         terminal_chunk_ordinal=0,
@@ -268,6 +281,7 @@ def test_postgres_public_signed_export_uses_one_repeatable_read_snapshot(postgre
         postgres_db,
         signing_key=b"snapshot-signing-key",
         signer_key_id="snapshot-signer-v1",
+        compartment_id="research-a",
     ).export_run("pg-export", sign=True)
     first = next(records)
     assert first["record_type"] == "run"
@@ -287,6 +301,10 @@ def test_postgres_public_signed_export_uses_one_repeatable_read_snapshot(postgre
         )
 
     remaining = list(records)
+    assert (
+        next(record for record in remaining if record["record_type"] == "audit_export_config")["public_config"]["compartment_id"]
+        == "research-a"
+    )
     assert not [record for record in remaining if record["record_type"] == "secret_resolution"]
     with postgres_db.engine.connect() as connection:
         assert connection.scalar(select(runs_table.c.settings_json).where(runs_table.c.run_id == "pg-export")) == '{"version": 2}'

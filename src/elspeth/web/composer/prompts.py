@@ -22,7 +22,11 @@ from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.prompts import build_mode_transition_system_prompt
 from elspeth.web.composer.guided.state_machine import TerminalKind
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, build_schema_contract_evidence
-from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, ComposerHistoryMessage
+from elspeth.web.composer.protocol import (
+    COMPOSER_HISTORY_USER_AUTHORED_KEY,
+    COMPOSER_HISTORY_USER_MESSAGE_ID_KEY,
+    ComposerHistoryMessage,
+)
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.skills import load_deployment_skill, load_skill_with_hash
 from elspeth.web.composer.state import CompositionState
@@ -613,7 +617,11 @@ def build_messages(
     # 3. Chat history
     if chat_history:
         messages.extend(
-            {key: value for key, value in history_message.items() if key != COMPOSER_HISTORY_USER_AUTHORED_KEY}
+            {
+                key: value
+                for key, value in history_message.items()
+                if key not in {COMPOSER_HISTORY_USER_AUTHORED_KEY, COMPOSER_HISTORY_USER_MESSAGE_ID_KEY}
+            }
             for history_message in chat_history
         )
 

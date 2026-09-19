@@ -10,6 +10,8 @@ transaction it is about to commit: the actor must exist, be ``active``, and
 hold an unrevoked, unexpired, deployment-wide ``admin`` role at DATABASE time.
 That check is made per call and is never cached (spec §Routes), so revoking an
 administrator takes effect on their next request, not at their next login.
+The one delegated curator mutation instead re-proves a live human approver
+grant and a direct active approver edge inside its own transaction.
 
 Audit is the caller's.  This module never opens the Landscape; each mutation
 takes a required ``record`` callback and invokes it with the typed outcome
@@ -48,7 +50,7 @@ from enum import Enum
 from typing import Any, Final, Literal, TypedDict, cast, final, get_args
 
 from sqlalchemy import bindparam, delete, insert, or_, select, update
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Connection, Engine, Row
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.auth import (
@@ -146,6 +148,11 @@ class IdentityNotFound(IdentityAuthorityRefusal):
 @final
 class IdentityAlreadyExists(IdentityAuthorityRefusal):
     _MESSAGE = "an identity already exists for that provider and subject"
+
+
+@final
+class ServiceIdentityProvisioningUnavailable(IdentityAuthorityRefusal):
+    _MESSAGE = "service identities cannot be pre-provisioned through the human login path"
 
 
 @final
@@ -719,6 +726,7 @@ def _require_actor(actor: object) -> IdentityAdminActor:
 def _require_claims(claims: object) -> IdentityClaims:
     if type(claims) is not IdentityClaims:
         raise TypeError("claims must be an exact IdentityClaims")
+    claims.validate_provider()
     return claims
 
 
@@ -1034,6 +1042,11 @@ def _verified_actor(actor: IdentityAdminActor, actor_row: Any, actor_grants: Seq
     if actor_row is None or actor_row.access_state != "active":
         raise AdminAuthorityRequired()
     kind = _parsed_kind(actor_row.kind, identity_id=actor.identity_id)
+    if actor_row.provider == "service" and kind != "service":
+        # Refuse a legacy malformed row before it can act as a human admin.
+        raise AdminAuthorityRequired()
+    if kind == "service" and (actor.on_behalf_of is None or actor.console_request_id is None):
+        raise AdminAuthorityRequired()
     if kind != "service" and (actor.on_behalf_of is not None or actor.console_request_id is not None):
         raise AdminAuthorityRequired()
     if not _holds_deployment_admin(actor_grants):
@@ -2180,6 +2193,11 @@ class RepositoryIdentityAuthority:
         """
         actor = _require_actor(actor)
         _require_provider(provider)
+        # This path always mints a human who binds on first browser login.
+        # Service credentials are not implemented, so admitting the service
+        # provider here would create a service namespace row with human kind.
+        if provider == "service":
+            raise ServiceIdentityProvisioningUnavailable()
         _require_nonblank(subject, "subject")
         _require_optional_text(username, "username")
         _require_optional_text(organisation_id, "organisation_id")
@@ -2292,6 +2310,8 @@ class RepositoryIdentityAuthority:
             row = conn.execute(_IDENTITY_BY_ID_FOR_UPDATE, {"identity_id": identity_id}).one_or_none()
             if row is None:
                 raise IdentityNotFound()
+            if row.provider == "service" and row.kind != "service":
+                raise RoleForbiddenForIdentity()
             if row.access_state != "pending":
                 raise IdentityNotPending()
             kind = _parsed_kind(row.kind, identity_id=identity_id)
@@ -2436,6 +2456,8 @@ class RepositoryIdentityAuthority:
             row = conn.execute(_IDENTITY_BY_ID_FOR_UPDATE, {"identity_id": identity_id}).one_or_none()
             if row is None:
                 raise IdentityNotFound()
+            if row.provider == "service" and row.kind != "service":
+                raise RoleForbiddenForIdentity()
             if row.access_state != "disabled":
                 raise IdentityNotDisabled()
             if _parsed_optional_text(row.disable_reason, identity_id=identity_id, column="disable_reason") == REBOUND_DISABLE_REASON:
@@ -2595,6 +2617,8 @@ class RepositoryIdentityAuthority:
             row = conn.execute(_IDENTITY_BY_ID_FOR_UPDATE, {"identity_id": identity_id}).one_or_none()
             if row is None:
                 raise IdentityNotFound()
+            if row.provider == "service" and row.kind != "service":
+                raise RoleForbiddenForIdentity()
             if row.access_state != "active":
                 raise IdentityNotActive()
             if expires_at is not None and _ensure_utc(expires_at) <= now:
@@ -2641,6 +2665,120 @@ class RepositoryIdentityAuthority:
                     at=now,
                     on_behalf_of=actor.on_behalf_of,
                     console_request_id=actor.console_request_id,
+                )
+            )
+            return grant
+
+    def grant_curator_as_approver(
+        self,
+        *,
+        actor_identity_id: str,
+        identity_id: str,
+        expires_at: datetime | None,
+        note: str | None,
+        record: Callable[[RoleChanged], None],
+    ) -> RoleGrant:
+        """Appoint a curator through a live, direct approver relationship.
+
+        Lock the admin population, participants, relevant grants and edge before
+        reading the database clock. This keeps a revocation or expiry that wins
+        any lock wait from authorising the appointment.
+        """
+        _require_nonblank(actor_identity_id, "actor_identity_id")
+        _require_nonblank(identity_id, "identity_id")
+        _require_optional_text(note, "note")
+        _require_optional_datetime(expires_at, "expires_at")
+        participants = tuple(sorted({actor_identity_id, identity_id}))
+        with self._engine.begin() as conn:
+            admin_row_holder = False
+            for participant in participants:
+                for candidate in conn.execute(_ROLES_OF_IDENTITY, {"identity_id": participant}).all():
+                    if candidate.role == "admin" and candidate.scope is None:
+                        admin_row_holder = True
+            if admin_row_holder:
+                conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
+
+            identity_rows: dict[str, Row[Any] | None] = {}
+            for participant in participants:
+                identity_rows[participant] = conn.execute(_IDENTITY_BY_ID_FOR_UPDATE, {"identity_id": participant}).one_or_none()
+
+            target_role_rows: list[Any] = []
+            locked_approver_rows: list[Any] = []
+            locked_curator_rows: list[Any] = []
+            for participant in participants:
+                role_rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": participant}).all()
+                if participant == identity_id:
+                    target_role_rows = list(role_rows)
+                for candidate in role_rows:
+                    if candidate.scope is not None or candidate.revoked_at is not None:
+                        continue
+                    if participant == actor_identity_id and candidate.role == "approver":
+                        destination = locked_approver_rows
+                    elif participant == identity_id and candidate.role == "curator":
+                        destination = locked_curator_rows
+                    else:
+                        continue
+                    locked = conn.execute(_ROLE_BY_ID_FOR_UPDATE, {"role_id": candidate.role_id}).one_or_none()
+                    if locked is not None:
+                        destination.append(locked)
+
+            locked_edges: list[Any] = []
+            for candidate in conn.execute(_ACTIVE_INCIDENT_EDGES, {"identity_id": identity_id}).all():
+                if (candidate.from_identity_id, candidate.to_identity_id, candidate.relationship_type) != (
+                    actor_identity_id,
+                    identity_id,
+                    "approver",
+                ):
+                    continue
+                locked_edge = conn.execute(_RELATIONSHIP_BY_ID_FOR_UPDATE, {"relationship_id": candidate.relationship_id}).one_or_none()
+                if locked_edge is not None:
+                    locked_edges.append(locked_edge)
+
+            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            actor_row = identity_rows[actor_identity_id]
+            if actor_row is None or actor_row.access_state != "active" or actor_row.kind != "human" or actor_row.provider == "service":
+                raise AdminAuthorityRequired()
+            if actor_identity_id == identity_id:
+                raise AdminAuthorityRequired()
+            if not any(_is_active(grant.expires_at, grant.revoked_at, now) for grant in locked_approver_rows):
+                raise AdminAuthorityRequired()
+            if not any(edge.revoked_at is None for edge in locked_edges):
+                raise AdminAuthorityRequired()
+
+            row = identity_rows[identity_id]
+            if row is None:
+                raise IdentityNotFound()
+            if row.provider == "service" and row.kind != "service":
+                raise RoleForbiddenForIdentity()
+            if row.access_state != "active":
+                raise IdentityNotActive()
+            if expires_at is not None and _ensure_utc(expires_at) <= now:
+                raise ValueError("expires_at must be in the future")
+            kind = _parsed_kind(row.kind, identity_id=identity_id)
+            _refuse_role_conflict(kind=kind, role="curator", held=_active_grants(target_role_rows, now))
+            occupant = _unrevoked_grant_row(locked_curator_rows, role="curator", scope=None)
+            if occupant is not None:
+                if _is_active(occupant.expires_at, occupant.revoked_at, now):
+                    raise RoleAlreadyHeld()
+                conn.execute(update(identity_roles_table).where(identity_roles_table.c.role_id == occupant.role_id).values(revoked_at=now))
+            grant = _new_role_grant(
+                identity_id=identity_id,
+                role="curator",
+                scope=None,
+                expires_at=None if expires_at is None else _ensure_utc(expires_at),
+                note=note,
+                granted_by_identity_id=actor_identity_id,
+                now=now,
+            )
+            conn.execute(insert(identity_roles_table).values(**_role_values(grant)))
+            record(
+                RoleChanged(
+                    grant=grant,
+                    actor_identity_id=actor_identity_id,
+                    note=note,
+                    at=now,
+                    on_behalf_of=None,
+                    console_request_id=None,
                 )
             )
             return grant

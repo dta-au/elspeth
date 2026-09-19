@@ -472,6 +472,48 @@ def test_r14_required_policy_missing_still_refuses_before_measuring(fenced_sessi
     assert decision.evidence.usage is None
 
 
+def test_r14_revoked_identity_policy_suspends_work_until_reissued(fenced_session_with_policy: FencedSessionWithPolicy) -> None:
+    fenced = fenced_session_with_policy
+    conn = _resolve_mutation_connection(fenced.connection_token)
+    conn.execute(update(quota_policies_table).where(quota_policies_table.c.policy_id == fenced.identity_policy_id).values(revoked_at=DAY))
+    decision = _assess(fenced)
+    assert decision.refusal_reason is AdmissionRefusalReason.QUOTA_POLICY_MISSING
+    assert decision.evidence.quota_disposition is QuotaDisposition.POLICY_MISSING
+    assert decision.evidence.identity_policy_id is None
+    assert decision.evidence.container_policy_id == fenced.container_policy_id
+    conn.execute(
+        insert(quota_policies_table).values(
+            policy_id="reissued-identity-policy",
+            identity_id=fenced.identity_id,
+            tokens_per_day=IDENTITY_TOKENS_PER_DAY,
+            storage_bytes=1_000_000,
+            set_by_actor="system",
+            set_at=DAY,
+        )
+    )
+    assert _assess(fenced).allowed
+
+
+def test_r14_never_issued_identity_uses_container_only_policy(fenced_session: FencedSession) -> None:
+    fenced = fenced_session
+    conn = _resolve_mutation_connection(fenced.connection_token)
+    conn.execute(
+        insert(quota_policies_table).values(
+            policy_id="container-only",
+            identity_id=None,
+            tokens_per_day=10_000,
+            storage_bytes=1_000_000,
+            set_by_actor="config",
+            set_at=DAY,
+        )
+    )
+    decision = _assess(fenced)
+    assert decision.allowed
+    assert decision.evidence.quota_disposition is QuotaDisposition.WITHIN_CAP
+    assert decision.evidence.identity_policy_id is None
+    assert decision.evidence.container_policy_id == "container-only"
+
+
 def test_run_replay_keeps_call_day_and_deduplicates_reordering(fenced_session: FencedSession) -> None:
     entries = (
         dataclasses.replace(_entry(10, 5, call_id="before-midnight"), recorded_at=DAY - timedelta(microseconds=1)),

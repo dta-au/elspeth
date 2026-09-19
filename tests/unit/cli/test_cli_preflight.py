@@ -164,6 +164,7 @@ def _explicit_audit_export_settings(*, enabled: bool | str | int, sink: str = "a
     """
     return {
         "enabled": enabled,
+        "compartment_id": "test-compartment",
         "sink": sink,
         "total_record_limit": 1_000,
         "total_byte_limit": 1_000_000,

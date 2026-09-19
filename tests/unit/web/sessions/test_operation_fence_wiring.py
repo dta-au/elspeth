@@ -30,12 +30,18 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
-from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionPolicy, ChargeableOperation
+from elspeth.contracts.chargeable_admission import (
+    AdmissionRefusalReason,
+    ChargeableAdmissionDecision,
+    ChargeableAdmissionPolicy,
+    ChargeableOperation,
+)
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.coordination import repository as coordination_repository
+from elspeth.web.coordination.approval_authority import ApprovalGateInputs
 from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.envelope import RunExecutionInput
@@ -329,10 +335,23 @@ def _resolved_signature(member: Any) -> tuple[tuple[tuple[str, inspect._Paramete
     )
     parameters = tuple(parameter for parameter in signature.parameters.values() if parameter.name != "self")
     for parameter in parameters:
-        if parameter.name == "execution_input" and member in {
-            sessions_protocol.SessionOperationRunMutations.create_pending_run,
-            coordination_repository._RepositoryRunMutations.create_pending_run,
-        }:
+        if (
+            parameter.name == "execution_input"
+            and member
+            in {
+                sessions_protocol.SessionOperationRunMutations.create_pending_run,
+                coordination_repository._RepositoryRunMutations.create_pending_run,
+            }
+        ) or (
+            parameter.name == "approval"
+            and member
+            in {
+                sessions_protocol.SessionOperationRunMutations.assess_start_admission,
+                sessions_protocol.SessionOperationRunMutations.issue_start_permit,
+                coordination_repository._RepositoryRunMutations.assess_start_admission,
+                coordination_repository._RepositoryRunMutations.issue_start_permit,
+            }
+        ):
             assert parameter.default is None
         else:
             assert parameter.default is inspect.Parameter.empty
@@ -473,10 +492,18 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         (
             (run_protocol, implementation_types[2]),
             {
+                "check_approval_binding": (
+                    (
+                        ("state_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("approval", inspect.Parameter.KEYWORD_ONLY, ApprovalGateInputs),
+                    ),
+                    AdmissionRefusalReason | None,
+                ),
                 "assess_start_admission": (
                     (
                         ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
                         ("policy", inspect.Parameter.KEYWORD_ONLY, ChargeableAdmissionPolicy),
+                        ("approval", inspect.Parameter.KEYWORD_ONLY, ApprovalGateInputs | None),
                     ),
                     sessions_protocol.RunStartPermitRecord,
                 ),
@@ -484,6 +511,7 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     (
                         ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
                         ("policy", inspect.Parameter.KEYWORD_ONLY, ChargeableAdmissionPolicy),
+                        ("approval", inspect.Parameter.KEYWORD_ONLY, ApprovalGateInputs | None),
                     ),
                     sessions_protocol.RunStartPermitRecord,
                 ),

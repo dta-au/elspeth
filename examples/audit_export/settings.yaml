@@ -55,6 +55,7 @@ landscape:
   url: sqlite:///examples/audit_export/runs/audit.db
   export:
     enabled: true
+    compartment_id: audit-export-example
     sink: audit_export
     format: json
     signing_mode: unsigned

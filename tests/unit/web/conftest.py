@@ -101,10 +101,8 @@ def _make_session(
     )
 
 
-@pytest.fixture
-def test_client(tmp_path: Path) -> TestClient:
-    """Sync ASGI test client with app state exposing ``sessions_service``."""
-
+def _route_client(tmp_path: Path, settings: WebSettings) -> TestClient:
+    """Build a route test app with one in-memory session service."""
     eng = create_session_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -152,14 +150,7 @@ def test_client(tmp_path: Path) -> TestClient:
     # (matches production wiring in ``web/app.py:579``).
     app.state.sessions_telemetry = service._telemetry
     app.state.session_engine = eng
-    app.state.settings = WebSettings(
-        data_dir=tmp_path,
-        composer_max_composition_turns=15,
-        composer_max_discovery_turns=10,
-        composer_timeout_seconds=85.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
-    )
+    app.state.settings = settings
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = None
@@ -170,6 +161,47 @@ def test_client(tmp_path: Path) -> TestClient:
     client.app.state.phase3_engine = eng
     client.app.state.phase3_sessions_service = service
     return client
+
+
+@pytest.fixture
+def test_client(tmp_path: Path) -> TestClient:
+    """The shared open-local route fixture, with governance disabled."""
+    return _route_client(
+        tmp_path,
+        WebSettings(
+            data_dir=tmp_path,
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+        ),
+    )
+
+
+@pytest.fixture
+def closed_local_settings(tmp_path: Path) -> WebSettings:
+    """A governance-on local deployment safe under R11."""
+    return WebSettings(
+        data_dir=tmp_path,
+        auth_provider="local",
+        registration_mode="closed",
+        workflow_governance="on",
+        compartment_id="test-compartment",
+        quota_default_tokens_per_day=100_000,
+        quota_default_storage_bytes=1_000_000,
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+    )
+
+
+@pytest.fixture
+def closed_local_app(tmp_path: Path, closed_local_settings: WebSettings) -> TestClient:
+    """The same route app as ``test_client`` with closed local governance."""
+    return _route_client(tmp_path, closed_local_settings)
 
 
 @pytest.fixture

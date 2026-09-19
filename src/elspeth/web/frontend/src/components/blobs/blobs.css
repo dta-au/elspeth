@@ -201,6 +201,13 @@
   color: var(--color-text-secondary);
 }
 
+.blob-manager-identity-total {
+  margin-inline: var(--space-sm);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  text-align: right;
+}
+
 .blob-manager-upload-btn {
   font-size: var(--font-size-xs);
   padding: var(--space-2xs) var(--space-sm);

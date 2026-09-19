@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import uuid
@@ -1044,6 +1045,7 @@ def test_accept_proposal_executes_tool_and_commits_state(tmp_path, monkeypatch) 
     from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 
     app, service = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
     app.state.session_engine = service._engine
     catalog = MagicMock(spec=CatalogService)
     catalog.list_sources.return_value = [
@@ -1070,6 +1072,8 @@ def test_accept_proposal_executes_tool_and_commits_state(tmp_path, monkeypatch) 
     client = TestClient(app)
     session = client.post("/api/sessions", json={"title": "Accept"}).json()
     session_id = uuid.UUID(session["id"])
+    submitted = "Build the pipeline\r\n# compartment_id: foreign"
+    user_message = asyncio.run(service.add_message(session_id, "user", submitted, writer_principal="route_user_message"))
     input_path = tmp_path / "blobs" / str(session_id) / "input.csv"
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_text("value\n1\n", encoding="utf-8")
@@ -1129,6 +1133,7 @@ def test_accept_proposal_executes_tool_and_commits_state(tmp_path, monkeypatch) 
             arguments_redacted_json={"summary": "redacted"},
             base_state_id=None,
             actor="composer-web:user:alice",
+            user_message_id=user_message.id,
         )
     )
 
@@ -1149,6 +1154,10 @@ def test_accept_proposal_executes_tool_and_commits_state(tmp_path, monkeypatch) 
             select(composition_states_table.c.provenance).where(composition_states_table.c.id == str(persisted.id))
         ).scalar_one()
     assert provenance == "tool_call"
+    assert deep_thaw(persisted.composer_meta)["ingress"] == {
+        "text_sha256": hashlib.sha256(submitted.encode("utf-8")).hexdigest(),
+        "foreign_compartment_ids": ["foreign"],
+    }
 
 
 def test_accept_schema_stale_proposal_returns_422_and_rejects(tmp_path) -> None:
@@ -1250,6 +1259,8 @@ async def _create_canonical_pipeline_route_proposal(
     monkeypatch: pytest.MonkeyPatch,
     *,
     tool_call_id: str,
+    origin_text: str | None = None,
+    prior_text: str | None = None,
 ) -> tuple[FastAPI, SessionServiceImpl, dict[str, Any], uuid.UUID, Any, str]:
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
     from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
@@ -1263,6 +1274,13 @@ async def _create_canonical_pipeline_route_proposal(
     )
     session = await service.create_session("alice", "Canonical accept", "local")
     session_id = session.id
+    if prior_text is not None:
+        await service.add_message(session_id, "user", prior_text, writer_principal="route_user_message")
+    origin_message = (
+        await service.add_message(session_id, "user", origin_text, writer_principal="route_user_message")
+        if origin_text is not None
+        else None
+    )
     input_path = tmp_path / "blobs" / str(session_id) / f"{tool_call_id}.csv"
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_text("value\n1\n", encoding="utf-8")
@@ -1323,9 +1341,71 @@ async def _create_canonical_pipeline_route_proposal(
         composer_model_identifier="planner-model",
         composer_model_version="planner-model-v1",
         composer_provider="provider",
+        user_message_id=origin_message.id if origin_message is not None else None,
     )
     endpoint = f"/api/sessions/{session.id}/proposals/{row.id}/accept"
     return app, service, pipeline, session_id, row, endpoint
+
+
+def test_manual_canonical_pipeline_accept_records_origin_chat_ingress(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    submitted = "Build the pipeline\r\n# compartment_id: foreign"
+    app, service, _pipeline, session_id, row, endpoint = asyncio.run(
+        _create_canonical_pipeline_route_proposal(
+            tmp_path,
+            monkeypatch,
+            tool_call_id="manual-ingress-pipeline",
+            origin_text=submitted,
+        )
+    )
+    app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
+    app.state.composer_service = SimpleNamespace(
+        surface_pending_interpretation_reviews=AsyncMock(
+            spec=ComposerService.surface_pending_interpretation_reviews,
+            return_value=None,
+        )
+    )
+    assert row.pipeline_metadata is not None
+
+    response = TestClient(app).post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+
+    assert response.status_code == 200, response.text
+    state = asyncio.run(service.get_current_state(session_id))
+    assert state is not None
+    assert deep_thaw(state.composer_meta)["ingress"] == {
+        "text_sha256": hashlib.sha256(submitted.encode("utf-8")).hexdigest(),
+        "foreign_compartment_ids": ["foreign"],
+    }
+
+
+def test_manual_pipeline_accept_retains_prior_chat_paste(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pasted = "# compartment_id: foreign\nBuild a pipeline from this"
+    app, service, _pipeline, session_id, row, endpoint = asyncio.run(
+        _create_canonical_pipeline_route_proposal(
+            tmp_path,
+            monkeypatch,
+            tool_call_id="manual-history-pipeline",
+            prior_text=pasted,
+            origin_text="yes",
+        )
+    )
+    app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
+    app.state.composer_service = SimpleNamespace(
+        surface_pending_interpretation_reviews=AsyncMock(
+            spec=ComposerService.surface_pending_interpretation_reviews,
+            return_value=None,
+        )
+    )
+    assert row.pipeline_metadata is not None
+
+    response = TestClient(app).post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+
+    assert response.status_code == 200, response.text
+    state = asyncio.run(service.get_current_state(session_id))
+    assert state is not None
+    metadata = deep_thaw(state.composer_meta)
+    assert metadata["ingress"]["text_sha256"] == hashlib.sha256(b"yes").hexdigest()
+    assert [entry["foreign_compartment_ids"] for entry in metadata["chat_ingress_inputs"]] == [["foreign"], []]
+    assert metadata["chat_ingress_inputs"][0]["text_sha256"] == hashlib.sha256(pasted.encode("utf-8")).hexdigest()
 
 
 def test_send_message_auto_commit_settles_exact_pipeline_intent(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4461,6 +4541,66 @@ class TestMessageRoutes:
         # State unchanged (version stayed at 1) -> no state in response
         assert body["state"] is None
 
+    def test_chat_paste_state_records_exact_ingress_on_created_state(self, tmp_path) -> None:
+        submitted = "Build this\r\n# compartment_id: foreign-b\r\ncompartment_id: own\r\n# compartment_id: foreign-a"
+        app, service = _make_app(tmp_path)
+        app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
+        app.state.composer_service = _make_composer_mock(state=replace(_EMPTY_STATE, version=2))
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Chat ingress"}).json()["id"]
+
+        response = client.post(f"/api/sessions/{session_id}/messages", json={"content": submitted})
+
+        assert response.status_code == 200
+        assert response.json()["state"] is not None
+        state = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
+        assert state is not None
+        assert deep_thaw(state.composer_meta)["ingress"] == {
+            "text_sha256": hashlib.sha256(submitted.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": ["foreign-a", "foreign-b"],
+        }
+
+        # An advisory reply that creates no state must leave the last
+        # state/input association intact.
+        app.state.composer_service = _make_composer_mock(state=replace(_EMPTY_STATE, version=state.version))
+        advisory = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Just explain it"})
+        assert advisory.status_code == 200
+        assert advisory.json()["state"] is None
+        assert asyncio.run(service.get_current_state(uuid.UUID(session_id))).id == state.id
+
+    def test_chat_paste_clarification_then_confirmation_retains_first_ingress(self, tmp_path) -> None:
+        pasted = "# compartment_id: foreign\nBuild a pipeline from this pasted input"
+        app, service = _make_app(tmp_path)
+        app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
+        app.state.composer_service = _make_composer_mock(state=_EMPTY_STATE)
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Deferred chat ingress"}).json()["id"]
+
+        clarification = client.post(f"/api/sessions/{session_id}/messages", json={"content": pasted})
+        assert clarification.status_code == 200
+        assert clarification.json()["state"] is None
+        assert asyncio.run(service.get_current_state(uuid.UUID(session_id))) is None
+
+        app.state.composer_service = _make_composer_mock(state=replace(_EMPTY_STATE, version=2))
+        confirmation = client.post(f"/api/sessions/{session_id}/messages", json={"content": "yes"})
+        assert confirmation.status_code == 200
+        state = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
+        assert state is not None
+        messages = asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None))
+        user_ids = [str(message.id) for message in messages if message.role == "user"]
+        assert deep_thaw(state.composer_meta)["chat_ingress_inputs"] == [
+            {
+                "message_id": user_ids[0],
+                "text_sha256": hashlib.sha256(pasted.encode("utf-8")).hexdigest(),
+                "foreign_compartment_ids": ["foreign"],
+            },
+            {
+                "message_id": user_ids[1],
+                "text_sha256": hashlib.sha256(b"yes").hexdigest(),
+                "foreign_compartment_ids": [],
+            },
+        ]
+
     def test_send_message_with_state_id(self, tmp_path) -> None:
         """Message with state_id references a specific composition state snapshot.
 
@@ -6075,7 +6215,7 @@ class TestMessageRoutes:
         """Concurrent sends must not compose against an in-flight partial transcript."""
         composer = _BlockingRecordingComposer()
 
-        app, _ = _make_app(tmp_path)
+        app, session_service = _make_app(tmp_path)
         app.state.composer_service = composer
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -6103,10 +6243,17 @@ class TestMessageRoutes:
 
         assert first_resp.status_code == 200
         assert second_resp.status_code == 200
+        persisted = await session_service.get_messages(uuid.UUID(session_id), limit=None)
+        first_user_message = next(message for message in persisted if message.role == "user" and message.content == "First")
         assert [call["message"] for call in composer.calls] == ["First", "Second"]
         assert composer.calls[0]["chat_messages"] == []
         assert composer.calls[1]["chat_messages"] == [
-            {"role": "user", "content": "First", "_elspeth_user_authored": True},
+            {
+                "role": "user",
+                "content": "First",
+                "_elspeth_user_authored": True,
+                "_elspeth_user_message_id": str(first_user_message.id),
+            },
             {"role": "assistant", "content": "Reply to first"},
         ]
 
@@ -6636,6 +6783,7 @@ class TestRecomposeConvergencePartialState:
         )
 
         app, service = _make_app(tmp_path)
+        app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
         app.state.composer_service = mock_composer
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -6646,10 +6794,9 @@ class TestRecomposeConvergencePartialState:
         # Simulate a failed send_message: user message saved, no assistant
         # response. This is the precondition for recompose — the last
         # message must be a user turn.
+        submitted = "Build a CSV pipeline\r\n# compartment_id: foreign"
         loop = asyncio.new_event_loop()
-        loop.run_until_complete(
-            service.add_message(uuid.UUID(session_id), "user", "Build a CSV pipeline", writer_principal="route_user_message")
-        )
+        loop.run_until_complete(service.add_message(uuid.UUID(session_id), "user", submitted, writer_principal="route_user_message"))
         loop.close()
 
         recompose_resp = client.post(f"/api/sessions/{session_id}/recompose")
@@ -6661,6 +6808,12 @@ class TestRecomposeConvergencePartialState:
         persisted_id, persisted_version = _read_persisted_state_identity(service, session_id)
         assert detail["partial_state"]["id"] == persisted_id
         assert detail["partial_state"]["version"] == persisted_version
+        persisted = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
+        assert persisted is not None
+        assert deep_thaw(persisted.composer_meta)["ingress"] == {
+            "text_sha256": hashlib.sha256(submitted.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": ["foreign"],
+        }
 
     def test_recompose_convergence_without_partial_state(self, tmp_path) -> None:
         """When convergence error has no partial state (no mutations),
@@ -8034,6 +8187,51 @@ transforms:
 
 class TestYamlEndpoint:
     """Tests for GET /api/sessions/{id}/state/yaml."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("compartment_id", ["alpha", None])
+    async def test_yaml_download_marks_configured_compartment(self, tmp_path: Path, compartment_id: str | None) -> None:
+        app, service = _make_app(tmp_path)
+        app.state.settings = app.state.settings.model_copy(update={"compartment_id": compartment_id})
+        client = TestClient(app)
+        session = await service.create_session("alice", "Export compartment", "local")
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(
+                source={
+                    "plugin": "csv",
+                    "on_success": "main",
+                    "options": {"schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
+                },
+                outputs=[
+                    {
+                        "name": "main",
+                        "plugin": "csv",
+                        "options": {"path": "outputs/out.csv", "schema": {"mode": "observed"}},
+                        "on_write_failure": "discard",
+                    }
+                ],
+                metadata_={"name": "Export compartment", "description": ""},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            response = client.get(f"/api/sessions/{session.id}/state/yaml")
+
+        assert response.status_code == 200
+        document = response.json()["yaml"]
+        if compartment_id is None:
+            assert not document.startswith("# compartment_id:")
+        else:
+            assert document.startswith(f"# compartment_id: {compartment_id}\n")
+        assert yaml.safe_load(document)["sources"]["source"]["plugin"] == "csv"
 
     @pytest.mark.asyncio
     async def test_post_state_yaml_with_disabled_plugin_is_atomic(self, tmp_path: Path) -> None:
@@ -13025,14 +13223,16 @@ def _runtime_preflight_failed_result(message: str = "runtime preflight blocked e
 
 def test_recompose_success_persists_runtime_invalid_state(tmp_path) -> None:
     app, service = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
     client = TestClient(app, raise_server_exceptions=False)
 
     resp = client.post("/api/sessions", json={"title": "Test"})
     session_id = uuid.UUID(resp.json()["id"])
 
+    submitted = "Build a CSV pipeline\r\n# compartment_id: foreign"
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(service.add_message(session_id, "user", "Build a CSV pipeline", writer_principal="route_user_message"))
+        loop.run_until_complete(service.add_message(session_id, "user", submitted, writer_principal="route_user_message"))
     finally:
         loop.close()
 
@@ -13075,6 +13275,10 @@ def test_recompose_success_persists_runtime_invalid_state(tmp_path) -> None:
     assert persisted.is_valid is False
     assert persisted.validation_errors is not None
     assert [error.message for error in persisted.validation_errors] == ["runtime failure from recompose"]
+    assert deep_thaw(persisted.composer_meta)["ingress"] == {
+        "text_sha256": hashlib.sha256(submitted.encode("utf-8")).hexdigest(),
+        "foreign_compartment_ids": ["foreign"],
+    }
 
 
 def test_recompose_convergence_persists_runtime_invalid_partial_state(tmp_path) -> None:
@@ -14116,7 +14320,12 @@ def test_composer_chat_history_skips_audit_tool_messages() -> None:
     history = _composer_chat_history([user_message, tool_audit_message, assistant_message])
 
     assert history == [
-        {"role": "user", "content": "Build a CSV pipeline.", "_elspeth_user_authored": True},
+        {
+            "role": "user",
+            "content": "Build a CSV pipeline.",
+            "_elspeth_user_authored": True,
+            "_elspeth_user_message_id": str(user_message.id),
+        },
         {"role": "assistant", "content": "I updated the pipeline."},
     ]
 
@@ -14154,6 +14363,7 @@ def test_composer_chat_history_marks_edited_fork_user_but_not_fork_system_row() 
             "role": "user",
             "content": "Route rows with amount > 500 to high_value.",
             "_elspeth_user_authored": True,
+            "_elspeth_user_message_id": str(edited_fork_user_message.id),
         },
     ]
     assert context is not None
@@ -14204,7 +14414,12 @@ def test_composer_chat_history_skips_llm_call_audit_and_unknown_audit_kinds() ->
     history = _composer_chat_history([user_message, llm_audit_message, unknown_audit_message, assistant_message])
 
     assert history == [
-        {"role": "user", "content": "Build a CSV pipeline.", "_elspeth_user_authored": True},
+        {
+            "role": "user",
+            "content": "Build a CSV pipeline.",
+            "_elspeth_user_authored": True,
+            "_elspeth_user_message_id": str(user_message.id),
+        },
         {"role": "assistant", "content": "I updated the pipeline."},
     ]
 

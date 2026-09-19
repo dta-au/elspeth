@@ -154,6 +154,7 @@ class TestValidateCommand:
                 "url": f"sqlite:///{tmp_path / 'audit.db'}",
                 "export": {
                     "enabled": True,
+                    "compartment_id": "test-compartment",
                     "sink": "audit_export",
                     "format": "json",
                     "signing_mode": "unsigned",

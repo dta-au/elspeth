@@ -12,14 +12,16 @@ against the sessions store on EVERY request and never cached: a revoked
 admin's next request is refused. There is no configuration shortcut. The
 first admin comes from the D20 bootstrap (the ``sso_admin_subjects`` seed at
 first login, or ``elspeth composer users bootstrap-admin``); after that the
-admin API is the only path. A caller without the role sees 404, the same as
-the dev-admin surface: hidden, not forbidden, so the surface does not
-confirm its own existence to a probe.
+admin API is the usual path. A live approver can also appoint a curator over
+a direct report through ``POST /roles`` while workflow governance is on. A
+caller holding neither role sees 404, so the surface does not confirm its
+own existence to a probe.
 
 The authority is the arbiter
 ----------------------------
 Every rule with teeth lives in ``RepositoryIdentityAuthority`` and is
-enforced inside its transaction: the actor's admin role is re-proved there,
+enforced inside its transaction: the actor's admin or delegated approver
+authority is re-proved there,
 ``on_behalf_of`` / ``console_request_id`` are accepted only from a
 ``service`` identity (checked against the actor's STORED kind, never the
 request), self-disable and last-admin protection, R8's admin/workload
@@ -351,6 +353,17 @@ async def _require_identity_admin(request: Request) -> UserIdentity:
     return user
 
 
+async def _require_identity_admin_or_approver(request: Request) -> UserIdentity:
+    """Hide the role-grant route from callers holding neither live role."""
+    user = await get_current_user(request)
+    authority = _authority(request)
+    if await run_sync_in_worker(authority.holds_active_role, identity_id=user.user_id, role="admin"):
+        return user
+    if await run_sync_in_worker(authority.holds_active_role, identity_id=user.user_id, role="approver"):
+        return user
+    raise _hidden()
+
+
 def _actor(user: UserIdentity, provenance: _Provenance) -> IdentityAdminActor:
     return IdentityAdminActor(
         identity_id=user.user_id,
@@ -376,7 +389,7 @@ def _refused(exc: IdentityAuthorityRefusal) -> HTTPException:
     silently promoted to "not found".
     """
     if type(exc) is AdminAuthorityRequired:
-        # The actor lost admin between the dependency and the transaction,
+        # The actor lost a required role between dependency and transaction,
         # or a human sent console provenance. Hidden, like the dependency.
         return _hidden()
     if type(exc) in _NOT_FOUND_REFUSALS:
@@ -590,21 +603,48 @@ def create_identity_admin_router() -> APIRouter:
         request: Request,
         response: Response,
         body: GrantRoleRequest,
-        admin: UserIdentity = Depends(_require_identity_admin),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(_require_identity_admin_or_approver)],
     ) -> RoleView:
+        authority = _authority(request)
         provider = _provider(request)
         recorder = _recorder(request)
 
         def record(event: RoleChanged) -> None:
             _record_role_change(recorder, request, provider, event, change="granted")
 
+        if await run_sync_in_worker(authority.holds_active_role, identity_id=user.user_id, role="admin"):
+            try:
+                grant = await run_sync_in_worker(
+                    authority.grant_role,
+                    actor=_actor(user, body),
+                    identity_id=body.identity_id,
+                    role=body.role,
+                    scope=body.scope,
+                    expires_at=body.expires_at,
+                    note=body.note,
+                    record=record,
+                )
+            except IdentityAuthorityRefusal as exc:
+                raise _refused(exc) from exc
+            _uncacheable(response)
+            return _role_view(grant)
+
+        if body.role != "curator" or body.scope is not None or body.on_behalf_of is not None or body.console_request_id is not None:
+            raise _hidden()
+        settings: WebSettings = request.app.state.settings
+        if settings.workflow_governance != "on":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "refusal": "workflow_governance_off",
+                    "detail": "workflow governance is off on this deployment (set ELSPETH_WEB__WORKFLOW_GOVERNANCE=on)",
+                },
+            )
         try:
             grant = await run_sync_in_worker(
-                _authority(request).grant_role,
-                actor=_actor(admin, body),
+                authority.grant_curator_as_approver,
+                actor_identity_id=user.user_id,
                 identity_id=body.identity_id,
-                role=body.role,
-                scope=body.scope,
                 expires_at=body.expires_at,
                 note=body.note,
                 record=record,

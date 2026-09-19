@@ -15,6 +15,7 @@ schedule coroutines on the main event loop from the background thread.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -47,6 +48,7 @@ from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.enums import CallType, NodeStateStatus, RunStatus, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import CANONICAL_VERSION, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
@@ -98,6 +100,11 @@ from elspeth.web.blobs.protocol import (
 from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_authority import (
+    ApprovalBinding,
+    ApprovalGateInputs,
+    runtime_val_manifest_sha256,
+)
 from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
@@ -127,6 +134,7 @@ from elspeth.web.execution.errors import (
     BlobRowsSourceAdmissionError,
     BlobSourcePathMismatchError,
     CompletionGateIntegrityError,
+    ExecutionApprovalRequired,
     ExecutionReadinessError,
     MalformedBlobRefError,
     PathAllowlistViolationError,
@@ -1116,6 +1124,201 @@ class ExecutionServiceImpl:
             user_id = "trained-operator"
         return self._plugin_snapshot_factory(user_id)
 
+    def _approval_inputs_from_frozen(
+        self,
+        frozen: FrozenRunSettings,
+        *,
+        user_id: str,
+        session_id: UUID,
+        session_operation_context: SessionOperationContext,
+    ) -> ApprovalGateInputs:
+        """Compile the approval tuple from the same frozen inputs used by a run.
+
+        This path deliberately applies the operator's telemetry and export
+        settings before hashing. Those settings also enter the Landscape run
+        config; the authored settings alone are not the run's config.
+        """
+        from elspeth.core.secrets import resolve_secret_refs
+        from elspeth.web.execution.export_marking import apply_operator_export_marking, operator_marked_config_dict
+        from elspeth.web.operator_telemetry import apply_operator_pipeline_telemetry
+
+        catalog_sha = self._openrouter_catalog_sha256
+        if catalog_sha is None:
+            raise RuntimeError("ExecutionServiceImpl has no OpenRouter catalog snapshot")
+        executable_config = cast(dict[str, Any], deep_thaw(frozen.executable_config))
+        # Durable execution replaces path sources with content-addressed retained
+        # paths. Predict that exact path without creating a retained copy while
+        # compiling a request; at execute the copy is made and hashed again.
+        sources: list[Any] = []
+        if "sources" in executable_config:
+            sources.extend(executable_config["sources"].values())
+        if "source" in executable_config:
+            sources.append(executable_config["source"])
+        retained_root = Path(self._settings.data_dir) / "retained-run-inputs"
+        for source in sources:
+            options = source["options"]
+            if "path" not in options:
+                continue
+            source_path = Path(options["path"])
+            with source_path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            options["path"] = str(retained_root / f"{digest}{source_path.suffix}")
+        if self._secret_service is not None:
+            env_ref_names = {item.name for item in self._secret_service.list_refs(user_id)}
+            executable_config, _ = resolve_secret_refs(
+                executable_config,
+                self._secret_service,
+                user_id,
+                env_ref_names=env_ref_names,
+            )
+        inline_refs = _discover_blob_content_refs(executable_config)
+        if inline_refs:
+            blob_service = self._blob_service
+            if blob_service is None:
+                raise RuntimeError("Inline blob approval compilation requires the blob service")
+            records_by_id: dict[UUID, BlobRecord] = {}
+            for ref in inline_refs:
+                if ref.blob_id in records_by_id:
+                    continue
+                record = self._call_async(blob_service.get_blob(ref.blob_id, session_operation_context=session_operation_context))
+                if record.session_id != session_id:
+                    raise BlobNotFoundError(str(ref.blob_id))
+                records_by_id[ref.blob_id] = record
+            _enforce_blob_content_ref_metadata(
+                inline_refs,
+                records_by_id,
+                per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
+                aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
+            )
+            llm_node_names = {
+                node["name"]
+                for collection_key in _NODE_COLLECTION_KEYS
+                if collection_key in executable_config and type(executable_config[collection_key]) is list
+                for node in executable_config[collection_key]
+                if type(node) is dict and "plugin" in node and node["plugin"] == "llm" and "name" in node
+            }
+            refused_prompt_refs = [
+                ref
+                for ref in inline_refs
+                if is_llm_authored_prompt_surface_binding(
+                    ref.field_path,
+                    llm_node_names=llm_node_names,
+                    creation_modality=records_by_id[ref.blob_id].creation_modality,
+                )
+            ]
+            if refused_prompt_refs:
+                bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in refused_prompt_refs)
+                raise InlineBlobPromptSurfaceAdmissionError(
+                    f"{bound} binds LLM-authored blob content into an llm prompt surface; inline prompt, "
+                    "system prompt, query template and model content admits only user-verbatim blobs"
+                )
+            contents = {
+                blob_id: self._call_async(blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context))
+                for blob_id in records_by_id
+            }
+            executable_config, _ = _substitute_blob_content_refs(
+                executable_config,
+                {ref: contents[ref.blob_id] for ref in inline_refs},
+                refs=inline_refs,
+                blob_metadata={
+                    blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes) for blob_id, record in records_by_id.items()
+                },
+            )
+        settings = load_settings_from_config_dict(operator_marked_config_dict(executable_config, self._settings), expand_env_vars=False)
+        settings = apply_operator_pipeline_telemetry(settings, self._settings)
+        effective_export = apply_operator_export_marking(settings.landscape.export, self._settings)
+        settings = settings.model_copy(update={"landscape": settings.landscape.model_copy(update={"export": effective_export})})
+        audit_config = audit_safe_resolved_config(
+            settings,
+            audit_safe_settings=cast(dict[str, Any], deep_thaw(frozen.audit_safe_config)),
+            plugin_snapshot=frozen.plugin_snapshot,
+        )
+        return ApprovalGateInputs(
+            evidence=_build_web_plugin_policy_evidence(snapshot=frozen.plugin_snapshot, policy=self._web_plugin_policy),
+            config_hash=stable_hash(audit_config),
+            canonical_version=CANONICAL_VERSION,
+            openrouter_catalog_sha256=catalog_sha,
+            runtime_val_manifest_sha256=runtime_val_manifest_sha256(),
+        )
+
+    async def compile_approval_binding(
+        self,
+        session_id: UUID,
+        state_id: UUID,
+        *,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> ApprovalBinding:
+        """Validate and compile a state for a human approval request."""
+        if session_operation_context.fence.session_id != str(session_id):
+            raise ValueError("approval binding context belongs to a different session")
+        try:
+            record = await self._session_service.get_state(state_id)
+        except ValueError as exc:
+            raise StateAccessError(str(state_id)) from exc
+        if record.session_id != session_id:
+            raise StateAccessError(str(state_id))
+        authored = state_from_record(record)
+        semantic_errors, _, semantic_contracts = validate_semantic_contracts(authored)
+        if semantic_errors:
+            raise SemanticContractViolationError(entries=semantic_errors, contracts=semantic_contracts)
+        try:
+            completion_gates = parse_completion_gates(record.composer_meta)
+        except ValueError as exc:
+            raise CompletionGateIntegrityError(session_id=str(session_id), state_id=str(state_id)) from exc
+        materialized = materialize_state_for_execution(authored)
+        if isinstance(materialized, InterpretationReviewPending):
+            raise UnresolvedInterpretationPlaceholderError(sites=tuple(materialized.sites))
+        snapshot = self._plugin_snapshot_for_user(user_id, operation="approval binding")
+        preflight = await self._authoritative_state_preflight(
+            materialized,
+            plugin_snapshot=snapshot,
+            user_id=user_id,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            completion_gates=completion_gates,
+            completion_gate_state=authored,
+        )
+        if not preflight.is_valid:
+            raise PipelineValidationError(errors=tuple(preflight.errors), readiness=preflight.readiness)
+        if not preflight.readiness.execution_ready:
+            raise ExecutionReadinessError(blockers=tuple(preflight.readiness.blockers))
+        policy_result = validate_plugin_policy(
+            materialized,
+            snapshot=snapshot,
+            profile_registry=self._operator_profile_registry,
+            catalog=self._catalog,
+        )
+        if policy_result.findings:
+            raise RuntimeError("Plugin policy validation diverged between approval preflight and runtime preparation")
+        audit_yaml = resolve_runtime_yaml_paths(
+            self._yaml_generator.generate_yaml(materialized), str(self._settings.data_dir), session_id=str(session_id)
+        )
+        executable_yaml = resolve_runtime_yaml_paths(
+            self._yaml_generator.generate_yaml(policy_result.executable_state),
+            str(self._settings.data_dir),
+            session_id=str(session_id),
+        )
+        audit_config = load_bounded_pipeline_yaml(audit_yaml)
+        executable_config = load_bounded_pipeline_yaml(executable_yaml)
+        if type(audit_config) is not dict or type(executable_config) is not dict:
+            raise TypeError("YamlGenerator.generate_yaml() must produce a mapping for approval compilation")
+        frozen = FrozenRunSettings(
+            plugin_snapshot=snapshot,
+            executable_config=cast(dict[str, Any], executable_config),
+            audit_safe_config=cast(dict[str, Any], audit_config),
+            profiled_s3_audit_identities=policy_result.profiled_s3_audit_identities,
+            profiled_textract_audit_identities=policy_result.profiled_textract_audit_identities,
+        )
+        inputs = await run_sync_in_worker(
+            self._approval_inputs_from_frozen,
+            frozen,
+            user_id=user_id,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        return inputs.binding
+
     def _authoritative_proof_blob_resolver(
         self,
         state: CompositionState,
@@ -1960,6 +2163,22 @@ class ExecutionServiceImpl:
         executable_config = load_bounded_pipeline_yaml(executable_pipeline_yaml)
         if type(audit_safe_config) is not dict or type(executable_config) is not dict:
             raise TypeError("YamlGenerator.generate_yaml() must produce a mapping for runtime preparation")
+        # Export policy has an operator-owned compartment binding. Validate
+        # the effective version and marking before creating a Sessions run;
+        # otherwise an export without a compartment returns HTTP 202 and
+        # fails later in the background worker after admission side effects.
+        landscape_config = executable_config["landscape"] if "landscape" in executable_config else None
+        if type(landscape_config) is dict and "export" in landscape_config:
+            from elspeth.web.execution.export_marking import apply_operator_export_marking, operator_marked_config_dict
+
+            preliminary_settings = load_settings_from_config_dict(
+                operator_marked_config_dict(executable_config, self._settings), expand_env_vars=False
+            )
+            effective_export = apply_operator_export_marking(preliminary_settings.landscape.export, self._settings)
+            if effective_export.auth_events == "deployment_snapshot":
+                raise ValueError("landscape.export.auth_events=deployment_snapshot is not permitted in Web execution")
+            if effective_export.enabled:
+                effective_export.public_snapshot_config()
         frozen_run_settings = FrozenRunSettings(
             plugin_snapshot=plugin_snapshot,
             executable_config=cast(dict[str, Any], executable_config),
@@ -1967,11 +2186,47 @@ class ExecutionServiceImpl:
             profiled_s3_audit_identities=policy_result.profiled_s3_audit_identities,
             profiled_textract_audit_identities=policy_result.profiled_textract_audit_identities,
         )
+        if self._settings.workflow_governance == "on":
+            if user_id is None:
+                raise AuditIntegrityError("Governed execution requires an authenticated user")
+            approval_inputs = await run_sync_in_worker(
+                self._approval_inputs_from_frozen,
+                frozen_run_settings,
+                user_id=user_id,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+            reason = await self._session_service.check_approval_binding(
+                session_id,
+                state_record.id,
+                approval=approval_inputs,
+                session_operation_context=session_operation_context,
+            )
+            if reason is not None:
+                raise ExecutionApprovalRequired(reason=reason, binding=approval_inputs.binding)
         frozen_run_settings, retained_inputs = await run_sync_in_worker(
             retain_execution_inputs,
             frozen_run_settings,
             root=Path(self._settings.data_dir) / "retained-run-inputs",
         )
+        if self._settings.workflow_governance == "on":
+            if user_id is None:
+                raise AuditIntegrityError("Governed execution requires an authenticated user")
+            approval_inputs = await run_sync_in_worker(
+                self._approval_inputs_from_frozen,
+                frozen_run_settings,
+                user_id=user_id,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+            reason = await self._session_service.check_approval_binding(
+                session_id,
+                state_record.id,
+                approval=approval_inputs,
+                session_operation_context=session_operation_context,
+            )
+            if reason is not None:
+                raise ExecutionApprovalRequired(reason=reason, binding=approval_inputs.binding)
         retained_blobs: list[RetainedBlobInput] = []
         for reference in discover_execution_blob_inputs(frozen_run_settings):
             if self._blob_service is None:
@@ -2079,33 +2334,74 @@ class ExecutionServiceImpl:
                 # A still-live Landscape seat is retryable; do not project it.
                 return False
             return False
-        permit = await self._session_service.assess_run_start_admission(run.id, session_operation_context=session_operation_lease.context)
+        approval_inputs: ApprovalGateInputs | None = None
+        restored: RestoredExecutionEnvelope | None = None
+        session = None
+        if self._settings.workflow_governance == "on":
+            session = await self._session_service.get_session(run.session_id)
+            active = self._principal_is_active
+            if session.archived_at is not None or (
+                not self._trained_operator_mode and (active is None or not await run_sync_in_worker(active, session.user_id))
+            ):
+                await run_sync_in_worker(
+                    self._session_service.session_operation_authority.mutate,
+                    session_operation_lease.context,
+                    lambda tx: tx.runs.mark_recovery_required(run_id=run.id, reason=RecoveryRequiredReason.COMPATIBILITY_MISMATCH),
+                )
+                return False
+            try:
+                restored = await self._restore_admitted_run(
+                    run,
+                    user_id=session.user_id,
+                    auth_provider_type=session.auth_provider_type,
+                    session_operation_context=session_operation_lease.context,
+                )
+            except ExecutionEnvelopeRefused as exc:
+                await self._record_recovery_refusal(run.id, session_operation_lease, exc)
+                return False
+            approval_inputs = await run_sync_in_worker(
+                self._approval_inputs_from_frozen,
+                restored.settings,
+                user_id=session.user_id,
+                session_id=run.session_id,
+                session_operation_context=session_operation_lease.context,
+            )
+        if approval_inputs is None:
+            permit = await self._session_service.assess_run_start_admission(
+                run.id, session_operation_context=session_operation_lease.context
+            )
+        else:
+            permit = await self._session_service.assess_run_start_admission(
+                run.id, session_operation_context=session_operation_lease.context, approval=approval_inputs
+            )
         if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
             return False
         if permit.state is StartPermitState.REFUSED or permit.execution_refusal is not None:
             await self._settle_admission_refusal(run.id, session_operation_lease)
             return False
-        session = await self._session_service.get_session(run.session_id)
-        active = self._principal_is_active
-        if session.archived_at is not None or (
-            not self._trained_operator_mode and (active is None or not await run_sync_in_worker(active, session.user_id))
-        ):
-            await run_sync_in_worker(
-                self._session_service.session_operation_authority.mutate,
-                session_operation_lease.context,
-                lambda tx: tx.runs.mark_recovery_required(run_id=run.id, reason=RecoveryRequiredReason.COMPATIBILITY_MISMATCH),
-            )
-            return False
-        try:
-            restored = await self._restore_admitted_run(
-                run,
-                user_id=session.user_id,
-                auth_provider_type=session.auth_provider_type,
-                session_operation_context=session_operation_lease.context,
-            )
-        except ExecutionEnvelopeRefused as exc:
-            await self._record_recovery_refusal(run.id, session_operation_lease, exc)
-            return False
+        if session is None:
+            session = await self._session_service.get_session(run.session_id)
+            active = self._principal_is_active
+            if session.archived_at is not None or (
+                not self._trained_operator_mode and (active is None or not await run_sync_in_worker(active, session.user_id))
+            ):
+                await run_sync_in_worker(
+                    self._session_service.session_operation_authority.mutate,
+                    session_operation_lease.context,
+                    lambda tx: tx.runs.mark_recovery_required(run_id=run.id, reason=RecoveryRequiredReason.COMPATIBILITY_MISMATCH),
+                )
+                return False
+        if restored is None:
+            try:
+                restored = await self._restore_admitted_run(
+                    run,
+                    user_id=session.user_id,
+                    auth_provider_type=session.auth_provider_type,
+                    session_operation_context=session_operation_lease.context,
+                )
+            except ExecutionEnvelopeRefused as exc:
+                await self._record_recovery_refusal(run.id, session_operation_lease, exc)
+                return False
         shutdown_event = threading.Event()
         with self._shutdown_events_lock:
             self._shutdown_events[str(run.id)] = shutdown_event
@@ -2619,6 +2915,18 @@ class ExecutionServiceImpl:
         admission_refusal_pending = False
         try:
             session_operation_lease.guard_external_effect()
+            approval_inputs: ApprovalGateInputs | None = None
+            if durable_admission and self._settings.workflow_governance == "on":
+                approval_settings = frozen_run_settings if restored_envelope is None else restored_envelope.settings
+                if approval_settings is None or user_id is None:
+                    raise AuditIntegrityError("Governed worker start requires frozen settings and an authenticated user")
+                approval_run = self._call_async(self._session_service.get_run(run_uuid))
+                approval_inputs = self._approval_inputs_from_frozen(
+                    approval_settings,
+                    user_id=user_id,
+                    session_id=approval_run.session_id,
+                    session_operation_context=session_operation_context,
+                )
             if durable_admission and restored_envelope is None:
                 admitted_run = self._call_async(self._session_service.get_run(run_uuid))
                 if admitted_run.cancel_requested_at is not None:
@@ -2627,9 +2935,16 @@ class ExecutionServiceImpl:
             if durable_admission:
                 from elspeth.web.coordination.contracts import StartPermitState
 
-                permit = self._call_async(
-                    self._session_service.assess_run_start_admission(run_uuid, session_operation_context=session_operation_context)
-                )
+                if approval_inputs is None:
+                    permit = self._call_async(
+                        self._session_service.assess_run_start_admission(run_uuid, session_operation_context=session_operation_context)
+                    )
+                else:
+                    permit = self._call_async(
+                        self._session_service.assess_run_start_admission(
+                            run_uuid, session_operation_context=session_operation_context, approval=approval_inputs
+                        )
+                    )
                 if (
                     permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}
                     or permit.execution_refusal is not None
@@ -2649,9 +2964,16 @@ class ExecutionServiceImpl:
                         )
                     )
                     frozen_run_settings = restored_envelope.settings
-                permit = self._call_async(
-                    self._session_service.issue_run_start_permit(run_uuid, session_operation_context=session_operation_context)
-                )
+                if approval_inputs is None:
+                    permit = self._call_async(
+                        self._session_service.issue_run_start_permit(run_uuid, session_operation_context=session_operation_context)
+                    )
+                else:
+                    permit = self._call_async(
+                        self._session_service.issue_run_start_permit(
+                            run_uuid, session_operation_context=session_operation_context, approval=approval_inputs
+                        )
+                    )
                 if (
                     permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}
                     or permit.execution_refusal is not None
@@ -2743,18 +3065,21 @@ class ExecutionServiceImpl:
                 )
             if raw_eligibility_config is None:
                 raise TypeError("Pipeline YAML must produce a mapping before sink effect eligibility")
+            from elspeth.web.execution.export_marking import operator_marked_config_dict
+
+            effective_eligibility_config = operator_marked_config_dict(raw_eligibility_config, self._settings)
             validate_sink_effect_eligibility_from_raw_config(
-                raw_eligibility_config,
+                effective_eligibility_config,
                 purpose=SinkEffectExecutionPurpose.RESUME if resume_existing else SinkEffectExecutionPurpose.FRESH,
             )
-            export_settings = validate_landscape_export_settings_from_raw_config(raw_eligibility_config)
+            export_settings = validate_landscape_export_settings_from_raw_config(effective_eligibility_config)
             # Session download authority does not grant access to deployment-wide
             # authentication history, including for restored or operator-authored runs.
             if export_settings.auth_events == "deployment_snapshot":
                 raise ValueError("landscape.export.auth_events=deployment_snapshot is not permitted in Web execution")
             if export_settings.enabled:
                 validate_sink_effect_eligibility_from_raw_config(
-                    raw_eligibility_config,
+                    effective_eligibility_config,
                     purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
                 )
 
@@ -3109,9 +3434,12 @@ class ExecutionServiceImpl:
             # Operator ${VAR} expansion remains available on the CLI loader,
             # load_settings().
             if resolved_dict is None:
-                settings = load_settings_from_yaml_string(pipeline_yaml, expand_env_vars=False)
+                if effective_eligibility_config is raw_eligibility_config:
+                    settings = load_settings_from_yaml_string(pipeline_yaml, expand_env_vars=False)
+                else:
+                    settings = load_settings_from_config_dict(effective_eligibility_config, expand_env_vars=False)
             else:
-                settings = load_settings_from_config_dict(resolved_dict, expand_env_vars=False)
+                settings = load_settings_from_config_dict(operator_marked_config_dict(resolved_dict, self._settings), expand_env_vars=False)
 
             # AWS ECS web execution is governed by operator-owned telemetry
             # routing. Apply the fixed task-local policy before graph/config
@@ -3123,6 +3451,10 @@ class ExecutionServiceImpl:
             from elspeth.web.operator_telemetry import apply_operator_pipeline_telemetry
 
             settings = apply_operator_pipeline_telemetry(settings, self._settings)
+            from elspeth.web.execution.export_marking import apply_operator_export_marking
+
+            effective_export = apply_operator_export_marking(settings.landscape.export, self._settings)
+            settings = settings.model_copy(update={"landscape": settings.landscape.model_copy(update={"export": effective_export})})
             if audit_safe_config is None:
                 parsed_audit_config = load_bounded_pipeline_yaml(pipeline_yaml)
                 if type(parsed_audit_config) is dict:
@@ -3191,34 +3523,6 @@ class ExecutionServiceImpl:
             session_operation_lease.guard_external_effect()
             if landscape_db is None:
                 landscape_db = open_landscape_db(self._settings)
-            session_operation_lease.guard_external_effect()
-            payload_store = FilesystemPayloadStore(base_path=self._settings.get_payload_store_path())
-
-            # Stage admitted blob_rows content into the run's payload store
-            # BEFORE the orchestrator runs: the blob_rows source validates
-            # every payload ref with ``exists()`` before emitting a row, and
-            # the consuming transform retrieves by content hash.
-            # ``read_blob_content`` re-verifies bytes against the blob's
-            # content_hash under the custody lock, and ``store()`` is
-            # content-addressed and idempotent, so re-staging an already
-            # present payload is a no-op.  The final equality check binds the
-            # two stores' identities: what the payload store now holds under
-            # ``expected_ref`` is byte-for-byte the session blob's content.
-            if admitted_blob_rows:
-                staging_blob_service = self._blob_service
-                if staging_blob_service is None:
-                    raise RuntimeError("blob_rows sources require BlobServiceProtocol wiring")
-                for staged_blob_id, expected_ref in admitted_blob_rows:
-                    if restored_envelope is not None:
-                        item = next(item for item in restored_envelope.blob_inputs if item.reference.blob_id == staged_blob_id)
-                        staged_content = read_retained_input(item.retained)
-                    else:
-                        staged_content = self._call_async(
-                            staging_blob_service.read_blob_content(staged_blob_id, session_operation_context=session_operation_context)
-                        )
-                    stored_ref = payload_store.store(staged_content)
-                    if stored_ref != expected_ref:
-                        raise BlobIntegrityError(str(staged_blob_id), expected=expected_ref, actual=stored_ref)
 
             # Fold aggregations into transforms, assemble PipelineConfig, and
             # run the four orchestrator route-target validators. The
@@ -3246,6 +3550,52 @@ class ExecutionServiceImpl:
                         plugin_snapshot=plugin_snapshot,
                     ),
                 )
+            if approval_inputs is not None:
+                actual_hash = stable_hash(pipeline_config.config)
+                if actual_hash != approval_inputs.config_hash:
+                    # The worker can materialize inline blob content and
+                    # secrets after the early permit check. Recheck the exact
+                    # Landscape-bound config before orchestrator I/O.
+                    actual_approval = replace(approval_inputs, config_hash=actual_hash)
+                    permit = self._call_async(
+                        self._session_service.assess_run_start_admission(
+                            run_uuid,
+                            session_operation_context=session_operation_context,
+                            approval=actual_approval,
+                        )
+                    )
+                    if permit.execution_refusal is None and permit.state is not StartPermitState.REFUSED:
+                        raise AuditIntegrityError("Changed runtime config did not persist an approval refusal")
+                    admission_refusal_pending = True
+                    self._call_async(self._settle_admission_refusal(run_uuid, session_operation_lease))
+                    return None
+
+            # No blob payload bytes enter durable runtime storage until the
+            # final Landscape config agrees with the approval binding.
+            session_operation_lease.guard_external_effect()
+            payload_store = FilesystemPayloadStore(base_path=self._settings.get_payload_store_path())
+
+            # Stage admitted blob_rows content before the orchestrator runs:
+            # the source validates each payload ref with ``exists()`` before
+            # emitting a row, and the transform retrieves by content hash.
+            # The blob read verifies bytes under the custody lock; store is
+            # content-addressed and idempotent. The equality check binds the
+            # run payload to the session blob's content identity.
+            if admitted_blob_rows:
+                staging_blob_service = self._blob_service
+                if staging_blob_service is None:
+                    raise RuntimeError("blob_rows sources require BlobServiceProtocol wiring")
+                for staged_blob_id, expected_ref in admitted_blob_rows:
+                    if restored_envelope is not None:
+                        item = next(item for item in restored_envelope.blob_inputs if item.reference.blob_id == staged_blob_id)
+                        staged_content = read_retained_input(item.retained)
+                    else:
+                        staged_content = self._call_async(
+                            staging_blob_service.read_blob_content(staged_blob_id, session_operation_context=session_operation_context)
+                        )
+                    stored_ref = payload_store.store(staged_content)
+                    if stored_ref != expected_ref:
+                        raise BlobIntegrityError(str(staged_blob_id), expected=expected_ref, actual=stored_ref)
 
             # Set up EventBus to bridge ProgressEvent -> RunEvent -> broadcaster.
             # _to_run_event is a pure mapping (system code) — let it crash.

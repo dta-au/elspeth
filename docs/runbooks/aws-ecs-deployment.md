@@ -1440,6 +1440,18 @@ background, including the alternative seed path and its hazards, is in the
 [Identity Providers guide](../guides/identity-providers.md), §Admitting the
 first person.
 
+For an existing pool crossing a pre-1.0 schema boundary, stop the old tasks
+and export the identity, grant and approver-edge cohort from the stopped
+Sessions store **before** the database owner drops it in the schema
+compatibility step. After initializing the recreated stores and bootstrapping
+the administrator, restore the eligible cohort and record the mapping, then
+send the operator notice. Follow the
+[identity workflow cutover handoff](identity-workflow-cutover.md); this is
+required before ordinary traffic and authenticated acceptance. If workflow
+governance is on, verify readiness, an active non-author approver and a fresh
+approval for a representative recreated composition. Former approvals,
+attestations and library rows remain only in the archive.
+
 The legacy browser-client settings (`oidc_*`), the browser-origin allowlist
 and the Cognito access-token audience-claim mode are deleted; a task
 definition that still exports any of them refuses to boot on an unknown

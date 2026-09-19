@@ -192,11 +192,13 @@ def _make_settings(*, fmt: str = "json", sign: bool = False, sink: str = "output
         sinks={sink: SimpleNamespace(options={})},
         landscape=SimpleNamespace(
             export=SimpleNamespace(
+                enabled=True,
                 format=fmt,
                 sign=sign,
                 signing_secret_ref="ELSPETH_SIGNING_KEY" if sign else None,
                 sink=sink,
                 include_raw_error_rows=include_raw_error_rows,
+                public_snapshot_config=lambda: {"compartment_id": "test-compartment"},
                 content_store=SimpleNamespace(content_store_id="archive-primary-v1", namespace="audit-export"),
             )
         ),

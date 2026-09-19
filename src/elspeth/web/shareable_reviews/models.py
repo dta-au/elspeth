@@ -220,9 +220,8 @@ class SharedInspectResponse(_StrictResponse):
     identity id the token signature binds — stable, but meaningless to a
     recipient who has no login. ``created_by_username`` is the sharer's
     human-readable name, frozen into the snapshot at mark-time, and is
-    what the reviewer's banner shows. It is ``None`` for snapshots minted
-    before the field existed; those blobs are immutable signed bytes and
-    cannot be backfilled, so the frontend falls back to the opaque id.
+    what the reviewer's banner shows. This release requires it in every
+    signed share snapshot.
 
     ``expires_at`` lets the frontend show "this link expires in N days"
     without re-decoding the token.
@@ -235,8 +234,6 @@ class SharedInspectResponse(_StrictResponse):
     yaml: str
     audit_readiness: AuditReadinessSnapshot
     created_by_user_id: str
-    # Required-but-nullable rather than defaulted: every producer must decide
-    # what attribution it has. Only the legacy-blob path may answer "none".
-    created_by_username: str | None
+    created_by_username: str
     created_at: datetime
     expires_at: datetime

@@ -3286,11 +3286,11 @@ audit_access_log_table = Table(
 # This comment used to continue "the history of record is the per-login
 # profile snapshot in the Landscape ``auth_events.metadata_json``". That
 # snapshot is NOT WRITTEN (measured 2026-09-07): the SSO login row's
-# ``metadata_json`` holds exactly ``{"method", "path"}`` -- ``routes.py``'s
-# ``record_login`` closure passes provider, user_id, username and
-# identity_id, ``record_login_success`` passes
-# ``metadata=_request_metadata(request)``, and ``_request_metadata`` in
-# ``web/auth/audit.py`` returns the HTTP method and path and nothing else.
+# ``metadata_json`` holds request method/path and ``compartment_id``; it
+# still has no profile snapshot. ``routes.py``'s ``record_login`` closure
+# passes provider, user_id, username and identity_id;
+# ``record_login_success`` passes ``metadata=_request_metadata(request)``,
+# which supplies method/path; the recorder adds ``compartment_id``.
 # The identity_id, provider, username and request_id it named are top-level
 # COLUMNS on ``auth_events``, not metadata keys.
 #

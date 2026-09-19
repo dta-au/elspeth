@@ -12,6 +12,7 @@ from typing import Any, Literal, TypedDict
 
 class AuditExportPublicConfig(TypedDict):
     auth_events: Literal["omitted", "deployment_snapshot"]
+    compartment_id: str
     chunking_algorithm_version: str
     export_format: str
     exporter_version: str

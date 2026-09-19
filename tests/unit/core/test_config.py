@@ -13,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 def _complete_audit_export_config(**overrides: object) -> dict[str, object]:
     config: dict[str, object] = {
         "enabled": True,
+        "compartment_id": "test-compartment",
         "sink": "audit_archive",
         "format": "csv",
         "signing_mode": "unsigned",

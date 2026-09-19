@@ -19,6 +19,7 @@ from elspeth.contracts.blobs import (
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.compartments import chat_ingress_input, compartment_ingress_record
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PipelinePlannerError, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
@@ -56,6 +57,7 @@ from .._helpers import (
     UserIdentity,
     WebRateLimiter,
     _cancel_on_client_disconnect,
+    _chat_ingress_inputs,
     _composer_heartbeat_cancel_of,
     _composer_progress_sink,
     _failure_log_request_id,
@@ -477,6 +479,22 @@ async def post_guided_plan(
             )
 
         state_dict = observed_state.to_dict()
+        checkpoint_meta = dict(deep_thaw(observed_record.composer_meta)) if observed_record and observed_record.composer_meta else {}
+        checkpoint_meta["ingress"] = compartment_ingress_record(
+            origin.content,
+            own_compartment_id=request.app.state.settings.compartment_id,
+        )
+        checkpoint_meta["chat_ingress_inputs"] = [
+            *_chat_ingress_inputs(
+                await service.get_messages(session_id, limit=None),
+                own_compartment_id=request.app.state.settings.compartment_id,
+            ),
+            chat_ingress_input(
+                message_id=str(origin.message_id),
+                text=origin.content,
+                own_compartment_id=request.app.state.settings.compartment_id,
+            ),
+        ]
         checkpoint_data = CompositionStateData(
             sources=state_dict["sources"],
             nodes=state_dict["nodes"],
@@ -485,7 +503,7 @@ async def post_guided_plan(
             metadata_=state_dict["metadata"],
             is_valid=observed_record.is_valid if observed_record is not None else False,
             validation_errors=observed_record.validation_errors if observed_record is not None else None,
-            composer_meta=observed_record.composer_meta if observed_record is not None else None,
+            composer_meta=checkpoint_meta,
         )
 
         async with _cancel_on_client_disconnect(request):
@@ -519,8 +537,8 @@ async def post_guided_plan(
             # GuidedOperationFailureCode (mirrors the freeform surface's
             # identical PlannerDeclined handling in ComposerServiceImpl).
             decline_text = outcome.decline_text.strip() or _EMPTY_DECLINE_FALLBACK
-            # The checkpoint above copies ``observed_record.composer_meta``
-            # verbatim, so a guided walk holding a pending proposal carries
+            # The checkpoint above carries ``observed_record.composer_meta``
+            # with the new input provenance, so a guided walk holding a pending proposal carries
             # that proposal across this settlement. Its anchor has to follow
             # the row being written or every later currency check names a
             # checkpoint that is no longer current — the same permanent brick

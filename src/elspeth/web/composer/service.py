@@ -70,6 +70,7 @@ from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREF
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, chat_ingress_input, compartment_ingress_record
 from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer import tool_error_payloads as _tool_error_payloads
 from elspeth.web.composer import yaml_generator
@@ -174,6 +175,7 @@ from elspeth.web.composer.prompts import (
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
+    COMPOSER_HISTORY_USER_MESSAGE_ID_KEY,
     PIPELINE_STAGED_AUTO_COMMIT_MESSAGE,
     PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE,
     PIPELINE_STAGED_REVIEW_MESSAGE,
@@ -1590,6 +1592,36 @@ _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS: Final[int] = 8
 _TRAINED_OPERATOR_COMPOSITION_ROOT = object()
 
 
+def _chat_ingress_inputs_for_compose(
+    message: str,
+    messages: list[ComposerHistoryMessage],
+    *,
+    user_message_id: str | None,
+    own_compartment_id: str | None,
+) -> list[ChatIngressInput]:
+    """Carry exact, durable human input evidence through mid-turn state writes."""
+    inputs: list[ChatIngressInput] = []
+    for history_message in messages:
+        if type(history_message) is not dict:
+            raise InvariantError("composer chat history entries must be exact dictionaries")
+        if COMPOSER_HISTORY_USER_AUTHORED_KEY not in history_message:
+            continue
+        if history_message[COMPOSER_HISTORY_USER_AUTHORED_KEY] is not True or history_message["role"] != "user":
+            raise InvariantError("composer user-authorship marker is malformed")
+        if COMPOSER_HISTORY_USER_MESSAGE_ID_KEY not in history_message:
+            raise AuditIntegrityError("persisted human chat history is missing its message id")
+        inputs.append(
+            chat_ingress_input(
+                history_message[COMPOSER_HISTORY_USER_MESSAGE_ID_KEY],
+                history_message["content"],
+                own_compartment_id=own_compartment_id,
+            )
+        )
+    if user_message_id is not None:
+        inputs.append(chat_ingress_input(user_message_id, message, own_compartment_id=own_compartment_id))
+    return inputs
+
+
 def _freeform_planner_conversation_context(
     message: str,
     messages: list[ComposerHistoryMessage],
@@ -2582,6 +2614,9 @@ class ComposerServiceImpl:
     def _state_payload_for_compose_turn(
         self,
         response: Any,
+        *,
+        ingress: CompositionIngressRecord | None = None,
+        chat_ingress_inputs: list[ChatIngressInput] | None = None,
     ) -> Any:
         """Build a StatePayload for the current interim Step 2 redacted row.
 
@@ -2627,7 +2662,11 @@ class ComposerServiceImpl:
                 metadata_=state_d["metadata"],
                 is_valid=result.validation.is_valid and not pending_sites,
                 validation_errors=validation_errors,
-                composer_meta={"validation_lane": "authoring_only"},
+                composer_meta={
+                    "validation_lane": "authoring_only",
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                },
             ),
             # persist_compose_turn inserts composition state rows under
             # the session write lock and re-derives
@@ -5214,6 +5253,8 @@ class ComposerServiceImpl:
         # (elspeth-d581b3da7f), so a missed site must fail loudly here rather
         # than default to None.
         persisted_assistant_content: str | None,
+        ingress: CompositionIngressRecord | None = None,
+        chat_ingress_inputs: list[ChatIngressInput] | None = None,
         advisor_repair_context_introduced: bool = False,
     ) -> _PersistOutcome:
         """Phase P4 of the compose loop — delegates to :func:`turn_audit.persist_turn_audit`."""
@@ -5241,6 +5282,8 @@ class ComposerServiceImpl:
             persisted_tool_call_turn=persisted_tool_call_turn,
             persisted_assistant_message_id=persisted_assistant_message_id,
             persisted_assistant_content=persisted_assistant_content,
+            ingress=ingress,
+            chat_ingress_inputs=chat_ingress_inputs,
             assistant_row_uses_current_dispatch=not advisor_repair_context_introduced,
         )
 
@@ -6707,6 +6750,17 @@ class ComposerServiceImpl:
                 a fresh recorder for direct and test-only callers.
         """
         initial_version = state.version
+        ingress = compartment_ingress_record(message, own_compartment_id=self._settings.compartment_id) if session_id is not None else None
+        chat_ingress_inputs = (
+            _chat_ingress_inputs_for_compose(
+                message,
+                messages,
+                user_message_id=user_message_id,
+                own_compartment_id=self._settings.compartment_id,
+            )
+            if session_id is not None
+            else None
+        )
         # F-5c. On the first compose-loop entry of this service instance,
         # upsert the composer skill markdown into
         # ``skill_markdown_history`` so an auditor inspecting a future
@@ -7012,6 +7066,8 @@ class ComposerServiceImpl:
                         persisted_tool_call_turn=_persisted_tool_call_turn,
                         persisted_assistant_message_id=_persisted_assistant_message_id,
                         persisted_assistant_content=_persisted_assistant_content,
+                        ingress=ingress,
+                        chat_ingress_inputs=chat_ingress_inputs,
                         advisor_repair_context_introduced=_advisor_repair_context_introduced,
                     )
                 return (

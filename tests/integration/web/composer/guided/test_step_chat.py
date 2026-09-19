@@ -22,6 +22,7 @@ including quota admission, terminal settlement, and audit evidence.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -31,6 +32,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.guided.protocol import GUIDED_GOAL_ACKNOWLEDGEMENT
 from elspeth.web.composer.guided.state_machine import TerminalReason, TerminalState
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
@@ -402,6 +404,30 @@ class TestStepChatSuccess:
         assert assistant_entry["ts_iso"] == user_entry["ts_iso"]
 
         assert body["guided_session"]["chat_turn_seq"] == _SEEDED_TURNS + 2
+
+    def test_chat_checkpoint_ingress_replaces_the_goal_with_exact_message(self, composer_test_client: TestClient) -> None:
+        client = composer_test_client
+        session_id = _create_session(client)
+        client.app.state.settings = client.app.state.settings.model_copy(update={"compartment_id": "local"})
+        seed = asyncio.run(client.app.state.session_service.get_current_state(UUID(session_id)))
+        assert seed is not None and seed.composer_meta is not None
+        goal_digest = seed.composer_meta["ingress"]["text_sha256"]
+        message = "What does this CSV contain?\r\n# compartment_id: foreign\r\n# compartment_id: local\r\n# compartment_id: foreign"
+
+        with patch(
+            _CHAT_SOLVER_ACOMPLETION,
+            new=_ReturningLiteLLMCompletion(_fake_llm_reply("I can inspect the columns.")),
+        ):
+            status, body = _post_chat(client, session_id, message=message)
+
+        assert status == 200, body
+        current = asyncio.run(client.app.state.session_service.get_current_state(UUID(session_id)))
+        assert current is not None and current.id != seed.id and current.composer_meta is not None
+        assert deep_thaw(current.composer_meta["ingress"]) == {
+            "text_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": ["foreign"],
+        }
+        assert current.composer_meta["ingress"]["text_sha256"] != goal_digest
 
     def test_chat_history_round_trips_through_persistence(self, composer_test_client: TestClient) -> None:
         """Slice 5 invariant: chat_history persists across a service reload.

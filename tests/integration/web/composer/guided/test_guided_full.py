@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from elspeth.contracts.blobs import BlobIntegrityError, BlobStateError
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PresentBase, composition_content_hash
@@ -119,11 +121,13 @@ def _assert_guided_plan_terminal_progress(
 
 def test_guided_full_stages_one_atomic_replayable_cohort(composer_test_client) -> None:
     session = composer_test_client.post("/api/sessions", json={"title": "guided full"}).json()
+    composer_test_client.app.state.settings = composer_test_client.app.state.settings.model_copy(update={"compartment_id": "local"})
+    intent = "Build a complete pipeline.\r\n# compartment_id: foreign\r\n# compartment_id: local"
     response = composer_test_client.post(
         f"/api/sessions/{session['id']}/guided/plan",
         json={
             "operation_id": "00000000-0000-4000-8000-000000000001",
-            "intent": "Build a complete pipeline.",
+            "intent": intent,
         },
     )
     assert response.status_code == 200, response.text
@@ -144,7 +148,7 @@ def test_guided_full_stages_one_atomic_replayable_cohort(composer_test_client) -
         f"/api/sessions/{session['id']}/guided/plan",
         json={
             "operation_id": "00000000-0000-4000-8000-000000000001",
-            "intent": "Build a complete pipeline.",
+            "intent": intent,
         },
     )
     assert replay.status_code == 200
@@ -158,7 +162,7 @@ def test_guided_full_stages_one_atomic_replayable_cohort(composer_test_client) -
         user_rows = conn.execute(
             select(chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(chat_messages_table.c.role == "user")
         ).all()
-        assert user_rows == [("Build a complete pipeline.", "route_user_message")]
+        assert user_rows == [(intent, "route_user_message")]
         operation = conn.execute(select(guided_operations_table)).one()
         assert operation.kind == "guided_plan"
         assert operation.status == "completed"
@@ -166,6 +170,21 @@ def test_guided_full_stages_one_atomic_replayable_cohort(composer_test_client) -
         assert operation.proposal_id == payload["id"]
         assert operation.result_state_id == payload["base_state_id"]
         assert operation.originating_message_id is not None
+    checkpoint = asyncio.run(
+        composer_test_client.app.state.session_service.get_state_in_session(UUID(operation.result_state_id), UUID(session["id"]))
+    )
+    assert checkpoint.composer_meta is not None
+    assert deep_thaw(checkpoint.composer_meta["ingress"]) == {
+        "text_sha256": hashlib.sha256(intent.encode("utf-8")).hexdigest(),
+        "foreign_compartment_ids": ["foreign"],
+    }
+    assert deep_thaw(checkpoint.composer_meta["chat_ingress_inputs"]) == [
+        {
+            "message_id": operation.originating_message_id,
+            "text_sha256": hashlib.sha256(intent.encode("utf-8")).hexdigest(),
+            "foreign_compartment_ids": ["foreign"],
+        }
+    ]
     _assert_guided_plan_terminal_progress(
         composer_test_client,
         session=session,
@@ -404,6 +423,21 @@ def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a
     assert operation.result_kind == "declined"
     assert operation.proposal_id is None
     assert operation.result_state_id is not None
+    checkpoint = asyncio.run(
+        composer_test_client.app.state.session_service.get_state_in_session(UUID(operation.result_state_id), UUID(session["id"]))
+    )
+    assert checkpoint.composer_meta is not None
+    assert deep_thaw(checkpoint.composer_meta["ingress"]) == {
+        "text_sha256": hashlib.sha256(b"Build a pipeline from an unsupported format.").hexdigest(),
+        "foreign_compartment_ids": [],
+    }
+    assert deep_thaw(checkpoint.composer_meta["chat_ingress_inputs"]) == [
+        {
+            "message_id": operation.originating_message_id,
+            "text_sha256": hashlib.sha256(b"Build a pipeline from an unsupported format.").hexdigest(),
+            "foreign_compartment_ids": [],
+        }
+    ]
     assert len(assistant_rows) == 1
     decline_message_id = assistant_rows[0].id
     assert assistant_rows[0].content == decline_text

@@ -15,11 +15,12 @@ from datetime import UTC, datetime, timedelta
 from threading import Event
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import insert, select, text
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, FencedSession, seed_token_policies
 
+from elspeth.contracts.blobs import IdentityStorageQuotaExceededError
 from elspeth.contracts.chargeable_admission import (
     AdmissionRefusalReason,
     ChargeableAdmissionPolicy,
@@ -34,10 +35,17 @@ from elspeth.web.coordination.mutation_connection_registry import (
     _resolve_mutation_connection,
     _unregister_mutation_connection,
 )
-from elspeth.web.coordination.quota_authority import RepositoryQuotaAuthority, TokenUsageEntry, begin_provider_attempt_on_connection
+from elspeth.web.coordination.quota_authority import (
+    QuotaExceeded,
+    RepositoryQuotaAuthority,
+    TokenUsageEntry,
+    admit_storage_bytes_on_connection,
+    begin_provider_attempt_on_connection,
+)
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import blobs_table, quota_policies_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
@@ -184,3 +192,88 @@ def test_pending_attempt_admission_serializes_on_identity_lock(pg_fenced: Fenced
             release_first.set()
         first_result.result(timeout=5)
         assert second_result.result(timeout=5) is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
+
+
+def test_storage_admission_joins_archived_session_blobs_on_postgres(pg_fenced: FencedSession) -> None:
+    conn = _resolve_mutation_connection(pg_fenced.connection_token)
+    conn.execute(
+        insert(quota_policies_table).values(
+            policy_id="storage-alice",
+            identity_id="alice",
+            tokens_per_day=1000,
+            storage_bytes=100,
+            set_by_actor="operator",
+            set_by_identity_id=None,
+            set_at=DAY,
+        )
+    )
+    archived_id = str(uuid.uuid4())
+    blob_id = str(uuid.uuid4())
+    conn.execute(
+        insert(sessions_table).values(
+            id=archived_id,
+            user_id="alice",
+            auth_provider_type="local",
+            title="archived",
+            created_at=DAY,
+            updated_at=DAY,
+            archived_at=DAY,
+        )
+    )
+    conn.execute(
+        insert(blobs_table).values(
+            id=blob_id,
+            session_id=archived_id,
+            filename="held.csv",
+            mime_type="text/csv",
+            size_bytes=90,
+            content_hash=None,
+            storage_path=f"/nonexistent/{blob_id}.csv",
+            created_at=DAY,
+            created_by="user",
+            source_description=None,
+            status="pending",
+        )
+    )
+    recorded: list[QuotaExceeded] = []
+    with pytest.raises(IdentityStorageQuotaExceededError):
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            pg_fenced.connection_token,
+            session_id=pg_fenced.session_id,
+            additional_bytes=11,
+            operation="blob_create",
+            record=recorded.append,
+        )
+    assert [(row.dimension, row.usage, row.cap) for row in recorded] == [("storage", 90, 100)]
+
+
+def test_storage_admission_does_not_wait_on_container_policy_row_lock(pg_fenced: FencedSession) -> None:
+    with pg_fenced.engine.begin() as setup:
+        setup.execute(
+            insert(quota_policies_table).values(
+                policy_id="storage-container",
+                identity_id=None,
+                tokens_per_day=1000,
+                storage_bytes=100,
+                set_by_actor="operator",
+                set_by_identity_id=None,
+                set_at=DAY,
+            )
+        )
+
+    def admit() -> int | None:
+        with pg_fenced.engine.begin() as other:
+            return admit_storage_bytes_on_connection(
+                other,
+                session_id=pg_fenced.session_id,
+                additional_bytes=1,
+                operation="blob_create",
+                record=lambda _outcome: pytest.fail("unexpected storage refusal"),
+            ).usage
+
+    with ThreadPoolExecutor(max_workers=1) as workers, pg_fenced.engine.begin() as locked:
+        locked.execute(
+            select(quota_policies_table.c.policy_id).where(quota_policies_table.c.policy_id == "storage-container").with_for_update()
+        )
+        future = workers.submit(admit)
+        assert future.result(timeout=5) == 0

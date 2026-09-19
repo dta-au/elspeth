@@ -2,6 +2,8 @@
 import { create } from "zustand";
 import type { BlobMetadata } from "@/types/api";
 import * as api from "@/api/client";
+import type { ApiError } from "@/types/index";
+import { storageQuotaMessage } from "@/utils/bytes";
 
 interface BlobUploadOptions {
   /** Request-owner fence for publishing a mapped upload error. */
@@ -144,8 +146,11 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       }));
       return blob;
     } catch (err) {
+      const quotaRefusal = (err as Partial<ApiError>).storage_quota;
       const detail =
-        (err as { status?: number }).status === 413
+        (err as { status?: number }).status === 413 && quotaRefusal !== undefined
+          ? storageQuotaMessage(quotaRefusal)
+          : (err as { status?: number }).status === 413
           ? "File exceeds the maximum upload size."
           : (err as { status?: number }).status === 415
             ? "Unsupported file type. Please use CSV, JSON, JSONL, or plain text."

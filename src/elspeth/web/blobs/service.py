@@ -60,11 +60,17 @@ from elspeth.web.blobs.protocol import (
     BlobRunLinkRecord,
     BlobStateError,
     InlineCustodyRequest,
+    StorageAccountingUnavailableError,
     StorageMimeType,
     fork_blob_id,
     names_same_blob,
 )
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
+from elspeth.web.coordination.quota_authority import (
+    QuotaExceeded,
+    admit_storage_bytes_on_connection,
+    refuse_unrecorded_quota_exceeded,
+)
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import (
     _run_lock_cleanup,
@@ -1379,6 +1385,7 @@ def _reserve_pending_blob(
     idempotent: bool,
     fork_write_fence: BlobForkWriteFence | None,
     guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
+    quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
 ) -> tuple[Row[Any], bool]:
     session_id = expected["session_id"]
     with _blob_phase_transaction(engine, held_connection) as conn:
@@ -1397,6 +1404,13 @@ def _reserve_pending_blob(
                 session_id,
                 additional_bytes=expected["size_bytes"],
                 max_storage_per_session=max_storage_per_session,
+            )
+            admit_storage_bytes_on_connection(
+                conn,
+                session_id=session_id,
+                additional_bytes=expected["size_bytes"],
+                operation="session_fork",
+                record=quota_exceeded_recorder,
             )
             try:
                 with conn.begin_nested():
@@ -1512,6 +1526,7 @@ def _persist_blob_content(
     write_guard: Callable[[], None] | None = None,
     session_operation_authority: SessionOperationAuthority | None = None,
     session_operation_context: SessionOperationContext | None = None,
+    quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
 ) -> Row[Any] | BlobRecord:
     """Persist one blob through committed reservation, file, and ready phases."""
     if type(blob_id) is not UUID:
@@ -1621,6 +1636,7 @@ def _persist_blob_content(
             data_dir,
             max_storage_per_session,
             session_operation_authority=session_operation_authority,
+            quota_exceeded_recorder=quota_exceeded_recorder,
         )
         return service._persist_fenced_blob_record(
             reservation,
@@ -1645,6 +1661,7 @@ def _persist_blob_content(
                 idempotent=idempotent,
                 fork_write_fence=fork_write_fence,
                 guided_operation_write_fence=guided_operation_write_fence,
+                quota_exceeded_recorder=quota_exceeded_recorder,
             )
             storage_existed_before_write = storage.exists()
             try:
@@ -2021,6 +2038,7 @@ def persist_inline_custody_blob_on_connection(
     staged: StagedInlineCustody,
     max_storage_per_session: int,
     write_fence: BlobGuidedOperationWriteFence | None,
+    quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
 ) -> tuple[Row[Any], InlineCustodyPublication]:
     """Insert pre-staged metadata into the originating message/proposal cohort.
 
@@ -2072,6 +2090,13 @@ def persist_inline_custody_blob_on_connection(
             session_id,
             additional_bytes=expected["size_bytes"],
             max_storage_per_session=max_storage_per_session,
+        )
+        admit_storage_bytes_on_connection(
+            conn,
+            session_id=session_id,
+            additional_bytes=expected["size_bytes"],
+            operation="inline_custody",
+            record=quota_exceeded_recorder,
         )
         _insert_pending_blob_row(conn, blob_id=blob_id, storage=storage, expected=expected)
         row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
@@ -2430,10 +2455,12 @@ class BlobServiceImpl:
         max_storage_per_session: int = 500 * 1024 * 1024,
         *,
         session_operation_authority: SessionOperationAuthority | None = None,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
     ) -> None:
         self._engine = engine
         self._data_dir = data_dir.expanduser().resolve()
         self._max_storage_per_session = max_storage_per_session
+        self._quota_exceeded_recorder = quota_exceeded_recorder
         if session_operation_authority is None:
             # The dialect-derived default is the same authority the session
             # service builds over this engine; a deployment that wires one
@@ -2441,11 +2468,11 @@ class BlobServiceImpl:
             if engine.dialect.name == "sqlite":
                 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 
-                session_operation_authority = SQLiteLocalSessionOperationAuthority(engine)
+                session_operation_authority = SQLiteLocalSessionOperationAuthority(engine, quota_exceeded_recorder=quota_exceeded_recorder)
             elif engine.dialect.name == "postgresql":
                 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 
-                session_operation_authority = PostgresSessionOperationRepository(engine)
+                session_operation_authority = PostgresSessionOperationRepository(engine, quota_exceeded_recorder=quota_exceeded_recorder)
             else:
                 raise NotImplementedError(f"Session operation authority is not implemented for dialect {engine.dialect.name}")
         self._session_operation_authority = session_operation_authority
@@ -3731,11 +3758,10 @@ class BlobServiceImpl:
                             size_bytes=len(file_bytes),
                             content_hash_val=content_hash(file_bytes),
                         )
-                    except BlobQuotaExceededError as exc:
+                    except (BlobQuotaExceededError, StorageAccountingUnavailableError) as exc:
                         blob_errors.append(BlobFinalizationError(blob_id=blob_id, exc_type=type(exc).__name__, detail=str(exc)))
-                        # Run succeeded but this blob would breach the
-                        # session quota — mark as error so the run
-                        # finalization isn't aborted entirely.
+                        # A bound was exceeded or accounting could not be
+                        # measured. Keep the run output out of ready state.
                         # Delete the backing file to prevent untracked
                         # disk growth from repeated over-quota outputs.
                         self._mark_output_blob_error_and_remove_bytes(
@@ -4012,6 +4038,13 @@ class BlobServiceImpl:
                         additional_bytes=missing_bytes,
                         max_storage_per_session=self._max_storage_per_session,
                     )
+                    admit_storage_bytes_on_connection(
+                        conn,
+                        session_id=target_session_id_str,
+                        additional_bytes=missing_bytes,
+                        operation="session_fork",
+                        record=self._quota_exceeded_recorder,
+                    )
                 return tuple(source_records)
 
         await checkpoint()
@@ -4076,6 +4109,7 @@ class BlobServiceImpl:
                     idempotent=True,
                     fork_write_fence=write_fence,
                     write_guard=authority.require,
+                    quota_exceeded_recorder=self._quota_exceeded_recorder,
                 )
                 if isinstance(persisted, BlobRecord):
                     raise AuditIntegrityError("composite fork persistence returned a session-operation record")

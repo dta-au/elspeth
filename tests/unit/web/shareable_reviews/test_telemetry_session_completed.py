@@ -116,6 +116,7 @@ class _ReadinessServiceFake:
 @dataclass(frozen=True, slots=True)
 class _ShareReviewSettingsFake:
     shareable_link_lifetime_seconds: int
+    compartment_id: str | None
 
 
 @pytest.fixture
@@ -289,7 +290,7 @@ def _build_service_with_fresh_telemetry(  # type: ignore[no-untyped-def]
     session_service = _SessionServiceFake(session_record=session_record, state_record=state_record)
     execution_service = _ExecutionServiceFake(validation=_ok_validation())
     readiness_service = _ReadinessServiceFake(readiness=readiness)
-    settings = _ShareReviewSettingsFake(shareable_link_lifetime_seconds=30 * 24 * 3600)
+    settings = _ShareReviewSettingsFake(shareable_link_lifetime_seconds=30 * 24 * 3600, compartment_id="own")
 
     telemetry = build_sessions_telemetry()
 

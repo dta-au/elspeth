@@ -52,6 +52,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.compartments import is_compartment_id
 from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -93,6 +94,12 @@ from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 # whose audit row already wrote).
 from elspeth.web.composer.telemetry_phase8 import record_interpretation_opt_out
 from elspeth.web.composer.tools import is_blob_store_only_mutation_tool
+from elspeth.web.coordination.approval_authority import (
+    ApprovalGateInputs,
+    ApprovalSupersession,
+    refuse_unrecorded_approval_supersession,
+    supersede_open_approvals,
+)
 from elspeth.web.coordination.contracts import (
     ArchiveManifestRelation,
     CancellationSource,
@@ -678,6 +685,44 @@ def _composition_state_data_content_hash(state: CompositionStateData) -> str:
             "metadata": state.metadata_,
         }
     )
+
+
+def _valid_compartment_ingress_metadata(value: object) -> bool:
+    """Keep guided checkpoint ingress in the exact, content-free evidence shape."""
+    if type(value) is not dict or set(value) != {"text_sha256", "foreign_compartment_ids"}:
+        return False
+    digest = value["text_sha256"]
+    foreign_ids = value["foreign_compartment_ids"]
+    return (
+        is_lower_sha256_hex(digest)
+        and type(foreign_ids) is list
+        and all(type(identifier) is str and is_compartment_id(identifier) for identifier in foreign_ids)
+        and foreign_ids == sorted(set(foreign_ids))
+    )
+
+
+def _valid_chat_ingress_inputs_metadata(value: object) -> bool:
+    """Accept only ordered, distinct durable chat IDs with exact content-free evidence."""
+    if type(value) is not list:
+        return False
+    seen: set[str] = set()
+    for item in value:
+        if type(item) is not dict or set(item) != {"message_id", "text_sha256", "foreign_compartment_ids"}:
+            return False
+        message_id = item["message_id"]
+        if type(message_id) is not str:
+            return False
+        try:
+            if str(UUID(message_id)) != message_id:
+                return False
+        except ValueError:
+            return False
+        if message_id in seen or not _valid_compartment_ingress_metadata(
+            {"text_sha256": item["text_sha256"], "foreign_compartment_ids": item["foreign_compartment_ids"]}
+        ):
+            return False
+        seen.add(message_id)
+    return True
 
 
 def _final_composer_metadata_hash(metadata: Mapping[str, Any] | None) -> str:
@@ -4427,6 +4472,7 @@ class SessionServiceImpl:
         runtime_preflight: SessionRuntimePreflight | None = None,
         chargeable_admission_policy: ChargeableAdmissionPolicy | None = None,
         quota_exceeded_recorder: Callable[[QuotaExceeded], None] = _refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
     ) -> None:
         from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 
@@ -4446,6 +4492,7 @@ class SessionServiceImpl:
             secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash
         )
         self._quota_exceeded_recorder = quota_exceeded_recorder
+        self._approval_supersession_recorder = approval_supersession_recorder
         if owner_instance_id is not None and (type(owner_instance_id) is not str or not owner_instance_id.strip()):
             raise ValueError("owner_instance_id must be a nonblank exact string")
         if type(session_operation_lease_seconds) is not int or not 1 <= session_operation_lease_seconds <= 3600:
@@ -4454,9 +4501,13 @@ class SessionServiceImpl:
         self._session_operation_lease_seconds = session_operation_lease_seconds
         if session_operation_authority is None:
             if engine.dialect.name == "sqlite":
-                session_operation_authority = SQLiteLocalSessionOperationAuthority(engine)
+                session_operation_authority = SQLiteLocalSessionOperationAuthority(
+                    engine, approval_supersession_recorder=approval_supersession_recorder
+                )
             elif engine.dialect.name == "postgresql":
-                session_operation_authority = PostgresSessionOperationRepository(engine)
+                session_operation_authority = PostgresSessionOperationRepository(
+                    engine, approval_supersession_recorder=approval_supersession_recorder
+                )
             else:
                 raise NotImplementedError(f"session operation authority not implemented for dialect {engine.dialect.name}")
         self._session_operation_authority = session_operation_authority
@@ -6423,6 +6474,12 @@ class SessionServiceImpl:
             conn,
             session_id=session_id,
             state_id=allocated_state_id,
+        )
+        supersede_open_approvals(
+            conn,
+            session_id=session_id,
+            now=database_now(conn),
+            record=self._approval_supersession_recorder,
         )
         return allocated_state_id
 
@@ -10079,18 +10136,45 @@ class SessionServiceImpl:
             ),
         )
 
-    async def assess_run_start_admission(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
-        return await self._audited_start_admission(
-            run_id,
-            session_operation_context=session_operation_context,
-            admit=lambda transaction: transaction.runs.assess_start_admission(run_id=run_id, policy=self._chargeable_admission_policy),
+    async def check_approval_binding(
+        self,
+        session_id: UUID,
+        state_id: UUID,
+        *,
+        approval: ApprovalGateInputs,
+        session_operation_context: SessionOperationContext,
+    ) -> AdmissionRefusalReason | None:
+        if session_operation_context.fence.session_id != str(session_id):
+            raise AuditIntegrityError("Approval preflight session custody mismatch")
+        return cast(
+            "AdmissionRefusalReason | None",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.runs.check_approval_binding(state_id=state_id, approval=approval),
+            ),
         )
 
-    async def issue_run_start_permit(self, run_id: UUID, *, session_operation_context: SessionOperationContext) -> RunStartPermitRecord:
+    async def assess_run_start_admission(
+        self, run_id: UUID, *, session_operation_context: SessionOperationContext, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord:
         return await self._audited_start_admission(
             run_id,
             session_operation_context=session_operation_context,
-            admit=lambda transaction: transaction.runs.issue_start_permit(run_id=run_id, policy=self._chargeable_admission_policy),
+            admit=lambda transaction: transaction.runs.assess_start_admission(
+                run_id=run_id, policy=self._chargeable_admission_policy, approval=approval
+            ),
+        )
+
+    async def issue_run_start_permit(
+        self, run_id: UUID, *, session_operation_context: SessionOperationContext, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord:
+        return await self._audited_start_admission(
+            run_id,
+            session_operation_context=session_operation_context,
+            admit=lambda transaction: transaction.runs.issue_start_permit(
+                run_id=run_id, policy=self._chargeable_admission_policy, approval=approval
+            ),
         )
 
     async def _audited_start_admission(
@@ -11355,7 +11439,13 @@ class SessionServiceImpl:
 
                 def _guided_checkpoint(composer_meta: object, *, role: str) -> GuidedSession:
                     metadata = deep_thaw(composer_meta)
-                    if type(metadata) is not dict or "guided_session" not in metadata or type(metadata["guided_session"]) is not dict:
+                    if (
+                        type(metadata) is not dict
+                        or "guided_session" not in metadata
+                        or type(metadata["guided_session"]) is not dict
+                        or ("ingress" in metadata and not _valid_compartment_ingress_metadata(metadata["ingress"]))
+                        or ("chat_ingress_inputs" in metadata and not _valid_chat_ingress_inputs_metadata(metadata["chat_ingress_inputs"]))
+                    ):
                         raise AuditIntegrityError(f"{role} deferred intent state has no exact guided checkpoint")
                     try:
                         return GuidedSession.from_dict(metadata["guided_session"])
@@ -11700,7 +11790,8 @@ class SessionServiceImpl:
                         raise AuditIntegrityError("guided-full observed composition content changed before staging")
 
                 # Interim fail-closed refusal (elspeth-da0e3db919). Staging
-                # copies the observed head's ``composer_meta`` verbatim, so a
+                # carries the observed head's guided checkpoint metadata
+                # (with the new input ingress record), so a
                 # guided walk mid-review carries its live ``active_proposal``
                 # onto this new checkpoint while the anchor keeps naming the
                 # PREVIOUS row — the identical stranding elspeth-ed67eb9d0d
@@ -11792,6 +11883,7 @@ class SessionServiceImpl:
                         conn=conn,
                         staged=staged_custody,
                         max_storage_per_session=command.custody_max_storage_per_session,
+                        quota_exceeded_recorder=self._quota_exceeded_recorder,
                         write_fence=BlobGuidedOperationWriteFence(
                             session_id=command.fence.session_id,
                             operation_id=command.fence.operation_id,
@@ -12147,7 +12239,13 @@ class SessionServiceImpl:
             raise AuditIntegrityError("guided proposal supersession id/hash binding is incomplete")
 
         metadata = deep_thaw(command.state.composer_meta)
-        if type(metadata) is not dict or set(metadata) != {"guided_session"}:
+        if (
+            type(metadata) is not dict
+            or not {"guided_session"} <= set(metadata)
+            or set(metadata) - {"guided_session", "ingress", "chat_ingress_inputs"}
+            or ("ingress" in metadata and not _valid_compartment_ingress_metadata(metadata["ingress"]))
+            or ("chat_ingress_inputs" in metadata and not _valid_chat_ingress_inputs_metadata(metadata["chat_ingress_inputs"]))
+        ):
             raise AuditIntegrityError("guided proposal checkpoint metadata is malformed")
         from elspeth.web.composer.guided.planning import (
             guided_candidate_state,
@@ -12747,7 +12845,13 @@ class SessionServiceImpl:
                     raise AuditIntegrityError("guided back-edit has no exact active review occurrence")
 
                 metadata = deep_thaw(command.state.composer_meta)
-                if type(metadata) is not dict or set(metadata) != {"guided_session"}:
+                if (
+                    type(metadata) is not dict
+                    or not {"guided_session"} <= set(metadata)
+                    or set(metadata) - {"guided_session", "ingress", "chat_ingress_inputs"}
+                    or ("ingress" in metadata and not _valid_compartment_ingress_metadata(metadata["ingress"]))
+                    or ("chat_ingress_inputs" in metadata and not _valid_chat_ingress_inputs_metadata(metadata["chat_ingress_inputs"]))
+                ):
                     raise AuditIntegrityError("guided back-edit candidate metadata is malformed")
                 try:
                     candidate_guided = GuidedSession.from_dict(metadata["guided_session"])
@@ -13288,7 +13392,13 @@ class SessionServiceImpl:
 
                 current_guided = state_from_record(current_record).guided_session
                 metadata = deep_thaw(command.state.composer_meta)
-                if current_guided is None or current_guided.active_proposal is None or type(metadata) is not dict:
+                if (
+                    current_guided is None
+                    or current_guided.active_proposal is None
+                    or type(metadata) is not dict
+                    or ("ingress" in metadata and not _valid_compartment_ingress_metadata(metadata["ingress"]))
+                    or ("chat_ingress_inputs" in metadata and not _valid_chat_ingress_inputs_metadata(metadata["chat_ingress_inputs"]))
+                ):
                     raise AuditIntegrityError("guided proposal acceptance checkpoint metadata is malformed")
                 _verify_guided_deferred_message_authority(
                     conn,

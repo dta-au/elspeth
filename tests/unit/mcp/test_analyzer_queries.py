@@ -2709,6 +2709,8 @@ class TestResolvedPromptTemplateHashAcrossReadSurfaces:
         assert mcp_op[0]["approved_prompt_artifact_hash"] == self.HASH
 
         # 3. Export records — both the state call and the operation call.
-        call_records = [r for r in LandscapeExporter(db).export_run(run_id) if r.get("record_type") == "call"]
+        call_records = [
+            r for r in LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id) if r.get("record_type") == "call"
+        ]
         exported_hashes = [r.get("approved_prompt_artifact_hash") for r in call_records]
         assert exported_hashes.count(self.HASH) == 2

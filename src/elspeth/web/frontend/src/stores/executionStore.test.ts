@@ -465,6 +465,24 @@ describe("executionStore.execute", () => {
     expect(runId).toBeNull();
     expect(state.error).toBe("A run is already in progress for this pipeline.");
   });
+
+  it.each([
+    ["approval_required", "Approval is required before this pipeline can run."],
+    ["approval_binding_mismatch", "The approval no longer matches this pipeline. Request a new approval."],
+  ])("shows %s as an approval refusal, not an active run", async (errorType, expected) => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValue({
+      status: 409,
+      error_type: errorType,
+      detail: `Run admission refused: ${errorType}`,
+    });
+
+    expect(await useExecutionStore.getState().execute("session-1")).toBeNull();
+    expect(useExecutionStore.getState().error).toBe(expected);
+    expect(useExecutionStore.getState().pendingApproval).toBe(expected);
+    useExecutionStore.getState().clearValidation();
+    expect(useExecutionStore.getState().pendingApproval).toBeNull();
+  });
 });
 
 function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostics {

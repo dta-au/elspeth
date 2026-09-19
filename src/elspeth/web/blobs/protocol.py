@@ -40,7 +40,9 @@ from elspeth.contracts.blobs import BlobServiceProtocol as BlobServiceProtocol
 from elspeth.contracts.blobs import BlobStateError as BlobStateError
 from elspeth.contracts.blobs import BlobStatus as BlobStatus
 from elspeth.contracts.blobs import FinalizeBlobStatus as FinalizeBlobStatus
+from elspeth.contracts.blobs import IdentityStorageQuotaExceededError as IdentityStorageQuotaExceededError
 from elspeth.contracts.blobs import InlineCustodyRequest as InlineCustodyRequest
+from elspeth.contracts.blobs import StorageAccountingUnavailableError as StorageAccountingUnavailableError
 from elspeth.contracts.blobs import StorageMimeType as StorageMimeType
 from elspeth.contracts.blobs import fork_blob_id as fork_blob_id
 from elspeth.contracts.blobs import names_same_blob as names_same_blob

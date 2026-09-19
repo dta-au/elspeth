@@ -16,7 +16,7 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.mutation_connection_registry import _resolve_mutation_connection
 from elspeth.web.coordination.quota_authority import RepositoryQuotaAuthority, utc_day_start
-from elspeth.web.sessions.models import identities_table, sessions_table
+from elspeth.web.sessions.models import identities_table, quota_policies_table, sessions_table
 
 
 class RepositoryChargeableAdmissionAuthority:
@@ -62,17 +62,32 @@ class RepositoryChargeableAdmissionAuthority:
         policies = RepositoryQuotaAuthority.active_policy(connection_token, identity_id=session.user_id)
         identity_policy = policies.identity
         container_policy = policies.container
+        # An administrator may explicitly revoke an identity's allowance.
+        # A container-only regime still admits identities that were never
+        # issued a person policy; historical revocation is the distinguishing
+        # fact that suspends this identity until an administrator reissues it.
+        identity_policy_revoked = (
+            identity_policy is None
+            and conn.execute(
+                select(quota_policies_table.c.policy_id)
+                .where(quota_policies_table.c.identity_id == session.user_id, quota_policies_table.c.revoked_at.is_not(None))
+                .limit(1)
+            ).first()
+            is not None
+        )
         # Boot settings supply issuance defaults and required policy slots;
         # they do not disable an explicit operator-authored allowance row.
-        if not policy.token_quota_configured and identity_policy is None and container_policy is None:
+        if not policy.token_quota_configured and identity_policy is None and container_policy is None and not identity_policy_revoked:
             return ChargeableAdmissionDecision(
                 refusal_reason=None,
                 evidence=AdmissionPolicyEvidence(
                     quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash=policy.secret_wiring_hash
                 ),
             )
-        missing = (policy.identity_token_quota_configured and identity_policy is None) or (
-            policy.container_token_quota_configured and container_policy is None
+        missing = (
+            identity_policy_revoked
+            or (policy.identity_token_quota_configured and identity_policy is None)
+            or (policy.container_token_quota_configured and container_policy is None)
         )
         if missing:
             return ChargeableAdmissionDecision(

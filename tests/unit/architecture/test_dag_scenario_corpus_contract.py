@@ -686,7 +686,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # Rotated for the approval-artifact audit field rename: canonical call material
 # now sorts approved_prompt_artifact_hash first. The terminal resume digest was
 # measured through the production harness; semantic oracle snapshots did not move.
-EXPECTED_CASE_REGISTRY_SHA256 = "8dce7592056dc5ff168f65c5c9df7084c1d2bedcd93fdeeb7350b1954b5b9aad"
+EXPECTED_CASE_REGISTRY_SHA256 = "9af816eaaaf97c64f4cc7a095703149f4936dc6988d093926e48640930e7f38a"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

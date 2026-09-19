@@ -312,7 +312,7 @@ _PRODUCTION_ENDPOINT_PREAMBLE_AST_SHA256 = {
     # delete_blob: the docstring names the idempotent, cleanup-capable contract.
     "delete_blob": "24bded45619a8b1ff30e436119136e59b1a8e8427fd205cac69cd09d3a96a04e",
 }
-_PRODUCTION_IMPORTS_AST_SHA256 = "ddba86cd52908d2d48352875cce8e6391dd9e343bc362998ac6059461cb177d8"
+_PRODUCTION_IMPORTS_AST_SHA256 = "7edde4d3577c43fa2859b5284663a6a27b17ba98d5a4f4a9e6a6c68ea862908d"
 _SYNTHETIC_IMPORTS_AST_SHA256 = "94033e0618e2844484fe405c1390874e190827ea0928d790784c88ca22422c20"
 _SYNTHETIC_DELETE_IMPORTS_AST_SHA256 = "495d568047a365b64f2ea5b19dc4f628b0a881f9580b622a6b524913ed180b99"
 _ROUTER_FACTORY_SIGNATURE_AST_SHA256 = "6662cca5c620abce45dd4871654fd02fea18f10e2ebfcb15db05f466dd165115"
@@ -323,8 +323,8 @@ _PRODUCTION_TOP_LEVEL_DEFINITIONS = (
     (ast.FunctionDef, "create_blobs_router"),
 )
 _PRODUCTION_ENDPOINT_POST_ACQUIRE_AST_SHA256 = {
-    "create_blob_upload": "f0e2e38eef879ccb4cf32ce6ae44e0d55d987f61e5ba652dc26a356dca915b84",
-    "create_blob_inline": "06259ae65e2a1df9b94e5335d754fec157a722be17c7056715817104c0db2c0f",
+    "create_blob_upload": "048d344a7d6939fc9ba4163f40b3cbc8356dabea3489180fd06322c36e95a035",
+    "create_blob_inline": "815f01692e5ac0dd77fae4ca3dcfb7caeb0c33995dfb2797c7e1e49ff5ebad8a",
     "get_blob_metadata": "6f5fecde5c973519d1f0f19cd46daa3c95365844275ad8802eb6a1963e5907e1",
     "download_blob_content": "de533132ec1ef83d39add60f4c16b3ac3230ebc0a4142dc5ce36b27357cc40ec",
     "preview_blob_content": "7ccaecad1d53f7b5db494ff1d06e9f23ead181d5b9eca977cae4eab8be957468",
