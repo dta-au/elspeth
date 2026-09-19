@@ -171,6 +171,7 @@ vi.mock("./ChatInput", async (importOriginal) => ({
     onBlobUploadCompleted,
     onBlobUploadRejected,
     onBlobUploadSettled,
+    uploadPromptSentence,
     uploadDisabled,
   }: {
     placeholder?: string;
@@ -190,6 +191,7 @@ vi.mock("./ChatInput", async (importOriginal) => ({
     ) => boolean;
     onBlobUploadRejected?: (requestId: string, sessionId: string) => boolean;
     onBlobUploadSettled?: (requestId: string, sessionId: string) => void;
+    uploadPromptSentence?: (filename: string) => string;
     uploadDisabled?: boolean;
   }) => (
     <>
@@ -246,7 +248,7 @@ vi.mock("./ChatInput", async (importOriginal) => ({
                 mockedChatInputUpload.acceptedRequestIds.push(queuedRequest.requestId);
                 onBlobUploaded?.(blob);
                 onChange?.(
-                  `${value ?? ""}${value ? "\n" : ""}I've uploaded "${blob.filename}"; please use it as the pipeline input.`,
+                  `${value ?? ""}${value ? "\n" : ""}${uploadPromptSentence?.(blob.filename) ?? `I've uploaded "${blob.filename}". Please use it for the role I describe, or ask whether it is a pipeline input, reference table, or LLM prompt.`}`,
                 );
               }
               onBlobUploadSettled?.(queuedRequest.requestId, queuedRequest.sessionId);
@@ -10006,6 +10008,9 @@ describe("freeform upload session fence (elspeth-341a3e2fc4)", () => {
     expect(
       screen.getByTestId("chat-input").getAttribute("data-value"),
     ).toContain('I\'ve uploaded "fast.csv"');
+    expect(
+      screen.getByTestId("chat-input").getAttribute("data-value"),
+    ).toContain("reference table, or LLM prompt");
   });
 
   it("suppresses a foreign-session upload failure alert but keeps the owning session's", async () => {

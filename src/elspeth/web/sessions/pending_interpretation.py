@@ -10,8 +10,10 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, TypedDict, cast, final
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, final
 from uuid import UUID
+
+from sqlalchemy import Connection
 
 from elspeth.contracts.composer_interpretation import (
     INTERPRETATION_HASH_DOMAIN_V2,
@@ -50,6 +52,7 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.guided_replay import validation_errors_for_composer_surface
+from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, SessionInlineBlobSnapshot
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
@@ -70,6 +73,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
+    from elspeth.contracts.blobs import BlobRecord
     from elspeth.web.catalog.protocol import CatalogService
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.schemas import ValidationResult
@@ -1572,13 +1576,18 @@ def _pending_interpretation_validation_candidate_digest(
 
 
 # Runtime-equivalent preflight for interpretation-resolution state writes:
-# ``(patched_state, user_id, session_id, plugin_snapshot) -> ValidationResult``.
+# A fifth frozen content reader is supplied only for inline-marker states.
 # Bound at app wiring over ``validate_pipeline`` with the app's settings and
 # secret resolver — the sessions layer never imports the execution stack.
-SessionRuntimePreflight = Callable[
-    ["CompositionState", str | None, str, "PluginAvailabilitySnapshot | None"],
-    "ValidationResult",
-]
+class SessionRuntimePreflight(Protocol):
+    def __call__(
+        self,
+        state: CompositionState,
+        user_id: str | None,
+        session_id: str,
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+        blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+    ) -> ValidationResult: ...
 
 
 def _validate_patched_composition_state_for_policy(
@@ -1614,6 +1623,9 @@ class _SessionPendingInterpretationValidator:
 
     __slots__ = (
         "__catalog",
+        "__expected_anchor",
+        "__expected_live",
+        "__inline_blob_snapshot",
         "__plugin_snapshot",
         "__profile_aware",
         "__profile_registry",
@@ -1630,6 +1642,9 @@ class _SessionPendingInterpretationValidator:
         profile_registry: OperatorProfileRegistry | None,
         catalog: CatalogService | None,
         runtime_preflight: SessionRuntimePreflight | None = None,
+        inline_blob_snapshot: SessionInlineBlobSnapshot | None = None,
+        expected_anchor: CompositionStateRecord | None = None,
+        expected_live: CompositionStateRecord | None = None,
         session_id: str,
         user_id: str | None,
     ) -> None:
@@ -1664,8 +1679,22 @@ class _SessionPendingInterpretationValidator:
         self.__profile_registry = profile_registry
         self.__catalog = catalog
         self.__runtime_preflight = runtime_preflight
+        self.__inline_blob_snapshot = inline_blob_snapshot
+        self.__expected_anchor = expected_anchor
+        self.__expected_live = expected_live
         self.__session_id = session_id
         self.__user_id = user_id
+
+    def assert_source_state(self, snapshot: SessionPendingInterpretationSnapshot) -> None:
+        """Refuse a candidate derived from different locked state rows."""
+        if self.__expected_anchor is not None and snapshot.anchor_state != self.__expected_anchor:
+            raise AuditIntegrityError("pending interpretation anchor changed after inline blob snapshot")
+        if self.__expected_live is not None and snapshot.live_state != self.__expected_live:
+            raise AuditIntegrityError("pending interpretation live state changed after inline blob snapshot")
+
+    def assert_current_blob_rows(self, conn: Connection, session_id: UUID) -> None:
+        if self.__inline_blob_snapshot is not None:
+            self.__inline_blob_snapshot.assert_current_rows(conn, session_id=session_id)
 
     def __call__(
         self,
@@ -1703,7 +1732,15 @@ class _SessionPendingInterpretationValidator:
         # interpretation-resolution row never claims validity over engine
         # stages the authoring validator cannot see.
         if is_valid and self.__runtime_preflight is not None:
-            runtime = self.__runtime_preflight(candidate_state, self.__user_id, self.__session_id, self.__plugin_snapshot)
+            inline_snapshot = self.__inline_blob_snapshot
+            if inline_snapshot is not None:
+                if not inline_snapshot.assert_covers(InlinePreflightState.from_composition_state(candidate_state)):
+                    raise AuditIntegrityError("pending interpretation candidate introduced an unprepared inline blob marker")
+                runtime = self.__runtime_preflight(
+                    candidate_state, self.__user_id, self.__session_id, self.__plugin_snapshot, inline_snapshot.content
+                )
+            else:
+                runtime = self.__runtime_preflight(candidate_state, self.__user_id, self.__session_id, self.__plugin_snapshot)
             if not runtime.is_valid:
                 is_valid = False
                 messages = (*messages, *(error.message for error in runtime.errors))
@@ -1755,6 +1792,8 @@ class _SessionPendingInterpretationPlanner:
         snapshot: SessionPendingInterpretationSnapshot,
         validator: SessionPendingInterpretationValidator,
     ) -> SessionPendingInterpretationDecision:
+        if type(validator) is _SessionPendingInterpretationValidator:
+            validator.assert_source_state(snapshot)
         event_id = command.event_id
         composition_state_id = command.composition_state_id
         affected_node_id = command.affected_node_id

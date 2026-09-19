@@ -22,6 +22,7 @@ prompt-patch can land on real node JSON.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -34,6 +35,7 @@ import structlog
 from sqlalchemy import insert, select, update
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.composer_interpretation import (
     INTERPRETATION_HASH_DOMAIN_V2,
     InterpretationChoice,
@@ -42,6 +44,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
@@ -68,6 +71,7 @@ from elspeth.web.interpretation_state import (
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
+    blobs_table,
     composition_states_table,
     interpretation_events_table,
     proposal_events_table,
@@ -1191,6 +1195,228 @@ async def _seed_authoring_valid_state(
         ),
         provenance="tool_call",
     )
+
+
+async def _seed_inline_reference_review_state(
+    service: SessionServiceImpl, *, session_id: UUID, blob_id: UUID, content: bytes
+) -> tuple[CompositionStateRecord, BlobRecord]:
+    await _seed_authoring_valid_state(service, session_id=session_id)
+    digest = hashlib.sha256(content).hexdigest()
+    pipeline = _authoring_valid_pipeline_dict()
+    pipeline["nodes"].insert(
+        0,
+        {
+            "id": "lookup",
+            "node_type": "transform",
+            "plugin": "reference_join",
+            "input": "input",
+            "on_success": "lookup_out",
+            "on_error": "discard",
+            "options": {
+                "reference_content": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": digest},
+                "reference_format": "csv",
+                "reference_key_name": "sku",
+                "key_field": "sku",
+                "output": {"description": "ref['description']"},
+            },
+        },
+    )
+    pipeline["nodes"][1]["input"] = "lookup_out"
+    state = await _save_composition_state(
+        service,
+        session_id,
+        CompositionStateData(
+            sources=pipeline["sources"],
+            nodes=pipeline["nodes"],
+            edges=pipeline["edges"],
+            outputs=pipeline["outputs"],
+            metadata_=pipeline["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    record = BlobRecord(
+        id=blob_id,
+        session_id=session_id,
+        filename="reference.csv",
+        mime_type="text/csv",
+        size_bytes=len(content),
+        content_hash=digest,
+        storage_path="/tmp/session-preflight-reference.csv",
+        created_at=datetime.now(UTC),
+        created_by="user",
+        source_description=None,
+        status="ready",
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(blobs_table).values(
+                id=str(blob_id),
+                session_id=str(session_id),
+                filename=record.filename,
+                mime_type=record.mime_type,
+                size_bytes=record.size_bytes,
+                content_hash=record.content_hash,
+                storage_path=record.storage_path,
+                created_at=record.created_at,
+                created_by=record.created_by,
+                source_description=None,
+                status=record.status,
+                creation_modality=record.creation_modality.value,
+            )
+        )
+    return state, record
+
+
+@pytest.mark.asyncio
+async def test_pending_inline_reference_uses_prepared_bytes_in_runtime_preflight(engine) -> None:
+    content = b"sku,description\nhats,A fine hat\n"
+    session_id = uuid4()
+    blob_id = uuid4()
+    record_holder: list[BlobRecord] = []
+    preflight_bytes: list[bytes] = []
+
+    def read_blob(context: SessionOperationContext, requested_id: UUID) -> tuple[BlobRecord, bytes]:
+        assert context.fence.session_id == str(session_id)
+        assert requested_id == blob_id
+        return record_holder[0], content
+
+    def runtime_preflight(_state, _user_id, _session_id, _plugin_snapshot, blob_get_content):
+        preflight_bytes.append(blob_get_content(blob_id)[1])
+        return _runtime_preflight_result(is_valid=True)
+
+    service = DualFencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+        runtime_preflight=runtime_preflight,
+        inline_blob_read=read_blob,
+    )
+    state, record = await _seed_inline_reference_review_state(service, session_id=session_id, blob_id=blob_id, content=content)
+    record_holder.append(record)
+    with engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(session_id)).values(interpretation_review_disabled=True))
+
+    async with _compose_operation(service, session_id) as context:
+        event = await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state.id,
+            affected_node_id="llm_transform_1",
+            tool_call_id="call_inline_pending",
+            user_term="cool",
+            kind=InterpretationKind.VAGUE_TERM,
+            llm_draft="creative",
+            model_identifier="test-model",
+            model_version="test-version",
+            provider="test",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
+    assert event.choice is InterpretationChoice.OPTED_OUT
+    assert preflight_bytes == [content]
+
+
+@pytest.mark.asyncio
+async def test_resolve_inline_reference_uses_prepared_bytes(engine) -> None:
+    content = b"sku,description\nhats,A fine hat\n"
+    session_id = uuid4()
+    blob_id = uuid4()
+    record_holder: list[BlobRecord] = []
+    preflight_bytes: list[bytes] = []
+
+    def read_blob(_context: SessionOperationContext, requested_id: UUID) -> tuple[BlobRecord, bytes]:
+        assert requested_id == blob_id
+        return record_holder[0], content
+
+    def runtime_preflight(_state, _user_id, _session_id, _plugin_snapshot, blob_get_content):
+        preflight_bytes.append(blob_get_content(blob_id)[1])
+        return _runtime_preflight_result(is_valid=True)
+
+    service = DualFencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+        runtime_preflight=runtime_preflight,
+        inline_blob_read=read_blob,
+    )
+    state, record = await _seed_inline_reference_review_state(service, session_id=session_id, blob_id=blob_id, content=content)
+    record_holder.append(record)
+    async with _compose_operation(service, session_id) as context:
+        event = await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state.id,
+            affected_node_id="llm_transform_1",
+            tool_call_id="call_inline_resolve",
+            user_term="cool",
+            kind=InterpretationKind.VAGUE_TERM,
+            llm_draft="creative",
+            model_identifier="test-model",
+            model_version="test-version",
+            provider="test",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
+        _resolved, new_state = await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+    assert new_state.is_valid is True
+    assert preflight_bytes == [content]
+
+
+@pytest.mark.asyncio
+async def test_pending_inline_reference_refuses_blob_row_changed_after_read(engine) -> None:
+    content = b"sku,description\nhats,A fine hat\n"
+    session_id = uuid4()
+    blob_id = uuid4()
+    record_holder: list[BlobRecord] = []
+
+    def read_blob(_context: SessionOperationContext, _requested_id: UUID) -> tuple[BlobRecord, bytes]:
+        with engine.begin() as conn:
+            conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob_id)).values(status="error"))
+        return record_holder[0], content
+
+    service = DualFencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+        runtime_preflight=lambda *_args: _runtime_preflight_result(is_valid=True),
+        inline_blob_read=read_blob,
+    )
+    state, record = await _seed_inline_reference_review_state(service, session_id=session_id, blob_id=blob_id, content=content)
+    record_holder.append(record)
+    with engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(session_id)).values(interpretation_review_disabled=True))
+
+    async with _compose_operation(service, session_id) as context:
+        with pytest.raises(AuditIntegrityError, match="inline blob changed"):
+            await service.create_pending_interpretation_event(
+                session_id=session_id,
+                composition_state_id=state.id,
+                affected_node_id="llm_transform_1",
+                tool_call_id="call_inline_stale",
+                user_term="cool",
+                kind=InterpretationKind.VAGUE_TERM,
+                llm_draft="creative",
+                model_identifier="test-model",
+                model_version="test-version",
+                provider="test",
+                composer_skill_hash="a" * 64,
+                session_operation_context=context,
+            )
+    with engine.connect() as conn:
+        assert conn.execute(select(interpretation_events_table.c.id).where(interpretation_events_table.c.id.is_not(None))).all() == []
 
 
 @pytest.mark.asyncio

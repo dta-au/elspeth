@@ -48,7 +48,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
+from elspeth.contracts.blobs import BlobGuidedOperationWriteFence, BlobNotFoundError, BlobRecord, BlobServiceProtocol
 from elspeth.contracts.chargeable_admission import ChargeableOperation
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource
@@ -1685,6 +1685,26 @@ def _freeform_planner_conversation_context(
 _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE: Final[bool] = True
 
 
+def _contains_blob_ref(value: object) -> bool:
+    """Conservatively disable verdict reuse when an option contains a blob binding."""
+    if isinstance(value, Mapping):
+        return "blob_ref" in value or any(_contains_blob_ref(child) for child in value.values())
+    if isinstance(value, (tuple, list)):
+        return any(_contains_blob_ref(child) for child in value)
+    return False
+
+
+def _state_contains_blob_ref(state: CompositionState) -> bool:
+    return any(
+        _contains_blob_ref(options)
+        for options in (
+            *(source.options for source in state.sources.values()),
+            *(node.options for node in state.nodes),
+            *(output.options for output in state.outputs),
+        )
+    )
+
+
 def _proof_repair_is_applicable(state: CompositionState) -> bool:
     """Return True iff the proof step has any input it can inspect.
 
@@ -2318,6 +2338,7 @@ class ComposerServiceImpl:
         sessions_service: SessionServiceProtocol | None = None,
         session_engine: Engine | None = None,
         secret_service: WebSecretResolver | None = None,
+        blob_service: BlobServiceProtocol | None = None,
         runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
         plugin_snapshot_factory: Callable[[str], PluginAvailabilitySnapshot] | None,
         operator_profile_registry: OperatorProfileRegistry | None,
@@ -2367,6 +2388,7 @@ class ComposerServiceImpl:
         self._data_dir: str = str(settings.data_dir)
         self._session_engine = session_engine
         self._secret_service = secret_service
+        self._blob_service = blob_service
         # Server-authored secret→destination allowlist (elspeth-f3c1aafd25);
         # deny-by-default when the deployment configures no rules.
         self._secret_wiring_policy = runtime_secret_wiring_policy(settings.secret_wiring_allowlist)
@@ -2741,10 +2763,31 @@ class ComposerServiceImpl:
         session_id: str | None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         *,
+        session_operation_context: SessionOperationContext | None = None,
         allow_pending_interpretation_placeholders: bool = False,
     ) -> ValidationResult:
         if plugin_snapshot is None:
             plugin_snapshot, _policy_catalog = self._plugin_policy_context(user_id)
+
+        def _blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
+            if self._blob_service is None or session_operation_context is None:
+                return None
+            try:
+                record = self._blob_service.get_blob_sync(blob_id, session_operation_context)
+            except BlobNotFoundError:
+                return None
+            if session_id is not None and str(record.session_id) != session_id:
+                return None
+            return record
+
+        def _blob_get_content(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+            if self._blob_service is None or session_operation_context is None:
+                raise BlobNotFoundError(str(blob_id))
+            record, content = self._blob_service.read_blob_content_sync(blob_id, session_operation_context)
+            if session_id is not None and str(record.session_id) != session_id:
+                raise BlobNotFoundError(str(blob_id))
+            return record, content
+
         return validate_pipeline(
             state,
             self._settings,
@@ -2753,6 +2796,8 @@ class ComposerServiceImpl:
             secret_wiring_policy=self._secret_wiring_policy,
             user_id=user_id,
             session_id=session_id,
+            blob_get_metadata=_blob_get_metadata,
+            blob_get_content=_blob_get_content,
             allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
             plugin_snapshot=plugin_snapshot,
             profile_registry=self._operator_profile_registry,
@@ -3083,6 +3128,7 @@ class ComposerServiceImpl:
         session_scope: str,
         llm_calls: tuple[ComposerLLMCall, ...] = (),
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        session_operation_context: SessionOperationContext | None = None,
         interpretation_tolerant: bool = False,
         deadline: float | None = None,
     ) -> ValidationResult:
@@ -3092,10 +3138,14 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             interpretation_tolerant=interpretation_tolerant,
         )
+        # Blob status can change without a CompositionState version change.
+        # A completed ready verdict for a marker must be paid again before a
+        # later decision; the coordinator still coalesces concurrent workers.
+        contains_blob_ref = _state_contains_blob_ref(state)
         # A cache miss is the normal, expected state on the first preflight for
         # this key — absence is not a missing-key bug, so membership-test then
         # subscript instead of relying on .get's implicit-None default.
-        cached = cache[key] if key in cache else None
+        cached = cache[key] if not contains_blob_ref and key in cache else None
         if isinstance(cached, ValidationResult):
             return cached
         if isinstance(cached, RuntimePreflightFailure):
@@ -3108,9 +3158,13 @@ class ComposerServiceImpl:
 
         async def worker() -> ValidationResult:
             preflight: Callable[..., ValidationResult] = (
-                functools.partial(self._runtime_preflight, allow_pending_interpretation_placeholders=True)
+                functools.partial(
+                    self._runtime_preflight,
+                    session_operation_context=session_operation_context,
+                    allow_pending_interpretation_placeholders=True,
+                )
                 if interpretation_tolerant
-                else self._runtime_preflight
+                else functools.partial(self._runtime_preflight, session_operation_context=session_operation_context)
             )
             args = (state, user_id, session_id) if plugin_snapshot is None else (state, user_id, session_id, plugin_snapshot)
             return await run_sync_in_worker(preflight, *args)
@@ -3128,7 +3182,8 @@ class ComposerServiceImpl:
         if deadline is not None:
             timeout = max(0.0, min(timeout, deadline - asyncio.get_running_loop().time()))
         entry = await self._runtime_preflight_coordinator.run(key, worker, timeout=timeout)
-        cache[key] = entry
+        if not contains_blob_ref:
+            cache[key] = entry
         if isinstance(entry, RuntimePreflightFailure):
             exc_name = type(entry.original_exc).__name__
             exc_class = exc_name if exc_name in _KNOWN_PREFLIGHT_EXCEPTION_CLASSES else "other"
@@ -3166,6 +3221,7 @@ class ComposerServiceImpl:
         session_scope: str,
         llm_calls: tuple[ComposerLLMCall, ...] = (),
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        session_operation_context: SessionOperationContext | None = None,
         deadline: float | None = None,
     ) -> ValidationResult | None:
         """Verify a pending-review handoff before it is announced (elspeth-5a372d3267).
@@ -3198,6 +3254,7 @@ class ComposerServiceImpl:
             session_scope=session_scope,
             llm_calls=llm_calls,
             plugin_snapshot=plugin_snapshot,
+            session_operation_context=session_operation_context,
             interpretation_tolerant=True,
             deadline=deadline,
         )
@@ -3470,6 +3527,7 @@ class ComposerServiceImpl:
         session_scope: str,
         recorder: BufferingRecorder,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ValidationResult | None:
         """This turn's deterministic runtime preflight, or ``None``.
 
@@ -3502,6 +3560,7 @@ class ComposerServiceImpl:
             session_scope=session_scope,
             llm_calls=recorder.llm_calls,
             plugin_snapshot=plugin_snapshot,
+            session_operation_context=session_operation_context,
         )
 
     async def _reuse_or_recompute_runtime_preflight(
@@ -3516,6 +3575,7 @@ class ComposerServiceImpl:
         session_scope: str,
         llm_calls: tuple[ComposerLLMCall, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ValidationResult | None:
         """The ONE reuse/recompute/cross-turn preflight rule, shared verbatim.
 
@@ -3556,9 +3616,22 @@ class ComposerServiceImpl:
                 session_scope=session_scope,
                 llm_calls=llm_calls,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
             )
-        if last_runtime_preflight is not None:
+        if last_runtime_preflight is not None and not _state_contains_blob_ref(state):
             return last_runtime_preflight
+        if _state_contains_blob_ref(state):
+            return await self._cached_runtime_preflight(
+                state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=llm_calls,
+                plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
+            )
         if state.sources and state.outputs and not state.validate().is_valid:
             return await self._cached_runtime_preflight(
                 state,
@@ -3569,6 +3642,7 @@ class ComposerServiceImpl:
                 session_scope=session_scope,
                 llm_calls=llm_calls,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
             )
         return None
 
@@ -3586,6 +3660,7 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder,
         repair_turns_used: int,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> bool:
         """Pre-finalize runtime-preflight gate (Fix 2).
 
@@ -3650,6 +3725,7 @@ class ComposerServiceImpl:
             session_scope=session_scope,
             recorder=recorder,
             plugin_snapshot=plugin_snapshot,
+            session_operation_context=session_operation_context,
         )
 
         if runtime_result is None or runtime_result.is_valid:
@@ -3664,6 +3740,7 @@ class ComposerServiceImpl:
                 session_scope=session_scope,
                 llm_calls=recorder.llm_calls,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
             )
             if outstanding_findings is None:
                 # Verified pure handoff: the review card genuinely is all that
@@ -3722,6 +3799,7 @@ class ComposerServiceImpl:
         tool_invocations: tuple[ComposerToolInvocation, ...] = (),
         llm_calls: tuple[ComposerLLMCall, ...] = (),
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         """Apply the deterministic final-gate check and build a ComposerResult.
 
@@ -3744,6 +3822,7 @@ class ComposerServiceImpl:
             tool_invocations=tool_invocations,
             llm_calls=llm_calls,
             plugin_snapshot=plugin_snapshot,
+            session_operation_context=session_operation_context,
         )
 
     async def _require_chargeable_admission(
@@ -4118,6 +4197,7 @@ class ComposerServiceImpl:
                 user_id=originating_message.user_id,
                 session_id=originating_message.session_id,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
                 llm_calls=recorder.llm_calls,
             )
             # Await inside a try so a typed planner failure is logged with its
@@ -4383,6 +4463,7 @@ class ComposerServiceImpl:
                 user_id=user_id,
                 session_id=originating_message.session_id,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
                 llm_calls=recorder.llm_calls,
             )
             custody_config = PlannerCustodyConfig(
@@ -4694,6 +4775,7 @@ class ComposerServiceImpl:
         user_id: str | None,
         session_id: str,
         plugin_snapshot: PluginAvailabilitySnapshot | None,
+        session_operation_context: SessionOperationContext | None = None,
         llm_calls: tuple[ComposerLLMCall, ...] = (),
     ) -> _PlannerPreviewPreflightCallbacks:
         """Stage-2 callbacks for ``preview_pipeline`` inside a planner request.
@@ -4746,6 +4828,7 @@ class ComposerServiceImpl:
                 session_scope=f"session:{session_id}",
                 llm_calls=llm_calls,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
             )
         except ComposerRuntimePreflightError:
             return _PlannerPreviewPreflightCallbacks()
@@ -4766,6 +4849,7 @@ class ComposerServiceImpl:
                 session_scope=f"session:{session_id}",
                 llm_calls=llm_calls,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
                 interpretation_tolerant=True,
             )
         except ComposerRuntimePreflightError:
@@ -4869,6 +4953,7 @@ class ComposerServiceImpl:
                     session_scope=f"session:{session_id}",
                     llm_calls=recorder.llm_calls,
                     plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
                 )
             except ComposerRuntimePreflightError:
                 runtime_result = None
@@ -5000,6 +5085,7 @@ class ComposerServiceImpl:
             user_id=user_id,
             session_id=session_id,
             plugin_snapshot=plugin_snapshot,
+            session_operation_context=session_operation_context,
             llm_calls=recorder.llm_calls,
         )
         custody_config = PlannerCustodyConfig(
@@ -5517,6 +5603,7 @@ class ComposerServiceImpl:
                     session_scope=session_scope,
                     llm_calls=recorder.llm_calls,
                     plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
                 )
 
             # Verified-handoff repair gate (elspeth-85f3cc3022, battery round
@@ -5553,6 +5640,7 @@ class ComposerServiceImpl:
                     recorder=recorder,
                     repair_turns_used=repair_turns_used,
                     plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
                 )
             ):
                 return _ClassifyOutcome(
@@ -5740,6 +5828,7 @@ class ComposerServiceImpl:
                                 session_scope=session_scope,
                                 recorder=recorder,
                                 plugin_snapshot=plugin_snapshot,
+                                session_operation_context=session_operation_context,
                             ),
                             user_id=user_id,
                             runtime_preflight_cache=runtime_preflight_cache,
@@ -6019,6 +6108,7 @@ class ComposerServiceImpl:
             recorder=recorder,
             repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
+            session_operation_context=session_operation_context,
         ):
             return _TerminateOutcome(action="continue", repair_turns_delta=1)
 
@@ -6049,6 +6139,7 @@ class ComposerServiceImpl:
                     session_scope=session_scope,
                     recorder=recorder,
                     plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
                 ),
                 user_id=user_id,
                 runtime_preflight_cache=runtime_preflight_cache,
@@ -6336,6 +6427,7 @@ class ComposerServiceImpl:
             tool_invocations=recorder.invocations,
             llm_calls=recorder.llm_calls,
             plugin_snapshot=plugin_snapshot,
+            session_operation_context=session_operation_context,
         )
 
         runtime_result = result.runtime_preflight
@@ -6366,6 +6458,7 @@ class ComposerServiceImpl:
                 session_scope=session_scope,
                 llm_calls=recorder.llm_calls,
                 plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
             )
             return _append_interpretation_review_handoff_message(
                 result,
@@ -6601,6 +6694,7 @@ class ComposerServiceImpl:
                     session_scope=session_scope,
                     llm_calls=recorder.llm_calls,
                     plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
                     deadline=deadline,
                 )
             # elspeth-2306940c70: the blocked result below withholds the

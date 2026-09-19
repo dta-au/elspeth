@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -35,7 +36,8 @@ from elspeth.web.execution.schemas import SemanticEdgeContractResponse
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 
 _BLOB_ID = UUID("5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b")
-_BLOB_HASH = "a" * 64
+_BLOB_CONTENT = b"prompt text"
+_BLOB_HASH = hashlib.sha256(_BLOB_CONTENT).hexdigest()
 
 
 class _YamlGenerator:
@@ -168,7 +170,7 @@ def _ready_blob() -> BlobRecord:
         session_id=UUID("8cf34f4c-27c3-4c51-953a-f679852516a2"),
         filename="prompt.txt",
         mime_type="text/plain",
-        size_bytes=32,
+        size_bytes=len(_BLOB_CONTENT),
         content_hash=_BLOB_HASH,
         storage_path="/tmp/prompt.txt",
         created_at=datetime.now(UTC),
@@ -287,14 +289,15 @@ def test_materialization_validates_blob_metadata_and_substitutes_exact_yaml() ->
         data_dir=Path("/tmp/test_data"),
         session_id="test-session",
         blob_get_metadata=get_metadata,
+        blob_get_content=lambda _blob_id: (_ready_blob(), _BLOB_CONTENT),
         load_yaml=lambda pipeline_yaml: config,
     )
 
     assert isinstance(result, PhaseReport)
     expected_config = _blob_config()
-    expected_config["transforms"][0]["options"]["prompt_template"] = "validated blob-backed inline content placeholder"  # type: ignore[index]
+    expected_config["transforms"][0]["options"]["prompt_template"] = "prompt text"  # type: ignore[index]
     assert result.artifact.pipeline_yaml == yaml.dump(expected_config, default_flow_style=False)
-    assert result.checks[0].detail == "All inline-content blob references are valid"
+    assert result.checks[0].detail == "All inline-content blob references and bytes are valid"
     assert requested == [_BLOB_ID]
 
 

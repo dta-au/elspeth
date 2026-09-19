@@ -425,6 +425,7 @@ def validate_pipeline(
     secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+    blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
     session_id: str | None = None,
 ) -> ValidationResult:
@@ -448,6 +449,7 @@ def validate_pipeline(
         secret_wiring_policy=secret_wiring_policy,
         user_id=user_id,
         blob_get_metadata=blob_get_metadata,
+        blob_get_content=blob_get_content,
         allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
         session_id=session_id,
     )
@@ -465,6 +467,7 @@ def _validate_pipeline_impl(
     secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+    blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
     session_id: str | None = None,
     dependencies: ValidationDependencies,
@@ -501,9 +504,9 @@ def _validate_pipeline_impl(
         yaml_generator: YamlGenerator module/object with generate_yaml() method.
         secret_service: Optional secret resolver for validating secret refs.
         user_id: User ID for scoped secret resolution (required if secret_service is set).
-        blob_get_metadata: Optional sync metadata lookup for validate-time
-            inline-content blob checks. Runtime content reads stay in the
-            execution preflight; validate checks metadata only.
+        blob_get_metadata: Sync metadata lookup scoped to this session and fence.
+        blob_get_content: Sync verified metadata/content read under the same
+            session fence. Inline markers fail readiness when this is absent.
         allow_pending_interpretation_placeholders: When true, composer
             authoring preflight masks unresolved ``{{interpretation:<term>}}``
             tokens before YAML generation. Runtime execution leaves this false.
@@ -607,6 +610,7 @@ def _validate_pipeline_impl(
             data_dir=settings.data_dir,
             session_id=session_id,
             blob_get_metadata=blob_get_metadata,
+            blob_get_content=blob_get_content,
             load_yaml=dependencies.load_yaml,
         ),
     )

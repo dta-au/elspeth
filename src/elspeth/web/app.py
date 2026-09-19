@@ -39,6 +39,7 @@ from starlette.responses import Response as StarletteResponse
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
 from elspeth.contracts import RunStatus
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import AuditIntegrityError
@@ -1663,9 +1664,20 @@ def _create_app(
         user_id: str | None,
         session_id: str,
         plugin_snapshot: PluginAvailabilitySnapshot | None,
+        blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
     ) -> ValidationResult:
         if plugin_snapshot is None:
             raise ValueError("session runtime preflight requires a principal snapshot")
+
+        def _blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
+            if blob_get_content is None:
+                return None
+            try:
+                record, _content = blob_get_content(blob_id)
+            except KeyError:
+                return None
+            return record
+
         return validate_pipeline(
             state,
             settings,
@@ -1674,6 +1686,8 @@ def _create_app(
             secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
             user_id=user_id,
             session_id=session_id,
+            blob_get_metadata=_blob_get_metadata,
+            blob_get_content=blob_get_content,
             plugin_snapshot=plugin_snapshot,
             profile_registry=app.state.operator_profile_registry,
             catalog=app.state.catalog_service,
@@ -1694,6 +1708,7 @@ def _create_app(
         operator_profile_registry=app.state.operator_profile_registry,
         catalog=app.state.catalog_service,
         runtime_preflight=_session_runtime_preflight,
+        inline_blob_read=lambda context, blob_id: app.state.blob_service.read_blob_content_sync(blob_id, context),
         session_operation_authority=session_operation_authority,
         audit_access_log_authority=audit_access_log_authority,
         skill_markdown_history_authority=skill_markdown_history_authority,
@@ -1743,6 +1758,7 @@ def _create_app(
         sessions_service=session_service,
         session_engine=session_engine,
         secret_service=app.state.scoped_secret_resolver,
+        blob_service=app.state.blob_service,
         runtime_preflight_coordinator=runtime_preflight_coordinator,
         plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
         operator_profile_registry=app.state.operator_profile_registry,

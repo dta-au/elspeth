@@ -1466,6 +1466,15 @@ class ExecutionServiceImpl:
                 return None
             return record
 
+        def _blob_get_content(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+            if self._blob_service is None:
+                raise BlobNotFoundError(str(blob_id))
+            content = self._call_async(self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context))
+            record = _blob_get_metadata(blob_id)
+            if record is None:
+                raise BlobNotFoundError(str(blob_id))
+            return record, content
+
         result = validate_pipeline(
             state,
             self._settings,
@@ -1474,6 +1483,7 @@ class ExecutionServiceImpl:
             secret_wiring_policy=self._secret_wiring_policy,
             user_id=user_id,
             blob_get_metadata=_blob_get_metadata,
+            blob_get_content=_blob_get_content,
             session_id=str(session_id) if session_id is not None else None,
             plugin_snapshot=plugin_snapshot,
             profile_registry=self._operator_profile_registry,

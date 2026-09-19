@@ -55,6 +55,16 @@ def ctx() -> "PluginContext":
 
 
 class TestJoinSemantics:
+    def test_composer_assistance_wires_an_existing_upload(self) -> None:
+        assistance = ReferenceJoin.get_agent_assistance()
+        assert assistance is not None
+        hints = " ".join(assistance.composer_hints)
+        assert "list_blobs" in hints
+        assert "get_blob_metadata" in hints
+        assert "node:<node_id>.options.reference_content" in hints
+        assert "create_blob only for table bytes you create" in hints
+        assert "reference_format explicitly" in hints
+
     def test_csv_flat_hit_adds_named_field(self, ctx: "PluginContext") -> None:
         transform = build()
         result = transform.process(make_pipeline_row({"order_id": "a", "product": "hats"}), ctx)
@@ -194,6 +204,33 @@ class TestMissPolicy:
 
 
 class TestLoadTimeRejection:
+    def test_duplicate_csv_header_is_refused_before_a_value_is_overwritten(self) -> None:
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content="sku,description,description\nhats,First,Last\n")
+
+        assert "duplicate CSV header" in str(exc.value)
+        assert "'description'" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "table",
+        [
+            '[{"sku":"hats","description":"First","description":"Last"}]',
+            '[{"sku":"hats","description":"Fine","tax":{"rate":1,"rate":2}}]',
+        ],
+    )
+    def test_duplicate_json_object_member_is_refused_even_when_nested(self, table: str) -> None:
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content=table, reference_format="json")
+
+        assert "duplicate JSON object member" in str(exc.value)
+
+    def test_distinct_case_sensitive_reference_names_remain_distinct(self, ctx: "PluginContext") -> None:
+        transform = build(reference_content="sku,description,Description\nhats,Lower,Upper\n")
+
+        result = transform.process(make_pipeline_row({"product": "hats"}), ctx)
+        assert result.row is not None
+        assert result.row["product_description"] == "Lower"
+
     def test_duplicate_reference_keys_are_refused(self) -> None:
         with pytest.raises(PluginConfigError) as exc:
             build(reference_content="sku,description\nhats,One\nhats,Two\n")

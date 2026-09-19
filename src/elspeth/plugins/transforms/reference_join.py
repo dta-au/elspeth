@@ -167,6 +167,16 @@ class ReferenceTableError(ValueError):
     """The reference table could not be parsed, or is not usable as a table."""
 
 
+def _reject_duplicate_json_object_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Preserve each JSON object's member names only when they are unambiguous."""
+    members: dict[str, object] = {}
+    for name, value in pairs:
+        if name in members:
+            raise ReferenceTableError(f"reference table has a duplicate JSON object member {name!r}")
+        members[name] = value
+    return members
+
+
 @dataclass(frozen=True, slots=True)
 class ReferenceIndex:
     """A reference table resolved down to exactly what row processing needs.
@@ -204,6 +214,11 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
             # "Product SKU" to "product_sku" would break an authored path.
             if not fieldnames:
                 raise ReferenceTableError("reference table is empty: no CSV header row")
+            seen_headers: set[str] = set()
+            for name in fieldnames:
+                if name in seen_headers:
+                    raise ReferenceTableError(f"reference table has a duplicate CSV header {name!r}")
+                seen_headers.add(name)
             csv_entries: list[Mapping[str, object]] = []
             for position, record in enumerate(reader):
                 # DictReader pads a short row with restval and buckets surplus
@@ -231,7 +246,7 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
         return csv_entries
 
     try:
-        loaded = json.loads(cfg.reference_content)
+        loaded = json.loads(cfg.reference_content, object_pairs_hook=_reject_duplicate_json_object_members)
     except json.JSONDecodeError as exc:
         raise ReferenceTableError(f"reference table is not valid JSON: {exc}") from exc
     # ``json.loads`` yields exact builtins (never a frozen proxy or tuple), so
@@ -525,7 +540,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ca3fb9ffcf8366c2"
+    source_file_hash: str | None = "sha256:4083229f527c6cbb"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -596,8 +611,10 @@ class ReferenceJoin(BaseTransform):
                 composer_hints=(
                     "The reference table is configuration, not a source: it is fixed when the run starts and is not fetched.",
                     "On the CLI use reference_file: <name>.csv beside settings.yaml; the loader reads it into reference_content.",
-                    "In the composer there is no filesystem: create_blob with the table bytes, then "
-                    "wire_blob_inline_ref at field_path 'node:<node_id>.options.reference_content'. "
+                    "In the composer there is no filesystem: for a user-uploaded table, discover its ready blob "
+                    "with list_blobs and get_blob_metadata, then wire_blob_inline_ref at field_path "
+                    "'node:<node_id>.options.reference_content'. Use create_blob only for table bytes you create. "
+                    "Set reference_format explicitly to csv or json; the blob filename does not infer it. "
                     "Pasting a table as a literal option value hits the inline byte cap.",
                     "Output expressions see ONLY the matched entry as 'ref'. row[...] is not in scope here and is rejected "
                     "at config load, and a bare column name is not an expression — write ref['description'].",

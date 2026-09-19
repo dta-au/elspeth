@@ -60,7 +60,6 @@ from elspeth.contracts.blobs_inline import (
 # emitter, so a new options-bearing kind fails there on the day it is emitted.
 _NODE_COLLECTION_KEYS: Final = ("transforms", "gates", "aggregations", "coalesce", "collectors")
 _OUTPUT_COLLECTION_KEYS: Final = ("outputs", "sinks")
-_VALIDATION_INLINE_CONTENT_PLACEHOLDER: Final = "validated blob-backed inline content placeholder"
 BLOB_INLINE_PER_REF_BYTE_CAP: Final = 256 * 1024
 BLOB_INLINE_AGGREGATE_BYTE_CAP: Final = 1024 * 1024
 
@@ -232,19 +231,21 @@ def _metadata_evaluation_validation_violations(
     return violations
 
 
-def _substitute_blob_content_refs_for_validation(config: dict[str, Any]) -> dict[str, Any]:
-    """Replace validated inline-content markers with parseable placeholder text.
+def _substitute_blob_content_refs_for_validation(
+    config: dict[str, Any],
+    fetched: dict[BlobInlineRef, bytes],
+    *,
+    refs: list[BlobInlineRef],
+    blob_metadata: dict[UUID, tuple[AllowedMimeType, int]],
+) -> dict[str, Any]:
+    """Validate pinned bytes and substitute them without persisting audit rows.
 
-    Validate-time metadata checks intentionally do not read blob bytes; runtime
-    remains the only path that links blobs to a run, fetches bytes, verifies the
-    pinned hash against content, and records the audit rows. Once metadata has
-    proven a marker points at a ready blob within caps, plugin construction
-    still needs a field-shaped value rather than the deferred marker dict.
+    The runtime resolver owns hash/encoding verification and replacement for
+    both validation and execution. Validation discards its audit-row payload;
+    only run admission is allowed to persist those rows or link a run.
     """
-    refs = _discover_blob_content_refs(config)
-    for ref in refs:
-        _substitute_at_path(config, ref.field_path, _VALIDATION_INLINE_CONTENT_PLACEHOLDER)
-    return config
+    resolved, _audit = _substitute_blob_content_refs(config, fetched, refs=refs, blob_metadata=blob_metadata)
+    return resolved
 
 
 def _malformed_validation_violations(exc: BlobContentResolutionError) -> list[BlobInlineValidationViolation]:

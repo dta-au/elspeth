@@ -14,8 +14,8 @@ from uuid import UUID
 
 import yaml
 
-from elspeth.contracts.blobs import BlobRecord
-from elspeth.contracts.blobs_inline import BlobInlineRef, BlobInlineValidationViolation
+from elspeth.contracts.blobs import AllowedMimeType, BlobNotFoundError, BlobRecord, BlobStateError
+from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef, BlobInlineValidationViolation
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import PipelineLoweringError
 from elspeth.contracts.freeze import freeze_fields
@@ -274,6 +274,7 @@ def materialize_validation_yaml(
     session_id: str | None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None,
     load_yaml: Callable[[str], object],
+    blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
 ) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Generate the exact runtime YAML and validate inline-blob metadata.
 
@@ -316,16 +317,52 @@ def materialize_validation_yaml(
         )
     pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(data_dir), session_id=session_id)
 
-    if blob_get_metadata is not None and "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
+    if "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
         loaded = load_yaml(pipeline_yaml)
         if type(loaded) is not dict:
             raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
         config_dict = cast(dict[str, object], loaded)
+        try:
+            refs = _discover_blob_content_refs(config_dict)
+        except BlobContentResolutionError as exc:
+            malformed = [
+                BlobInlineValidationViolation(category="malformed", field_path=field_path, detail=reason)
+                for field_path, reason in exc.malformed
+            ]
+            detail = _blob_inline_validation_detail(malformed)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in malformed),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        if blob_get_metadata is None:
+            unavailable = [
+                BlobInlineValidationViolation(
+                    category="not_ready", field_path=ref.field_path, detail="authorized blob metadata read is unavailable"
+                )
+                for ref in refs
+            ]
+            detail = _blob_inline_validation_detail(unavailable)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in unavailable),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
         # The modality refusal below reuses the records this validation reads,
         # so each ref's metadata is fetched once and both checks judge one record.
         resolved_records: dict[UUID, BlobRecord] = {}
 
         def _recorded_blob_metadata(blob_id: UUID) -> BlobRecord | None:
+            if blob_id in resolved_records:
+                return resolved_records[blob_id]
             record = blob_get_metadata(blob_id)
             if record is not None:
                 resolved_records[blob_id] = record
@@ -358,7 +395,7 @@ def materialize_validation_yaml(
         # run would be refused after creation. The runtime YAML names each node by
         # its composer id (collectors, named by scope, cannot carry the llm plugin).
         llm_authored_refs = _llm_authored_prompt_surface_refs(
-            _discover_blob_content_refs(config_dict),
+            refs,
             resolved_records,
             llm_node_names=frozenset(node.id for node in interpretation.materialized_state.nodes if node.plugin == "llm"),
         )
@@ -377,10 +414,125 @@ def materialize_validation_yaml(
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
-        check_detail = "All inline-content blob references are valid"
-        pipeline_yaml = yaml.dump(_substitute_blob_content_refs_for_validation(config_dict), default_flow_style=False)
-    elif blob_get_metadata is None:
-        check_detail = "No blob metadata service — check skipped"
+        if blob_get_content is None:
+            unavailable = [
+                BlobInlineValidationViolation(
+                    category="not_ready", field_path=ref.field_path, detail="authorized blob content read is unavailable"
+                )
+                for ref in refs
+            ]
+            detail = _blob_inline_validation_detail(unavailable)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in unavailable),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        fetched: dict[BlobInlineRef, bytes] = {}
+        content_by_blob_id: dict[UUID, bytes] = {}
+        content_failure_by_blob_id: dict[UUID, BlobInlineValidationViolation] = {}
+        content_violations: list[BlobInlineValidationViolation] = []
+        actual_total_bytes = 0
+        for ref in refs:
+            previous_failure = content_failure_by_blob_id.get(ref.blob_id)
+            if previous_failure is not None:
+                content_violations.append(
+                    BlobInlineValidationViolation(
+                        category=previous_failure.category, field_path=ref.field_path, detail=previous_failure.detail
+                    )
+                )
+                continue
+            if ref.blob_id not in content_by_blob_id:
+                try:
+                    content_record, content = blob_get_content(ref.blob_id)
+                except BlobNotFoundError:
+                    failure = BlobInlineValidationViolation(category="missing", field_path=ref.field_path, detail="blob not found")
+                    content_failure_by_blob_id[ref.blob_id] = failure
+                    content_violations.append(failure)
+                    continue
+                except BlobStateError:
+                    failure = BlobInlineValidationViolation(category="not_ready", field_path=ref.field_path, detail="blob is not ready")
+                    content_failure_by_blob_id[ref.blob_id] = failure
+                    content_violations.append(failure)
+                    continue
+                metadata_record = resolved_records[ref.blob_id]
+                if (
+                    content_record.id != metadata_record.id
+                    or content_record.session_id != metadata_record.session_id
+                    or content_record.status != "ready"
+                    or content_record.content_hash != metadata_record.content_hash
+                    or content_record.mime_type != metadata_record.mime_type
+                    or content_record.size_bytes != metadata_record.size_bytes
+                    or len(content) != metadata_record.size_bytes
+                    or content_record.creation_modality != metadata_record.creation_modality
+                ):
+                    failure = BlobInlineValidationViolation(
+                        category="not_ready", field_path=ref.field_path, detail="blob changed during validation"
+                    )
+                    content_failure_by_blob_id[ref.blob_id] = failure
+                    content_violations.append(failure)
+                    continue
+                content_by_blob_id[ref.blob_id] = content
+            content = content_by_blob_id[ref.blob_id]
+            if len(content) > BLOB_INLINE_PER_REF_BYTE_CAP:
+                content_violations.append(
+                    BlobInlineValidationViolation(
+                        category="oversized",
+                        field_path=ref.field_path,
+                        detail=f"{len(content)} bytes exceeds per-ref cap {BLOB_INLINE_PER_REF_BYTE_CAP}",
+                    )
+                )
+            actual_total_bytes += len(content)
+            fetched[ref] = content
+        if actual_total_bytes > BLOB_INLINE_AGGREGATE_BYTE_CAP:
+            content_violations.append(
+                BlobInlineValidationViolation(
+                    category="oversized",
+                    field_path="(aggregate)",
+                    detail=f"total resolved bytes {actual_total_bytes} exceeds aggregate cap {BLOB_INLINE_AGGREGATE_BYTE_CAP}",
+                )
+            )
+        if content_violations:
+            detail = _blob_inline_validation_detail(content_violations)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in content_violations),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        try:
+            resolved_config = _substitute_blob_content_refs_for_validation(
+                config_dict,
+                fetched,
+                refs=refs,
+                blob_metadata={
+                    record.id: (cast(AllowedMimeType, record.mime_type), len(content_by_blob_id[record.id]))
+                    for record in resolved_records.values()
+                },
+            )
+        except BlobContentResolutionError as exc:
+            decode_violations = [
+                BlobInlineValidationViolation(category="malformed", field_path=field_path, detail=f"cannot decode as {encoding}")
+                for field_path, encoding in exc.undecodable
+            ]
+            detail = _blob_inline_validation_detail(decode_violations)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in decode_violations),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        check_detail = "All inline-content blob references and bytes are valid"
+        pipeline_yaml = yaml.dump(resolved_config, default_flow_style=False)
     else:
         check_detail = "No inline-content blob references found"
 

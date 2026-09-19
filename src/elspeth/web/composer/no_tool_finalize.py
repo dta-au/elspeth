@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.no_tool_policy import (
     blocking_result_from_tool_invocations as _blocking_result_from_tool_invocations,
@@ -72,6 +73,7 @@ async def finalize_no_tool_response(
     tool_invocations: tuple[ComposerToolInvocation, ...] = (),
     llm_calls: tuple[ComposerLLMCall, ...] = (),
     plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+    session_operation_context: SessionOperationContext | None = None,
 ) -> ComposerResult:
     """Apply the deterministic final-gate check and build a ComposerResult.
 
@@ -258,6 +260,7 @@ async def finalize_no_tool_response(
         session_scope=session_scope,
         llm_calls=llm_calls,
         plugin_snapshot=plugin_snapshot,
+        session_operation_context=session_operation_context,
     )
 
     if runtime_result is not None and not runtime_result.is_valid and not _is_pending_interpretation_handoff(runtime_result):

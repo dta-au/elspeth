@@ -347,6 +347,9 @@ describe("ChatInput upload identity", () => {
     await userEvent.upload(fileInput!, new File(["id\n1\n"], "intended.csv", { type: "text/csv" }));
 
     await waitFor(() => expect(onBlobUploaded).toHaveBeenCalledWith(uploaded));
+    const draft = (screen.getByLabelText(/message input/i) as HTMLTextAreaElement).value;
+    expect(draft).toContain('I\'ve uploaded "intended.csv"');
+    expect(draft).toContain("pipeline input, reference table, or LLM prompt");
   });
 
   it("does not publish or append a completion rejected by its owner fence", async () => {

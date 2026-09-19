@@ -2905,8 +2905,12 @@ class BlobServiceImpl:
         session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
         """Get blob metadata through the caller's exact session-operation fence."""
-        _require_blob_operation_context(session_operation_context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
-        return await self._run_sync(lambda: self._fenced_blob_record(blob_id, session_operation_context))
+        return await self._run_sync(lambda: self.get_blob_sync(blob_id, session_operation_context))
+
+    def get_blob_sync(self, blob_id: UUID, context: SessionOperationContext) -> BlobRecord:
+        """Get blob metadata in a synchronous preflight worker under its exact fence."""
+        _require_blob_operation_context(context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        return self._fenced_blob_record(blob_id, context)
 
     async def list_blobs(
         self,

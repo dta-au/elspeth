@@ -43,6 +43,7 @@ class _ValidationRunImpl(Protocol):
         secret_wiring_policy: SecretWiringPolicy | None = None,
         user_id: str | None = None,
         blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+        blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
         allow_pending_interpretation_placeholders: bool = False,
         session_id: str | None = None,
         dependencies: ValidationDependencies,
@@ -86,6 +87,7 @@ class ValidationPipeline:
         secret_wiring_policy: SecretWiringPolicy | None = None,
         user_id: str | None = None,
         blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+        blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
         allow_pending_interpretation_placeholders: bool = False,
         session_id: str | None = None,
     ) -> ValidationResult:
@@ -111,6 +113,7 @@ class ValidationPipeline:
                 secret_wiring_policy=secret_wiring_policy,
                 user_id=user_id,
                 blob_get_metadata=blob_get_metadata,
+                blob_get_content=blob_get_content,
                 allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
                 session_id=session_id,
                 dependencies=self.dependencies,

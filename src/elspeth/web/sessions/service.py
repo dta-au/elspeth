@@ -30,7 +30,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.blobs import BlobForkPlanEntry, BlobGuidedOperationWriteFence, fork_blob_id
+from elspeth.contracts.blobs import BlobForkPlanEntry, BlobGuidedOperationWriteFence, BlobRecord, fork_blob_id
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.chargeable_admission import (
     AdmissionRefusalReason,
@@ -165,6 +165,7 @@ from elspeth.web.sessions.guided_replay import (
     validation_errors_for_composer_surface,
     with_guided_response_descriptor,
 )
+from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, SessionInlineBlobSnapshot, prepare_session_inline_blob_snapshot
 from elspeth.web.sessions.locking import (
     acquire_session_advisory_xact_lock,
     process_session_lock,
@@ -4476,6 +4477,7 @@ class SessionServiceImpl:
         owner_instance_id: str | None = None,
         session_operation_lease_seconds: int = 30,
         runtime_preflight: SessionRuntimePreflight | None = None,
+        inline_blob_read: Callable[[SessionOperationContext, UUID], tuple[BlobRecord, bytes]] | None = None,
         chargeable_admission_policy: ChargeableAdmissionPolicy | None = None,
         quota_exceeded_recorder: Callable[[QuotaExceeded], None] = _refuse_unrecorded_quota_exceeded,
         approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
@@ -4494,6 +4496,7 @@ class SessionServiceImpl:
         self._operator_profile_registry = operator_profile_registry
         self._catalog = catalog
         self._runtime_preflight = runtime_preflight
+        self._inline_blob_read = inline_blob_read
         self._chargeable_admission_policy = chargeable_admission_policy or ChargeableAdmissionPolicy(
             secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash
         )
@@ -4535,6 +4538,75 @@ class SessionServiceImpl:
     def session_operation_lease_seconds(self) -> int:
         return self._session_operation_lease_seconds
 
+    @staticmethod
+    def _inline_preflight_config(state: CompositionStateRecord | CompositionStateData) -> InlinePreflightState:
+        """Inspect stored option fields without constructing unrelated state shapes."""
+        return InlinePreflightState.from_stored_state(state)
+
+    async def _prepare_inline_blob_snapshot(
+        self,
+        config: InlinePreflightState,
+        *,
+        session_id: UUID,
+        session_operation_context: SessionOperationContext,
+    ) -> SessionInlineBlobSnapshot | None:
+        """Read custody-verified bytes before entering any SESSIONS lock."""
+        reader = self._inline_blob_read
+        if reader is None:
+            return None
+
+        def _metadata_hint(blob_id: UUID) -> tuple[str, str | None, int] | None:
+            # This short read is only a size/status hint. The custody read
+            # below still verifies the exact fence and returns one row/byte
+            # version. Close this connection before taking BLOB_CUSTODY.
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(blobs_table.c.status, blobs_table.c.content_hash, blobs_table.c.size_bytes)
+                    .where(blobs_table.c.id == str(blob_id))
+                    .where(blobs_table.c.session_id == str(session_id))
+                ).one_or_none()
+                return (row.status, row.content_hash, row.size_bytes) if row is not None else None
+
+        return cast(
+            SessionInlineBlobSnapshot | None,
+            await self._run_sync(
+                prepare_session_inline_blob_snapshot,
+                config,
+                session_id=session_id,
+                read_blob=lambda blob_id: reader(session_operation_context, blob_id),
+                metadata_hint=_metadata_hint,
+            ),
+        )
+
+    async def _preflight_state_pair(
+        self,
+        *,
+        session_id: UUID,
+        anchor_id: UUID,
+    ) -> tuple[CompositionStateRecord | None, CompositionStateRecord | None]:
+        """Capture a short read-only state view before blob custody acquisition."""
+        sid = str(session_id)
+
+        def _read() -> tuple[CompositionStateRecord | None, CompositionStateRecord | None]:
+            with self._engine.connect() as conn:
+                anchor_row = conn.execute(
+                    select(composition_states_table)
+                    .where(composition_states_table.c.id == str(anchor_id))
+                    .where(composition_states_table.c.session_id == sid)
+                ).one_or_none()
+                live_row = conn.execute(
+                    select(composition_states_table)
+                    .where(composition_states_table.c.session_id == sid)
+                    .order_by(desc(composition_states_table.c.version))
+                    .limit(1)
+                ).one_or_none()
+                return (
+                    self._row_to_state_record(anchor_row) if anchor_row is not None else None,
+                    self._row_to_state_record(live_row) if live_row is not None else None,
+                )
+
+        return cast(tuple[CompositionStateRecord | None, CompositionStateRecord | None], await self._run_sync(_read))
+
     def _validate_patched_composition_state(
         self,
         state: CompositionState,
@@ -4542,6 +4614,7 @@ class SessionServiceImpl:
         plugin_snapshot: PluginAvailabilitySnapshot | None,
         session_id: str,
         user_id: str | None,
+        inline_blob_snapshot: SessionInlineBlobSnapshot | None = None,
     ) -> ValidationSummary:
         """Validate a post-review state through its executable profile view.
 
@@ -4576,7 +4649,12 @@ class SessionServiceImpl:
         if not summary.is_valid or self._runtime_preflight is None:
             return summary
 
-        runtime = self._runtime_preflight(state, user_id, session_id, plugin_snapshot)
+        if inline_blob_snapshot is not None:
+            if not inline_blob_snapshot.assert_covers(InlinePreflightState.from_composition_state(state)):
+                raise AuditIntegrityError("interpretation resolution introduced an unprepared inline blob marker")
+            runtime = self._runtime_preflight(state, user_id, session_id, plugin_snapshot, inline_blob_snapshot.content)
+        else:
+            runtime = self._runtime_preflight(state, user_id, session_id, plugin_snapshot)
         if runtime.is_valid:
             return summary
 
@@ -8490,6 +8568,7 @@ class SessionServiceImpl:
         created_at: datetime | None = None,
         _event_id: UUID | None = None,
         _prepare_only: bool = False,
+        proposed_state: CompositionStateData | None = None,
     ) -> InterpretationEventRecord | _PreparedPendingInterpretation:
         """Insert a PENDING interpretation event.
 
@@ -8537,12 +8616,31 @@ class SessionServiceImpl:
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
         event_id = _event_id if _event_id is not None else uuid.uuid4()
         principal_user_id, plugin_snapshot = await self._session_principal_context(sid)
+        expected_anchor: CompositionStateRecord | None = None
+        expected_live: CompositionStateRecord | None = None
+        if proposed_state is None:
+            expected_anchor, expected_live = await self._preflight_state_pair(session_id=session_id, anchor_id=composition_state_id)
+            snapshot_config = self._inline_preflight_config(expected_live) if expected_live is not None else None
+        else:
+            snapshot_config = self._inline_preflight_config(proposed_state)
+        inline_blob_snapshot = (
+            await self._prepare_inline_blob_snapshot(
+                snapshot_config,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+            if snapshot_config is not None
+            else None
+        )
         validator = _SessionPendingInterpretationValidator(
             profile_aware=self._plugin_snapshot_factory is not None,
             plugin_snapshot=plugin_snapshot,
             profile_registry=self._operator_profile_registry,
             catalog=self._catalog,
             runtime_preflight=self._runtime_preflight,
+            inline_blob_snapshot=inline_blob_snapshot,
+            expected_anchor=expected_anchor if inline_blob_snapshot is not None else None,
+            expected_live=expected_live if inline_blob_snapshot is not None else None,
             session_id=sid,
             user_id=principal_user_id,
         )
@@ -8645,6 +8743,31 @@ class SessionServiceImpl:
         if type(session_operation_context) is not SessionOperationContext:
             raise TypeError("session_operation_context must be an exact SessionOperationContext")
 
+        def _read_pending_event() -> Any:
+            with self._engine.connect() as conn:
+                return conn.execute(
+                    select(interpretation_events_table)
+                    .where(interpretation_events_table.c.id == eid)
+                    .where(interpretation_events_table.c.session_id == sid)
+                    .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
+                ).one_or_none()
+
+        preflight_event = await self._run_sync(_read_pending_event)
+        expected_anchor: CompositionStateRecord | None = None
+        expected_live: CompositionStateRecord | None = None
+        inline_blob_snapshot: SessionInlineBlobSnapshot | None = None
+        if preflight_event is not None and preflight_event.composition_state_id is not None:
+            expected_anchor, expected_live = await self._preflight_state_pair(
+                session_id=session_id,
+                anchor_id=UUID(preflight_event.composition_state_id),
+            )
+            if expected_live is not None:
+                inline_blob_snapshot = await self._prepare_inline_blob_snapshot(
+                    self._inline_preflight_config(expected_live),
+                    session_id=session_id,
+                    session_operation_context=session_operation_context,
+                )
+
         def _sync() -> tuple[InterpretationEventRecord, CompositionStateRecord]:
             with (
                 self._session_process_locked_begin(sid) as conn,
@@ -8676,6 +8799,8 @@ class SessionServiceImpl:
                     raise InterpretationEventNotFoundError(
                         f"resolve_interpretation_event: interpretation event {eid!r} not found in session {sid!r}"
                     )
+                if inline_blob_snapshot is not None and event_row != preflight_event:
+                    raise AuditIntegrityError("interpretation event changed after inline blob snapshot")
 
                 # Step 2: compute accepted_value per F-14.
                 if choice is InterpretationChoice.ACCEPTED_AS_DRAFTED:
@@ -8748,6 +8873,10 @@ class SessionServiceImpl:
                         surfacing_state_record = self._row_to_state_record(surfacing_state_row)
                 if surfacing_state_record is None:
                     raise AuditIntegrityError(f"resolve_interpretation_event: event {eid!r} has no same-session surfacing state")
+                if inline_blob_snapshot is not None:
+                    if state_record != expected_live or surfacing_state_record != expected_anchor:
+                        raise AuditIntegrityError("interpretation state changed after inline blob snapshot")
+                    inline_blob_snapshot.assert_current_rows(conn, session_id=session_id)
                 if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
                     source_name, reviewed_fields = _source_data_contract_demand_from_state_record(
                         surfacing_state_record,
@@ -8881,12 +9010,21 @@ class SessionServiceImpl:
                     is_valid=False,
                     validation_errors=None,
                 )
-                patched_validation = self._validate_patched_composition_state(
-                    state_from_record(patched_state_record),
-                    plugin_snapshot=plugin_snapshot,
-                    session_id=sid,
-                    user_id=principal_user_id,
-                )
+                if inline_blob_snapshot is None:
+                    patched_validation = self._validate_patched_composition_state(
+                        state_from_record(patched_state_record),
+                        plugin_snapshot=plugin_snapshot,
+                        session_id=sid,
+                        user_id=principal_user_id,
+                    )
+                else:
+                    patched_validation = self._validate_patched_composition_state(
+                        state_from_record(patched_state_record),
+                        plugin_snapshot=plugin_snapshot,
+                        session_id=sid,
+                        user_id=principal_user_id,
+                        inline_blob_snapshot=inline_blob_snapshot,
+                    )
                 raw_validation_errors = [
                     CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component)
                     for error in patched_validation.errors
@@ -9897,6 +10035,7 @@ class SessionServiceImpl:
                 created_at=now + timedelta(microseconds=index),
                 _event_id=draft.event_id,
                 _prepare_only=True,
+                proposed_state=state,
             )
             if type(prepared) is not _PreparedPendingInterpretation:
                 raise AuditIntegrityError("imported interpretation preparation did not return an exact package")
@@ -11431,6 +11570,7 @@ class SessionServiceImpl:
                 created_at=now,
                 _event_id=draft.event_id,
                 _prepare_only=True,
+                proposed_state=prepared_state,
             )
             if type(prepared_interpretation) is not _PreparedPendingInterpretation:
                 raise AuditIntegrityError("guided interpretation preparation did not return an exact package")

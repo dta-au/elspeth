@@ -1075,6 +1075,7 @@ def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator
         "catalog: 'CatalogService', secret_service: 'WebSecretResolver | None' = None, "
         "secret_wiring_policy: 'SecretWiringPolicy | None' = None, user_id: 'str | None' = None, "
         "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
+        "blob_get_content: 'Callable[[UUID], tuple[BlobRecord, bytes]] | None' = None, "
         "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
     )
 

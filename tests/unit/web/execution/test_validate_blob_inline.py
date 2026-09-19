@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -145,11 +147,82 @@ def _ready_blob_record(*, session_id: UUID, blob_id: UUID = BLOB_ID, size_bytes:
     )
 
 
+def _state_with_reference_join(
+    tmp_path: Path, *, session_id: UUID, reference_format: str, content: str | dict[str, str]
+) -> CompositionState:
+    state = _state_with_inline_prompt(tmp_path, session_id=session_id)
+    source_path = Path(state.sources["source"].options["path"])
+    source_path.write_text("product\nhats\n", encoding="utf-8")
+    return replace(
+        state,
+        nodes=(
+            replace(
+                state.nodes[0],
+                id="enrich",
+                plugin="reference_join",
+                input="classify_input",
+                options={
+                    "reference_content": content,
+                    "reference_format": reference_format,
+                    "key_field": "product",
+                    "reference_key_name": "sku",
+                    "output": {"description": "ref['description']"},
+                    "schema": {"mode": "observed"},
+                },
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("reference_format", "table"),
+    [
+        ("csv", "sku,description\nhats,A fine hat\n"),
+        ("json", '[{"sku":"hats","description":"A fine hat"}]'),
+    ],
+)
+def test_uploaded_reference_table_preflight_matches_inline_text(tmp_path: Path, reference_format: str, table: str) -> None:
+    session_id = uuid4()
+    direct_state = _state_with_reference_join(tmp_path, session_id=session_id, reference_format=reference_format, content=table)
+    direct = validate_pipeline_for_trained_operator(
+        direct_state,
+        SimpleNamespace(data_dir=tmp_path),
+        composer_yaml_generator,
+        session_id=str(session_id),
+    )
+    assert direct.is_valid is True, direct.errors
+
+    encoded = table.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    marker = {"blob_ref": str(BLOB_ID), "mode": "inline_content", "sha256": digest}
+    uploaded_state = replace(
+        direct_state,
+        nodes=(replace(direct_state.nodes[0], options={**direct_state.nodes[0].options, "reference_content": marker}),),
+    )
+    record = replace(
+        _ready_blob_record(session_id=session_id, size_bytes=len(encoded)),
+        filename=f"reference.{reference_format}",
+        mime_type="text/csv" if reference_format == "csv" else "application/json",
+        content_hash=digest,
+    )
+    uploaded = validate_pipeline_for_trained_operator(
+        uploaded_state,
+        SimpleNamespace(data_dir=tmp_path),
+        composer_yaml_generator,
+        blob_get_metadata=lambda _blob_id: record,
+        blob_get_content=lambda _blob_id: (record, encoded),
+        session_id=str(session_id),
+    )
+    assert uploaded.is_valid is True, uploaded.errors
+
+
 class _BlobMetadataService:
-    def __init__(self, record: BlobRecord | None) -> None:
+    def __init__(self, record: BlobRecord | None, content: bytes | None = None) -> None:
         self._record = record
+        self._content = content
         self.requested_blob_ids: list[UUID] = []
         self.session_operation_contexts: list[SessionOperationContext] = []
+        self.read_blob_ids: list[UUID] = []
 
     async def get_blob(
         self,
@@ -162,6 +235,13 @@ class _BlobMetadataService:
         if self._record is None:
             raise BlobNotFoundError(str(blob_id))
         return self._record
+
+    async def read_blob_content(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> bytes:
+        self.read_blob_ids.append(blob_id)
+        self.session_operation_contexts.append(session_operation_context)
+        if self._content is None:
+            raise BlobNotFoundError(str(blob_id))
+        return self._content
 
 
 class _UnusedSessionService:
@@ -245,12 +325,32 @@ def test_validate_substitutes_ready_inline_blob_marker_before_settings_load(
     tmp_path: Path,
 ) -> None:
     session_id = uuid4()
+    prompt_bytes = b"prompt text"
+    prompt_hash = hashlib.sha256(prompt_bytes).hexdigest()
+    state = _state_with_inline_prompt(tmp_path, session_id=session_id)
+    state = replace(
+        state,
+        nodes=(
+            replace(
+                state.nodes[0],
+                options={
+                    **state.nodes[0].options,
+                    "prompt_template": {
+                        "blob_ref": str(BLOB_ID),
+                        "mode": "inline_content",
+                        "sha256": prompt_hash,
+                    },
+                },
+            ),
+        ),
+    )
+    record = replace(_ready_blob_record(session_id=session_id), size_bytes=len(prompt_bytes), content_hash=prompt_hash)
 
     def load_settings(config_dict: dict[str, Any], *, expand_env_vars: bool = True) -> SimpleNamespace:
         # Web preflight must not expand host ${VAR} placeholders.
         assert expand_env_vars is False
         prompt_template = config_dict["transforms"][0]["options"]["prompt_template"]
-        assert type(prompt_template) is str
+        assert prompt_template == "prompt text"
         assert config_dict["transforms"][0]["options"]["api_key"] == "elspeth-preflight-secret-placeholder"
         return SimpleNamespace()
 
@@ -271,10 +371,11 @@ def test_validate_substitutes_ready_inline_blob_marker_before_settings_load(
     mock_build_graph.return_value = mock_graph
 
     result = validate_pipeline_for_trained_operator(
-        _state_with_inline_prompt(tmp_path, session_id=session_id),
+        state,
         SimpleNamespace(data_dir=tmp_path),
         composer_yaml_generator,
-        blob_get_metadata=lambda _blob_id: _ready_blob_record(session_id=session_id),
+        blob_get_metadata=lambda _blob_id: record,
+        blob_get_content=lambda _blob_id: (record, prompt_bytes),
         session_id=str(session_id),
     )
 
@@ -380,3 +481,61 @@ async def test_execution_service_validate_state_treats_cross_session_inline_blob
     assert blob_service.session_operation_contexts[0] is operation_lease.context
     assert operation_lease.context.operation_kind is SessionOperationKind.BLOB_READ
     assert operation_lease.context.fence.session_id == str(requested_session_id)
+
+
+@pytest.mark.asyncio
+async def test_execution_service_preflight_reads_uploaded_reference_table_under_its_fence(tmp_path: Path) -> None:
+    session_id, operation_lease, engine = await _acquire_blob_read_lease()
+    service: ExecutionServiceImpl | None = None
+    try:
+        table = b"sku,description\nhats,A fine hat\n"
+        digest = hashlib.sha256(table).hexdigest()
+        record = replace(
+            _ready_blob_record(session_id=session_id),
+            mime_type="text/csv",
+            size_bytes=len(table),
+            content_hash=digest,
+        )
+        blob_service = _BlobMetadataService(record=record, content=table)
+        state = _state_with_reference_join(
+            tmp_path,
+            session_id=session_id,
+            reference_format="csv",
+            content={"blob_ref": str(BLOB_ID), "mode": "inline_content", "sha256": digest},
+        )
+        loop = asyncio.get_running_loop()
+        service = ExecutionServiceImpl.for_trained_operator(
+            loop=loop,
+            broadcaster=ProgressBroadcaster(loop),
+            settings=WebSettings(
+                data_dir=tmp_path,
+                composer_max_composition_turns=10,
+                composer_max_discovery_turns=5,
+                composer_timeout_seconds=30.0,
+                composer_rate_limit_per_minute=60,
+                shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+            ),
+            session_service=cast(Any, _UnusedSessionService()),
+            yaml_generator=composer_yaml_generator,
+            telemetry=build_sessions_telemetry(),
+            blob_service=cast(Any, blob_service),
+        )
+        result = await service.validate_state(
+            state,
+            session_operation_context=operation_lease.context,
+            user_id="user-1",
+            session_id=session_id,
+        )
+    finally:
+        try:
+            try:
+                if service is not None:
+                    await service.shutdown()
+            finally:
+                await operation_lease.close()
+        finally:
+            engine.dispose()
+
+    assert result.is_valid is True, result.errors
+    assert blob_service.read_blob_ids == [BLOB_ID]
+    assert blob_service.session_operation_contexts == [operation_lease.context] * 3

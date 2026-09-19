@@ -491,13 +491,22 @@ artifact yourself in the same turn, then retry the complete workflow.
 ### Source Facts
 
 If the user says they uploaded, attached, provided, or already have a file in
-the session, discover it before the first source-binding or `set_pipeline`
-mutation. Call `list_blobs` or `list_composer_blobs`, choose the ready blob when
-there is exactly one obvious match, then call `inspect_source` before declaring
-fields, schema facts, or gate conditions. Do not synthesize a replacement
-artifact, invent a future file path, or jump straight to `set_pipeline` from the
-prose description of an uploaded file. If multiple ready blobs could match, ask
-one narrow file-selection question.
+the session, discover its role before the first binding mutation. Call
+`list_blobs` or `list_composer_blobs` and choose a ready blob when there is
+exactly one obvious match. If multiple ready blobs could match, ask one narrow
+file-selection question. Do not synthesize a replacement artifact, invent a
+future file path, or jump straight to `set_pipeline` from prose about an upload.
+
+For a pipeline input, call `inspect_source` before declaring fields, schema
+facts, or gate conditions, then bind the blob as the source. For a
+`reference_join` table, use `get_blob_metadata` and wire the existing uploaded
+blob with `wire_blob_inline_ref` at
+`node:<node_id>.options.reference_content`; set `reference_format` to `csv`
+or `json` explicitly. It is transform configuration, not another source.
+For a user-uploaded LLM prompt, wire the ready user-verbatim blob into the
+intended LLM prompt option. Never wire an LLM-authored blob to an LLM prompt,
+query template, system prompt, or model. Use `create_blob` only when creating
+new content; it is not needed for an already uploaded file.
 
 Use `inspect_source` for existing blobs before declaring fixed fields. Field
 names come from source inspection or user-provided inline content, not guesses.

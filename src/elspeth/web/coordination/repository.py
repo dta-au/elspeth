@@ -1110,6 +1110,7 @@ class _RepositoryInterpretationMutations:
             opt_out_marker_exists=marker_exists,
             superseded_events=tuple(self._event_record(row) for row in superseded_rows),
         )
+        validator.assert_current_blob_rows(connection, UUID(state._session_id))
         decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator)
         if type(decision) is not SessionPendingInterpretationDecision:
             raise TypeError("pending interpretation planner must return an exact decision")

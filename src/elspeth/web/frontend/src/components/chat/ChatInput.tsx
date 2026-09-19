@@ -31,6 +31,10 @@ import type { BlobMetadata } from "@/types/api";
  * upload completes after a session switch.
  */
 export function uploadedBlobPromptSentence(filename: string): string {
+  return `I've uploaded "${filename}". Please use it for the role I describe, or ask whether it is a pipeline input, reference table, or LLM prompt.`;
+}
+
+export function uploadedSourcePromptSentence(filename: string): string {
   return `I've uploaded "${filename}"; please use it as the pipeline input.`;
 }
 
@@ -163,6 +167,8 @@ interface ChatInputProps {
   /** Return false to suppress stale local and blob-store failure publication. */
   onBlobUploadRejected?: (requestId: string, sessionId: string) => boolean;
   onBlobUploadSettled?: (requestId: string, sessionId: string) => void;
+  /** Guided source selection supplies its source-specific draft sentence. */
+  uploadPromptSentence?: (filename: string) => string;
   /** Disables only the upload affordance; ordinary text remains independently gated. */
   uploadDisabled?: boolean;
   /** Controlled mode: external value (use with onChange) */
@@ -209,6 +215,7 @@ export function ChatInput({
   onBlobUploadCompleted,
   onBlobUploadRejected,
   onBlobUploadSettled,
+  uploadPromptSentence = uploadedBlobPromptSentence,
   uploadDisabled = false,
   value: controlledValue,
   onChange: controlledOnChange,
@@ -398,7 +405,7 @@ export function ChatInput({
       const newText =
         currentText +
         (currentText ? "\n" : "") +
-        uploadedBlobPromptSentence(blob.filename);
+        uploadPromptSentence(blob.filename);
       if (isControlled) {
         controlledOnChange?.(newText);
       } else {

@@ -38,7 +38,11 @@ import { dedupeGuidedUserMessages } from "./guidedReplay";
 import type { ChatTurn as GuidedWireChatTurn } from "@/types/guided";
 import { ComposingIndicator } from "./ComposingIndicator";
 import { AuthorityChip } from "./AuthorityChip";
-import { ChatInput, uploadedBlobPromptSentence } from "./ChatInput";
+import {
+  ChatInput,
+  uploadedBlobPromptSentence,
+  uploadedSourcePromptSentence,
+} from "./ChatInput";
 import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
 import { CompletionSummary } from "./guided/CompletionSummary";
@@ -2437,6 +2441,7 @@ export function ChatPanel({
           <PipelinePolicySummary state={compositionState} />
           <ChatInput
             onSend={onSend}
+            uploadPromptSentence={uploadedSourcePromptSentence}
             // Upload handlers are wired only where an upload can mean
             // something. Passing undefined is the affordance's OFF state,
             // not a disabled-but-live one.

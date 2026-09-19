@@ -546,6 +546,14 @@ class BlobServiceProtocol(Protocol):
         """
         ...
 
+    def get_blob_sync(self, blob_id: UUID, context: SessionOperationContext) -> BlobRecord:
+        """Get scoped metadata synchronously for a preflight worker."""
+        ...
+
+    def read_blob_content_sync(self, blob_id: UUID, context: SessionOperationContext) -> tuple[BlobRecord, bytes]:
+        """Read one fenced, verified metadata/content version in a preflight worker."""
+        ...
+
     async def list_blobs(
         self,
         session_id: UUID,

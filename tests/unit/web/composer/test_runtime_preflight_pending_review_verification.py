@@ -25,6 +25,7 @@ carve-out to a terminal that names only the review cards.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -546,10 +547,12 @@ class TestAttemptPreflightRepairHandoffVerification:
         clean_state = MagicMock(spec=CompositionState)
         clean_state.version = 1
         clean_state.validate.return_value = SimpleNamespace(is_valid=True)
-        clean_state.sources = {"source": object()}
+        clean_state.sources = {
+            "source": SourceSpec(plugin="csv", on_success="rows", options={"path": "input.csv"}, on_validation_failure="discard")
+        }
         clean_state.nodes = ()
         clean_state.edges = ()
-        clean_state.outputs = (object(),)
+        clean_state.outputs = (OutputSpec(name="main", plugin="csv", options={"path": "out.csv"}, on_write_failure="discard"),)
         result = await service._turn_runtime_preflight(
             state=clean_state,
             user_id="user-1",
@@ -638,6 +641,61 @@ class TestPendingHandoffOutstandingFindings:
         assert strict is not tolerant
         assert any(blocker.code == INTERPRETATION_REVIEW_PENDING_CODE for blocker in strict.readiness.blockers)
         assert all(blocker.code != INTERPRETATION_REVIEW_PENDING_CODE for blocker in tolerant.readiness.blockers)
+
+    @pytest.mark.anyio
+    async def test_blob_reference_preflight_rechecks_unchanged_state(self, service, monkeypatch) -> None:
+        """A once-ready upload can become unavailable without a state version change."""
+        state = _nonempty_state(version=1)
+        state = replace(
+            state,
+            sources={
+                "source": replace(
+                    state.sources["source"],
+                    options={
+                        "path": {
+                            "blob_ref": "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b",
+                            "mode": "inline_content",
+                            "sha256": "a" * 64,
+                        }
+                    },
+                )
+            },
+        )
+        calls = 0
+
+        def changing_preflight(*_args: Any, **_kwargs: Any) -> ValidationResult:
+            nonlocal calls
+            calls += 1
+            return _valid_result() if calls == 1 else _structural_failure_result()
+
+        monkeypatch.setattr(service_module, "validate_pipeline", changing_preflight)
+        cache = service._new_runtime_preflight_cache()
+        snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+        first = await service._reuse_or_recompute_runtime_preflight(
+            state=state,
+            user_id="user-1",
+            session_id=None,
+            last_runtime_preflight=None,
+            runtime_preflight_cache=cache,
+            initial_version=1,
+            session_scope="session:test",
+            llm_calls=(),
+            plugin_snapshot=snapshot,
+        )
+        second = await service._reuse_or_recompute_runtime_preflight(
+            state=state,
+            user_id="user-1",
+            session_id=None,
+            last_runtime_preflight=first,
+            runtime_preflight_cache=cache,
+            initial_version=1,
+            session_scope="session:test",
+            llm_calls=(),
+            plugin_snapshot=snapshot,
+        )
+        assert calls == 2
+        assert first is not None and first.is_valid
+        assert second is not None and not second.is_valid
 
     @pytest.mark.anyio
     async def test_preview_and_completion_tolerant_passes_share_one_engine_run(self, service, monkeypatch) -> None:

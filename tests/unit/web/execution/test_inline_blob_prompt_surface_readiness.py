@@ -161,6 +161,7 @@ def _validate(tmp_path: Path, field: str, modality: CreationModality) -> Any:
         SimpleNamespace(data_dir=tmp_path),
         composer_yaml_generator,
         blob_get_metadata=lambda blob_id: record if blob_id == _BLOB_ID else None,
+        blob_get_content=lambda _blob_id: (record, _CONTENT),
         session_id=str(_SESSION_ID),
     )
 
@@ -242,6 +243,7 @@ def test_validate_admits_llm_authored_blob_outside_the_prompt_surface(tmp_path: 
         SimpleNamespace(data_dir=tmp_path),
         composer_yaml_generator,
         blob_get_metadata=lambda _blob_id: record,
+        blob_get_content=lambda _blob_id: (record, _CONTENT),
         session_id=str(_SESSION_ID),
     )
 

@@ -561,6 +561,7 @@ files:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
     dict[str, Any]: 6
+    dict[str, object]: 2
   src/elspeth/plugins/transforms/report_assemble.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/truncate.py:
@@ -1042,5 +1043,5 @@ totals:
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1136
-  dict[str, object]: 404
-  soft: 2735
+  dict[str, object]: 406
+  soft: 2737
