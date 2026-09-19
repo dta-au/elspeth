@@ -229,7 +229,7 @@ class AzureLLMProvider:
             llm_call_governance=self._llm_call_governance,
         )
         try:
-            client.chat_completion(
+            response = client.chat_completion(
                 model=model,
                 messages=[ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
                 temperature=0.0,
@@ -240,6 +240,11 @@ class AzureLLMProvider:
                 # smoke-test cost.
                 max_tokens=32,
             )
+            if not response.content.strip():
+                raise ContentPolicyError("Azure preflight returned empty content")
+            finish_reason = finish_reason_from_raw_response(response.raw_response)
+            if finish_reason not in (None, FinishReason.STOP):
+                raise LLMClientError("Azure preflight returned an unusable finish reason", retryable=False)
         finally:
             client.close()
 

@@ -70,6 +70,7 @@ class _BlobClientFake:
 class _ContainerClientFake:
     def __init__(self, blob_client: _BlobClientFake) -> None:
         self._blob_client = blob_client
+        self.account_name = "testaccount"
         self.close = _CallRecorder()
 
     def get_blob_client(self, *_args: Any, **_kwargs: Any) -> _BlobClientFake:

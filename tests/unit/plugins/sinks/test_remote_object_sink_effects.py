@@ -207,6 +207,7 @@ class _AzureBlob:
 
 class _AzureStore:
     def __init__(self) -> None:
+        self.account_name = "test"
         self.value: _Object | None = None
         self.requests: list[dict[str, object]] = []
         self.response_loss = False
@@ -265,6 +266,38 @@ def test_remote_sinks_declare_recoverable_pipeline_effects(factory: Any) -> None
     store = _S3Store() if factory is _s3 else _AzureStore()
     sink = factory(store)
     validate_sink_effect_capability(sink, "write", SinkEffectInputKind.PIPELINE_MEMBERS)
+
+
+def test_azure_target_identifies_storage_account() -> None:
+    first_store = _AzureStore()
+    second_store = _AzureStore()
+    first_store.account_name = "account-a"
+    second_store.account_name = "account-b"
+    first = _azure(first_store, blob_path="out.csv", format="csv")
+    second = _azure(second_store, blob_path="out.csv", format="csv")
+    request = SinkEffectInspectionRequest(effect_id="a" * 64, target="{}", predecessor_descriptor=None)
+
+    first_target = first.inspect_effect(request, _CTX).reference
+    second_target = second.inspect_effect(request, _CTX).reference
+
+    assert first_target == "azure://account-a/container/out.csv"
+    assert second_target == "azure://account-b/container/out.csv"
+
+
+def test_azure_csv_stage_limit_applies_before_aggregate_serialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink = _azure(_AzureStore(), blob_path="out.csv", format="csv", max_blob_bytes=8)
+    original = sink._serialize_rows
+
+    def per_member_only(rows: list[dict[str, Any]]) -> bytes:
+        if len(rows) != 1:
+            raise AssertionError("cumulative CSV must be streamed into the bounded stage")
+        return original(rows)
+
+    monkeypatch.setattr(sink, "_serialize_rows", per_member_only)
+    first = _member(0, {"id": 1})
+    second = _member(1, {"id": 2})
+    with pytest.raises(remote_effects.RemoteObjectEffectLimitError, match="byte limit exceeded"):
+        _prepare(sink, effect_id="b" * 64, current=(first, second), target_snapshot=(first, second))
 
 
 @pytest.mark.parametrize("factory", [_s3, _azure])

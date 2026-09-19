@@ -96,6 +96,7 @@ class _BlobClient:
 
 class _ContainerClient:
     def __init__(self, blob_client: _BlobClient) -> None:
+        self.account_name = "testaccount"
         self.get_blob_client = _CallRecorder(return_value=blob_client)
         self.close = _CallRecorder()
 
