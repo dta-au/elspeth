@@ -459,6 +459,9 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
         _fake_llm_response(content="The inline pipeline proposal is pending approval."),
     )
 
+    async def provider_completion(**kwargs: Any) -> Any:
+        return await llm(kwargs["messages"], kwargs["tools"])
+
     seeded_at = datetime.now(UTC)
     with harness.engine.begin() as conn:
         conn.execute(
@@ -483,7 +486,7 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
     )
     try:
         with (
-            patch.object(harness.service, "_call_llm", new=llm),
+            patch("litellm.acompletion", new=provider_completion),
             patch(
                 "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
                 wraps=real_build_set_pipeline_candidate,
