@@ -17,8 +17,8 @@ This conftest builds ONE production stack that all parity surfaces share:
 * the scripted deterministic completion double lifted from
   ``tests/unit/web/composer/test_pipeline_planner.py`` (its stateful sequential
   form is what the guided-staged repair cases will need), patched onto the
-  module global ``elspeth.web.composer.service._litellm_acompletion`` so the
-  real planner response parser, custody, candidate validation, and audited
+  provider boundary ``litellm.acompletion`` so quota admission and settlement,
+  the real planner response parser, custody, candidate validation, and audited
   ``set_pipeline`` commit are all exercised;
   so freeform provably traverses ``plan_pipeline`` +
   ``build_planner_capability_manifest`` rather than a recipe-router graph
@@ -432,7 +432,7 @@ class ParityEnv:
         """Patch the completion global to emit this fixture's pipeline; return it."""
         pipeline = rewrite_source_paths(fixture["canonical_arguments"], self.data_dir, session_id)
         completion = _ScriptedCompletion(emit_proposal_response(pipeline))
-        self.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+        self.monkeypatch.setattr("litellm.acompletion", completion)
         return pipeline
 
     def reference_state(self, fixture: Mapping[str, Any]) -> CompositionState:
@@ -645,7 +645,7 @@ class ParityEnv:
             (self.data_dir / "outputs" / session_id).mkdir(parents=True, exist_ok=True)
 
             completion = _ScriptedCompletion(emit_proposal_response(candidate))
-            self.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+            self.monkeypatch.setattr("litellm.acompletion", completion)
 
             # Goal-first (elspeth-378cfa0e18): every profile's start carries the
             # goal, so both arms open the same way and spend the single scripted

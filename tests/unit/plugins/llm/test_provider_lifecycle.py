@@ -15,6 +15,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.plugins.transforms.llm.provider import LLMProvider
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
@@ -50,6 +51,7 @@ class FakeLifecycleContext:
     payload_store: Any = None
     concurrency_config: Any = None
     shutdown_event: Any = None
+    llm_call_governance: LLMCallGovernance | None = None
 
 
 def _make_azure_config() -> dict[str, Any]:

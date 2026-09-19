@@ -365,7 +365,7 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
@@ -447,7 +447,7 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
@@ -480,7 +480,7 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
     expected = _build_advisor_user_message(arguments)
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock) as mock_provider,
+        patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
     ):
         mock_llm.side_effect = [
             _make_tool_call("typed_public", "request_advisor_hint", arguments),
@@ -529,7 +529,7 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=_make_advisor_response(),
         ) as mock_acompletion,
@@ -572,7 +572,7 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
     }
 
     with patch(
-        "elspeth.web.composer.service._litellm_acompletion",
+        "litellm.acompletion",
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
@@ -608,7 +608,7 @@ async def test_advisor_omits_seed_when_advisor_model_does_not_support_it(monkeyp
     }
 
     with patch(
-        "elspeth.web.composer.service._litellm_acompletion",
+        "litellm.acompletion",
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
@@ -646,7 +646,7 @@ async def test_budget_exhaustion_returns_structured_error() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
@@ -699,7 +699,7 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
         pytest.raises(ComposerConvergenceError) as exc_info,
@@ -757,7 +757,7 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=api_error,
         ),
@@ -818,7 +818,7 @@ async def test_three_failed_advisor_calls_trigger_anti_anchor_hint() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=api_error,
         ),
@@ -873,7 +873,7 @@ async def test_successful_advisor_call_resets_anti_anchor_failures() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=[
                 api_errors[0],
@@ -1134,7 +1134,7 @@ async def test_missing_advisor_trigger_rejects_without_outbound_call() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=_make_advisor_response(),
         ) as mock_acompletion,
@@ -1178,7 +1178,7 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=ValueError("unexpected codec failure"),
         ),
@@ -1222,7 +1222,7 @@ async def test_transport_failure_still_degrades_into_structured_advisor_feedback
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=httpx.ConnectError("connection refused"),
         ),
@@ -1255,7 +1255,7 @@ async def test_f4_advisor_empty_content_classified_as_malformed() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=empty_response,
         ),
@@ -1301,7 +1301,7 @@ async def test_advisor_non_string_content_classified_as_malformed(content: objec
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=malformed_response,
         ),
@@ -1341,7 +1341,7 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=api_error,
         ) as mock_acompletion,
@@ -1413,7 +1413,7 @@ async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: st
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
@@ -1447,7 +1447,7 @@ async def test_invalid_advisor_call_preserves_budget_for_next_valid_call() -> No
     }
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock) as mock_provider,
+        patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
     ):
         mock_llm.side_effect = [
             _make_tool_call("invalid", "request_advisor_hint", invalid),
@@ -1530,7 +1530,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
@@ -1601,7 +1601,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
@@ -1659,7 +1659,7 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
 
     with (
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=asyncio.CancelledError(),
         ),

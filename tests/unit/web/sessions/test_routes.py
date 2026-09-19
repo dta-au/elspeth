@@ -5203,7 +5203,7 @@ class TestMessageRoutes:
             provider_requests.append(kwargs)
             return next(responses)
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+        monkeypatch.setattr("litellm.acompletion", completion)
 
         sent = client.post(
             f"/api/sessions/{session_id}/messages",
@@ -5229,12 +5229,16 @@ class TestMessageRoutes:
             ),
             "GET": json.dumps(returned_audit, sort_keys=True),
         }
-        assert [message.tool_calls[0]["_kind"] for message in persisted_audit if message.tool_calls] == [
+        # Physical calls checkpoint before the planner returns its semantic cohort.
+        envelopes = [message.tool_calls[0] for message in persisted_audit if message.tool_calls]
+        assert [envelope["_kind"] for envelope in envelopes] == [
+            "llm_call_audit",
             "llm_call_audit",
             "planner_attempt_audit",
-            "llm_call_audit",
             "planner_attempt_audit",
         ]
+        assert [envelope["call"]["planner_call_ordinal"] for envelope in envelopes[:2]] == [1, 2]
+        assert [envelope["attempt"]["planner_call_ordinal"] for envelope in envelopes[2:]] == [1, 2]
         for surface_name, surface_payload in audit_surfaces.items():
             for canary_name, canary in canaries.items():
                 assert canary not in surface_payload, f"{canary_name} canary leaked through {surface_name} planner audit"
@@ -5948,7 +5952,7 @@ class TestMessageRoutes:
         )
 
         with patch(
-            "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+            "litellm.acompletion",
             new=_async_return(malformed_tool_response),
         ):
             send_resp = client.post(
@@ -6038,7 +6042,7 @@ class TestMessageRoutes:
         )
 
         with patch(
-            "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+            "litellm.acompletion",
             new=_async_return(mismatched_tool_response),
         ):
             send_resp = client.post(

@@ -221,7 +221,7 @@ def _build_app(
         "_compute_availability",
         lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),

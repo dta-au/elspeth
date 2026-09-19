@@ -37,8 +37,8 @@ LLM and enforces, on each turn:
    caching is wired. Marked ``xfail`` today because the
    ``cache_control`` markers have not landed (Phase 3 of the plan).
 
-The fake LLM is patched at ``service._call_llm`` so the dispatch path,
-audit recorder, and budget counters all run through the real code. Only
+The fake LLM is patched at ``litellm.acompletion`` so the dispatch path,
+provider admission, audit recorder, and budget counters run through real code. Only
 the provider call itself is replaced — this keeps the harness faithful
 to production behaviour while staying deterministic and offline.
 """
@@ -195,18 +195,13 @@ async def _run_envelope(script: Sequence[ScriptedTurn], *, user_message: str = "
 
     responses = [_build_scripted_response(turn) for turn in script]
 
-    with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+    with patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = responses
         result = await service.compose(user_message, [], state, session_id=session_id)
 
     sizes: list[int] = []
     for invocation in mock_llm.call_args_list:
-        # _call_llm is patched as a bound method; positional args are
-        # (messages, tools).
-        if len(invocation.args) >= 2:
-            sizes.append(_serialize_call(invocation.args[0], invocation.args[1]))
-        elif "messages" in invocation.kwargs and "tools" in invocation.kwargs:
-            sizes.append(_serialize_call(invocation.kwargs["messages"], invocation.kwargs["tools"]))
+        sizes.append(_serialize_call(invocation.kwargs["messages"], invocation.kwargs["tools"]))
     return _EnvelopeRun(result=result, per_turn_byte_sizes=tuple(sizes))
 
 

@@ -454,6 +454,7 @@ class TestSingleQueryProcessing:
             rate_limit_registry=None,
             shutdown_event=None,
             payload_store=None,
+            llm_call_governance=None,
         )
         transform.on_start(ctx)
 

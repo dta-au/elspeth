@@ -987,7 +987,7 @@ class TestStep2IntraStep:
                 usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
             )
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", terminal_completion)
+        monkeypatch.setattr("litellm.acompletion", terminal_completion)
 
         settled = _post_current_response(
             composer_test_client,
@@ -1064,7 +1064,7 @@ class TestStep2IntraStep:
             provider_calls.append(kwargs)
             raise AssertionError("an intentless session must never reach the provider")
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", never_called)
+        monkeypatch.setattr("litellm.acompletion", never_called)
 
         settled = _post_current_response(
             composer_test_client,
@@ -1136,7 +1136,7 @@ class TestStep2IntraStep:
             provider_calls.append(kwargs)
             raise AssertionError("an intentless session must never reach the provider")
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", never_called)
+        monkeypatch.setattr("litellm.acompletion", never_called)
         monkeypatch.setattr(guided_route, "_has_planner_intent", lambda guided: True)
 
         settled = _post_current_response(
@@ -1300,7 +1300,7 @@ class TestStep2IntraStep:
                 usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
             )
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", terminal_completion)
+        monkeypatch.setattr("litellm.acompletion", terminal_completion)
 
         settled = _post_current_response(
             composer_test_client,
@@ -1466,7 +1466,7 @@ class TestStep2IntraStep:
                 usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
             )
 
-        monkeypatch.setattr(service_module, "_litellm_acompletion", terminal_completion)
+        monkeypatch.setattr("litellm.acompletion", terminal_completion)
 
         from structlog.testing import capture_logs
 
@@ -1633,7 +1633,7 @@ class TestStep2IntraStep:
             return _planner_terminal_response()
 
         monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)  # type: ignore[attr-defined]
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
+        monkeypatch.setattr("litellm.acompletion", mutating_completion)
 
         failed = _post_current_response(
             composer_test_client,
@@ -1722,7 +1722,7 @@ class TestStep2IntraStep:
         async def cancelling_completion(**_kwargs: Any) -> _PlannerResponse:
             raise asyncio.CancelledError("provider cancelled matching planner request")
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", cancelling_completion)
+        monkeypatch.setattr("litellm.acompletion", cancelling_completion)
         with app.state.session_engine.connect() as conn:
             state_ids_before = conn.execute(
                 select(composition_states_table.c.id).where(composition_states_table.c.session_id == session_id)
@@ -4800,7 +4800,7 @@ class TestStep2IntraStep:
         async def declining_completion(**_kwargs: Any) -> _PlannerResponse:
             return next(responses)
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", declining_completion)
+        monkeypatch.setattr("litellm.acompletion", declining_completion)
 
         declined = _post_current_response(
             composer_test_client,

@@ -165,7 +165,7 @@ def test_real_guided_service_discovers_once_then_commits_canonical_document_abst
         provider="openrouter",
     )
     app.state.composer_service = real_service
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     planned = composer_test_client.post(
         f"/api/sessions/{session['id']}/guided/plan",

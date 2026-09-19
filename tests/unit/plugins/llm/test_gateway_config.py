@@ -262,6 +262,7 @@ def _make_ctx() -> SimpleNamespace:
         landscape=object(),
         telemetry_emit=lambda event: None,
         payload_store=None,
+        llm_call_governance=None,
     )
 
 

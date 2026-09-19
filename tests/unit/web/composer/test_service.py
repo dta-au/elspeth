@@ -597,7 +597,7 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
         )
 
     monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)  # type: ignore[attr-defined]
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
+    monkeypatch.setattr("litellm.acompletion", mutating_completion)
 
     for guided in (ordinary, replace(ordinary, profile=TUTORIAL_PROFILE)):
         with pytest.raises(AuditIntegrityError, match="planner call inputs changed"):
@@ -1825,7 +1825,7 @@ class TestComposerSingleToolCall:
         final_turn = _make_llm_response(content="Pipeline configured.")
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm,
             patch.object(
                 service,
                 "_cached_runtime_preflight",
@@ -3362,7 +3362,7 @@ class TestProviderCacheTokenAudit:
             }
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm:
             mock_llm.return_value = response
             result = await service.compose("Hi", [], state, session_id=session_id)
 
@@ -4555,7 +4555,7 @@ class TestComposerSamplingConfig:
         # care about what reached LiteLLM on the first (and possibly only) call.
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 return_value=completion,
             ) as mock_acomp,
@@ -4576,7 +4576,7 @@ class TestComposerSamplingConfig:
         completion = _make_llm_response(content="acknowledged")
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=completion,
         ) as mock_acomp:
@@ -4595,7 +4595,7 @@ class TestComposerSamplingConfig:
         completion = _make_llm_response(content="diagnostic text")
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=completion,
         ) as mock_acomp:
@@ -4614,7 +4614,7 @@ class TestComposerSamplingConfig:
         completion = _make_llm_response(content="diagnostic text")
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=completion,
         ) as mock_acomp:
@@ -4646,7 +4646,7 @@ class TestEmptyChoicesValidation:
         empty_response = FakeLLMResponse(choices=[])
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 return_value=empty_response,
             ),
@@ -4688,7 +4688,7 @@ class TestEmptyChoicesValidation:
 
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 side_effect=[mutation_call, empty_response],
             ) as mock_acomp,
@@ -4741,7 +4741,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 side_effect=bad_request,
             ),
@@ -4781,7 +4781,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 side_effect=bad_request,
             ),
@@ -4839,7 +4839,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 side_effect=bad_request,
             ),
@@ -4878,7 +4878,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 side_effect=bad_request,
             ),
@@ -4909,7 +4909,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 side_effect=[transient_error, success],
             ) as mock_llm,
@@ -4950,7 +4950,7 @@ class TestComposerAvailabilityAndBadRequest:
 
         with (
             patch(
-                "elspeth.web.composer.service._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 side_effect=bad_request,
             ) as mock_llm,
