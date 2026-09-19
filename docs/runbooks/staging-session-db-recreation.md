@@ -225,18 +225,19 @@ create missing identity policy rows when both issuance defaults are
 configured. Do not widen registration to admit the cohort or bypass these
 paths with the historical SQL workaround.
 
-**Token admission is already fail-closed.** A configured
+**Token admission is fail-closed.** A configured
 `quota_default_tokens_per_day` requires an active identity policy; a configured
 `quota_container_tokens_per_day` requires an active container policy. A
 missing required slot refuses chargeable work with `quota_policy_missing`.
-An applicable active identity or container policy otherwise refuses with
-`token_accounting_unavailable`, including policies authored independently of
-boot defaults, because complete accounting is not implemented. Adding policy
-rows does not make chargeable work available in this release. Only an active
-identity with no configured token-policy requirements and no applicable
-active policies receives the explicit no-quota allowance. Keep the
-deployment's intended policy posture; do not remove policies as a recovery
-shortcut.
+For an applicable active identity or container policy, admission compares
+the measured UTC-day total with each limit. A known empty day is zero; a
+pending attempt, unknown reported usage, or an accounting-query failure
+refuses with `token_accounting_unavailable`. Exhaustion refuses with
+`quota_exceeded`. Explicit policy rows apply even without boot defaults.
+Only an active identity with no configured token-policy requirements and no
+applicable active policies receives the explicit no-quota allowance. Keep
+the deployment's intended policy posture; do not remove policies as a
+recovery shortcut.
 
 Verify that an admitted account can log in again, and separately verify the
 expected chargeable-admission result before reopening ordinary traffic.

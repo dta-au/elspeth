@@ -1,5 +1,11 @@
 # Kubernetes (multi-replica) and Identity Workflow — Master Implementation Plan
 
+> **2026-09-19 execution update:** Workstream I's starting epochs, quota
+> implementation assumptions, and approval-eligibility default are stale on
+> `release/0.8.1`. Use the [current identity execution map](../2026-09-19-identity-workflow-finalization.md)
+> before any I-task file. Workstream K remains a separate plan. The review
+> record below is historical and is not an implementation acceptance.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Land the last two structural building blocks of ELSPETH: a maintained
@@ -156,7 +162,17 @@ Rows are in execution order within each workstream.
   - On SQLite, `grant_role` stores a non-UTC `expires_at` at the wrong instant: `_ensure_utc` (`coordination/membership_authority.py:50-51`) only tags naive values, and SQLite `DateTime` drops `tzinfo`, so a `+10:00` expiry is enforced ten hours late. I11's export reproduces what the SQLite authority enforces.
   - `grant_role` refuses a past `expires_at` with a bare `ValueError` (`identity_authority.py:2601`), which reaches the client as HTTP 500, not a typed 409. I11 documents the 500; a typed refusal must update I11's re-admission step 3 and its restoration test.
   - `assert_relationship` locks its two `identities` rows in argument order (`identity_authority.py:2731-2732`), not stable id order, so it can deadlock (`40P01`, fail-safe, a 500 on the admin route) against I7's curator grant and the I3 and I4 participant locks.
-- **Operator decisions still open (raised by the task authors on 2026-09-14 and by the 2026-09-15 review fixes; each task states the default it took):**
+- **2026-09-19 identity rulings:** the operator reaffirmed role-based approval
+  eligibility (the addressed approver sorts first, but every active non-author
+  approver may inspect and decide), required a later rejection to retire
+  earlier approvals for that state, required an audit event for supersession,
+  and required `compartment_id` in signed Landscape exports. The I3/I6/I7/I9/I10/I11
+  defaults and code excerpts below that conflict with these rulings are
+  superseded by the [current identity execution map](../2026-09-19-identity-workflow-finalization.md).
+- **Historical open-decision list (raised 2026-09-14/15):** the four identity
+  subjects resolved above are no longer open. Other questions in this list
+  still need disposition before their affected tasks ship; each task states
+  its earlier default for comparison.
   - **K5 (review B5):** the P4a probe needs a composer provider in the kind lane. Either the `kubernetes-kind` job gets a provider secret, or P4a gives no evidence in CI, and K8's published acceptance claim must match whichever is chosen.
   - **K5:** the acceptance controller takes `replicas: tuple[ProbePod, ProbePod]` with `ProbePod(address, deployment, role)`, the shape of ACA's `ProbeReplica`, instead of a `deployments=` mapping. Confirm that shape, or require `deployments=` with each replica's origin and role derived inside the controller.
   - **K5 (review W1 fix):** the failure-diagnostics collector redacts only values the `kind_cluster` fixture minted. K5's optional composer provider env file, its `lane` registration password and the probes' bearer tokens could pass through a pod log line (no logging path for them exists at HEAD: `cli.py:4733` sets `access_log=False`). Hand those values to the collector, or accept the residual.
