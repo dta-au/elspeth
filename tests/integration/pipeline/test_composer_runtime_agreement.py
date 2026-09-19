@@ -608,7 +608,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -623,14 +623,17 @@ from elspeth.contracts.chargeable_admission import (
     ChargeableOperation,
     QuotaDisposition,
 )
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.enums import CreationModality, RunStatus
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.secrets import (
     SecretInventoryItem,
     SecretUnavailabilityReason,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.contracts.token_usage import TokenUsage
 from elspeth.core.config import (
     AggregationSettings,
     CoalesceSettings,
@@ -649,6 +652,9 @@ from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline
 from elspeth.engine.orchestrator.types import RouteValidationError
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
+from elspeth.plugins.transforms.llm.transform import LLMTransform
+from elspeth.testing import make_pipeline_row
 from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobIntegrityError, BlobRecord
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
 from elspeth.web.composer.state import (
@@ -667,6 +673,7 @@ from elspeth.web.execution.validation import validate_pipeline_for_trained_opera
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.base_classes import _TestSchema, as_sink, as_source, as_transform
+from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_factory
 from tests.fixtures.pipeline import build_production_graph
 from tests.fixtures.plugins import (
@@ -4103,7 +4110,7 @@ sinks:
     @patch("elspeth.web.execution.service.load_settings_from_config_dict")
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
-    def test_runtime_records_audit_hash_before_settings_load(
+    def test_runtime_records_audit_hash_and_delivers_uploaded_prompt_to_provider_stub(
         self,
         mock_payload_cls: Any,
         mock_landscape_cls: Any,
@@ -4126,6 +4133,13 @@ sinks:
         )
         blob_service = _FakeBlobService(blob_record=blob_record, content=content)
         cast(Any, service)._blob_service = blob_service
+        provider = Mock(spec=LLMProvider)
+        provider.execute_query.return_value = LLMQueryResult(
+            content="accepted",
+            usage=TokenUsage.known(4, 1),
+            model="openai/gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
 
         async def record_blob_inline_resolutions(
             *,
@@ -4144,6 +4158,24 @@ sinks:
             assert expand_env_vars is False
             prompt_template = config_dict["transforms"][0]["options"]["prompt_template"]
             assert prompt_template == "You are an audited prompt."
+            transform = LLMTransform(
+                {
+                    "provider": "openrouter",
+                    "model": "openai/gpt-4o",
+                    "api_key": "test-key",
+                    "prompt_template": prompt_template,
+                    "schema": {"mode": "observed"},
+                    "required_input_fields": [],
+                }
+            )
+            transform._provider = provider
+            row = make_pipeline_row({"text": "hello"})
+            context = make_context(
+                state_id="state-123",
+                run_id="run-123",
+                token=TokenInfo(row_id="row-1", token_id="token-1", row_data=make_pipeline_row({})),
+            )
+            assert transform._process_row(row, context).status == "success"
             raise RuntimeError("stop after inline audit")
 
         mock_load.side_effect = stop_after_audit
@@ -4167,6 +4199,8 @@ sinks:
         assert len(resolutions) == 1
         assert resolutions[0].field_path == "node:classify.options.prompt_template"
         assert resolutions[0].content_hash == sha256
+        provider.execute_query.assert_called_once()
+        assert provider.execute_query.call_args.args[0] == [ChatMessage(role="user", content=content.decode("utf-8"))]
 
 
 class TestComposerRuntimeFixedModeImplicitRequiredAgreement:

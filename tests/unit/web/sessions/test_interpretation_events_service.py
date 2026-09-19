@@ -28,11 +28,12 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import insert, select, update
+from sqlalchemy import Connection, insert, select, update
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BlobRecord
@@ -70,6 +71,7 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.inline_blob_preflight import SessionInlineBlobSnapshot
 from elspeth.web.sessions.models import (
     blobs_table,
     composition_states_table,
@@ -1376,7 +1378,8 @@ async def test_resolve_inline_reference_uses_prepared_bytes(engine) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_inline_reference_refuses_blob_row_changed_after_read(engine) -> None:
+@pytest.mark.parametrize("blob_update", [{"status": "error"}, {"mime_type": "application/json"}])
+async def test_pending_inline_reference_refuses_blob_row_changed_after_read(engine, blob_update: dict[str, str]) -> None:
     content = b"sku,description\nhats,A fine hat\n"
     session_id = uuid4()
     blob_id = uuid4()
@@ -1384,7 +1387,7 @@ async def test_pending_inline_reference_refuses_blob_row_changed_after_read(engi
 
     def read_blob(_context: SessionOperationContext, _requested_id: UUID) -> tuple[BlobRecord, bytes]:
         with engine.begin() as conn:
-            conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob_id)).values(status="error"))
+            conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob_id)).values(**blob_update))
         return record_holder[0], content
 
     service = DualFencedSessionServiceHarness(
@@ -1417,6 +1420,58 @@ async def test_pending_inline_reference_refuses_blob_row_changed_after_read(engi
             )
     with engine.connect() as conn:
         assert conn.execute(select(interpretation_events_table.c.id).where(interpretation_events_table.c.id.is_not(None))).all() == []
+
+
+def test_inline_snapshot_refuses_modality_swap_with_identical_bytes() -> None:
+    """Replacement may change trust provenance while retaining the same hash and size."""
+    session_id = uuid4()
+    blob_id = uuid4()
+    content = b"prompt text"
+    digest = hashlib.sha256(content).hexdigest()
+    record = BlobRecord(
+        id=blob_id,
+        session_id=session_id,
+        filename="prompt.txt",
+        mime_type="text/plain",
+        size_bytes=len(content),
+        content_hash=digest,
+        storage_path="/tmp/inline-prompt.txt",
+        created_at=datetime.now(UTC),
+        created_by="user",
+        source_description=None,
+        status="ready",
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+    snapshot = SessionInlineBlobSnapshot(refs=frozenset(), records={blob_id: (record, content)})
+    row = SimpleNamespace(
+        session_id=str(session_id),
+        status="ready",
+        content_hash=digest,
+        size_bytes=len(content),
+        filename=record.filename,
+        mime_type=record.mime_type,
+        storage_path=record.storage_path,
+        created_by=record.created_by,
+        source_description=record.source_description,
+        creation_modality=CreationModality.LLM_GENERATED.value,
+        created_from_message_id="composer-message",
+        creating_model_identifier="model",
+        creating_model_version="v1",
+        creating_provider="provider",
+        creating_composer_skill_hash="a" * 64,
+        creating_arguments_hash="b" * 64,
+    )
+    conn = MagicMock(spec=Connection)
+    conn.execute.return_value.one_or_none.return_value = row
+
+    with pytest.raises(AuditIntegrityError, match="inline blob changed"):
+        snapshot.assert_current_rows(conn, session_id=session_id)
 
 
 @pytest.mark.asyncio

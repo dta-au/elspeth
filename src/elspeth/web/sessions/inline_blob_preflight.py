@@ -103,6 +103,18 @@ class SessionInlineBlobSnapshot:
                     blobs_table.c.status,
                     blobs_table.c.content_hash,
                     blobs_table.c.size_bytes,
+                    blobs_table.c.filename,
+                    blobs_table.c.mime_type,
+                    blobs_table.c.storage_path,
+                    blobs_table.c.created_by,
+                    blobs_table.c.source_description,
+                    blobs_table.c.creation_modality,
+                    blobs_table.c.created_from_message_id,
+                    blobs_table.c.creating_model_identifier,
+                    blobs_table.c.creating_model_version,
+                    blobs_table.c.creating_provider,
+                    blobs_table.c.creating_composer_skill_hash,
+                    blobs_table.c.creating_arguments_hash,
                 ).where(blobs_table.c.id == str(blob_id))
             ).one_or_none()
             if (
@@ -111,6 +123,18 @@ class SessionInlineBlobSnapshot:
                 or row.status != record.status
                 or row.content_hash != record.content_hash
                 or row.size_bytes != record.size_bytes
+                or row.filename != record.filename
+                or row.mime_type != record.mime_type
+                or row.storage_path != record.storage_path
+                or row.created_by != record.created_by
+                or row.source_description != record.source_description
+                or row.creation_modality != record.creation_modality.value
+                or row.created_from_message_id != record.created_from_message_id
+                or row.creating_model_identifier != record.creating_model_identifier
+                or row.creating_model_version != record.creating_model_version
+                or row.creating_provider != record.creating_provider
+                or row.creating_composer_skill_hash != record.creating_composer_skill_hash
+                or row.creating_arguments_hash != record.creating_arguments_hash
             ):
                 raise AuditIntegrityError("inline blob changed after preflight snapshot")
 
