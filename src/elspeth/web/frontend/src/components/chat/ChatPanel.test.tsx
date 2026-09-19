@@ -10590,6 +10590,67 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     expect(within(panel).getByRole("status")).toHaveTextContent(COMPOSE_CONNECTING_MESSAGE);
   });
 
+  it("shows completed guided blockers without offering a mutation through advisory chat", () => {
+    useExecutionStore.setState({ validationResult: withheldValidation() });
+    useSessionStore.setState({
+      guidedSession: {
+        step: "step_4_wire",
+        history: [],
+        terminal: { kind: "completed", reason: null, pipeline_yaml: "" },
+        chat_history: [],
+        chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+    });
+    render(<ChatPanel />);
+    const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
+    expect(within(panel).getByText("Save for review is blocked. Run pipeline is still available.")).toBeInTheDocument();
+    const apply = within(panel).getByRole("button", { name: /^Apply suggestion/ });
+    expect(apply).toBeDisabled();
+    expect(within(panel).getByRole("status")).toHaveTextContent(
+      "Pipeline suggestions can be applied in the freeform editor.",
+    );
+    const freeformEditor = screen.getByRole("button", { name: "Open freeform editor" });
+    expect(freeformEditor.closest(".guided-authoring-scroll")).not.toBeNull();
+    fireEvent.click(apply);
+    expect(useComposer().sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("announces pending interpretation arrivals once and Show focuses the existing card", () => {
+    render(<ChatPanel />);
+    const event: InterpretationEvent = {
+      id: "decision-review",
+      session_id: "session-1",
+      composition_state_id: "state-1",
+      affected_node_id: null,
+      tool_call_id: "call-review",
+      user_term: "cool",
+      kind: "vague_term",
+      llm_draft: "trendy",
+      accepted_value: null,
+      choice: "pending",
+      interpretation_source: "user_approved",
+      created_at: "2026-09-19T00:00:00Z",
+      resolved_at: null,
+      actor: "system:composer",
+      model_identifier: "test-model",
+      model_version: "test-model",
+      provider: "test-provider",
+      composer_skill_hash: "0".repeat(64),
+      arguments_hash: null,
+      hash_domain_version: null,
+      runtime_model_identifier_at_resolve: null,
+      runtime_model_version_at_resolve: null,
+      approved_prompt_artifact_hash: null,
+    };
+    act(() => useInterpretationEventsStore.getState().addPendingEvent("session-1", event));
+    expect(screen.getByTestId("acknowledgement-live-region")).toHaveTextContent("1 decision to acknowledge");
+    expect(screen.getByTestId("decision-panel-live-region")).toBeEmptyDOMElement();
+    fireEvent.click(screen.getByRole("button", { name: "Show interpretation review: cool" }));
+    expect(screen.getByTestId("acknowledgement-stack").contains(document.activeElement)).toBe(true);
+  });
+
   it("keeps the proposals banner reachable under its pinned name inside the panel", () => {
     useExecutionStore.setState({ validationResult: withheldValidation() });
     useSessionStore.setState({

@@ -39,8 +39,8 @@ files, 190 matched release or integration history. Exact copies of the other
 evaluation scenarios were byte-identical in the main checkout. Donor branch
 refs remain available. The integration worktree was retained.
 
-The integration branch changes only the decision-panel frontend files, the
-adapted decoder boundary test, this reconciliation note, and the separate
+The reconciled donor commits change only the decision-panel frontend files,
+the adapted decoder boundary test, this reconciliation note, and the separate
 [landing plan](../plans/2026-09-19-composer-landing.md).
 
 ## Verification on the integration branch
@@ -52,8 +52,10 @@ adapted decoder boundary test, this reconciliation note, and the separate
   had two `spawnSync ... EPERM` failures; both passed in the permitted rerun.
 - Frontend TypeScript typecheck, ESLint, Stylelint and production build: exit 0.
 
-These checks do not establish live-browser acceptance. Phase 1 still has the
-ticketed limits: validator suggestion rows are transient after reload, the
-advisor's discarded suggestion is not on this wire, and `Open checks` selects
-the Checks tab without switching the narrow Compose view to Pipeline. The
-phase-2 migration of review and proposal controls is `elspeth-b0ef01ea25`.
+These donor checks do not establish live-browser acceptance. Validator
+suggestion rows remain transient after reload and the advisor's discarded
+suggestion is not on this wire. The independent landing review subsequently
+measured that `Open checks` already switches narrow Compose to Pipeline and
+focuses Checks; the donor's navigation warning was stale. The landing plan
+records the separate review repairs and validation sequence. The phase-2
+migration of review and proposal controls remains `elspeth-b0ef01ea25`.

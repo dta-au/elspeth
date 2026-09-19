@@ -27,9 +27,8 @@
 //   * root is `<section role="region" aria-label="Awaiting your decision (N)">`;
 //   * Apply buttons are named `Apply suggestion: <humanised text>`;
 //   * pointer buttons are named `Show interpretation review: <user term>`;
-//   * `Open checks` always renders. On a narrow viewport the Checks tab lives
-//     behind the Pipeline view tab, which this event does not switch; the
-//     panel itself is in the Compose view so the information is never hidden.
+//   * `Open checks` always renders. The workspace handles the view intent by
+//     revealing Pipeline on narrow screens, then selecting and focusing Checks.
 //   * no tool or API vocabulary in visible copy (F-3).
 //
 // There is deliberately no "review again" button. A compose turn that

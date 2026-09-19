@@ -1114,6 +1114,16 @@
   overscroll-behavior: contain;
 }
 
+/* Share the minimum visible space while decisions are pending. At 375px a
+   review stack, policy summary and input squeezed the dock to 6px, too short
+   for its 36px Show/Reject controls. Giving both transcript and dock 160px
+   instead clipped the input. These smaller bounded floors retain both
+   scrollable surfaces and leave the primary input inside the panel. */
+.chat-panel-dock:has(.decision-panel),
+.chat-panel:has(.decision-panel) .chat-panel-messages-region {
+  min-height: min(96px, 18%);
+}
+
 /* The dock is keyboard-focusable (tabIndex={0} in ChatPanel) because it can
    scroll and its hidden content need not contain anything focusable: measured
    67px below the last focusable control, reachable by wheel or drag alone —
@@ -2392,6 +2402,7 @@
   flex: 1 1 auto;
   min-width: 0;
   font-size: var(--font-size-sm);
+  overflow-wrap: anywhere;
 }
 
 .decision-panel-apply-btn,

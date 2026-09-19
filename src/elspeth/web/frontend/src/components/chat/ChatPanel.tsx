@@ -2031,29 +2031,19 @@ export function ChatPanel({
   // the handlers below send canned chat prompts so each click that changes
   // the pipeline is a planner call.
   const validationResult = useExecutionStore((s) => s.validationResult);
-  const pendingInterpretationsById = useInterpretationEventsStore((state) =>
-    activeSessionId === null ? undefined : state.pendingBySession[activeSessionId],
-  );
-  const pendingInterpretations = useMemo<InterpretationEvent[]>(
-    () =>
-      pendingInterpretationsById === undefined
-        ? []
-        : Object.values(pendingInterpretationsById),
-    [pendingInterpretationsById],
-  );
   const decisionRows = useMemo(
     () =>
       projectDecisionRows({
         validationResult,
         compositionState,
-        pendingInterpretations,
+        pendingInterpretations: pendingAcknowledgementEvents,
         proposals: compositionProposals,
         staleProposalIds,
       }),
     [
       validationResult,
       compositionState,
-      pendingInterpretations,
+      pendingAcknowledgementEvents,
       compositionProposals,
       staleProposalIds,
     ],
@@ -2072,10 +2062,15 @@ export function ChatPanel({
   // backend's 422 (bootstrap race), so Apply stays closed until
   // composeTimeoutReady, and reads as connecting (or the stuck unavailable
   // state) rather than as a dead click.
-  const decisionApplyDisabled = isComposing || !composeTimeoutReady;
-  const decisionApplyDisabledReason = composerTimeoutUnavailable
-    ? COMPOSE_UNAVAILABLE_MESSAGE
-    : COMPOSE_CONNECTING_MESSAGE;
+  const guidedCompleted = guidedSession?.terminal?.kind === "completed";
+  // Completed guided chat is advisory. Show the same readiness information,
+  // but keep mutation on the existing freeform editing surface.
+  const decisionApplyDisabled = guidedCompleted || isComposing || !composeTimeoutReady;
+  const decisionApplyDisabledReason = guidedCompleted
+    ? "Pipeline suggestions can be applied in the freeform editor."
+    : composerTimeoutUnavailable
+      ? COMPOSE_UNAVAILABLE_MESSAGE
+      : COMPOSE_CONNECTING_MESSAGE;
   const handleApplySuggestion = useCallback(
     (suggestion: ValidationEntryDTO) => {
       void sendMessage(applySuggestionPrompt(suggestion));
@@ -2318,6 +2313,40 @@ export function ChatPanel({
       </div>
     );
   }
+
+  // Proposal and interpretation arrivals retain their existing announcers.
+  // This live region announces only facts those surfaces do not already own.
+  const decisionPanel = (
+    <>
+      <PendingProposalsLiveRegion
+        proposals={compositionProposals}
+        staleProposalIds={staleProposalIds}
+      />
+      <DecisionPanelLiveRegion
+        count={decisionRows.rows.filter(
+          (row) => row.kind === "blocker" || row.kind === "suggestion",
+        ).length}
+      />
+      <DecisionPanel
+        rows={decisionRows.rows}
+        blockedVerbs={decisionRows.blockedVerbs}
+        count={decisionRows.count}
+        proposals={compositionProposals}
+        staleProposalIds={staleProposalIds}
+        proposalActionPendingIds={proposalActionPendingIds}
+        isComposing={isComposing}
+        applyDisabled={decisionApplyDisabled}
+        applyDisabledReason={decisionApplyDisabledReason}
+        phraseFor={decisionPhraseFor}
+        stepLabelFor={decisionStepLabelFor}
+        onApplySuggestion={handleApplySuggestion}
+        onOpenChecks={handleOpenChecks}
+        onShowInterpretation={handleShowInterpretation}
+        onAcceptProposal={acceptProposal}
+        onRejectProposal={rejectProposal}
+      />
+    </>
+  );
 
   // ── Shared guided chrome builders ───────────────────────────────────────────
   //
@@ -2607,16 +2636,6 @@ export function ChatPanel({
             Same persistent-mount contract as the guided surface: the stack
             returns null when empty; the live region is unconditional. */}
         <AcknowledgementLiveRegion sessionId={activeSessionId ?? ""} />
-        <AcknowledgementStack
-          sessionId={activeSessionId ?? ""}
-          isTutorial={isTutorial}
-          onResolved={(newState) => {
-            if (newState !== null) {
-              useSessionStore.setState({ compositionState: newState });
-            }
-          }}
-        />
-        <CompletionSummary terminal={guidedSession.terminal} isTutorial={isTutorial} />
         {/* The conversation SURVIVES the commit (elspeth-986801d218). The
             build is over — there is no wizard turn, no decision card and no
             forward affordance — but the chat channel stays open so the user
@@ -2627,6 +2646,20 @@ export function ChatPanel({
             false, so the freeform SideRail (Run / Export) keeps its place. */}
         {buildGuidedWorkspaceScroller(
           <>
+            {/* These cards share the scroll budget with the transcript, as
+                they do during guided authoring. Fixed above the scroller,
+                they squeezed the new decision dock and input off a narrow
+                screen. The announcer stays outside this scrolling content. */}
+            <AcknowledgementStack
+              sessionId={activeSessionId ?? ""}
+              isTutorial={isTutorial}
+              onResolved={(newState) => {
+                if (newState !== null) {
+                  useSessionStore.setState({ compositionState: newState });
+                }
+              }}
+            />
+            <CompletionSummary terminal={guidedSession.terminal} isTutorial={isTutorial} />
             <GuidedChatHistory
               chatHistory={guidedSession.chat_history}
               onRetrySyntheticFailure={handleRetrySyntheticFailure}
@@ -2675,6 +2708,9 @@ export function ChatPanel({
             ) : null}
           </>,
         )}
+        <div className="chat-panel-dock" tabIndex={0} ref={attachDock}>
+          {decisionPanel}
+        </div>
         {buildGuidedComposer({
           placeholder: GUIDED_COMPLETED_CHAT_PLACEHOLDER,
           // Editable, in the tutorial dwell too: a locked prompt is an
@@ -3654,49 +3690,7 @@ export function ChatPanel({
         {/* Blob manager drawer */}
         {showBlobManager && <BlobManager onUseAsInput={handleUseAsInput} />}
 
-        {/* Pending-proposal banner — surfaces composer proposals that need
-            operator approval, co-located with the input so the user does not
-            have to scroll up to find the Accept button on the originating
-            tool-call message. Component returns null when nothing is pending. */}
-        {/* Persistent announcer for banner arrivals (elspeth-2d1cf8908c):
-            the banner returns null when empty, so a live-region role on the
-            banner itself would mount WITH its content — the unreliable
-            pattern AcknowledgementLiveRegion documents. This node pre-exists
-            the content; only its text mutates. */}
-        <PendingProposalsLiveRegion
-          proposals={compositionProposals}
-          staleProposalIds={staleProposalIds}
-        />
-        {/* Decision panel (elspeth-cb0d4b8dba): blockers, validator
-            suggestions with Apply, pointers to pending review cards, and
-            the pending-proposals banner hosted inside one region. Its own
-            always-mounted live region announces the non-proposal rows; the
-            proposals region above keeps announcing proposals, so one
-            arrival is never announced twice. */}
-        <DecisionPanelLiveRegion
-          count={
-            decisionRows.rows.filter((row) => row.kind !== "pending_proposal")
-              .length
-          }
-        />
-        <DecisionPanel
-          rows={decisionRows.rows}
-          blockedVerbs={decisionRows.blockedVerbs}
-          count={decisionRows.count}
-          proposals={compositionProposals}
-          staleProposalIds={staleProposalIds}
-          proposalActionPendingIds={proposalActionPendingIds}
-          isComposing={isComposing}
-          applyDisabled={decisionApplyDisabled}
-          applyDisabledReason={decisionApplyDisabledReason}
-          phraseFor={decisionPhraseFor}
-          stepLabelFor={decisionStepLabelFor}
-          onApplySuggestion={handleApplySuggestion}
-          onOpenChecks={handleOpenChecks}
-          onShowInterpretation={handleShowInterpretation}
-          onAcceptProposal={acceptProposal}
-          onRejectProposal={rejectProposal}
-        />
+        {decisionPanel}
 
         {/*
           Inline-source fallback prompt (Phase 5a Task 5).
