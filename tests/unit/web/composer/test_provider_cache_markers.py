@@ -342,7 +342,7 @@ class TestCacheMarkersWiredAtCallSite:
             return anthropic_response
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new=fake_acompletion,
         ):
             result = await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
@@ -427,7 +427,7 @@ class TestCacheMarkersWiredAtCallSite:
             return oai_response
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new=fake_acompletion,
         ):
             await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)

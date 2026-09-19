@@ -3778,6 +3778,8 @@ class ComposerServiceImpl:
         The explanation is advisory UI text only: it does not call composer
         tools, mutate CompositionState, or persist chat messages.
         """
+        if recorder is None:
+            recorder = BufferingRecorder()
         if not self._availability.available:
             raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
 

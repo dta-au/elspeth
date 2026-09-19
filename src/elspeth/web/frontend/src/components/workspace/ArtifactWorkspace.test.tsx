@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "@/api/client";
 import * as auditApi from "@/api/auditReadiness";
+import { DecisionPanel } from "@/components/chat/DecisionPanel";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { EMPTY_GUIDED_REVIEWED_COMPONENTS } from "@/stores/guidedReviewedComponents";
@@ -523,6 +524,79 @@ describe("ArtifactWorkspace", () => {
       "aria-selected",
       "true",
     );
+  });
+
+  it("opens visible Checks from the decision panel on a narrow viewport and moves keyboard focus", async () => {
+    class NarrowResizeObserver implements ResizeObserver {
+      constructor(private callback: ResizeObserverCallback) {}
+
+      observe(target: Element): void {
+        this.callback(
+          [{ target, contentRect: { width: 375 } } as ResizeObserverEntry],
+          this,
+        );
+      }
+
+      unobserve(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal("ResizeObserver", NarrowResizeObserver);
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    const user = userEvent.setup();
+    render(
+      <ComposerWorkspace
+        authoring={
+          <DecisionPanel
+            rows={[{
+              kind: "blocker",
+              id: "blocked",
+              code: "advisor",
+              detail: "Review is required.",
+            }]}
+            blockedVerbs={["save_for_review"]}
+            count={1}
+            proposals={[]}
+            staleProposalIds={[]}
+            proposalActionPendingIds={[]}
+            isComposing={false}
+            applyDisabled={false}
+            applyDisabledReason={null}
+            phraseFor={() => "Pipeline"}
+            stepLabelFor={() => null}
+            onApplySuggestion={vi.fn()}
+            onOpenChecks={() => dispatchArtifactViewIntent({
+              tab: "checks",
+              focusMode: false,
+              sessionId: "session-1",
+            })}
+            onShowInterpretation={vi.fn()}
+            onAcceptProposal={vi.fn()}
+            onRejectProposal={vi.fn()}
+          />
+        }
+        artifact={<ArtifactWorkspace />}
+        inspector={null}
+        actionBar={null}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute(
+      "aria-selected", "true",
+    );
+    expect(screen.queryByRole("tab", { name: /^Checks/ })).not.toBeInTheDocument();
+    screen.getByRole("button", { name: "Open checks" }).focus();
+    await user.keyboard("{Enter}");
+
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveAttribute(
+      "aria-selected", "true",
+    );
+    const checks = screen.getByRole("tab", { name: /^Checks/ });
+    expect(checks).toHaveAttribute("aria-selected", "true");
+    expect(checks).toHaveFocus();
+    expect(screen.getByRole("tabpanel", { name: /^Checks/ })).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Open checks" }),
+    ).not.toBeInTheDocument();
   });
 
   it("routes a new-session request from the first committed layout effect", () => {

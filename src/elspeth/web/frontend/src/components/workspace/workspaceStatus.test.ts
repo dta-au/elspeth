@@ -361,6 +361,85 @@ describe("workspace status projections", () => {
   });
 });
 
+describe("blocked readiness (elspeth-cb0d4b8dba)", () => {
+  // Measured on session 94f6f00c: a green build whose completion the advisor
+  // gate withheld carried ONE blocker and read "1 warning" on the badge,
+  // because the projection only read errors / is_valid / warnings. A
+  // readiness blocker is the user's own progress being stopped; it must
+  // outrank a warning count and say so.
+  const blocked = {
+    ...makeValidationResult({
+      readiness: {
+        authoring_valid: true,
+        execution_ready: true,
+        completion_ready: false,
+        blockers: [
+          {
+            code: "advisor_signoff_blocked",
+            component_id: "pipeline",
+            component_type: "pipeline",
+            detail: "Completion advisory review did not clear.",
+          },
+        ],
+      },
+    }),
+    warnings: [
+      {
+        component_id: "colour_questions",
+        component_type: "transform",
+        message: "Prompt-injection exposure is low.",
+        suggestion: null,
+      },
+    ],
+  };
+
+  it("projects Blocked ahead of the warning count", () => {
+    expect(projectValidationWorkspaceStatus(blocked)).toEqual({
+      text: "Blocked",
+      tone: "warning",
+      accessibleLabel: "Validation: Blocked",
+      issueCount: 1,
+      blocked: true,
+    });
+  });
+
+  it("still lets validation errors outrank a blocker", () => {
+    const withError = makeValidationResult({
+      is_valid: false,
+      errors: [
+        {
+          component_id: "node-1",
+          component_type: "transform",
+          message: "Invalid",
+          suggestion: null,
+        },
+      ],
+      readiness: blocked.readiness,
+    });
+    expect(projectValidationWorkspaceStatus(withError)).toMatchObject({
+      text: "1 error",
+      tone: "error",
+    });
+  });
+
+  it("carries Blocked through the merged Checks badge", () => {
+    const auditReady = projectAuditWorkspaceStatus({
+      activeSessionId: SESSION_ID,
+      compositionVersion: 4,
+      snapshotsBySession: { [SESSION_ID]: auditSnapshot() },
+      errorBySession: {},
+    });
+    expect(
+      projectChecksWorkspaceStatus(projectValidationWorkspaceStatus(blocked), auditReady),
+    ).toEqual({
+      text: "Blocked",
+      tone: "warning",
+      accessibleLabel: "Checks: Blocked",
+      issueCount: 1,
+    });
+  });
+});
+
 describe("merged checks projection", () => {
   const validationPassed = projectValidationWorkspaceStatus(
     makeValidationResult(),

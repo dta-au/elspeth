@@ -1114,6 +1114,16 @@
   overscroll-behavior: contain;
 }
 
+/* Share the minimum visible space while decisions are pending. At 375px a
+   review stack, policy summary and input squeezed the dock to 6px, too short
+   for its 36px Show/Reject controls. Giving both transcript and dock 160px
+   instead clipped the input. These smaller bounded floors retain both
+   scrollable surfaces and leave the primary input inside the panel. */
+.chat-panel-dock:has(.decision-panel),
+.chat-panel:has(.decision-panel) .chat-panel-messages-region {
+  min-height: min(96px, 18%);
+}
+
 /* The dock is keyboard-focusable (tabIndex={0} in ChatPanel) because it can
    scroll and its hidden content need not contain anything focusable: measured
    67px below the last focusable control, reachable by wheel or drag alone —
@@ -2324,6 +2334,99 @@
 }
 
 .pending-proposals-banner-actions .btn {
+  min-height: var(--size-control-compact);
+}
+
+/* Decision panel (elspeth-cb0d4b8dba): the one "Awaiting your decision"
+   surface above the chat input. Same input-aligned margins and warning
+   accent as the proposals banner it hosts; the hosted banner drops its
+   outer margin and border so it reads as a section of the panel. */
+.decision-panel {
+  margin: 0 var(--space-md) var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--color-border-strong);
+  border-left: 3px solid var(--color-warning);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-elevated);
+  color: var(--color-text);
+}
+
+.decision-panel-header {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: var(--space-xs);
+}
+
+.decision-panel-title {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: 600;
+}
+
+.decision-panel-verbs {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.decision-panel-gate {
+  margin: 0 0 var(--space-xs);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.decision-panel-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.decision-panel-item {
+  display: flex;
+  gap: var(--space-md);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-xs) 0;
+}
+
+.decision-panel-item + .decision-panel-item {
+  border-top: 1px solid var(--color-border);
+}
+
+.decision-panel-item-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--font-size-sm);
+  overflow-wrap: anywhere;
+}
+
+.decision-panel-apply-btn,
+.decision-panel-show-btn {
+  flex-shrink: 0;
+}
+
+.decision-panel .pending-proposals-banner {
+  margin: var(--space-xs) 0 0;
+  padding: var(--space-xs) 0 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  border-radius: 0;
+  background: transparent;
+}
+
+.decision-panel-actions {
+  display: flex;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  margin-top: var(--space-sm);
+}
+
+.decision-panel-checks-btn {
   min-height: var(--size-control-compact);
 }
 

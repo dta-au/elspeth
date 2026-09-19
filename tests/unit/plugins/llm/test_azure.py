@@ -762,6 +762,7 @@ class TestLLMTransformAzurePipelining:
                 azure_endpoint="https://my-resource.openai.azure.com",
                 api_key="azure-api-key",
                 api_version="2024-10-21",
+                max_retries=0,
             )
 
 

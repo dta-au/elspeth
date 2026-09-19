@@ -167,7 +167,7 @@ async def _drive_freeform_scripted(
     completion (the positive driver scripts exactly one). Returns the committed
     ``CompositionState`` and the accepted proposal record.
     """
-    env.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    env.monkeypatch.setattr("litellm.acompletion", completion)
     await env.sessions.update_composer_preferences(
         session.id,
         trust_mode="explicit_approve",
@@ -320,7 +320,7 @@ async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(pa
         # escape-hatch overtime turn on the advisor model. A fourth malformed
         # terminal spends the hatch, so the original REPAIR_EXHAUSTED stands.
         completion = _ScriptedCompletion(malformed, malformed, malformed, malformed)
-        parity_env.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+        parity_env.monkeypatch.setattr("litellm.acompletion", completion)
         response = await client.post(f"/api/sessions/{session_id}/messages", json={"content": _LINEAR["intent"]})
 
     assert response.status_code == 500, response.text

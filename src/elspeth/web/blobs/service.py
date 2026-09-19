@@ -4440,13 +4440,11 @@ class BlobServiceImpl:
                         )
                         continue
                     if residual_row_exists:
+                        # Exact identities remain in the cleanup result and
+                        # custody records, not process-global metric labels.
                         _BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER.add(
                             1,
-                            {
-                                "orphan_blob_id": str(blob_id),
-                                "target_session_id": target_session_id_str,
-                                "exc_type": type(cleanup_exc).__name__,
-                            },
+                            {"exc_type": type(cleanup_exc).__name__},
                         )
                     continue
                 deleted_ids.append(blob_id)

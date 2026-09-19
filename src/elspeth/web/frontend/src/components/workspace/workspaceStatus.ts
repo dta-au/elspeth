@@ -24,6 +24,13 @@ export interface WorkspaceStatus {
    *  mirrors the validation channel's own failure — counts in exactly one of
    *  them. It may therefore undercount a channel's standalone `text`. */
   issueCount: number;
+  /** Set only when a readiness blocker withholds Run or Save for review
+   *  (elspeth-cb0d4b8dba). The merged Checks projection reads it to say
+   *  "Blocked" instead of a bare issue count: a blocker is the user's own
+   *  progress being stopped, which a count of warnings does not convey.
+   *  Optional-and-absent (never `false`) so the literal shape every other
+   *  status carries is unchanged. */
+  blocked?: true;
 }
 
 function validationStatus(
@@ -56,6 +63,20 @@ export function projectValidationWorkspaceStatus(
     return validationStatus(plural(errorCount, "error"), "error", errorCount);
   }
   if (!validationResult.is_valid) return validationStatus("Failed", "error");
+  // A readiness blocker on an otherwise valid result (the advisor sign-off
+  // withheld on a green build, a review card awaiting the user) outranks the
+  // warning count: measured on session 94f6f00c the badge read "1 warning"
+  // while Save for review was disabled with no visible reason.
+  // Optional chain mirrors ExecuteButton's read of the same field: fixtures
+  // and older wire shapes can omit `readiness`, and an absent gate is "no
+  // blocker", never a crash on the badge.
+  const blockerCount = validationResult.readiness?.blockers.length ?? 0;
+  if (blockerCount > 0) {
+    return {
+      ...validationStatus("Blocked", "warning", blockerCount),
+      blocked: true,
+    };
+  }
   const warningCount = validationResult.warnings?.length ?? 0;
   if (warningCount > 0) {
     return validationStatus(
@@ -165,7 +186,9 @@ export function projectChecksWorkspaceStatus(
   ) as WorkspaceStatusTone;
   const issueCount = validation.issueCount + audit.issueCount;
   const text =
-    issueCount > 0
+    validation.blocked === true && tone !== "error"
+      ? "Blocked"
+      : issueCount > 0
       ? plural(issueCount, "issue")
       : tone === "error"
         ? "Check failed"

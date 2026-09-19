@@ -251,7 +251,7 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
         requests.append(kwargs)
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     result = await composer.compose(
         "Build a CSV to JSONL pipeline.",
@@ -372,7 +372,7 @@ async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
         )
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     result = await composer.compose(
         "Build a CSV to JSONL pipeline.",
@@ -418,7 +418,7 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
         requests.append(kwargs)
         return responses.pop(0)
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     await composer.compose(
         message,
@@ -513,7 +513,7 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     async def completion(**_kwargs: Any) -> _Response:
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     worker_started = threading.Event()
     release_worker = threading.Event()
@@ -616,7 +616,7 @@ async def test_auto_commit_cancellation_survives_rejection_failure_and_repeated_
     async def completion(**_kwargs: Any) -> _Response:
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     proposal_created = asyncio.Event()
     release_create_result = asyncio.Event()
@@ -809,7 +809,7 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
     async def completion(**_kwargs: Any) -> _Response:
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
     # The planner audit cohort settles via add_messages_atomic
     # (elspeth-90231248dc); failing it is what must abort before any
     # proposal/authority/state row exists.
@@ -898,7 +898,7 @@ async def test_freeform_matching_provider_cancellation_persists_once_without_sel
     async def cancelling_completion(**_kwargs: Any) -> _Response:
         raise asyncio.CancelledError("provider cancelled matching freeform planner request")
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", cancelling_completion)
+    monkeypatch.setattr("litellm.acompletion", cancelling_completion)
 
     with pytest.raises(asyncio.CancelledError) as caught:
         await composer.compose(
@@ -970,7 +970,7 @@ async def test_freeform_planner_manifest_mismatch_is_durable_before_failure(
         return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
+    monkeypatch.setattr("litellm.acompletion", mutating_completion)
 
     with pytest.raises(AuditIntegrityError, match="planner call inputs changed"):
         await composer.compose(
@@ -1011,7 +1011,7 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
         kwargs["messages"][0]["content"] += "\nprovider-side mutation"
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
+    monkeypatch.setattr("litellm.acompletion", mutating_completion)
 
     audit_worker_started = threading.Event()
     release_audit_worker = threading.Event()
@@ -1021,7 +1021,8 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
     def pause_mismatch_audit_insert(*args: Any, **kwargs: Any) -> Any:
         row_id = original_insert(*args, **kwargs)
         tool_calls = kwargs["tool_calls"]
-        if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "llm_call_audit":
+        # Physical evidence already checkpointed; race the manifest-mismatch cohort.
+        if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "planner_attempt_audit":
             audit_worker_started.set()
             if not release_audit_worker.wait(timeout=5.0):
                 raise TimeoutError("test did not release mismatch audit worker")

@@ -981,6 +981,13 @@
   min-height: 480px;
 }
 
+/* A decision dock needs room alongside the transcript and wrapped input
+   controls. At short phone heights, the App-owned outer scroller exposes
+   this extra space instead of clipping Send and Upload inside the pane. */
+.composer-workspace[data-layout-mode="narrow"]:has(.decision-panel) {
+  min-height: 640px;
+}
+
 .composer-workspace[data-layout-mode="narrow"] .workspace-view-tabs {
   display: flex;
   grid-row: 1;

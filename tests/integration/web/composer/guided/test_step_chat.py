@@ -15,9 +15,8 @@ Verifies the end-to-end contract of the per-step chat endpoint:
 
 HTTP transport: SyncASGITestClient (in-process, synchronous — same
 pattern as the other guided integration tests). Patch target convention:
-``elspeth.web.composer.guided.chat_solver._litellm_acompletion`` —
-patch the symbol where ``chat_solver`` resolves it rather than patching the
-provider library globally.
+``litellm.acompletion`` keeps the real Composer provider wrapper in place,
+including quota admission, terminal settlement, and audit evidence.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 # Helpers
 # ---------------------------------------------------------------------------
 
-_CHAT_SOLVER_ACOMPLETION = "elspeth.web.composer.guided.chat_solver._litellm_acompletion"
+_CHAT_SOLVER_ACOMPLETION = "litellm.acompletion"
 
 
 @dataclass
@@ -248,14 +247,9 @@ def _llm_call_audit_bodies(client: TestClient, session_id: str) -> list[dict]:
     for message in messages:
         if message.role != "audit":
             continue
-        try:
-            content = json.loads(message.content)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(content, dict):
-            continue
-        if content.get("_kind") == "llm_call_audit":
-            rows.append(content)
+        for envelope in message.tool_calls or ():
+            if envelope["_kind"] == "llm_call_audit":
+                rows.append(dict(envelope["call"]))
     return rows
 
 

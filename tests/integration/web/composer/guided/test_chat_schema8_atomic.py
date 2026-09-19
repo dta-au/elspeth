@@ -624,7 +624,7 @@ def test_upload_advisory_provider_cannot_answer_a_source_turn(
     record_before = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
     assert record_before is not None
     completion = _ReturningLiteLLMCompletion(_fake_llm_reply("Please choose how to interpret this uploaded JSON."))
-    monkeypatch.setattr("elspeth.web.composer.guided.chat_solver._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
     request_body = _chat_body(turn, message='I\'ve uploaded "MOCK_DATA.json"; please use it as the pipeline input.')
 
     response = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=request_body)
@@ -670,7 +670,7 @@ def test_uploaded_source_provider_authors_options_before_atomic_replay(
             }
         )
     )
-    monkeypatch.setattr("elspeth.web.composer.guided.chat_solver._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
     request_body = _chat_body(turn, message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.')
 
     response = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=request_body)
@@ -2699,7 +2699,6 @@ class TestCompletedSessionChat:
         skips context assembly entirely — so every assertion about what the
         model is told has to come through this seam.
         """
-        from elspeth.web.composer.guided import chat_solver
 
         captured: list[dict[str, object]] = []
 
@@ -2707,7 +2706,7 @@ class TestCompletedSessionChat:
             captured.append(kwargs)
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=reply, tool_calls=None))])
 
-        monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture)
+        monkeypatch.setattr("litellm.acompletion", capture)
         return captured
 
     @staticmethod
