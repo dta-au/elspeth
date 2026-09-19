@@ -7044,12 +7044,12 @@ assistant_message_kind: "synthetic_failure",
       expect(log).toHaveTextContent("why is node-2 here?");
       expect(log).toHaveTextContent("It reshapes each row.");
 
-      // CompletionSummary stays a DIRECT child of .chat-panel--completed (the
-      // `> .guided-completion` gutter rule is pinned in completionSurface.test)
-      // and outside the log — a heading is not a turn arrival.
+      // CompletionSummary shares the bounded scroll area so fixed cards do
+      // not push the decision dock and input off short screens. It remains
+      // outside the live log — a heading is not a turn arrival.
       const completion = container.querySelector(".guided-completion");
       expect(completion).not.toBeNull();
-      expect(completion!.parentElement?.classList.contains("chat-panel--completed")).toBe(true);
+      expect(completion!.parentElement?.classList.contains("guided-authoring-scroll")).toBe(true);
       expect(log.contains(completion)).toBe(false);
 
       // The acknowledgement live region must not nest inside another live

@@ -1021,7 +1021,8 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
     def pause_mismatch_audit_insert(*args: Any, **kwargs: Any) -> Any:
         row_id = original_insert(*args, **kwargs)
         tool_calls = kwargs["tool_calls"]
-        if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "llm_call_audit":
+        # Physical evidence already checkpointed; race the manifest-mismatch cohort.
+        if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "planner_attempt_audit":
             audit_worker_started.set()
             if not release_audit_worker.wait(timeout=5.0):
                 raise TimeoutError("test did not release mismatch audit worker")

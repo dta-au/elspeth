@@ -1529,19 +1529,21 @@ class TestStep2IntraStep:
         assert [entry["fields"] for entry in gap] == [["amount_aud", "client"]]
         assert "preserve or produce every other reviewed output required field" in planner_contexts[0]["unproducible_output_fields_usage"]
         audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
-        planner_evidence_kinds = [
-            envelope.get("_kind")
+        planner_evidence = [
+            envelope
             for message in audit_messages
             for envelope in (message.tool_calls or ())
             if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
             and (envelope.get("_kind") == "planner_attempt_audit" or envelope.get("call", {}).get("planner_call_ordinal") is not None)
         ]
+        planner_evidence_kinds = [envelope["_kind"] for envelope in planner_evidence]
         assert planner_evidence_kinds
         assert len(planner_evidence_kinds) % 2 == 0
-        assert all(
-            planner_evidence_kinds[index : index + 2] == ["llm_call_audit", "planner_attempt_audit"]
-            for index in range(0, len(planner_evidence_kinds), 2)
-        )
+        call_count = len(planner_evidence_kinds) // 2
+        # Each physical call checkpoints before the planner persists its semantic cohort.
+        assert planner_evidence_kinds == ["llm_call_audit"] * call_count + ["planner_attempt_audit"] * call_count
+        assert [envelope["call"]["planner_call_ordinal"] for envelope in planner_evidence[:call_count]] == list(range(1, call_count + 1))
+        assert [envelope["attempt"]["planner_call_ordinal"] for envelope in planner_evidence[call_count:]] == list(range(1, call_count + 1))
 
     @pytest.mark.parametrize(
         ("profile", "expected_surface"),
@@ -4813,21 +4815,17 @@ class TestStep2IntraStep:
             "I cannot produce a safe proposal from the reviewed facts."
         )
         audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
-        planner_evidence_kinds = [
-            envelope.get("_kind")
+        planner_evidence = [
+            envelope
             for message in audit_messages
             for envelope in (message.tool_calls or ())
             if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
             and (envelope.get("_kind") == "planner_attempt_audit" or envelope.get("call", {}).get("planner_call_ordinal") is not None)
         ]
-        assert planner_evidence_kinds == [
-            "llm_call_audit",
-            "planner_attempt_audit",
-            "llm_call_audit",
-            "planner_attempt_audit",
-            "llm_call_audit",
-            "planner_attempt_audit",
-        ]
+        planner_evidence_kinds = [envelope["_kind"] for envelope in planner_evidence]
+        assert planner_evidence_kinds == ["llm_call_audit"] * 3 + ["planner_attempt_audit"] * 3
+        assert [envelope["call"]["planner_call_ordinal"] for envelope in planner_evidence[:3]] == [1, 2, 3]
+        assert [envelope["attempt"]["planner_call_ordinal"] for envelope in planner_evidence[3:]] == [1, 2, 3]
 
     def test_escape_hatch_decline_materializes_a_prospective_current_turn(
         self,
