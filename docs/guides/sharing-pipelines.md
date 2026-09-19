@@ -70,7 +70,7 @@ accept this trade-off.
 ## First-deploy operator action
 
 For 0.8.1, shareable-review state is part of the broader web session database
-contract. The release expects `SESSION_SCHEMA_EPOCH=59` and
+contract. The release expects `SESSION_SCHEMA_EPOCH=60` and
 `SQLITE_SCHEMA_EPOCH=42`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed
@@ -105,7 +105,8 @@ policy limits to 64-bit integers and makes token-ledger prompt/completion measur
 nullable: unknown usage is NULL, never zero. Landscape epoch 42 requires
 admission evidence v2 with per-principal token quota usage and limits; stored
 v1 evidence is incompatible. Session epoch 59 adds timestamp-leading indexes for
-container-wide quota scans. A Landscape store below epoch 42 is stale and must be recreated. When
+container-wide quota scans. Session epoch 60 persists guided fork failure diagnostics.
+A Landscape store below epoch 42 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this

@@ -1,7 +1,7 @@
 ### Task I2: Storage quota R13 at every byte-admitting site
 
 > **Current execution note (2026-09-19):** This is active delivery work.
-> Re-anchor the call graph against Sessions epoch 59 and the current source;
+> Re-anchor the call graph against Sessions epoch 60 and the current source;
 > its old epoch-57 assertion and positional line numbers are stale. Preserve
 > the zero-net-byte replay exemption and cover replacement growth as well as
 > the four named byte-admission categories. See the
