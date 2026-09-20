@@ -130,10 +130,25 @@ function activeArtifact(
   tab: ArtifactTab,
   runAvailable: boolean,
   checksValidationContent: React.ReactNode,
+  openFullscreen: () => void,
 ): JSX.Element {
   switch (tab) {
     case "graph":
-      return <GraphView />;
+      // Fullscreen lives on the tab that owns the graph, not in the shared
+      // toolbar. It wraps GraphView rather than sitting inside it because
+      // GraphModal renders the same GraphView (the button must not appear in
+      // the full-screen view it opens) and because it must stay reachable in
+      // every graph state: it is the only keyboard-operable trigger for
+      // GraphModal (palette "Show graph" and Ctrl+Shift+G deliberately pass
+      // focusMode:false, and the canvas's click gestures are already bound).
+      return (
+        <>
+          <Button compact className="artifact-graph-fullscreen-btn" onClick={openFullscreen}>
+            Fullscreen
+          </Button>
+          <GraphView />
+        </>
+      );
     case "approvals":
       return <ApprovalsView />;
     case "spec":
@@ -561,16 +576,8 @@ export function ArtifactWorkspaceSurface({
             );
           })}
         </div>
-        {/* Right cluster (2026-08-15 UX review): Plugin catalog precedes
-            Focus graph in DOM order — visual order IS tab order (WCAG 2.4.3;
-            no CSS `order` on interactive controls), and Focus graph keeps
-            its long-standing terminal-edge position whether or not the
-            catalog renders. Focus graph itself must NEVER be removed in
-            favour of a canvas gesture: it is the only keyboard-operable
-            trigger for GraphModal (palette "Show graph" and Ctrl+Shift+G
-            deliberately pass focusMode:false), and the canvas's click
-            gestures are already bound (empty-click deselects, double-click
-            zooms). */}
+        {/* Right cluster: session-wide tools only. The graph's Fullscreen
+            control moved onto the Workflow tab itself (see activeArtifact). */}
         <div className="artifact-toolbar-actions">
           {/* Sole opener of the History drawer since the action-bar chips
               retired with the Checks tab: gated on the same completed-history
@@ -590,9 +597,6 @@ export function ArtifactWorkspaceSurface({
             </Button>
           )}
           {catalogAvailable && <CatalogButton />}
-          <Button compact onClick={focusGraph}>
-            Focus graph
-          </Button>
         </div>
       </div>
       <p
@@ -636,7 +640,7 @@ export function ArtifactWorkspaceSurface({
                 key={`${activeSessionId ?? "no-session"}:${tab}`}
                 label={`${activeLabel} artifact`}
               >
-                {activeArtifact(tab, runAvailable, checksValidationContent)}
+                {activeArtifact(tab, runAvailable, checksValidationContent, focusGraph)}
               </ErrorBoundary>
             )}
           </div>

@@ -330,6 +330,16 @@
   padding: var(--space-md);
 }
 
+/* Workflow tab: opens the full-screen graph. Top-left of the panel — the
+   pending-proposal pill owns top-right, the zoom controls bottom-left and the
+   minimap bottom-right. */
+.artifact-graph-fullscreen-btn {
+  position: absolute;
+  z-index: var(--z-panel-controls);
+  top: var(--space-sm);
+  left: var(--space-sm);
+}
+
 /* Approvals tab: the approved value under an audit-style row. Prompts are
    multi-line, so the text keeps its line breaks and reads at body colour. */
 .approvals-view-value {

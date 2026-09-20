@@ -1095,7 +1095,7 @@ test.describe("Composer deterministic workspace geometry", () => {
           [composer.checksTab(), 36],
           [composer.artifactTab("Run"), 36],
           [composer.catalogButton(), 36],
-          [page.getByRole("button", { name: "Focus graph" }), 36],
+          [page.getByRole("button", { name: "Fullscreen" }), 36],
         ];
         const boxes = await Promise.all(
           controls.map(([control]) => control.boundingBox()),

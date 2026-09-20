@@ -450,7 +450,7 @@ describe("ArtifactWorkspace", () => {
     const user = userEvent.setup();
     renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
 
-    await user.click(screen.getByRole("button", { name: "Focus graph" }));
+    await user.click(screen.getByRole("button", { name: "Fullscreen" }));
     act(() => useSessionStore.setState({ compositionStateLoaded: true }));
     await act(async () => Promise.resolve());
 
@@ -954,7 +954,7 @@ describe("ArtifactWorkspace", () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
     const user = userEvent.setup();
     renderArtifactWorkspace();
-    await user.click(screen.getByRole("tab", { name: "Spec" }));
+    // Fullscreen lives on the Workflow tab, so the request starts there.
     const observations: Array<{ focused: Element | null; selected: string | null }> = [];
     const listener = () => {
       const graph = screen.getByRole("tab", { name: "Workflow" });
@@ -965,7 +965,7 @@ describe("ArtifactWorkspace", () => {
     };
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
-    await user.click(screen.getByRole("button", { name: "Focus graph" }));
+    await user.click(screen.getByRole("button", { name: "Fullscreen" }));
 
     await waitFor(() => expect(observations).toHaveLength(1));
     await Promise.resolve();
@@ -990,7 +990,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
       useSessionStore.setState({ activeSessionId: "session-2" });
     });
 
@@ -1005,7 +1005,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
       fireEvent.click(screen.getByRole("tab", { name: "Run" }));
     });
     await act(async () => Promise.resolve());
@@ -1028,7 +1028,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
       view.unmount();
     });
 
@@ -1122,7 +1122,7 @@ describe("ArtifactWorkspace", () => {
     };
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
-    fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
+    fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
     fireEvent.click(
       screen.getByRole("button", { name: "Switch speculative session" }),
     );
@@ -1198,7 +1198,8 @@ describe("ArtifactWorkspace", () => {
       "Spec artifact encountered an error",
     );
     expect(screen.getByRole("tablist", { name: "Pipeline artifacts" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Focus graph" })).toBeEnabled();
+    // Fullscreen belongs to the Workflow tab's panel, not the shared toolbar.
+    expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Validation status" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Run pipeline" })).toBeEnabled();
 
@@ -1548,19 +1549,19 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     vi.unstubAllGlobals();
   });
 
-  it("mounts Plugin catalog before Focus graph in DOM order when admitted", () => {
+  it("keeps Plugin catalog in the toolbar and Fullscreen inside the Workflow panel", () => {
     renderArtifactWorkspace({ catalogAvailable: true });
 
     const catalog = screen.getByRole("button", { name: "Plugin catalog" });
-    const focusGraph = screen.getByRole("button", { name: "Focus graph" });
-    // WCAG 2.4.3: visual order IS tab order — catalog precedes Focus graph
-    // in the DOM, no CSS `order` on interactive controls. Focus graph keeps
-    // the terminal edge whether or not the catalog renders.
+    const fullscreen = screen.getByRole("button", { name: "Fullscreen" });
+    // WCAG 2.4.3: visual order IS tab order — the toolbar precedes the panel
+    // in the DOM, no CSS `order` on interactive controls.
     expect(
-      catalog.compareDocumentPosition(focusGraph) &
+      catalog.compareDocumentPosition(fullscreen) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(catalog.parentElement).toBe(focusGraph.parentElement);
+    expect(screen.getByRole("tabpanel", { name: "Workflow" })).toContainElement(fullscreen);
+    expect(catalog.parentElement).not.toContainElement(fullscreen);
   });
 
   it("omits the catalog trigger by default (tutorial/guided mounts)", () => {
@@ -1568,10 +1569,11 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     expect(
       screen.queryByRole("button", { name: "Plugin catalog" }),
     ).toBeNull();
-    // Focus graph is unconditional: it is the only keyboard-operable
-    // GraphModal trigger (palette/Ctrl+Shift+G pass focusMode:false).
+    // Fullscreen is unconditional on the Workflow tab, empty state included:
+    // it is the only keyboard-operable GraphModal trigger (palette and
+    // Ctrl+Shift+G pass focusMode:false).
     expect(
-      screen.getByRole("button", { name: "Focus graph" }),
+      screen.getByRole("button", { name: "Fullscreen" }),
     ).toBeInTheDocument();
   });
 
@@ -1753,7 +1755,7 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       expect(screen.queryByRole("button", { name: "History" })).toBeNull();
     });
 
-    it("mounts the trigger before the terminal-edge Focus graph control", () => {
+    it("mounts the trigger in the toolbar, ahead of the Workflow panel's Fullscreen control", () => {
       useSessionStore.setState({
         guidedSession: guidedSessionWithHistory(),
       } as never);
@@ -1761,8 +1763,8 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
 
       const history = screen.getByRole("button", { name: "History" });
       expect(history).toHaveAttribute("id", "artifact-history-trigger");
-      const focusGraph = screen.getByRole("button", { name: "Focus graph" });
-      expect(history.parentElement).toBe(focusGraph.parentElement);
+      const focusGraph = screen.getByRole("button", { name: "Fullscreen" });
+      expect(history.parentElement).not.toContainElement(focusGraph);
       expect(
         history.compareDocumentPosition(focusGraph) &
           Node.DOCUMENT_POSITION_FOLLOWING,

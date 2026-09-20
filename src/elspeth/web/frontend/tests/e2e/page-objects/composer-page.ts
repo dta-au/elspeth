@@ -113,7 +113,7 @@ export class ComposerPage {
   }
 
   focusGraph(): Locator {
-    return this.page.getByRole("button", { name: "Focus graph" });
+    return this.page.getByRole("button", { name: "Fullscreen" });
   }
 
   runPipeline(): Locator {

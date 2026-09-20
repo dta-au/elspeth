@@ -2,9 +2,8 @@ import { Button } from "@/components/ui";
 import { OPEN_CATALOG_EVENT } from "@/lib/composer-events";
 
 /**
- * Plugin-catalog trigger, mounted in the artifact-workspace toolbar beside
- * "Focus graph" (promoted out of the retired More-actions popover,
- * 2026-08-15 UX review). Plain compact species to match that row's 36px
+ * Plugin-catalog trigger, mounted in the artifact-workspace toolbar
+ * (promoted out of the retired More-actions popover, 2026-08-15 UX review). Plain compact species to match that row's 36px
  * register; the popover-era "Reference" meta chip and grid layout are gone —
  * beside a tablist and a view toggle, "read-only reference, not an action"
  * is no longer distinguishing information. The accessible name is the
