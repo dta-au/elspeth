@@ -92,6 +92,8 @@ class ModelToken:
     branch_name: str | None = None
     fork_group_id: str | None = None
     children: list[str] = field(default_factory=list)  # Child token IDs if forked
+    expected_child_count: int = 0  # Requested branch count, independent of returned children
+    coalesced_parent_ids: tuple[str, ...] = ()  # Consumed inputs, independent of persisted edges
     processed: bool = False  # Whether token has been processed by transform
 
 
@@ -340,6 +342,7 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         # Update parent model state
         model.state = TokenState.FORKED
         model.children = [c.token_id for c in children]
+        model.expected_child_count = len(branches)
 
         # Create model entries for children
         child_ids = []
@@ -430,6 +433,7 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
             row_id=model.row_id,
             state=TokenState.CREATED,
             parent_token_id=None,  # Merged token has multiple parents (tracked in DB)
+            coalesced_parent_ids=tuple(sibling_ids),
         )
 
         return merged.token_id
@@ -527,17 +531,28 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
 
     @invariant()
     def fork_creates_correct_number_of_children(self) -> None:
-        """Invariant: Forked parents have correct number of children in model."""
-        for token_id, model in self.model_tokens.items():
-            if model.state == TokenState.FORKED:
-                # Verify all expected children exist in database
-                for child_id in model.children:
-                    assert child_id in self.model_tokens, f"Child {child_id} of forked parent {token_id} missing from model"
-
-                    child_model = self.model_tokens[child_id]
-                    assert child_model.parent_token_id == token_id, (
-                        f"Child {child_id} has wrong parent: {child_model.parent_token_id} != {token_id}"
-                    )
+        """Invariant: Persisted direct children match the requested fork and returned IDs."""
+        with self.db.connection() as conn:
+            for token_id, model in self.model_tokens.items():
+                if model.state != TokenState.FORKED:
+                    continue
+                persisted_ids = list(
+                    conn.execute(
+                        text("""
+                            SELECT t.token_id
+                            FROM token_parents p
+                            JOIN tokens t ON t.token_id = p.token_id AND t.run_id = p.run_id
+                            WHERE p.parent_token_id = :parent_id AND p.run_id = :run_id
+                        """),
+                        {"parent_id": token_id, "run_id": self.run.run_id},
+                    ).scalars()
+                )
+                assert len(persisted_ids) == model.expected_child_count, (
+                    f"Persisted fork children for {token_id}: expected {model.expected_child_count}, got {len(persisted_ids)}"
+                )
+                assert set(persisted_ids) == set(model.children), (
+                    f"Persisted fork children for {token_id}: IDs {persisted_ids} differ from returned children {model.children}"
+                )
 
     @invariant()
     def terminal_states_have_outcomes(self) -> None:
@@ -586,25 +601,25 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         entry for each sibling that was consumed.
         """
         with self.db.connection() as conn:
-            for token_id, _model in self.model_tokens.items():
-                # Find tokens with join_group_id (they were created by coalesce)
+            for token_id, model in self.model_tokens.items():
+                if not model.coalesced_parent_ids:
+                    continue
                 result = conn.execute(
-                    text("SELECT join_group_id FROM tokens WHERE token_id = :token_id"),
-                    {"token_id": token_id},
+                    text("SELECT join_group_id FROM tokens WHERE token_id = :token_id AND run_id = :run_id"),
+                    {"token_id": token_id, "run_id": self.run.run_id},
                 ).fetchone()
 
-                if result is not None and result[0] is not None:
-                    # This is a merged token - verify it has parent links.
-                    # Query on the SAME connection: opening a second
-                    # db.connection() here would nest transactions on the
-                    # in-memory StaticPool under the write-intent begin
-                    # discipline (one DBAPI connection, explicit BEGINs).
-                    parent_rows = conn.execute(
-                        text("SELECT parent_token_id FROM token_parents WHERE token_id = :token_id"),
-                        {"token_id": token_id},
-                    ).fetchall()
-                    parent_ids = [r[0] for r in parent_rows]
-                    assert len(parent_ids) >= 2, f"Merged token {token_id} should have at least 2 parents, got {len(parent_ids)}"
+                assert result is not None, f"Persisted coalesce token {token_id} is missing"
+                assert result[0] is not None, f"Persisted coalesce token {token_id} has no join group"
+                parent_ids = list(
+                    conn.execute(
+                        text("SELECT parent_token_id FROM token_parents WHERE token_id = :token_id AND run_id = :run_id"),
+                        {"token_id": token_id, "run_id": self.run.run_id},
+                    ).scalars()
+                )
+                assert len(parent_ids) == len(model.coalesced_parent_ids) and set(parent_ids) == set(model.coalesced_parent_ids), (
+                    f"Persisted coalesce parents for {token_id}: expected {model.coalesced_parent_ids}, got {parent_ids}"
+                )
 
     @invariant()
     def model_count_matches_database(self) -> None:
@@ -627,6 +642,67 @@ TestTokenLifecycleStateMachine.settings = settings(max_examples=50, stateful_ste
 
 class TestTokenLifecycleInvariants:
     """Property tests for token lifecycle invariants using @given decorators."""
+
+    @pytest.mark.parametrize("corruption", ["missing", "extra", "replacement"])
+    def test_coalesce_invariant_detects_database_corruption(self, corruption: str) -> None:
+        machine = TokenLifecycleStateMachine()
+        try:
+            parent_id = machine.create_token({"value": 1})
+            machine.fork_token(parent_id, ["left", "middle", "right"])
+            children = machine.model_tokens[parent_id].children
+            merged_id = machine.coalesce_forked_siblings(children[0])
+            assert isinstance(merged_id, str)
+            machine.coalesce_merged_tokens_have_parent_links()
+            with machine.db.write_connection() as conn:
+                parameters = {"token_id": merged_id, "child_id": children[0], "parent_id": parent_id, "run_id": machine.run.run_id}
+                if corruption == "missing":
+                    conn.execute(text("DELETE FROM token_parents WHERE token_id = :token_id AND parent_token_id = :child_id"), parameters)
+                elif corruption == "extra":
+                    conn.execute(
+                        text(
+                            "INSERT INTO token_parents (run_id, token_id, parent_token_id, ordinal) VALUES (:run_id, :token_id, :parent_id, 3)"
+                        ),
+                        parameters,
+                    )
+                else:
+                    conn.execute(
+                        text(
+                            "UPDATE token_parents SET parent_token_id = :parent_id WHERE token_id = :token_id AND parent_token_id = :child_id"
+                        ),
+                        parameters,
+                    )
+            with pytest.raises(AssertionError, match="Persisted coalesce"):
+                machine.coalesce_merged_tokens_have_parent_links()
+        finally:
+            machine.teardown()
+
+    @pytest.mark.parametrize("corruption", ["missing", "extra", "replacement"])
+    def test_fork_child_invariant_detects_database_corruption(self, corruption: str) -> None:
+        """Changing persisted links must fail even while the model stays intact."""
+        machine = TokenLifecycleStateMachine()
+        try:
+            parent_id = machine.create_token({"value": 1})
+            machine.fork_token(parent_id, ["left", "right"])
+            machine.fork_creates_correct_number_of_children()
+            child_id = machine.model_tokens[parent_id].children[0]
+            extra_id = machine.create_token({"value": 2})
+            with machine.db.write_connection() as conn:
+                if corruption in {"missing", "replacement"}:
+                    conn.execute(
+                        text("DELETE FROM token_parents WHERE token_id = :child_id AND parent_token_id = :parent_id"),
+                        {"child_id": child_id, "parent_id": parent_id},
+                    )
+                if corruption in {"extra", "replacement"}:
+                    conn.execute(
+                        text(
+                            "INSERT INTO token_parents (run_id, token_id, parent_token_id, ordinal) VALUES (:run_id, :child_id, :parent_id, 0)"
+                        ),
+                        {"run_id": machine.run.run_id, "child_id": extra_id, "parent_id": parent_id},
+                    )
+            with pytest.raises(AssertionError, match="Persisted fork children"):
+                machine.fork_creates_correct_number_of_children()
+        finally:
+            machine.teardown()
 
     @given(token_count=st.integers(min_value=2, max_value=10))
     @settings(max_examples=20, deadline=None)

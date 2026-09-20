@@ -993,12 +993,10 @@ class TestTokenManagerBoundaryPaths:
                 assert parameter.default is inspect.Parameter.empty
                 assert type_hints[parameter_name] is int
 
-    def test_create_initial_token_requires_contract(self) -> None:
-        # Since elspeth-a27e71979f, SourceRow.__post_init__ rejects contract=None
-        # at construction time, so the engine's guard is now unreachable via
-        # normal construction. Verify the earlier guard fires instead.
-        with pytest.raises(TypeError, match="contract"):
-            SourceRow.valid({"value": 42})
+    def test_source_row_rejects_missing_contract_before_token_creation(self) -> None:
+        """Construction rejects a missing contract before TokenManager can consume it."""
+        with pytest.raises(ValueError, match=r"^Valid SourceRow must have a contract\."):
+            SourceRow(row={"value": 42}, is_quarantined=False, contract=None, source_row_index=0)
 
     def test_create_quarantine_token_rejects_non_quarantined_source_row(self) -> None:
         manager, _factory, run_id, source_node_id = _make_manager_context()

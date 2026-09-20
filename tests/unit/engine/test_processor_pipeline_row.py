@@ -165,36 +165,12 @@ class TestRowProcessorPipelineRow:
         assert result.token.row_data["amount"] == 100
         assert result.token.row_data.contract is contract
 
-    def test_process_row_requires_contract_on_source_row(self) -> None:
-        """process_row should raise if SourceRow has no contract.
-
-        The error propagates from TokenManager.create_initial_token(),
-        which enforces this requirement.
-        """
-        from elspeth.engine.processor import RowProcessor
-
-        factory = _make_mock_factory()
-        span_factory = _make_mock_span_factory()
-
-        RowProcessor(
-            execution=factory.execution,
-            data_flow=factory.data_flow,
-            span_factory=span_factory,
-            run_id="run_001",
-            source_node_id=NodeID("source_001"),
-            source_on_success="default",
-            traversal=_empty_traversal(),
-            scheduler=factory.scheduler,
-            coordination_token=leader_coordination_token(factory, "run_001"),
-        )
-
-        # Since elspeth-a27e71979f, SourceRow.__post_init__ rejects contract=None
-        # at construction time, so the engine's guard is now unreachable via
-        # normal construction. Verify the earlier guard fires instead.
+    def test_source_row_requires_contract_before_processing(self) -> None:
+        """A non-quarantined source row rejects a missing contract at construction."""
         from elspeth.contracts import SourceRow
 
-        with pytest.raises(TypeError, match="contract"):
-            SourceRow.valid({"amount": 100})  # type: ignore[call-arg]
+        with pytest.raises(ValueError, match="Valid SourceRow must have a contract"):
+            SourceRow(row={"amount": 100}, is_quarantined=False, contract=None, source_row_index=0)
 
 
 class TestRowProcessorExistingRow:

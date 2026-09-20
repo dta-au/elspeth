@@ -210,15 +210,8 @@ def _effective_input_fields(probe_rows: list[PipelineRow]) -> frozenset[str]:
     return effective
 
 
-@given(row=probe_row())
-@settings(
-    max_examples=30,
-    deadline=None,
-    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
-)
 def test_annotated_transforms_preserve_input_fields(
     _annotated_cls: type[BaseTransform],
-    row: PipelineRow,
 ) -> None:
     """Forward invariant — ADR-009 §Clause 4.
 
@@ -231,50 +224,47 @@ def test_annotated_transforms_preserve_input_fields(
     is clear — either fix the implementation or remove the annotation.
     """
     try:
-        transform = _probe_instantiate(_annotated_cls)
+        _probe_instantiate(_annotated_cls)
     except _UnprobeableTransform as exc:
         pytest.skip(f"{_annotated_cls.__name__}: {exc.reason}")
 
-    probe_rows = transform.forward_invariant_probe_rows(row)
+    checked_emissions = 0
 
-    result = transform.execute_forward_invariant_probe(
-        probe_rows,
-        _probe_context(transform),
+    @given(row=probe_row())
+    @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+    def check(row: PipelineRow) -> None:
+        nonlocal checked_emissions
+        # Keep each example independent, including stateful filter plugins.
+        transform = _probe_instantiate(_annotated_cls)
+        probe_rows = transform.forward_invariant_probe_rows(row)
+        input_fields = _effective_input_fields(probe_rows)
+        if not input_fields:
+            return
+        result = transform.execute_forward_invariant_probe(probe_rows, _probe_context(transform))
+        if result.status != "success":
+            # A quarantine is not a pass-through violation, but cannot prove it.
+            return
+        for emitted in _emitted_rows_from_result(result):
+            runtime_contract = frozenset(fc.normalized_name for fc in emitted.contract.fields)
+            runtime_payload = frozenset(emitted.keys())
+            dropped = input_fields - (runtime_contract & runtime_payload)
+            assert not dropped, (
+                f"{_annotated_cls.__name__} is annotated passes_through_input=True "
+                f"but dropped fields {sorted(dropped)!r} from probe row "
+                f"{row.to_dict()!r}. Either fix the implementation or remove "
+                "the annotation."
+            )
+            checked_emissions += 1
+
+    check()
+    assert checked_emissions >= 1, (
+        f"{_annotated_cls.__name__} produced no checkable pass-through emissions. "
+        "Its probe must emit at least one successful row with nonempty effective input fields."
     )
 
-    if result.status != "success":
-        # Legitimate processing error on this probe (e.g., quarantine). Not
-        # a pass-through contract violation.
-        return
 
-    emitted_rows = _emitted_rows_from_result(result)
-    if not emitted_rows:
-        # Empty emission — ADR-009 §Clause 3 carve-out. Drops nothing.
-        return
-
-    input_fields = _effective_input_fields(probe_rows)
-    for emitted in emitted_rows:
-        runtime_contract = frozenset(fc.normalized_name for fc in emitted.contract.fields)
-        runtime_payload = frozenset(emitted.keys())
-        runtime_observed = runtime_contract & runtime_payload
-        dropped = input_fields - runtime_observed
-        assert not dropped, (
-            f"{_annotated_cls.__name__} is annotated passes_through_input=True "
-            f"but dropped fields {sorted(dropped)!r} from probe row "
-            f"{row.to_dict()!r}. Either fix the implementation or remove "
-            "the annotation."
-        )
-
-
-@given(row=probe_row())
-@settings(
-    max_examples=30,
-    deadline=None,
-    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
-)
 def test_preserving_transforms_do_not_rewrite_values(
     _preserving_cls: type[BaseTransform],
-    row: PipelineRow,
 ) -> None:
     """Value invariant — elspeth-e6e552ce34.
 
@@ -288,31 +278,39 @@ def test_preserving_transforms_do_not_rewrite_values(
     declaration site.
     """
     try:
-        transform = _probe_instantiate(_preserving_cls)
+        _probe_instantiate(_preserving_cls)
     except _UnprobeableTransform as exc:
         pytest.skip(f"{_preserving_cls.__name__}: {exc.reason}")
 
-    probe_rows = transform.forward_invariant_probe_rows(row)
-    input_values = {name: probe.to_dict()[name] for probe in probe_rows for name in _observed_fields(probe) if name in probe.to_dict()}
+    checked_values = 0
 
-    result = transform.execute_forward_invariant_probe(
-        probe_rows,
-        _probe_context(transform),
+    @given(row=probe_row())
+    @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+    def check(row: PipelineRow) -> None:
+        nonlocal checked_values
+        transform = _probe_instantiate(_preserving_cls)
+        probe_rows = transform.forward_invariant_probe_rows(row)
+        input_values = {name: probe.to_dict()[name] for probe in probe_rows for name in _observed_fields(probe) if name in probe.to_dict()}
+        result = transform.execute_forward_invariant_probe(probe_rows, _probe_context(transform))
+        if result.status != "success":
+            return
+        for emitted in _emitted_rows_from_result(result):
+            payload = emitted.to_dict()
+            surviving = input_values.keys() & payload.keys()
+            rewritten = {name: (input_values[name], payload[name]) for name in surviving if payload[name] != input_values[name]}
+            assert not rewritten, (
+                f"{_preserving_cls.__name__} is annotated preserves_input_values=True "
+                f"but rewrote {rewritten!r} on probe row {row.to_dict()!r}. Either "
+                "fix the implementation or remove the annotation — the type-"
+                "resolution walk recurses through this transform on that promise."
+            )
+            checked_values += len(surviving)
+
+    check()
+    assert checked_values >= 1, (
+        f"{_preserving_cls.__name__} produced no surviving input value comparisons. "
+        "Its probe must successfully emit at least one surviving input value."
     )
-    if result.status != "success":
-        return
-
-    for emitted in _emitted_rows_from_result(result):
-        payload = emitted.to_dict()
-        rewritten = {
-            name: (input_values[name], payload[name]) for name in input_values if name in payload and payload[name] != input_values[name]
-        }
-        assert not rewritten, (
-            f"{_preserving_cls.__name__} is annotated preserves_input_values=True "
-            f"but rewrote {rewritten!r} on probe row {row.to_dict()!r}. Either "
-            "fix the implementation or remove the annotation — the type-"
-            "resolution walk recurses through this transform on that promise."
-        )
 
 
 def test_harness_skip_rate_budget() -> None:
@@ -504,7 +502,7 @@ def _assert_undeclared_transform_does_not_forward(
         probe_rows = transform.backward_invariant_probe_rows(_with_sentinel_field(probe))
         # A probe hook that rebuilds its input rows without the sentinel
         # cannot witness forwarding either way — do not count that emission.
-        if any(_FORWARDING_SENTINEL not in _observed_fields(input_row) for input_row in probe_rows):
+        if not probe_rows or any(_FORWARDING_SENTINEL not in _observed_fields(input_row) for input_row in probe_rows):
             return
         result = transform.execute_backward_invariant_probe(probe_rows, _probe_context(transform))
         if result.status != "success":
@@ -524,11 +522,14 @@ def _assert_undeclared_transform_does_not_forward(
             "is under-powered for this transform."
         )
 
-    # No successful sentinel-carrying emission — no evidence either way. The
-    # all-probes-error case is already failed by the backward invariant above,
-    # so a silent pass here cannot hide a dead probe config.
+    # The backward invariant uses different inputs and cannot prove this
+    # sentinel-bearing sweep reached an assertion.
     if asserted_count == 0:
-        return
+        pytest.fail(
+            f"{cls.__name__} produced no checkable emission from sentinel-bearing input "
+            f"in {probe_count} probes, so its forwarding declaration was never checked. "
+            "Override backward_invariant_probe_rows() to retain the sentinel and exercise a success emission."
+        )
 
     if sentinel_always_forwarded:
         pytest.fail(

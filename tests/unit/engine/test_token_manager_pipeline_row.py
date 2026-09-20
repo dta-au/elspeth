@@ -158,24 +158,12 @@ class TestTokenManagerCreateInitialToken:
         call_kwargs = recorder.create_row_with_token.call_args.kwargs
         assert call_kwargs["data"] == {"amount": 100}
 
-    def test_create_initial_token_requires_contract(self) -> None:
-        """SourceRow.valid() should fail fast when contract is omitted.
-
-        This is a critical guard - if a source plugin returns SourceRow without
-        contract, we crash immediately with a clear message rather than propagating
-        None through the pipeline.
-        """
+    def test_source_row_rejects_missing_contract_before_token_creation(self) -> None:
+        """Construction rejects a missing contract before TokenManager can consume it."""
         from elspeth.contracts import SourceRow
-        from elspeth.engine.tokens import TokenManager
 
-        recorder = _make_recorder()
-        TokenManager(recorder, step_resolver=_make_step_resolver())
-
-        # Since elspeth-a27e71979f, SourceRow.__post_init__ rejects contract=None
-        # at construction time, so the engine's guard is now unreachable via
-        # normal construction. Verify the earlier guard fires instead.
-        with pytest.raises(TypeError, match="contract"):
-            SourceRow.valid({"amount": 100})
+        with pytest.raises(ValueError, match=r"^Valid SourceRow must have a contract\."):
+            SourceRow(row={"amount": 100}, is_quarantined=False, contract=None, source_row_index=0)
 
 
 class TestTokenManagerForkToken:

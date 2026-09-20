@@ -120,7 +120,7 @@ def test_harness_catches_deliberate_misannotation(monkeypatch: pytest.MonkeyPatc
     weakens the live assertion is caught here.
 
     Mechanism: monkeypatch the plugin manager to return only the fixture,
-    then call the live ``@given``-decorated test function directly with the
+    then call the live test function and its inner ``@given`` sweep with the
     fixture as ``_annotated_cls``. Hypothesis will explore probe rows; the
     fixture drops fields whenever the probe has 2+ keys, so the assertion
     fires reliably. ``pytest.raises(AssertionError)`` confirms the live
@@ -148,9 +148,8 @@ def test_harness_catches_deliberate_misannotation(monkeypatch: pytest.MonkeyPatc
         f"monkeypatch failed — plugin manager did not return the fixture alone. Got {[p.__name__ for p in plugins]!r}."
     )
 
-    # Drive the live forward-invariant function. ``@given(row=probe_row())``
-    # supplies row values; ``_annotated_cls`` is a regular keyword arg passed
-    # through Hypothesis to the inner function. Hypothesis raises the
+    # Drive the live forward-invariant function. Its inner ``@given`` sweep
+    # supplies row values for the supplied ``_annotated_cls``. Hypothesis raises the
     # underlying ``AssertionError`` after shrinking to a minimal probe.
     with pytest.raises(AssertionError) as exc_info:
         test_annotated_transforms_preserve_input_fields(

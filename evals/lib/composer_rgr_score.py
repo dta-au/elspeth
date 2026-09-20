@@ -739,6 +739,7 @@ def score(
 
     Returns a dict with verdict (RED/AMBER/GREEN), red_reasons, amber_reasons,
     and stats. Verdict precedence is RED > AMBER > GREEN.
+    Final-message content criteria are matched case-insensitively.
     """
     if state_origin not in ("http", "mocked_harness"):
         raise ValueError("Unknown scorer state origin")
@@ -751,7 +752,7 @@ def score(
 
     red_reasons: list[str] = []
 
-    sentinel_hits = [s for s in red.get("build_failure_sentinels", []) if s in final_body]
+    sentinel_hits = [s for s in red.get("build_failure_sentinels", []) if s.lower() in final_body]
     if sentinel_hits:
         red_reasons.append(f"build-failure sentinel(s) present in final message: {sentinel_hits}")
 
@@ -768,10 +769,18 @@ def score(
     # cannot drift from the engine's definition of "empty".
     if state is None or state == "null":
         red_reasons.append("final composition state is null (no committed pipeline)")
+    elif not isinstance(state, dict):
+        red_reasons.append("final composition state is not an object")
     elif isinstance(state, dict) and state.get("source") is None and not state.get("nodes") and not state.get("outputs"):
         red_reasons.append("composition state is structurally empty (no source, nodes, or outputs)")
 
-    is_valid = bool(state.get("is_valid")) if isinstance(state, dict) else None
+    is_valid: bool | None = None
+    if isinstance(state, dict):
+        raw_validity = state.get("is_valid")
+        if type(raw_validity) is bool:
+            is_valid = raw_validity
+        else:
+            red_reasons.append("final composition state has missing or non-boolean is_valid")
     if red.get("must_be_valid", True) and is_valid is False:
         # The null/empty case is already handled unconditionally by the
         # degenerate-state floor above (and would otherwise double-append its
@@ -782,11 +791,11 @@ def score(
         if relaxed_reason is not None:
             red_reasons.append(relaxed_reason)
 
-    phrase_hits = [p for p in red.get("passivity_phrases", []) if p in final_body]
+    phrase_hits = [p for p in red.get("passivity_phrases", []) if p.lower() in final_body]
     if phrase_hits:
         red_reasons.append(f"forbidden passivity phrases in final message: {phrase_hits}")
 
-    credential_hits = [p for p in red.get("credential_misnarration_phrases", []) if p in final_body]
+    credential_hits = [p for p in red.get("credential_misnarration_phrases", []) if p.lower() in final_body]
     if credential_hits:
         red_reasons.append(f"credential misnarration phrases in final message: {credential_hits}")
 

@@ -313,7 +313,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:af0c0a15ba029a67"
+    source_file_hash: str | None = "sha256:e30482871023e9a6"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -458,6 +458,10 @@ class FieldMapper(BaseTransform):
         field. The output schema below still guarantees identity targets.
         """
         return frozenset(target for source, target in cfg.mapping.items() if source != target)
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Exercise value preservation with the configured rename source present."""
+        return self.backward_invariant_probe_rows(probe)
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the real rename/drop path for the backward invariant."""

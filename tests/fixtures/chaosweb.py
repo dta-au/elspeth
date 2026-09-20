@@ -247,6 +247,13 @@ def _build_config_from_marker(
     if marker is None:
         return ChaosWebConfig(**base_config)
 
+    if marker.args:
+        raise pytest.UsageError("chaosweb marker does not accept positional arguments; use keyword arguments")
+    allowed_keys = {*_ERROR_INJECTION_KEYS, "base_ms", "jitter_ms", "content_mode", "preset"}
+    unknown_keys = marker.kwargs.keys() - allowed_keys
+    if unknown_keys:
+        raise pytest.UsageError(f"Unknown chaosweb marker argument(s): {', '.join(sorted(unknown_keys))}")
+
     preset = marker.kwargs.get("preset")
     overrides: dict[str, Any] = {}
 

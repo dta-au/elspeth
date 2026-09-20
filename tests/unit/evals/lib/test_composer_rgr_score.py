@@ -89,6 +89,54 @@ def _assistant_tool_call(name: str) -> dict[str, Any]:
 
 
 class TestBaselineRedSignals:
+    @pytest.mark.parametrize("state", [[], "unavailable", 42, False])
+    @pytest.mark.parametrize("must_be_valid", [True, False])
+    def test_nonobject_state_is_red(self, state: Any, must_be_valid: bool) -> None:
+        result = score(_scenario(red={"must_be_valid": must_be_valid}), [_msg("assistant", "Done.")], state)
+        assert result["verdict"] == "RED"
+        assert result["red_reasons"] == ["final composition state is not an object"]
+        assert result["stats"]["is_valid"] is None
+
+    @pytest.mark.parametrize("validity", [None, "false", "true", 1, 0, [], {}])
+    @pytest.mark.parametrize("must_be_valid", [True, False])
+    def test_nonboolean_validity_is_red(self, validity: Any, must_be_valid: bool) -> None:
+        result = score(
+            _scenario(red={"must_be_valid": must_be_valid, "allow_is_valid_false_when_error_codes": ["allowed"]}),
+            [_msg("assistant", "Done.")],
+            _state_valid(is_valid=validity, validation_errors=[{"message": "pending", "error_code": "allowed", "component": None}]),
+        )
+        assert result["verdict"] == "RED"
+        assert result["red_reasons"] == ["final composition state has missing or non-boolean is_valid"]
+        assert result["stats"]["is_valid"] is None
+
+    def test_missing_validity_is_red(self) -> None:
+        state = _state_valid()
+        del state["is_valid"]
+        result = score(_scenario(), [_msg("assistant", "Done.")], state)
+        assert result["verdict"] == "RED"
+        assert result["red_reasons"] == ["final composition state has missing or non-boolean is_valid"]
+        assert result["stats"]["is_valid"] is None
+
+    @pytest.mark.parametrize(
+        ("criterion", "needle", "reason_prefix"),
+        [
+            ("build_failure_sentinels", "Cannot Complete", "build-failure sentinel(s) present in final message"),
+            ("passivity_phrases", "Should I", "forbidden passivity phrases in final message"),
+            ("credential_misnarration_phrases", "Missing Credentials", "credential misnarration phrases in final message"),
+        ],
+    )
+    @pytest.mark.parametrize("body_case", ["lower", "upper", "unchanged", "absent"])
+    def test_content_criteria_ignore_case(self, criterion: str, needle: str, reason_prefix: str, body_case: str) -> None:
+        bodies = {"lower": needle.lower(), "upper": needle.upper(), "unchanged": needle, "absent": "All done."}
+        result = score(
+            scenario=_scenario(red={criterion: [needle]}),
+            messages=[_msg("assistant", bodies[body_case])],
+            state=_state_valid(),
+        )
+
+        assert result["verdict"] == ("GREEN" if body_case == "absent" else "RED")
+        assert result["red_reasons"] == ([] if body_case == "absent" else [f"{reason_prefix}: {[needle]}"])
+
     def test_green_when_all_clean(self) -> None:
         result = score(
             scenario=_scenario(),
