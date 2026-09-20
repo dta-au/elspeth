@@ -261,7 +261,7 @@ class SingleQueryStrategy:
     system_prompt: str | None
     system_prompt_source: str | None
     model: str
-    temperature: float
+    temperature: float | None
     max_tokens: int | None
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
@@ -507,7 +507,7 @@ class MultiQueryStrategy:
     system_prompt: str | None
     system_prompt_source: str | None
     model: str
-    temperature: float
+    temperature: float | None
     max_tokens: int | None
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
@@ -1206,7 +1206,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:680490fd3c9b555c"
+    source_file_hash: str | None = "sha256:69c4e135586d5d27"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1378,7 +1378,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 messages: Sequence[ChatMessage],
                 *,
                 model: str,
-                temperature: float,
+                temperature: float | None,
                 max_tokens: int | None,
                 audit_parent: LLMAuditParent,
                 response_format: object | None = None,

@@ -34,6 +34,7 @@ from elspeth.plugins.llm.config_validation import (
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL_VALUE_SOURCES,
     derive_azure_model,
+    validate_azure_api_version,
     validate_azure_endpoint,
     validate_bedrock_credential_fields,
     validate_bedrock_model,
@@ -60,7 +61,15 @@ class LLMSourceConfig(DataPluginConfig):
     model: str | None = Field(default=None, description="Model identifier")
     prompt_template: str = Field(..., description="Static Jinja2 prompt template")
     system_prompt: str | None = Field(default=None, description="Optional system prompt")
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="Sampling temperature")
+    temperature: float | None = Field(
+        default=0.0,
+        ge=0.0,
+        le=2.0,
+        description=(
+            "Sampling temperature. Set to null to omit it from the request so the provider default applies — "
+            "required for reasoning deployments, which reject any explicit temperature"
+        ),
+    )
     max_tokens: int | None = Field(default=None, gt=0, description="Maximum tokens in response")
     response_field: str = Field(default="llm_response", description="Field name for LLM response in output")
 
@@ -179,6 +188,11 @@ class AzureOpenAILLMSourceConfig(LLMSourceConfig):
     @classmethod
     def _validate_endpoint_url(cls, value: str) -> str:
         return validate_azure_endpoint(value)
+
+    @field_validator("api_version")
+    @classmethod
+    def _validate_api_version(cls, value: str) -> str:
+        return validate_azure_api_version(value)
 
     @model_validator(mode="before")
     @classmethod

@@ -517,13 +517,20 @@
         "title": "System Prompt"
       },
       "temperature": {
+        "anyOf": [
+          {
+            "maximum": 2.0,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "composer_tier": "advanced",
         "default": 0.0,
-        "description": "Sampling temperature",
-        "maximum": 2.0,
-        "minimum": 0.0,
-        "title": "Temperature",
-        "type": "number"
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
+        "title": "Temperature"
       }
     },
     "required": [
@@ -580,11 +587,11 @@
         "type": "object"
       },
       {
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "name": "temperature",
         "required": false,
         "tier": "advanced",
-        "type": "number"
+        "type": "object"
       },
       {
         "description": "Field name for LLM response in output",

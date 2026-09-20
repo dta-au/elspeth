@@ -672,6 +672,58 @@ class TestAuditedLLMClient:
         assert call_kwargs["request_data"].to_dict()["temperature"] == 0.7
         assert call_kwargs["request_data"].to_dict()["max_tokens"] == 100
 
+    def test_max_tokens_param_renames_the_wire_and_audit_key(self) -> None:
+        """A provider that requires max_completion_tokens sends and records that name."""
+        execution = self._create_mock_execution()
+        openai_client = self._create_mock_openai_client()
+
+        client = AuditedLLMClient(
+            **mock_audit_authority(),
+            execution=execution,
+            state_id="state_123",
+            run_id="run_abc",
+            telemetry_emit=lambda event: None,
+            underlying_client=openai_client,
+            provider="azure",
+            max_tokens_param="max_completion_tokens",
+        )
+
+        client.chat_completion(
+            model="gpt-4",
+            messages=[ChatMessage(role="user", content="Hello")],
+            max_tokens=100,
+        )
+
+        sdk_kwargs = openai_client.single_create_kwargs()
+        assert sdk_kwargs["max_completion_tokens"] == 100
+        assert "max_tokens" not in sdk_kwargs
+        recorded = execution.last_record_call_kwargs["request_data"].to_dict()
+        assert recorded["max_completion_tokens"] == 100
+        assert "max_tokens" not in recorded
+
+    def test_temperature_none_is_omitted_from_wire_and_audit(self) -> None:
+        """temperature=None means provider default: not sent, and not recorded as 0.0."""
+        execution = self._create_mock_execution()
+        openai_client = self._create_mock_openai_client()
+
+        client = AuditedLLMClient(
+            **mock_audit_authority(),
+            execution=execution,
+            state_id="state_123",
+            run_id="run_abc",
+            telemetry_emit=lambda event: None,
+            underlying_client=openai_client,
+        )
+
+        client.chat_completion(
+            model="gpt-4",
+            messages=[ChatMessage(role="user", content="Hello")],
+            temperature=None,
+        )
+
+        assert "temperature" not in openai_client.single_create_kwargs()
+        assert "temperature" not in execution.last_record_call_kwargs["request_data"].to_dict()
+
     def test_provider_recorded_in_request(self) -> None:
         """Provider name is recorded in request data."""
         execution = self._create_mock_execution()

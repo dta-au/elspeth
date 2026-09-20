@@ -249,7 +249,7 @@ class BedrockLLMProvider:
         messages: Sequence[ChatMessage],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,

@@ -155,6 +155,83 @@ def test_runtime_preflight_rejects_unusable_completion(
     assert provider._llm_clients == {}
 
 
+def _recording_azure_provider(create_calls: list[dict[str, Any]]) -> AzureLLMProvider:
+    provider = AzureLLMProvider(
+        endpoint="https://test.openai.azure.com/",
+        api_key="test-key",
+        api_version="2024-10-21",
+        deployment_name="reasoning-deployment",
+        recorder=FakeAuditRecorder(),
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"), finish_reason="stop")],
+        model="reasoning-deployment",
+        usage=None,
+        model_dump=lambda: {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}], "model": "reasoning-deployment"},
+    )
+
+    def create(**kwargs: Any) -> SimpleNamespace:
+        create_calls.append(kwargs)
+        return response
+
+    provider._underlying_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    return provider
+
+
+def test_runtime_preflight_wire_request_is_accepted_by_reasoning_deployments() -> None:
+    """Reasoning deployments reject max_tokens and any explicit temperature.
+
+    The preflight is the first Azure call of a run, so a rejected parameter
+    here fails the run before any row is processed.
+    """
+    create_calls: list[dict[str, Any]] = []
+    provider = _recording_azure_provider(create_calls)
+
+    provider.runtime_preflight(operation_id="op-1", model="reasoning-deployment", coordination_token=_LEADER_TOKEN)
+
+    assert len(create_calls) == 1
+    assert "temperature" not in create_calls[0]
+    assert "max_tokens" not in create_calls[0]
+    # The budget covers reasoning tokens as well as the visible reply.
+    assert create_calls[0]["max_completion_tokens"] >= 1024
+
+
+def test_execute_query_sends_max_completion_tokens_and_omits_null_temperature() -> None:
+    create_calls: list[dict[str, Any]] = []
+    provider = _recording_azure_provider(create_calls)
+
+    provider.execute_query(
+        [ChatMessage(role="user", content="hello")],
+        model="reasoning-deployment",
+        temperature=None,
+        max_tokens=100,
+        audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+    )
+
+    assert len(create_calls) == 1
+    assert create_calls[0]["max_completion_tokens"] == 100
+    assert "max_tokens" not in create_calls[0]
+    assert "temperature" not in create_calls[0]
+
+
+def test_execute_query_still_sends_an_explicit_temperature() -> None:
+    create_calls: list[dict[str, Any]] = []
+    provider = _recording_azure_provider(create_calls)
+
+    provider.execute_query(
+        [ChatMessage(role="user", content="hello")],
+        model="reasoning-deployment",
+        temperature=0.0,
+        max_tokens=None,
+        audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+    )
+
+    assert create_calls[0]["temperature"] == 0.0
+    assert "max_completion_tokens" not in create_calls[0]
+
+
 @dataclass
 class FakeTelemetryEmit:
     events: list[Any] = field(default_factory=list)

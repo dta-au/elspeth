@@ -1045,8 +1045,8 @@ Options common to all providers:
 | `prompt_template` | string | **Yes** | — | Jinja2 prompt template |
 | `model` | string | provider-dependent | — | Model identifier; required for `openrouter` and `bedrock`, defaulted from `deployment_name` for `azure` |
 | `system_prompt` | string | No | (none) | Optional system message |
-| `temperature` | float | No | `0.0` | Sampling temperature, `0.0`–`2.0`; the default is the deterministic setting |
-| `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0 |
+| `temperature` | float or null | No | `0.0` | Sampling temperature, `0.0`–`2.0`; the default is the deterministic setting. Set `null` to omit it from the request so the provider default applies — required for reasoning deployments (for example Azure GPT-5-family), which reject any explicit temperature |
+| `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0. The `azure` provider sends it as `max_completion_tokens`, which also counts reasoning tokens |
 | `response_field` | string | No | `llm_response` | Row field for the model response; must be a valid Python identifier |
 | `queries` | list or mapping | No | (none) | Multi-query specs; omit for single-query mode |
 | `lookup` | mapping | No | (none) | Lookup data made available to the template |
@@ -1067,7 +1067,7 @@ Options common to all providers:
 | `deployment_name` | string | **Yes** | — | Azure OpenAI deployment name; also the default `model` |
 | `endpoint` | string | **Yes** | — | Azure OpenAI endpoint URL |
 | `api_key` | string | **Yes** | — | Azure OpenAI API key |
-| `api_version` | string | No | `2024-10-21` | Azure API version |
+| `api_version` | string | No | `2024-10-21` | Azure API version. A dated version must be `2024-09-01-preview` or later — the first to define `max_completion_tokens`, which the provider always sends |
 | `tracing` | mapping | No | (none) | Optional plugin-internal tracing (`langfuse` or `azure_ai`) |
 
 `provider: bedrock` adds:

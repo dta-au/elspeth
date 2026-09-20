@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from threading import Lock
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal
 
 import structlog
 from pydantic import Field, field_validator, model_validator
@@ -25,7 +25,12 @@ from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
-from elspeth.plugins.llm.config_validation import AZURE_MODEL_VALUE_SOURCES, derive_azure_model, validate_azure_endpoint
+from elspeth.plugins.llm.config_validation import (
+    AZURE_MODEL_VALUE_SOURCES,
+    derive_azure_model,
+    validate_azure_api_version,
+    validate_azure_endpoint,
+)
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMQueryResult, finish_reason_from_raw_response
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig
@@ -34,6 +39,22 @@ if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 logger = structlog.get_logger(__name__)
+
+# Azure OpenAI takes the output budget as ``max_completion_tokens``. Reasoning
+# deployments reject the deprecated ``max_tokens`` with HTTP 400, gpt-4o and
+# later non-reasoning deployments accept either, and a deployment name is
+# operator-chosen so the model family cannot be inferred from it — every
+# Azure call sends the current name. ``validate_azure_api_version`` holds the
+# API version at or above the first one that defines it.
+_AZURE_MAX_TOKENS_PARAM: Final = "max_completion_tokens"
+
+# ``max_completion_tokens`` counts reasoning tokens as well as the visible
+# reply, so a budget sized for "ok" alone is spent before a reasoning
+# deployment emits any content and the preflight reads as an empty completion.
+# The cap never binds on a non-reasoning deployment (the reply is a few
+# tokens); it is well above Azure's floor of 16, below which the API returns
+# HTTP 400 "integer_below_min_value" before any model work.
+_PREFLIGHT_MAX_COMPLETION_TOKENS: Final = 2048
 
 
 class AzureOpenAIConfig(LLMConfig):
@@ -76,6 +97,11 @@ class AzureOpenAIConfig(LLMConfig):
     @classmethod
     def _validate_endpoint_url(cls, value: str) -> str:
         return validate_azure_endpoint(value)
+
+    @field_validator("api_version")
+    @classmethod
+    def _validate_api_version(cls, value: str) -> str:
+        return validate_azure_api_version(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -146,7 +172,7 @@ class AzureLLMProvider:
         messages: Sequence[ChatMessage],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
@@ -156,8 +182,9 @@ class AzureLLMProvider:
         Args:
             messages: Chat messages (system + user)
             model: Model/deployment name
-            temperature: Sampling temperature
-            max_tokens: Max response tokens (None = provider default)
+            temperature: Sampling temperature (None = omitted, provider default)
+            max_tokens: Max response tokens, sent as ``max_completion_tokens``
+                (None = provider default)
             audit_parent: Validated row or operation audit parent
             response_format: OpenAI response_format dict (e.g., {"type": "json_object"})
 
@@ -227,18 +254,17 @@ class AzureLLMProvider:
             provider="azure",
             limiter=self._limiter,
             llm_call_governance=self._llm_call_governance,
+            max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
         )
         try:
             response = client.chat_completion(
                 model=model,
                 messages=[ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
-                temperature=0.0,
-                # Azure OpenAI requires max_output_tokens >= 16. Values below
-                # the floor return HTTP 400 with "integer_below_min_value"
-                # before any model work, killing the entire pipeline at
-                # preflight. 32 gives margin without materially affecting
-                # smoke-test cost.
-                max_tokens=32,
+                # No temperature: reasoning deployments reject any explicit
+                # value with HTTP 400, and a smoke test has no determinism
+                # requirement.
+                temperature=None,
+                max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
             )
             if not response.content.strip():
                 raise ContentPolicyError("Azure preflight returned empty content")
@@ -277,6 +303,7 @@ class AzureLLMProvider:
                     provider="azure",
                     limiter=self._limiter,
                     llm_call_governance=self._llm_call_governance,
+                    max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

@@ -69,9 +69,13 @@ class RawCallPayload:
 # LLM call data
 # ---------------------------------------------------------------------------
 
-_LLM_REQUEST_RESERVED_KEYS = frozenset(
-    {"model", "messages", "temperature", "provider", "max_tokens"},
-)
+# The output-budget parameter has two wire names: ``max_tokens`` and its
+# successor ``max_completion_tokens``, which reasoning deployments require and
+# which also counts reasoning tokens. The request records whichever name was
+# sent, so both are reserved.
+_LLM_MAX_TOKENS_PARAMS = frozenset({"max_tokens", "max_completion_tokens"})
+
+_LLM_REQUEST_RESERVED_KEYS = frozenset({"model", "messages", "temperature", "provider"}) | _LLM_MAX_TOKENS_PARAMS
 
 
 def _require_non_empty_str(value: object, field_name: str) -> str:
@@ -142,17 +146,25 @@ class LLMCallRequest:
 
     model: str
     messages: Sequence[Mapping[str, Any]]
-    temperature: float
+    # None = the request carried no temperature (provider default). Recorded
+    # as absent, never as 0.0: the audit trail must not claim a value that
+    # was not sent.
+    temperature: float | None
     provider: str
     max_tokens: int | None = None
+    # Wire name max_tokens was sent under (see _LLM_MAX_TOKENS_PARAMS).
+    max_tokens_param: str = "max_tokens"
     extra_kwargs: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.model, "model")
         _require_message_sequence(self.messages)
-        _require_finite_number(self.temperature, "temperature")
+        if self.temperature is not None:
+            _require_finite_number(self.temperature, "temperature")
         _require_non_empty_str(self.provider, "provider")
         require_int(self.max_tokens, "max_tokens", optional=True, min_value=0)
+        if self.max_tokens_param not in _LLM_MAX_TOKENS_PARAMS:
+            raise ValueError(f"max_tokens_param must be one of {sorted(_LLM_MAX_TOKENS_PARAMS)}, got {self.max_tokens_param!r}")
         # Always deep-freeze inner message dicts — a pre-built tuple may
         # still contain mutable inner dicts (e.g. tuple([{"role": "user"}])).
         object.__setattr__(
@@ -170,18 +182,20 @@ class LLMCallRequest:
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
 
-        Conditionally omits ``max_tokens`` when None, spreads
-        ``extra_kwargs`` to match the old ``**kwargs`` pattern.
+        Conditionally omits ``temperature`` and ``max_tokens`` when None,
+        records ``max_tokens`` under the wire name it was sent with, and
+        spreads ``extra_kwargs`` to match the old ``**kwargs`` pattern.
         """
         d: dict[str, Any] = {
             "model": self.model,
             "messages": [deep_thaw(m) for m in self.messages],
-            "temperature": self.temperature,
-            "provider": self.provider,
-            **deep_thaw(self.extra_kwargs),
         }
+        if self.temperature is not None:
+            d["temperature"] = self.temperature
+        d["provider"] = self.provider
+        d.update(deep_thaw(self.extra_kwargs))
         if self.max_tokens is not None:
-            d["max_tokens"] = self.max_tokens
+            d[self.max_tokens_param] = self.max_tokens
         return d
 
 
