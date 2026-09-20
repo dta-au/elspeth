@@ -619,7 +619,9 @@ class RowProcessor:
         # (META-9.1): an undeclared expansion's frame is inert forever, and
         # the durable re-derivation is a DB read per miss — remember the
         # verdict so an ordinary multi-row transform's children cost one read
-        # per group, not one per settled loss.
+        # per group, not one per settled loss. Only a POSITIVELY undeclared
+        # group enters (mint step at no declared opener); a declared opener
+        # with a missing node_state raises and is never remembered.
         self._inert_expand_groups: set[str] = set()
         self._branch_to_sink: dict[BranchName, SinkName] = branch_to_sink or {}
         self._unbound_branch_first_node: dict[BranchName, NodeID] = unbound_branch_first_node or {}
@@ -3386,10 +3388,25 @@ class RowProcessor:
         opener TOKEN; the opener NODE is the declared opener node at which
         that token holds a node_state (an opener token visits exactly one
         declared opener — it terminates there as EXPAND_PARENT); the binding
-        is config's, keyed on that node. Undeclared expansions (no declared
-        opener node visited) stay inert, remembered per group id. The result
-        is registered on the registry so later frames of the same group are
-        an in-memory hit.
+        is config's, keyed on that node. The result is registered on the
+        registry so later frames of the same group are an in-memory hit.
+
+        Inert is a POSITIVE verdict, never an absence (elspeth-353d097dbb).
+        A group with no opener node_state at any declared opener is inert —
+        remembered per group id — only when it is a collector RELEASE group
+        (``group_records.closes_group_id``, META-38's written fact: its
+        "opener" is a group member) or when its member's mint step
+        (``tokens.step_in_pipeline``, written in the mint transaction, and
+        injective over processing nodes: ``ExecutionGraph.build_step_map``)
+        is the step of NO declared opener. A mint step that IS a declared
+        opener's, with no node_state there, raises: memoising that as inert
+        would strand the roster with nothing staged. The state is
+        unreachable on a sound store — ``begin_node_state`` commits in its
+        own transaction before the opener executes, nothing deletes
+        node_states, an aggregation flush can never be a declared opener
+        (scopes name ``transforms:`` entries), and resume refuses any
+        node-id/config drift (full topology hash) — so reaching it means
+        the audit store or the config it is read under is wrong.
 
         META-22.1 cross-check, MEMBERSHIP over COLLECTOR-SCOPED evidence
         (META-35): ``resolve_group_collector_node`` is ANY-node completion
@@ -3433,6 +3450,35 @@ class RowProcessor:
             if record.opener_token_id in visited:
                 candidates.append(binding)
         if not candidates:
+            # Inert needs POSITIVE evidence (elspeth-353d097dbb): "no
+            # node_state at a declared opener" alone is an absence, and
+            # memoising an absence turns one bad read into a permanently
+            # stranded roster. The member's mint step places the expansion
+            # independently of node_states, so the two are cross-checked.
+            if record.closes_group_id is not None:
+                # A collector RELEASE group (META-38's written fact): its
+                # "opener" is a group member, so no declared opener minted it.
+                self._inert_expand_groups.add(frame.group_id)
+                return None
+            mint_step = reads.get_token_mint_step(run_id=self._run_id, token_id=frame.member_key)
+            if mint_step is None:
+                raise AuditIntegrityError(
+                    f"EXPAND group {frame.group_id!r} (run {self._run_id!r}) member {frame.member_key!r} records no mint "
+                    "step, so the group cannot be classified as declared or undeclared; expand_token stamps the "
+                    "expanding node's step on every member it mints."
+                )
+            declared_at_step = sorted(
+                str(opener_node_id)
+                for opener_node_id in self._expand_opener_binding_by_node_id
+                if self._step_resolver(opener_node_id) == mint_step
+            )
+            if declared_at_step:
+                raise AuditIntegrityError(
+                    f"EXPAND group {frame.group_id!r} (run {self._run_id!r}) was minted at step {mint_step}, the step of "
+                    f"declared opener node(s) {declared_at_step}, but opener token {record.opener_token_id!r} holds no "
+                    "node_state there. begin_node_state commits before the opener executes, so the group cannot exist "
+                    "without it; refusing to classify the group inert and strand its roster."
+                )
             self._inert_expand_groups.add(frame.group_id)
             return None
         if len(candidates) > 1:
