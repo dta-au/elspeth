@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui";
+import { useCopiedReset } from "./peoplePanel";
 
 export interface GeneratedCredential {
   username: string;
@@ -23,6 +24,7 @@ export function GeneratedPassword({ credential, onDismiss }: { credential: Gener
     setCopy("idle");
     headingRef.current?.focus();
   }, [credential]);
+  useCopiedReset(copy === "copied", () => setCopy("idle"));
 
   return (
     <section aria-labelledby={headingId} className="user-admin-password-banner">

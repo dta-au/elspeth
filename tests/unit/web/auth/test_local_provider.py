@@ -213,7 +213,7 @@ LocalAuthProvider(
         principal_is_active=lambda identity_id: True,
     ),
     admit_identity=lambda claims: (_ for _ in ()).throw(AssertionError("no login happens here")),
-    retire_identity=lambda username, credential_exists, delete_credential: (_ for _ in ()).throw(AssertionError("no deletion happens here")),
+    retire_identity=lambda username, reason, credential_exists, delete_credential: (_ for _ in ()).throw(AssertionError("no deletion happens here")),
 )
 print(oct(stat.S_IMODE(path.stat().st_mode)))
 """
@@ -340,10 +340,10 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         provider.create_user("alice", "password123", display_name="Alice")
         token = await provider.login("alice", "password123")
 
-        first = provider.delete_user("alice")
+        first = provider.delete_user("alice", reason="left the team")
         assert first == LocalUserDeletion(credential_deleted=True, identity_retired=True)
         # Nothing left in either store: the natural key was rewritten.
-        assert provider.delete_user("alice") == LocalUserDeletion(credential_deleted=False, identity_retired=False)
+        assert provider.delete_user("alice", reason="left the team") == LocalUserDeletion(credential_deleted=False, identity_retired=False)
 
         with pytest.raises(AuthenticationError, match="Invalid token"):
             await provider.authenticate(token)
@@ -361,7 +361,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         retired: list[str] = []
         owed = [False, True]
 
-        def retire(username: str, _credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
+        def retire(username: str, _reason: str, _credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
             delete_credential()
             retired.append(username)
             return owed[len(retired) - 1]
@@ -369,9 +369,9 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retire)
         provider.create_user("alice", "password123", display_name="Alice")
 
-        assert provider.delete_user("alice") == LocalUserDeletion(credential_deleted=True, identity_retired=False)
+        assert provider.delete_user("alice", reason="left the team") == LocalUserDeletion(credential_deleted=True, identity_retired=False)
         assert retired == ["alice"]
-        recovery = provider.delete_user("alice")
+        recovery = provider.delete_user("alice", reason="left the team")
         assert recovery == LocalUserDeletion(credential_deleted=False, identity_retired=True)
         assert recovery.removed_anything is True
         assert retired == ["alice", "alice"]
@@ -380,7 +380,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         """The retirer decides its last-administrator refusal on this answer, so it must be the store's."""
         seen: list[bool] = []
 
-        def retire(_username: str, credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
+        def retire(_username: str, _reason: str, credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
             seen.append(credential_exists())
             delete_credential()
             seen.append(credential_exists())
@@ -390,8 +390,8 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         provider.create_user("alice", "password123", display_name="Alice")
         provider.create_user("bob", "password123", display_name="Bob")
 
-        provider.delete_user("alice")
-        provider.delete_user("alice")
+        provider.delete_user("alice", reason="left the team")
+        provider.delete_user("alice", reason="left the team")
         # Present, gone, and on the re-run absent from the start; bob's row never answers for alice.
         assert seen == [True, False, False, False]
 
@@ -448,18 +448,18 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         provider.create_user("bob", "password123", display_name="Bob")
 
         with pytest.raises(RuntimeError, match="audit outage"):
-            provider.delete_user("alice")
+            provider.delete_user("alice", reason="left the team")
         assert [account.user_id for account in provider.list_users()] == ["bob"]
         assert authority.count_active_human_admins() == 2
         audit_is_down[0] = False
-        assert provider.delete_user("bob") == LocalUserDeletion(credential_deleted=True, identity_retired=True)
+        assert provider.delete_user("bob", reason="left the team") == LocalUserDeletion(credential_deleted=True, identity_retired=True)
 
         # alice is now the last active administrator, with no credential. (A
         # last administrator who HAS one is refused: see the CLI and authority tests.)
         assert authority.count_active_human_admins() == 1
         assert provider.list_users() == []
 
-        assert provider.delete_user("alice") == LocalUserDeletion(credential_deleted=False, identity_retired=True)
+        assert provider.delete_user("alice", reason="left the team") == LocalUserDeletion(credential_deleted=False, identity_retired=True)
         assert authority.count_active_human_admins() == 0
         authority.bootstrap_admin(
             claims=IdentityClaims(provider="local", subject="recovery", username="recovery"),
@@ -477,25 +477,25 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         class _Refused(RuntimeError):
             pass
 
-        def retire(_username: str, _credential_exists: Callable[[], bool], _delete_credential: Callable[[], None]) -> bool:
+        def retire(_username: str, _reason: str, _credential_exists: Callable[[], bool], _delete_credential: Callable[[], None]) -> bool:
             raise _Refused
 
         provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retire)
         provider.create_user("alice", "password123", display_name="Alice")
 
         with pytest.raises(_Refused):
-            provider.delete_user("alice")
+            provider.delete_user("alice", reason="left the team")
         assert [account.user_id for account in provider.list_users()] == ["alice"]
 
     def test_delete_user_rejects_a_retirer_that_never_deletes(self, tmp_path) -> None:
         """Returning without deleting and without refusing would retire an identity whose password still works."""
         provider = LocalAuthProvider.for_account_administration(
-            tmp_path / "auth.db", retire_identity=lambda _username, _credential_exists, _delete_credential: True
+            tmp_path / "auth.db", retire_identity=lambda _username, _reason, _credential_exists, _delete_credential: True
         )
         provider.create_user("alice", "password123", display_name="Alice")
 
         with pytest.raises(RuntimeError, match="without calling the credential deletion"):
-            provider.delete_user("alice")
+            provider.delete_user("alice", reason="left the team")
 
     def test_open_registration_audit_failure_removes_the_committed_user(self, provider) -> None:
         """Audit runs after the durable commit; a failed audit compensates.

@@ -115,7 +115,7 @@ describe("People & access: implementation review regressions", () => {
   it("finds an approver who lies beyond the first page of links", async () => {
     const all = [...Array.from({ length: 200 }, (_, index) => edge(index, "jane-id", `member-${index}`)), edge(200, "sam-id", "jane-id")];
     vi.mocked(admin.listRelationships).mockImplementation((_id, offset = 0, limit = 50) => Promise.resolve({ relationships: all.slice(offset, offset + limit), limit, offset }));
-    vi.mocked(people.fetchPersonLabels).mockResolvedValue([{ identity_id: "sam-id", label: "Sam Lee", detail: "sam.lee · oidc", kind: "human", access_state: "active", retired: false }]);
+    vi.mocked(people.fetchPersonLabels).mockResolvedValue([{ identity_id: "sam-id", label: "Sam Lee", detail: "sam.lee", provider: "oidc", kind: "human", access_state: "active", retired: false }]);
     await open(/Jane Doe/);
     await userEvent.click(screen.getByRole("tab", { name: "Approvers" }));
 
@@ -214,6 +214,7 @@ describe("People & access: implementation review regressions", () => {
     render(<PeopleAccessDialog onClose={vi.fn()} onUnavailable={vi.fn()} />);
     await userEvent.click(await within(await screen.findByRole("list", { name: "People results" })).findByRole("button", { name: /Alex Kim/ }));
     await userEvent.click(await screen.findByRole("button", { name: "Delete local account for Alex Kim" }));
+    await userEvent.type(screen.getByLabelText("Reason (required)"), "left the team");
     await userEvent.click(screen.getByRole("button", { name: "Delete local account" }));
     const reads = vi.mocked(people.fetchPerson).mock.calls.length;
     await userEvent.click(await screen.findByRole("button", { name: "Check current details" }));
@@ -230,6 +231,7 @@ describe("People & access: implementation review regressions", () => {
     render(<PeopleAccessDialog onClose={vi.fn()} onUnavailable={vi.fn()} />);
     await userEvent.click(await within(await screen.findByRole("list", { name: "People results" })).findByRole("button", { name: /Alex Kim/ }));
     await userEvent.click(await screen.findByRole("button", { name: "Delete local account for Alex Kim" }));
+    await userEvent.type(screen.getByLabelText("Reason (required)"), "left the team");
     await userEvent.click(screen.getByRole("button", { name: "Delete local account" }));
     expect(screen.getByRole("button", { name: "Delete local account" })).toBeDisabled();
     const reads = vi.mocked(people.fetchPerson).mock.calls.length;
@@ -247,6 +249,7 @@ describe("People & access: implementation review regressions", () => {
     });
     await open(/Jane Doe/);
     await userEvent.click(screen.getByRole("button", { name: "Delete local account for Jane Doe" }));
+    await userEvent.type(screen.getByLabelText("Reason (required)"), "left the team");
     await userEvent.click(screen.getByRole("button", { name: "Delete local account" }));
     await userEvent.click(await screen.findByRole("button", { name: "Check current details" }));
 
@@ -255,7 +258,9 @@ describe("People & access: implementation review regressions", () => {
     await userEvent.click(screen.getByRole("button", { name: "Finish removing Jane Doe" }));
 
     await waitFor(() => expect(screen.queryByText(/retiring Jane Doe did not finish/)).not.toBeInTheDocument());
-    expect(client.deleteAdminUser).toHaveBeenLastCalledWith("jane.doe");
+    // The retry writes the deletion's only audit row, so it carries the reason
+    // already typed: not asked again, and never sent without one.
+    expect(client.deleteAdminUser).toHaveBeenLastCalledWith("jane.doe", "left the team");
   });
 
   // ── 8. Leaving a section asks before it discards ────────────────────────

@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import * as api from "@/api/client";
 import * as admin from "@/api/identityAdmin";
-import { errorStatus, isUncertainOutcome, localKey } from "@/api/people";
+import { PROVIDER_LABEL, errorStatus, isUncertainOutcome, localKey } from "@/api/people";
 import { Button, Input } from "@/components/ui";
 import type { ActivationRole, HumanProvisionProvider } from "@/types/identityAdmin";
 import type { PeopleCapabilities } from "@/types/people";
@@ -116,7 +116,7 @@ export function AddPersonForm({ capabilities, onCredential, onAdded, onCancel }:
           <div className="identity-admin-fields">
             <label className="identity-admin-field">Sign-in provider
               <select className="input" value={provider} onChange={(event) => setProvider(event.target.value as (typeof SSO_PROVIDERS)[number])}>
-                {SSO_PROVIDERS.map((value) => <option key={value} value={value}>{value}{value === configured ? " (this deployment)" : ""}</option>)}
+                {SSO_PROVIDERS.map((value) => <option key={value} value={value}>{PROVIDER_LABEL[value]}{value === configured ? " (this deployment)" : ""}</option>)}
               </select>
             </label>
             <Input label="Subject identifier" value={subject} required maxLength={512} autoComplete="off" hint="The identifier the provider sends for this person. It is often not their email address; ask whoever runs the provider if unsure." onChange={(event) => setSubject(event.target.value)} />

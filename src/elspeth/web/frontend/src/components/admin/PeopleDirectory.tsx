@@ -1,5 +1,5 @@
 import { useId } from "react";
-import { personDisambiguator, personName } from "@/api/people";
+import { PROVIDER_LABEL, personDisambiguator, personName } from "@/api/people";
 import { Button, Input } from "@/components/ui";
 import type { IdentityProvider } from "@/types/identityAdmin";
 import type { PeopleCapabilities, PeopleQuery, PeopleStatusFilter, PeopleTypeFilter, PersonRecord } from "@/types/people";
@@ -9,7 +9,10 @@ export type DirectoryLoad =
   | { status: "ready"; people: PersonRecord[]; hasMore: boolean }
   | { status: "error"; message: string };
 
-const PROVIDERS: IdentityProvider[] = ["local", "oidc", "entra", "vanguard", "google", "service"];
+// No "service": a service account is a TYPE, and the Type filter beside this
+// one already selects it. Listed here too, it returned nothing under the
+// default Type of "People".
+const PROVIDERS: IdentityProvider[] = ["local", "oidc", "entra", "vanguard", "google"];
 
 export function personStateLabel(person: PersonRecord): string {
   if (person.record_type === "local_account") return person.access === "not_set_up" ? "Access not set up" : "Local account";
@@ -72,7 +75,7 @@ export function PeopleDirectory({ capabilities, query, draftText, load, selected
             <label className="identity-admin-field">Sign-in method
               <select className="input" value={query.provider} onChange={(event) => onQuery({ provider: event.target.value as IdentityProvider | "all", offset: 0 })}>
                 <option value="all">All</option>
-                {PROVIDERS.map((value) => <option key={value} value={value}>{value}</option>)}
+                {PROVIDERS.map((value) => <option key={value} value={value}>{PROVIDER_LABEL[value]}</option>)}
               </select>
             </label>
             <label className="identity-admin-field">Type

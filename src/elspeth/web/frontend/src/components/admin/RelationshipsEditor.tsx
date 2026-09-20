@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import * as admin from "@/api/identityAdmin";
-import { fetchPersonLabels, isAbort, personName as nameOf } from "@/api/people";
+import { PROVIDER_LABEL, fetchPersonLabels, isAbort, personName as nameOf } from "@/api/people";
 import { Button, Input } from "@/components/ui";
 import type { RelationshipView } from "@/types/identityAdmin";
 import type { IdentityPerson, PersonLabel } from "@/types/people";
@@ -82,7 +82,7 @@ export function RelationshipsEditor({ identityId, personName }: Props): JSX.Elem
   function label(id: string): JSX.Element {
     const known = loaded?.labels[id];
     if (known === undefined) return <><span>Name unavailable</span> <code className="people-grant-meta">{id}</code></>;
-    return <><strong>{known.label}</strong> <span className="people-grant-meta">{known.detail}{known.retired ? " · retired account" : known.access_state !== "active" ? ` · access ${known.access_state}` : ""}</span></>;
+    return <><strong>{known.label}</strong> <span className="people-grant-meta">{known.detail} · {PROVIDER_LABEL[known.provider]}{known.retired ? " · retired account" : known.access_state !== "active" ? ` · access ${known.access_state}` : ""}</span></>;
   }
   function plainLabel(id: string): string {
     return loaded?.labels[id]?.label ?? "this person";
@@ -139,7 +139,7 @@ export function RelationshipsEditor({ identityId, personName }: Props): JSX.Elem
           const edge = form.edge;
           void mutation.run(() => admin.revokeRelationship(edge.relationship_id, note.trim() || undefined), "Approver link removed.", "Approver link was not removed").then((ok) => { if (ok) closeForm(); });
         }}>
-          <h4>{form.edge.from_identity_id === identityId ? `Stop ${personName} approving for ${plainLabel(form.edge.to_identity_id)}?` : `Remove ${plainLabel(form.edge.from_identity_id)} as an approver for ${personName}?`}</h4>
+          <h5>{form.edge.from_identity_id === identityId ? `Stop ${personName} approving for ${plainLabel(form.edge.to_identity_id)}?` : `Remove ${plainLabel(form.edge.from_identity_id)} as an approver for ${personName}?`}</h5>
           <Input label="Note (optional)" value={note} maxLength={512} onChange={(event) => setNote(event.target.value)} />
           <div className="identity-admin-actions"><Button type="submit" variant="danger" disabled={blocked}>Remove approver link</Button><Button disabled={mutation.busy} onClick={cancel}>Cancel</Button></div>
         </form>
