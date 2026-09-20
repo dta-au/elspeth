@@ -5,6 +5,7 @@ import type { CompositionState } from "@/types";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { GraphApprovals } from "./GraphApprovals";
+import { GraphOutputs } from "./GraphOutputs";
 
 const event: InterpretationEvent = {
   id: "approval", session_id: "session", composition_state_id: "state",
@@ -39,6 +40,44 @@ function stateWithTitle(eventId: string): CompositionState {
 }
 
 describe("GraphApprovals", () => {
+  it.each([
+    "aws_bedrock_prompt_shield",
+    "aws_bedrock_content_safety",
+    "aws_textract_document_analysis",
+  ])("shows %s profile aliases in both tables", async (plugin) => {
+    const state = stateWithTitle(event.id);
+    state.nodes[0].plugin = plugin;
+    state.nodes[0].options.profile = "approved-documents";
+    render(<><GraphApprovals events={[event]} state={state} /><GraphOutputs state={state} /></>);
+    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+    const labels = screen.getAllByText("profile approved-documents");
+    expect(labels).toHaveLength(2);
+    for (const label of labels) expect(label).toHaveClass("graph-output-detail");
+  });
+
+  it("shows an S3 source profile in both tables", async () => {
+    const state = stateWithTitle(event.id);
+    state.nodes = [];
+    state.sources = { documents: {
+      plugin: "aws_s3", options: { profile: "approved-documents" },
+      on_success: "results", on_validation_failure: "discard",
+    } };
+    render(<><GraphApprovals events={[{ ...event, affected_node_id: "source:documents" }]} state={state} /><GraphOutputs state={state} /></>);
+    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+    expect(screen.getAllByText("profile approved-documents")).toHaveLength(2);
+  });
+
+  it("shows Azure Document Intelligence model selection in both tables", async () => {
+    const state = stateWithTitle(event.id);
+    state.nodes[0].plugin = "azure_document_intelligence";
+    state.nodes[0].options = { model_id: "prebuilt-layout" };
+    render(<><GraphApprovals events={[event]} state={state} /><GraphOutputs state={state} /></>);
+    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+    const labels = screen.getAllByText("model prebuilt-layout");
+    expect(labels).toHaveLength(2);
+    for (const label of labels) expect(label).toHaveClass("graph-output-detail");
+  });
+
   it("shows the saved LLM title with styled node and profile details", async () => {
     render(<GraphApprovals events={[event]} state={stateWithTitle(event.id)} />);
     await userEvent.setup().click(screen.getByText("Approvals (1)"));

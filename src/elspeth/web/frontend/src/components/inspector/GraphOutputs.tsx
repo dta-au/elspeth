@@ -1,7 +1,7 @@
 import { Fragment, type ReactNode } from "react";
 import type { CompositionState, NodeSpec, NodeType } from "@/types";
 import { FORK_CONNECTION, publishedSuccessConnection } from "@/lib/graphTopology";
-import { llmBindingLabel } from "@/lib/llmBindingLabel";
+import { pluginBindingLabel } from "@/lib/pluginBindingLabel";
 import { sortedSourceEntries } from "@/utils/compositionState";
 import { buildConnectionIndex } from "@/components/workspace/specRouting";
 
@@ -9,7 +9,7 @@ interface PolicyRow {
   kind: string;
   name: string;
   plugin: string | null;
-  model: string | null;
+  binding: string | null;
   success: ReactNode[];
   condition: string;
   action: ReactNode;
@@ -73,7 +73,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
     kind: "Source",
     name,
     plugin: source.plugin,
-    model: source.plugin === "llm" ? llmBindingLabel(source.options) : null,
+    binding: pluginBindingLabel(source.plugin, source.options),
     success: [successAction(source.on_success, destinationName)],
     condition: "Row fails validation",
     action: failureAction(source.on_validation_failure, destinationName),
@@ -82,7 +82,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
     kind: NODE_LABELS[node.node_type],
     name: node.id,
     plugin: node.plugin,
-    model: node.plugin === "llm" ? llmBindingLabel(node.options) : null,
+    binding: pluginBindingLabel(node.plugin, node.options),
     success: nodeSuccessActions(node, destinationName),
     condition: node.node_type === "coalesce" && node.policy === "require_all"
       ? "Required branch missing"
@@ -95,7 +95,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
     kind: "Output",
     name: output.name,
     plugin: output.plugin,
-    model: null,
+    binding: pluginBindingLabel(output.plugin, output.options),
     success: ["Row sunk"],
     condition: "Row write fails",
     action: failureAction(output.on_write_failure, destinationName, output.name),
@@ -119,7 +119,7 @@ export function GraphOutputs({ state }: { state: CompositionState }): JSX.Elemen
                 <th scope="row">
                   {row.kind}: <code>{row.name}</code>
                   {row.plugin && <span className="graph-output-detail">{row.plugin}</span>}
-                  {row.model && <span className="graph-output-detail">{row.model}</span>}
+                  {row.binding && <span className="graph-output-detail">{row.binding}</span>}
                 </th>
                 <td>{row.success.map((action, index) => <div key={index}>{action}</div>)}</td>
                 <td>

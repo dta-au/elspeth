@@ -1,6 +1,6 @@
 import type { InterpretationEvent } from "@/types/interpretation";
 import type { CompositionState } from "@/types";
-import { llmBindingLabel } from "@/lib/llmBindingLabel";
+import { pluginBindingLabel } from "@/lib/pluginBindingLabel";
 import { sourceComponentId } from "@/utils/compositionState";
 
 const APPROVAL_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
@@ -82,6 +82,7 @@ export function GraphApprovals({
                 ?? state.nodes.find((node) => node.id === event.affected_node_id)
                 ?? state.outputs.find((output) => output.name === event.affected_node_id);
               const authoredName = authoredApprovalName(event, component?.options);
+              const binding = component ? pluginBindingLabel(component.plugin, component.options) : null;
               const fallbackName = fallbackApprovalName(event);
               const name = authoredName === null
                 ? fallbackName
@@ -98,9 +99,9 @@ export function GraphApprovals({
                     {name}
                     {nodeName && <> for <code>{nodeName}</code></>}
                     {component?.plugin && <span className="graph-output-detail">{component.plugin}</span>}
-                    {component?.plugin === "llm" && (
+                    {binding && (
                       <span className="graph-output-detail" title="Current node configuration">
-                        {llmBindingLabel(component.options)}
+                        {binding}
                       </span>
                     )}
                   </th>
