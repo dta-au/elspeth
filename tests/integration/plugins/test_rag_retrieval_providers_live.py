@@ -1,14 +1,14 @@
-"""Protected live-provider lane: ``transform:rag_retrieval`` provider variants.
+"""Protected live-provider lane: the retrieval transforms' variants.
 
-One pytest node per production retrieval discriminator. The variant inventory
-derives from the owned production vocabularies — the ``RAGRetrievalConfig``
-``provider`` Literal (``RetrievalProviderName``) validated against the
-``PROVIDERS`` registry, ``AzureSearchAuthMode`` (``api_key`` /
-``managed_identity``), and ``ChromaSearchMode`` (``ephemeral`` /
-``persistent`` / ``client``) — projected to the golden variant ids exactly the
-way ``scripts/state_engine_plugin_matrix._variant_map`` does
-(``azure-search-<mode>`` with ``_`` -> ``-``, ``chroma-<mode>``). Every node
-crosses the full production boundary via the shared lane harness.
+One pytest node per production retrieval discriminator, for both plugins that
+share the retrieval core. The variant inventory derives from the owned
+production vocabularies — ``ChromaSearchMode`` (``ephemeral`` / ``persistent``
+/ ``client``) for ``transform:rag_retrieval`` and ``AzureSearchAuthMode``
+(``api_key`` / ``managed_identity``) for ``transform:azure_ai_search`` —
+projected to the golden variant ids exactly the way
+``scripts/state_engine_plugin_matrix._variant_map`` does (``chroma-<mode>``;
+``<mode>`` with ``_`` -> ``-``). Every node crosses the full production
+boundary via the shared lane harness.
 
 The RAG transform's ``on_start`` readiness gate refuses an empty or missing
 collection, so each Chroma node seeds its own uniquely named collection
@@ -23,10 +23,10 @@ Resource vocabulary
 Endpoint/index/host identity uses only the closed lane vocabulary from
 ``scripts/state_engine_assessment_lib/selectors.py`` (``PROVIDER_RESOURCES``
 + ``COMMON_LIVE_RESOURCES``). That vocabulary carries no API-key names, so
-the ``azure-search-api-key`` variant uses ``AZURE_SEARCH_API_KEY`` — the
-credential name this plugin's own ``example_use`` establishes — rather than
-an invented name; the managed-identity variant is keyless (ambient Azure
-credential chain). Secrets never appear in test code: the pipeline YAML
+the ``api-key`` variant uses ``AZURE_SEARCH_API_KEY`` — the credential name
+the plugin's own ``example_use`` establishes — rather than an invented name;
+the ``managed-identity`` variant is keyless and runs only on an Azure host
+that has a managed identity (``ManagedIdentityCredential``, no fallback chain). Secrets never appear in test code: the pipeline YAML
 carries ``${NAME}`` references resolved by the production env-expansion pass.
 """
 
@@ -59,18 +59,16 @@ pytestmark = [pytest.mark.slow, pytest.mark.integration, pytest.mark.live_provid
 
 _AZURE_SEARCH_MODES = get_args(AzureSearchAuthMode)
 _CHROMA_MODES = get_args(ChromaSearchMode)
-RAG_VARIANTS = (
-    *(f"azure-search-{mode.replace('_', '-')}" for mode in _AZURE_SEARCH_MODES),
-    *(f"chroma-{mode}" for mode in _CHROMA_MODES),
-)
+RAG_VARIANTS = tuple(f"chroma-{mode}" for mode in _CHROMA_MODES)
+AZURE_AI_SEARCH_VARIANTS = tuple(mode.replace("_", "-") for mode in _AZURE_SEARCH_MODES)
 
 _VARIANT_RESOURCES: dict[str, tuple[str, ...]] = {
-    "azure-search-api-key": (
+    "api-key": (
         "ELSPETH_TEST_AZURE_SEARCH_ENDPOINT",
         "ELSPETH_TEST_AZURE_SEARCH_INDEX",
         "AZURE_SEARCH_API_KEY",
     ),
-    "azure-search-managed-identity": (
+    "managed-identity": (
         "ELSPETH_TEST_AZURE_SEARCH_ENDPOINT",
         "ELSPETH_TEST_AZURE_SEARCH_INDEX",
     ),
@@ -90,10 +88,10 @@ _FILLER_DOCUMENT = "An unrelated filler passage recorded only to give the collec
 
 @dataclass(frozen=True, slots=True)
 class _PreparedRetrieval:
-    """One variant's provider config, query, expectations, and teardown."""
+    """One variant's plugin, plugin-specific options, query, expectations, and teardown."""
 
-    provider: RetrievalProviderName
-    provider_config: dict[str, Any]
+    plugin: str
+    plugin_options: dict[str, Any]
     query_text: str
     expect_seeded_hit: bool
     expected_call_type: str
@@ -111,13 +109,12 @@ def _seed_chroma_collection(client: chromadb.api.ClientAPI, collection_name: str
 
 
 def _prepare_retrieval(variant: str, tmp_path: Path) -> _PreparedRetrieval:
-    if variant == "azure-search-api-key":
+    if variant == "api-key":
         return _PreparedRetrieval(
-            provider="azure_search",
-            provider_config={
+            plugin="azure_ai_search",
+            plugin_options={
                 "endpoint": "${ELSPETH_TEST_AZURE_SEARCH_ENDPOINT}",
                 "index": "${ELSPETH_TEST_AZURE_SEARCH_INDEX}",
-                "auth_mode": "api_key",
                 "api_key": "${AZURE_SEARCH_API_KEY}",
                 "search_mode": "keyword",
             },
@@ -126,13 +123,12 @@ def _prepare_retrieval(variant: str, tmp_path: Path) -> _PreparedRetrieval:
             expected_call_type=CallType.HTTP.value,
             cleanup=lambda: None,
         )
-    if variant == "azure-search-managed-identity":
+    if variant == "managed-identity":
         return _PreparedRetrieval(
-            provider="azure_search",
-            provider_config={
+            plugin="azure_ai_search",
+            plugin_options={
                 "endpoint": "${ELSPETH_TEST_AZURE_SEARCH_ENDPOINT}",
                 "index": "${ELSPETH_TEST_AZURE_SEARCH_INDEX}",
-                "auth_mode": "managed_identity",
                 "use_managed_identity": True,
                 "search_mode": "keyword",
             },
@@ -151,8 +147,8 @@ def _prepare_retrieval(variant: str, tmp_path: Path) -> _PreparedRetrieval:
         client: chromadb.api.ClientAPI = chromadb.Client()
         _seed_chroma_collection(client, collection_name)
         return _PreparedRetrieval(
-            provider="chroma",
-            provider_config={"collection": collection_name, "mode": "ephemeral"},
+            plugin="rag_retrieval",
+            plugin_options={"provider": "chroma", "provider_config": {"collection": collection_name, "mode": "ephemeral"}},
             query_text=_SEED_DOCUMENT,
             expect_seeded_hit=True,
             expected_call_type=CallType.VECTOR.value,
@@ -163,11 +159,14 @@ def _prepare_retrieval(variant: str, tmp_path: Path) -> _PreparedRetrieval:
         client = chromadb.PersistentClient(path=str(persist_directory))
         _seed_chroma_collection(client, collection_name)
         return _PreparedRetrieval(
-            provider="chroma",
-            provider_config={
-                "collection": collection_name,
-                "mode": "persistent",
-                "persist_directory": str(persist_directory),
+            plugin="rag_retrieval",
+            plugin_options={
+                "provider": "chroma",
+                "provider_config": {
+                    "collection": collection_name,
+                    "mode": "persistent",
+                    "persist_directory": str(persist_directory),
+                },
             },
             query_text=_SEED_DOCUMENT,
             expect_seeded_hit=True,
@@ -183,31 +182,42 @@ def _prepare_retrieval(variant: str, tmp_path: Path) -> _PreparedRetrieval:
         client = chromadb.HttpClient(host=host, port=port, ssl=ssl)
         _seed_chroma_collection(client, remote_collection)
         return _PreparedRetrieval(
-            provider="chroma",
-            provider_config={
-                "collection": remote_collection,
-                "mode": "client",
-                "host": host,
-                "port": port,
-                "ssl": ssl,
+            plugin="rag_retrieval",
+            plugin_options={
+                "provider": "chroma",
+                "provider_config": {
+                    "collection": remote_collection,
+                    "mode": "client",
+                    "host": host,
+                    "port": port,
+                    "ssl": ssl,
+                },
             },
             query_text=_SEED_DOCUMENT,
             expect_seeded_hit=True,
             expected_call_type=CallType.VECTOR.value,
             cleanup=lambda: client.delete_collection(remote_collection),
         )
-    raise AssertionError(f"unknown rag_retrieval variant {variant!r}")
+    raise AssertionError(f"unknown retrieval variant {variant!r}")
 
 
 @pytest.fixture
 def rag_variant(request: pytest.FixtureRequest) -> str:
-    """One retrieval variant from the owned production discriminators."""
+    """One rag_retrieval variant from the owned production discriminators."""
     variant = str(request.param)
-    assert set(get_args(RetrievalProviderName)) == {"azure_search", "chroma"}
+    assert set(get_args(RetrievalProviderName)) == {"chroma"}
     assert variant in RAG_VARIANTS
-    provider_key = "azure_search" if variant.startswith("azure-search-") else "chroma"
-    if provider_key not in PROVIDERS:
-        pytest.skip(f"retrieval provider {provider_key!r} SDK is not installed in this environment")
+    if "chroma" not in PROVIDERS:
+        pytest.skip("retrieval provider 'chroma' SDK is not installed in this environment")
+    require_env(*_VARIANT_RESOURCES[variant])
+    return variant
+
+
+@pytest.fixture
+def azure_ai_search_variant(request: pytest.FixtureRequest) -> str:
+    """One azure_ai_search variant from the owned production discriminators."""
+    variant = str(request.param)
+    assert variant in AZURE_AI_SEARCH_VARIANTS
     require_env(*_VARIANT_RESOURCES[variant])
     return variant
 
@@ -218,15 +228,28 @@ def test_rag_retrieval_variant_completes_a_production_run(
     tmp_path: Path,
     request: pytest.FixtureRequest,
 ) -> None:
-    """One retrieval-enriched row crosses the full production lifecycle live."""
-    prepared = _prepare_retrieval(rag_variant, tmp_path)
+    """One Chroma-enriched row crosses the full production lifecycle live."""
+    _run_retrieval_variant(rag_variant, tmp_path, request)
+
+
+@pytest.mark.parametrize("azure_ai_search_variant", AZURE_AI_SEARCH_VARIANTS, indirect=True)
+def test_azure_ai_search_variant_completes_a_production_run(
+    azure_ai_search_variant: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """One Azure-AI-Search-enriched row crosses the full production lifecycle live."""
+    _run_retrieval_variant(azure_ai_search_variant, tmp_path, request)
+
+
+def _run_retrieval_variant(variant: str, tmp_path: Path, request: pytest.FixtureRequest) -> None:
+    prepared = _prepare_retrieval(variant, tmp_path)
     try:
         output_path = tmp_path / "output.jsonl"
         options: dict[str, Any] = {
             "output_prefix": "retrieval",
             "query_field": "question",
-            "provider": prepared.provider,
-            "provider_config": prepared.provider_config,
+            **prepared.plugin_options,
             "top_k": 3,
             "min_score": 0.0,
             "on_no_results": "continue",
@@ -243,7 +266,7 @@ def test_rag_retrieval_variant_completes_a_production_run(
             "transforms": [
                 {
                     "name": "subject",
-                    "plugin": "rag_retrieval",
+                    "plugin": prepared.plugin,
                     "input": "subject_input",
                     "on_success": "output",
                     "on_error": "discard",

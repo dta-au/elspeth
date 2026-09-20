@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalProvider
 
 ProviderFactory = Callable[..., "RetrievalProvider"]
-RetrievalProviderName = Literal["azure_search", "chroma"]
+RetrievalProviderName = Literal["chroma"]
 
 # Registry entry: (config class, provider class or factory callable)
 _ProviderEntry = tuple[type[Any], Callable[..., Any]]
@@ -29,16 +29,6 @@ def _get_providers() -> dict[str, _ProviderEntry]:
     (the same posture as ``read_litellm_model_list``).
     """
     providers: dict[str, _ProviderEntry] = {}
-
-    # azure_search speaks the Azure Search REST API through httpx (a core
-    # dependency) and needs no optional SDK: it is unconditionally available,
-    # and any import failure here is a first-party bug that must surface.
-    from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
-        AzureSearchProvider,
-        AzureSearchProviderConfig,
-    )
-
-    providers["azure_search"] = (AzureSearchProviderConfig, AzureSearchProvider)
 
     try:
         from elspeth.plugins.infrastructure.clients.retrieval.chroma import (

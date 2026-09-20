@@ -17,25 +17,23 @@ sources:
 
 transforms:
 - name: rag_0
-  plugin: rag_retrieval
+  plugin: azure_ai_search
   input: rag_in
   on_success: output
   on_error: quarantine
   options:
     query_field: question
     output_prefix: policy
-    provider: azure_search
-    provider_config:
-      endpoint: ${AZURE_SEARCH_ENDPOINT}
-      index: ${AZURE_SEARCH_INDEX}
-      api_key: ${AZURE_SEARCH_API_KEY}
-      search_mode: hybrid
-      # Field names of an index built by the portal "Import and vectorize data" wizard.
-      content_field: chunk
-      id_field: chunk_id
-      title_field: title
-      vector_field: text_vector
-      select: [chunk, chunk_id, title]
+    endpoint: ${AZURE_SEARCH_ENDPOINT}
+    index: ${AZURE_SEARCH_INDEX}
+    api_key: ${AZURE_SEARCH_API_KEY}
+    search_mode: hybrid
+    # Index field names of an index built by the portal "Import and vectorize data" wizard.
+    field_content: chunk
+    field_id: chunk_id
+    field_title: title
+    field_vector: text_vector
+    select: [chunk, chunk_id, title]
     top_k: 3
     min_score: 0.0
     on_no_results: continue

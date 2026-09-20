@@ -17,7 +17,6 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.security.web import (
     NetworkError,
     SSRFBlockedError,
-    SSRFSafeRequest,
     validate_literal_ip_for_ssrf,
     validate_url_for_ssrf,
 )
@@ -25,8 +24,8 @@ from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 
 if TYPE_CHECKING:
+    from elspeth.contracts.audit_protocols import CallRecorder
     from elspeth.contracts.contexts import LimiterProtocol
-    from elspeth.core.landscape.execution_repository import ExecutionRepository
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 
@@ -218,7 +217,7 @@ _SCORE_KEYS: dict[str, str] = {
 
 
 class AzureSearchProvider:
-    """Azure AI Search implementation of RetrievalProvider.
+    """Azure AI Search implementation of RetrievalSearcher.
 
     Uses a single AuditedHTTPClient for connection pooling across searches.
     The client's state_id and token_id are updated per-call for correct
@@ -230,7 +229,7 @@ class AzureSearchProvider:
         self,
         config: AzureSearchProviderConfig,
         *,
-        execution: ExecutionRepository,
+        execution: CallRecorder,
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: LimiterProtocol | None = None,
@@ -605,104 +604,6 @@ class AzureSearchProvider:
             count=count,
             message=(f"Index '{index_name}' has {count} documents" if count > 0 else f"Index '{index_name}' is empty"),
         )
-
-    @staticmethod
-    def _readiness_get(
-        safe_request: SSRFSafeRequest,
-        *,
-        headers: dict[str, str],
-        timeout: float,
-    ) -> httpx.Response:
-        request_headers = {**headers, "Host": safe_request.host_header}
-        extensions: dict[str, str] | None = None
-        if safe_request.scheme == "https":
-            extensions = {"sni_hostname": safe_request.sni_hostname}
-
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-            return client.get(
-                safe_request.connection_url,
-                headers=request_headers,
-                extensions=extensions,
-            )
-
-    def check_readiness(self) -> CollectionReadinessResult:
-        """Check that the Azure Search index exists and has documents.
-
-        Uses raw httpx (NOT AuditedHTTPClient) because this is a startup
-        probe, not a row-level operation. There is no state_id or token_id
-        available during on_start().
-
-        SSRF protection: validates the endpoint URL resolves to a public IP
-        before making the request, preventing DNS rebinding attacks where
-        a config-authored hostname resolves to an internal IP.
-
-        Auth modes:
-        - api_key: sends api-key header
-        - use_managed_identity: acquires a Bearer token via ManagedIdentityCredential
-        """
-        from elspeth.core.security.web import NetworkError, SSRFBlockedError, validate_url_for_ssrf
-
-        index_name = self._config.index
-
-        try:
-            count_url = f"{self._config.endpoint.rstrip('/')}/indexes/{index_name}/docs/$count?api-version={self._config.api_version}"
-
-            # SSRF validation: resolve DNS and reject internal IPs before
-            # making the request. The request uses the returned IP-pinned URL
-            # with Host and TLS SNI set to the original hostname to avoid a
-            # validation-to-use DNS gap.
-            try:
-                safe_request = validate_url_for_ssrf(count_url)
-            except (SSRFBlockedError, NetworkError) as exc:
-                return CollectionReadinessResult(
-                    collection=index_name,
-                    reachable=False,
-                    count=None,
-                    message=f"Index '{index_name}' endpoint blocked by SSRF validation: {exc}",
-                )
-
-            headers = self._auth_headers()
-
-            response = self._readiness_get(safe_request, headers=headers, timeout=10.0)
-
-            if response.status_code == 404:
-                # Index absent — count is unknown, not zero.
-                return CollectionReadinessResult(
-                    collection=index_name,
-                    reachable=True,
-                    count=None,
-                    message=f"Index '{index_name}' not found",
-                )
-
-            response.raise_for_status()
-
-            # Tier 3 boundary: $count response body is external data.
-            # Parse defensively — malformed body should be distinguishable
-            # from a genuine network outage.
-            try:
-                count = int(response.text.strip())
-            except ValueError:
-                # Malformed $count response — count is unknown, not zero.
-                return CollectionReadinessResult(
-                    collection=index_name,
-                    reachable=True,
-                    count=None,
-                    message=f"Index '{index_name}' returned non-integer $count body: {response.text!r}",
-                )
-
-            return CollectionReadinessResult(
-                collection=index_name,
-                reachable=True,
-                count=count,
-                message=(f"Index '{index_name}' has {count} documents" if count > 0 else f"Index '{index_name}' is empty"),
-            )
-        except (httpx.HTTPError, ConnectionError, OSError) as exc:
-            return CollectionReadinessResult(
-                collection=index_name,
-                reachable=False,
-                count=None,
-                message=f"Index '{index_name}' unreachable: {type(exc).__name__}: {exc}",
-            )
 
     def close(self) -> None:
         """Release the shared HTTP client and its connection pool."""

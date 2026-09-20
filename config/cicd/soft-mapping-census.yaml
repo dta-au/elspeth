@@ -456,6 +456,8 @@ files:
     Mapping[str, Any]: 43
     boundary: 2
     dict[str, Any]: 19
+  src/elspeth/plugins/transforms/azure/ai_search.py:
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/azure/base.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/azure/content_safety.py:
@@ -554,11 +556,11 @@ files:
   src/elspeth/plugins/transforms/rag/config.py:
     dict[str, Any]: 1
   src/elspeth/plugins/transforms/rag/core.py:
-    dict[str, Any]: 3
+    dict[str, Any]: 4
   src/elspeth/plugins/transforms/rag/query.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/rag/transform.py:
-    dict[str, Any]: 3
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/reference_join.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
@@ -1044,6 +1046,6 @@ totals:
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1137
+  dict[str, Any]: 1139
   dict[str, object]: 406
-  soft: 2738
+  soft: 2740

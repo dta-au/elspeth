@@ -26,14 +26,17 @@ import structlog
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism, TransformResult, propagate_contract
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorReason
 from elspeth.contracts.events import RAGRetrievalStatistics, TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
+from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
 from elspeth.plugins.transforms.rag.formatter import format_context
@@ -214,6 +217,69 @@ class RetrievalTransformBase(BaseTransform):
         # Lifecycle dependencies — set in on_start()
         self._run_id: str = ""
         self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject a deterministic retrieval query for invariant probing."""
+        return [
+            self._augment_invariant_probe_row(
+                probe,
+                field_name="rag_probe_query",
+                value="What is the policy?",
+            )
+        ]
+
+    def execute_forward_invariant_probe(
+        self,
+        probe_rows: list[PipelineRow],
+        ctx: Any,
+    ) -> TransformResult:
+        """Exercise the real retrieval path with a provider-agnostic local double."""
+        if len(probe_rows) != 1:
+            raise FrameworkBugError(
+                f"{self.__class__.__name__}.execute_forward_invariant_probe() "
+                f"received {len(probe_rows)} rows; retrieval invariant probes require exactly 1 row."
+            )
+
+        class _InvariantProvider:
+            def __init__(self) -> None:
+                self.last_skipped_count = 0
+                self.last_skipped_reasons: list[dict[str, Any]] = []
+
+            def search(
+                self,
+                query: str,
+                top_k: int,
+                min_score: float,
+                *,
+                state_id: str,
+                token_id: str | None,
+                member_token: WorkerMembershipToken,
+                work_item: TokenWorkItem,
+            ) -> list[RetrievalChunk]:
+                del query, top_k, min_score, state_id, token_id
+                return [
+                    RetrievalChunk(
+                        content="Probe context",
+                        score=0.95,
+                        source_id="probe-doc",
+                        metadata={"kind": "invariant"},
+                    )
+                ]
+
+            def close(self) -> None:
+                return None
+
+        original_provider = self._searcher
+        original_on_start_called = self._on_start_called
+        probe_provider = _InvariantProvider()
+        try:
+            self.__dict__["_searcher"] = probe_provider
+            self._on_start_called = True
+            return super().execute_forward_invariant_probe(probe_rows, ctx)
+        finally:
+            self._on_start_called = original_on_start_called
+            self.__dict__["_searcher"] = original_provider
+            probe_provider.close()
 
     @abstractmethod
     def _build_searcher(self, ctx: LifecycleContext) -> RetrievalSearcher:

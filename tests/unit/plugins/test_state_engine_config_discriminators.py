@@ -190,7 +190,10 @@ def test_azure_search_rejects_explicit_mode_that_disagrees_with_credentials() ->
 
 
 def test_rag_provider_schema_is_the_owned_closed_product_vocabulary() -> None:
-    assert RAGRetrievalConfig.model_json_schema()["properties"]["provider"]["enum"] == ["azure_search", "chroma"]
+    # One registered provider: pydantic renders a single-member Literal as ``const``, not ``enum``.
+    provider_schema = RAGRetrievalConfig.model_json_schema()["properties"]["provider"]
+    assert provider_schema["const"] == "chroma"
+    assert "enum" not in provider_schema
 
 
 def test_chroma_modes_are_central_owned_vocabularies_reused_by_configs() -> None:

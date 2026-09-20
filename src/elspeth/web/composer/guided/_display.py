@@ -48,6 +48,7 @@ _ACRONYMS: Final[frozenset[str]] = frozenset(
 """Words rendered fully upper-case by the humanised fallback."""
 
 _DISPLAY_NAME_OVERRIDES: Final[dict[str, str]] = {
+    "azure_ai_search": "Azure AI Search (RAG)",
     "azure_blob": "Azure Blob Storage",
     "dataverse": "Microsoft Dataverse",
     "chroma_sink": "Chroma Vector Store",

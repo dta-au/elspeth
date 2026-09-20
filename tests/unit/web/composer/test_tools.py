@@ -8813,28 +8813,62 @@ class TestTransformProviderConfigPathSecurity:
         assert error is not None
         assert "managed identity" in error.lower()
 
-    def test_upsert_node_rejects_azure_search_managed_identity(self) -> None:
+    @staticmethod
+    def _azure_ai_search_managed_identity_node(*, input_name: str, on_success: str) -> dict[str, Any]:
+        return {
+            "id": "rag",
+            "node_type": "transform",
+            "plugin": "azure_ai_search",
+            "input": input_name,
+            "on_success": on_success,
+            "on_error": "discard",
+            "options": {
+                "endpoint": "https://tenant-b.search.windows.net",
+                "index": "payroll",
+                "use_managed_identity": True,
+                "schema": {"mode": "observed"},
+                "output_prefix": "rag_",
+                "query_field": "text",
+            },
+        }
+
+    @staticmethod
+    def _azure_ai_search_without_a_profile() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+        # What build_plugin_snapshot records for an operator-profiled plugin with no usable alias.
+        catalog = _mock_catalog()
+        catalog.list_transforms.return_value = [
+            *catalog.list_transforms.return_value,
+            PluginSummary(
+                name="azure_ai_search",
+                description="Azure AI Search RAG retrieval transform",
+                plugin_type="transform",
+                config_fields=[],
+            ),
+        ]
+        return _restricted_policy_pair(
+            catalog,
+            PluginId("transform", "azure_ai_search"),
+            PluginUnavailableReason.PROFILE_UNAVAILABLE,
+        )
+
+    def test_upsert_node_rejects_raw_azure_ai_search_managed_identity(self) -> None:
         state = _empty_state()
-        catalog = self._catalog_with_rag()
+        view, snapshot = self._azure_ai_search_without_a_profile()
         result = execute_tool(
             "upsert_node",
-            {
-                "id": "rag",
-                "node_type": "transform",
-                "plugin": "rag_retrieval",
-                "input": "rows",
-                "on_success": "retrieved",
-                "on_error": "discard",
-                "options": self._azure_search_managed_identity_options(),
-            },
+            self._azure_ai_search_managed_identity_node(input_name="rows", on_success="retrieved"),
             state,
-            catalog,
+            view,
             data_dir="/data",
+            plugin_snapshot=snapshot,
         )
         assert result.success is False
-        assert "managed identity" in result.validation.errors[0].message.lower()
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
-    def test_patch_node_options_rejects_azure_search_managed_identity(self) -> None:
+    def test_patch_node_options_cannot_repoint_rag_retrieval_at_azure_search(self) -> None:
+        # rag_retrieval used to reach Azure through provider="azure_search"; that arm is gone,
+        # so a patch can no longer move an admitted Chroma node onto the server's identity.
         state = _empty_state()
         catalog = self._catalog_with_rag()
         created = execute_tool(
@@ -8873,11 +8907,12 @@ class TestTransformProviderConfigPathSecurity:
         )
 
         assert result.success is False
-        assert "managed identity" in result.validation.errors[0].message.lower()
+        assert result.updated_state is created.updated_state
+        assert "provider: Input should be 'chroma'" in result.validation.errors[0].message
 
-    def test_set_pipeline_rejects_azure_search_managed_identity(self) -> None:
+    def test_set_pipeline_rejects_raw_azure_ai_search_managed_identity(self) -> None:
         state = _empty_state()
-        catalog = self._catalog_with_rag()
+        view, snapshot = self._azure_ai_search_without_a_profile()
         args = {
             "source": {
                 "plugin": "csv",
@@ -8885,17 +8920,7 @@ class TestTransformProviderConfigPathSecurity:
                 "options": {"path": "/data/blobs/test-session/in.csv", "schema": {"mode": "observed"}},
                 "on_validation_failure": "quarantine",
             },
-            "nodes": [
-                {
-                    "id": "rag",
-                    "node_type": "transform",
-                    "plugin": "rag_retrieval",
-                    "input": "source_out",
-                    "on_success": "main",
-                    "on_error": "discard",
-                    "options": self._azure_search_managed_identity_options(),
-                }
-            ],
+            "nodes": [self._azure_ai_search_managed_identity_node(input_name="source_out", on_success="main")],
             "edges": [{"id": "e1", "from_node": "source", "to_node": "rag", "edge_type": "on_success", "label": None}],
             "outputs": [
                 {
@@ -8910,9 +8935,10 @@ class TestTransformProviderConfigPathSecurity:
                 }
             ],
         }
-        result = execute_tool("set_pipeline", args, state, catalog, data_dir="/data")
+        result = execute_tool("set_pipeline", args, state, view, data_dir="/data", plugin_snapshot=snapshot)
         assert result.success is False
-        assert "managed identity" in result.validation.errors[0].message.lower()
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
     def test_helper_allows_azure_search_api_key(self) -> None:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_policy

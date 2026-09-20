@@ -9,15 +9,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from elspeth.contracts import Determinism, TransformResult
-from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts import Determinism
 from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
-from elspeth.contracts.scheduler import TokenWorkItem
-from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
-from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 from elspeth.plugins.transforms.rag.config import PROVIDERS, RAGRetrievalConfig
 from elspeth.plugins.transforms.rag.core import RetrievalTransformBase
 
@@ -41,7 +37,7 @@ class RAGRetrievalTransform(RetrievalTransformBase):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:505b39c4063685ec"
+    source_file_hash: str | None = "sha256:375b2337d23fa0ad"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
@@ -49,9 +45,9 @@ class RAGRetrievalTransform(RetrievalTransformBase):
     capability_tags: tuple[str, ...] = ("rag", "retrieval", "vector-search")
 
     usage_when_to_use = (
-        "Use to retrieve ranked, provenance-bearing context from an existing Chroma collection or "
-        "Azure Search index. Retrieved text is untrusted before LLM consumption even when it comes "
-        "from an approved index."
+        "Use to retrieve ranked, provenance-bearing context from an existing Chroma collection. "
+        "Retrieved text is untrusted before LLM consumption even when it comes from an approved "
+        "collection. Use azure_ai_search for Azure AI Search."
     )
     usage_when_not_to_use = (
         "Not for corpus indexing or answer generation: populate the collection with chroma_sink or "
@@ -63,12 +59,11 @@ class RAGRetrievalTransform(RetrievalTransformBase):
         "  options:\n"
         "    output_prefix: policy\n"
         "    query_field: question\n"
-        "    provider: azure_search\n"
+        "    provider: chroma\n"
         "    provider_config:\n"
-        "      endpoint: https://catalogue-reference.search.windows.net\n"
-        "      index: approved-documents\n"
-        "      api_key: {secret_ref: AZURE_SEARCH_API_KEY}\n"
-        "      search_mode: hybrid\n"
+        "      collection: approved-documents\n"
+        "      mode: persistent\n"
+        "      persist_directory: ./chroma\n"
         "    top_k: 5\n"
         "    schema: {mode: observed}"
     )
@@ -79,77 +74,10 @@ class RAGRetrievalTransform(RetrievalTransformBase):
         return {
             "output_prefix": "policy",
             "query_field": "rag_probe_query",
-            "provider": "azure_search",
-            "provider_config": {
-                "endpoint": "https://invariant.example.search.windows.net",
-                "index": "invariant-probe",
-                "api_key": "probe-key",
-            },
+            "provider": "chroma",
+            "provider_config": {"collection": "invariant-probe", "mode": "ephemeral"},
             "schema": {"mode": "observed"},
         }
-
-    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
-        """Inject a deterministic retrieval query for invariant probing."""
-        return [
-            self._augment_invariant_probe_row(
-                probe,
-                field_name="rag_probe_query",
-                value="What is the policy?",
-            )
-        ]
-
-    def execute_forward_invariant_probe(
-        self,
-        probe_rows: list[PipelineRow],
-        ctx: Any,
-    ) -> TransformResult:
-        """Exercise the real retrieval path with a provider-agnostic local double."""
-        if len(probe_rows) != 1:
-            raise FrameworkBugError(
-                f"{self.__class__.__name__}.execute_forward_invariant_probe() "
-                f"received {len(probe_rows)} rows; RAG invariant probes require exactly 1 row."
-            )
-
-        class _InvariantProvider:
-            def __init__(self) -> None:
-                self.last_skipped_count = 0
-                self.last_skipped_reasons: list[dict[str, Any]] = []
-
-            def search(
-                self,
-                query: str,
-                top_k: int,
-                min_score: float,
-                *,
-                state_id: str,
-                token_id: str | None,
-                member_token: WorkerMembershipToken,
-                work_item: TokenWorkItem,
-            ) -> list[RetrievalChunk]:
-                del query, top_k, min_score, state_id, token_id
-                return [
-                    RetrievalChunk(
-                        content="Probe context",
-                        score=0.95,
-                        source_id="probe-doc",
-                        metadata={"kind": "invariant"},
-                    )
-                ]
-
-            def close(self) -> None:
-                return None
-
-        original_provider = self._searcher
-        original_on_start_called = self._on_start_called
-        probe_provider = _InvariantProvider()
-        try:
-            self.__dict__["_searcher"] = probe_provider
-            self._on_start_called = True
-            return super().execute_forward_invariant_probe(probe_rows, ctx)
-        finally:
-            self._on_start_called = original_on_start_called
-            self.__dict__["_searcher"] = original_provider
-            probe_provider.close()
 
     def __init__(self, config: dict[str, Any]) -> None:
         self._rag_config = RAGRetrievalConfig.from_dict(config, plugin_name=self.name)
@@ -219,15 +147,6 @@ class RAGRetrievalTransform(RetrievalTransformBase):
                     f"received {type(provider_config).__name__}."
                 )
             return provider_config.collection
-        if provider_name == "azure_search":
-            from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
-
-            if not isinstance(provider_config, AzureSearchProviderConfig):
-                raise FrameworkBugError(
-                    f"{self.__class__.__name__} provider azure_search requires AzureSearchProviderConfig; "
-                    f"received {type(provider_config).__name__}."
-                )
-            return provider_config.index
         raise FrameworkBugError(f"{self.__class__.__name__} has no readiness identity contract for provider {provider_name!r}.")
 
     def _record_readiness_check(
@@ -257,9 +176,7 @@ class RAGRetrievalTransform(RetrievalTransformBase):
                 issue_code=None,
                 summary="Vector retrieval against a configured backend (Chroma, etc). Builds a query from row fields, returns ranked chunks for downstream LLM grounding.",
                 composer_hints=(
-                    "Name the Chroma collection in provider_config.collection or the Azure Search index in provider_config.index.",
-                    "Azure Search reads provider_config.content_field and id_field (defaults content / id); an index built by the portal import wizard needs chunk / chunk_id. Set title_field and url_field to emit source_name and source_link citation metadata.",
-                    "Azure Search vector and hybrid modes send the query as text, so the index must define an integrated vectorizer on vector_field; semantic mode needs semantic_config and scores by the 0-4 reranker score.",
+                    "Name the Chroma collection in provider_config.collection. For Azure AI Search use the azure_ai_search plugin.",
                     "Query template uses row-field interpolation; document what fields are read so downstream consumers can wire them.",
                     "top_k and min_score interact — high min_score plus low top_k may return zero chunks. Configure on_no_results to handle the empty-result case.",
                     "The transform emits running mean/variance telemetry for retrieval scores — watch these to catch retrieval-quality regressions.",

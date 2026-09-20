@@ -34,13 +34,14 @@ from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.plugins.transforms.aws.textract_config_shared import AuthMode as TextractAuthMode
 from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysisConfig
 from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysisConfig
+from elspeth.plugins.transforms.azure.ai_search import AzureAISearchConfig
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig, RetrievalProviderName
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 V3_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 UNCLASSIFIED = "UNCLASSIFIED"
-EXPECTED_COUNTS = {"source": 9, "transform": 37, "sink": 9}
+EXPECTED_COUNTS = {"source": 9, "transform": 38, "sink": 9}
 EXPECTED_VARIANT_COUNT = 76
 ALLOWED_PB_BOUNDARIES = frozenset({"PB-01", "PB-02", "PB-04", "PB-06", "PB-07", "PB-09"})
 ALLOWED_LOCAL_FIXTURES = frozenset({"hermetic", "provider-contract-fake", "real-process-http"})
@@ -175,7 +176,7 @@ def _variant_map() -> dict[str, tuple[str, ...]]:
     if source_discriminator != "provider" or transform_discriminator != "provider":
         raise ValueError("LLM variant discriminator must remain provider")
     retrieval_providers = get_args(RetrievalProviderName)
-    if set(retrieval_providers) != {"azure_search", "chroma"}:
+    if set(retrieval_providers) != {"chroma"}:
         raise ValueError("RAG provider Literal drifted from its owned registry contract")
     dataverse_modes = _owned_literal_values(DataverseAuthConfig, "method")
     return {
@@ -184,11 +185,9 @@ def _variant_map() -> dict[str, tuple[str, ...]]:
         "source:llm": tuple(source_llm),
         "transform:aws_textract_document_analysis": tuple(get_args(TextractAuthMode)),
         "transform:aws_textract_inline_analysis": tuple(get_args(TextractAuthMode)),
+        "transform:azure_ai_search": tuple(mode.replace("_", "-") for mode in get_args(AzureSearchAuthMode)),
         "transform:llm": tuple(transform_llm),
-        "transform:rag_retrieval": (
-            *(f"azure-search-{mode.replace('_', '-')}" for mode in get_args(AzureSearchAuthMode)),
-            *(f"chroma-{mode}" for mode in get_args(ChromaSearchMode)),
-        ),
+        "transform:rag_retrieval": tuple(f"chroma-{mode}" for mode in get_args(ChromaSearchMode)),
         "sink:azure_blob": tuple(get_args(AzureAuthMethod)),
         "sink:chroma_sink": tuple(get_args(ChromaConnectionMode)),
         "sink:dataverse": dataverse_modes,
@@ -407,28 +406,28 @@ def _validate_variant_configs(variants: Mapping[str, tuple[str, ...]]) -> set[tu
             )
             validated_subjects.add(("transform:aws_textract_inline_analysis", mode))
         for mode in get_args(AzureSearchAuthMode):
-            provider_config: dict[str, object] = {
+            search_options: dict[str, object] = {
                 "endpoint": "https://matrix.search.windows.net",
                 "index": "matrix-index",
-                "auth_mode": mode,
             }
             if mode == "api_key":
-                provider_config["api_key"] = "matrix-key"
+                search_options["api_key"] = "matrix-key"
             else:
-                provider_config["use_managed_identity"] = True
-            AzureSearchProviderConfig.model_validate(provider_config)
-            RAGRetrievalConfig.from_dict(
+                search_options["use_managed_identity"] = True
+            AzureSearchProviderConfig.model_validate({**search_options, "auth_mode": mode})
+            search_config = AzureAISearchConfig.from_dict(
                 {
                     "output_prefix": "retrieval",
                     "query_field": "query",
-                    "provider": "azure_search",
-                    "provider_config": provider_config,
+                    **search_options,
                     "schema": schema,
                 }
             )
-            validated_subjects.add(("transform:rag_retrieval", f"azure-search-{mode.replace('_', '-')}"))
+            if search_config.provider_config().auth_mode != mode:
+                raise ValueError(f"azure_ai_search options for {mode!r} derived a different auth mode")
+            validated_subjects.add(("transform:azure_ai_search", mode.replace("_", "-")))
         for mode in get_args(ChromaSearchMode):
-            provider_config = {"collection": "matrix-collection", "mode": mode}
+            provider_config: dict[str, object] = {"collection": "matrix-collection", "mode": mode}
             if mode == "persistent":
                 provider_config["persist_directory"] = ".state-engine-chroma"
             elif mode == "client":

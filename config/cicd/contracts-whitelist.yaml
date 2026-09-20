@@ -221,6 +221,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.probe_config:return"
   - "src/elspeth/plugins/sources/llm/source.py:LLMSource.probe_config:return"
   - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.probe_config:return"
+  - "src/elspeth/plugins/transforms/azure/ai_search.py:AzureAISearchTransform.probe_config:return"
   # Sink probe_config, same contract as the transform hook above: a sink that
   # declares input_semantic_requirements() must be instantiable in isolation
   # so tests/invariants/test_semantic_requirements_are_satisfiable can read it.
@@ -473,6 +474,8 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.__init__:config"
   # Shared retrieval core — forwards the same raw plugin config to BaseTransform
   - "src/elspeth/plugins/transforms/rag/core.py:RetrievalTransformBase.__init__:config"
+  # Azure AI Search transform (config is user YAML — Tier 3 boundary, parsed into AzureAISearchConfig)
+  - "src/elspeth/plugins/transforms/azure/ai_search.py:AzureAISearchTransform.__init__:config"
   # _process_fn.work is now Mapping[str, Any] (IM-2 fix — the pool hands off
   # ctx.row, which is MappingProxyType after RowContext.__post_init__
   # freezes it). _QuerySuccess.fields is likewise Mapping[str, Any].

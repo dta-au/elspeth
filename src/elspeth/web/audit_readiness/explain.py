@@ -115,6 +115,12 @@ def _describe_plugin_node(node: NodeSpec) -> str:
             f"request and top-k result hashes recorded. External call to "
             f"the configured vector store."
         )
+    if plugin == "azure_ai_search":
+        return (
+            f"- {name} (Azure AI Search RAG retrieval) — for each query: the "
+            f"search request and top-k result hashes recorded. External call "
+            f"to the operator-configured Azure AI Search service."
+        )
     if plugin in ("azure_content_safety", "azure_prompt_shield"):
         return (
             f"- {name} ({plugin} — Azure safety) — for each row: the "
