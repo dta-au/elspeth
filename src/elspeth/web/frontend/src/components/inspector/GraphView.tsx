@@ -38,6 +38,7 @@ import dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { selectApprovedInterpretations, useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { projectGuidedGraph } from "@/components/chat/guided/guidedGraphProjection";
 import { GuidedGraphPane } from "./GuidedGraphPane";
 import { useTheme } from "@/hooks/useTheme";
@@ -61,6 +62,7 @@ import type { CompositionState } from "@/types/index";
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphFailurePolicies } from "./GraphFailurePolicies";
+import { GraphApprovals } from "./GraphApprovals";
 
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
@@ -831,6 +833,12 @@ function layoutGraph(
 
 export function GraphView() {
   const compositionState = useSessionStore((s) => s.compositionState);
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const resolvedInterpretationsBySession = useInterpretationEventsStore((s) => s.resolvedBySession);
+  const approvedInterpretations = useMemo(
+    () => selectApprovedInterpretations(activeSessionId === null ? [] : resolvedInterpretationsBySession[activeSessionId] ?? []),
+    [activeSessionId, resolvedInterpretationsBySession],
+  );
   const pendingProposalCount = useSessionStore(
     (s) =>
       s.compositionProposals.filter(
@@ -1316,6 +1324,15 @@ export function GraphView() {
     }
     const nodeIds = new Set(rfNodes.map(n => n.id));
     const outputIds = new Set(compositionState.outputs.map((output) => output.name));
+    function hasErrorRoute(sourceId: string, targetId: string): boolean {
+      // An explicit on_error hint may carry a useful route name. Its label
+      // differs from the inferred "error" label, but both draw the same route.
+      return rfEdges.some((edge) =>
+        edge.source === sourceId
+        && edge.target === targetId
+        && edge.data.flowType === "error",
+      );
+    }
     function addDirectOutputErrorEdge(
       kind: string,
       sourceId: string,
@@ -1334,7 +1351,7 @@ export function GraphView() {
         "error",
         "error",
       );
-      if (existingConnections.has(semanticKey)) return;
+      if (hasErrorRoute(sourceId, targetId)) return;
 
       rfEdges.push({
         id: inferredSemanticEdgeId(
@@ -1564,7 +1581,10 @@ export function GraphView() {
           producer.label,
           producer.edgeType,
         );
-        if (existingConnections.has(semanticKey)) continue;
+        if (
+          existingConnections.has(semanticKey)
+          || (producer.origin === "error" && hasErrorRoute(producer.nodeId, queueId))
+        ) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: inferredSemanticEdgeId(
@@ -1646,7 +1666,10 @@ export function GraphView() {
           producer.label,
           producer.edgeType,
         );
-        if (existingConnections.has(semanticKey)) continue;
+        if (
+          existingConnections.has(semanticKey)
+          || (producer.origin === "error" && hasErrorRoute(producer.nodeId, node.id))
+        ) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: rowUnionIds.has(producer.nodeId)
@@ -1789,12 +1812,7 @@ export function GraphView() {
         node.node_type !== "collector" &&
         node.on_error &&
         nodeIds.has(node.on_error) &&
-        !existingConnections.has(edgeSemanticIdentity(
-          node.id,
-          node.on_error,
-          "error",
-          "error",
-        ))
+        !hasErrorRoute(node.id, node.on_error)
       ) {
         rfEdges.push({
           id: inferredSemanticEdgeId(
@@ -2214,7 +2232,12 @@ export function GraphView() {
             />
           )}
         </div>
-        {compositionState && <GraphFailurePolicies state={compositionState} />}
+        {compositionState && (
+          <>
+            <GraphApprovals events={approvedInterpretations} />
+            <GraphFailurePolicies state={compositionState} />
+          </>
+        )}
         {selectedConfig && (
           <NodeConfigPanel
             config={selectedConfig}

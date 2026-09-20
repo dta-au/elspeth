@@ -5,12 +5,14 @@ import userEvent from "@testing-library/user-event";
 import { GraphView } from "./GraphView";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
 import { EMPTY_GUIDED_REVIEWED_COMPONENTS } from "@/stores/guidedReviewedComponents";
 import type { TurnPayload } from "@/types/guided";
 import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "@/types/index";
+import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { projectValidationWorkspaceStatus } from "@/components/workspace/workspaceStatus";
 
@@ -287,6 +289,7 @@ function makeProposal(
 describe("GraphView", () => {
   beforeEach(() => {
     useSessionStore.setState({
+      activeSessionId: null,
       compositionState: null,
       compositionProposals: [],
       // Guided projection inputs (elspeth-9f0873426a): a test that seeds a
@@ -300,6 +303,7 @@ describe("GraphView", () => {
     useSessionStore.setState({ selectedNodeId: null } as never);
     useExecutionStore.setState({ validationResult: null } as never);
     resetStore(usePreferencesStore);
+    resetStore(useInterpretationEventsStore);
     // OptionRows (rendered inside the node config panel) now reads the
     // catalog store's schema cache; reset it so no test's seeded schema
     // leaks into a later one.
@@ -342,15 +346,74 @@ describe("GraphView", () => {
     const policies = screen.getByText("Failure handling").closest("details");
     expect(policies).toHaveAttribute("open");
     const table = within(policies as HTMLElement).getByRole("table");
+    expect(within(table).getByRole("columnheader", { name: "Node" })).toBeInTheDocument();
     expect(within(table).getByRole("row", { name: /Source: source/ })).toHaveTextContent(
       "Row fails validationDiscard row (audit recorded)",
     );
-    expect(within(table).getByRole("row", { name: /Node: classify/ })).toHaveTextContent(
+    expect(within(table).getByRole("row", { name: /Transform: classify/ })).toHaveTextContent(
       "profile sonnetRow processing failsSend to quarantine",
     );
     expect(within(table).getByRole("row", { name: /Output: results/ })).toHaveTextContent(
       "Row write failsDiscard row (audit recorded)",
     );
+  });
+
+  it("shows all interpretation approvals above failure handling with independent disclosures", async () => {
+    const user = userEvent.setup();
+    const approved: InterpretationEvent = {
+      id: "approval-1", session_id: "session-1", composition_state_id: "state-1",
+      affected_node_id: "classify", tool_call_id: "tool-1", user_term: "category",
+      kind: "vague_term", llm_draft: "initial definitions",
+      accepted_value: "billing, outage, or other", choice: "amended",
+      created_at: "2026-09-20T07:23:00Z", resolved_at: "2026-09-20T07:24:00Z",
+      actor: "user:owner:1", interpretation_source: "user_approved",
+      model_identifier: "model", model_version: "1", provider: "provider",
+      composer_skill_hash: "hash", arguments_hash: "hash", hash_domain_version: "v2",
+      runtime_model_identifier_at_resolve: null, runtime_model_version_at_resolve: null,
+      approved_prompt_artifact_hash: null,
+    };
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode()] }) });
+    useInterpretationEventsStore.setState({
+      resolvedBySession: {
+        "session-1": [
+          approved,
+          {
+            ...approved, id: "prompt-approval", kind: "llm_prompt_template",
+            user_term: "llm_prompt_template:classify",
+            accepted_value: "System prompt:\nClassify carefully.\n\nPrompt template:\nClassify each complaint",
+          },
+          {
+            ...approved, id: "legacy-prompt-approval", kind: "llm_prompt_template",
+            user_term: "llm_prompt_template:summarize", affected_node_id: "summarize",
+            accepted_value: "Summarize each complaint",
+          },
+          { ...approved, id: "opted-out", choice: "opted_out" },
+        ],
+        "other-session": [{ ...approved, id: "other-session" }],
+      },
+    });
+
+    render(<GraphView />);
+    const approvals = screen.getByText("Approvals (3)").closest("details") as HTMLDetailsElement;
+    const failures = screen.getByText("Failure handling").closest("details") as HTMLDetailsElement;
+    expect(approvals.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(approvals.open).toBe(false);
+    expect(failures.open).toBe(true);
+    await user.click(screen.getByText("Approvals (3)"));
+    expect(approvals.open).toBe(true);
+    expect(failures.open).toBe(true);
+    const table = within(approvals).getByRole("table");
+    expect(within(table).getByRole("columnheader", { name: "Approved value" })).toBeInTheDocument();
+    expect(within(table).getByRole("row", { name: /category/ })).toHaveTextContent("billing, outage, or other");
+    expect(within(table).getByRole("row", { name: /System and user prompts for classify/ })).toHaveTextContent("Classify each complaint");
+    expect(within(table).getByRole("row", { name: /User prompt for summarize/ })).toHaveTextContent("Summarize each complaint");
+    expect(within(table).getByRole("columnheader", { name: "Approved at" })).toBeInTheDocument();
+    expect(within(table).getAllByRole("time")).toHaveLength(3);
+    expect(within(table).getAllByRole("time")[0]).toHaveAttribute("datetime", approved.resolved_at);
+    expect(within(table).getAllByRole("row")).toHaveLength(4);
+    await user.click(screen.getByText("Failure handling"));
+    expect(approvals.open).toBe(true);
+    expect(failures.open).toBe(false);
   });
 
   it("renders a pending proposal pill when proposal affects graph", () => {
@@ -1422,6 +1485,56 @@ describe("GraphView", () => {
       ]);
       expect(connectionTexts("results to failed_writes:")).toEqual([
         "results to failed_writes: error (error)",
+      ]);
+    });
+
+    it("keeps named error edges without adding generic error lines to the same sinks", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          nodes: [
+            makeNode({ id: "lookup_category", on_error: "join_failures" }),
+            makeNode({ id: "generate_text", on_error: "llm_failures" }),
+          ],
+          edges: [
+            makeEdge({ from_node: "lookup_category", to_node: "join_failures", edge_type: "on_error", label: "category lookup failures" }),
+            makeEdge({ from_node: "generate_text", to_node: "llm_failures", edge_type: "on_error", label: "chaos LLM failures" }),
+          ],
+          outputs: [
+            { name: "join_failures", plugin: "json", options: {} },
+            { name: "llm_failures", plugin: "json", options: {} },
+          ],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+      expect(edgeElements(container, "lookup_category", "join_failures").map((edge) => edge.textContent)).toEqual(["category lookup failures"]);
+      expect(edgeElements(container, "generate_text", "llm_failures").map((edge) => edge.textContent)).toEqual(["chaos LLM failures"]);
+      expect(connectionTexts("lookup_category to join_failures:")).toEqual([
+        "lookup_category to join_failures: category lookup failures (error)",
+      ]);
+      expect(connectionTexts("generate_text to llm_failures:")).toEqual([
+        "generate_text to llm_failures: chaos LLM failures (error)",
+      ]);
+    });
+
+    it("keeps a named error edge to a transform without adding a generic line", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          nodes: [
+            makeNode({ id: "generate_text", on_error: "recovery_in" }),
+            makeNode({ id: "recover", input: "recovery_in" }),
+          ],
+          edges: [makeEdge({
+            from_node: "generate_text", to_node: "recover",
+            edge_type: "on_error", label: "chaos LLM failures",
+          })],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+      expect(edgeElements(container, "generate_text", "recover").map((edge) => edge.textContent)).toEqual(["chaos LLM failures"]);
+      expect(connectionTexts("generate_text to recover:")).toEqual([
+        "generate_text to recover: chaos LLM failures (error)",
       ]);
     });
 

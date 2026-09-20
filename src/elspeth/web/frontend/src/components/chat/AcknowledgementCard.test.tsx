@@ -630,6 +630,34 @@ describe("AcknowledgementCard — error mapping", () => {
 // Approve button that stays disabled until the prompt has been viewed.
 
 describe("AcknowledgementCard — prompt-template View/Approve controls", () => {
+  it("shows both prompt roles before approval of a single-prompt LLM node", async () => {
+    const user = userEvent.setup();
+    const state: CompositionState = {
+      ...makeCompositionState(7),
+      nodes: [{
+        id: "node-1", node_type: "transform", plugin: "llm",
+        input: "rows", on_success: null, on_error: null,
+        options: {
+          system_prompt: "You are a careful reviewer.",
+          prompt_template: "Summarise {{ row.text }}.",
+        },
+      }],
+    };
+    renderCard(
+      makeEvent({
+        kind: "llm_prompt_template",
+        llm_draft: "System prompt:\nYou are a careful reviewer.\n\nPrompt template:\nSummarise {{ row.text }}.",
+      }),
+      { showAmend: false, compositionState: state },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    expect(region).toHaveTextContent("System prompt");
+    expect(region).toHaveTextContent("You are a careful reviewer.");
+    expect(region).toHaveTextContent("User prompt");
+    expect(region).toHaveTextContent("Summarise {{ row.text }}.");
+  });
+
   it("renders two distinct controls pre-view: an enabled View prompt toggle and a disabled Approve", () => {
     renderCard(
       makeEvent({

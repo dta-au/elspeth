@@ -23,7 +23,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
     action: failureAction(source.on_validation_failure),
   }));
   const nodes = state.nodes.map((node) => ({
-    component: `Node: ${node.id}`,
+    component: `Transform: ${node.id}`,
     model: node.plugin === "llm" ? llmBindingLabel(node.options) : null,
     condition: node.node_type === "coalesce" && node.policy === "require_all"
       ? "Required branch missing"
@@ -44,12 +44,12 @@ function policyRows(state: CompositionState): PolicyRow[] {
 export function GraphFailurePolicies({ state }: { state: CompositionState }): JSX.Element {
   const rows = policyRows(state);
   return (
-    <details className="graph-failure-policies" open>
+    <details className="graph-detail-table" open>
       <summary>Failure handling</summary>
-      <div className="graph-failure-policies-scroll">
+      <div className="graph-detail-table-scroll">
         <table>
           <thead>
-            <tr><th scope="col">Component</th><th scope="col">When</th><th scope="col">Action</th></tr>
+            <tr><th scope="col">Node</th><th scope="col">When</th><th scope="col">Action</th></tr>
           </thead>
           <tbody>
             {rows.map((row) => (

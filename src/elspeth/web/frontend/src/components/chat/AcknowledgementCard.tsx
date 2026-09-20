@@ -517,11 +517,14 @@ export function AcknowledgementCard({
     promptDisplay === null
       ? ""
       : promptDisplay.segments.map((segment) => segment.text).join("");
+  const reviewedDisplayText = promptDisplay?.systemPrompt !== undefined && promptDisplay.systemPrompt !== null
+    ? `System prompt:\n${promptDisplay.systemPrompt}\n\nPrompt template:\n${promptDisplayText}`
+    : promptDisplayText;
   const promptHasPendingSlot =
     promptDisplay !== null &&
     promptDisplay.segments.some((segment) => segment.kind === "pending");
   const showOriginalTemplate =
-    promptDisplay !== null && llmDraft !== "" && promptDisplayText !== llmDraft;
+    promptDisplay !== null && llmDraft !== "" && reviewedDisplayText !== llmDraft;
 
   const promptHasResolvedSlot =
     promptDisplay !== null &&
@@ -615,6 +618,17 @@ export function AcknowledgementCard({
                   </li>
                 )}
               </ul>
+            )}
+            {promptDisplay.systemPrompt !== undefined && (
+              <>
+                {promptDisplay.systemPrompt !== null && (
+                  <>
+                    <p className="ack-card-prompt-role">System prompt</p>
+                    <pre className="ack-card-prompt-pre">{promptDisplay.systemPrompt}</pre>
+                  </>
+                )}
+                <p className="ack-card-prompt-role">User prompt</p>
+              </>
             )}
             <pre className="ack-card-prompt-pre">
               {promptDisplay.segments.map((segment, index) =>

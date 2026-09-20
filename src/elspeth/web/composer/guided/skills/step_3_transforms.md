@@ -94,6 +94,15 @@ surfaces.
 
 ## LLM node field declarations
 
+When proposing an LLM transform, include a task-specific `system_prompt` and
+user `prompt_template` unless the user explicitly asked to omit a system
+prompt. Keep any prompt the user supplied and propose the missing role. The
+system prompt states the role and constraints; the user template passes the
+reviewed upstream fields and requests the intended reply. If the goal does
+not say what the LLM should do or what kind of answer it should produce, ask
+before proposing the LLM node. A list of every row field followed by a request
+for arbitrary text is not a task-specific prompt.
+
 An `llm` node's field contract is explicit and two-way: every `row.*` field its
 `prompt_template` interpolates MUST also appear in
 `options.required_input_fields`, and every declared field must be interpolated

@@ -119,6 +119,12 @@
   font-size: var(--font-size-sm);
 }
 
+.bubble-system--validation {
+  text-align: left;
+  color: var(--color-text);
+  font-style: normal;
+}
+
 .trusted-system-notice {
   margin-top: var(--space-md);
   padding: var(--space-sm) var(--space-md);
@@ -2933,6 +2939,15 @@
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
+}
+
+.ack-card-prompt-role {
+  margin: var(--space-sm) 0 var(--space-xs);
+  font-weight: var(--font-weight-semibold);
+}
+
+.ack-card-prompt-role:first-child {
+  margin-top: 0;
 }
 
 .ack-card-prompt-pre {

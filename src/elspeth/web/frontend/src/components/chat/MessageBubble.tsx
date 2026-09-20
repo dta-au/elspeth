@@ -11,6 +11,10 @@ import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ToolCallCard } from "./ToolCallCard";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
 
+const PENDING_REVIEW_NOTICE =
+  "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue.";
+const RESOLVED_REVIEW_NOTICE = "Review cards from this turn are no longer pending.";
+
 interface MessageBubbleProps {
   message: ChatMessage;
   isComposing?: boolean;
@@ -34,6 +38,8 @@ interface MessageBubbleProps {
    */
   sourcesCreated?: ReadonlyArray<InlineSourceSummary>;
   onEditInlineSource?: (summary: InlineSourceSummary) => void;
+  /** Creation times of current pending cards; absent until review state loads. */
+  pendingReviewCreatedAt?: ReadonlyArray<string>;
 }
 
 export function MessageBubble({
@@ -46,19 +52,28 @@ export function MessageBubble({
   staleProposalIds = [],
   sourcesCreated,
   onEditInlineSource,
+  pendingReviewCreatedAt,
 }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
   const [toolsExpanded, setToolsExpanded] = useState(false);
   const hasToolCalls = !!(message.tool_calls && message.tool_calls.length > 0);
   const hasSourcesCreated = !!(sourcesCreated && sourcesCreated.length > 0);
-  const visibleSegments = useMemo(
-    () =>
-      message.segments ?? [
+  const visibleSegments = useMemo(() => {
+    const segments = message.segments ?? [
         { kind: "text" as const, content: message.content },
-      ],
-    [message.content, message.segments],
-  );
+      ];
+    if (pendingReviewCreatedAt === undefined) return segments;
+    const handoffAt = Date.parse(message.created_at);
+    if (Number.isNaN(handoffAt) || pendingReviewCreatedAt.some((createdAt) => Date.parse(createdAt) <= handoffAt)) {
+      return segments;
+    }
+    return segments.map((segment) =>
+      segment.kind === "trusted_system_notice" && segment.content === PENDING_REVIEW_NOTICE
+        ? { ...segment, content: RESOLVED_REVIEW_NOTICE }
+        : segment,
+    );
+  }, [message.content, message.created_at, message.segments, pendingReviewCreatedAt]);
   const [copied, setCopied] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
@@ -120,15 +135,16 @@ export function MessageBubble({
   // legibility). An sr-only label, read first, supplies it. (elspeth-f700d8d8a5)
   const authorLabel = isUser ? "You said:" : isSystem ? "System note:" : "ELSPETH said:";
 
-  // System messages: centre-aligned full-width banner, muted colour,
-  // italic text. Used for audit markers like "Pipeline reverted to version N."
+  // Short audit markers remain centred and italic. The current validation
+  // message can contain long error explanations, so it reads as a left-aligned
+  // notice instead.
   if (isSystem) {
     return (
       <div
         className="message-bubble message-bubble--system message-row message-row--system"
       >
         <div
-          className="bubble bubble-system"
+          className={`bubble bubble-system${message.id === "system-validation-current" ? " bubble-system--validation" : ""}`}
           role="status"
         >
           <span className="sr-only">{authorLabel}</span>
