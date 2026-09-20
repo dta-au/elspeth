@@ -23,7 +23,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
     action: failureAction(source.on_validation_failure),
   }));
   const nodes = state.nodes.map((node) => ({
-    component: `Node: ${node.id}`,
+    component: `Transform: ${node.id}`,
     model: node.plugin === "llm" ? llmBindingLabel(node.options) : null,
     condition: node.node_type === "coalesce" && node.policy === "require_all"
       ? "Required branch missing"

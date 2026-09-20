@@ -5,7 +5,7 @@ const APPROVAL_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
   timeStyle: "short",
 });
 
-export function GraphAssumptionApprovals({
+export function GraphApprovals({
   events,
 }: {
   events: ReadonlyArray<InterpretationEvent>;
@@ -14,20 +14,20 @@ export function GraphAssumptionApprovals({
 
   return (
     <details className="graph-detail-table">
-      <summary>Assumption approvals ({events.length})</summary>
+      <summary>Approvals ({events.length})</summary>
       <div className="graph-detail-table-scroll">
         <table>
           <thead>
             <tr>
               <th scope="col">Name</th>
-              <th scope="col">Assumption</th>
+              <th scope="col">Approved value</th>
               <th scope="col">Approved at</th>
             </tr>
           </thead>
           <tbody>
             {events.map((event) => {
               if (event.user_term === null || event.accepted_value === null || event.resolved_at === null) {
-                throw new Error("approved interpretation is missing its name, assumption, or approval time");
+                throw new Error("approved interpretation is missing its name, value, or approval time");
               }
               const approvedAt = new Date(event.resolved_at);
               const dateLabel = Number.isNaN(approvedAt.getTime())
@@ -40,7 +40,7 @@ export function GraphAssumptionApprovals({
                       ? `Prompt for ${event.affected_node_id}`
                       : event.user_term}
                   </th>
-                  <td className="graph-assumption-approvals-value">{event.accepted_value}</td>
+                  <td className="graph-approvals-value">{event.accepted_value}</td>
                   <td><time dateTime={event.resolved_at}>{dateLabel}</time></td>
                 </tr>
               );

@@ -350,7 +350,7 @@ describe("GraphView", () => {
     expect(within(table).getByRole("row", { name: /Source: source/ })).toHaveTextContent(
       "Row fails validationDiscard row (audit recorded)",
     );
-    expect(within(table).getByRole("row", { name: /Node: classify/ })).toHaveTextContent(
+    expect(within(table).getByRole("row", { name: /Transform: classify/ })).toHaveTextContent(
       "profile sonnetRow processing failsSend to quarantine",
     );
     expect(within(table).getByRole("row", { name: /Output: results/ })).toHaveTextContent(
@@ -358,7 +358,7 @@ describe("GraphView", () => {
     );
   });
 
-  it("shows approved assumption history above failure handling with independent disclosures", async () => {
+  it("shows all interpretation approvals above failure handling with independent disclosures", async () => {
     const user = userEvent.setup();
     const approved: InterpretationEvent = {
       id: "approval-1", session_id: "session-1", composition_state_id: "state-1",
@@ -388,15 +388,16 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const assumptions = screen.getByText("Assumption approvals (2)").closest("details") as HTMLDetailsElement;
+    const approvals = screen.getByText("Approvals (2)").closest("details") as HTMLDetailsElement;
     const failures = screen.getByText("Failure handling").closest("details") as HTMLDetailsElement;
-    expect(assumptions.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(assumptions.open).toBe(false);
+    expect(approvals.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(approvals.open).toBe(false);
     expect(failures.open).toBe(true);
-    await user.click(screen.getByText("Assumption approvals (2)"));
-    expect(assumptions.open).toBe(true);
+    await user.click(screen.getByText("Approvals (2)"));
+    expect(approvals.open).toBe(true);
     expect(failures.open).toBe(true);
-    const table = within(assumptions).getByRole("table");
+    const table = within(approvals).getByRole("table");
+    expect(within(table).getByRole("columnheader", { name: "Approved value" })).toBeInTheDocument();
     expect(within(table).getByRole("row", { name: /category/ })).toHaveTextContent("billing, outage, or other");
     expect(within(table).getByRole("row", { name: /Prompt for classify/ })).toHaveTextContent("Classify each complaint");
     expect(within(table).getByRole("columnheader", { name: "Approved at" })).toBeInTheDocument();
@@ -404,7 +405,7 @@ describe("GraphView", () => {
     expect(within(table).getAllByRole("time")[0]).toHaveAttribute("datetime", approved.resolved_at);
     expect(within(table).getAllByRole("row")).toHaveLength(3);
     await user.click(screen.getByText("Failure handling"));
-    expect(assumptions.open).toBe(true);
+    expect(approvals.open).toBe(true);
     expect(failures.open).toBe(false);
   });
 
