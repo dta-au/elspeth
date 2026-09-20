@@ -766,20 +766,37 @@ class TestTokenIdentityProperties:
             orchestrator = Orchestrator(db)
             run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
 
-            # Verify row_ids exist and are consistent
+            # Compare the persisted tokens with the independently recorded source rows.
             with db.connection() as conn:
-                # Get distinct row_ids from tokens
-                row_ids = conn.execute(
-                    text("""
-                        SELECT DISTINCT r.row_id
+                source_row_ids = set(
+                    conn.execute(
+                        text("""
+                        SELECT r.row_id
                         FROM rows r
                         WHERE r.run_id = :run_id
                     """),
-                    {"run_id": run.run_id},
-                ).fetchall()
+                        {"run_id": run.run_id},
+                    ).scalars()
+                )
+                # Scope by token ownership so an invalid row reference cannot
+                # disappear through an inner join to the source rows.
+                token_row_ids = (
+                    conn.execute(
+                        text("""
+                        SELECT t.row_id
+                        FROM tokens t
+                        WHERE t.run_id = :run_id
+                    """),
+                        {"run_id": run.run_id},
+                    )
+                    .scalars()
+                    .all()
+                )
 
-            # Should have exactly num_rows distinct row_ids
-            assert len(row_ids) == num_rows, f"Expected {num_rows} distinct row_ids, got {len(row_ids)}"
+            assert len(source_row_ids) == num_rows
+            # This linear pipeline creates exactly one token per source row.
+            assert len(token_row_ids) == num_rows, f"Expected {num_rows} tokens, got {len(token_row_ids)}"
+            assert set(token_row_ids) == source_row_ids, "Token row_ids differ from source row_ids after transforms"
 
 
 # =============================================================================

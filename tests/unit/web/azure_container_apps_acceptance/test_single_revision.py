@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import threading
+from functools import partial
+from itertools import count
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,7 +16,12 @@ from pydantic import ValidationError
 import elspeth.web.azure_container_apps_single_revision as single_revision
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.http_client import AcceptanceCredentials
-from elspeth.web._acceptance_common.replica_probes import SESSION_OPERATION_CONFLICT_DETAIL, EvidenceObserver, MembershipRow
+from elspeth.web._acceptance_common.replica_probes import (
+    SESSION_OPERATION_CONFLICT_DETAIL,
+    EvidenceObserver,
+    MembershipRow,
+    ReplicaProbeDriver,
+)
 from elspeth.web._azure_container_apps_acceptance.receipt_contracts import ReplicaBinding, extract_exec_receipt
 from elspeth.web.azure_container_apps_single_revision import AffinityClient, SingleTopology, discover_pair, main, run_fence_trials
 
@@ -239,6 +246,12 @@ def test_cli_emits_distinct_single_receipt_and_topology_after_real_cookie_reques
     routing = Routing()
     monkeypatch.setattr(AffinityClient, "from_env", lambda env: routing.factory())
     monkeypatch.setattr(single_revision, "_observer", lambda env: routing.observer)
+    dispatch_ticks = count()
+    monkeypatch.setattr(
+        single_revision,
+        "ReplicaProbeDriver",
+        partial(ReplicaProbeDriver, clock=lambda: next(dispatch_ticks) / 1000.0),
+    )
     app = tmp_path / "app.json"
     app.write_text(json.dumps(app_document()))
     app.chmod(0o600)

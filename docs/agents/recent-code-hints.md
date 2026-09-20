@@ -228,7 +228,7 @@ the same commit; the rules live there, the history lives here.
   skip assertions (int, `None`, nested mapping, absent key) to the named test, which rotated the
   fingerprint. Same both-arms rule as the frozen-input pins in W2 brief item 15, applied to
   boundary metadata.
-  See [CONTRIBUTING: Why a green scoped run proves nothing](../../CONTRIBUTING.md#why-a-green-scoped-run-proves-nothing).
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates).
 
 - **2026-08-29 — tier_model R5 carries a HARD-CODED per-file exemption map in the rule (`_R5_NAMED_BOUNDARY_CONTEXTS`), so "the identical `isinstance` chain fires in my file but not in that one" is not evidence of a reproducible structural exemption** (elspeth-0bd4fb6042)
   Measured in B61 on `web/sessions/_auto_title.py`, whose `_auto_title_exception_class` runs four
@@ -1713,7 +1713,7 @@ the same commit; the rules live there, the history lives here.
   7. A rebuild-and-compare check passes hardest when it did nothing. Twice in one lane `git add` failed silently on an index lock, so the index still equalled HEAD, the generated patch was 0 bytes, and `cmp` printed MATCH. Such a procedure must assert its own preconditions before comparing: the patch must be non-empty, and the index must differ from HEAD. Re-verify against the CURRENT HEAD too — HEAD can move while you wait on a lock.
   8. Removing a value can blind a nearby assertion while the test stays green. A guided fixture carried `{"tier": "'high'"}` in the predecessor and `{"tier": "'priority'"}` in the replanned candidate; repairing the incoherent pair out of both sides left the two mappings identical, so the re-keyed `mapping == {"amount": "amount"}` passed whether the binder carried the replan through or restored the predecessor wholesale. When a repair removes a value, check whether that value was the only thing making a nearby assertion discriminate; prefer the whole-object assertion (fixed at `b06c5f6dc`; the vacuous form shipped in `fe8b0cc4c`).
   The unifying rule: confirmations are where this happens, because the search is for agreement rather than for a result. Prefer stating "not traced" over a green that cannot be accounted for.
-  See [CONTRIBUTING: Why a green scoped run proves nothing](../../CONTRIBUTING.md#why-a-green-scoped-run-proves-nothing).
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates).
 
 - **2026-08-26 — editing any plugin source file moves frozen corpus bytes; a whole-tree trap with no local symptom** (elspeth-e6e552ce34)
   Every plugin declares a `source_file_hash` line, the node audit record carries that byte, and `docs/architecture/dag/scenario-corpus/v1/manifest.yaml` pins the audit records LITERALLY. A one-line edit under `src/elspeth/plugins/` — even a pure declaration such as adding a class attribute — bumps its hash and turns the DAG scenario corpus red, with nothing in the plugin's own suite to warn. elspeth-e6e552ce34 cost 32 reds in `tests/integration/core/dag` this way (csv_source + passthrough).
@@ -1927,7 +1927,7 @@ the same commit; the rules live there, the history lives here.
   Two ways a whole-tree measurement lies.
   1. `pytest tests/` takes ~18 minutes; four sibling commits landed inside one such window on 2026-08-17 and the run reported 456 failures across engine/pipeline/e2e that did not exist before or after (a representative slice re-run immediately after: 22 passed). Record `git rev-parse HEAD` BEFORE and AFTER a long run; if they differ, a red result is uninterpretable — re-run rather than diagnose.
   2. Running the A/B side in a `git worktree` silently changes what is collected: `evals/*` is git-ignored except for tracked re-includes, so a fresh worktree has no `evals/composer-rgr`, `composer-harness`, and every suite that GLOBS those assets collects fewer tests there (measured: `test_convergence_scenarios.py` 11 vs 32, `test_paths.py` 22 vs 40, `test_execution_repository.py` 148 vs 161). A worktree test-count delta is therefore NOT attributable to the change under test. To attribute a count honestly, diff per-file collected counts (`pytest --collect-only -q | sed 's/::.*//' | uniq -c`) between the two trees and read the per-file rows, not the total. Worktree e2e recovery tests also fail on capture-root binding, so a worktree pass/fail is its own instrument.
-  See [CONTRIBUTING: Why a green scoped run proves nothing](../../CONTRIBUTING.md#why-a-green-scoped-run-proves-nothing).
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates).
 
 - **2026-08-17 — a directory-scoped test `conftest.py` that mutates `sys.path` is PROCESS-GLOBAL, not directory-scoped**
   `tests/unit/evals/composer_battery/

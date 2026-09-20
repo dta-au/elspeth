@@ -100,17 +100,27 @@ working around it.
 - **STOP — read [CONTRIBUTING.md § Whole-tree gates](CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit)
   BEFORE writing code. This is not optional.** Whole-tree AST gates pin the
   EXACT set of dynamic-attribute sites, masquerade sites (tests included),
-  wire-shape templates, and output bytes; a locally green scoped run proves
-  nothing about them, and one careless `getattr` turns the branch red for
+  wire-shape templates, and output bytes; a locally green scoped run does not
+  cover them, and one careless `getattr` turns the branch red for
   every sibling (this has happened — 7201beeb7). Dated incident log:
   [docs/agents/recent-code-hints.md](docs/agents/recent-code-hints.md).
-- Scoped test runs miss cross-cutting gates — run the full `pytest tests/`
-  before merging. `addopts` carries `-n 12`, so the bare command IS the
-  parallel run: serial it is ~17 hours against 44,399 tests, which is why the
-  default is parallel rather than a flag you have to remember. Pass `-n 0` for
-  a single test or a debugger (`pdb` and `-s` do not work through xdist), and
-  note that xdist auto-disables `pytest-benchmark` — the `performance` marker
-  is deselected by default anyway.
+- Choose tests by the reach of the change. Run affected tests and every
+  whole-tree gate whose scanned inputs could change. Run the full
+  `pytest tests/` before merging changes whose effects cannot be bounded by
+  those checks, such as shared runtime behavior, contracts, schemas, plugin
+  registration, graph construction, or test/scan infrastructure. An isolated
+  test, fixture, documentation, or frontend change does not automatically
+  require the Python full suite. If the full suite already passed on the same
+  production tree, verify a subsequent isolated test repair with its focused
+  tests and relevant negative controls; do not rerun the full suite merely to
+  turn a diagnosed unrelated flaky failure green. State the scope and limits
+  of the checks you ran. `addopts` carries `-n 12`; pass `-n 0` for a single
+  test or debugger. Xdist disables `pytest-benchmark`, and the `performance`
+  marker is deselected by default.
+- Before starting a full suite on a shared host, establish who owns the test
+  capacity, check for active suites and host load, and run only one broad suite
+  at a time. Use 12 workers only when capacity permits; lower the count when
+  it does not. Do not launch parallel full suites from separate agent sessions.
 - The default selection also deselects the `testcontainer` marker, so a green
   `pytest tests/` says NOTHING about PostgreSQL. Two 0.8.0 defects passed it:
   a one-element `IN` CHECK that PostgreSQL reflects as `=` (elspeth-d0e62aea41)
