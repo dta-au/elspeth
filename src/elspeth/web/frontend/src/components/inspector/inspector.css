@@ -399,6 +399,15 @@
   font-weight: normal;
 }
 
+.graph-detail-table code {
+  background-color: var(--color-surface-elevated);
+  padding: var(--space-2xs) var(--space-xs);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  overflow-wrap: anywhere;
+}
+
 /* The role="img" scope: contains ONLY the React Flow diagram. The live
    pending pill and the interactive Controls/MiniMap sit outside it so
    role="img"'s children-presentational semantics cannot swallow them. */

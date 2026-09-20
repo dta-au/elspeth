@@ -1,14 +1,18 @@
+import { Fragment, type ReactNode } from "react";
 import type { CompositionState, NodeSpec, NodeType } from "@/types";
 import { FORK_CONNECTION, publishedSuccessConnection } from "@/lib/graphTopology";
 import { llmBindingLabel } from "@/lib/llmBindingLabel";
 import { sortedSourceEntries } from "@/utils/compositionState";
+import { buildConnectionIndex } from "@/components/workspace/specRouting";
 
 interface PolicyRow {
-  component: string;
+  kind: string;
+  name: string;
+  plugin?: string;
   model: string | null;
-  success: string[];
+  success: ReactNode[];
   condition: string;
-  action: string;
+  action: ReactNode;
 }
 
 const NODE_LABELS: Record<NodeType, string> = {
@@ -21,57 +25,78 @@ const NODE_LABELS: Record<NodeType, string> = {
   collector: "Collector",
 };
 
-function successAction(route: string | null | undefined): string {
+type DestinationName = (route: string, fromNode?: string) => ReactNode;
+
+function successAction(route: string | null | undefined, destinationName: DestinationName, fromNode?: string): ReactNode {
   if (route === "discard") return "Discard row (audit recorded)";
-  if (route) return `Send to ${route}`;
+  if (route) return <>Send to {destinationName(route, fromNode)}</>;
   return "No success route set";
 }
 
-function nodeSuccessActions(node: NodeSpec): string[] {
+function nodeSuccessActions(node: NodeSpec, destinationName: DestinationName): ReactNode[] {
   if (node.node_type === "gate" && node.routes && Object.keys(node.routes).length > 0) {
     return Object.entries(node.routes).map(([name, route]) => {
       const action = route === FORK_CONNECTION
         ? node.fork_to?.length
-          ? `Fork to ${node.fork_to.join(", ")}`
+          ? <>Fork to {node.fork_to.map((branch, index) => (
+            <Fragment key={branch}>{index > 0 && ", "}{destinationName(branch, node.id)}</Fragment>
+          ))}</>
           : "No fork destinations set"
-        : successAction(route);
-      return `${name}: ${action}`;
+        : successAction(route, destinationName, node.id);
+      return <Fragment key={name}>{name}: {action}</Fragment>;
     });
   }
-  return [successAction(publishedSuccessConnection(node))];
+  return [successAction(publishedSuccessConnection(node), destinationName, node.id)];
 }
 
-function failureAction(route: string | null | undefined): string {
+function failureAction(route: string | null | undefined, destinationName: DestinationName, fromNode?: string): ReactNode {
   if (route === "discard") return "Discard row (audit recorded)";
-  if (route) return `Send to ${route}`;
+  if (route) return <>Send to {destinationName(route, fromNode)}</>;
   return "No failure route set";
 }
 
 function policyRows(state: CompositionState): PolicyRow[] {
+  const { consumers } = buildConnectionIndex(state);
+  const queueIds = new Set(state.nodes.filter((node) => node.node_type === "queue").map((node) => node.id));
+  const destinationName: DestinationName = (route, fromNode) => {
+    // Queue input and output share a connection name: upstream rows enter the
+    // queue first; the queue itself forwards to the other consumers.
+    if (queueIds.has(route) && route !== fromNode) return <code>{route}</code>;
+    const destinations = consumers.get(route)?.filter((id) => id !== fromNode);
+    return destinations?.length
+      ? destinations.map((name, index) => (
+        <Fragment key={name}>{index > 0 && ", "}<code>{name}</code></Fragment>
+      ))
+      : <><code>{route}</code> (not connected)</>;
+  };
   const sources = sortedSourceEntries(state).map(([name, source]) => ({
-    component: `Source: ${name}`,
+    kind: "Source",
+    name,
     model: source.plugin === "llm" ? llmBindingLabel(source.options) : null,
-    success: [successAction(source.on_success)],
+    success: [successAction(source.on_success, destinationName)],
     condition: "Row fails validation",
-    action: failureAction(source.on_validation_failure),
+    action: failureAction(source.on_validation_failure, destinationName),
   }));
   const nodes = state.nodes.map((node) => ({
-    component: `${NODE_LABELS[node.node_type]}: ${node.id}`,
+    kind: NODE_LABELS[node.node_type],
+    name: node.id,
     model: node.plugin === "llm" ? llmBindingLabel(node.options) : null,
-    success: nodeSuccessActions(node),
+    success: nodeSuccessActions(node, destinationName),
     condition: node.node_type === "coalesce" && node.policy === "require_all"
       ? "Required branch missing"
       : "Row processing fails",
     action: node.node_type === "coalesce" && node.policy === "require_all"
       ? "No combined row (failure recorded)"
-      : failureAction(node.on_error),
+      : failureAction(node.on_error, destinationName, node.id),
   }));
   const outputs = state.outputs.map((output) => ({
-    component: `Output: ${output.name} (${output.plugin})`,
+    kind: "Output",
+    name: output.name,
+    plugin: output.plugin,
     model: null,
-    success: ["Row saved"],
+    success: ["Row sunk"],
     condition: "Row write fails",
-    action: failureAction(output.on_write_failure),
+    action: failureAction(output.on_write_failure, destinationName, output.name),
   }));
   return [...sources, ...nodes, ...outputs];
 }
@@ -88,12 +113,12 @@ export function GraphOutputs({ state }: { state: CompositionState }): JSX.Elemen
           </thead>
           <tbody>
             {rows.map((row) => (
-              <tr key={row.component}>
+              <tr key={`${row.kind}:${row.name}`}>
                 <th scope="row">
-                  {row.component}
+                  {row.kind}: <code>{row.name}</code>{row.plugin && ` (${row.plugin})`}
                   {row.model && <span className="graph-output-detail">{row.model}</span>}
                 </th>
-                <td>{row.success.map((action) => <div key={action}>{action}</div>)}</td>
+                <td>{row.success.map((action, index) => <div key={index}>{action}</div>)}</td>
                 <td>
                   <span className="graph-output-detail">{row.condition}</span>
                   {row.action}

@@ -321,7 +321,7 @@ describe("GraphView", () => {
     // The badge renders node.node_type
     expect(screen.getByText("transform")).toBeInTheDocument();
     // The node ID as display name
-    expect(screen.getByText("classify")).toBeInTheDocument();
+    expect(within(screen.getByTestId("node-classify")).getByText("classify")).toBeInTheDocument();
     // The plugin name
     expect(screen.getByText("llm_transform")).toBeInTheDocument();
   });
@@ -331,11 +331,11 @@ describe("GraphView", () => {
       compositionState: makeState({
         sources: {
           source: {
-            plugin: "csv", options: {}, on_success: "classify", on_validation_failure: "discard",
+            plugin: "csv", options: {}, on_success: "rows", on_validation_failure: "discard",
           },
         },
         nodes: [makeNode({
-          id: "classify", plugin: "llm", options: { profile: "sonnet" },
+          id: "classify", input: "rows", plugin: "llm", options: { profile: "sonnet" },
           on_error: "quarantine", on_success: "results",
         })],
         outputs: [{ name: "results", plugin: "csv", options: {}, on_write_failure: "discard" }],
@@ -353,10 +353,10 @@ describe("GraphView", () => {
       "Send to classifyRow fails validationDiscard row (audit recorded)",
     );
     expect(within(table).getByRole("row", { name: /Transform: classify/ })).toHaveTextContent(
-      "profile sonnetSend to resultsRow processing failsSend to quarantine",
+      "profile sonnetSend to resultsRow processing failsSend to quarantine (not connected)",
     );
     expect(within(table).getByRole("row", { name: /Output: results/ })).toHaveTextContent(
-      "Row savedRow write failsDiscard row (audit recorded)",
+      "Row sunkRow write failsDiscard row (audit recorded)",
     );
   });
 
