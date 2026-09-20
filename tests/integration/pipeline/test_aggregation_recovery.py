@@ -66,6 +66,7 @@ from elspeth.core.landscape.schema import (
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import _TestSchema, _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
 from tests.fixtures.landscape import age_barrier_hold, leader_coordination_token, leader_token_for, make_factory, member_token_for
@@ -1446,7 +1447,7 @@ class TestAggregationRecoveryIntegration:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1463,7 +1464,7 @@ class TestAggregationRecoveryIntegration:
                     source_name="source",
                     plugin_name="test_source",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json="{}",
                     schema_contract_json=audit_record.to_json(),
                     schema_contract_hash=contract.version_hash(),
@@ -1481,7 +1482,7 @@ class TestAggregationRecoveryIntegration:
                     node_type=NodeType.AGGREGATION,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1498,7 +1499,7 @@ class TestAggregationRecoveryIntegration:
                             node_type=node_type,
                             plugin_version="1.0",
                             determinism=Determinism.DETERMINISTIC,
-                            config_hash="test",
+                            config_hash=fake_sha256("test"),
                             config_json="{}",
                             registered_at=now,
                         )

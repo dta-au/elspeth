@@ -37,6 +37,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     claim_test_work_item,
     leader_coordination_token,
@@ -428,7 +429,7 @@ class TestSchemaContractRoundTripProperties:
             source_node_id=source.node_id,
             source_name="primary",
             plugin_name="test",
-            config_hash="confighash",
+            config_hash=fake_sha256("confighash"),
             lifecycle_state="loading",
             source_schema_json='{"mode": "observed"}',
             coordination_token=leader_coordination_token(factory, run_id),

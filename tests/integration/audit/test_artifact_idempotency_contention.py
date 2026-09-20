@@ -12,6 +12,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, member_token_for
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -44,7 +45,7 @@ def _register_contending_artifact(
                 sink_node_id="sink-artifact-contention",
                 artifact_type="csv",
                 path="/output/contention.csv",
-                content_hash="sha256:contention",
+                content_hash=fake_sha256("sha256:contention"),
                 size_bytes=128,
                 artifact_id=proposed_artifact_id,
                 idempotency_key="run-artifact-contention:row-artifact-contention:csv_sink",

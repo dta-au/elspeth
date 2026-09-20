@@ -47,6 +47,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
+from tests.fixtures.audit_hashing import fake_error_hash
 from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, make_factory, make_landscape_db
 from tests.strategies.ids import multiple_branches
 from tests.strategies.json import row_data
@@ -480,7 +481,7 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
             ref=TokenRef(token_id=token_id, run_id=self.run.run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="test_error_hash",
+            error_hash=fake_error_hash("test_error_hash"),
         )
 
         # Update model state
@@ -867,7 +868,7 @@ class TestTokenLifecycleInvariants:
                     ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.QUARANTINED_AT_SOURCE,
-                    error_hash="test_error_hash",
+                    error_hash=fake_error_hash("test_error_hash"),
                 )
             assert isinstance(exc_info.value.__cause__, IntegrityError)
 

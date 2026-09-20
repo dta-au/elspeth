@@ -22,7 +22,7 @@ from elspeth.core.landscape.run_coordination_repository import fenced_leader_tra
 from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
-_ERROR_HASH = "abcd1234" * 8
+_ERROR_HASH = "abcd1234" * 2
 
 
 def _build_base_run(factory: RecorderFactory) -> tuple[str, str, str]:

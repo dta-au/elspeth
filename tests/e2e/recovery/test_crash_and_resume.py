@@ -65,6 +65,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import (
     _TestSinkBase,
     _TestSourceBase,
@@ -220,7 +221,7 @@ class _ResumeSink(_TestSinkBase):
 
     def write(self, rows: Any, ctx: Any) -> SinkWriteResult:
         _ResumeSink.results.extend(rows)
-        return SinkWriteResult(artifact=ArtifactDescriptor.for_file(path="memory", size_bytes=0, content_hash="abc"))
+        return SinkWriteResult(artifact=ArtifactDescriptor.for_file(path="memory", size_bytes=0, content_hash=fake_sha256("abc")))
 
     def close(self) -> None:
         pass
@@ -838,7 +839,7 @@ class TestResumeIdempotence:
             source_node_id="source",
             source_name="source",
             plugin_name="list_source",
-            config_hash="crash-and-resume",
+            config_hash=fake_sha256("crash-and-resume"),
             lifecycle_state="loaded",
             coordination_token=leader_coordination_token(factory, run_id),
             source_schema_json=json.dumps(
@@ -1185,7 +1186,7 @@ class TestCheckpointRecovery:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="sha256-rfc8785-v1",
                     status=RunStatus.FAILED,
@@ -1207,7 +1208,7 @@ class TestCheckpointRecovery:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1220,7 +1221,7 @@ class TestCheckpointRecovery:
                     source_name="source",
                     plugin_name="test_source",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=contract_json,
                     schema_contract_hash=contract_hash,
@@ -1237,7 +1238,7 @@ class TestCheckpointRecovery:
                     node_type=NodeType.TRANSFORM,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1255,7 +1256,7 @@ class TestCheckpointRecovery:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"hash-{i}",
+                        source_data_hash=fake_sha256(f"hash-{i}"),
                         created_at=now,
                     )
                 )
@@ -1327,7 +1328,7 @@ class TestCheckpointRecovery:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="sha256-rfc8785-v1",
                     status=RunStatus.FAILED,
@@ -1349,7 +1350,7 @@ class TestCheckpointRecovery:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1362,7 +1363,7 @@ class TestCheckpointRecovery:
                     source_name="source",
                     plugin_name="test_source",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=contract_json,
                     schema_contract_hash=contract_hash,
@@ -1379,7 +1380,7 @@ class TestCheckpointRecovery:
                     node_type=NodeType.TRANSFORM,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1393,7 +1394,7 @@ class TestCheckpointRecovery:
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="hash-0",
+                    source_data_hash=fake_sha256("hash-0"),
                     created_at=now,
                 )
             )
@@ -1547,7 +1548,7 @@ class TestAggregationRecovery:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1560,7 +1561,7 @@ class TestAggregationRecovery:
                     node_type=NodeType.AGGREGATION,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1575,7 +1576,7 @@ class TestAggregationRecovery:
             source_node_id="source",
             source_name="source",
             plugin_name="test_source",
-            config_hash="test",
+            config_hash=fake_sha256("test"),
             lifecycle_state="loaded",
             source_schema_json='{"properties": {"test_field": {"type": "string"}}, "required": ["test_field"]}',
             schema_contract=test_contract,

@@ -52,6 +52,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.integration.engine import _scheduler_contention_worker as worker
 
@@ -132,7 +133,7 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
                         node_type=node_type.value,
                         plugin_version="1.0",
                         determinism="deterministic",
-                        config_hash="config",
+                        config_hash=fake_sha256("config"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -153,7 +154,7 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
                         row_index=ingest_sequence,
                         source_row_index=ingest_sequence,
                         ingest_sequence=ingest_sequence,
-                        source_data_hash=f"hash-{row_id}",
+                        source_data_hash=fake_sha256(f"hash-{row_id}"),
                         created_at=now,
                     )
                 )

@@ -19,6 +19,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import edges_table
 from elspeth.core.payload_store import FilesystemPayloadStore
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -77,7 +78,7 @@ class TestResumeEdgeIDs:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -92,7 +93,7 @@ class TestResumeEdgeIDs:
                     node_type=NodeType.GATE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -108,7 +109,7 @@ class TestResumeEdgeIDs:
                         node_type=NodeType.SINK,
                         plugin_version="1.0",
                         determinism=Determinism.IO_WRITE,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )

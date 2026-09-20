@@ -24,6 +24,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import as_sink, as_source
 from tests.fixtures.landscape import expire_leader_seat
 from tests.fixtures.pipeline import build_production_graph
@@ -69,7 +70,7 @@ def _make_resume_point(run_id: str) -> ResumePoint:
         run_id=run_id,
         sequence_number=0,
         created_at=datetime.now(UTC),
-        upstream_topology_hash="topology-hash",
+        upstream_topology_hash=fake_sha256("topology-hash"),
         format_version=Checkpoint.CURRENT_FORMAT_VERSION,
     )
     return ResumePoint(
@@ -159,7 +160,7 @@ def _create_failed_run(
                     plugin_version=plugin.plugin_version,
                     determinism=plugin.determinism,
                     source_file_hash=plugin.source_file_hash,
-                    config_hash="resume-guardrails",
+                    config_hash=fake_sha256("resume-guardrails"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -176,7 +177,7 @@ def _create_failed_run(
                     source_name="primary",
                     plugin_name="list_source",
                     lifecycle_state="loaded",
-                    config_hash="resume-guardrails",
+                    config_hash=fake_sha256("resume-guardrails"),
                     schema_json=json.dumps(_ResumeSourceSchema.model_json_schema()),
                     schema_contract_json=audit_record.to_json(),
                     schema_contract_hash=contract.version_hash(),

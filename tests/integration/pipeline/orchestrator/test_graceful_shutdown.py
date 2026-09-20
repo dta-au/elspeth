@@ -29,6 +29,7 @@ from elspeth.core.dag.models import GraphValidationError
 from elspeth.engine.orchestrator import PipelineConfig, prepare_for_run
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import (
     _TestSchema,
     _TestSourceBase,
@@ -1156,7 +1157,7 @@ class TestInterruptAndResume:
                 insert(runs_table).values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.FAILED,
@@ -1184,7 +1185,7 @@ class TestInterruptAndResume:
                         plugin_version=plugin.plugin_version,
                         determinism=plugin.determinism,
                         source_file_hash=plugin.source_file_hash,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -1201,7 +1202,7 @@ class TestInterruptAndResume:
                     source_name="primary",
                     plugin_name="list_source",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=schema_contract_json,
                     schema_contract_hash=schema_contract_hash,
@@ -1237,7 +1238,7 @@ class TestInterruptAndResume:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"h{i}",
+                        source_data_hash=fake_sha256(f"h{i}"),
                         source_data_ref=ref,
                         created_at=now,
                     )

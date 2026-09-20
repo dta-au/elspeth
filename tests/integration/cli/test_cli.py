@@ -10,6 +10,8 @@ import yaml
 from sqlalchemy import insert
 from typer.testing import CliRunner
 
+from tests.fixtures.audit_hashing import fake_sha256
+
 # Note: In Click 8.0+, mix_stderr is no longer a CliRunner parameter.
 # Stderr output is combined with stdout by default when using CliRunner.invoke()
 runner = CliRunner()
@@ -724,7 +726,7 @@ class TestJoinCommand:
 
         run_id = "run-terminal-001"
         settings_path = _make_minimal_settings(tmp_path)
-        _seed_running_run(tmp_path, run_id=run_id, config_hash="any", status="completed", live_leader=False)
+        _seed_running_run(tmp_path, run_id=run_id, config_hash=fake_sha256("any"), status="completed", live_leader=False)
 
         result = runner.invoke(
             app,
@@ -743,7 +745,7 @@ class TestJoinCommand:
         settings_path = _make_minimal_settings(tmp_path)
 
         # Seed with a deliberately wrong config_hash so the admission check refuses.
-        _seed_running_run(tmp_path, run_id=run_id, config_hash="totally-wrong-hash", live_leader=True)
+        _seed_running_run(tmp_path, run_id=run_id, config_hash=fake_sha256("totally-wrong-hash"), live_leader=True)
 
         result = runner.invoke(
             app,
@@ -1033,7 +1035,7 @@ class TestJoinCommand:
 
         run_id = "run-json-banner-005"
         settings_path = _make_minimal_settings(tmp_path)
-        _seed_running_run(tmp_path, run_id=run_id, config_hash="any", live_leader=False)
+        _seed_running_run(tmp_path, run_id=run_id, config_hash=fake_sha256("any"), live_leader=False)
 
         banner = "Using database from settings.yaml"
 

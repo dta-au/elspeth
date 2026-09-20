@@ -22,6 +22,7 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.executors import SinkExecutor
 from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.sinks.csv_sink import CSVSink
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import create_observed_contract
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import leader_coordination_token, make_factory
@@ -49,7 +50,7 @@ class TestSinkDurability:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -64,7 +65,7 @@ class TestSinkDurability:
                     node_type=NodeType.SINK,
                     plugin_version="1.0",
                     determinism=Determinism.IO_WRITE,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )

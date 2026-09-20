@@ -19,6 +19,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import node_states_table, token_outcomes_table
+from tests.fixtures.audit_hashing import fake_error_hash
 from tests.fixtures.landscape import leader_coordination_token, member_token_for, register_test_node
 
 
@@ -138,7 +139,7 @@ def test_sqlite_process_cannot_mutate_node_state_between_validation_and_insert(
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.SINK_DISCARDED,
             sink_name=DISCARD_SINK_NAME,
-            error_hash="discard-error",
+            error_hash=fake_error_hash("discard-error"),
         )
     finally:
         start.set()
@@ -175,7 +176,7 @@ def test_sqlite_writer_lock_contention_uses_landscape_error_taxonomy(tmp_path: P
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.SINK_DISCARDED,
                 sink_name=DISCARD_SINK_NAME,
-                error_hash="discard-error",
+                error_hash=fake_error_hash("discard-error"),
             )
     finally:
         holder.rollback()

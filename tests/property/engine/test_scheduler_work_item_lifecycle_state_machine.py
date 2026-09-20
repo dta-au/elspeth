@@ -67,6 +67,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import expire_lease, landscape_database_now, member_token_for
 
 RUN_ID = "run-rc6-scheduler-property"
@@ -105,7 +106,7 @@ def _insert_run_and_nodes(engine: Tier1Engine, *, now: datetime) -> Coordination
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -126,7 +127,7 @@ def _insert_run_and_nodes(engine: Tier1Engine, *, now: datetime) -> Coordination
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -134,7 +135,7 @@ def _insert_run_and_nodes(engine: Tier1Engine, *, now: datetime) -> Coordination
 
     for worker_id in WORKERS:
         if worker_id != LEADER_WORKER_ID:
-            coordination.admit_follower(run_id=RUN_ID, worker_id=worker_id, config_hash="config", window_seconds=3600)
+            coordination.admit_follower(run_id=RUN_ID, worker_id=worker_id, config_hash=fake_sha256("config"), window_seconds=3600)
     return authority
 
 
@@ -150,7 +151,7 @@ def _insert_row_and_token(engine: Tier1Engine, *, sequence: int, now: datetime) 
                 row_index=sequence,
                 source_row_index=sequence,
                 ingest_sequence=sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=now,
             )
         )

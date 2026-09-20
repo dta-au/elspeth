@@ -47,6 +47,7 @@ from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.sources.null_source import NullSource
 from elspeth.plugins.transforms.passthrough import PassThrough
 from elspeth.testing import make_contract, make_row
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import inject_write_failure
 from tests.fixtures.landscape import expire_leader_seat, insert_crashed_leader_seat, leader_token_for, make_factory
 from tests.helpers.checkpoint import create_checkpoint
@@ -158,7 +159,7 @@ def _build_two_source_failed_run(
             runs_table.insert().values(
                 run_id=run_id,
                 started_at=now,
-                config_hash="test",
+                config_hash=fake_sha256("test"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=RunStatus.FAILED,
@@ -185,7 +186,7 @@ def _build_two_source_failed_run(
                     plugin_version=plugin.plugin_version,
                     determinism=plugin.determinism,
                     source_file_hash=plugin.source_file_hash,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -201,7 +202,7 @@ def _build_two_source_failed_run(
                     source_name=source_name,
                     plugin_name="null",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=schema_json,
                     schema_contract_json=contract_json,
                     schema_contract_hash=contract_hash,
@@ -235,7 +236,7 @@ def _build_two_source_failed_run(
                     row_index=row_index,
                     source_row_index=source_row_index,
                     ingest_sequence=ingest_sequence,
-                    source_data_hash=f"h-{row_id}",
+                    source_data_hash=fake_sha256(f"h-{row_id}"),
                     source_data_ref=ref,
                     created_at=now,
                 )
@@ -429,7 +430,7 @@ class TestResumeComprehensive:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.FAILED,
@@ -458,7 +459,7 @@ class TestResumeComprehensive:
                         plugin_version=plugin.plugin_version,
                         determinism=plugin.determinism,
                         source_file_hash=plugin.source_file_hash,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -499,7 +500,7 @@ class TestResumeComprehensive:
                     source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=schema_contract_json,
                     schema_contract_hash=schema_contract_hash,
@@ -520,7 +521,7 @@ class TestResumeComprehensive:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"h{i}",
+                        source_data_hash=fake_sha256(f"h{i}"),
                         source_data_ref=ref,
                         created_at=now,
                     )
@@ -997,7 +998,7 @@ class TestResumeComprehensive:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.FAILED,
@@ -1026,7 +1027,7 @@ class TestResumeComprehensive:
                         plugin_version=plugin.plugin_version,
                         determinism=plugin.determinism,
                         source_file_hash=plugin.source_file_hash,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -1057,7 +1058,7 @@ class TestResumeComprehensive:
                     source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=schema_contract_json,
                     schema_contract_hash=schema_contract_hash,
@@ -1081,7 +1082,7 @@ class TestResumeComprehensive:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"h{i}",
+                        source_data_hash=fake_sha256(f"h{i}"),
                         source_data_ref=ref,
                         created_at=now,
                     )
@@ -1239,7 +1240,7 @@ class TestResumeComprehensive:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.FAILED,
@@ -1268,7 +1269,7 @@ class TestResumeComprehensive:
                         plugin_version=plugin.plugin_version,
                         determinism=plugin.determinism,
                         source_file_hash=plugin.source_file_hash,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -1299,7 +1300,7 @@ class TestResumeComprehensive:
                     source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=schema_contract_json,
                     schema_contract_hash=schema_contract_hash,
@@ -1323,7 +1324,7 @@ class TestResumeComprehensive:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"h{i}",
+                        source_data_hash=fake_sha256(f"h{i}"),
                         source_data_ref=ref,
                         created_at=now,
                     )
@@ -1479,7 +1480,7 @@ class TestResumeComprehensive:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.FAILED,
@@ -1508,7 +1509,7 @@ class TestResumeComprehensive:
                         plugin_version=plugin.plugin_version,
                         determinism=plugin.determinism,
                         source_file_hash=plugin.source_file_hash,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -1539,7 +1540,7 @@ class TestResumeComprehensive:
                     source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=schema_contract_json,
                     schema_contract_hash=schema_contract_hash,
@@ -1563,7 +1564,7 @@ class TestResumeComprehensive:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"h{i}",
+                        source_data_hash=fake_sha256(f"h{i}"),
                         source_data_ref=ref,
                         created_at=now,
                     )
@@ -1712,7 +1713,7 @@ class TestResumeComprehensive:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.FAILED,
@@ -1741,7 +1742,7 @@ class TestResumeComprehensive:
                         plugin_version=plugin.plugin_version,
                         determinism=plugin.determinism,
                         source_file_hash=plugin.source_file_hash,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -1772,7 +1773,7 @@ class TestResumeComprehensive:
                     source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=schema_contract_json,
                     schema_contract_hash=schema_contract_hash,
@@ -1796,7 +1797,7 @@ class TestResumeComprehensive:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"h{i}",
+                        source_data_hash=fake_sha256(f"h{i}"),
                         source_data_ref=ref,
                         created_at=now,
                     )
@@ -1936,7 +1937,7 @@ class TestResumeComprehensive:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.FAILED,
@@ -1965,7 +1966,7 @@ class TestResumeComprehensive:
                         plugin_version=plugin.plugin_version,
                         determinism=plugin.determinism,
                         source_file_hash=plugin.source_file_hash,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -1996,7 +1997,7 @@ class TestResumeComprehensive:
                     source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=schema_contract_json,
                     schema_contract_hash=schema_contract_hash,
@@ -2016,7 +2017,7 @@ class TestResumeComprehensive:
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="h0",
+                    source_data_hash=fake_sha256("h0"),
                     source_data_ref=ref,
                     created_at=now,
                 )
@@ -2714,7 +2715,7 @@ class TestMultiSourceResumeContractDispatch:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.FAILED,
@@ -2740,7 +2741,7 @@ class TestMultiSourceResumeContractDispatch:
                         plugin_version=plugin.plugin_version,
                         determinism=plugin.determinism,
                         source_file_hash=plugin.source_file_hash,
-                        config_hash="test",
+                        config_hash=fake_sha256("test"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -2752,7 +2753,7 @@ class TestMultiSourceResumeContractDispatch:
                     source_name="source",
                     plugin_name="null",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json=source_schema_json,
                     schema_contract_json=contract_json,
                     schema_contract_hash=contract_hash,
@@ -2780,7 +2781,7 @@ class TestMultiSourceResumeContractDispatch:
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="h-single",
+                    source_data_hash=fake_sha256("h-single"),
                     source_data_ref=ref,
                     created_at=now,
                 )

@@ -37,6 +37,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import LandscapeDB
+from tests.fixtures.audit_hashing import fake_error_hash
 from tests.fixtures.landscape import (
     claim_test_work_item,
     leader_coordination_token,
@@ -592,7 +593,7 @@ class TestTokenOutcomeProperties:
         )
 
         # Record QUARANTINED outcome (requires error_hash)
-        error_hash = stable_hash({"reason": "validation_failed"})
+        error_hash = fake_error_hash("validation_failed")
         outcome_id = factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
             outcome=TerminalOutcome.FAILURE,
@@ -728,16 +729,16 @@ class TestTokenOutcomeProperties:
                 TerminalPath.ON_ERROR_ROUTED,
                 {
                     "sink_name": "failsink",
-                    "error_hash": stable_hash({"reason": "on_error"}),
+                    "error_hash": fake_error_hash("on_error"),
                 },
             ),
             (TerminalOutcome.TRANSIENT, TerminalPath.FORK_PARENT, {}),
-            (TerminalOutcome.FAILURE, TerminalPath.UNROUTED, {"error_hash": stable_hash({"reason": "failure"})}),
-            (TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE, {"error_hash": stable_hash({"reason": "validation"})}),
+            (TerminalOutcome.FAILURE, TerminalPath.UNROUTED, {"error_hash": fake_error_hash("failure")}),
+            (TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE, {"error_hash": fake_error_hash("validation")}),
             (
                 TerminalOutcome.FAILURE,
                 TerminalPath.QUARANTINED_AT_SOURCE,
-                {"sink_name": "quarantine", "error_hash": stable_hash({"reason": "validation"})},
+                {"sink_name": "quarantine", "error_hash": fake_error_hash("validation")},
             ),
             (TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED, {"batch_id": "batch_1"}),
             (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED, {}),

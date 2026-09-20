@@ -23,6 +23,7 @@ from elspeth.engine.orchestrator import Orchestrator, PipelineConfig, prepare_fo
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
 from elspeth.engine.orchestrator.source_iteration import SourceIterationDriver
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.landscape import expire_leader_seat, leader_coordination_token
 from tests.fixtures.pipeline import build_linear_pipeline
@@ -324,7 +325,7 @@ def _setup_adr019_failed_resume_run(
                     plugin_version=plugin.plugin_version,
                     determinism=plugin.determinism,
                     source_file_hash=plugin.source_file_hash,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -360,7 +361,7 @@ def _setup_adr019_failed_resume_run(
                 source_name="primary",
                 plugin_name=source.name,
                 lifecycle_state="loaded",
-                config_hash="test",
+                config_hash=fake_sha256("test"),
                 schema_json=json.dumps({"properties": {"value": {"type": "integer"}}, "required": ["value"]}),
                 schema_contract_json=audit_record.to_json(),
                 schema_contract_hash=contract.version_hash(),
@@ -379,7 +380,7 @@ def _setup_adr019_failed_resume_run(
                     row_index=i,
                     source_row_index=i,
                     ingest_sequence=i,
-                    source_data_hash=f"h{i}",
+                    source_data_hash=fake_sha256(f"h{i}"),
                     source_data_ref=ref,
                     created_at=now,
                 )

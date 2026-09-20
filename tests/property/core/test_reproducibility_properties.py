@@ -47,6 +47,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 
 # =============================================================================
@@ -186,7 +187,7 @@ def _insert_purged_call(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="src_hash",
+                source_data_hash=fake_sha256("src_hash"),
                 created_at=now,
             )
         )
@@ -207,8 +208,8 @@ def _insert_purged_call(
                 step_index=0,
                 attempt=0,
                 status=NodeStateStatus.COMPLETED.value,
-                input_hash="in_hash",
-                output_hash="out_hash",
+                input_hash=fake_sha256("in_hash"),
+                output_hash=fake_sha256("out_hash"),
                 started_at=now,
             )
         )
@@ -220,8 +221,8 @@ def _insert_purged_call(
                 call_index=0,
                 call_type=CallType.HTTP.value,
                 status=CallStatus.SUCCESS.value,
-                request_hash="req_hash",
-                response_hash="resp_hash",  # Proof the payload once existed
+                request_hash=fake_sha256("req_hash"),
+                response_hash=fake_sha256("resp_hash"),  # Proof the payload once existed
                 response_ref=None,  # NULL = payload has been purged
                 created_at=now,
             )

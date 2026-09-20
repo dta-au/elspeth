@@ -27,6 +27,7 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, leader_token_for, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -260,7 +261,7 @@ class TestCheckpointRecoveryIntegration:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="sha256-rfc8785-v1",
                     status=RunStatus.FAILED,
@@ -281,7 +282,7 @@ class TestCheckpointRecoveryIntegration:
                     node_type=NodeType.TRANSFORM,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="x",
+                    config_hash=fake_sha256("x"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -298,7 +299,7 @@ class TestCheckpointRecoveryIntegration:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="src_x",
+                    config_hash=fake_sha256("src_x"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -310,7 +311,7 @@ class TestCheckpointRecoveryIntegration:
                     source_name="primary",
                     plugin_name="test_source",
                     lifecycle_state="loaded",
-                    config_hash="src_x",
+                    config_hash=fake_sha256("src_x"),
                     schema_json="{}",
                     schema_contract_json=contract_json,
                     schema_contract_hash=contract_hash,
@@ -331,7 +332,7 @@ class TestCheckpointRecoveryIntegration:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"hash{i}",
+                        source_data_hash=fake_sha256(f"hash{i}"),
                         created_at=now,
                     )
                 )
@@ -598,7 +599,7 @@ class TestResumeCheckpointCleanup:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
