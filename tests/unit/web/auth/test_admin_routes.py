@@ -1,9 +1,4 @@
-"""Tests for the dev-admin user management routes -- /api/auth/admin/users.
-
-The surface exists only when WebSettings.dev_admin_user names a local-auth
-user; every other configuration must 404 exactly like the hidden /login and
-/register arms so probes cannot learn the surface exists.
-"""
+"""Local account management: configured dev admin or live local-auth administrator."""
 
 from __future__ import annotations
 
@@ -39,13 +34,20 @@ class _NoopAuthAuditRecorder:
         return None
 
 
-def _create_test_app(provider, **settings_overrides) -> FastAPI:
+def _create_test_app(provider, *, authority: RepositoryIdentityAuthority | None = None, **settings_overrides) -> FastAPI:
     """Create a FastAPI app with the auth + dev-admin routers mounted."""
     from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
     app = FastAPI()
     app.add_middleware(RequestIdMiddleware)
     app.state.auth_provider = provider
+    if authority is None:
+        # Match build_local_auth_provider's default identity substrate.
+        authority = RepositoryIdentityAuthority(
+            create_session_engine(f"sqlite:///{provider._db_path.parent / 'identity-substrate.db'}"),
+            lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply,
+        )
+    app.state.identity_authority = authority
     app.state.settings = WebSettings(
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
@@ -81,7 +83,7 @@ async def _bearer(client: AsyncClient, username: str, password: str) -> dict[str
 
 @pytest.mark.asyncio
 class TestDevAdminGuard:
-    async def test_all_routes_404_when_flag_unset(self, tmp_path) -> None:
+    async def test_all_routes_404_for_non_admin_when_flag_unset(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
         app = _create_test_app(provider)
 
@@ -110,12 +112,12 @@ class TestDevAdminGuard:
                 await client.request("DELETE", "/api/auth/admin/users/john", headers=headers, json={"reason": "left the team"})
             ).status_code == 404
 
-    async def test_routes_404_without_credentials_when_disabled(self, tmp_path) -> None:
+    async def test_routes_401_without_credentials_when_flag_unset(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
         app = _create_test_app(provider)
 
         async with _client_for(app) as client:
-            assert (await client.get("/api/auth/admin/users")).status_code == 404
+            assert (await client.get("/api/auth/admin/users")).status_code == 401
 
     async def test_routes_401_without_credentials_when_enabled(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
@@ -364,7 +366,7 @@ class TestDeleteUserLastAdministrator:
         provider, authority = _substrate(tmp_path)
         _bootstrap_identity_admin(provider, authority, "alice")
         assert authority.count_active_human_admins() == 1
-        app = _create_test_app(provider, dev_admin_user="john")
+        app = _create_test_app(provider, authority=authority, dev_admin_user="john")
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
@@ -403,7 +405,7 @@ class TestDeleteUserLastAdministrator:
             record=lambda _event: None,
         )
         assert authority.count_active_human_admins() == 2
-        app = _create_test_app(provider, dev_admin_user="john")
+        app = _create_test_app(provider, authority=authority, dev_admin_user="john")
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")

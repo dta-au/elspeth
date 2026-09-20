@@ -1,7 +1,7 @@
 """People directory -- GET /api/auth/admin/people.
 
 ONE READ FACADE over two stores that answer different questions. ``auth.db``
-holds local CREDENTIALS and is administered by the configured dev admin; the
+holds local CREDENTIALS and is administered by local-auth administrators; the
 ``identities`` substrate holds ADMISSION and is administered by holders of a
 live ``admin`` role. An administrator looking for a person should not have to
 know which store the person's record lives in, so this module merges the two
@@ -10,12 +10,11 @@ it, behind that route's own guard.
 
 Two capabilities, resolved independently, on every request
 -----------------------------------------------------------
-``local_accounts`` (the dev admin) and ``identity_admin`` (a live ``admin``
-role) are separate grants and a caller may hold either, both or neither. Each
-source is QUERIED only when its own capability is held -- admission by an OR
-that then returned every field would hand a dev admin the identity directory,
-and an identity administrator the credential inventory. A caller holding
-neither sees 404, like the two surfaces this one fronts.
+``local_accounts`` (a local-auth administrator or the configured dev admin)
+and ``identity_admin`` (a live ``admin`` role) are resolved separately. A
+configured dev admin need not hold an identity role, and external-auth
+administrators cannot manage local credentials. Each source is QUERIED only
+when its own capability is held. A caller holding neither sees 404.
 
 Correlation
 -----------
@@ -50,7 +49,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.auth import AuthProviderType, IdentityAccessState, IdentityProviderType
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.admin_routes import is_dev_admin
+from elspeth.web.auth.admin_routes import can_manage_local_accounts
 from elspeth.web.auth.identity_admin_routes import IdentityView, _authority, _hidden, _identity_view, _StrictModel, _uncacheable
 from elspeth.web.auth.local import LocalAuthProvider, LocalUserAccount
 from elspeth.web.auth.middleware import get_current_user
@@ -314,11 +313,12 @@ async def _resolve(request: Request) -> tuple[UserIdentity, PeopleCapabilities]:
     settings: WebSettings = request.app.state.settings
     try:
         identity_admin = await run_sync_in_worker(_authority(request).holds_active_role, identity_id=user.user_id, role="admin")
+        local_accounts = await can_manage_local_accounts(request, user)
     except SQLAlchemyError as exc:
         raise _source_unavailable("identities") from exc
     return user, PeopleCapabilities(
         identity_admin=identity_admin,
-        local_accounts=is_dev_admin(settings, user),
+        local_accounts=local_accounts,
         auth_provider=settings.auth_provider,
         quotas_enabled=settings.quotas_enabled,
         self_identity_id=user.user_id,
