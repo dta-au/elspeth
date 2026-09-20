@@ -72,8 +72,8 @@ def engine():
             "alice-tutorial-exit-mode-counter",
             "alice-tutorial-exit-clears-progress",
             "alice-tutorial-mode-only-counter",
-            "alice-banner-reshow",
-            "alice-banner-discriminate",
+            "alice-intro-reshow",
+            "alice-intro-discriminate",
             "alice-partial",
             "alice-empty-patch-no-row",
             "alice-empty-patch-existing",
@@ -127,16 +127,21 @@ def tutorial_completed_counter(monkeypatch: pytest.MonkeyPatch) -> _RecordingCou
     return counter
 
 
-def test_get_for_new_user_returns_guided_default(service):
-    """A user with no row gets the server-side default 'guided'."""
+def test_get_for_new_user_returns_freeform_default(service, engine):
+    """A user with no row gets the server-side default 'freeform'."""
     prefs = asyncio.run(service.get_composer_preferences("alice-get-default"))
-    assert prefs.default_mode == "guided"
-    assert prefs.banner_dismissed_at is None
+    assert prefs.default_mode == "freeform"
+    assert prefs.freeform_intro_dismissed_at is None
     assert prefs.tutorial_completed_at is None
     # Panel U1: updated_at is None when no row exists — no write event
     # to associate a timestamp with; fabricating one would put a value
     # the system never wrote into an audit-visible field.
     assert prefs.updated_at is None
+    with engine.connect() as connection:
+        assert (
+            connection.execute(select(user_preferences_table).where(user_preferences_table.c.user_id == "alice-get-default")).first()
+            is None
+        )
 
 
 def test_get_for_user_with_row_returns_real_updated_at(service):
@@ -156,7 +161,7 @@ def test_update_persists_and_round_trips(service):
     # B2 (Phase 8a-2): service returns a transition wrapper; the
     # caller reads ``.current`` for the post-write state. New users
     # have no prior row — ``.prior.value`` is None (NOT a synthesised
-    # guided-default sentinel; that would fabricate state the system
+    # Freeform-default sentinel; that would fabricate state the system
     # never wrote — see ComposerPreferencesTransition docstring).
     result = asyncio.run(service.update_composer_preferences("alice-update-persist", payload))
     assert result.prior.value is None
@@ -172,7 +177,7 @@ def test_patch_sets_tutorial_completed_at(service):
     result = asyncio.run(
         service.update_composer_preferences(
             "alice-tutorial-set",
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete"),
         )
     )
     assert result.prior.value is None
@@ -190,6 +195,7 @@ def test_patch_can_set_mode_and_tutorial_in_one_call(service):
             UpdateComposerPreferencesRequest(
                 default_mode="freeform",
                 tutorial_completed_at=stamp,
+                tutorial_completed_via="complete",
             ),
         )
     )
@@ -202,7 +208,7 @@ def test_partial_update_preserves_tutorial_completed_at(service):
     asyncio.run(
         service.update_composer_preferences(
             "alice-tutorial-preserve",
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete"),
         )
     )
 
@@ -223,7 +229,7 @@ def test_explicit_null_clears_tutorial_completed_at(service):
     asyncio.run(
         service.update_composer_preferences(
             "alice-tutorial-retake",
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete"),
         )
     )
 
@@ -245,7 +251,7 @@ def test_absent_tutorial_field_preserves_but_explicit_null_clears(service):
     asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete"),
         )
     )
 
@@ -269,7 +275,7 @@ def test_corrupt_tutorial_completed_at_crashes_with_named_error(service, engine)
             user_preferences_table.insert().values(
                 user_id=user,
                 default_composer_mode="guided",
-                banner_dismissed_at=None,
+                freeform_intro_dismissed_at=None,
                 tutorial_completed_at=None,
                 updated_at=datetime(2026, 5, 15, tzinfo=UTC),
             )
@@ -290,14 +296,14 @@ def test_patch_tutorial_emits_counter_with_tutorial_changed_label(service, prefe
     asyncio.run(
         service.update_composer_preferences(
             "alice-tutorial-counter",
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete"),
         )
     )
 
     assert preferences_patch_counter.calls
     _amount, attrs = preferences_patch_counter.calls[-1]
-    assert attrs["mode_changed"] is False
-    assert attrs["banner_dismissed"] is False
+    assert attrs["mode_changed"] is True
+    assert attrs["freeform_intro_dismissed"] is False
     assert attrs["wrote_row"] is True
     assert attrs["tutorial_changed"] is True
 
@@ -326,7 +332,7 @@ def test_tutorial_completed_counter_first_time_label(
     asyncio.run(
         service.update_composer_preferences(
             "alice-tutorial-first-time-counter",
-            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete"),
         )
     )
 
@@ -342,7 +348,7 @@ def test_tutorial_completed_counter_skip_label(
     asyncio.run(
         service.update_composer_preferences(
             "alice-tutorial-skip-counter",
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="skip"),
         )
     )
 
@@ -355,7 +361,11 @@ def test_tutorial_completed_counter_retake_label(
 ):
     stamp = datetime(2026, 5, 15, 14, 10, tzinfo=UTC)
     user = "alice-tutorial-retake-counter"
-    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(tutorial_completed_at=stamp)))
+    asyncio.run(
+        service.update_composer_preferences(
+            user, UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete")
+        )
+    )
 
     asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(tutorial_completed_at=None)))
 
@@ -369,9 +379,17 @@ def test_tutorial_completed_counter_repeat_label(
     first = datetime(2026, 5, 15, 14, 15, tzinfo=UTC)
     second = datetime(2026, 5, 15, 14, 20, tzinfo=UTC)
     user = "alice-tutorial-repeat-counter"
-    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(tutorial_completed_at=first)))
+    asyncio.run(
+        service.update_composer_preferences(
+            user, UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=first, tutorial_completed_via="complete")
+        )
+    )
 
-    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(tutorial_completed_at=second)))
+    asyncio.run(
+        service.update_composer_preferences(
+            user, UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=second, tutorial_completed_via="complete")
+        )
+    )
 
     assert tutorial_completed_counter.calls[-1] == (1, {"completion_path": "repeat"})
 
@@ -380,14 +398,13 @@ def test_tutorial_completed_counter_exit_label(
     service,
     tutorial_completed_counter: _RecordingCounter,
 ):
-    """An exit-to-freeform opt-out carries the explicit discriminator and must
-    not be bucketed as "skip" by the payload-shape inference (elspeth-61591e64bb)."""
+    """An exit-to-freeform opt-out is recorded as an exit."""
     stamp = datetime(2026, 5, 15, 14, 25, tzinfo=UTC)
 
     asyncio.run(
         service.update_composer_preferences(
             "alice-tutorial-exit-counter",
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp, tutorial_completed_via="exit"),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="exit"),
         )
     )
 
@@ -398,8 +415,7 @@ def test_tutorial_completed_counter_exit_discriminator_wins_over_mode_shape(
     service,
     tutorial_completed_counter: _RecordingCounter,
 ):
-    """The explicit discriminator outranks the addressed-mode shape inference
-    that would otherwise classify this payload as "first_time"."""
+    """Saving the Freeform default alongside an exit preserves its intent."""
     stamp = datetime(2026, 5, 15, 14, 30, tzinfo=UTC)
 
     asyncio.run(
@@ -431,7 +447,7 @@ def test_tutorial_exit_patch_clears_resume_fields(service):
     asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp, tutorial_completed_via="exit"),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="exit"),
         )
     )
 
@@ -457,58 +473,58 @@ def test_tutorial_completed_counter_does_not_fire_for_mode_only_patch(
     assert tutorial_completed_counter.calls == []
 
 
-def test_explicit_null_clears_banner_dismissed_at(service):
-    """PATCH ``{"banner_dismissed_at": null}`` clears a prior dismissal so
-    the banner re-shows on the next session. Symmetric with the tutorial
+def test_explicit_null_clears_freeform_intro_dismissed_at(service):
+    """PATCH ``{"freeform_intro_dismissed_at": null}`` clears a prior dismissal so
+    the intro re-shows on the next session. Symmetric with the tutorial
     field; uses ``model_fields_set`` to distinguish absent vs explicit null."""
     stamp = datetime(2026, 5, 15, 16, 0, tzinfo=UTC)
     asyncio.run(
         service.update_composer_preferences(
-            "alice-banner-reshow",
-            UpdateComposerPreferencesRequest(banner_dismissed_at=stamp),
+            "alice-intro-reshow",
+            UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=stamp),
         )
     )
 
     result = asyncio.run(
         service.update_composer_preferences(
-            "alice-banner-reshow",
-            UpdateComposerPreferencesRequest(banner_dismissed_at=None),
+            "alice-intro-reshow",
+            UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=None),
         )
     )
 
-    assert result.current.banner_dismissed_at is None
-    prefs = asyncio.run(service.get_composer_preferences("alice-banner-reshow"))
-    assert prefs.banner_dismissed_at is None
+    assert result.current.freeform_intro_dismissed_at is None
+    prefs = asyncio.run(service.get_composer_preferences("alice-intro-reshow"))
+    assert prefs.freeform_intro_dismissed_at is None
 
 
-def test_absent_banner_field_preserves_but_explicit_null_clears(service):
-    """Absent ``banner_dismissed_at`` preserves the existing value; explicit
+def test_absent_intro_field_preserves_but_explicit_null_clears(service):
+    """Absent ``freeform_intro_dismissed_at`` preserves the existing value; explicit
     JSON ``null`` clears it. The discriminator is ``model_fields_set``."""
     stamp = datetime(2026, 5, 15, 16, 5, tzinfo=UTC)
-    user = "alice-banner-discriminate"
+    user = "alice-intro-discriminate"
     asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(banner_dismissed_at=stamp),
+            UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=stamp),
         )
     )
 
     absent_payload = UpdateComposerPreferencesRequest(default_mode="freeform")
-    assert "banner_dismissed_at" not in absent_payload.model_fields_set
+    assert "freeform_intro_dismissed_at" not in absent_payload.model_fields_set
     asyncio.run(service.update_composer_preferences(user, absent_payload))
     after_absent = asyncio.run(service.get_composer_preferences(user))
     # Same UTC-tzinfo round-trip pattern as test_partial_update_only_touches_provided_fields.
-    assert after_absent.banner_dismissed_at is not None
-    got = after_absent.banner_dismissed_at
+    assert after_absent.freeform_intro_dismissed_at is not None
+    got = after_absent.freeform_intro_dismissed_at
     if got.tzinfo is None:
         got = got.replace(tzinfo=UTC)
     assert got == stamp
 
-    null_payload = UpdateComposerPreferencesRequest(banner_dismissed_at=None)
-    assert "banner_dismissed_at" in null_payload.model_fields_set
+    null_payload = UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=None)
+    assert "freeform_intro_dismissed_at" in null_payload.model_fields_set
     asyncio.run(service.update_composer_preferences(user, null_payload))
     after_null = asyncio.run(service.get_composer_preferences(user))
-    assert after_null.banner_dismissed_at is None
+    assert after_null.freeform_intro_dismissed_at is None
 
 
 def test_partial_update_only_touches_provided_fields(service):
@@ -522,7 +538,7 @@ def test_partial_update_only_touches_provided_fields(service):
     asyncio.run(
         service.update_composer_preferences(
             "alice-partial",
-            UpdateComposerPreferencesRequest(banner_dismissed_at=stamp),
+            UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=stamp),
         )
     )
     prefs = asyncio.run(service.get_composer_preferences("alice-partial"))
@@ -535,8 +551,8 @@ def test_partial_update_only_touches_provided_fields(service):
     # The earlier .replace(tzinfo=None)-on-both-sides assertion was a
     # locked-in buggy expectation per
     # feedback_locked_in_buggy_expectations.md.
-    assert prefs.banner_dismissed_at is not None
-    got = prefs.banner_dismissed_at
+    assert prefs.freeform_intro_dismissed_at is not None
+    got = prefs.freeform_intro_dismissed_at
     if got.tzinfo is None:
         got = got.replace(tzinfo=UTC)
     assert got == stamp
@@ -553,8 +569,8 @@ def test_empty_patch_on_no_row_does_not_insert(service, engine):
     # Response is the default (matches GET no-row behaviour); prior is
     # None because no row existed before the empty PATCH.
     assert result.prior.value is None
-    assert result.current.default_mode == "guided"
-    assert result.current.banner_dismissed_at is None
+    assert result.current.default_mode == "freeform"
+    assert result.current.freeform_intro_dismissed_at is None
 
     # And critically, no row was inserted.
     with engine.connect() as conn:
@@ -593,9 +609,9 @@ def test_empty_patch_on_existing_row_bumps_updated_at_only(service, engine):
 
 
 def test_users_are_isolated(service):
-    asyncio.run(service.update_composer_preferences("alice-isolated", UpdateComposerPreferencesRequest(default_mode="freeform")))
+    asyncio.run(service.update_composer_preferences("alice-isolated", UpdateComposerPreferencesRequest(default_mode="guided")))
     bob_prefs = asyncio.run(service.get_composer_preferences("bob-isolated"))
-    assert bob_prefs.default_mode == "guided"
+    assert bob_prefs.default_mode == "freeform"
 
 
 def test_corrupt_mode_read_via_public_api_raises(service):
@@ -747,7 +763,7 @@ def test_corrupt_mode_blocks_partial_patch_that_does_not_set_mode(service):
         conn.execute(text("UPDATE user_preferences SET default_composer_mode = 'kiosk' WHERE user_id = :uid").bindparams(uid=user))
         conn.execute(text("PRAGMA ignore_check_constraints = OFF"))
 
-    # PATCH only banner_dismissed_at — forces the upsert to read the
+    # PATCH only freeform_intro_dismissed_at — forces the upsert to read the
     # existing mode to know what to INSERT. Must raise on the corrupt
     # read with the offending value named.
     stamp = datetime(2026, 5, 16, tzinfo=UTC)
@@ -755,7 +771,7 @@ def test_corrupt_mode_blocks_partial_patch_that_does_not_set_mode(service):
         asyncio.run(
             service.update_composer_preferences(
                 user,
-                UpdateComposerPreferencesRequest(banner_dismissed_at=stamp),
+                UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=stamp),
             )
         )
     assert exc_info.value.user_id == user
@@ -809,7 +825,7 @@ def test_empty_user_id_rejected_by_check_constraint(engine):
             user_preferences_table.insert().values(
                 user_id="",
                 default_composer_mode="guided",
-                banner_dismissed_at=None,
+                freeform_intro_dismissed_at=None,
                 tutorial_completed_at=None,
                 updated_at=datetime(2026, 5, 16, tzinfo=UTC),
             )
@@ -817,12 +833,12 @@ def test_empty_user_id_rejected_by_check_constraint(engine):
 
 
 def test_concurrent_partial_patches_return_serialized_current_state(tmp_path):
-    """Concurrent mode/banner PATCH responses must reflect a serialized row.
+    """Concurrent mode/intro PATCH responses must reflect a serialized row.
 
     The old implementation read preserved fields before its upsert. This test
-    blocks the mode-only writer after it has resolved its stale banner value but
-    before its INSERT...ON CONFLICT runs, then lets a banner-only writer race.
-    Correct SQLite write-intent discipline either serializes the banner writer
+    blocks the mode-only writer after it has resolved its stale intro value but
+    before its INSERT...ON CONFLICT runs, then lets an intro-only writer race.
+    Correct SQLite write-intent discipline either serializes the intro writer
     until after the mode writer commits, or the upsert returns the row after the
     conflict update. In both cases one response must show both partial updates.
     """
@@ -867,41 +883,41 @@ def test_concurrent_partial_patches_return_serialized_current_state(tmp_path):
         args=("mode", UpdateComposerPreferencesRequest(default_mode="freeform")),
         name="preferences-mode-writer",
     )
-    banner_thread = threading.Thread(
+    intro_thread = threading.Thread(
         target=_run_patch,
-        args=("banner", UpdateComposerPreferencesRequest(banner_dismissed_at=stamp)),
-        name="preferences-banner-writer",
+        args=("intro", UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=stamp)),
+        name="preferences-intro-writer",
     )
 
     mode_thread.start()
     assert mode_writer_ready.wait(timeout=5.0), "mode writer did not reach the upsert gate"
-    banner_thread.start()
-    banner_thread.join(timeout=0.3)
+    intro_thread.start()
+    intro_thread.join(timeout=0.3)
     release_mode_writer.set()
     mode_thread.join(timeout=5.0)
-    banner_thread.join(timeout=5.0)
+    intro_thread.join(timeout=5.0)
     assert not mode_thread.is_alive()
-    assert not banner_thread.is_alive()
+    assert not intro_thread.is_alive()
     if errors:
         raise AssertionError(errors)
 
     with engine.connect() as conn:
         row = conn.execute(select(user_preferences_table).where(user_preferences_table.c.user_id == user)).one()
     assert row.default_composer_mode == "freeform"
-    got_banner = row.banner_dismissed_at
-    if got_banner.tzinfo is None:
-        got_banner = got_banner.replace(tzinfo=UTC)
-    assert got_banner == stamp
+    got_intro = row.freeform_intro_dismissed_at
+    if got_intro.tzinfo is None:
+        got_intro = got_intro.replace(tzinfo=UTC)
+    assert got_intro == stamp
 
     def _response_has_both(value: object) -> bool:
         current = value.current  # type: ignore[attr-defined]
-        banner = current.banner_dismissed_at
-        if banner is not None and banner.tzinfo is None:
-            banner = banner.replace(tzinfo=UTC)
-        return current.default_mode == "freeform" and banner == stamp
+        intro = current.freeform_intro_dismissed_at
+        if intro is not None and intro.tzinfo is None:
+            intro = intro.replace(tzinfo=UTC)
+        return current.default_mode == "freeform" and intro == stamp
 
     assert any(_response_has_both(value) for value in results.values()), (
-        "At least one concurrent PATCH response must reflect the serialized row with both the mode and banner updates."
+        "At least one concurrent PATCH response must reflect the serialized row with both the mode and intro updates."
     )
 
 
@@ -963,7 +979,7 @@ def test_patch_advances_tutorial_stage_and_records_run_identity(service):
 
 def test_unrelated_patch_preserves_tutorial_progress(service):
     """Absent resume fields are preserved by unrelated PATCHes (the
-    model_fields_set discrimination, same as banner/tutorial timestamps)."""
+    model_fields_set discrimination, same as intro/tutorial timestamps)."""
     user = "alice-tutorial-progress-preserve"
     asyncio.run(
         service.update_composer_preferences(
@@ -997,7 +1013,7 @@ def test_setting_tutorial_completed_clears_progress(service):
     result = asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(tutorial_completed_at=stamp),
+            UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete"),
         )
     )
     assert result.current.tutorial_stage is None
@@ -1016,23 +1032,12 @@ def test_resetting_tutorial_clears_progress_for_clean_restart(service):
     (with default_mode) — must restart the tutorial CLEANLY at Welcome. A
     stale tutorial_stage would resurrect a mid-tutorial resume instead."""
     user = "alice-tutorial-progress-reset"
-    stamp = datetime(2026, 5, 15, 15, 5, tzinfo=UTC)
     asyncio.run(
         service.update_composer_preferences(
             user,
             UpdateComposerPreferencesRequest(tutorial_stage="run", tutorial_session_id="sess-5"),
         )
     )
-    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(tutorial_completed_at=stamp)))
-    # Simulate a lingering in-progress row alongside a completion (write
-    # ordering race between the stage PATCH and the completion PATCH).
-    asyncio.run(
-        service.update_composer_preferences(
-            user,
-            UpdateComposerPreferencesRequest(tutorial_stage="graduation", tutorial_session_id="sess-5"),
-        )
-    )
-
     result = asyncio.run(
         service.update_composer_preferences(
             user,
@@ -1237,3 +1242,38 @@ def test_transition_prior_flag_is_derived_from_the_service_engine_dialect(servic
     )
     assert result.prior.serialised is prior_read_is_serialised(service._engine.dialect.name)
     assert service._engine.dialect.name == "sqlite"
+
+
+@pytest.mark.parametrize("intent", ["complete", "skip", "exit"])
+def test_completion_intent_preserves_repeat_and_retake_telemetry(service, engine, tutorial_completed_counter, intent):
+    user = f"intent-repeat-{intent}"
+    with engine.begin() as connection:
+        ensure_test_identity(connection, identity_id=user)
+    payload = UpdateComposerPreferencesRequest.model_validate(
+        {
+            "default_mode": "freeform",
+            "tutorial_completed_at": "2026-09-20T00:00:00Z",
+            "tutorial_completed_via": intent,
+        }
+    )
+    asyncio.run(service.update_composer_preferences(user, payload))
+    expected = "first_time" if intent == "complete" else intent
+    assert tutorial_completed_counter.calls[-1] == (1, {"completion_path": expected})
+    asyncio.run(service.update_composer_preferences(user, payload))
+    assert tutorial_completed_counter.calls[-1] == (1, {"completion_path": "repeat"})
+    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(tutorial_completed_at=None)))
+    assert tutorial_completed_counter.calls[-1] == (1, {"completion_path": "retake"})
+    count = len(tutorial_completed_counter.calls)
+    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(tutorial_completed_at=None)))
+    assert len(tutorial_completed_counter.calls) == count
+
+
+def test_unrelated_first_write_defaults_freeform_and_preserves_explicit_guided(service, engine):
+    user = "first-unrelated-preference"
+    with engine.begin() as connection:
+        ensure_test_identity(connection, identity_id=user)
+    result = asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(show_advanced=True)))
+    assert result.current.default_mode == "freeform"
+    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(default_mode="guided")))
+    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(show_advanced=False)))
+    assert asyncio.run(service.get_composer_preferences(user)).default_mode == "guided"

@@ -1760,7 +1760,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       set({
         error:
           "Session created, but couldn't apply your default mode. " +
-          "You're in freeform; switch to guided from the header if you want.",
+          "You're in freeform; mode options are in Composer options.",
       });
     }
   },

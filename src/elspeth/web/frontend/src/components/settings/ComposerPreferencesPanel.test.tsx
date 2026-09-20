@@ -28,17 +28,25 @@ describe("ComposerPreferencesForm", () => {
     usePreferencesStore.setState({
       loaded: true,
       defaultMode: "guided",
-      bannerDismissedAt: null,
       tutorialCompletedAt: null,
       tutorialCompleted: false,
       writing: false,
       writeError: null,
-      optedOutAtSessionId: null,
     });
     // Reset sessionStore so activeSessionId is null and reads from
     // useSessionStore.getState() are predictable.
     useSessionStore.setState({ activeSessionId: null });
     vi.clearAllMocks();
+  });
+
+  it.each(["freeform", "guided"] as const)("focuses the selected %s mode and lists Freeform first", (mode) => {
+    usePreferencesStore.setState({ defaultMode: mode });
+    render(<ComposerPreferencesPanel onClose={vi.fn()} />);
+    const group = screen.getByRole("group", { name: "Default mode for new sessions" });
+    const radios = within(group).getAllByRole("radio");
+    expect(radios[0]).toHaveAccessibleName("Freeform");
+    expect(radios[1]).toHaveAccessibleName("Guided");
+    expect(screen.getByRole("radio", { name: mode === "freeform" ? "Freeform" : "Guided" })).toHaveFocus();
   });
 
   it("renders the current default-mode selection (freeform)", () => {
@@ -62,7 +70,7 @@ describe("ComposerPreferencesForm", () => {
     expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
   });
 
-  it("writes the new default-mode on selection (forwards activeSessionId watermark)", async () => {
+  it("writes the new default-mode on selection", async () => {
     const setDefault = vi
       .spyOn(usePreferencesStore.getState(), "setDefaultMode")
       .mockResolvedValueOnce(undefined);
@@ -70,13 +78,10 @@ describe("ComposerPreferencesForm", () => {
     render(<ComposerPreferencesForm />);
     await userEvent.click(screen.getByLabelText(/freeform/i));
 
-    // Second arg is the activeSessionId watermark used by the
-    // DefaultModeChangedBanner timing predicate. Null here because no
-    // session is active in the test setup.
-    expect(setDefault).toHaveBeenCalledWith("freeform", null);
+    expect(setDefault).toHaveBeenCalledWith("freeform");
   });
 
-  it("forwards the active session id when one is set (banner timing watermark)", async () => {
+  it("changes only the default when an active session exists", async () => {
     useSessionStore.setState({ activeSessionId: "sess-xyz" });
     const setDefault = vi
       .spyOn(usePreferencesStore.getState(), "setDefaultMode")
@@ -85,7 +90,7 @@ describe("ComposerPreferencesForm", () => {
     render(<ComposerPreferencesForm />);
     await userEvent.click(screen.getByLabelText(/freeform/i));
 
-    expect(setDefault).toHaveBeenCalledWith("freeform", "sess-xyz");
+    expect(setDefault).toHaveBeenCalledWith("freeform");
   });
 
   it("disables inputs while writing", () => {
@@ -111,8 +116,8 @@ describe("ComposerPreferencesForm", () => {
     expect(alert).toBeInTheDocument();
     expect(alert).toHaveTextContent(/503 Service Unavailable/);
     // The affordance is the shared stylesheet rule, not a one-off inline
-    // style: the same class ships on DefaultModeChangedBanner and
-    // UserAdminDialog, and only this call site used to carry inline colour,
+    // style: the same class ships on UserAdminDialog, and only this call
+    // site used to carry inline colour,
     // so the same error rendered two different ways (elspeth-b9871d3648).
     expect(alert).toHaveClass("composer-preferences-error");
     expect(alert.getAttribute("style")).toBeNull();
@@ -212,7 +217,6 @@ describe("ComposerPreferencesForm", () => {
     const user = userEvent.setup();
     vi.mocked(updateUserComposerPreferences).mockResolvedValueOnce({
       default_mode: "guided",
-      banner_dismissed_at: null,
       freeform_intro_dismissed_at: null,
       tutorial_completed_at: null,
       tutorial_stage: null,
@@ -249,12 +253,10 @@ describe("ComposerPreferencesPanel — modal chrome", () => {
     usePreferencesStore.setState({
       loaded: true,
       defaultMode: "guided",
-      bannerDismissedAt: null,
       tutorialCompletedAt: null,
       tutorialCompleted: false,
       writing: false,
       writeError: null,
-      optedOutAtSessionId: null,
     });
     useSessionStore.setState({ activeSessionId: null });
     vi.clearAllMocks();

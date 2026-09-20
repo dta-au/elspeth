@@ -1178,11 +1178,25 @@
    rule and made the row unresponsive at any breakpoint. */
 .chat-panel-header-actions {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-sm);
   min-width: 0;
   flex: 0 1 auto;
   margin-left: auto;
+}
+
+.composer-options {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-sm);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.composer-options > div {
+  max-width: 100%;
 }
 
 /* Composer-authority chip (elspeth-f5e6723133) — names whether this session
@@ -1212,8 +1226,8 @@
   border-left-color: var(--color-success);
 }
 
-/* ModeSwitchButton — the symmetric guided<->freeform toggle in BOTH body
-   headers ("Switch to guided" / "Exit to freeform"). Quiet outline at rest with
+/* ModeSwitchButton — conversion controls shared by Composer options and the
+   Guided header. Quiet outline at rest with
    a hover lift and WCAG 2.5.8 target height (36px compact — the chrome-row
    size; this is the control that sets the header's 52px canonical height,
    matching .artifact-workspace-toolbar across the pane divider). The confirm

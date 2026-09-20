@@ -6,7 +6,7 @@ destructive archive/drop/recreate action during a stopped-service window. This
 document is a procedure and a record template, not evidence that a cutover has
 occurred. Complete it against the final candidate commit after the integrated
 identity tests and release gates have finished. The current development base
-has Sessions epoch 60 and Landscape epoch 42; measure the final candidate
+has Sessions epoch 61 and Landscape epoch 42; measure the final candidate
 values instead of copying those numbers into the operator record.
 
 ## Before stopping the service

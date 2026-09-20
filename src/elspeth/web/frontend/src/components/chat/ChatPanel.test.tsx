@@ -6456,11 +6456,8 @@ assistant_message_kind: "synthetic_failure",
     expect(
       screen.queryByRole("button", { name: "Exit to freeform" }),
     ).toBeNull();
-    // Default-freeform contract: freeform body surfaces a "Switch to guided"
-    // affordance in the header so the user can opt into guided mode.
-    expect(
-      screen.getByRole("button", { name: "Switch to guided" }),
-    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Switch to guided" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Composer options" })).toHaveAttribute("aria-expanded", "false");
   });
 
   it("'Switch to guided' collects a goal from the freeform body and passes it to enterGuided()", async () => {
@@ -6480,6 +6477,7 @@ assistant_message_kind: "synthetic_failure",
 
     render(<ChatPanel />);
 
+    fireEvent.click(screen.getByRole("button", { name: "Composer options" }));
     const button = screen.getByRole("button", { name: "Switch to guided" });
     await act(async () => {
       button.click();
@@ -6801,6 +6799,7 @@ assistant_message_kind: "synthetic_failure",
 
     render(<ChatPanel />);
 
+    fireEvent.click(screen.getByRole("button", { name: "Composer options" }));
     expect(
       screen.getByRole("button", { name: "Switch to guided" }),
     ).not.toBeDisabled();
@@ -6844,6 +6843,7 @@ assistant_message_kind: "synthetic_failure",
 
     render(<ChatPanel />);
 
+    fireEvent.click(screen.getByRole("button", { name: "Composer options" }));
     const button = screen.getByRole("button", { name: "Switch to guided" });
     expect(button).not.toBeDisabled();
     await act(async () => {

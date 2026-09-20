@@ -21,7 +21,6 @@ function makePayload(
 ): UserComposerPreferencesPayload {
   return {
     default_mode: "guided",
-    banner_dismissed_at: null,
     freeform_intro_dismissed_at: null,
     tutorial_completed_at: null,
     tutorial_stage: null,
@@ -56,7 +55,6 @@ describe("api/client user composer preferences", () => {
     const prefs = await fetchUserComposerPreferences();
 
     expect(prefs.default_mode).toBe("guided");
-    expect(prefs.banner_dismissed_at).toBeNull();
     expect(prefs.tutorial_completed_at).toBeNull();
     const [url, init] = fetchSpy.mock.calls[0];
     expect(url).toBe("/api/composer-preferences");

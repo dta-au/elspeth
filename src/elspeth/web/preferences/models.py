@@ -84,7 +84,6 @@ class ComposerPreferences(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     default_mode: ComposerMode
-    banner_dismissed_at: datetime | None
     freeform_intro_dismissed_at: datetime | None
     tutorial_completed_at: datetime | None
     # In-progress tutorial resume state. All four are NULL when no tutorial
@@ -104,28 +103,19 @@ class ComposerPreferences(BaseModel):
 class UpdateComposerPreferencesRequest(BaseModel):
     """Partial-update payload for PATCH.
 
-    Every field is independently optional; the service writes only the
+    Fields are optional except for the coupled completion intent and mode;
+    the service writes only the
     fields the caller actually set. An empty PATCH is a no-op (the
     request succeeds; ``updated_at`` is bumped if any row already
     exists; if no row exists, none is created — see PreferencesService
     Panel C2 guard for the no-insert contract).
 
-    ``banner_dismissed_at`` semantics:
-
-      - Field absent from JSON → unchanged.
-      - JSON ``null`` → clear the banner dismissal (the banner re-shows
-        on next session — there is no separate "un-dismiss" RPC).
-      - ISO-8601 datetime string → set to that value (records the
-        dismissal time).
-
-    This field uses ``model_fields_set`` in the service so the
-    re-show affordance can distinguish "not mentioned" from "clear it".
-
     ``tutorial_completed_at`` semantics:
 
       - Field absent from JSON → unchanged.
       - JSON ``null`` → clear/reset the tutorial completion gate.
-      - ISO-8601 datetime string → set to that value.
+      - ISO-8601 datetime string → set to that value; requires an explicit
+        ``tutorial_completed_via`` and ``default_mode="freeform"``.
 
     This field uses ``model_fields_set`` in the service so the reset
     affordance can distinguish "not mentioned" from "clear it".
@@ -135,8 +125,8 @@ class UpdateComposerPreferencesRequest(BaseModel):
     absent-vs-explicit-null discrimination via ``model_fields_set``. They
     interact with ``tutorial_completed_at`` through the service's
     completion-clears-progress rule: a PATCH that sets OR clears
-    ``tutorial_completed_at`` also clears any resume fields it does not
-    itself supply, because completing (or resetting for a retake — the e2e
+    ``tutorial_completed_at`` clears resume state and rejects populated
+    resume fields in the same request, because completing (or resetting for a retake — the e2e
     harness recipe) terminates any in-progress tutorial. See
     ``PreferencesService.update_composer_preferences``.
     """
@@ -144,7 +134,6 @@ class UpdateComposerPreferencesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     default_mode: ComposerMode | None = None
-    banner_dismissed_at: datetime | None = None
     freeform_intro_dismissed_at: datetime | None = None
     tutorial_completed_at: datetime | None = None
     tutorial_stage: TutorialStage | None = None
@@ -152,16 +141,21 @@ class UpdateComposerPreferencesRequest(BaseModel):
     tutorial_run_id: str | None = None
     tutorial_source_data_hash: str | None = None
     show_advanced: bool | None = None
-    # Request-only telemetry discriminator (never persisted, not in the GET
-    # payload): qualifies a completion write as an explicit tutorial exit
-    # (the in-tutorial "Exit tutorial" / exit-to-freeform opt-out,
-    # elspeth-61591e64bb). Without it the server's payload-shape inference
-    # would bucket an exit as "skip". Only meaningful alongside a non-null
-    # ``tutorial_completed_at`` in the same PATCH — enforced below.
-    tutorial_completed_via: Literal["exit"] | None = None
+    # Request-only intent; completion and the Freeform default are one write.
+    tutorial_completed_via: Literal["complete", "skip", "exit"] | None = None
 
     @model_validator(mode="after")
     def _via_requires_completion_write(self) -> "UpdateComposerPreferencesRequest":
-        if self.tutorial_completed_via is not None and self.tutorial_completed_at is None:
+        if "tutorial_completed_at" in self.model_fields_set and any(
+            value is not None
+            for value in (self.tutorial_stage, self.tutorial_session_id, self.tutorial_run_id, self.tutorial_source_data_hash)
+        ):
+            raise ValueError("tutorial completion or reset cannot include populated progress fields")
+        if self.tutorial_completed_at is not None:
+            if self.tutorial_completed_via is None:
+                raise ValueError("tutorial_completed_at requires tutorial_completed_via")
+            if self.default_mode != "freeform":
+                raise ValueError("tutorial completion requires default_mode=freeform")
+        elif "tutorial_completed_via" in self.model_fields_set:
             raise ValueError("tutorial_completed_via requires a non-null tutorial_completed_at in the same PATCH")
         return self

@@ -2,9 +2,8 @@
    composer preferences).
    Owners: .secrets-*, .user-admin-*, .composer-preferences-*.
 
-   .composer-preferences-error is also rendered by
-   components/common/DefaultModeChangedBanner.tsx and by UserAdminDialog, so
-   the rule below is the one error affordance all three share; it is defined
+   .composer-preferences-error is also rendered by UserAdminDialog, so
+   the rule below is the error affordance both share; it is defined
    here, with the rest of the settings surface, rather than being duplicated
    per call site (elspeth-b9871d3648). */
 
@@ -63,8 +62,8 @@
   gap: var(--space-sm);
 }
 
-/* THE settings error affordance — one rule, four call sites: the secret
-   entry form, ComposerPreferencesForm, DefaultModeChangedBanner and
+/* THE settings error affordance — one rule for the secret
+   entry form, ComposerPreferencesForm and
    UserAdminDialog (elspeth-b9871d3648). Every one of them renders it on a
    role="alert"/aria-describedby element whose whole purpose is to be
    noticed. Before this, .composer-preferences-error had three call sites and

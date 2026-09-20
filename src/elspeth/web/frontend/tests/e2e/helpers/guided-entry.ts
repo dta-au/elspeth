@@ -32,6 +32,7 @@ export const CONFIRM_SWITCH_TO_GUIDED = "Confirm switch to guided";
  * screen rather than later as a missing wizard.
  */
 export async function switchToGuidedWithGoal(page: Page, goal: string): Promise<void> {
+  await page.getByRole("button", { name: "Composer options", exact: true }).click();
   await page.getByRole("button", { name: SWITCH_TO_GUIDED }).click();
   await page.getByLabel(GUIDED_GOAL_LABEL).fill(goal);
   const confirm = page.getByRole("button", { name: CONFIRM_SWITCH_TO_GUIDED, exact: true });

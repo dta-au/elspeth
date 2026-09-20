@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
 import { usePreferencesStore } from "@/stores/preferencesStore";
-import { useSessionStore } from "@/stores/sessionStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useTheme, type Theme } from "@/hooks/useTheme";
 import { Button, Input } from "@/components/ui";
@@ -14,9 +13,7 @@ import type { ComposerMode } from "@/types/api";
  *
  * Surfaces a role="alert" region (Panel a11y F2) for failed PATCH results
  * so the write failure is announced rather than silently logging to
- * console only. Also forwards activeSessionId to setDefaultMode so the
- * banner's timing watermark is set if the user opts out from settings
- * while a session is active.
+ * console only. The preference applies to new sessions.
  */
 interface ComposerPreferencesFormProps {
   onClose?: () => void;
@@ -46,9 +43,8 @@ export function ComposerPreferencesForm({
   // for !loaded sits after the hook calls.
   const onChange = useCallback(
     async (mode: ComposerMode) => {
-      const activeSessionId = useSessionStore.getState().activeSessionId;
       try {
-        await setDefaultMode(mode, activeSessionId);
+        await setDefaultMode(mode);
       } catch (err) {
         // Surfaced via writeError -> role="alert" region below.
         console.error("[preferences] setDefaultMode failed:", err);
@@ -101,23 +97,23 @@ export function ComposerPreferencesForm({
           <Input
             type="radio"
             name="composer-default-mode"
-            value="guided"
-            checked={defaultMode === "guided"}
-            disabled={writing}
-            onChange={() => void onChange("guided")}
-          />
-          <span>Guided (recommended)</span>
-        </label>
-        <label className="composer-preferences-option">
-          <Input
-            type="radio"
-            name="composer-default-mode"
             value="freeform"
             checked={defaultMode === "freeform"}
             disabled={writing}
             onChange={() => void onChange("freeform")}
           />
           <span>Freeform</span>
+        </label>
+        <label className="composer-preferences-option">
+          <Input
+            type="radio"
+            name="composer-default-mode"
+            value="guided"
+            checked={defaultMode === "guided"}
+            disabled={writing}
+            onChange={() => void onChange("guided")}
+          />
+          <span>Guided</span>
         </label>
       </fieldset>
       <fieldset className="composer-preferences-fieldset">
@@ -235,7 +231,7 @@ export function ComposerPreferencesPanel({
   useFocusTrap(
     modalRef,
     true,
-    "input[name='composer-default-mode'][value='guided']",
+    "input[name='composer-default-mode']:checked",
   );
 
   useEffect(() => {

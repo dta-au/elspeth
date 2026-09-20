@@ -112,10 +112,6 @@
   overflow: hidden;
 }
 
-.workspace-authoring-status {
-  flex: 0 0 auto;
-}
-
 /* The application's bottom bar: the rule and the fill are painted ONCE, by
    this one grid item spanning both columns (elspeth-9c94a58500). Its cells are
    the parent grid's own columns via subgrid, so the collapse control lands in

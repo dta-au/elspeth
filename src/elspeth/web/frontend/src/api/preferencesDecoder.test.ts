@@ -3,7 +3,6 @@ import { decodeUserComposerPreferences } from "./preferencesDecoder";
 
 const full = {
   default_mode: "guided",
-  banner_dismissed_at: null,
   freeform_intro_dismissed_at: "2026-05-19T12:00:00Z",
   tutorial_completed_at: null,
   tutorial_stage: "run",

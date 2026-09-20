@@ -55,7 +55,6 @@ const STAGES: Record<PersistedTutorialStage, true> = {
 };
 const KEYS = [
   "default_mode",
-  "banner_dismissed_at",
   "freeform_intro_dismissed_at",
   "tutorial_completed_at",
   "tutorial_stage",
@@ -107,7 +106,6 @@ export function decodeUserComposerPreferences(value: unknown): UserComposerPrefe
   }
   return {
     default_mode: mode as ComposerMode,
-    banner_dismissed_at: nullableString(r.banner_dismissed_at, `${path}.banner_dismissed_at`),
     freeform_intro_dismissed_at: nullableString(r.freeform_intro_dismissed_at, `${path}.freeform_intro_dismissed_at`),
     tutorial_completed_at: nullableString(r.tutorial_completed_at, `${path}.tutorial_completed_at`),
     tutorial_stage: stage as PersistedTutorialStage | null,

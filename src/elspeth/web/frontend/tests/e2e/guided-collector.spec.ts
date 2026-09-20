@@ -380,6 +380,18 @@ interface FixtureState {
 }
 
 async function installCollectorRoutes(page: Page, state: FixtureState): Promise<void> {
+  // This Guided-specific scenario explicitly opts into Guided.
+  const preferences: Record<string, unknown> = {
+    default_mode: "guided",
+    freeform_intro_dismissed_at: null,
+    tutorial_completed_at: null,
+    tutorial_stage: null,
+    tutorial_session_id: null,
+    tutorial_run_id: null,
+    tutorial_source_data_hash: null,
+    show_advanced: false,
+    updated_at: null,
+  };
   await page.route("**/api/**", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -420,50 +432,23 @@ async function installCollectorRoutes(page: Page, state: FixtureState): Promise<
       return;
     }
 
-    // Full wire shape: the payload is decoded structurally since 69c910a56
-    // (preferencesDecoder.ts KEYS) and a missing key fails the tutorial gate
-    // closed, which is what hid the "Let's go" welcome turn.
-    if (path === "/api/composer-preferences" && method === "GET") {
-      await route.fulfill({
-        json: {
-          default_mode: "guided",
-          banner_dismissed_at: null,
-          freeform_intro_dismissed_at: null,
-          tutorial_completed_at: null,
-          tutorial_stage: null,
-          tutorial_session_id: null,
-          tutorial_run_id: null,
-          tutorial_source_data_hash: null,
-          // The wire contract carries this and the wire-stage assertions below
-          // depend on it: with show_advanced false every per-row "Technical
-          // details" disclosure starts CLOSED, which is what the expand loop
-          // relies on (elspeth-ca456d9d8d). State the precondition here rather
-          // than inheriting it from the store's default.
-          show_advanced: false,
-          updated_at: null,
-        },
-      });
-      return;
-    }
-
-    if (path === "/api/composer-preferences" && method === "PATCH") {
-      await route.fulfill({
-        json: {
-          default_mode: "guided",
-          banner_dismissed_at: null,
-          freeform_intro_dismissed_at: null,
-          tutorial_completed_at: null,
-          tutorial_stage: null,
-          tutorial_session_id: null,
-          tutorial_run_id: null,
-          tutorial_source_data_hash: null,
-          // The PATCH response echoes the persisted preferences and the store
-          // reads show_advanced straight off it, so it carries the same value
-          // the GET above states (elspeth-ca456d9d8d).
-          show_advanced: false,
-          updated_at: "2026-08-25T12:11:00Z",
-        },
-      });
+    if (path === "/api/composer-preferences") {
+      if (method === "PATCH") {
+        const body = request.postDataJSON() as Record<string, unknown>;
+        for (const key of Object.keys(preferences)) {
+          if (key in body) preferences[key] = body[key];
+        }
+        if (body.tutorial_completed_at != null) {
+          expect(body.default_mode).toBe("freeform");
+          expect(["complete", "skip", "exit"]).toContain(body.tutorial_completed_via);
+          preferences.tutorial_stage = null;
+          preferences.tutorial_session_id = null;
+          preferences.tutorial_run_id = null;
+          preferences.tutorial_source_data_hash = null;
+        }
+        preferences.updated_at = "2026-08-25T12:11:00Z";
+      }
+      await route.fulfill({ json: preferences });
       return;
     }
 
@@ -608,6 +593,7 @@ async function installCollectorRoutes(page: Page, state: FixtureState): Promise<
       await route.fulfill({
         json: {
           is_valid: true,
+          readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
           summary: "Collector pipeline is valid.",
           checks: [],
           errors: [],
@@ -627,6 +613,7 @@ async function installCollectorRoutes(page: Page, state: FixtureState): Promise<
           rows: [],
           validation_result: {
             is_valid: true,
+            readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
             summary: "Collector pipeline is valid.",
             checks: [],
             errors: [],

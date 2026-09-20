@@ -5,6 +5,7 @@ import {
   respondGuided,
 } from "@/api/client";
 import { ChatPanel } from "@/components/chat/ChatPanel";
+import { Button } from "@/components/ui";
 import {
   EXIT_TO_FREEFORM_ACTION,
   useSessionStore,
@@ -136,6 +137,7 @@ export function TutorialGuidedShell({
   const sawActiveRef = useRef(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [startupAttempt, setStartupAttempt] = useState(0);
   // The runtime-resolved synthetic sample URLs for THIS tutorial session
   // (8a GET surface). null until they resolve; the ChatPanel is gated on them
   // so the box is never an editable/empty placeholder and the learner can never
@@ -173,9 +175,12 @@ export function TutorialGuidedShell({
           const exit = await exitStartedGuidedSession(sessionId);
           if (exit.status !== "complete") {
             setError(exit.message);
+          } else if (!handedOffRef.current) {
+            handedOffRef.current = true;
+            onExited?.(sessionId);
           }
         } catch (err) {
-          console.error("[tutorial] startup exit-to-freeform failed:", err);
+          setError(formatError(err));
         }
         return true;
       };
@@ -217,7 +222,9 @@ export function TutorialGuidedShell({
     seedGuided,
     resetForTutorialSession,
     onSessionMissing,
+    onExited,
     exitRequestedRef,
+    startupAttempt,
   ]);
 
   // Hand off when guided reaches a terminal — but ONLY on a terminal this
@@ -278,9 +285,15 @@ export function TutorialGuidedShell({
           {starting ? "Starting guided composer" : ""}
         </p>
         {error !== null && (
-          <p role="alert" className="tutorial-error">
-            {error}
-          </p>
+          <div>
+            <p role="alert" className="tutorial-error">{error}</p>
+            <Button variant="bare" disabled={starting} onClick={() => {
+              startedRef.current = false;
+              setStartupAttempt((attempt) => attempt + 1);
+            }}>
+              Retry tutorial startup
+            </Button>
+          </div>
         )}
         {sampleUrls !== null ? (
           // Gate the wizard on the resolved URLs: the locked STEP_1 prompt must

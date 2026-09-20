@@ -33,7 +33,19 @@ describe("TutorialTurn7Graduation", () => {
       renameSession: vi.fn().mockResolvedValue(undefined),
       loadSessions: vi.fn().mockResolvedValue(undefined),
       selectSession: vi.fn().mockImplementation(async (id: string) => {
-        useSessionStore.setState({ activeSessionId: id });
+        useSessionStore.setState({ activeSessionId: id, guidedSession: {
+          step: "step_4_wire", history: [], chat_history: [], chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] }, profile: null,
+          terminal: { kind: "completed", reason: null, pipeline_yaml: "sources: {}" },
+        } });
+      }),
+      exitToFreeform: vi.fn().mockImplementation(async () => {
+        const guided = useSessionStore.getState().guidedSession;
+        if (guided === null) throw new Error("Missing test session");
+        useSessionStore.setState({ guidedSession: {
+          ...guided, terminal: { kind: "exited_to_freeform", reason: "user_pressed_exit", pipeline_yaml: null },
+        } });
+        return { status: "applied" };
       }),
     } as never);
     vi.mocked(api.createSession).mockResolvedValue({
@@ -42,17 +54,13 @@ describe("TutorialTurn7Graduation", () => {
       created_at: "2026-05-19T12:30:00Z",
       updated_at: "2026-05-19T12:30:00Z",
     });
-    // Body-aware echo mirroring the backend: a default_mode-only PATCH does
-    // not touch tutorial_completed_at, and vice versa. saveTutorialMode (sent
-    // first by onFinish) must not flip tutorialCompleted to true off a
-    // default_mode write.
+    // Completion and Freeform preference are saved in one request.
     vi.mocked(api.updateUserComposerPreferences).mockImplementation(
       async (body) => ({
         default_mode:
           body.default_mode ??
           usePreferencesStore.getState().defaultMode ??
-          "guided",
-        banner_dismissed_at: null,
+          "freeform",
         freeform_intro_dismissed_at: null,
         tutorial_completed_at:
           body.tutorial_completed_at === undefined
@@ -118,7 +126,9 @@ describe("TutorialTurn7Graduation", () => {
 
     await waitFor(() => {
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
+        default_mode: "freeform",
         tutorial_completed_at: expect.any(String),
+        tutorial_completed_via: "complete",
       });
     });
     expect(usePreferencesStore.getState().tutorialCompleted).toBe(true);
@@ -131,7 +141,7 @@ describe("TutorialTurn7Graduation", () => {
     expect(api.createSession).not.toHaveBeenCalled();
   });
 
-  it("renames the tutorial session and saves Guided as the default before finishing", async () => {
+  it("renames the tutorial session and saves Freeform with explicit completion intent", async () => {
     const user = userEvent.setup();
     render(
       <TutorialTurn7Graduation
@@ -151,14 +161,13 @@ describe("TutorialTurn7Graduation", () => {
       ),
     );
     expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-      default_mode: "guided",
-    });
-    expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
+      default_mode: "freeform",
       tutorial_completed_at: expect.any(String),
+      tutorial_completed_via: "complete",
     });
   });
 
-  it("does not rename a skipped tutorial session but still saves Guided default", async () => {
+  it("does not rename a skipped tutorial session and saves Freeform", async () => {
     const user = userEvent.setup();
     render(
       <TutorialTurn7Graduation
@@ -173,7 +182,9 @@ describe("TutorialTurn7Graduation", () => {
     );
     await waitFor(() => {
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-        default_mode: "guided",
+        default_mode: "freeform",
+        tutorial_completed_at: expect.any(String),
+        tutorial_completed_via: "skip",
       });
     });
     expect(useSessionStore.getState().renameSession).not.toHaveBeenCalled();
@@ -231,7 +242,7 @@ describe("TutorialTurn7Graduation", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
-  it("shows a role alert when the composer cannot open the built pipeline after graduation is saved", async () => {
+  it("does not save graduation when the composer cannot open the built pipeline", async () => {
     const user = userEvent.setup();
     // selectSession resolves but leaves the session inactive (e.g. a 404 on
     // load cleared activeSessionId); graduation must surface the failure and
@@ -257,11 +268,41 @@ describe("TutorialTurn7Graduation", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "The composer could not open your pipeline.",
     );
-    expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-      tutorial_completed_at: expect.any(String),
-    });
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
     expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
     expect(useSessionStore.getState().activeSessionId).toBeNull();
+  });
+
+  it("refuses graduation when the session ID loaded but its Guided state did not", async () => {
+    useSessionStore.setState({ selectSession: vi.fn().mockImplementation(async (id: string) => {
+      useSessionStore.setState({ activeSessionId: id, guidedSession: null });
+    }) });
+    const user = userEvent.setup();
+    render(<TutorialTurn7Graduation sessionId="sess-new" skipped={false} cancelled={false} />);
+    await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The tutorial session has not loaded");
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
+  });
+
+  it("keeps a pending exit visible and allows retry without publishing completion", async () => {
+    const appliedExit = useSessionStore.getState().exitToFreeform;
+    const exitToFreeform = vi.fn().mockResolvedValueOnce({
+      status: "not_applied", reason: "pending", message: "Wait for the current operation to finish.",
+    }).mockImplementationOnce(appliedExit);
+    useSessionStore.setState({ exitToFreeform });
+    const user = userEvent.setup();
+    render(<TutorialTurn7Graduation sessionId="sess-new" skipped={false} cancelled={false} />);
+    await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Wait for the current operation to finish.");
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
+    expect(screen.getByRole("button", { name: "Take me to the composer" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
+    await waitFor(() => expect(usePreferencesStore.getState().tutorialCompleted).toBe(true));
+    expect(useSessionStore.getState().activeSessionId).toBe("sess-new");
+    expect(useSessionStore.getState().guidedSession?.terminal?.kind).toBe("exited_to_freeform");
+    expect(api.updateUserComposerPreferences).toHaveBeenCalledTimes(1);
   });
 });
 

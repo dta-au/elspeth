@@ -56,7 +56,6 @@ const artifactWorkspacePropsSpy = vi.hoisted(() => vi.fn());
 vi.mock("./components/workspace/ComposerWorkspace", () => ({
   ComposerWorkspace: (props: {
     authoring: React.ReactNode;
-    authoringStatus?: React.ReactNode;
     artifact: React.ReactNode;
     inspector: React.ReactNode;
     actionBar: React.ReactNode;
@@ -66,7 +65,6 @@ vi.mock("./components/workspace/ComposerWorkspace", () => ({
     return (
       <div data-testid="composer-workspace-stub">
         {props.authoring}
-        {props.authoringStatus}
         {props.artifact}
         {props.inspector}
         {props.actionBar}
@@ -288,7 +286,6 @@ vi.mock("./api/client", () => ({
   // (throwing at first call) without the mock entries.
   fetchUserComposerPreferences: vi.fn().mockResolvedValue({
     default_mode: "guided",
-    banner_dismissed_at: null,
     freeform_intro_dismissed_at: null,
     tutorial_completed_at: "2026-05-19T00:00:00Z",
     tutorial_stage: null,
@@ -1745,12 +1742,12 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     // silent-swallow was the I5 bug (CorruptPreferencesError got
     // logged-and-forgotten, leaving the user with no signal). Bootstrap
     // is now contracted to NEVER reject; failures are surfaced via the
-    // store's writeError so the role="alert" region (Phase 1B-round-2)
+    // store's bootstrapError so the role="alert" region (Phase 1B-round-2)
     // shows the user something is wrong.
     //
     // We exercise the failure path through the lower API mock rather
     // than spying on bootstrap directly, so the test runs through the
-    // real bootstrap() implementation including the catch/writeError
+    // real bootstrap() implementation including the catch/bootstrapError
     // branch — the part that was previously uncovered.
     const apiClient = await import("@/api/client");
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
@@ -1764,7 +1761,8 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     await waitFor(() => {
       const state = usePreferencesStore.getState();
       expect(state.loaded).toBe(true);
-      expect(state.writeError).not.toBeNull();
+      expect(state.bootstrapError).not.toBeNull();
+      expect(state.writeError).toBeNull();
     });
     // No-fabrication shape: defaultMode is still null (we don't guess).
     expect(usePreferencesStore.getState().defaultMode).toBeNull();
@@ -1773,10 +1771,10 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
     // I5: the failure MUST be surfaced to the user via the always-mounted
     // alert region in App.tsx. Without this assertion the test would
-    // pass even if writeError were set in the store but never rendered
+    // pass even if bootstrapError were set in the store but never rendered
     // to the DOM — the silent-failure-one-layer-up regression I5
     // exists to prevent. The role="alert" region carries the
-    // writeError text from the store.
+    // bootstrapError text from the store.
     await waitFor(() => {
       const alerts = screen.getAllByRole("alert");
       const surfaced = alerts.some(
@@ -1829,6 +1827,47 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     );
   });
 
+  it("keeps the tutorial visible when saving a preference fails", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      defaultMode: "freeform",
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+      bootstrapError: null,
+      writeError: "Couldn't save your preference: network down",
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    expect(screen.getByTestId("tutorial-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-workspace-stub")).not.toBeInTheDocument();
+    expect(screen.getByText(/Couldn't save your preference: network down/)).toBeInTheDocument();
+  });
+
+  it("blocks the tutorial when preferences could not be loaded", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      defaultMode: null,
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+      bootstrapError: "Preferences could not be loaded: network down",
+      writeError: null,
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    expect(screen.queryByTestId("tutorial-stub")).not.toBeInTheDocument();
+    expect(screen.getByText(/Preferences could not be loaded: network down/)).toBeInTheDocument();
+  });
+
   it("remounts the tutorial shell after Reset tutorial succeeds", async () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
@@ -1847,7 +1886,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     );
     vi.spyOn(api, "updateUserComposerPreferences").mockResolvedValueOnce({
       default_mode: "guided",
-      banner_dismissed_at: null,
       freeform_intro_dismissed_at: null,
       tutorial_completed_at: null,
       tutorial_stage: null,

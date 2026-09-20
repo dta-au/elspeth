@@ -34,6 +34,7 @@ async function isolateAuditReadinessSideRail(
     await route.fulfill({
       json: {
         is_valid: true,
+        readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
         summary: "Guided demo pipeline validates.",
         checks: [],
         errors: [],
@@ -101,6 +102,7 @@ async function isolateAuditReadinessSideRail(
         ],
         validation_result: {
           is_valid: true,
+          readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
           summary: "Guided demo pipeline validates.",
           checks: [],
           errors: [],

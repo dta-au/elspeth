@@ -201,7 +201,6 @@ vi.mock("../api/client", () => ({
   },
   fetchUserComposerPreferences: vi.fn().mockResolvedValue({
     default_mode: "freeform",
-    banner_dismissed_at: null,
     tutorial_completed_at: "2026-05-19T00:00:00Z",
     tutorial_stage: null,
     tutorial_session_id: null,

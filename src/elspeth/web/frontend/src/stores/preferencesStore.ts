@@ -1,36 +1,4 @@
-// ============================================================================
-// preferencesStore — account-level composer preferences (Phase 1B Task 2).
-//
-// One Zustand store per user-account row at /api/composer-preferences.
-// Reads via bootstrap() on auth-success (App.tsx) and via resolveDefaultMode()
-// at session-create time (sessionStore.createSession). Writes are optimistic
-// with revert-on-error, gated by a single `writing` flag that serialises
-// concurrent setDefaultMode / saveTutorialMode /
-// markTutorialGraduated / dismissDefaultChangedBanner calls (all go
-// through PATCH; an unguarded race would let the second call's
-// optimistic set + revert overwrite the first call's pending result).
-//
-// defaultMode is null before bootstrap completes. Components MUST gate on
-// `loaded === true` before assuming a non-null mode; the typed getter
-// resolveDefaultMode() does this for non-component callers.
-//
-// Cross-tab coordination (Phase 1B Panel: banner cluster):
-//   When one tab calls dismissDefaultChangedBanner(), we write the resolved
-//   timestamp to localStorage under BANNER_DISMISSED_STORAGE_KEY. Other
-//   tabs subscribe (via initCrossTabSync) and update their local
-//   bannerDismissedAt without making a second PATCH. The storage event
-//   does not fire in the originating tab, so there is no echo loop.
-//   Mirrors src/hooks/useTheme.test.tsx's cross-tab pattern.
-//
-// Banner timing watermark (Phase 1B Panel: "first session after opt-out"):
-//   When setDefaultMode("freeform") is called and a session is currently
-//   active, we capture the activeSessionId into optedOutAtSessionId. The
-//   DefaultModeChangedBanner suppresses itself while the user is still in
-//   that session — they see the banner only after navigating to a new
-//   session or reloading. The watermark is in-memory only; a reload
-//   surfaces the banner (matches "I opted out, refreshed, see
-//   confirmation" intuition).
-// ============================================================================
+// Account-level preferences. Completion persistence and local publication are separate.
 
 import { create } from "zustand";
 import {
@@ -44,10 +12,6 @@ import type {
   UserComposerPreferencesPayload,
 } from "@/types/api";
 
-// localStorage key for cross-tab banner-dismiss broadcasts. Versioned
-// (`v1`) so a future schema change can add a `v2` key without colliding
-// with stale tabs that pre-date the upgrade.
-const BANNER_DISMISSED_STORAGE_KEY = "elspeth_prefs_banner_dismissed_v1";
 const FREEFORM_INTRO_DISMISSED_STORAGE_KEY =
   "elspeth_prefs_freeform_intro_dismissed_v1";
 
@@ -67,7 +31,6 @@ export interface TutorialProgress {
 
 interface PreferencesState {
   defaultMode: ComposerMode | null;
-  bannerDismissedAt: string | null;
   freeformIntroDismissedAt: string | null;
   tutorialCompletedAt: string | null;
   tutorialCompleted: boolean;
@@ -84,27 +47,18 @@ interface PreferencesState {
   // render this as an accessible role="alert" region (Panel a11y F2).
   // Cleared on the next successful write or by explicit clearError().
   writeError: string | null;
-  // Session in which the user opted out of guided. Banner suppresses while
-  // activeSessionId matches this watermark. See module comment.
-  optedOutAtSessionId: string | null;
-
+  bootstrapError: string | null;
   bootstrap: () => Promise<void>;
   saveTutorialProgress: (progress: TutorialProgress) => Promise<void>;
   resolveDefaultMode: () => Promise<ComposerMode>;
-  setDefaultMode: (mode: ComposerMode, activeSessionId?: string | null) => Promise<void>;
+  setDefaultMode: (mode: ComposerMode) => Promise<void>;
   setShowAdvanced: (value: boolean) => Promise<void>;
-  saveTutorialMode: (mode: ComposerMode) => Promise<void>;
-  markTutorialGraduated: (options?: {
+  markTutorialGraduated: (options: {
     publishLocally?: boolean;
-    // Telemetry discriminator: an explicit in-tutorial exit (the wire-stage
-    // exit terminal or the shell-chrome "Exit tutorial" control) rides the
-    // PATCH as tutorial_completed_via so the backend does not bucket it as
-    // "skip" (elspeth-61591e64bb).
-    via?: "exit";
+    via: "complete" | "skip" | "exit";
   }) => Promise<string | null>;
   publishTutorialGraduation: (completedAt: string | null) => void;
   resetTutorial: () => Promise<void>;
-  dismissDefaultChangedBanner: () => Promise<void>;
   dismissFreeformIntro: () => Promise<void>;
   clearError: () => void;
   reset: () => void;
@@ -127,21 +81,12 @@ function isRateLimitedApiError(
   );
 }
 
-// Longest the graduation retry will sleep on a server-supplied retry_after.
-// This MUST stay below markTutorialGraduated's own 5000ms wait-loop bound:
-// `writing` is held across the sleep, and the whole store assumes that flag
-// covers about one round-trip — the wait loop's double-stamp guard and five
-// sibling actions that `return` while it is true (resetTutorial, the
-// mid-tutorial wedged-resume escape hatch, most of all) both break if a
-// retry can hold it for tens of seconds. A retry_after ABOVE this cap is
-// therefore not slept out: the save fails fast and surfaces the envelope's
-// actionable "try again in N seconds" copy, which beats freezing the
-// tutorial's own escape hatch for half a minute.
+// Keep rate-limit sleeps shorter than the serialization wait. Longer server
+// retry intervals surface immediately as actionable errors.
 const MAX_RETRY_AFTER_WAIT_MS = 3_000;
 
 const INITIAL_STATE = {
   defaultMode: null as ComposerMode | null,
-  bannerDismissedAt: null as string | null,
   freeformIntroDismissedAt: null as string | null,
   tutorialCompletedAt: null as string | null,
   tutorialCompleted: false,
@@ -153,33 +98,17 @@ const INITIAL_STATE = {
   loaded: false,
   writing: false,
   writeError: null as string | null,
-  optedOutAtSessionId: null as string | null,
+  bootstrapError: null as string | null,
 };
 
 export const usePreferencesStore = create<PreferencesState>((set, get) => ({
   ...INITIAL_STATE,
 
   bootstrap: async () => {
-    // I5 — silent-failure-hunter remediation. bootstrap() is contracted
-    // to NEVER reject: callers (App.tsx, resolveDefaultMode) treat
-    // bootstrap as "load OR record why we couldn't". On failure we
-    // degrade to the guided default and surface the failure via
-    // writeError so the role="alert" region (Phase 1B-round-2) shows
-    // the user something is wrong. Loaded is set true on the failure
-    // branch as well so the UI doesn't block on a condition that will
-    // never become true (a corrupt-row user would otherwise be unable
-    // to even create a session).
-    //
-    // The error_type discriminator distinguishes a CorruptPreferencesError
-    // (the row is structurally invalid — needs operator action) from a
-    // transient network failure (will probably recover). The frontend
-    // does not show bad_value (the backend handler strips it), only the
-    // user-actionable framing.
     try {
       const payload = await fetchUserComposerPreferences();
       set({
         defaultMode: payload.default_mode,
-        bannerDismissedAt: payload.banner_dismissed_at,
         freeformIntroDismissedAt: payload.freeform_intro_dismissed_at,
         tutorialCompletedAt: payload.tutorial_completed_at,
         tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
@@ -189,6 +118,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorialSourceDataHash: payload.tutorial_source_data_hash,
         showAdvanced: payload.show_advanced,
         loaded: true,
+        bootstrapError: null,
       });
     } catch (err) {
       // No-fabrication shape: an absent value stays null rather than
@@ -217,40 +147,56 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
           : "Couldn't load your preferences.";
       set({
         loaded: true,
-        writeError: message,
+        bootstrapError: message,
       });
     }
   },
 
   saveTutorialProgress: async (progress) => {
-    // Deliberately NOT gated on the `writing` serialisation flag: stage
-    // transitions must never be silently dropped because an unrelated
-    // preferences write is in flight, and this PATCH touches only the
-    // disjoint tutorial_* resume fields (the backend upsert writes only
-    // the supplied fields, so there is no clobber hazard with a
-    // concurrent default_mode/banner write). No optimistic set/revert
-    // either — the local tutorial UI state lives in the tutorial
-    // machine; this store only mirrors the server's persisted copy, so
-    // it updates from the response.
-    const payload = await updateUserComposerPreferences({
-      tutorial_stage: progress.stage,
-      tutorial_session_id: progress.sessionId,
-      tutorial_run_id: progress.runId,
-      tutorial_source_data_hash: progress.sourceDataHash,
-    });
-    set({
-      tutorialStage: payload.tutorial_stage,
-      tutorialSessionId: payload.tutorial_session_id,
-      tutorialRunId: payload.tutorial_run_id,
-      tutorialSourceDataHash: payload.tutorial_source_data_hash,
-    });
+    // Completion clears these same fields, so progress participates in the
+    // write lock. A queued transition becomes obsolete once completion lands,
+    // even when its local publication is intentionally deferred.
+    for (let waitedMs = 0; get().writing && waitedMs < 5000; waitedMs += 50) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (get().writing) {
+      const error = new Error("Another preference save is still pending. Please try again.");
+      set({ writeError: error.message });
+      throw error;
+    }
+    if (get().tutorialCompletedAt !== null) return;
+    set({ writing: true, writeError: null });
+    try {
+      const payload = await updateUserComposerPreferences({
+        tutorial_stage: progress.stage,
+        tutorial_session_id: progress.sessionId,
+        tutorial_run_id: progress.runId,
+        tutorial_source_data_hash: progress.sourceDataHash,
+      });
+      set({
+        tutorialStage: payload.tutorial_stage,
+        tutorialSessionId: payload.tutorial_session_id,
+        tutorialRunId: payload.tutorial_run_id,
+        tutorialSourceDataHash: payload.tutorial_source_data_hash,
+        writing: false,
+        writeError: null,
+      });
+    } catch (err) {
+      set({
+        writing: false,
+        writeError: err instanceof Error
+          ? `Couldn't save tutorial progress: ${err.message}`
+          : "Couldn't save tutorial progress.",
+      });
+      throw err;
+    }
   },
 
   resolveDefaultMode: async () => {
     const current = get();
     if (current.loaded) {
       // bootstrap has already run. If defaultMode is null at this point,
-      // bootstrap failed (writeError is set) and a second bootstrap pass
+      // bootstrap failed (bootstrapError is set) and a second bootstrap pass
       // would just re-fail against the same broken backend. Throw
       // immediately so sessionStore.createSession surfaces the honest
       // secondary-failure attribution to the user without an extra
@@ -266,7 +212,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     const after = get();
     if (after.defaultMode === null) {
       // bootstrap resolved without populating defaultMode — backend contract
-      // violation (Phase 1A's GET always returns a row, defaulting to guided).
+      // violation (Phase 1A's GET always returns a row, defaulting to freeform).
       throw new Error(
         "preferencesStore: bootstrap completed but defaultMode is null",
       );
@@ -274,32 +220,16 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     return after.defaultMode;
   },
 
-  setDefaultMode: async (mode, activeSessionId = null) => {
+  setDefaultMode: async (mode) => {
     if (get().writing) return;
     const previous = get().defaultMode;
-    const wasOptOut = mode === "freeform" && previous !== "freeform";
-    // Capture the timing watermark BEFORE the async write so a reload
-    // mid-write still suppresses the banner for the current session if
-    // the write succeeds. Reset to null on opt-IN (mode === "guided") so
-    // an opt-out → opt-in → opt-out cycle gets a fresh watermark.
-    set({
-      defaultMode: mode,
-      writing: true,
-      writeError: null,
-      optedOutAtSessionId: wasOptOut
-        ? activeSessionId
-        : mode === "guided"
-          ? null
-          : get().optedOutAtSessionId,
-    });
+    set({ defaultMode: mode, writing: true, writeError: null });
     try {
       const payload = await updateUserComposerPreferences({
         default_mode: mode,
       });
       set({
         defaultMode: payload.default_mode,
-        tutorialCompletedAt: payload.tutorial_completed_at,
-        tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
         writing: false,
       });
     } catch (err) {
@@ -310,9 +240,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
           err instanceof Error
             ? `Couldn't save your preference: ${err.message}`
             : "Couldn't save your preference.",
-        // Revert the watermark on failure so the banner doesn't suppress
-        // for a write that didn't land.
-        optedOutAtSessionId: wasOptOut ? null : get().optedOutAtSessionId,
       });
       throw err;
     }
@@ -338,66 +265,24 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     }
   },
 
-  saveTutorialMode: async (mode) => {
-    if (get().writing) return;
-    const previous = {
-      defaultMode: get().defaultMode,
-      optedOutAtSessionId: get().optedOutAtSessionId,
-    };
-    set({
-      defaultMode: mode,
-      writing: true,
-      writeError: null,
-      optedOutAtSessionId: mode === "guided" ? null : get().optedOutAtSessionId,
-    });
-    try {
-      const payload = await updateUserComposerPreferences({
-        default_mode: mode,
-      });
-      set({
-        defaultMode: payload.default_mode,
-        bannerDismissedAt: payload.banner_dismissed_at,
-        tutorialCompletedAt: payload.tutorial_completed_at,
-        tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
-        writing: false,
-      });
-    } catch (err) {
-      set({
-        defaultMode: previous.defaultMode,
-        optedOutAtSessionId: previous.optedOutAtSessionId,
-        writing: false,
-        writeError:
-          err instanceof Error
-            ? `Couldn't save your preference: ${err.message}`
-            : "Couldn't save your preference.",
-      });
-      throw err;
-    }
-  },
-
-  markTutorialGraduated: async (options = {}) => {
-    // A graduation opt-out (skip or exit) must never be silently dropped
-    // because an unrelated preferences write is in flight — the old
-    // `if (writing) return` no-op did exactly that, stranding exit clicks
-    // (elspeth-61591e64bb). Wait for the in-flight write to settle before
-    // sending; bounded so a hung PATCH cannot wedge the exit (a rare
-    // interleaved write beats a dropped opt-out).
+  markTutorialGraduated: async (options) => {
+    // Wait for the current writer, then re-read the durable timestamp. A
+    // timeout must not overlap writes or report an unsaved completion.
     for (let waitedMs = 0; get().writing && waitedMs < 5000; waitedMs += 50) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    // Re-read AFTER the wait: the write just waited out may itself have been
-    // this same graduation (a double-clicked Exit, or the chrome exit racing
-    // the wizard's onExited hand-off). Proceeding unconditionally would stamp
-    // a second completion PATCH and double-count completion_path telemetry —
-    // the backend counts every via=exit write, not null→set transitions
-    // (preferences/service.py). publishLocally=false writes (skip) never set
-    // tutorialCompleted, so the graduation card's deliberate re-persist
-    // still goes through.
+    if (get().writing) {
+      const error = new Error("Another preference save is still pending. Please try again.");
+      set({ writeError: error.message });
+      throw error;
+    }
     const settled = get();
-    if (settled.tutorialCompleted && settled.tutorialCompletedAt !== null) {
+    const publishLocally = options.publishLocally ?? true;
+    if (settled.tutorialCompletedAt !== null) {
+      set({ writeError: null });
+      if (publishLocally) get().publishTutorialGraduation(settled.tutorialCompletedAt);
       return settled.tutorialCompletedAt;
     }
-    const publishLocally = options.publishLocally ?? true;
     const stamp = new Date().toISOString();
     const previous = {
       tutorialCompletedAt: get().tutorialCompletedAt,
@@ -408,10 +293,9 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       writeError: null,
     });
     const patchBody = {
+      default_mode: "freeform" as const,
       tutorial_completed_at: stamp,
-      ...(options.via !== undefined
-        ? { tutorial_completed_via: options.via }
-        : {}),
+      tutorial_completed_via: options.via,
     };
     try {
       let payload: UserComposerPreferencesPayload;
@@ -436,14 +320,9 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         payload = await updateUserComposerPreferences(patchBody);
       }
       set({
-        ...(publishLocally
-          ? {
-              tutorialCompletedAt: payload.tutorial_completed_at,
-              tutorialCompleted: tutorialCompletedFrom(
-                payload.tutorial_completed_at,
-              ),
-            }
-          : {}),
+        defaultMode: payload.default_mode,
+        tutorialCompletedAt: payload.tutorial_completed_at,
+        tutorialCompleted: publishLocally && tutorialCompletedFrom(payload.tutorial_completed_at),
         // Completion-clears-progress (backend rule): the server just
         // terminated any in-progress resume state; mirror it. Safe to
         // publish even when publishLocally=false — the resume fields do
@@ -453,6 +332,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorialRunId: payload.tutorial_run_id,
         tutorialSourceDataHash: payload.tutorial_source_data_hash,
         writing: false,
+        writeError: null,
       });
       return payload.tutorial_completed_at;
     } catch (err) {
@@ -506,7 +386,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       });
       set({
         defaultMode: payload.default_mode,
-        bannerDismissedAt: payload.banner_dismissed_at,
         tutorialCompletedAt: payload.tutorial_completed_at,
         tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
         // A retake restarts cleanly at Welcome: the reset PATCH also
@@ -527,62 +406,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
           err instanceof Error
             ? `Couldn't reset the tutorial: ${err.message}`
             : "Couldn't reset the tutorial.",
-      });
-      throw err;
-    }
-  },
-
-  dismissDefaultChangedBanner: async () => {
-    if (get().writing) {
-      // Offensive guard (the engine-patterns-reference skill §Offensive
-      // Programming Examples): the dismiss button is disabled
-      // while `writing` is true, so reaching this branch means a UI
-      // guard was bypassed (programmatic call, keyboard race, or
-      // future caller that doesn't read the writing flag). Throw a
-      // named error so the regression surfaces loudly instead of
-      // silently failing to dismiss.
-      throw new Error(
-        "preferencesStore: dismissDefaultChangedBanner called while a write was in flight — UI must disable the trigger before invoking this action",
-      );
-    }
-    const stamp = new Date().toISOString();
-    const previous = get().bannerDismissedAt;
-    set({ bannerDismissedAt: stamp, writing: true, writeError: null });
-    try {
-      const payload = await updateUserComposerPreferences({
-        banner_dismissed_at: stamp,
-      });
-      const resolved = payload.banner_dismissed_at;
-      set({
-        bannerDismissedAt: resolved,
-        tutorialCompletedAt: payload.tutorial_completed_at,
-        tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
-        writing: false,
-      });
-      // Cross-tab broadcast (Panel banner cluster): write the resolved
-      // value to localStorage so peer tabs update their local state
-      // without making a second PATCH. The storage event does not fire
-      // in this tab.
-      if (typeof window !== "undefined" && resolved !== null) {
-        try {
-          window.localStorage.setItem(
-            BANNER_DISMISSED_STORAGE_KEY,
-            resolved,
-          );
-        } catch {
-          // localStorage may be disabled (private browsing strict mode);
-          // in-tab state is correct, peer tabs will catch up on next
-          // bootstrap. No user-visible failure.
-        }
-      }
-    } catch (err) {
-      set({
-        bannerDismissedAt: previous,
-        writing: false,
-        writeError:
-          err instanceof Error
-            ? `Couldn't dismiss the banner: ${err.message}`
-            : "Couldn't dismiss the banner.",
       });
       throw err;
     }
@@ -635,7 +458,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
 
 // ── Cross-tab sync wiring ────────────────────────────────────────────────
 // Idempotent at-most-once subscription, attached at module load. Mirrors
-// the useTheme storage-event pattern but for the banner-dismiss key.
+// the useTheme storage-event pattern for freeform-introduction dismissal.
 // Guarded against re-execution (e.g. HMR) and SSR (no window).
 let crossTabSyncInitialised = false;
 
@@ -652,12 +475,6 @@ export function initCrossTabSync(): void {
       });
       return;
     }
-    if (event.key !== BANNER_DISMISSED_STORAGE_KEY) return;
-    // Update local state to match the broadcast value WITHOUT making
-    // another PATCH (the originating tab already wrote it). If the
-    // current store already has a non-null dismissed_at, prefer the
-    // peer's value (idempotent — the peer's value won the race).
-    usePreferencesStore.setState({ bannerDismissedAt: event.newValue });
   });
 }
 

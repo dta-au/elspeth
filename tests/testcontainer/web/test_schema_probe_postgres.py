@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,7 @@ from elspeth.web import schema_probe as schema_probe_module
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.preferences.models import UpdateComposerPreferencesRequest
-from elspeth.web.preferences.service import PreferencesService
+from elspeth.web.preferences.service import PreferencesService, TutorialProgressConflict
 from elspeth.web.schema_probe import (
     SchemaInitBusyError,
     SchemaState,
@@ -54,6 +55,7 @@ from elspeth.web.sessions.models import (
     guided_operation_events_table,
     guided_operations_table,
     skill_markdown_history_table,
+    user_preferences_table,
 )
 from elspeth.web.sessions.models import metadata as session_metadata
 from elspeth.web.sessions.models import schema_identity_table as session_schema_identity_table
@@ -107,6 +109,14 @@ def test_fresh_create_reaches_current(postgres_engine: Engine, kind: str) -> Non
         assert probe_landscape_schema(postgres_engine) is SchemaState.MISSING
         init_landscape_schema(postgres_engine)
         assert probe_landscape_schema(postgres_engine) is SchemaState.CURRENT
+
+
+def test_preferences_omitted_mode_uses_freeform_database_default(postgres_engine: Engine) -> None:
+    init_session_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="default-mode")
+        conn.execute(insert(user_preferences_table).values(user_id="default-mode", updated_at=func.now()))
+        assert conn.execute(select(user_preferences_table.c.default_composer_mode)).scalar_one() == "freeform"
 
 
 @pytest.mark.parametrize(
@@ -1159,6 +1169,80 @@ def test_preferences_upsert_round_trips_on_postgres(postgres_engine: Engine) -> 
     assert transition.current.default_mode == "guided"
     assert transition.current.tutorial_completed_at is None
     assert asyncio.run(service.get_composer_preferences("postgres-preferences-user")) == transition.current
+
+
+@pytest.mark.parametrize("existing_progress", [False, True])
+def test_late_tutorial_progress_cannot_overwrite_committed_completion(postgres_engine: Engine, existing_progress: bool) -> None:
+    """The upsert must recheck completion after its READ COMMITTED prior read."""
+    init_session_schema(postgres_engine)
+    service = PreferencesService(postgres_engine)
+    user_id = "postgres-tutorial-race"
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
+    if existing_progress:
+        asyncio.run(
+            service.update_composer_preferences(
+                user_id,
+                UpdateComposerPreferencesRequest(default_mode="guided", tutorial_stage="guided", tutorial_session_id="tutorial-session"),
+            )
+        )
+
+    progress_engine = create_engine(postgres_engine.url)
+    progress_service = PreferencesService(progress_engine)
+    prior_read_finished = threading.Event()
+    release_progress = threading.Event()
+
+    def _pause_progress_insert(conn, cursor, statement, parameters, context, executemany) -> None:
+        if statement.startswith("INSERT INTO user_preferences"):
+            prior_read_finished.set()
+            assert release_progress.wait(timeout=15), "Completion did not release the late progress writer"
+
+    event.listen(progress_engine, "before_cursor_execute", _pause_progress_insert)
+
+    def _write_progress() -> None:
+        asyncio.run(
+            progress_service.update_composer_preferences(
+                user_id,
+                UpdateComposerPreferencesRequest(
+                    default_mode="guided",
+                    tutorial_stage="audit",
+                    tutorial_session_id="tutorial-session",
+                    tutorial_run_id="tutorial-run",
+                    tutorial_source_data_hash="tutorial-source-hash",
+                ),
+            )
+        )
+
+    completed_at = datetime(2026, 9, 20, tzinfo=UTC)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            progress = executor.submit(_write_progress)
+            try:
+                assert prior_read_finished.wait(timeout=15), "Progress writer did not reach its upsert"
+                completed = asyncio.run(
+                    service.update_composer_preferences(
+                        user_id,
+                        UpdateComposerPreferencesRequest(
+                            default_mode="freeform", tutorial_completed_at=completed_at, tutorial_completed_via="exit"
+                        ),
+                    )
+                )
+                assert completed.current.tutorial_completed_at == completed_at
+            finally:
+                release_progress.set()
+            with pytest.raises(TutorialProgressConflict):
+                progress.result(timeout=15)
+    finally:
+        event.remove(progress_engine, "before_cursor_execute", _pause_progress_insert)
+        progress_engine.dispose()
+
+    current = asyncio.run(service.get_composer_preferences(user_id))
+    assert current.default_mode == "freeform"
+    assert current.tutorial_completed_at == completed_at
+    assert current.tutorial_stage is None
+    assert current.tutorial_session_id is None
+    assert current.tutorial_run_id is None
+    assert current.tutorial_source_data_hash is None
 
 
 def test_skill_markdown_history_upsert_round_trips_on_postgres(postgres_engine: Engine, tmp_path: Path) -> None:

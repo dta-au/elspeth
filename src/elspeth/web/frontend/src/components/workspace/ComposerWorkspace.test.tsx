@@ -82,7 +82,6 @@ interface WorkspaceFixtureProps {
   artifact?: ReactNode;
   inspector?: ReactNode;
   actionBar?: ReactNode;
-  authoringStatus?: ReactNode;
   collapsedStatus?: {
     text: string;
     tone: "neutral" | "busy" | "error";
@@ -96,7 +95,6 @@ function renderWorkspace(props: WorkspaceFixtureProps = {}) {
       artifact={props.artifact ?? <button type="button">Artifact control</button>}
       inspector={props.inspector ?? <aside>Inspector content</aside>}
       actionBar={props.actionBar ?? <button type="button">Primary action</button>}
-      authoringStatus={props.authoringStatus}
       collapsedStatus={props.collapsedStatus}
     />,
   );
@@ -447,12 +445,16 @@ describe("ComposerWorkspace", () => {
     const cleanup = vi.fn();
     function CustodyProbe() {
       useEffect(() => cleanup, []);
-      return <button type="button">Live draft</button>;
+      return (
+        <>
+          <button type="button">Live draft</button>
+          <div role="status">Authoring ready</div>
+        </>
+      );
     }
 
     renderWorkspace({
       authoring: <CustodyProbe />,
-      authoringStatus: <div role="status">Authoring ready</div>,
       collapsedStatus: { text: "2 unread acknowledgements", tone: "neutral" },
     });
     emitWidth(1280);

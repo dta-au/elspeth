@@ -46,6 +46,7 @@ import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
 import { CompletionSummary } from "./guided/CompletionSummary";
 import { ModeSwitchButton } from "./guided/ModeSwitchButton";
+import { ComposerOptions } from "./ComposerOptions";
 import {
   PendingProposalsLiveRegion,
   actionableProposals,
@@ -3179,8 +3180,7 @@ export function ChatPanel({
         aria-label="Guided composer"
       >
         {/* Header — mirrors the freeform body header so the mode-switch control
-            ("Exit to freeform") sits in the same top-right spot that freeform's
-            "Switch to guided" occupies. The tutorial suppresses the exit
+            ("Exit to freeform") remains directly available in the header. The tutorial suppresses the exit
             affordance, so it has no header. Session title and model identity
             are app-level facts and live in AppHeader (elspeth-8fa71e6d15) —
             this column keeps only compose-state chrome. */}
@@ -3363,16 +3363,7 @@ export function ChatPanel({
       // components/chat/chat.css [data-composing="true"] rules.
       data-composing={isComposing ? "true" : undefined}
     >
-      {/* Compose-state header. The "Switch to guided" affordance lives in the
-          header so it's always visible without competing with the chat input
-          for vertical real-estate. Symmetric with the "Exit to freeform"
-          control in the guided branch above — both are the same
-          ModeSwitchButton, so they share the conditional-confirm behaviour.
-          Session title and model identity are app-level facts and live in
-          AppHeader (elspeth-8fa71e6d15): a second in-column copy competed
-          with these controls for a 360px rail and truncated at every width.
-          The AuthorityChip stays — it is the one fact this audit-first
-          product must keep visible at a glance (chat.css:693). */}
+      {/* Authority stays visible; Guided is a deliberate Composer options action. */}
       <div className="chat-panel-header">
         {/* Layout lives in chat.css, NOT in a style prop (elspeth-0b70269ccc).
             As an inline style this row was `inline-flex` with no wrap and no
@@ -3384,8 +3375,8 @@ export function ChatPanel({
               this session auto-applies mutations or gates them behind
               proposals — named in the chrome. */}
           <AuthorityChip />
-          <ModeSwitchButton
-            target="guided"
+          <ComposerOptions
+            key={activeSessionId}
             hasWork={currentChatHasWork}
             disabledReason={guidedSwitchDisabledReason}
           />

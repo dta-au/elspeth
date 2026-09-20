@@ -15,7 +15,6 @@ def test_user_preferences_table_columns() -> None:
     assert column_names == {
         "user_id",
         "default_composer_mode",
-        "banner_dismissed_at",
         "freeform_intro_dismissed_at",
         "tutorial_completed_at",
         "tutorial_stage",
@@ -39,13 +38,13 @@ def test_user_preferences_user_id_is_primary_key() -> None:
     assert pk_columns == {"user_id"}
 
 
-def test_default_composer_mode_has_server_default_guided() -> None:
-    """The stored default for new rows is 'guided' even at the DB level."""
+def test_default_composer_mode_has_server_default_freeform() -> None:
+    """The stored default for new rows is 'freeform' even at the DB level."""
     table = metadata.tables["user_preferences"]
     column = table.c.default_composer_mode
-    # Server default's `.arg` is "guided" when set via `server_default="guided"`.
+    # Server default's `.arg` is "freeform" when set via `server_default="freeform"`.
     assert column.server_default is not None
-    assert "guided" in str(column.server_default.arg)
+    assert str(column.server_default.arg) == "freeform"
 
 
 def test_default_composer_mode_check_constraint_closes_the_enum() -> None:

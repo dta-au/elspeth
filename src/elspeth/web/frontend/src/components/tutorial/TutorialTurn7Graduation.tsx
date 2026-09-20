@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { departTutorialSession } from "./tutorialDeparture";
 import {
   GRADUATION_CANCELLED_NOTE,
   HELLO_WORLD_SESSION_TITLE,
@@ -32,6 +33,8 @@ export function TutorialTurn7Graduation({
   const headingRef = useRef<HTMLHeadingElement | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const finishingRef = useRef(false);
+  const skippedSessionRef = useRef<string | null>(null);
   const writing = usePreferencesStore((state) => state.writing);
 
   useEffect(() => {
@@ -40,26 +43,18 @@ export function TutorialTurn7Graduation({
   }, []);
 
   const onFinish = useCallback(async () => {
+    if (finishingRef.current) return;
+    finishingRef.current = true;
     setPending(true);
     setError(null);
     try {
-      // Promote the tutorial session to its final title and save Guided as
-      // the default composer mode. A skipped tutorial has no session to
-      // rename (and may not have created one), so only rename a real,
-      // non-skipped session. Both calls run BEFORE the landing + graduation
-      // publish; if either fails we surface the error and do not transition
-      // (fail-closed).
+      // Preserve the built pipeline and finish its authoritative mode
+      // transition before publishing the tutorial dismissal.
       if (sessionId !== null && !skipped) {
         await useSessionStore
           .getState()
           .renameSession(sessionId, HELLO_WORLD_SESSION_TITLE);
       }
-      await usePreferencesStore.getState().saveTutorialMode("guided");
-
-      const completedAt = await usePreferencesStore
-        .getState()
-        .markTutorialGraduated({ publishLocally: false });
-
       if (sessionId !== null && !skipped) {
         // Land the user ON the pipeline they just built so they can click Run
         // for real and revisit it later — graduation used to drop them into a
@@ -77,24 +72,29 @@ export function TutorialTurn7Graduation({
             landed.error ?? "The composer could not open your pipeline.",
           );
         }
+        await departTutorialSession(sessionId, "complete");
       } else {
         // Skipped (no built pipeline to land on): drop into a fresh composer
         // session so the user still lands somewhere usable.
-        const previousActiveSessionId =
-          useSessionStore.getState().activeSessionId;
-        await useSessionStore.getState().createSession();
-        const sessionState = useSessionStore.getState();
-        if (sessionState.activeSessionId === previousActiveSessionId) {
-          throw new Error(
-            sessionState.error ?? "The composer session could not be created.",
-          );
+        const completedAt = await usePreferencesStore.getState().markTutorialGraduated({
+          via: "skip",
+          publishLocally: false,
+        });
+        if (skippedSessionRef.current === null) {
+          const previousActiveSessionId = useSessionStore.getState().activeSessionId;
+          await useSessionStore.getState().createSession();
+          const sessionState = useSessionStore.getState();
+          if (sessionState.activeSessionId === null || sessionState.activeSessionId === previousActiveSessionId) {
+            throw new Error(sessionState.error ?? "The composer session could not be created.");
+          }
+          skippedSessionRef.current = sessionState.activeSessionId;
         }
+        usePreferencesStore.getState().publishTutorialGraduation(completedAt);
       }
-
-      usePreferencesStore.getState().publishTutorialGraduation(completedAt);
     } catch (err) {
       setError(formatError(err));
     } finally {
+      finishingRef.current = false;
       setPending(false);
     }
   }, [sessionId, skipped]);
