@@ -662,7 +662,7 @@ def test_release_dockerfile_keeps_builder_os_packages_out_of_the_runtime() -> No
 
     assert (
         "FROM gcr.io/distroless/python3-debian13:debug-nonroot"
-        "@sha256:6418f576f2011f5d265d03f53aee812b4efcba5c6646a3f4d855b9fb51cd2d72 AS runtime"
+        "@sha256:83d04312b1f81179f887dca05ab99b86983c4f4970fc7c79ff9fd9204d7ebcf8 AS runtime"
     ) in runtime
     assert "COPY --from=builder /opt/venv /opt/venv" in runtime
     assert "COPY --from=builder /runtime-root/ /" in runtime
