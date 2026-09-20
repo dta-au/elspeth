@@ -669,7 +669,6 @@ nodes_table = Table(
     Column("determinism", String(32), nullable=False),  # deterministic, seeded, nondeterministic (from Determinism enum)
     Column("config_hash", String(64), nullable=False),
     Column("config_json", Text, nullable=False),
-    Column("schema_hash", String(64)),
     Column("sequence_in_pipeline", Integer),
     Column("registered_at", DateTime(timezone=True), nullable=False),
     # Schema configuration for audit trail (WP-11.99)
@@ -685,7 +684,6 @@ nodes_table = Table(
     # This allows running the same pipeline multiple times against the same database
     PrimaryKeyConstraint("node_id", "run_id"),
     CheckConstraint(_LowerHex64Check("config_hash"), name="ck_nodes_config_hash_hex"),
-    CheckConstraint(_OptionalLowerHex64Check("schema_hash"), name="ck_nodes_schema_hash_hex"),
     CheckConstraint(_OptionalLowerHex32Check("output_contract_hash"), name="ck_nodes_output_contract_hash_hex"),
     CheckConstraint(_OptionalSha256Ref16Check("source_file_hash"), name="ck_nodes_source_file_hash_ref"),
 )

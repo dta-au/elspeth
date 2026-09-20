@@ -504,9 +504,8 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # manifest).
 # Verified mechanical
 # each time: a field-by-field diff of the live durable projection against the
-# frozen expectation showed every other field equal — schema_fields,
-# schema_hash and schema_mode are unchanged, so no audit projection material
-# moved.
+# frozen expectation showed every other field equal — schema_fields and
+# schema_mode are unchanged, so no audit projection material moved.
 # Rotated again 2026-08-07 for the json_explode comment correction: editing that
 # plugin file changed its ``source_file_hash``, which the manifest pins verbatim
 # inside one node record's audit material. Exactly ONE token moved
@@ -686,7 +685,15 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # Rotated for the approval-artifact audit field rename: canonical call material
 # now sorts approved_prompt_artifact_hash first. The terminal resume digest was
 # measured through the production harness; semantic oracle snapshots did not move.
-EXPECTED_CASE_REGISTRY_SHA256 = "9af816eaaaf97c64f4cc7a095703149f4936dc6988d093926e48640930e7f38a"
+# Rotated 2026-09-21 when the never-written node schema-digest column left the
+# Landscape and its always-null key left the exported node record: 52 literal
+# null tokens on 29 manifest lines were removed (the old manifest with those
+# tokens stripped is byte-identical to the new one apart from the resume digest).
+# Node keys hash the semantic config only, so no ``@`` suffix moved. Then
+# reopen-resume's resumed_full_projection_sha256 (6ede4243... -> 4947c833...,
+# captured from the production harness's own failure output), then this digest.
+# No oracle_freeze snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "4023b22566b3c8d24bc9cfdc4c8633fce4be37afde4a6eaa3c3345ab03ace049"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

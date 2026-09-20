@@ -1427,7 +1427,7 @@ class TestHashFields:
         assert len(row.source_data_hash) == 64
 
     def test_node_hashes_consistent_format(self) -> None:
-        """Node config_hash and schema_hash follow consistent format."""
+        """Node config_hash follows the consistent format."""
         node = Node(
             node_id="node-1",
             run_id="run-1",
@@ -1438,10 +1438,8 @@ class TestHashFields:
             config_hash=self.VALID_SHA256,
             config_json="{}",
             registered_at=datetime.now(UTC),
-            schema_hash=self.VALID_SHA256_REAL,
         )
         assert len(node.config_hash) == 64
-        assert len(node.schema_hash) == 64  # type: ignore[arg-type] # schema_hash may be None
 
     def test_node_state_input_hash_present(self) -> None:
         """NodeState variants require input_hash for traceability."""

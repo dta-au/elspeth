@@ -172,7 +172,6 @@ class NodeLoader:
             config_hash=row.config_hash,
             config_json=row.config_json,
             registered_at=row.registered_at,
-            schema_hash=row.schema_hash,
             sequence_in_pipeline=row.sequence_in_pipeline,
             schema_mode=row.schema_mode,
             schema_fields=schema_fields,

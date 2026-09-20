@@ -38,8 +38,10 @@ four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
 SHA-256 shape rather than the length alone, and gives every remaining session
 digest column its own shape CHECK. Landscape epoch 43 does the same for every
 Landscape digest column: SQLite ignores the declared `VARCHAR` width, so
-`String(64)` alone admitted any text.
-It also adds `interpretation_events.surface_origin`: review cards raised by
+`String(64)` alone admitted any text. Landscape epoch 43 also removes the
+never-written `nodes.schema_hash` column and its always-null key in the exported
+node record.
+Session epoch 63 also adds `interpretation_events.surface_origin`: review cards raised by
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
 model, provider and `composer_skill_hash` columns.

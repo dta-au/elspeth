@@ -183,7 +183,6 @@ class Node:
     config_json: str
     registered_at: datetime
     source_file_hash: str | None = None
-    schema_hash: str | None = None
     sequence_in_pipeline: int | None = None
     # Schema configuration for audit trail (WP-11.99)
     schema_mode: str | None = None  # "observed", "fixed", "flexible", "parse"

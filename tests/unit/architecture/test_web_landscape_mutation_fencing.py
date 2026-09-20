@@ -689,7 +689,11 @@ _EXPECTED_DML_COUNT = 158
 # public caller inventories remain unchanged (measured from the live AST).
 # Approved artifact column rename changes only SinkEffectLifecycle._insert_call;
 # the scanner still measures 158 identities and the same table/operation set.
-_EXPECTED_DML_INVENTORY_SHA256 = "dbfe48f510f8464bf9c82daa8d3f05b7171fd34358fcfa2ca0f819fed54ae92f"
+# Removing the never-written nodes.schema_hash column changes only
+# GraphAuditRepository.register_node's insert fingerprint (and its one
+# subordinate edge below); scripts/fencing_inventory.py against the base tree
+# classifies exactly that one identity as departed/arrived, write shapes 70/70.
+_EXPECTED_DML_INVENTORY_SHA256 = "f586b74e6d325e9e57bb8f56e3f562dac10b96f353228a178ffe7af8033c1568"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -781,7 +785,7 @@ _EXPECTED_CALL_COUNT = 280
 # wrapper: six validation writes move from load() to _load_rows().
 _EXPECTED_PRODUCTION_CALLER_SHA256 = "0b7a93820401e5a6878e38c28827b557e51f712ba865facd26ade2dd92fd3fc4"
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 138
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "84327c0bcbbf9e2e7f46f206d6fccc70ae79a5a0b93fb6d54d1d50319eb00f94"
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "d3b83b4cef4ce6ceae28d98c48ad49b0162b26ef96b7a7e7551e3ab4be89d26f"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92

@@ -281,7 +281,6 @@ def export_landscape(
                 ("config_hash", existing_node.config_hash, stable_hash(audit_safe_config)),
                 ("config_json", existing_node.config_json, canonical_json(audit_safe_config)),
                 ("source_file_hash", existing_node.source_file_hash, sink.source_file_hash),
-                ("schema_hash", existing_node.schema_hash, None),
                 ("sequence_in_pipeline", existing_node.sequence_in_pipeline, None),
                 ("schema_mode", existing_node.schema_mode, "observed"),
                 ("schema_fields", existing_node.schema_fields, None),

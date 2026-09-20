@@ -254,7 +254,6 @@ class TestNodeLoader:
             "config_hash": "cfg123",
             "config_json": "{}",
             "registered_at": NOW,
-            "schema_hash": None,
             "sequence_in_pipeline": 0,
             "schema_mode": None,
             "schema_fields_json": None,
@@ -267,7 +266,6 @@ class TestNodeLoader:
         sa_row = self._make_node_row(
             node_type="transform",
             determinism="non_deterministic",
-            schema_hash="sch123",
             sequence_in_pipeline=3,
             schema_mode="fixed",
             schema_fields_json=json.dumps(schema_fields),
@@ -278,7 +276,6 @@ class TestNodeLoader:
         assert isinstance(result, Node)
         assert result.node_type == NodeType.TRANSFORM
         assert result.determinism == Determinism.NON_DETERMINISTIC
-        assert result.schema_hash == "sch123"
         assert result.sequence_in_pipeline == 3
         assert result.schema_mode == "fixed"
         assert result.schema_fields == tuple(schema_fields)

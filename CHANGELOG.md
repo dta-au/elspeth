@@ -32,7 +32,9 @@ query templates and the system prompt; it no longer hashes an unused fallback.
 Epoch 42 requires admission evidence v2 with per-principal token quota usage
 and limits; stored v1 evidence is incompatible and must not be relabelled.
 Epoch 43 gives every Landscape digest column a shape CHECK: SQLite ignores the
-declared `VARCHAR` width, so `String(64)` alone admitted any text.
+declared `VARCHAR` width, so `String(64)` alone admitted any text. It also
+removes the never-written `nodes.schema_hash` column and its always-null key in
+the exported node record.
 These
 changes share one paired cutover; the intermediate ACA epochs are not a
 separate deployment requirement.

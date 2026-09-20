@@ -782,7 +782,6 @@ class LandscapeExporter:
                 "config_hash": node.config_hash,
                 # Full resolved config for audit trail portability (not just hash)
                 "config": self._parse_tier1_json(node.config_json, "config_json", f"node {node.node_id} in run {run_id}"),
-                "schema_hash": node.schema_hash,
                 "schema_mode": node.schema_mode,
                 "schema_fields": deep_thaw(node.schema_fields) if node.schema_fields is not None else None,
                 "sequence_in_pipeline": node.sequence_in_pipeline,

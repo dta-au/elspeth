@@ -575,7 +575,6 @@ def _stable_audit_records(
                 "plugin_name": record["plugin_name"],
                 "plugin_version": record["plugin_version"],
                 "schema_fields": record.get("schema_fields"),
-                "schema_hash": record.get("schema_hash"),
                 "schema_mode": record.get("schema_mode"),
                 "sequence_in_pipeline": record.get("sequence_in_pipeline"),
                 "source_file_hash": record.get("source_file_hash"),
@@ -1884,7 +1883,6 @@ _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]
             "determinism",
             "config_hash",
             "config",
-            "schema_hash",
             "schema_mode",
             "schema_fields",
             "sequence_in_pipeline",
@@ -2273,7 +2271,6 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
             "determinism",
             "config_hash",
             "config_json",
-            "schema_hash",
             "schema_mode",
             "schema_fields_json",
             "sequence_in_pipeline",
@@ -2297,7 +2294,6 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
                     "determinism": row["determinism"],
                     "config_hash": row["config_hash"],
                     "config": decode_json(row["config_json"], label=f"node {row['node_id']}.config_json"),
-                    "schema_hash": row["schema_hash"],
                     "schema_mode": row["schema_mode"],
                     "schema_fields": (
                         None

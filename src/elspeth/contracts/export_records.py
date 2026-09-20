@@ -117,7 +117,6 @@ class NodeExportRecord(TypedDict):
     determinism: str
     config_hash: str
     config: Any  # Resolved config — structure varies by plugin
-    schema_hash: str | None
     schema_mode: str | None
     schema_fields: list[dict[str, object]] | None
     sequence_in_pipeline: int | None

@@ -134,7 +134,7 @@ _INVENTORY: dict[tuple[str, str], dict[str, str]] = {
     ("landscape", "checkpoints"): {"upstream_topology_hash": "hex64"},
     ("landscape", "coalesce_effects"): {"parent_set_hash": "hex64", "effect_hash": "hex64"},
     ("landscape", "node_states"): {"input_hash": "hex64", "output_hash": "hex64"},
-    ("landscape", "nodes"): {"source_file_hash": "ref16", "config_hash": "hex64", "schema_hash": "hex64", "output_contract_hash": "hex32"},
+    ("landscape", "nodes"): {"source_file_hash": "ref16", "config_hash": "hex64", "output_contract_hash": "hex32"},
     ("landscape", "operations"): {"input_data_hash": "hex64", "output_data_hash": "hex64"},
     ("landscape", "routing_events"): {"reason_hash": "hex64"},
     ("landscape", "rows"): {"source_data_hash": "hex64"},
