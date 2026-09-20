@@ -67,6 +67,18 @@ drained and repair this release forward.
   delete with 403, stored user secrets are neither listed nor resolved nor
   allowed to shadow a server secret, and the panel renders read-only. See the
   [environment reference](docs/reference/environment-variables.md).
+- **Composer LLM steps always carry both prompts.** Composer validation now
+  rejects an `llm` node without a `system_prompt`
+  (`llm_system_prompt_missing`) or without a user prompt
+  (`llm_user_prompt_missing`). The planner keeps the prompt you gave as the
+  user prompt, drafts a system prompt when none was given and says so, or asks
+  first; the server never writes prompt text. A multi-query node keeps one
+  shared system prompt with one user prompt per query. The step's
+  configuration box shows "System prompt" and "User prompt" first, one user
+  row per query, and marks a missing role. Existing Composer sessions whose
+  LLM step has no system prompt now fail validation, and adding one reopens
+  that step's prompt review. YAML pipelines are unaffected: the runtime
+  `system_prompt` option stays optional.
 
 - **Coordination deadlines are decided from fresh post-lock database time.**
   Lease deadlines are now issued after locked admission rather than from a
