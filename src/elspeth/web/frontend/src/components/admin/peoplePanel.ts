@@ -18,13 +18,43 @@ export interface PeoplePanelServices {
   setDirty: (owner: string, dirty: boolean) => void;
   /** A refusal that hides a surface (404) or forbids it: re-read capabilities. */
   onAuthorityRefused: () => void;
+  /** Run `proceed` now, or ask first when it would throw away typed input. */
+  guardLeave: (proceed: () => void) => void;
 }
 
 const inert: PeoplePanelServices = {
   setEscapeHandler: () => undefined,
   setDirty: () => undefined,
   onAuthorityRefused: () => undefined,
+  guardLeave: (proceed) => proceed(),
 };
+
+/** The most records one person's roles or approver links are collected to. */
+export const PERSON_RECORDS_MAX = 2000;
+const COLLECT_PAGE_SIZE = 200;
+
+export interface Collected<T> {
+  items: T[];
+  /** True when the bound was reached, so the list may be incomplete and must SAY so. */
+  truncated: boolean;
+}
+
+/**
+ * Read every page of a paginated list, up to a stated bound.
+ *
+ * These lists answer questions of ABSENCE ("nobody approves for Jane", "Jane
+ * does not hold Approver"), and a first page cannot answer those. The routes
+ * report no total, so a short page is the end.
+ */
+export async function collectPages<T>(readPage: (offset: number, limit: number) => Promise<T[]>): Promise<Collected<T>> {
+  const items: T[] = [];
+  while (items.length < PERSON_RECORDS_MAX) {
+    const page = await readPage(items.length, COLLECT_PAGE_SIZE);
+    items.push(...page);
+    if (page.length < COLLECT_PAGE_SIZE) return { items, truncated: false };
+  }
+  return { items, truncated: true };
+}
 
 export const PeoplePanelContext = createContext<PeoplePanelServices>(inert);
 
@@ -70,7 +100,8 @@ export function useSubview(owner: string, open: boolean, dirty: boolean, cancel:
  * different things of the administrator, so they are never one message:
  *
  * - `rejected`: the server answered no. Nothing changed; fix and retry.
- * - `uncertain`: no answer arrived. The write may have landed, so the next
+ * - `uncertain`: no answer arrived, or the server failed (5xx) part-way
+ *   through. The write may have landed, so the next
  *   step is to LOOK, and another write is withheld until they have.
  * - `saved_stale`: the write landed and the re-read after it failed. Saying
  *   "failed" here would invite a duplicate grant.
@@ -119,11 +150,19 @@ export function usePersonMutation(reload: () => Promise<void>): PersonMutation {
       setMustReconcile(false);
       setNotice((current) => (current?.kind === "saved_stale" ? { kind: "saved", message: "Details are up to date." } : current?.kind === "uncertain" ? null : current));
     } catch (error) {
-      if (live.current) setNotice({ kind: "rejected", message: adminErrorMessage(error, "Could not refresh details") });
+      if (!live.current) return;
+      const status = errorStatus(error);
+      if (status === 404 || status === 403) onAuthorityRefused();
+      const reason = adminErrorMessage(error, "Could not refresh details");
+      // The CHECK failed, which says nothing about the write it was checking.
+      // The notice keeps its kind, because the kind is what carries the retry.
+      setNotice((current) => current?.kind === "saved_stale"
+        ? { kind: "saved_stale", message: `Saved. ${reason}` }
+        : { kind: "uncertain", message: `${reason}, so it is still not known whether the change was saved. Check again before trying it again.` });
     } finally {
       if (live.current) setBusy(false);
     }
-  }, [reload]);
+  }, [reload, onAuthorityRefused]);
 
   const run = useCallback(
     async (write: () => Promise<unknown>, done: string, fallback: string): Promise<boolean> => {
@@ -133,11 +172,12 @@ export function usePersonMutation(reload: () => Promise<void>): PersonMutation {
         await write();
       } catch (error) {
         if (!live.current) return false;
-        if (isUncertainOutcome(error)) {
+        const status = errorStatus(error);
+        if (isUncertainOutcome(error) || (status !== null && status >= 500)) {
+          // No answer, or a server that failed part-way: neither says the write did not land.
           setMustReconcile(true);
-          setNotice({ kind: "uncertain", message: "The connection dropped before the server answered, so this may or may not have been saved. Check the current details before trying again." });
+          setNotice({ kind: "uncertain", message: `${status === null ? "The connection dropped before the server answered" : "The server failed while handling this"}, so this may or may not have been saved. Check the current details before trying again.` });
         } else {
-          const status = errorStatus(error);
           if (status === 404 || status === 403) onAuthorityRefused();
           setNotice({ kind: "rejected", message: adminErrorMessage(error, fallback) });
         }

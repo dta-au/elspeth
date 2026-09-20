@@ -7,7 +7,7 @@ import type { IdentityPerson, PersonLabel } from "@/types/people";
 import { MutationNoticeView } from "./MutationNoticeView";
 import { PersonPicker } from "./PersonPicker";
 import { formatInstant } from "./peopleFormat";
-import { useCancelToTrigger, usePersonMutation, useSubview } from "./peoplePanel";
+import { PERSON_RECORDS_MAX, collectPages, useCancelToTrigger, usePersonMutation, useSubview } from "./peoplePanel";
 
 /** Which way the new edge points, from the selected person's side. */
 type Direction = "approver_for_person" | "person_approves_for";
@@ -17,6 +17,8 @@ interface Loaded {
   edges: RelationshipView[];
   labels: Record<string, PersonLabel>;
   labelsFailed: boolean;
+  /** The bound was reached: an empty direction below is then NOT a statement that nobody is there. */
+  truncated: boolean;
 }
 
 interface Props {
@@ -25,15 +27,17 @@ interface Props {
 }
 
 async function loadEdges(identityId: string): Promise<Loaded> {
-  const { relationships } = await admin.listRelationships(identityId);
+  // Every page: the two directions are split AFTER the read, so a first page
+  // full of one direction would report the other as empty.
+  const { items: relationships, truncated } = await collectPages(async (offset, limit) => (await admin.listRelationships(identityId, offset, limit)).relationships);
   const counterparts = relationships.map((edge) => (edge.from_identity_id === identityId ? edge.to_identity_id : edge.from_identity_id));
-  if (counterparts.length === 0) return { edges: relationships, labels: {}, labelsFailed: false };
+  if (counterparts.length === 0) return { edges: relationships, labels: {}, labelsFailed: false, truncated };
   try {
     const labels = await fetchPersonLabels(counterparts);
-    return { edges: relationships, labels: Object.fromEntries(labels.map((label) => [label.identity_id, label])), labelsFailed: false };
+    return { edges: relationships, labels: Object.fromEntries(labels.map((label) => [label.identity_id, label])), labelsFailed: false, truncated };
   } catch {
     // The edges are the fact; names are decoration. Show the edges and SAY the names are missing.
-    return { edges: relationships, labels: {}, labelsFailed: true };
+    return { edges: relationships, labels: {}, labelsFailed: true, truncated };
   }
 }
 
@@ -119,6 +123,7 @@ export function RelationshipsEditor({ identityId, personName }: Props): JSX.Elem
       ) : loaded === null ? <p>Loading approvers…</p> : (
         <>
           {loaded.labelsFailed && <p role="status" className="people-notice people-notice-saved_stale">Names could not be loaded, so people are shown by identity ID.</p>}
+          {loaded.truncated && <p role="status" className="people-notice people-notice-saved_stale">Showing the first {PERSON_RECORDS_MAX} approver links. {personName} has more, which are not shown here, so an empty list below may not be empty.</p>}
           <h4>Approvers for {personName}</h4>
           {edgeList(loaded.edges.filter((edge) => edge.to_identity_id === identityId), (edge) => edge.from_identity_id, `Nobody is assigned to approve for ${personName}.`)}
           <h4>People {personName} approves for</h4>

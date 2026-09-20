@@ -24,8 +24,8 @@ interface Props {
   activeAdminCount: number | null;
   quotasEnabled: boolean;
   onCredential: (credential: GeneratedCredential) => void;
-  /** The person's key changed (access was set up) or their record changed: refresh the directory too. */
-  onPersonChanged: (key: string) => void;
+  /** This person's record changed, or (with `to`) access was set up and their key moved: refresh the directory too. */
+  onPersonChanged: (from: string, to?: string) => void;
   onGone: (message: string) => void;
 }
 
@@ -95,6 +95,7 @@ function CopyId({ value }: { value: string }): JSX.Element {
 
 /** Everything about one person. Bound to a stable key, never to a row position. */
 export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabled, onCredential, onPersonChanged, onGone }: Props): JSX.Element {
+  const { guardLeave } = usePeoplePanel();
   const [person, setPerson] = useState<PersonRecord | null>(initial?.key === personKey ? initial : null);
   const [load, setLoad] = useState<Load>({ status: "loading" });
   const [tab, setTab] = useState<Tab>("roles");
@@ -114,7 +115,7 @@ export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabl
     const requested = personKey;
     const response = await fetchPerson(requested, signal);
     if (currentKey.current !== requested) return;
-    if (response.person.key !== requested) { onPersonChanged(response.person.key); return; }
+    if (response.person.key !== requested) { onPersonChanged(requested, response.person.key); return; }
     setPerson(response.person);
     setLoad({ status: "ready" });
   }, [personKey, onPersonChanged]);
@@ -177,14 +178,14 @@ export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabl
             <section aria-label={`Access for ${name}`} className="people-section">
               <div className="people-access-status"><span className="people-state people-state-not_set_up">Access not set up</span><span className="people-grant-meta">{name} has a local account and no access yet. They cannot use ELSPETH until access is set up.</span></div>
               {person.actions.set_up_access
-                ? <SetUpAccess person={person} onDone={onPersonChanged} />
+                ? <SetUpAccess person={person} onDone={(identityKey) => onPersonChanged(person.key, identityKey)} />
                 : <p>An access administrator must set up access.</p>}
             </section>
           ) : (
             <section aria-label={`Access for ${name}`} className="people-section"><p>Access is managed by an access administrator. You can manage this person's local sign-in account below.</p></section>
           )}
           <h4>Sign-in</h4>
-          <SignInSection personName={name} providerLabel="local" account={person.local_account} canManage={person.actions.manage_credentials} isSelf={person.actions.is_self} onCredential={onCredential} onChanged={reloadPerson} onDeleted={() => onGone(`Deleted the local account for ${name}.`)} />
+          <SignInSection personName={name} providerLabel="local" account={person.local_account} identityRetired={null} canManage={person.actions.manage_credentials} isSelf={person.actions.is_self} onCredential={onCredential} onChanged={reloadPerson} onGone={() => onGone(`The local account for ${name} is deleted.`)} />
         </>
       ) : (
         <>
@@ -198,10 +199,11 @@ export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabl
                 const next = event.key === "ArrowRight" ? (index + 1) % tabs.length : event.key === "ArrowLeft" ? (index - 1 + tabs.length) % tabs.length : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : -1;
                 if (next < 0) return;
                 event.preventDefault();
-                setTab(tabs[next]);
-                event.currentTarget.querySelectorAll<HTMLButtonElement>("[role=tab]")[next].focus();
+                // Leaving a section unmounts its form, so it asks first like leaving the person does.
+                const buttons = event.currentTarget.querySelectorAll<HTMLButtonElement>("[role=tab]");
+                guardLeave(() => { setTab(tabs[next]); buttons[next].focus(); });
               }}>
-                {tabs.map((value) => <Button key={value} id={`${tabsId}-tab-${value}`} role="tab" tabIndex={tab === value ? 0 : -1} aria-selected={tab === value} aria-controls={`${tabsId}-panel`} variant="bare" className="identity-admin-tab" onClick={() => setTab(value)}>{TAB_LABEL[value]}</Button>)}
+                {tabs.map((value) => <Button key={value} id={`${tabsId}-tab-${value}`} role="tab" tabIndex={tab === value ? 0 : -1} aria-selected={tab === value} aria-controls={`${tabsId}-panel`} variant="bare" className="identity-admin-tab" onClick={() => { if (value !== tab) guardLeave(() => setTab(value)); }}>{TAB_LABEL[value]}</Button>)}
               </div>
               <div id={`${tabsId}-panel`} role="tabpanel" aria-labelledby={`${tabsId}-tab-${tab}`}>
                 {tab === "roles" && <RolesEditor key={`${person.key}:${person.identity.access_state}`} identityId={person.identity.identity_id} personName={name} kind={person.identity.kind} onChanged={notifyChanged} />}
@@ -214,7 +216,7 @@ export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabl
           )}
 
           <h4>Sign-in</h4>
-          <SignInSection personName={name} providerLabel={person.identity.provider} account={person.local_account} canManage={person.actions.manage_credentials} isSelf={person.actions.is_self} onCredential={onCredential} onChanged={reloadPerson} onDeleted={() => { void reloadPerson(); }} />
+          <SignInSection personName={name} providerLabel={person.identity.provider} account={person.local_account} identityRetired={person.retired} canManage={person.actions.manage_credentials} isSelf={person.actions.is_self} onCredential={onCredential} onChanged={reloadPerson} onGone={() => onGone("That person is no longer available to you.")} />
 
           <details className="people-advanced">
             <summary>Advanced details</summary>
