@@ -1538,6 +1538,8 @@ def _resolve_source_data_contract(
     for index, existing in enumerate(requirements):
         if InterpretationKind(existing["kind"]) is InterpretationKind.SOURCE_DATA_CONTRACT:
             requirement_row["id"] = existing["id"]
+            if "display_title" in existing:
+                requirement_row["display_title"] = existing["display_title"]
             requirements[index] = requirement_row
             replaced = True
             break

@@ -2234,7 +2234,7 @@ export function GraphView() {
         </div>
         {compositionState && (
           <>
-            <GraphApprovals events={approvedInterpretations} />
+            <GraphApprovals events={approvedInterpretations} state={compositionState} />
             <GraphOutputs state={compositionState} />
           </>
         )}

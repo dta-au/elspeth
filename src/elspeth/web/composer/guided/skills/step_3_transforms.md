@@ -92,6 +92,13 @@ surfaced from the sealed proposal. A gate is not an `llm` node, so every
 other review kind (including `vague_term`) is dropped there and never
 surfaces.
 
+For interpretation requirements you author, include a concise plain-language
+`display_title` (at most 200 characters), such as "Routing threshold" or
+"Prompt injection protection". Keep the registered `user_term` unchanged.
+Use plain text without node/profile identifiers or Markdown; the interface
+adds the affected node and profile with their own styling. Do not author
+backend-owned prompt or model review rows just to add a title.
+
 ## LLM node field declarations
 
 When proposing an LLM transform, include a task-specific `system_prompt` and

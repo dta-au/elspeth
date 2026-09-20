@@ -158,11 +158,14 @@ _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER: Final[tuple[str, ...]] = (
     "draft",
 )
 _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER)
-_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = ", ".join(
-    (
-        *_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[:-1],
-        f"and {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[-1]}",
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = (
+    ", ".join(
+        (
+            *_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[:-1],
+            f"and {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[-1]}",
+        )
     )
+    + ", with optional display_title (a non-empty string of at most 200 characters)"
 )
 _INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
     "Then call request_interpretation_review for an authorable staged site; "
@@ -170,7 +173,9 @@ _INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
     "the card and ELSPETH writes resolved review metadata."
 )
 _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
-    " Inside interpretation_requirements, only " + _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT + " are authorable. "
+    " Inside interpretation_requirements, only "
+    + _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT
+    + " are authorable. display_title is a concise human-readable approval name. "
     "Resolver-owned fields are not settable: "
     + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
     + ". Omit those fields. Persist an authorable pending review with the current mutation tool, then call "
@@ -248,6 +253,7 @@ def _pending_interpretation_requirement(
     kind: InterpretationKind,
     user_term: str,
     draft: str,
+    display_title: str | None = None,
 ) -> InterpretationRequirement:
     """Return a pending interpretation-review requirement row."""
     requirement: InterpretationRequirement = {
@@ -261,6 +267,8 @@ def _pending_interpretation_requirement(
         "accepted_artifact_hash": None,
         "resolved_prompt_template_hash": None,
     }
+    if display_title is not None:
+        requirement["display_title"] = display_title
     return requirement
 
 
@@ -2451,7 +2459,7 @@ _ECHOED_REVIEW_METADATA_NOTE: Final[str] = (
     "interpretation_requirements rows matching the server's stored review state "
     "were accepted as an echo; resolver-owned review metadata is re-derived "
     "server-side and does not need to be sent back. Omit those rows (or send "
-    "only pending {kind, user_term, draft} shells) on future writes."
+    "only pending {kind, user_term, draft} shells with optional display_title) on future writes."
 )
 _ECHOED_SOURCE_AUTHORING_NOTE: Final[str] = (
     "source_authoring matched the server's stored provenance block exactly and "
@@ -2497,7 +2505,7 @@ def _normalize_echoed_interpretation_requirements(
     (elspeth-c67fbbbd83). An echoed row that EXACTLY matches a stored row
     (``stable_hash``-equal to the deep-thawed canonical row or to its
     planner-context projection) is therefore reduced to its author-owned
-    pending shell ``{kind, user_term, draft}``: the shell passes admission,
+    pending shell ``{kind, user_term, draft}`` with optional ``display_title``: the shell passes admission,
     canonicalization re-keys it to the stored id, and
     ``reconcile_authoritative_reviews`` restores the resolved server row —
     the same round trip a well-behaved planner performs by hand. Any row that
@@ -2530,6 +2538,8 @@ def _normalize_echoed_interpretation_requirements(
         if user_term == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM:
             continue
         shell = {"kind": kind, "user_term": user_term, "draft": draft}
+        if "display_title" in stored:
+            shell["display_title"] = stored["display_title"]
         shells_by_echo_hash[stable_hash(deep_thaw(stored))] = shell
         shells_by_echo_hash[stable_hash(project_planner_context_interpretation_requirement(stored))] = shell
     if not shells_by_echo_hash:
@@ -2570,7 +2580,7 @@ def _resolver_owned_interpretation_requirement_error(
     """Validate the complete authoring shape for ``interpretation_requirements``.
 
     Composer input may supply only the compact unresolved shell
-    ``{kind, user_term, draft}``. Identity, status, event linkage, accepted
+    ``{kind, user_term, draft}`` with optional ``display_title``. Identity, status, event linkage, accepted
     values, and artifact hashes are all resolver-owned even when the supplied
     value is null. Presence is therefore the authority violation; inspecting
     or reflecting the untrusted value would create a tool-error leak channel.
@@ -2633,8 +2643,12 @@ def _resolver_owned_interpretation_requirement_error(
                 f"only {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. Omit resolver-owned "
                 f"fields and retry {tool_name}. {_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
-        if set(requirement) != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
+        if set(requirement) - {"display_title"} != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
             return malformed_error
+        if "display_title" in requirement:
+            display_title = requirement["display_title"]
+            if type(display_title) is not str or not display_title.strip() or len(display_title) > 200:
+                return malformed_error
         kind = requirement["kind"]
         user_term = requirement["user_term"]
         draft = requirement["draft"]
@@ -2721,7 +2735,7 @@ def _canonical_interpretation_requirement_error(
     for requirement in requirements_value:
         if not isinstance(requirement, Mapping):
             return error
-        if set(requirement) != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
+        if set(requirement) - {"display_title"} != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
             return error
         if type(requirement["id"]) is not str or not requirement["id"].strip():
             return error
@@ -2841,7 +2855,7 @@ def _normalize_trusted_legacy_interpretation_requirements(
         if not isinstance(requirement, Mapping):
             return options
         fields = set(requirement)
-        if not required_legacy_fields <= fields or not fields <= _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
+        if not required_legacy_fields <= fields or not fields <= _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS | {"display_title"}:
             return options
         needs_normalization = needs_normalization or fields != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS
     if not needs_normalization:
@@ -2939,12 +2953,16 @@ def _canonicalize_authored_interpretation_requirements(
         draft = requirement["draft"]
         if type(draft) is not str:
             raise AssertionError("interpretation requirement draft must be admitted before canonicalization")
+        display_title = requirement["display_title"] if "display_title" in requirement else None
+        if display_title is not None and type(display_title) is not str:
+            raise AssertionError("interpretation requirement display_title must be admitted before canonicalization")
         canonical_requirements.append(
             _pending_interpretation_requirement(
                 requirement_id=requirement_id,
                 kind=InterpretationKind(kind),
                 user_term=persisted_user_term,
                 draft=draft,
+                display_title=display_title,
             )
         )
     canonical_options = dict(options)
@@ -3647,6 +3665,7 @@ def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonVa
                 "kind": requirement["kind"],
                 "user_term": requirement["user_term"],
                 "draft": requirement["draft"],
+                **({"display_title": requirement["display_title"]} if "display_title" in requirement else {}),
             }
             for requirement in requirements
         ]

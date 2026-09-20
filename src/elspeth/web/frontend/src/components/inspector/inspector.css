@@ -392,6 +392,10 @@
   overflow-wrap: anywhere;
 }
 
+.graph-approvals-date {
+  white-space: nowrap;
+}
+
 .graph-output-detail {
   display: inline;
   margin-inline: var(--space-xs);

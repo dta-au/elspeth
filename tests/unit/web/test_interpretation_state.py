@@ -1321,6 +1321,20 @@ def test_resolved_pipeline_decision_requires_matching_node_hash() -> None:
     assert materialized.nodes[0].options["mapping"] == strip_authoring_options(reviewed.nodes[0].options)["mapping"]
 
 
+def test_display_title_does_not_change_approved_pipeline_decision_artifact() -> None:
+    reviewed = _state_with_cleanup_node(_pipeline_decision_options())
+    artifact_hash = pipeline_decision_artifact_hash(reviewed.nodes[0], reviewed.nodes, user_term=RAW_HTML_CLEANUP_USER_TERM)
+    options = _pipeline_decision_options(status="resolved", artifact_hash=artifact_hash)
+    requirements = options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert isinstance(requirements, list)
+    requirements[0]["display_title"] = "Remove raw page content"
+    titled = _state_with_cleanup_node(options)
+    assert pipeline_decision_artifact_hash(titled.nodes[0], titled.nodes, user_term=RAW_HTML_CLEANUP_USER_TERM) == artifact_hash
+    materialized = materialize_state_for_execution(titled)
+    assert isinstance(materialized, CompositionState)
+    assert strip_authoring_options(materialized.nodes[0].options) == strip_authoring_options(reviewed.nodes[0].options)
+
+
 def test_resolved_pipeline_decision_hash_drift_fails_closed() -> None:
     state = _state_with_cleanup_node(_pipeline_decision_options(status="resolved", artifact_hash=stable_hash("old node shape")))
 

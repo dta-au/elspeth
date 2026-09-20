@@ -225,6 +225,7 @@ PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS: Final[tuple[str, ...]] = (
     "user_term",
     "draft",
     "status",
+    "display_title",
 )
 
 
@@ -259,6 +260,7 @@ class InterpretationRequirement(TypedDict):
     accepted_value: str | None
     accepted_artifact_hash: str | None
     resolved_prompt_template_hash: str | None
+    display_title: NotRequired[str]
 
 
 ResolvedReviewEvidenceField = Literal[
@@ -1816,7 +1818,7 @@ def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
     event_id = value["event_id"] if "event_id" in value else None
     if event_id is not None and not isinstance(event_id, str):
         raise TypeError("interpretation requirement event_id must be a string or None")
-    return InterpretationRequirement(
+    requirement = InterpretationRequirement(
         id=requirement_id,
         kind=kind.value,
         user_term=user_term,
@@ -1827,6 +1829,12 @@ def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
         accepted_artifact_hash=accepted_artifact_hash,
         resolved_prompt_template_hash=resolved_prompt_template_hash,
     )
+    if "display_title" in value:
+        display_title = value["display_title"]
+        if not isinstance(display_title, str) or not display_title.strip() or len(display_title) > 200:
+            raise TypeError("interpretation requirement display_title must be a non-empty string of at most 200 characters")
+        requirement["display_title"] = display_title
+    return requirement
 
 
 @trust_boundary(
@@ -2986,7 +2994,7 @@ def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> in
 
 def _pending_authoring_shell(requirement: InterpretationRequirement) -> InterpretationRequirement:
     """Return the canonical persisted pending row without resolver evidence."""
-    return {
+    shell: InterpretationRequirement = {
         "id": requirement["id"],
         "kind": requirement["kind"],
         "user_term": requirement["user_term"],
@@ -2997,6 +3005,9 @@ def _pending_authoring_shell(requirement: InterpretationRequirement) -> Interpre
         "accepted_artifact_hash": None,
         "resolved_prompt_template_hash": None,
     }
+    if "display_title" in requirement:
+        shell["display_title"] = requirement["display_title"]
+    return shell
 
 
 def serialize_authoring_review_options(options: Mapping[str, Any]) -> dict[str, Any]:
@@ -3024,6 +3035,7 @@ def serialize_authoring_review_options(options: Mapping[str, Any]) -> dict[str, 
                 "user_term": requirement["user_term"],
                 "status": "pending",
                 "draft": requirement["draft"],
+                **({"display_title": requirement["display_title"]} if "display_title" in requirement else {}),
             }
             for requirement in requirements
         ]

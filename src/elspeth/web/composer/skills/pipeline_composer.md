@@ -848,19 +848,28 @@ id "rate_cool"):
     {
       "kind": "vague_term",
       "user_term": "cool",
+      "display_title": "Definition of cool",
       "draft": "<your draft definition of \"cool\" — the exact scale/rubric/cutoff/category semantics you authored>"
     }
   ]
 }
 ```
 
-You author ONLY `kind`, `user_term`, and `draft`. The backend projects a node
+You author ONLY `kind`, `user_term`, `draft`, and optional `display_title`. The backend projects a node
 requirement ID as `<normalized user_term>:<node id>`; use that projected value
 in `prompt_template_parts` when an `interpretation_ref` must reference the row,
 as the example does, but never add `id` to the requirement shell. Never author
 `status` or the server-bookkeeping fields (`event_id`, `accepted_value`,
 `accepted_artifact_hash`, `resolved_prompt_template_hash`) — the backend owns
 them.
+
+Give each review you author a concise, plain-language `display_title` (at most
+200 characters), such as "Prompt injection protection" or "Category definitions".
+Keep the stable `user_term` unchanged. Write the title as plain text, without
+Markdown or node/profile identifiers: the interface adds the affected node and
+profile with their own styling. This is presentation metadata, not approved
+content. Follow the ownership matrix below: never author a backend-owned review
+just to attach a title. Backend-owned reviews receive a descriptive UI label.
 
 Merge this review shape into options accepted by the selected plugin's live
 schema; the example deliberately contains no provider, model, credential, or
@@ -1030,8 +1039,8 @@ staged source requirement or bound blob content is the authority for the exact
 artifact text.
 
 `interpretation_requirements` is always a JSON array. Never emit it as an object,
-even when there is only one requirement. The AUTHORED shape contains exactly
-`kind`, `user_term`, and `draft`. Never add `id`, `status`, or the
+even when there is only one requirement. The AUTHORED shape contains
+`kind`, `user_term`, and `draft`, plus optional `display_title`. Never add `id`, `status`, or the
 server-bookkeeping fields (`event_id`, `accepted_value`,
 `accepted_artifact_hash`, `resolved_prompt_template_hash`); those fields appear
 on records you READ back but are owned by the backend.
@@ -1163,7 +1172,7 @@ These are common one-shot mappings:
 Before any `set_pipeline` call containing interpretation requirements, check:
 
 - Every `interpretation_requirements` value is an array.
-- Every requirement object has exactly `kind`, `user_term`, and `draft`.
+- Every requirement object has `kind`, `user_term`, and `draft`, plus optional `display_title`.
 - If a requirement says raw fields are dropped, the cleanup node actually drops
   them.
 - The selected cleanup plugin's schema-defined projection/removal option is enabled.

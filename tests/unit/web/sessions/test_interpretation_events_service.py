@@ -972,6 +972,41 @@ async def test_03_resolve_accepted_as_drafted_uses_llm_draft(service) -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolve_preserves_authored_display_title_and_event_link(service) -> None:
+    session_id = uuid4()
+    node = _structured_llm_node(draft="Innovative and creative")
+    node["options"][INTERPRETATION_REQUIREMENTS_KEY][0]["display_title"] = "Definition of cool"
+    state = await _seed_state_with_llm_node(service, session_id=session_id, node=node)
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_title",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    resolved, new_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    assert new_state.nodes is not None
+    requirement = new_state.nodes[0]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["display_title"] == "Definition of cool"
+    assert requirement["event_id"] == str(resolved.id)
+    assert requirement["user_term"] == resolved.user_term == "cool"
+    assert requirement["accepted_value"] == resolved.accepted_value == "Innovative and creative"
+    assert requirement["resolved_prompt_template_hash"] == stable_hash("Innovative and creative")
+
+
+@pytest.mark.asyncio
 async def test_resolve_interpretation_event_preserves_named_sources(service) -> None:
     """Interpretation approval must not collapse multi-source composer state."""
     session_id = uuid4()

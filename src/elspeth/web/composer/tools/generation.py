@@ -1064,7 +1064,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"interpretation_requirements_invalid",
         "A node's interpretation_requirements entry is malformed. interpretation_requirements is a list of review entry objects, each carrying string fields kind, user_term, and draft; the server-owned id and status fields are filled automatically.",
-        'Simplest fix: omit interpretation_requirements entirely — the required LLM reviews (prompt template, model choice) are auto-staged by the server, and the prompt-injection-shield recommendation is advisory. If you must stage a review, re-emit each entry as an object {kind, user_term, draft} with non-empty string values — e.g. {"kind": "pipeline_decision", "user_term": "prompt_injection_shield_recommendation", "draft": "<recommendation text>"} — and never author id, status, or resolved review metadata.',
+        'Simplest fix: omit interpretation_requirements entirely — the required LLM reviews (prompt template, model choice) are auto-staged by the server, and the prompt-injection-shield recommendation is advisory. If you must stage a review, re-emit each entry as an object {kind, user_term, draft} with non-empty string values and optional display_title (a human-readable name of 1-200 characters) — e.g. {"kind": "pipeline_decision", "user_term": "prompt_injection_shield_recommendation", "draft": "<recommendation text>"} — and never author id, status, or resolved review metadata.',
     ),
     (
         r"plugin_options_invalid",
@@ -1308,7 +1308,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         'component="set_pipeline_arguments" to obtain the exact round-trippable payload for the CURRENT state, apply '
         "only the change you intend to that payload, and re-emit it as the full set_pipeline call. Never author the "
         "server-owned review fields (id, status, event_id, accepted_value, resolved_prompt_template_hash); each "
-        "interpretation_requirements entry you send carries only {kind, user_term, draft}.",
+        "interpretation_requirements entry you send carries only {kind, user_term, draft} plus optional display_title.",
     ),
     (
         r"vague_term_unwired|Pending vague_term review is not wired for resolution",

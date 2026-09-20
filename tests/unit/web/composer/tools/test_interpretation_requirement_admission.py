@@ -36,6 +36,8 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
     ServerStagedRequiredControlUserTerm,
+    parse_interpretation_requirements,
+    project_planner_context_interpretation_requirement,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
@@ -64,6 +66,49 @@ def _valid_authored_requirement() -> dict[str, str]:
         "user_term": "prompt_injection_shield_recommendation",
         "draft": "Recommend a prompt-injection shield.",
     }
+
+
+def test_display_title_survives_authoring_projection_echo_and_serialization() -> None:
+    authored = {**_valid_authored_requirement(), "display_title": "Prompt injection protection"}
+    options = {INTERPRETATION_REQUIREMENTS_KEY: [authored]}
+    assert common_tools._resolver_owned_interpretation_requirement_error(options, tool_name="upsert_node") is None
+    canonical = common_tools._canonicalize_authored_interpretation_requirements(options, component_id="summarize")
+    assert common_tools._canonical_interpretation_requirement_error(canonical, tool_name="upsert_node") is None
+    parsed = parse_interpretation_requirements(canonical)
+    assert parsed is not None
+    assert parsed[0]["display_title"] == "Prompt injection protection"
+    projected = project_planner_context_interpretation_requirement(parsed[0])
+    assert projected["display_title"] == authored["display_title"]
+    echoed, was_echoed = common_tools._normalize_echoed_interpretation_requirements(
+        {INTERPRETATION_REQUIREMENTS_KEY: [projected]}, stored_options=canonical
+    )
+    assert was_echoed
+    assert echoed[INTERPRETATION_REQUIREMENTS_KEY] == [authored]
+    assert common_tools._serialize_authoring_options(canonical)[INTERPRETATION_REQUIREMENTS_KEY] == [authored]
+    plain = common_tools._canonicalize_authored_interpretation_requirements(
+        {INTERPRETATION_REQUIREMENTS_KEY: [_valid_authored_requirement()]}, component_id="summarize"
+    )
+    assert parsed[0]["id"] == plain[INTERPRETATION_REQUIREMENTS_KEY][0]["id"]
+    assert parsed[0]["user_term"] == authored["user_term"]
+    assert "display_title" not in plain[INTERPRETATION_REQUIREMENTS_KEY][0]
+
+
+@pytest.mark.parametrize("title", [None, "", "  ", 7, True, {}, "x" * 201])
+def test_malformed_display_title_is_rejected_at_authoring_and_persisted_boundaries(title: object) -> None:
+    authored = {**_valid_authored_requirement(), "display_title": title}
+    assert (
+        common_tools._resolver_owned_interpretation_requirement_error(
+            {INTERPRETATION_REQUIREMENTS_KEY: [authored]}, tool_name="upsert_node"
+        )
+        is not None
+    )
+    canonical = common_tools._canonicalize_authored_interpretation_requirements(
+        {INTERPRETATION_REQUIREMENTS_KEY: [_valid_authored_requirement()]}, component_id="summarize"
+    )
+    canonical[INTERPRETATION_REQUIREMENTS_KEY][0]["display_title"] = title
+    with pytest.raises(TypeError, match="display_title"):
+        parse_interpretation_requirements(canonical)
+    assert common_tools._canonical_interpretation_requirement_error(canonical, tool_name="upsert_node") is not None
 
 
 def _canonical_pending_requirement(
@@ -979,7 +1024,8 @@ def test_direct_source_writers_preserve_trusted_requirement_id(writer: str) -> N
 
 
 @pytest.mark.parametrize("writer", ("upsert_node", "patch_node_options"))
-def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> None:
+@pytest.mark.parametrize("display_title", (None, "Prompt injection protection"))
+def test_direct_node_writers_preserve_trusted_requirement_id(writer: str, display_title: str | None) -> None:
     catalog = _catalog()
     trusted_id = "trusted-node-review-id"
     canonical = _canonical_pending_requirement(
@@ -995,6 +1041,8 @@ def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> Non
         },
     )
     shell = {field: canonical[field] for field in ("kind", "user_term", "draft")}
+    if display_title is not None:
+        shell["display_title"] = display_title
     if writer == "upsert_node":
         arguments = {
             "id": "existing",
@@ -1021,6 +1069,8 @@ def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> Non
     assert result.success, result.to_dict()
     retained = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
     assert retained[0]["id"] == trusted_id
+    if display_title is not None:
+        assert retained[0]["display_title"] == display_title
 
 
 @pytest.mark.parametrize("writer", ("upsert_node", "patch_node_options"))
