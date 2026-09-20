@@ -81,7 +81,6 @@ from elspeth.web.execution._validation_materialization import (
     validate_llm_base_url_policy,
     validate_llm_retry_budget_policy,
     validate_llm_tracing_policy,
-    validate_managed_identity_policy,
 )
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
@@ -614,13 +613,9 @@ def _validate_pipeline_impl(
             load_yaml=dependencies.load_yaml,
         ),
     )
-    managed_identity_validated = _apply_phase(
-        ledger,
-        validate_managed_identity_policy(materialized),
-    )
     retry_budget_validated = _apply_phase(
         ledger,
-        validate_llm_retry_budget_policy(managed_identity_validated),
+        validate_llm_retry_budget_policy(materialized),
     )
     base_url_validated = _apply_phase(
         ledger,

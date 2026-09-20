@@ -34,7 +34,7 @@ const PROMPT_OPTION_KEYS: ReadonlySet<string> = new Set(["prompt_template", "sys
  *  confirmed rather than letting a learner ask a revise for it and watch
  *  nothing happen. Unlisted keys read as their humanised token. */
 const OPTION_LABELS: Readonly<Record<string, string>> = {
-  prompt_template: "Prompt",
+  prompt_template: "User prompt",
   system_prompt: "System prompt",
   model: "Model",
   http: "Scraping identity (confirmed after commit)",

@@ -105,7 +105,7 @@ export function RolesEditor({ identityId, personName, kind, onChanged }: Props):
           const target = form.grant;
           void mutation.run(() => admin.revokeRole(target.role_id, note.trim() || undefined), `Revoked ${ROLE_LABEL[target.role]} from ${personName}.`, "Role was not revoked").then((ok) => { if (ok) closeForm(); });
         }}>
-          <h4>Revoke {ROLE_LABEL[form.grant.role]} from {personName}?</h4>
+          <h5>Revoke {ROLE_LABEL[form.grant.role]} from {personName}?</h5>
           <p>This removes one grant. {personName}'s other roles are not changed.</p>
           <Input label="Note (optional)" value={note} maxLength={512} onChange={(event) => setNote(event.target.value)} />
           <div className="identity-admin-actions"><Button type="submit" variant="danger" disabled={blocked}>Revoke role</Button><Button disabled={mutation.busy} onClick={cancel}>Cancel</Button></div>

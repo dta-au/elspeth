@@ -1,5 +1,6 @@
 export const ARTIFACT_TABS = [
   "graph",
+  "approvals",
   "spec",
   "yaml",
   "checks",

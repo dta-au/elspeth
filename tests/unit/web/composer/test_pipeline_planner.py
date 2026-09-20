@@ -583,6 +583,7 @@ def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                    "system_prompt": "You summarise text. Reply with a one-sentence summary only.",
                     "prompt_template": "Summarise {{ row.text }}",
                     "required_input_fields": ["text"],
                     "interpretation_requirements": [
@@ -2145,6 +2146,7 @@ def _generic_document_abstract_pipeline(data_dir: Path) -> dict[str, Any]:
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                    "system_prompt": "You write abstracts of documents. Reply with the abstract only.",
                     "prompt_template": "Write an abstract of {{ row.document_content }}",
                     "required_input_fields": ["document_content"],
                     "response_field": "abstract",

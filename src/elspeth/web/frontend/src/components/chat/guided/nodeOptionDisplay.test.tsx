@@ -23,7 +23,7 @@ describe("nodeOptionDisplay helpers", () => {
       "Model: anthropic/claude-sonnet-4",
     );
     expect(nodeOptionText({ key: "system_prompt", value: "Be terse." })).toBe("System prompt: Be terse.");
-    expect(nodeOptionText({ key: "prompt_template", value: "Rate it." })).toBe("Prompt: Rate it.");
+    expect(nodeOptionText({ key: "prompt_template", value: "Rate it." })).toBe("User prompt: Rate it.");
     expect(nodeOptionText({ key: "mapping", value: "a → b" })).toBe("Mapping: a → b");
     // web_scrape's display-only `http` identity carries the backend-rendered text.
     expect(nodeOptionText({ key: "http", value: "contact: ops@example.org; reason: catalogue refresh" })).toBe(
@@ -89,7 +89,7 @@ describe("NodeOptionsSummary", () => {
     const text = screen.getByText(/Summarise the text\./);
     expect(text).toHaveTextContent("Summarise the text. One sentence.");
     expect(text.className).toContain("guided-node-prompt__text");
-    expect(screen.queryByRole("button", { name: /Show full prompt/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Show full .*prompt/ })).toBeNull();
   });
 
   it("shows the first lines of a long prompt behind an expandable toggle", async () => {
@@ -98,14 +98,14 @@ describe("NodeOptionsSummary", () => {
       <NodeOptionsSummary entries={[{ key: "prompt_template", value: LONG_PROMPT }]} nodeLabel="node-1" />,
     );
 
-    const toggle = screen.getByRole("button", { name: "Show full prompt for node-1" });
+    const toggle = screen.getByRole("button", { name: "Show full user prompt for node-1" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByText(/Line 1 of the instruction\./)).toBeInTheDocument();
     expect(screen.queryByText(/Line 10 of the instruction\./)).toBeNull();
 
     await user.click(toggle);
     expect(
-      screen.getByRole("button", { name: "Show less of the prompt for node-1" }),
+      screen.getByRole("button", { name: "Show less of the user prompt for node-1" }),
     ).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText(/Line 10 of the instruction\./)).toBeInTheDocument();
   });

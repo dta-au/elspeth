@@ -80,7 +80,8 @@ describe("GraphOutputs", () => {
     expect(queue).toHaveTextContent("Send to summarize");
     const summarize = screen.getByRole("row", { name: /Transform: summarize/ });
     expect(summarize).toHaveTextContent("Send to unbound (not connected)");
-    const output = screen.getByRole("row", { name: /Output: results/ });
+    const output = screen.getByRole("row", { name: /Sink: results/ });
+    expect(screen.queryByRole("row", { name: /Output: / })).not.toBeInTheDocument();
     expect(within(output).getByText("Row written")).toBeInTheDocument();
     expect(output).toHaveTextContent("Send to invalid");
   });

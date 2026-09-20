@@ -201,6 +201,7 @@ def _textract_llm_mapper_args(tmp_path: Path) -> dict[str, Any]:
                 "on_error": "discard",
                 "options": {
                     "profile": "sonnet",
+                    "system_prompt": "You summarise documents. Reply with a short summary only.",
                     "prompt_template": "Summarise this document: {{ row.document_text }}",
                     "required_input_fields": ["document_text"],
                     "response_field": "summary",

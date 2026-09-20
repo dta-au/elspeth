@@ -61,7 +61,9 @@ AdmitIdentity = Callable[[IdentityClaims], "EnsureIdentityOutcome"]
 # raise without calling it. The probe in between answers whether a credential
 # row exists: the refusal protects an administrator who can still sign in, and
 # only this store knows whether one can.
-RetireIdentity = Callable[[str, Callable[[], bool], Callable[[], None]], bool]
+# Arguments: the username, the deleting person's stated reason, the credential
+# probe, the credential deletion.
+RetireIdentity = Callable[[str, str, Callable[[], bool], Callable[[], None]], bool]
 
 _slog = structlog.get_logger(__name__)
 
@@ -626,8 +628,12 @@ class LocalAuthProvider:
         )
         return cleared.rowcount == 1
 
-    def delete_user(self, user_id: str) -> LocalUserDeletion:
+    def delete_user(self, user_id: str, *, reason: str) -> LocalUserDeletion:
         """Delete a local auth user, and retire the identity it was bound to.
+
+        ``reason`` is the deleting person's own words, required because
+        disabling requires one and deletion is the graver act. It goes to the
+        retirer, which composes the recorded reason; this store records none.
 
         Deleting the credential is not enough. ``identities`` is a separate
         store keyed on ``(provider, subject)`` — for local auth, the username
@@ -679,7 +685,7 @@ class LocalAuthProvider:
             with self._connect() as conn:
                 credential_deletions.append(self._delete_user_rows(conn, user_id))
 
-        identity_retired = self._retire_identity(user_id, credential_exists, delete_credential)
+        identity_retired = self._retire_identity(user_id, reason, credential_exists, delete_credential)
         if not credential_deletions:
             # A retirer that returns without deleting and without refusing has
             # retired (or skipped) an identity whose password still works.

@@ -28,7 +28,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.auth.routes import _mark_sensitive_auth_response_uncacheable
 from elspeth.web.config import WebSettings
-from elspeth.web.coordination.identity_authority import LastActiveAdminProtected
+from elspeth.web.coordination.identity_authority import LOCAL_DELETION_REASON_MAX_LENGTH, LastActiveAdminProtected
 from elspeth.web.validation import has_visible_content
 
 _slog = structlog.get_logger(__name__)
@@ -67,6 +67,25 @@ class CreateUserRequest(BaseModel):
         if separator != "@" or not local or not domain:
             raise ValueError("must be a valid email address")
         return trimmed
+
+
+class DeleteUserRequest(BaseModel):
+    """Request body for DELETE /api/auth/admin/users/{user_id}.
+
+    A body, not a query parameter: a reason can name a person or an incident,
+    and query strings are written to access logs.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=LOCAL_DELETION_REASON_MAX_LENGTH)
+
+    @field_validator("reason")
+    @classmethod
+    def _must_state_a_reason(cls, v: str) -> str:
+        if not has_visible_content(v):
+            raise ValueError("must contain at least one visible character")
+        return v
 
 
 class _StrictResponse(BaseModel):
@@ -196,6 +215,7 @@ def create_dev_admin_router() -> APIRouter:
     @router.delete("/{user_id}", status_code=204)
     async def delete_user(
         user_id: str,
+        body: DeleteUserRequest,
         request: Request,
         admin: UserIdentity = Depends(_require_dev_admin),  # noqa: B008
     ) -> Response:
@@ -208,7 +228,7 @@ def create_dev_admin_router() -> APIRouter:
             raise HTTPException(status_code=400, detail="The dev admin account cannot delete itself")
         provider: LocalAuthProvider = request.app.state.auth_provider
         try:
-            deletion = await run_sync_in_worker(provider.delete_user, user_id)
+            deletion = await run_sync_in_worker(provider.delete_user, user_id, reason=body.reason)
         except LastActiveAdminProtected as exc:
             # Deleting the account retires its identity, and this one is the
             # container's last active human administrator (R5). Decided

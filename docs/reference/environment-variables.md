@@ -755,6 +755,52 @@ variables. In a container deployment that means the task role; locally it means
 whatever `AWS_PROFILE` / `AWS_REGION` and the usual `AWS_*` variables resolve
 to. Do not place access keys in plugin options.
 
+### Azure AI Search
+
+On the CLI and YAML authoring surface the `azure_ai_search` transform (Azure
+RAG retrieval) has **no environment variables**: `endpoint`, `index` and either
+`api_key` or `use_managed_identity` (with `client_id` for a user-assigned
+identity) are node options.
+
+The web surface is profile-only. `ELSPETH_WEB__AZURE_SEARCH_PROFILES` is a JSON
+array of operator-owned search-service profiles. Each entry carries:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `alias` | yes | the opaque name a web author selects as `profile`; unique across the array |
+| `endpoint` | yes | `https://<service>.search.windows.net`; never authored or offered on the authoring surface. It is not a secret: recorded search calls and authentication-failure messages name it |
+| `auth` | yes | `managed_identity` or `api_key` |
+| `client_id` | no | user-assigned identity client id; only with `managed_identity` |
+| `credential_ref` | with `api_key` | name of the server-scoped secret holding the query key; refused with `managed_identity` |
+| `indexes` | yes | a non-empty array of index names web authors may query, or the string `"any"` |
+| `api_version` | no | overrides the transform's default REST API version |
+
+`indexes` has no default. Pinning is the safe form; `"any"` opens every index
+on the service to every web author and has to be written out to take effect.
+Unknown fields, an empty `indexes` array and a binding the transform itself
+would refuse (a non-HTTPS endpoint, for example) fail web start-up, and the
+error names the failing field without echoing its value.
+
+Under a profile a web author writes `profile: <alias>`, an `index` the profile
+admits, and the ordinary retrieval options. `endpoint`, `api_key`,
+`use_managed_identity`, `client_id` and `api_version` are operator-owned
+bindings lowered only for execution and are refused in a web-authored pipeline.
+An `api_key` profile injects its server secret itself, so it needs no
+`ELSPETH_WEB__SECRET_WIRING_ALLOWLIST` rule. The secret still has to resolve:
+`credential_ref` must be listed in `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST`, the
+variable it names must be set, and `ELSPETH_FINGERPRINT_KEY` must be present.
+None of these is checked at start-up; a profile whose secret does not resolve
+simply reads as unavailable.
+
+Two other things gate it:
+
+- **The allowlist.** `ELSPETH_WEB__PLUGIN_ALLOWLIST` must include
+  `"transform:azure_ai_search"`. With the plugin allowed and no usable profile,
+  the web surfaces report it as unavailable rather than offering raw options.
+- **The role.** A managed-identity profile needs `Search Index Data Reader` on
+  the search service and role-based access enabled there; see
+  [the Container Apps runbook](../runbooks/azure-container-apps-cold-install.md#10-optional-grant-azure-ai-search-access-for-rag-retrieval).
+
 ---
 
 ## Azure Service Variables

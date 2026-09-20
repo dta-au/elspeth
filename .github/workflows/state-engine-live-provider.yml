@@ -380,12 +380,12 @@ jobs:
           - source:llm@bedrock
           - source:llm@gateway
           - source:llm@openrouter
+          - transform:azure_ai_search@api-key
+          - transform:azure_ai_search@managed-identity
           - transform:llm@azure
           - transform:llm@bedrock
           - transform:llm@gateway
           - transform:llm@openrouter
-          - transform:rag_retrieval@azure-search-api-key
-          - transform:rag_retrieval@azure-search-managed-identity
           - transform:rag_retrieval@chroma-client
           - transform:rag_retrieval@chroma-ephemeral
           - transform:rag_retrieval@chroma-persistent

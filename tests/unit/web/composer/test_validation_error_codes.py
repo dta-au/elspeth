@@ -32,6 +32,10 @@ from typing import Any
 import pytest
 
 from elspeth.web.composer.state import (
+    _LLM_SYSTEM_PROMPT_MISSING_EXPLANATION,
+    _LLM_SYSTEM_PROMPT_MISSING_FIX,
+    _LLM_USER_PROMPT_MISSING_EXPLANATION,
+    _LLM_USER_PROMPT_MISSING_FIX,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
@@ -597,6 +601,30 @@ class TestClosedCodeCatalogueInvariants:
         assert "ONLY if the upstream producer guarantees that exact name" in fix
         assert "fails every row at run time" in fix
 
+    def test_prompt_role_codes_resolve_to_planner_authoring_guidance(self) -> None:
+        """Both prompt-role codes are closed, distinct, and never offer a server default.
+
+        The repair is planner work or a question to the user (composer
+        invariant 1): the catalogue must not hand the planner a stock system
+        prompt to paste, and must not suggest satisfying the check by moving
+        the user's own prompt text across roles (session 60ab6a67).
+        """
+        for code in ("llm_system_prompt_missing", "llm_user_prompt_missing"):
+            assert code in _CLOSED_VALIDATION_ERROR_CODES
+            assert explain_validation_code(code) is not None, code
+
+        system = explain_validation_code("llm_system_prompt_missing")
+        user = explain_validation_code("llm_user_prompt_missing")
+        assert system is not None and user is not None
+        assert system != user
+
+        _explanation, fix = system
+        assert "options.system_prompt" in fix
+        assert "verbatim" in fix
+        assert "ask the user" in fix
+        assert "never move the user's prompt text into system_prompt" in fix
+        assert "Never send an empty or placeholder" in fix
+
     def test_transform_contract_advice_has_exactly_one_owner(self) -> None:
         """The catalogue must SERVE ``state``'s advice, never restate it.
 
@@ -625,6 +653,14 @@ class TestClosedCodeCatalogueInvariants:
             (
                 "prompt_template_undeclared_row_fields",
                 (_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION, _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX),
+            ),
+            (
+                "llm_system_prompt_missing",
+                (_LLM_SYSTEM_PROMPT_MISSING_EXPLANATION, _LLM_SYSTEM_PROMPT_MISSING_FIX),
+            ),
+            (
+                "llm_user_prompt_missing",
+                (_LLM_USER_PROMPT_MISSING_EXPLANATION, _LLM_USER_PROMPT_MISSING_FIX),
             ),
         ):
             guidance = explain_validation_code(code)

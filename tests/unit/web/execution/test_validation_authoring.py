@@ -542,6 +542,48 @@ def test_secret_phase_authorizes_exact_rules_across_all_components() -> None:
     assert result.checks[0].outcome_code == "secret_refs.resolved"
 
 
+def test_secret_phase_needs_no_wiring_rule_for_a_profile_injected_search_key() -> None:
+    """An azure_search_profiles ``credential_ref`` is server-authored end to end.
+
+    Wiring authorization walks the AUTHORED state, where a profiled node carries only
+    ``profile``; the marker appears in the lowered state. The same marker typed by an
+    author is still denied, so the operator needs no ``secret_wiring_allowlist`` rule
+    for a search profile and gains no loophole by omitting one.
+    """
+    authored_options: dict[str, object] = {"profile": "contracts", "index": "docs", "query_field": "q", "output_prefix": "p"}
+    lowered_options: dict[str, object] = {
+        "index": "docs",
+        "query_field": "q",
+        "output_prefix": "p",
+        "endpoint": "https://svc-b.search.windows.net",
+        "api_key": {"secret_ref": "SEARCH_B_KEY", "secret_scope": "server"},
+    }
+    authored = _state(nodes=(_node(plugin="azure_ai_search", options=authored_options),))
+    lowered = _state(nodes=(_node(plugin="azure_ai_search", options=lowered_options),))
+    secrets = _OwnedScopedSecretService(frozenset({"SEARCH_B_KEY"}))
+
+    profiled = validate_secret_evidence(
+        PolicyLoweredState(
+            authored_state=authored,
+            state=lowered,
+            profiled_s3_audit_identities=(),
+            profiled_textract_audit_identities=(),
+            operator_resolved_model_node_ids=frozenset(),
+        ),
+        secret_service=secrets,
+        user_id="alice",
+        secret_wiring_policy=SecretWiringPolicy(rules=()),
+    )
+    typed_by_the_author = validate_secret_evidence(
+        _policy(lowered), secret_service=secrets, user_id="alice", secret_wiring_policy=SecretWiringPolicy(rules=())
+    )
+
+    assert isinstance(profiled, PhaseReport)
+    assert profiled.artifact.all_secret_refs == (("SEARCH_B_KEY", "server"),)
+    assert isinstance(typed_by_the_author, PhaseFailure)
+    assert [error.error_code for error in typed_by_the_author.errors] == ["unauthorized_secret_ref"]
+
+
 def test_secret_phase_preserves_missing_reference_failure() -> None:
     state = _state(source=_source({"api_key": {"secret_ref": "MISSING"}}))
 

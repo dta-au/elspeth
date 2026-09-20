@@ -1232,7 +1232,8 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `aws_textract_document_analysis` | Extract text, tables, forms, and layout from S3-hosted documents through Amazon Textract |
 | `aws_textract_inline_analysis` | Synchronously analyze payload-store documents (managed blobs) through Amazon Textract `AnalyzeDocument` |
 | `pdf_rasterize` | Render each page of a payload-store PDF into a PNG payload, one output row per page — the on-ramp for multipage PDFs into `aws_textract_inline_analysis` |
-| `rag_retrieval` | Enriches rows with retrieval-augmented context from search providers |
+| `azure_ai_search` | Azure RAG: enriches rows with ranked, cited context from an existing Azure AI Search index ([example](../../examples/azure_search_rag/README.md)) |
+| `rag_retrieval` | Enriches rows with retrieval-augmented context from a Chroma collection |
 | `reference_join` | Add named fields to a row by matching one of its values against a key in a reference table bound as configuration (`reference_file` on the CLI, an `inline_content` blob on the web) — fixed at run start, never read at row time |
 
 ### AWS Bedrock LLM

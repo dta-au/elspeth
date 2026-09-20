@@ -31,6 +31,7 @@ from elspeth.contracts.coordination import (
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.checkpoint import CheckpointManager
+from elspeth.core.config import RateLimitSettings
 from elspeth.core.landscape import LandscapeDB, run_coordination_repository, run_lifecycle_repository
 from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -384,6 +385,7 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
         landscape_passphrase=None,
         payload_store_path=settings.payload_store.base_path,
         data_dir=tmp_path,
+        execution_rate_limit=RateLimitSettings(),
         get_landscape_url=lambda: settings.landscape.url,
         get_payload_store_path=lambda: settings.payload_store.base_path,
         get_session_db_url=lambda: f"sqlite:///{tmp_path / 'sessions.db'}",

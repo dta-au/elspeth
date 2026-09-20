@@ -154,8 +154,8 @@ describe("PeopleAccessDialog", () => {
     open();
     const rows = await screen.findAllByRole("button", { name: /Jane Doe/ });
     expect(rows).toHaveLength(2);
-    expect(rows[0]).toHaveTextContent("jane.doe · local");
-    expect(rows[1]).toHaveTextContent("jdoe@partner.example · oidc");
+    expect(rows[0]).toHaveTextContent("jane.doe · Local account");
+    expect(rows[1]).toHaveTextContent("jdoe@partner.example · OpenID Connect");
   });
 
   it("names a person prepared ahead of first sign-in from their linked account, but never a withheld one", async () => {
@@ -175,7 +175,9 @@ describe("PeopleAccessDialog", () => {
     open();
     const row = await screen.findByRole("button", { name: /subject-opaque/ });
     expect(row).toHaveTextContent("Pending access");
-    expect(screen.getByText(/one active human administrator/)).toBeInTheDocument();
+    // No panel-wide banner: on a one-administrator deployment it was shown on
+    // every open, to everyone. The warning lives on the person it is about.
+    expect(screen.queryByText(/one active human administrator/)).toBeNull();
   });
 
   // ── Selection integrity ─────────────────────────────────────────────────
@@ -204,7 +206,15 @@ describe("PeopleAccessDialog", () => {
     const prompt = await screen.findByRole("alertdialog");
     expect(prompt).toHaveTextContent("unsaved changes");
     expect(prompt).toHaveFocus();
+    // The safe action comes first, and the body behind the prompt is inert so
+    // Tab cannot leave it for the form. (jsdom does not enforce inert; the
+    // attribute is what can be asserted here.)
+    expect(within(prompt).getAllByRole("button").map((button) => button.textContent)).toEqual(["Keep editing", "Discard changes"]);
+    const rest = screen.getByLabelText("Note (optional)").closest(".people-body-rest");
+    expect(rest).toHaveAttribute("inert");
+    expect(rest?.contains(prompt)).toBe(false);
     await userEvent.click(within(prompt).getByRole("button", { name: "Keep editing" }));
+    expect(rest).not.toHaveAttribute("inert");
     expect(screen.getByLabelText("Note (optional)")).toHaveValue("half-typed");
     expect(screen.getByRole("heading", { name: "Jane Doe" })).toBeInTheDocument();
   });

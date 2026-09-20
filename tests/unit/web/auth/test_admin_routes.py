@@ -106,7 +106,9 @@ class TestDevAdminGuard:
                 await client.post("/api/auth/admin/users", headers=headers, json={"username": "a", "display_name": "A"})
             ).status_code == 404
             assert (await client.post("/api/auth/admin/users/john/reset-password", headers=headers)).status_code == 404
-            assert (await client.delete("/api/auth/admin/users/john", headers=headers)).status_code == 404
+            assert (
+                await client.request("DELETE", "/api/auth/admin/users/john", headers=headers, json={"reason": "left the team"})
+            ).status_code == 404
 
     async def test_routes_404_without_credentials_when_disabled(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
@@ -236,11 +238,36 @@ class TestDeleteUser:
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
-            response = await client.delete("/api/auth/admin/users/alice", headers=headers)
+            response = await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, json={"reason": "left the team"})
             assert response.status_code == 204
 
             login = await client.post("/api/auth/login", json={"username": "alice", "password": "user-password-1"})
             assert login.status_code == 401
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"json": {}},
+            {"json": {"reason": ""}},
+            {"json": {"reason": "   "}},
+            {"json": {"reason": "x" * 481}},
+            {"json": {"reason": "left the team", "extra": "field"}},
+        ],
+    )
+    async def test_delete_without_a_usable_reason_is_refused_and_deletes_nothing(self, tmp_path, kwargs) -> None:
+        # Disabling requires a reason; deleting is the graver act and must not
+        # cost less (ruling D3, 2026-09-20).
+        provider = _provider_with_admin(tmp_path)
+        provider.create_user("alice", "user-password-1", display_name="Alice")
+        app = _create_test_app(provider, dev_admin_user="john")
+
+        async with _client_for(app) as client:
+            headers = await _bearer(client, "john", "admin-password-1")
+            response = await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, **kwargs)
+            assert response.status_code == 422
+            login = await client.post("/api/auth/login", json={"username": "alice", "password": "user-password-1"})
+            assert login.status_code == 200
 
     async def test_admin_cannot_delete_own_account(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
@@ -248,7 +275,7 @@ class TestDeleteUser:
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
-            response = await client.delete("/api/auth/admin/users/john", headers=headers)
+            response = await client.request("DELETE", "/api/auth/admin/users/john", headers=headers, json={"reason": "left the team"})
         assert response.status_code == 400
         assert provider.list_users()[0].user_id == "john"
 
@@ -258,7 +285,7 @@ class TestDeleteUser:
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
-            response = await client.delete("/api/auth/admin/users/ghost", headers=headers)
+            response = await client.request("DELETE", "/api/auth/admin/users/ghost", headers=headers, json={"reason": "left the team"})
         assert response.status_code == 404
 
 
@@ -341,7 +368,7 @@ class TestDeleteUserLastAdministrator:
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
-            response = await client.delete("/api/auth/admin/users/alice", headers=headers)
+            response = await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, json={"reason": "left the team"})
             assert response.status_code == 409, response.text
             assert response.json()["detail"]["refusal"] == "last_active_admin_protected"
             # The refusal is decided BEFORE the credential goes: a refused
@@ -380,7 +407,9 @@ class TestDeleteUserLastAdministrator:
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
-            assert (await client.delete("/api/auth/admin/users/alice", headers=headers)).status_code == 204
+            assert (
+                await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, json={"reason": "left the team"})
+            ).status_code == 204
 
         assert authority.count_active_human_admins() == 1
         assert authority.read_identity_by_natural_key(provider="local", subject="alice") is None

@@ -24,6 +24,7 @@ from sqlalchemy import select, update
 from elspeth.web.auth.models import AuthenticationError, IdentityClaims
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
+    LOCAL_DELETION_REASON_MAX_LENGTH,
     AdminAlreadyBootstrapped,
     AdminAuthorityRequired,
     ApproverRoleRequired,
@@ -1338,20 +1339,43 @@ def test_local_identity_retirer_binds_the_local_provider_reason_and_recorder(eng
     recorder = _Recorder()
     retire = local_identity_retirer(authority, recorder)
     deletions: list[str] = []
-    assert retire("ada", lambda: True, lambda: deletions.append("ada")) is True
+    assert retire("ada", "  left the team  ", lambda: True, lambda: deletions.append("ada")) is True
     assert deletions == ["ada"]
     row = _identity_row(engine, pending.identity_id)
     assert row.access_state == "disabled"
-    assert row.disable_reason == "local credential deleted"
+    # The retirer composes the recorded reason: a fixed, searchable cause, then
+    # the deleting person's words. The surface never writes the reason itself.
+    assert row.disable_reason == "local credential deleted: left the team"
     assert [type(outcome) for outcome in recorder.outcomes] == [IdentityRetired]
+    assert recorder.outcomes[0].reason == "local credential deleted: left the team"
     assert recorder.outcomes[0].record.provider == "local"
     assert recorder.outcomes[0].previous_subject == "ada"
     # No identity behind the name: the credential still goes, nothing is retired.
-    assert retire("nobody", lambda: False, lambda: deletions.append("nobody")) is False
+    assert retire("nobody", "left the team", lambda: False, lambda: deletions.append("nobody")) is False
     assert deletions == ["ada", "nobody"]
     impostor: Any = object()
     with pytest.raises(TypeError):
         local_identity_retirer(impostor, recorder)
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "x" * (LOCAL_DELETION_REASON_MAX_LENGTH + 1)])
+def test_local_identity_retirer_refuses_an_unusable_reason_before_touching_either_store(engine, authority, reason) -> None:
+    pending = _pending(authority, "ada")
+    recorder = _Recorder()
+    deletions: list[str] = []
+    with pytest.raises(ValueError, match="operator_reason"):
+        local_identity_retirer(authority, recorder)("ada", reason, lambda: True, lambda: deletions.append("ada"))
+    assert deletions == []
+    assert recorder.outcomes == []
+    assert _identity_row(engine, pending.identity_id).access_state == "pending"
+
+
+def test_the_longest_permitted_deletion_reason_fits_the_audit_text_bound() -> None:
+    # The audit trail truncates a text field at its bound; the administrator's
+    # words must never be the part that is cut.
+    from elspeth.web.auth.audit import MAX_AUTH_AUDIT_TEXT_LENGTH
+
+    assert len("local credential deleted: ") + LOCAL_DELETION_REASON_MAX_LENGTH <= MAX_AUTH_AUDIT_TEXT_LENGTH
 
 
 def test_retirement_refuses_the_last_active_human_admin_before_the_credential_goes(engine, authority) -> None:

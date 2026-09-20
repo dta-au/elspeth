@@ -581,10 +581,22 @@ export async function resetAdminUserPassword(
 }
 
 /** Delete a local-auth account. Backend returns 204 No Content. */
-export async function deleteAdminUser(userId: string): Promise<void> {
+/** Longest deletion reason the server accepts (LOCAL_DELETION_REASON_MAX_LENGTH). */
+export const DELETE_ADMIN_USER_REASON_MAX_LENGTH = 480;
+
+/**
+ * Delete a local account. `reason` is required and lands in the audit trail:
+ * deleting must not cost less than disabling, which asks for one. It travels
+ * in the body, not the query string, which access logs record.
+ */
+export async function deleteAdminUser(userId: string, reason: string): Promise<void> {
   const response = await fetch(
     `/api/auth/admin/users/${encodeURIComponent(userId)}`,
-    { method: "DELETE", headers: authHeaders() },
+    {
+      method: "DELETE",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    },
   );
   if (!response.ok) {
     await parseResponse<never>(response);

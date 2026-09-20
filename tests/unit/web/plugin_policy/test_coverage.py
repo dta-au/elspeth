@@ -160,6 +160,7 @@ def _llm(
         input_stream,
         on_success,
         options={
+            "system_prompt": "You judge each submitted prompt. Reply with a one-line verdict.",
             "prompt_template": " ".join(f"{{{{ row.{field} }}}}" for field in prompt_fields),
             "required_input_fields": list(declared_fields),
             "response_field": response_field,

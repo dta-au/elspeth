@@ -268,6 +268,7 @@ def test_splice_transform_identical_review_staged_replay_is_same_object() -> Non
                 "provider": "openrouter",
                 "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "system_prompt": "You summarise text. Reply with the summary only.",
                 "prompt_template": "Summarise {{ row.text }}.",
                 "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
@@ -300,6 +301,7 @@ def test_splice_transform_replay_preserves_all_trusted_requirement_ids() -> None
                 "provider": "openrouter",
                 "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "system_prompt": "You summarise text. Reply with the summary only.",
                 # The server derives prompt_template from the parts (a pending
                 # ref renders as "pending interpretation"); the submitted
                 # literal must match the derivation or the replay projection
@@ -400,6 +402,7 @@ def test_splice_transform_identical_replay_rejects_noncanonical_retained_require
                 "provider": "openrouter",
                 "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "system_prompt": "You summarise text. Reply with the summary only.",
                 "prompt_template": "Summarise {{ row.text }}.",
                 "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},

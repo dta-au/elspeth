@@ -182,6 +182,7 @@ class _WebSettingsStub:
         # Secret wiring is deny-by-default (elspeth-f3c1aafd25); tests that
         # exercise wired secrets construct their own authorizing policy.
         self.secret_wiring_allowlist: tuple[Any, ...] = ()
+        self.execution_rate_limit = RateLimitSettings()
 
     def get_session_db_url(self) -> str:
         return f"sqlite:///{Path(self.data_dir) / 'sessions.db'}"
@@ -612,7 +613,7 @@ def _composition_state_record(
 
 
 def _successful_core_validation_result() -> ValidationResult:
-    """The real validator's successful 24-check prefix, without advisories."""
+    """The real validator's successful 23-check prefix, without advisories."""
     from elspeth.web.execution._validation_ledger import CORE_VALIDATION_CHECK_NAMES
 
     return ValidationResult(
@@ -1816,8 +1817,8 @@ class TestExecutionFlow:
         assert result.readiness.execution_ready is True
         assert result.readiness.completion_ready is False
         assert [blocker.code for blocker in result.readiness.blockers] == [ADVISOR_SIGNOFF_BLOCKED_CODE]
-        assert len(result.checks) == 26
-        assert [check.name for check in result.checks[24:]] == ["advisor_signoff", "proof_diagnostics"]
+        assert len(result.checks) == 25
+        assert [check.name for check in result.checks[23:]] == ["advisor_signoff", "proof_diagnostics"]
 
     @pytest.mark.asyncio
     async def test_validate_passes_record_completion_gates_to_validate_state(
@@ -1913,8 +1914,8 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is False
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
         blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
@@ -1976,8 +1977,8 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is False
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
         blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
@@ -2030,9 +2031,9 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is False
-        assert "unavailable" in result.checks[24].detail
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
+        assert "unavailable" in result.checks[23].detail
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
         assert result.readiness.execution_ready is False
         blob_service.get_blob.assert_not_awaited()
@@ -2078,8 +2079,8 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is False
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
         blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
@@ -2354,9 +2355,9 @@ class TestAuthoritativeProofDiagnostics:
             context = make_blob_read_context(session_id)
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
-        assert [check.name for check in result.checks[:24]] == [check.name for check in _successful_core_validation_result().checks]
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is False
+        assert [check.name for check in result.checks[:23]] == [check.name for check in _successful_core_validation_result().checks]
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
         assert result.is_valid is False
         assert result.readiness.authoring_valid is False
@@ -2503,7 +2504,7 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
-        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[23].name == "proof_diagnostics"
         assert result.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
         blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
 
@@ -2539,8 +2540,8 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is True
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is True
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is True
         assert result.errors == []
 
     @pytest.mark.asyncio
@@ -2573,8 +2574,8 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is True
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is True
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is True
 
     @pytest.mark.asyncio
     async def test_uninspectable_blob_source_abstains_with_passing_proof_check(
@@ -2599,8 +2600,8 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is True
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is True
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is True
         assert result.errors == []
 
     @pytest.mark.asyncio
@@ -2654,8 +2655,8 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is False
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
 
     @pytest.mark.asyncio
@@ -2699,8 +2700,8 @@ class TestAuthoritativeProofDiagnostics:
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is True
-        assert result.checks[24].name == "proof_diagnostics"
-        assert result.checks[24].passed is True
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is True
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
 
@@ -4280,7 +4281,12 @@ class TestB3Construction:
         service: ExecutionServiceImpl,
         mock_settings: _WebSettingsStub,
     ) -> None:
-        """Rate-limit persistence must be confined to the web app state root."""
+        """Rate limits are the operator's block, persisted under the web app state root.
+
+        A composition cannot carry ``rate_limit``, so the loaded pipeline's value
+        is only ever the engine default; building the limiter from it pinned
+        every web run to 60 calls/minute with no operator override.
+        """
         _configure_runtime_success(
             mock_load=mock_load,
             mock_instantiate=mock_instantiate,
@@ -4288,6 +4294,8 @@ class TestB3Construction:
             mock_orch_cls=mock_orch_cls,
         )
         mock_settings.data_dir = Path("/tmp/custom-web-state")
+        operator_rate_limit = RateLimitSettings(default_requests_per_minute=6000)
+        mock_settings.execution_rate_limit = operator_rate_limit
 
         with (
             patch(
@@ -4301,7 +4309,8 @@ class TestB3Construction:
         ):
             service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
-        mock_from_settings.assert_called_once_with(mock_load.return_value.rate_limit, state_dir=Path("/tmp/custom-web-state"))
+        mock_from_settings.assert_called_once_with(operator_rate_limit, state_dir=Path("/tmp/custom-web-state"))
+        assert mock_from_settings.call_args.args[0] is not mock_load.return_value.rate_limit
 
 
 @pytest.mark.usefixtures("mock_pipeline_config_assembly")
@@ -9505,13 +9514,94 @@ class TestTransformProviderConfigPathRestriction:
             await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
-    async def test_azure_search_managed_identity_provider_config_rejected_before_run(
+    @pytest.mark.parametrize(
+        "options",
+        [
+            pytest.param(
+                {"endpoint": "https://tenant-b.search.windows.net", "index": "payroll", "use_managed_identity": True},
+                id="raw-managed-identity-no-profile",
+            ),
+            pytest.param(
+                {"profile": "policies", "index": "approved-documents", "endpoint": "https://evil.example.com"}, id="profile-plus-endpoint"
+            ),
+            pytest.param(
+                {"profile": "policies", "index": "approved-documents", "use_managed_identity": True}, id="profile-plus-managed-identity"
+            ),
+            pytest.param({"profile": "policies", "index": "hr-records"}, id="index-outside-the-pin"),
+        ],
+    )
+    @pytest.mark.parametrize("gate", ["real-gate", "gate-bypassed"])
+    async def test_azure_ai_search_without_a_clean_profile_binding_rejected_before_run(
         self,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
         mock_settings: MagicMock,
+        options: dict[str, Any],
+        gate: str,
     ) -> None:
-        """Web execution must not run user-authored RAG configs with server managed identity."""
+        """The execution-layer half of the guarantee that replaces the managed-identity refusal.
+
+        With the real ``validate_pipeline`` gate the author gets a structured validation
+        error. With the gate stubbed VALID (this module's autouse fixture, standing in
+        for a caller that bypassed it) ``execute`` still refuses, because it lowers
+        through the operator-profile policy itself. Either way no pipeline runs and no
+        provider is ever constructed on the server's identity.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.web.config import WebSettings
+        from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+        from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+        from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+        class _NoSecrets:
+            def has_server_ref(self, name: str) -> bool:
+                return False
+
+            def has_user_ref(self, principal: str, name: str) -> bool:
+                return False
+
+            def has_ref(self, principal: str, name: str) -> bool:
+                return False
+
+            def server_generation(self, name: str) -> str | None:
+                return None
+
+            def user_generation(self, principal: str, name: str) -> str | None:
+                return None
+
+        runtime = RuntimeWebPluginConfig.from_settings(
+            WebSettings.model_validate(
+                {
+                    "composer_max_composition_turns": 4,
+                    "composer_max_discovery_turns": 4,
+                    "composer_timeout_seconds": 60,
+                    "composer_rate_limit_per_minute": 20,
+                    "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+                    "plugin_allowlist": ["source:csv", "sink:csv", "transform:azure_ai_search"],
+                    "azure_search_profiles": [
+                        {
+                            "alias": "policies",
+                            "endpoint": "https://operator-private-marker.search.windows.net",
+                            "auth": "managed_identity",
+                            "indexes": ["approved-documents"],
+                        }
+                    ],
+                }
+            )
+        )
+        policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+        snapshot = build_plugin_snapshot(
+            policy=policy,
+            catalog=create_catalog_service(),
+            profiles=profiles,
+            principal_scope="local:alice",
+            secret_inventory=_NoSecrets(),
+            generation_key=b"azure-search-execution-layer-proof",
+        )
+        service._plugin_snapshot_factory = lambda _user_id: snapshot
+        service._operator_profile_registry = profiles
+
         mock_settings.data_dir = "/tmp/elspeth_data"
         state = mock_session_service.get_current_state.return_value
         state.source = None
@@ -9520,29 +9610,39 @@ class TestTransformProviderConfigPathRestriction:
             {
                 "id": "rag",
                 "node_type": "transform",
-                "plugin": "rag_retrieval",
+                "plugin": "azure_ai_search",
                 "input": "transform_in",
                 "on_success": "results",
                 "on_error": "discard",
-                "options": {
-                    "provider": "azure_search",
-                    "provider_config": {
-                        "endpoint": "https://tenant-b.search.windows.net",
-                        "index": "payroll",
-                        "use_managed_identity": True,
-                    },
-                },
+                "options": {"query_field": "question", "output_prefix": "policy", "schema": {"mode": "observed"}, **options},
             }
         ]
         state.edges = None
 
         with (
             patch.object(service, "_run_pipeline") as run_pipeline,
-            pytest.raises(PipelineValidationError, match="managed identity"),
+            patch("elspeth.plugins.transforms.azure.ai_search.AzureSearchProvider") as provider_class,
         ):
-            await _execute(service, session_id=uuid4())
+            if gate == "real-gate":
+                with (
+                    patch("elspeth.web.execution.validation.validate_pipeline", side_effect=_real_validate_pipeline),
+                    pytest.raises(PipelineValidationError) as raised,
+                ):
+                    await _execute(service, session_id=uuid4(), user_id="alice")
+                # The mocked state never yields loadable settings, so a bare
+                # ``raises`` is satisfied by ANY node. Pin the refusal to the
+                # operator-profile gate and to this node.
+                assert [(error.error_code, error.component_id) for error in raised.value.errors] == [("profile_unavailable", "rag")]
+                rendered = " ".join(error.message for error in raised.value.errors)
+            else:
+                with pytest.raises(RuntimeError, match="Plugin policy validation diverged") as diverged:
+                    await _execute(service, session_id=uuid4(), user_id="alice")
+                rendered = str(diverged.value)
 
         run_pipeline.assert_not_called()
+        provider_class.assert_not_called()
+        for private_value in ("tenant-b", "evil.example.com", "operator-private-marker"):
+            assert private_value not in rendered
 
     @pytest.mark.asyncio
     async def test_sequential_multi_query_llm_default_retry_budget_rejected_before_run(

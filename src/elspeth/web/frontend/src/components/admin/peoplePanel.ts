@@ -200,3 +200,20 @@ export function usePersonMutation(reload: () => Promise<void>): PersonMutation {
   const clear = useCallback(() => setNotice(null), []);
   return { busy, notice, mustReconcile, run, refresh, clear };
 }
+
+/** How long "Copied" stays before the button offers Copy again. */
+export const COPIED_RESET_MS = 3000;
+
+/**
+ * Return a copy button to idle a few seconds after it reports success. A
+ * label that stays "Copied" says nothing the second time it is pressed.
+ */
+export function useCopiedReset(copied: boolean, reset: () => void): void {
+  const resetRef = useRef(reset);
+  resetRef.current = reset;
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => resetRef.current(), COPIED_RESET_MS);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+}

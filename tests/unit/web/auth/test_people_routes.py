@@ -235,6 +235,34 @@ async def test_an_identity_only_administrator_sees_no_credential_inventory(tmp_p
         assert "password" not in response.text.lower()
 
 
+async def test_the_sole_administrator_is_named_per_person_not_only_counted(tmp_path) -> None:
+    """The last-administrator warning belongs on the one person it is about.
+
+    A count alone makes a panel warn on everyone. Both the roster row and the
+    direct read name the person, and stop naming them once a second
+    administrator exists.
+    """
+    harness = _build(tmp_path)
+    nobody_id = _admit(harness.authority, _claims("nobody", display_name="No Body"), activate=True)
+    async with _client(harness.app) as client:
+        headers = await _bearer(client, "root")
+
+        async def sole_flags() -> dict[str, bool]:
+            body = (await client.get("/api/auth/admin/people", headers=headers)).json()
+            return {person["key"]: person["sole_active_admin"] for person in body["people"]}
+
+        root_key, nobody_key = f"identity:{harness.root_identity_id}", f"identity:{nobody_id}"
+        assert await sole_flags() == {root_key: True, nobody_key: False}
+        for identity_id, expected in ((harness.root_identity_id, True), (nobody_id, False)):
+            read = await client.get(f"/api/auth/admin/people/identity/{identity_id}", headers=headers)
+            assert read.json()["person"]["sole_active_admin"] is expected
+
+        _make_both(harness)
+        flags = await sole_flags()
+        assert flags[root_key] is False
+        assert set(flags.values()) == {False}
+
+
 async def test_pending_redaction_holds_through_search_labels_and_selection(tmp_path) -> None:
     harness = _build(tmp_path)
     pending_id = _admit(
@@ -253,6 +281,10 @@ async def test_pending_redaction_holds_through_search_labels_and_selection(tmp_p
         label = (await client.get(f"/api/auth/admin/people/labels?identity_id={pending_id}", headers=headers)).json()["labels"][0]
         assert label["label"] == "sub-771"
         assert "Sam" not in label["detail"]
+        # The sign-in method is data beside the detail, never text inside it:
+        # the panel names providers from one map.
+        assert label["provider"] == "oidc"
+        assert "oidc" not in label["detail"]
         selected = (await client.get(f"/api/auth/admin/people/identity/{pending_id}", headers=headers)).json()["person"]
         assert selected["identity"]["email"] is None
 
@@ -368,7 +400,9 @@ async def test_a_recycled_username_keeps_its_retired_history_separate(tmp_path) 
     old_id = _admit(harness.authority, _claims("jane", display_name="Jane Doe"), activate=True)
     async with _client(harness.app) as client:
         headers = await _bearer(client, "devadmin")
-        assert (await client.delete("/api/auth/admin/users/jane", headers=headers)).status_code == 204
+        assert (
+            await client.request("DELETE", "/api/auth/admin/users/jane", headers=headers, json={"reason": "left the team"})
+        ).status_code == 204
         created = await client.post("/api/auth/admin/users", headers=headers, json={"username": "jane", "display_name": "Jane Newcomer"})
         assert created.status_code == 201
 

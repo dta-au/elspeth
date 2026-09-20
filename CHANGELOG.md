@@ -67,6 +67,35 @@ drained and repair this release forward.
   delete with 403, stored user secrets are neither listed nor resolved nor
   allowed to shadow a server secret, and the panel renders read-only. See the
   [environment reference](docs/reference/environment-variables.md).
+- **Composer LLM steps always carry both prompts.** Composer validation now
+  rejects an `llm` node without a `system_prompt`
+  (`llm_system_prompt_missing`) or without a user prompt
+  (`llm_user_prompt_missing`). The planner keeps the prompt you gave as the
+  user prompt, drafts a system prompt when none was given and says so, or asks
+  first; the server never writes prompt text. A multi-query node keeps one
+  shared system prompt with one user prompt per query. The step's
+  configuration box shows "System prompt" and "User prompt" first, one user
+  row per query, and marks a missing role. Existing Composer sessions whose
+  LLM step has no system prompt now fail validation, and adding one reopens
+  that step's prompt review. YAML pipelines are unaffected: the runtime
+  `system_prompt` option stays optional.
+- **Azure AI Search retrieval is its own transform (breaking).** The new
+  `azure_ai_search` transform (Azure RAG) takes flat options (`endpoint`,
+  `index`, `api_key` or `use_managed_identity` with `client_id`, and
+  `field_content`, `field_id`, `field_title`, `field_url`, `field_vector` for
+  the index field names), and records its readiness probe in the audit trail
+  before the first row. The `azure_search` provider is removed from
+  `rag_retrieval`, which now serves Chroma only: YAML that used
+  `provider: azure_search` must move to the new plugin, and
+  `managed_identity_client_id` is now `client_id`. Web-authored pipelines reach
+  a search service only through an operator profile declared in the new
+  `ELSPETH_WEB__AZURE_SEARCH_PROFILES` setting, whose `indexes` pin is
+  mandatory (`"any"` is the explicit opt-out); the endpoint, key and identity
+  never appear in an authored pipeline. This replaces the blanket refusal of
+  managed identity in web pipelines, and the `managed_identity_policy`
+  validation check is removed with it. See the
+  [environment reference](docs/reference/environment-variables.md#azure-ai-search)
+  and the [Container Apps runbook](docs/runbooks/azure-container-apps-cold-install.md).
 
 - **Coordination deadlines are decided from fresh post-lock database time.**
   Lease deadlines are now issued after locked admission rather than from a

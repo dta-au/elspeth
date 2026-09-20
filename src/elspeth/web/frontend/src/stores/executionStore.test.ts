@@ -1461,6 +1461,55 @@ describe("executionStore.rehydrateActiveRun", () => {
     expect(connectToRun).not.toHaveBeenCalled();
   });
 
+  // A run this tab did not start — an agent, the API, another browser tab —
+  // begins while the session is already open, so no session change ever fires
+  // rehydrateActiveRun. The Run tab's own poll (loadRuns) is the only thing
+  // that sees it. Unattached, the tab rendered a bare toolbar whose only
+  // content was the "Runs (n)" drawer, with no live progress until a reload.
+  it("attaches to a live run the runs poll discovers mid-session", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-external", status: "running" }),
+    ]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+
+    const state = useExecutionStore.getState();
+    expect(state.activeRunId).toBe("run-external");
+    expect(state.activeRunSessionId).toBe("session-1");
+    expect(state.progress?.status).toBe("running");
+    expect(connectToRun).toHaveBeenCalledTimes(1);
+
+    // The 3s poll keeps firing while the run is live: it must not reconnect.
+    await useExecutionStore.getState().loadRuns("session-1");
+    expect(connectToRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("moves from a finished run to a newer live one, but never off a run still in flight", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-new", status: "running" }),
+      makeRun({ id: "run-mine", status: "running" }),
+    ]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+    const inFlight = { status: "running" } as never;
+    useExecutionStore.setState({ activeRunId: "run-mine", progress: inFlight });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+    expect(useExecutionStore.getState().activeRunId).toBe("run-mine");
+    expect(connectToRun).not.toHaveBeenCalled();
+
+    useExecutionStore.setState({ activeRunId: "run-mine", progress: { status: "completed" } as never });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-new", status: "running" }),
+      makeRun({ id: "run-mine", status: "completed" }),
+    ]);
+    await useExecutionStore.getState().loadRuns("session-1");
+    expect(useExecutionStore.getState().activeRunId).toBe("run-new");
+    expect(connectToRun).toHaveBeenCalledTimes(1);
+  });
+
   it("drops a response that resolves after the active session changes", async () => {
     const { fetchRuns } = await import("@/api/client");
     const pendingRuns = deferred<Run[]>();

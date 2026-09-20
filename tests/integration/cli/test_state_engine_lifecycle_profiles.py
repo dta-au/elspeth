@@ -25,6 +25,7 @@ from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.core.config import RateLimitSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -196,6 +197,7 @@ payload_store:
         landscape_passphrase=None,
         payload_store_path=settings.payload_store.base_path,
         data_dir=tmp_path,
+        execution_rate_limit=RateLimitSettings(),
         get_landscape_url=lambda: settings.landscape.url,
         get_payload_store_path=lambda: settings.payload_store.base_path,
         get_session_db_url=lambda: f"sqlite:///{tmp_path / 'sessions.db'}",

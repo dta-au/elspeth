@@ -159,6 +159,7 @@ def _unshielded_llm_state() -> CompositionState:
                 on_error="discard",
                 options={
                     "profile": "llm-default",
+                    "system_prompt": "You answer the prompt in each row. Reply concisely.",
                     "prompt_template": "{{ row['prompt'] }}",
                     "schema": {"mode": "observed", "fields": None},
                 },

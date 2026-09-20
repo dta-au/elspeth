@@ -159,6 +159,7 @@ interface ExecutionState {
   loadRunDiagnostics: (runId: string) => Promise<void>;
   evaluateRunDiagnostics: (runId: string) => Promise<void>;
   connectWebSocket: (runId: string) => void;
+  attachLiveRunIfUnattached: (sessionId: string, runs: Run[]) => void;
   clearValidation: () => void;
   reset: () => void;
 }
@@ -927,6 +928,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         }
         return { runs };
       });
+      get().attachLiveRunIfUnattached(sessionId, runs);
       return "loaded";
     } catch {
       // Non-critical -- runs list can be stale temporarily
@@ -954,13 +956,29 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     }
     if (!shouldApplyRunListResult(sessionId)) return;
     set({ runs });
+    get().attachLiveRunIfUnattached(sessionId, runs);
+  },
+
+  /**
+   * Attach this tab to the session's live (pending or running) run when it is
+   * not following one. Two callers: rehydrateActiveRun (reload, session
+   * switch) and loadRuns (the Run tab's poll). The second is what covers a
+   * run this tab did NOT start — another browser tab, an agent, the API: with
+   * no attachment the Run tab rendered a bare toolbar whose only content was
+   * the "Runs (n)" history drawer, and no live progress until a hard refresh.
+   */
+  attachLiveRunIfUnattached(sessionId: string, runs: Run[]) {
     const liveRun = runs.find(
       (run) => run.status === "running" || run.status === "pending",
     );
     if (!liveRun) return;
-    // execute() already owns a run for this tab (it set activeRunId and
-    // connected the WebSocket itself) — do not stomp its connection.
-    if (get().activeRunId !== null) return;
+    const { activeRunId, progress } = get();
+    if (activeRunId === liveRun.id) return;
+    // A run this tab is still following in flight keeps its connection:
+    // execute() owns it (it set activeRunId and opened the WebSocket itself).
+    // A FINISHED one does not — its terminal progress would otherwise pin the
+    // Run tab to the old result while a newer run is live.
+    if (activeRunId !== null && (progress === null || !isTerminalRunStatus(progress.status))) return;
     set({
       activeRunId: liveRun.id,
       activeRunSessionId: sessionId,

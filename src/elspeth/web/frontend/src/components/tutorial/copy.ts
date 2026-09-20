@@ -80,7 +80,7 @@ export const TURN_7_LEARNING_BULLETS_SKIPPED = [
   {
     title: "What the composer builds is AI-generated.",
     body:
-      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The system and user prompts used by its LLM steps, and cleanup choices it makes, are kept in the audit trail with your approval against them. You can revisit that record any time in the Approvals table on each pipeline's Graph tab.",
+      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The system and user prompts used by its LLM steps, and cleanup choices it makes, are kept in the audit trail with your approval against them. You can revisit that record any time on each pipeline's Approvals tab.",
   },
   {
     title: "Read before you run.",
@@ -93,7 +93,7 @@ export const TURN_7_LEARNING_BULLETS = [
   {
     title: "What you built is AI-generated.",
     body:
-      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The system and user prompts used by its LLM step, and cleanup choices such as dropping raw HTML, are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time in the Approvals table on your pipeline's Graph tab.",
+      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The system and user prompts used by its LLM step, and cleanup choices such as dropping raw HTML, are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time on your pipeline's Approvals tab.",
   },
   {
     title: "Read before you run.",

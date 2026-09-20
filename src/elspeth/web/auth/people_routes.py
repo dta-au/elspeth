@@ -120,6 +120,11 @@ class IdentityPerson(_StrictModel):
     # The row ``retire_identity`` left behind when a local account was
     # deleted: history, not a person who can sign in.
     retired: bool
+    # This person is the ONLY active human administrator, so the server will
+    # refuse to disable, retire or demote them. Said per person so the
+    # warning appears on the one person it is about. Advisory: R5 is decided
+    # by the mutation, under its own lock.
+    sole_active_admin: bool
     local_account: LocalAccountView | None
     actions: PersonActions
 
@@ -165,7 +170,12 @@ class PersonLabel(_StrictModel):
 
     identity_id: str
     label: str
+    # The username or subject that tells two people with one name apart. The
+    # sign-in method is DATA beside it, not text inside it: the panel names
+    # providers from one map, and a server-formatted "sam · oidc" was the one
+    # place a raw provider token still reached an administrator.
     detail: str
+    provider: IdentityProviderType
     kind: Literal["human", "service"]
     access_state: IdentityAccessState
     retired: bool
@@ -200,12 +210,14 @@ def _identity_person(
     *,
     account: LocalUserAccount | None,
     user: UserIdentity,
+    active_admin_ids: frozenset[str],
 ) -> IdentityPerson:
     return IdentityPerson(
         record_type="identity",
         key=identity_key(summary.identity_id),
         identity=_identity_view(summary),
         retired=is_retired_identity(summary),
+        sole_active_admin=active_admin_ids == {summary.identity_id},
         local_account=None if account is None else _local_view(account),
         actions=PersonActions(
             manage_access=True,
@@ -249,7 +261,8 @@ def _person_label(summary: IdentitySummary, *, account: LocalUserAccount | None)
     return PersonLabel(
         identity_id=view.identity_id,
         label=label,
-        detail=f"{secondary} · {view.provider}",
+        detail=secondary,
+        provider=view.provider,
         kind=view.kind,
         access_state=view.access_state,
         retired=is_retired_identity(summary),
@@ -404,6 +417,7 @@ def create_people_router() -> APIRouter:
             raise _hidden()
         try:
             summary = await run_sync_in_worker(_authority(request).read_identity_summary, identity_id=identity_id)
+            active_admin_ids = await run_sync_in_worker(_authority(request).active_human_admin_ids)
         except SQLAlchemyError as exc:
             raise _source_unavailable("identities") from exc
         if summary is None:
@@ -415,7 +429,10 @@ def create_people_router() -> APIRouter:
             except sqlite3.Error as exc:
                 raise _source_unavailable("local_accounts") from exc
         _uncacheable(response)
-        return PersonResponse(person=_identity_person(summary, account=account, user=user), capabilities=capabilities)
+        return PersonResponse(
+            person=_identity_person(summary, account=account, user=user, active_admin_ids=active_admin_ids),
+            capabilities=capabilities,
+        )
 
     @router.get("/local/{username}", response_model=PersonResponse)
     async def read_local_person(request: Request, response: Response, username: str) -> PersonResponse:
@@ -439,11 +456,14 @@ def create_people_router() -> APIRouter:
             bound = await _bound_local_identities(request, [account.user_id])
             # No identity bound to the username is an ordinary answer here, not a missing key.
             summary = bound[account.user_id] if account.user_id in bound else None
-            person = (
-                _local_person(account, identities_visible=True, user=user)
-                if summary is None
-                else _identity_person(summary, account=account, user=user)
-            )
+            if summary is None:
+                person = _local_person(account, identities_visible=True, user=user)
+            else:
+                try:
+                    active_admin_ids = await run_sync_in_worker(_authority(request).active_human_admin_ids)
+                except SQLAlchemyError as exc:
+                    raise _source_unavailable("identities") from exc
+                person = _identity_person(summary, account=account, user=user, active_admin_ids=active_admin_ids)
         else:
             person = _local_person(account, identities_visible=False, user=user)
         _uncacheable(response)
@@ -489,6 +509,10 @@ def create_people_router() -> APIRouter:
         if capabilities.identity_admin:
             authority = _authority(request)
             try:
+                # Read once, before the rows: the count the advisory shows and
+                # the person each row names as sole administrator are one fact.
+                active_admin_ids = await run_sync_in_worker(authority.active_human_admin_ids)
+                active_admins = len(active_admin_ids)
                 if status != "not_set_up" and len(page) < wanted:
                     # A person prepared ahead of their first sign-in is shown
                     # under their ACCOUNT's name and email, which the identity
@@ -516,10 +540,10 @@ def create_people_router() -> APIRouter:
                             summary,
                             account=_linked_account(by_username, summary),
                             user=user,
+                            active_admin_ids=active_admin_ids,
                         )
                         for summary in summaries
                     )
-                active_admins = await run_sync_in_worker(authority.count_active_human_admins)
             except SQLAlchemyError as exc:
                 raise _source_unavailable("identities") from exc
 

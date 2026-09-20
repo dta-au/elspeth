@@ -20,7 +20,7 @@ export function identityView(overrides: Partial<IdentityView> = {}): IdentityVie
 export function identityPerson(overrides: Partial<IdentityView> = {}, extra: Partial<Omit<IdentityPerson, "identity">> = {}): IdentityPerson {
   const identity = identityView(overrides);
   return {
-    record_type: "identity", key: `identity:${identity.identity_id}`, identity, retired: false, local_account: null,
+    record_type: "identity", key: `identity:${identity.identity_id}`, identity, retired: false, sole_active_admin: false, local_account: null,
     actions: { manage_access: true, manage_credentials: false, set_up_access: false, is_self: false },
     ...extra,
   };

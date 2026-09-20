@@ -48,7 +48,6 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
   const [query, setQuery] = useState<PeopleQuery>(FIRST_QUERY);
   const [draftText, setDraftText] = useState("");
   const [load, setLoad] = useState<DirectoryLoad>({ status: "loading" });
-  const [activeAdminCount, setActiveAdminCount] = useState<number | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [selected, setSelected] = useState<{ key: string; seed: PersonRecord | null } | null>(null);
   const [adding, setAdding] = useState(false);
@@ -121,7 +120,6 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
     void listPeople(query, controller.signal).then(
       (page) => {
         setLoad({ status: "ready", people: page.people, hasMore: page.has_more });
-        setActiveAdminCount(page.active_human_admin_count);
       },
       (error: unknown) => {
         if (isAbort(error)) return;
@@ -231,14 +229,21 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
               <span id="people-leave-title">{leave.reason === "password"
                 ? `The password for ${credentials.map((held) => held.username).join(" and ") || "this account"} is still on screen and cannot be shown again. Close anyway?`
                 : "You have unsaved changes. Discard them?"}</span>
-              <Button compact variant="danger" onClick={() => { const { proceed } = leave; dirtyOwners.current.clear(); setLeave(null); proceed(); }}>{leave.reason === "password" ? "Close without the password" : "Discard changes"}</Button>
+              {/* The safe action first: this prompt now appears on every tab
+                  change with typed input, and the first button is the one a
+                  hurried Enter or Tab lands on. */}
               <Button compact onClick={() => setLeave(null)}>{leave.reason === "password" ? "Keep open" : "Keep editing"}</Button>
+              <Button compact variant="danger" onClick={() => { const { proceed } = leave; dirtyOwners.current.clear(); setLeave(null); proceed(); }}>{leave.reason === "password" ? "Close without the password" : "Discard changes"}</Button>
             </div>
           )}
 
+          {/* While the prompt is open the rest of the body is inert, so Tab
+              stays in the prompt rather than landing in the form behind it.
+              React 18 does not type `inert`: same idiom as ComposerWorkspace.
+              `display: contents` keeps the body's grid as it was. */}
+          <div className="people-body-rest" {...(leave !== null ? { inert: "" } : {})}>
           {credentials.map((held) => <GeneratedPassword key={held.username} credential={held} onDismiss={() => setCredentials((current) => current.filter((other) => other !== held))} />)}
           {status !== null && <p role="status" className="people-notice people-notice-saved">{status}</p>}
-          {activeAdminCount === 1 && <p role="status" className="identity-admin-advisory">This deployment has one active human administrator. Add another before changing that administrator's access.</p>}
 
           {capabilities === null ? (
             capabilityError !== null
@@ -256,13 +261,14 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
                   <AddPersonForm capabilities={capabilities} onCredential={addCredential} onCancel={() => { setAdding(false); setView("list"); setTimeout(() => addButtonRef.current?.focus(), 0); }}
                     onAdded={(key) => { dirtyOwners.current.clear(); setAdding(false); setSelected({ key, seed: null }); setView("detail"); setRefreshTick((value) => value + 1); }} />
                 ) : selected !== null ? (
-                  <PersonDetail key={selected.key} personKey={selected.key} initial={selected.seed} activeAdminCount={activeAdminCount} quotasEnabled={capabilities.quotas_enabled} onCredential={addCredential} onPersonChanged={onPersonChanged} onGone={onGone} />
+                  <PersonDetail key={selected.key} personKey={selected.key} initial={selected.seed} quotasEnabled={capabilities.quotas_enabled} onCredential={addCredential} onPersonChanged={onPersonChanged} onGone={onGone} />
                 ) : (
                   <p className="people-empty-detail">Select a person to manage their access, roles, approvers, limits and sign-in.</p>
                 )}
               </div>
             </div>
           )}
+          </div>
         </div>
       </div>
     </PeoplePanelContext.Provider>

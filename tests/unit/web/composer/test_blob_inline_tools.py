@@ -61,6 +61,7 @@ def _inline_ref_state() -> CompositionState:
                     "provider": "openrouter",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "model": "openai/gpt-4o",
+                    "system_prompt": "You classify each input row. Reply with one category label.",
                     "prompt_template": "Placeholder",
                     "required_input_fields": [],
                     "schema": {"mode": "observed"},

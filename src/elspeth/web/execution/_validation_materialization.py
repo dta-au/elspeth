@@ -45,7 +45,6 @@ from elspeth.web.execution.schemas import (
     CHECK_LLM_BASE_URL_POLICY,
     CHECK_LLM_RETRY_BUDGET_POLICY,
     CHECK_LLM_TRACING_POLICY,
-    CHECK_MANAGED_IDENTITY_POLICY,
     ValidationCheck,
     ValidationError,
 )
@@ -57,7 +56,6 @@ from elspeth.web.provider_config_policy import (
     web_llm_base_url_policy_error,
     web_llm_retry_budget_policy_error,
     web_llm_tracing_policy_error,
-    web_rag_provider_config_policy_error,
 )
 
 
@@ -573,70 +571,6 @@ def materialize_validation_yaml(
     )
 
 
-def validate_managed_identity_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
-    """Reject web-authored managed identity configuration.
-
-    Subject set is every PLUGIN-BEARING node (elspeth-df8082552d). This gate
-    is OPTION-shaped — it reads ``options["provider"]`` and
-    ``options["provider_config"]`` and never consults the plugin name — so
-    ``node_type`` was the sole limiter, and a collector or aggregation
-    carrying a managed-identity ``provider_config`` passed it silently.
-    Measured before the fix, with a transform control: transform FIRES,
-    aggregation and collector SILENT.
-
-    Containment was incidental and LATE, never structural: a batch-aware
-    plugin's config model is ``extra="forbid"`` and has no ``provider_config``
-    field, so the composition dies at ``validate_runtime_plugins`` — two
-    phases AFTER this gate, with an unrelated error. The reactivation trigger
-    is one batch-aware plugin adding a ``provider_config`` field to its own
-    config model.
-    """
-    for node in materialized.authored.policy.state.nodes:
-        if node.plugin is None:
-            continue
-        policy_error = web_rag_provider_config_policy_error(node.options)
-        if policy_error is None:
-            continue
-        return PhaseFailure(
-            passed_checks=(),
-            failed_check=ValidationCheck(
-                name=CHECK_MANAGED_IDENTITY_POLICY,
-                passed=False,
-                detail=f"{node.node_type.capitalize()} '{node.id}' uses disallowed managed identity provider_config",
-                affected_nodes=(node.id,),
-                outcome_code=None,
-            ),
-            errors=(
-                ValidationError(
-                    component_id=node.id,
-                    component_type="transform",
-                    message=policy_error,
-                    suggestion="Use api_key authentication or an operator-controlled named connector/allowlist.",
-                    error_code=None,
-                ),
-            ),
-            readiness=_blocked_readiness(
-                code=CHECK_MANAGED_IDENTITY_POLICY,
-                detail=f"{node.node_type} {node.id} enables managed identity from web-authored provider_config",
-                component_id=node.id,
-                component_type="transform",
-            ),
-            semantic_contracts=materialized.authored.semantic_contracts,
-        )
-    return PhaseReport(
-        artifact=_snapshot_materialized_evidence(materialized),
-        checks=(
-            ValidationCheck(
-                name=CHECK_MANAGED_IDENTITY_POLICY,
-                passed=True,
-                detail="No web-authored managed identity provider_config",
-                affected_nodes=(),
-                outcome_code=None,
-            ),
-        ),
-    )
-
-
 def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject unsafe sequential multi-query LLM retry budgets.
 
@@ -952,5 +886,4 @@ __all__ = [
     "validate_llm_base_url_policy",
     "validate_llm_retry_budget_policy",
     "validate_llm_tracing_policy",
-    "validate_managed_identity_policy",
 ]

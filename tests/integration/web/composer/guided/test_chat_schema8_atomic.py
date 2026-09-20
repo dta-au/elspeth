@@ -2426,7 +2426,10 @@ def _committed_wire_payload(
 
 
 _REVIEW_TERM = "llm_prompt_template:copy"
-_REVIEW_DRAFT = "Summarise {{ row.name }} in one line."
+_REVIEW_SYSTEM_PROMPT = "You summarise records. Reply with one line only."
+_REVIEW_PROMPT_TEMPLATE = "Summarise {{ row.name }} in one line."
+# A node carrying both prompt roles is reviewed as one two-section surface.
+_REVIEW_DRAFT = f"System prompt:\n{_REVIEW_SYSTEM_PROMPT}\n\nPrompt template:\n{_REVIEW_PROMPT_TEMPLATE}"
 
 
 def _reviewable_llm_node_options() -> dict[str, object]:
@@ -2448,7 +2451,8 @@ def _reviewable_llm_node_options() -> dict[str, object]:
 
     return {
         "profile": "task-role",
-        "prompt_template": _REVIEW_DRAFT,
+        "system_prompt": _REVIEW_SYSTEM_PROMPT,
+        "prompt_template": _REVIEW_PROMPT_TEMPLATE,
         "schema": {"mode": "observed"},
         INTERPRETATION_REQUIREMENTS_KEY: [
             {

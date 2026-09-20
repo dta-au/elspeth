@@ -1,6 +1,7 @@
 /** Requests to the people directory read facade. Reads only: every write goes
  *  through the identity-administration or dev-admin API that owns it. */
 import { authHeaders, parseResponse } from "./client";
+import type { IdentityProvider } from "@/types/identityAdmin";
 import type {
   PeopleCapabilities,
   PeopleListResponse,
@@ -93,9 +94,23 @@ export function personName(person: PersonRecord): string {
 }
 
 /** The line that tells two people with one name apart: never the name again. */
+/**
+ * What an administrator calls each sign-in method. The ONE map: the directory
+ * filter, the Add person list, the Sign-in section and the disambiguator all
+ * read it, so a provider is never "entra" in one place and named in another.
+ */
+export const PROVIDER_LABEL: Record<IdentityProvider, string> = {
+  local: "Local account",
+  oidc: "OpenID Connect",
+  entra: "Microsoft Entra ID",
+  vanguard: "VANguard",
+  google: "Google",
+  service: "Service account",
+};
+
 export function personDisambiguator(person: PersonRecord): string {
-  if (person.record_type === "local_account") return `${person.local_account.username} · local`;
+  if (person.record_type === "local_account") return `${person.local_account.username} · ${PROVIDER_LABEL.local}`;
   const { username, subject, provider } = person.identity;
   const secondary = username !== null && username !== personName(person) ? username : subject;
-  return `${secondary} · ${provider}`;
+  return `${secondary} · ${PROVIDER_LABEL[provider]}`;
 }

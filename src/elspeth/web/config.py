@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, Valid
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-from elspeth.core.config import PayloadStoreSettings
+from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
@@ -35,7 +35,11 @@ from elspeth.web.auth.urls import (
 )
 from elspeth.web.compartments import COMPARTMENT_ID_PATTERN, is_compartment_id
 from elspeth.web.composer.reasoning import ReasoningEffort
-from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings, AWSTextractProfileSettings
+from elspeth.web.plugin_policy.profiles import (
+    AWSS3SourceProfileSettings,
+    AWSTextractProfileSettings,
+    AzureSearchProfileSettings,
+)
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
@@ -482,8 +486,18 @@ class WebSettings(BaseModel):
     bedrock_guardrail_default_profiles: Mapping[str, str] = Field(default_factory=dict)
     aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = ()
     aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = ()
+    azure_search_profiles: tuple[AzureSearchProfileSettings, ...] = ()
     orphan_run_max_age_seconds: int = Field(default=3600, ge=60)
     orphan_run_check_interval_seconds: int = Field(default=300, ge=30)
+    # External-call rate limits for web-executed runs: the same block a CLI
+    # pipeline sets as ``rate_limit:`` in settings.yaml. A composition cannot
+    # carry run-execution settings, so without this every web run was pinned to
+    # the engine default (60 calls/minute per service) with no operator
+    # override. Operator-owned, never author-settable. Limiters are keyed by
+    # provider type (``openrouter``, ``azure_openai``, ``bedrock``,
+    # ``gateway``), so one ``services`` entry covers every LLM profile that
+    # shares that provider.
+    execution_rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
 
     # Execution infrastructure — defaults derive from data_dir when not explicitly set
     landscape_url: str | None = None
@@ -963,6 +977,17 @@ class WebSettings(BaseModel):
             raise ValueError("AWS Textract profile aliases must be unique")
         return profiles
 
+    @field_validator("azure_search_profiles")
+    @classmethod
+    def _validate_azure_search_profiles(
+        cls,
+        profiles: tuple[AzureSearchProfileSettings, ...],
+    ) -> tuple[AzureSearchProfileSettings, ...]:
+        aliases = [profile.alias for profile in profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("Azure Search profile aliases must be unique")
+        return profiles
+
     @field_validator("operator_telemetry_service_name")
     @classmethod
     def _validate_operator_telemetry_service_name(cls, value: str) -> str:
@@ -1392,11 +1417,12 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
         "bedrock_guardrail_profiles",
         "aws_s3_source_profiles",
         "aws_textract_profiles",
+        "azure_search_profiles",
         "secret_wiring_allowlist",
     }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
-    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles"}
+    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles", "execution_rate_limit"}
 )
 
 
@@ -1539,6 +1565,7 @@ def settings_from_env() -> WebSettings:
             "bedrock_guardrail_default_profiles",
             "aws_s3_source_profiles",
             "aws_textract_profiles",
+            "azure_search_profiles",
         }
         safe_paths = {
             str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))

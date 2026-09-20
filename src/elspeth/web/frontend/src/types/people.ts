@@ -34,6 +34,8 @@ export interface IdentityPerson {
   identity: IdentityView;
   /** History left behind by a deleted local account; not someone who can sign in. */
   retired: boolean;
+  /** The only active human administrator: the server refuses to disable them. Advisory. */
+  sole_active_admin: boolean;
   local_account: LocalAccountView | null;
   actions: PersonActions;
 }
@@ -79,7 +81,9 @@ export interface PersonResponse {
 export interface PersonLabel {
   identity_id: string;
   label: string;
+  /** The username or subject that tells namesakes apart; the provider is beside it as data. */
   detail: string;
+  provider: IdentityProvider;
   kind: "human" | "service";
   access_state: IdentityAccessState;
   retired: boolean;
