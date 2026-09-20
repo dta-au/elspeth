@@ -330,29 +330,27 @@ class TestPipelineRowDeepCopy:
         # Contract is preserved (same reference is acceptable for immutable contracts)
         # SchemaContract is frozen=True, so sharing reference is safe
         assert copied.contract is contract or copied.contract == contract
-        # Data is copied (not shared)
+        # Compare rows directly: to_dict() creates fresh containers on every call.
+        assert copied is not original
         assert copied.to_dict() == original.to_dict()
-        assert copied.to_dict() is not original.to_dict()
 
-    def test_deepcopy_isolates_nested_data(self) -> None:
-        """Deepcopy should isolate nested mutable structures.
+    def test_deepcopy_creates_distinct_row_with_nested_data(self) -> None:
+        """Deepcopy should produce a distinct row with equal nested values.
 
-        Note: PipelineRow uses MappingProxyType internally which makes it immutable,
-        but the source data dict could have nested mutables. Deepcopy should still
-        produce an independent copy.
+        Nested data is deeply frozen, so the guarantee here is row identity,
+        value equality, and contract preservation, not mutable-data isolation.
         """
         import copy
 
         contract = _make_contract()
-        # Create PipelineRow - it stores immutable view internally
+        # PipelineRow freezes the input list internally.
         original = make_row({"amount": 100, "items": [1, 2, 3]}, contract=contract)
 
         copied = copy.deepcopy(original)
 
-        # Both should have same values
-        assert copied.to_dict()["items"] == [1, 2, 3]
-        # But be independent copies
-        assert copied.to_dict()["items"] is not original.to_dict()["items"]
+        assert copied is not original
+        assert copied.to_dict() == original.to_dict() == {"amount": 100, "items": [1, 2, 3]}
+        assert copied.contract is contract or copied.contract == contract
 
 
 class TestTokenInfoWithUpdatedData:
