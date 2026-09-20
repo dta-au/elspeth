@@ -11218,7 +11218,18 @@ class TestNewStateHasNoLineage:
         await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(source={"plugin": "csv"}, is_valid=True),
+            CompositionStateData(
+                sources={
+                    "source": {
+                        "plugin": "csv",
+                        "on_success": "output",
+                        "options": {},
+                        "on_validation_failure": "discard",
+                    }
+                },
+                metadata_={"name": "Pipeline", "description": ""},
+                is_valid=True,
+            ),
             provenance="session_seed",
         )
 

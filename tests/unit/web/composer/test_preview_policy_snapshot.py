@@ -270,6 +270,7 @@ async def test_preview_reads_uploaded_reference_table_with_operation_context(
                     completion_ready=True,
                     blockers=[
                         ValidationReadinessBlocker(
+                            suggestion=None,
                             code="interpretation_review_pending",
                             component_id="source",
                             component_type="source",
