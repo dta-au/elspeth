@@ -346,6 +346,7 @@ function validationIssues(): ValidationResult {
         component_id: "source",
         component_type: "source",
         detail: `Deterministic validation issue ${index + 1}`,
+        suggestion: null,
       })),
     },
   };
@@ -426,7 +427,7 @@ function pendingInterpretation(
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
   };
 }
 
