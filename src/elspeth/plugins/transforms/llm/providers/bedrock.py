@@ -58,7 +58,7 @@ _STATIC_BEDROCK_ERROR = "Bedrock LLM request failed"
 
 @dataclass(frozen=True, slots=True)
 class BedrockCredentials:
-    """Resolved explicit Bedrock credentials; absent fields defer to the AWS default chain.
+    """Resolved Bedrock credentials; no explicit credentials selects the AWS default chain.
 
     Holds secret VALUES, so every field is excluded from ``repr``. Instances
     are handed to :class:`_LiteLLMSDKAdapter` only — below the audited
@@ -88,7 +88,12 @@ class BedrockCredentials:
             ("aws_secret_access_key", self.aws_secret_access_key),
             ("aws_session_token", self.aws_session_token),
         )
-        return {name: value for name, value in candidates if value is not None}
+        kwargs = {name: value for name, value in candidates if value is not None}
+        if self.aws_access_key_id is not None and self.aws_session_token is None:
+            # LiteLLM fills None from AWS_SESSION_TOKEN even with explicit keys.
+            # An empty token blocks that fallback and is omitted by SigV4 signing.
+            kwargs["aws_session_token"] = ""
+        return kwargs
 
 
 class BedrockConfig(LLMConfig):

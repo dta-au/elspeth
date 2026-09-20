@@ -9,6 +9,8 @@ from unittest.mock import Mock, patch
 
 import httpx
 import pytest
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 from litellm.exceptions import (
     ContextWindowExceededError,
     ServiceUnavailableError,
@@ -19,6 +21,7 @@ from litellm.exceptions import (
 from litellm.exceptions import (
     Timeout as LiteLLMTimeout,
 )
+from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
 from litellm.types.utils import ModelResponse, Usage
 
 from elspeth.contracts.call_governance import LLMCallGovernance
@@ -216,7 +219,7 @@ class TestBedrockConfig:
     @pytest.mark.parametrize("session_token", [None, SESSION_TOKEN])
     def test_static_credential_pair_is_accepted_with_optional_session_token(self, session_token: str | None) -> None:
         overrides: dict[str, object] = {"aws_access_key_id": ACCESS_KEY_ID, "aws_secret_access_key": SECRET_ACCESS_KEY}
-        expected = {"aws_access_key_id": ACCESS_KEY_ID, "aws_secret_access_key": SECRET_ACCESS_KEY}
+        expected = {"aws_access_key_id": ACCESS_KEY_ID, "aws_secret_access_key": SECRET_ACCESS_KEY, "aws_session_token": ""}
         if session_token is not None:
             overrides["aws_session_token"] = session_token
             expected["aws_session_token"] = session_token
@@ -303,6 +306,44 @@ class TestBedrockConfig:
 
 
 class TestBedrockAdapter:
+    @pytest.mark.parametrize("ambient_token", [None, "ambient-session-sentinel"])
+    @pytest.mark.parametrize("credential_mode", ["long-lived", "temporary", "default-chain"])
+    def test_litellm_resolves_and_signs_with_one_credential_identity(
+        self, monkeypatch: pytest.MonkeyPatch, ambient_token: str | None, credential_mode: str
+    ) -> None:
+        resolver = BaseAWSLLM()
+        for name in resolver.aws_authentication_params:
+            monkeypatch.delenv(name.upper(), raising=False)
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ambient-access-sentinel")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret-sentinel")
+        if ambient_token is not None:
+            monkeypatch.setenv("AWS_SESSION_TOKEN", ambient_token)
+
+        if credential_mode == "default-chain":
+            credentials = DEFAULT_CHAIN
+            expected_access = "ambient-access-sentinel"
+            expected_secret = "ambient-secret-sentinel"
+            expected_token = ambient_token
+        else:
+            expected_access = ACCESS_KEY_ID
+            expected_secret = SECRET_ACCESS_KEY
+            expected_token = SESSION_TOKEN if credential_mode == "temporary" else None
+            credentials = BedrockCredentials(
+                aws_access_key_id=ACCESS_KEY_ID,
+                aws_secret_access_key=SECRET_ACCESS_KEY,
+                aws_session_token=expected_token,
+            )
+
+        # Exercise the real SDK resolver and signer, without a network request.
+        resolved = resolver.get_credentials(aws_region_name="us-east-1", **credentials.litellm_kwargs())
+        assert resolved.access_key == expected_access
+        assert resolved.secret_key == expected_secret
+        assert (resolved.token or None) == expected_token
+        request = AWSRequest(method="POST", url="https://bedrock-runtime.us-east-1.amazonaws.com/")
+        SigV4Auth(resolved, "bedrock", "us-east-1").add_auth(request)
+        assert f"Credential={expected_access}/" in request.headers["Authorization"]
+        assert request.headers.get("X-Amz-Security-Token") == expected_token
+
     @pytest.mark.parametrize("region_name", [None, "ap-southeast-2"])
     def test_forwards_only_normal_request_fields_and_optional_region(self, region_name: str | None) -> None:
         provider = _provider(region_name=region_name)
@@ -384,7 +425,8 @@ class TestBedrockAdapter:
         recorded = repr(recorder.calls)
         assert MODEL in recorded
         for secret_value in expected.values():
-            assert secret_value not in recorded
+            if secret_value:
+                assert secret_value not in recorded
 
     def test_configured_credentials_override_a_caller_supplied_identity(self) -> None:
         from elspeth.plugins.transforms.llm.providers.bedrock import _LiteLLMSDKAdapter
