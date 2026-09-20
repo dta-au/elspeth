@@ -15,6 +15,8 @@ interface Props {
   identityId: string;
   personName: string;
   kind: "human" | "service";
+  /** A role write landed. The administrator count the panel warns about may have moved. */
+  onChanged: () => void;
 }
 
 /**
@@ -23,7 +25,7 @@ interface Props {
  * there is deliberately no "change role" control, because a swap is two
  * writes with two outcomes and one dropdown would hide the second.
  */
-export function RolesEditor({ identityId, personName, kind }: Props): JSX.Element {
+export function RolesEditor({ identityId, personName, kind, onChanged }: Props): JSX.Element {
   const [grants, setGrants] = useState<RoleView[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [form, setForm] = useState<Form>(null);
@@ -37,7 +39,8 @@ export function RolesEditor({ identityId, personName, kind }: Props): JSX.Elemen
     const result = await admin.listRoles(identityId);
     setGrants(result.roles);
     setLoadError(null);
-  }, [identityId]);
+    onChanged();
+  }, [identityId, onChanged]);
 
   const load = useCallback(() => {
     let active = true;

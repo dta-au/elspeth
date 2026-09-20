@@ -157,9 +157,13 @@
   border-color: var(--color-accent);
 }
 
+/* A real border, not a box-shadow: forced-colors mode strips shadows, and the
+   selected person must stay marked there (WCAG 1.4.1). The padding gives back
+   the extra width so the row's text does not shift when it is selected. */
 .people-row[aria-current="true"] {
   border-color: var(--color-accent);
-  box-shadow: inset 3px 0 0 var(--color-accent);
+  border-inline-start-width: 4px;
+  padding-inline-start: calc(var(--space-sm) - 3px);
 }
 
 .people-row-name {

@@ -191,6 +191,18 @@ describe("People & access journeys", () => {
     expect(new Date(sent.expires_at as string).getTime()).toBe(new Date(local).getTime());
   });
 
+  it("drops the single-administrator warning once a role write makes a second administrator", async () => {
+    let admins = 1;
+    vi.mocked(people.listPeople).mockImplementation(() => Promise.resolve(page(roster, BOTH, { active_human_admin_count: admins })));
+    vi.mocked(admin.grantRole).mockImplementation(() => { admins = 2; return Promise.resolve(roleView({ role: "admin" })); });
+    await openPerson(/Jane Doe/);
+    expect(screen.getByText(/one active human administrator/)).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "Add role" }));
+    await userEvent.selectOptions(screen.getByLabelText("Role"), "admin");
+    await userEvent.click(screen.getByRole("button", { name: "Grant role" }));
+    await waitFor(() => expect(screen.queryByText(/one active human administrator/)).not.toBeInTheDocument());
+  });
+
   it("explains a combination the server will refuse, and restricts a service account's roles", async () => {
     vi.mocked(admin.listRoles).mockResolvedValue({ roles: [roleView({ role: "admin" })], limit: 50, offset: 0 });
     await openPerson(/Jane Doe/);
