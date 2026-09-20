@@ -370,6 +370,12 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
 
             validated_fields.append((field_name, value))
 
+        if not validated_fields:
+            return TransformResult.error(
+                {"reason": "no_scannable_fields"},
+                retryable=False,
+            )
+
         capacity_retry_started_at = time.monotonic()
         capacity_retry_deadline = capacity_retry_started_at + float(self._max_capacity_retry_seconds)
 

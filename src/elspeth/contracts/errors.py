@@ -511,6 +511,7 @@ TransformErrorCategory = Literal[
     # Field/validation errors
     "missing_field",
     "missing_scan_field",
+    "no_scannable_fields",  # Security scan in 'all' mode found no string-valued fields
     "type_mismatch",
     "validation_failed",
     "invalid_input",
