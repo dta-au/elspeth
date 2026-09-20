@@ -5,9 +5,14 @@ import { Button, Input } from "@/components/ui";
 import type { IdentityRole, RoleView } from "@/types/identityAdmin";
 import { MutationNoticeView } from "./MutationNoticeView";
 import { ROLE_LABEL, ROLE_PURPOSE, formatInstant, localInputToUtcIso, roleConflictAdvice, viewerTimeZone } from "./peopleFormat";
-import { useCancelToTrigger, usePersonMutation, useSubview } from "./peoplePanel";
+import { PERSON_RECORDS_MAX, collectPages, useCancelToTrigger, usePersonMutation, useSubview, type Collected } from "./peoplePanel";
 
 const ROLES: IdentityRole[] = ["user", "approver", "reviewer", "curator", "auditor", "oversight", "admin"];
+
+/** Every grant, not the first page: the conflict advice below reasons from what is ABSENT. */
+function readGrants(identityId: string): Promise<Collected<RoleView>> {
+  return collectPages(async (offset, limit) => (await admin.listRoles(identityId, offset, limit)).roles);
+}
 
 type Form = { type: "grant" } | { type: "revoke"; grant: RoleView } | null;
 
@@ -27,6 +32,7 @@ interface Props {
  */
 export function RolesEditor({ identityId, personName, kind, onChanged }: Props): JSX.Element {
   const [grants, setGrants] = useState<RoleView[] | null>(null);
+  const [truncated, setTruncated] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [form, setForm] = useState<Form>(null);
   const [role, setRole] = useState<IdentityRole>(kind === "service" ? "oversight" : "user");
@@ -36,8 +42,9 @@ export function RolesEditor({ identityId, personName, kind, onChanged }: Props):
   const adviceId = useId();
 
   const reload = useCallback(async () => {
-    const result = await admin.listRoles(identityId);
-    setGrants(result.roles);
+    const result = await readGrants(identityId);
+    setGrants(result.items);
+    setTruncated(result.truncated);
     setLoadError(null);
     onChanged();
   }, [identityId, onChanged]);
@@ -46,8 +53,8 @@ export function RolesEditor({ identityId, personName, kind, onChanged }: Props):
     let active = true;
     setGrants(null);
     setLoadError(null);
-    void admin.listRoles(identityId).then(
-      (result) => { if (active) setGrants(result.roles); },
+    void readGrants(identityId).then(
+      (result) => { if (active) { setGrants(result.items); setTruncated(result.truncated); } },
       (error: unknown) => { if (active && !isAbort(error)) setLoadError(admin.adminErrorMessage(error, "Could not load roles")); },
     );
     return () => { active = false; };
@@ -73,6 +80,8 @@ export function RolesEditor({ identityId, personName, kind, onChanged }: Props):
       ) : grants === null ? <p>Loading roles…</p> : grants.length === 0 ? (
         <p>{personName} holds no roles.</p>
       ) : (
+        <>
+        {truncated && <p role="status" className="people-notice people-notice-saved_stale">Showing the first {PERSON_RECORDS_MAX} role grants. {personName} holds more, which are not shown here.</p>}
         <ul className="people-grants">
           {grants.map((grant) => (
             <li key={grant.role_id} className="people-grant">
@@ -85,6 +94,7 @@ export function RolesEditor({ identityId, personName, kind, onChanged }: Props):
             </li>
           ))}
         </ul>
+        </>
       )}
 
       {form === null && grants !== null && <div><Button ref={triggerRef} disabled={blocked} onClick={() => { mutation.clear(); setForm({ type: "grant" }); }}>Add role</Button></div>}

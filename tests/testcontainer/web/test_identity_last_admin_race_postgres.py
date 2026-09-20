@@ -293,6 +293,7 @@ def test_a_disable_racing_an_account_deletion_leaves_exactly_one_admin(external_
                     subject="root",
                     reason="local credential deleted",
                     record=_rendezvous(observer, arrived, 1),
+                    credential_exists=lambda: True,
                     delete_credential=lambda: credential_deletions.append("root"),
                 )
             except LastActiveAdminProtected:
@@ -312,6 +313,61 @@ def test_a_disable_racing_an_account_deletion_leaves_exactly_one_admin(external_
         first_engine.dispose()
         second_engine.dispose()
         observer.dispose()
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        control.dispose()
+
+
+def test_a_last_admin_whose_credential_is_already_gone_is_retired_on_postgres(external_deployment_postgres_url: str) -> None:
+    """The failed-retirement recovery, under PostgreSQL's row locks rather than SQLite's one writer.
+
+    The probe runs while R5's population is locked FOR UPDATE, so it must not
+    need that lock itself, and the retirement it permits must leave the zero
+    administrators that operator recovery can then repair.
+    """
+    admin_url = make_url(external_deployment_postgres_url)
+    database = f"last_admin_recovery_{uuid.uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+    engine = create_session_engine(admin_url.set(database=database).render_as_string(hide_password=False))
+    try:
+        initialize_session_schema(engine)
+        authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        root_id = authority.bootstrap_admin(
+            claims=_claims("root"), note="first admin", quota_tokens_per_day=None, quota_storage_bytes=None, record=_noop
+        ).record.identity_id
+        deletions: list[str] = []
+
+        with pytest.raises(LastActiveAdminProtected):
+            authority.retire_identity(
+                provider="local",
+                subject="root",
+                reason="local credential deleted",
+                record=_noop,
+                credential_exists=lambda: True,
+                delete_credential=lambda: deletions.append("refused"),
+            )
+        assert deletions == []
+        assert authority.count_active_human_admins() == 1
+
+        retired = authority.retire_identity(
+            provider="local",
+            subject="root",
+            reason="local credential deleted",
+            record=_noop,
+            credential_exists=lambda: False,
+            delete_credential=lambda: deletions.append("recovered"),
+        )
+        assert retired is not None and retired.identity_id == root_id
+        assert deletions == ["recovered"]
+        assert authority.count_active_human_admins() == 0
+        authority.bootstrap_admin(
+            claims=_claims("recovery"), note="recovery", quota_tokens_per_day=None, quota_storage_bytes=None, record=_noop
+        )
+        assert authority.count_active_human_admins() == 1
+    finally:
+        engine.dispose()
         with control.connect() as conn:
             conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
         control.dispose()
@@ -374,6 +430,32 @@ def test_directory_search_is_literal_and_redaction_safe_on_postgres(external_dep
             )
         ]
         assert everyone == ["a_b", "axb", "sub-771"]
+
+        # The fold beyond ASCII. SQLite needed its own function for this; here
+        # it is the server's ``lower``, which must agree with it.
+        login("elodie", "Élodie Martin", activate=True)
+        assert subjects("Élodie Martin") == ["elodie"]
+        assert subjects("élodie") == ["elodie"]
+        assert subjects("ÉLODIE") == ["elodie"]
+
+        # Linked local accounts named by the caller: exact provider, never a
+        # never-admitted row, and an empty tuple adds no predicate at all.
+        for local_subject, activate in (("jane", True), ("pat", False)):
+            authority.ensure_identity(
+                claims=IdentityClaims(provider="local", subject=local_subject, username=local_subject),
+                activate=activate,
+                quota_tokens_per_day=None,
+                quota_storage_bytes=None,
+                identity_dormancy_days=90,
+                record_admission=_noop,
+                record_rebound=_noop,
+                record_dormant=_noop,
+            )
+        linked = IdentityDirectoryQuery(
+            text="Doe", access_state=None, provider=None, kind=None, linked_local_subjects=("jane", "pat", "elodie")
+        )
+        assert [row.subject for row in authority.search_identities(query=linked, limit=50, offset=0)] == ["jane"]
+        assert subjects("Doe") == []
     finally:
         engine.dispose()
         with control.connect() as conn:

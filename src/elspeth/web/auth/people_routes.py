@@ -258,15 +258,20 @@ def _person_label(summary: IdentitySummary, *, account: LocalUserAccount | None)
 
 def _account_label(account: LocalUserAccount) -> tuple[str, str]:
     shown = account.display_name.strip() or account.user_id
-    return (shown.casefold(), account.user_id)
+    return (shown.lower(), account.user_id)
 
 
 def _account_matches(account: LocalUserAccount, text: str | None) -> bool:
-    """Literal, case-insensitive containment: the same meaning the identity search gives a needle."""
+    """Literal, case-insensitive containment: the same meaning the identity search gives a needle.
+
+    ``lower``, not ``casefold``: the identity segment folds with the
+    database's ``lower``, and one directory must not find "STRASSE" under
+    "straße" in one segment and miss it in the other.
+    """
     if text is None:
         return True
-    needle = text.casefold()
-    return any(needle in field.casefold() for field in (account.user_id, account.display_name, account.email or ""))
+    needle = text.lower()
+    return any(needle in field.lower() for field in (account.user_id, account.display_name, account.email or ""))
 
 
 # ── Request plumbing ─────────────────────────────────────────────────────
@@ -485,6 +490,15 @@ def create_people_router() -> APIRouter:
             authority = _authority(request)
             try:
                 if status != "not_set_up" and len(page) < wanted:
+                    # A person prepared ahead of their first sign-in is shown
+                    # under their ACCOUNT's name and email, which the identity
+                    # store does not hold. Name the matching linked accounts so
+                    # the search finds the label it displays, before slicing.
+                    linked_matches = (
+                        tuple(sorted(username for username in bound if _account_matches(by_username[username], text)))
+                        if text is not None
+                        else ()
+                    )
                     summaries = await run_sync_in_worker(
                         authority.search_identities,
                         query=IdentityDirectoryQuery(
@@ -492,6 +506,7 @@ def create_people_router() -> APIRouter:
                             access_state=None if status == "all" else status,
                             provider=provider,
                             kind=_KIND_OF_TYPE[person_type],
+                            linked_local_subjects=linked_matches,
                         ),
                         limit=wanted - len(page),
                         offset=max(0, offset - len(unlinked)),

@@ -159,6 +159,7 @@ def test_retirement_records_operator_provenance(engine: Engine) -> None:
         subject="approver",
         reason="credential removed",
         record=_ignore,
+        credential_exists=lambda: True,
         delete_credential=lambda: None,
     )
     with engine.connect() as conn:
@@ -288,6 +289,7 @@ def test_automatic_withdrawal_audit_failure_restores_approvals(engine: Engine, t
                 subject="approver",
                 reason="removed",
                 record=_fail,
+                credential_exists=lambda: True,
                 delete_credential=lambda: None,
             )
     else:

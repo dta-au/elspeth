@@ -121,6 +121,47 @@ def test_search_text_is_literal_not_a_pattern(authority) -> None:
     assert _subjects(authority, text="\\") == []
 
 
+def test_search_folds_case_beyond_ascii(authority) -> None:
+    """SQLite's own ``lower`` leaves 'É' alone, so the name AS DISPLAYED found nobody."""
+    _login(authority, "elodie", activate=True, display_name="Élodie Martin", email="ÉLODIE@corp.example")
+    _login(authority, "zoe", activate=True, display_name="Zoe Åberg")
+
+    assert _subjects(authority, text="Martin") == ["elodie"]
+    assert _subjects(authority, text="Élodie Martin") == ["elodie"]
+    assert _subjects(authority, text="élodie") == ["elodie"]
+    assert _subjects(authority, text="ÉLODIE@CORP") == ["elodie"]
+    assert _subjects(authority, text="åberg") == ["zoe"]
+    assert _subjects(authority, text="not-present") == []
+    # Literal matching survives the change of fold.
+    assert _subjects(authority, text="%lodie") == []
+    # The order is by the same fold: "Élodie" sorts by "é", after "z".
+    assert _subjects(authority) == ["zoe", "elodie"]
+
+
+def test_search_includes_the_linked_accounts_its_caller_matched(engine, authority) -> None:
+    """A person prepared ahead of sign-in is shown under their ACCOUNT's name, which only the caller can search."""
+    _login(authority, "jane", activate=True)
+    _login(authority, "sam", activate=True)
+    _login(authority, "pat", activate=False)
+    _login(authority, "jane", activate=True, provider="vanguard")
+
+    assert _subjects(authority, text="Doe") == []
+    found = authority.search_identities(query=_query(text="Doe", linked_local_subjects=("jane", "pat")), limit=50, offset=0)
+    # Exact correlation: the LOCAL jane, not the sign-in provider's. And never
+    # a never-admitted pending row, whose account name the projection withholds.
+    assert [(row.provider, row.subject) for row in found] == [("local", "jane")]
+    # The other filters still narrow a linked match, and it is paged with the rest.
+    assert _subjects(authority, text="Doe", linked_local_subjects=("jane",), access_state="disabled") == []
+    assert authority.search_identities(query=_query(text="Doe", linked_local_subjects=("jane",)), limit=50, offset=1) == ()
+
+
+def test_linked_accounts_are_refused_without_a_needle() -> None:
+    with pytest.raises(ValueError, match="requires text"):
+        _query(linked_local_subjects=("jane",))
+    with pytest.raises(TypeError):
+        _query(text="x", linked_local_subjects=["jane"])
+
+
 def test_search_filters_compose_and_order_is_stable_across_pages(engine, authority) -> None:
     for name in ("Zed", "amy", "Bob", "amy"):
         _login(authority, f"{name.lower()}-{len(_subjects(authority))}", activate=True, display_name=name)
@@ -162,6 +203,7 @@ def test_local_correlation_is_exact_and_skips_a_retired_key(authority) -> None:
         subject="pat",
         reason="local credential deleted",
         record=_noop,
+        credential_exists=lambda: True,
         delete_credential=lambda: None,
     )
     new_id = _login(authority, "pat", activate=True)

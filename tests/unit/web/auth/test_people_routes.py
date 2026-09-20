@@ -300,6 +300,36 @@ async def test_setting_access_up_moves_a_person_to_their_identity_key(tmp_path) 
         assert after["local_account"]["username"] == "jane"
 
 
+async def test_setting_access_up_does_not_hide_a_person_from_search_by_their_shown_name(tmp_path) -> None:
+    """The directory shows a prepared person under their account's name, so that name must find them."""
+    harness = _build(tmp_path)
+    _make_both(harness)
+    async with _client(harness.app) as client:
+        headers = await _bearer(client, "devadmin")
+
+        async def search(text: str) -> list[str]:
+            response = await client.get("/api/auth/admin/people", headers=headers, params={"q": text})
+            assert response.status_code == 200, response.text
+            return _keys(response.json())
+
+        assert await search("Jane Doe") == ["local:jane"]
+        provisioned = await client.post(
+            "/api/auth/admin/identities",
+            headers=headers,
+            json={"provider": "local", "subject": "jane", "username": "jane", "role": "user", "note": "set up access"},
+        )
+        assert provisioned.status_code == 201, provisioned.text
+        key = f"identity:{provisioned.json()['identity']['identity_id']}"
+
+        assert await search("Jane Doe") == [key]
+        assert await search("JANE@CORP") == [key]
+        assert await search("jane") == [key]
+        assert await search("NoSuchPerson") == []
+        # Matched before the page is sliced, so it is counted by the page too.
+        paged = await client.get("/api/auth/admin/people", headers=headers, params={"q": "Jane Doe", "limit": 1})
+        assert (_keys(paged.json()), paged.json()["has_more"]) == ([key], False)
+
+
 async def test_a_label_borrows_the_linked_account_name_only_where_nothing_is_withheld(tmp_path) -> None:
     harness = _build(tmp_path)
     _make_both(harness)

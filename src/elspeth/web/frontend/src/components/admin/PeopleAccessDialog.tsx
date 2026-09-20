@@ -57,9 +57,19 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
   // password must not replace the first: neither can be shown again. A new
   // password for the SAME account does replace the old one, which no longer works.
   const [credentials, setCredentials] = useState<GeneratedCredential[]>([]);
-  const addCredential = useCallback((next: GeneratedCredential) => {
-    setCredentials((current) => [...current.filter((held) => held.username !== next.username), next]);
-  }, []);
+  // A generated password is shown under the authority that produced it. Each
+  // loss of the local-accounts capability starts a new generation, and the
+  // callback a section captured when it SENT its request belongs to the old
+  // one: a reset that answers after the loss is dropped, not shown.
+  const credentialGeneration = useRef(0);
+  const [credentialEpoch, setCredentialEpoch] = useState(0);
+  const addCredential = useMemo(() => {
+    const issuedIn = credentialEpoch;
+    return (next: GeneratedCredential) => {
+      if (credentialGeneration.current !== issuedIn) return;
+      setCredentials((current) => [...current.filter((held) => held.username !== next.username), next]);
+    };
+  }, [credentialEpoch]);
   const [leave, setLeave] = useState<Leave | null>(null);
   const [status, setStatus] = useState<string | null>(null);
 
@@ -87,6 +97,13 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
             setQuery(FIRST_QUERY);
             setDraftText("");
             setStatus("Your permissions changed. The panel now shows what you can manage.");
+            if (current.local_accounts && !result.local_accounts) {
+              // Passwords are the local-accounts capability's secrets: they
+              // leave the screen with it, including any still on their way.
+              credentialGeneration.current += 1;
+              setCredentialEpoch(credentialGeneration.current);
+              setCredentials([]);
+            }
           }
           return result;
         });
@@ -115,6 +132,12 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
     return () => controller.abort();
   }, [capabilities, query, refreshTick]);
 
+  /** Run `proceed` now, or ask first when it would throw away typed input. */
+  const guard = useCallback((proceed: () => void) => {
+    if (dirtyOwners.current.size > 0) setLeave({ reason: "unsaved", proceed });
+    else proceed();
+  }, []);
+
   // ── Services for the sections ───────────────────────────────────────────
   const services = useMemo<PeoplePanelServices>(() => ({
     setEscapeHandler: (owner, handler) => {
@@ -125,13 +148,8 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
       if (dirty) dirtyOwners.current.add(owner); else dirtyOwners.current.delete(owner);
     },
     onAuthorityRefused: () => setCapabilityAttempt((value) => value + 1),
-  }), []);
-
-  /** Run `proceed` now, or ask first when it would throw away typed input. */
-  const guard = useCallback((proceed: () => void) => {
-    if (dirtyOwners.current.size > 0) setLeave({ reason: "unsaved", proceed });
-    else proceed();
-  }, []);
+    guardLeave: guard,
+  }), [guard]);
 
   const requestClose = useCallback(() => {
     if (dirtyOwners.current.size > 0) setLeave({ reason: "unsaved", proceed: onClose });
@@ -172,8 +190,12 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
     (row ?? modalRef.current?.querySelector<HTMLElement>("input[type=search]"))?.focus();
   }, [view, load]);
 
-  const onPersonChanged = useCallback((key: string) => {
-    setSelected((current) => (current === null ? current : current.key === key ? current : { key, seed: null }));
+  // A record changed, or its key did (`to`: access was set up, so a local
+  // account became an identity). The report names the person it came FROM,
+  // because it can arrive after the administrator has moved on: a write for
+  // Jane that finishes while Sam is open refreshes the list and leaves Sam open.
+  const onPersonChanged = useCallback((from: string, to: string = from) => {
+    if (to !== from) setSelected((current) => (current !== null && current.key === from ? { key: to, seed: null } : current));
     setRefreshTick((value) => value + 1);
   }, []);
 

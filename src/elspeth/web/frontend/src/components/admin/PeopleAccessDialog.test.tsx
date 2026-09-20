@@ -190,7 +190,7 @@ describe("PeopleAccessDialog", () => {
     await userEvent.click(screen.getByRole("button", { name: /Sam Lee/ }));
     expect(await screen.findByRole("heading", { name: "Sam Lee" })).toBeInTheDocument();
     settleJane(respond(identityPerson({ display_name: "LATE JANE" })));
-    await waitFor(() => expect(admin.listRoles).toHaveBeenLastCalledWith("sam-id"));
+    await waitFor(() => expect(admin.listRoles).toHaveBeenLastCalledWith("sam-id", 0, 200));
     expect(screen.queryByText("LATE JANE")).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Sam Lee" })).toBeInTheDocument();
   });

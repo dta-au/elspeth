@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import * as api from "@/api/client";
+import { errorStatus } from "@/api/people";
 import { Button } from "@/components/ui";
 import type { LocalAccountView } from "@/types/people";
 import type { GeneratedCredential } from "./GeneratedPassword";
@@ -13,11 +14,15 @@ interface Props {
   /** How this person signs in when they have no local account the caller may manage. */
   providerLabel: string;
   account: LocalAccountView | null;
+  /** Whether the identity behind the account is retired; null when the caller cannot see identities. */
+  identityRetired: boolean | null;
   canManage: boolean;
   isSelf: boolean;
   onCredential: (credential: GeneratedCredential) => void;
+  /** Re-read this person. Rejects with the read's error, 404 included. */
   onChanged: () => Promise<void>;
-  onDeleted: () => void;
+  /** The re-read found nobody under this key any more. */
+  onGone: () => void;
 }
 
 /**
@@ -25,21 +30,41 @@ interface Props {
  * so this section renders an explanation rather than controls when the
  * caller lacks it, and it never describes deletion as a kind of disabling.
  */
-export function SignInSection({ personName, providerLabel, account, canManage, isSelf, onCredential, onChanged, onDeleted }: Props): JSX.Element {
+export function SignInSection({ personName, providerLabel, account, identityRetired, canManage, isSelf, onCredential, onChanged, onGone }: Props): JSX.Element {
   const [confirm, setConfirm] = useState<Confirm>(null);
+  // The account this section last tried to delete. Deletion is two writes in
+  // two stores; when only the first lands, the account is gone and the person
+  // is still live, and finishing the job needs the name that is no longer shown.
+  const [deleting, setDeleting] = useState<string | null>(null);
   const mutation = usePersonMutation(onChanged);
-  // A deleted account has nothing left to re-read under its old key, so the
-  // deletion does not borrow the section's reload: the shell moves on instead.
-  const nothingToReload = useCallback(async () => undefined, []);
-  const deletion = usePersonMutation(nothingToReload);
+  // The same re-read serves a confirmed deletion and the CHECK after an
+  // unanswered one, so it has to look: a person who is no longer there under
+  // this key is the deletion having landed, not a failed refresh.
+  const rereadAfterDeletion = useCallback(async () => {
+    try {
+      await onChanged();
+    } catch (error) {
+      if (errorStatus(error) !== 404) throw error;
+      onGone();
+    }
+  }, [onChanged, onGone]);
+  const deletion = usePersonMutation(rereadAfterDeletion);
   const close = useCallback(() => setConfirm(null), []);
   const { triggerRef, cancel } = useCancelToTrigger<HTMLButtonElement>(close);
   useSubview(`signin:${account?.username ?? providerLabel}`, confirm !== null, false, cancel);
   const blocked = mutation.busy || mutation.mustReconcile || deletion.busy || deletion.mustReconcile;
 
   if (account === null || !canManage) {
+    const unfinished = account === null && deleting !== null && identityRetired === false;
     return (
       <section aria-label={`Sign-in for ${personName}`} className="people-section">
+        <MutationNoticeView mutation={deletion} />
+        {unfinished && (
+          <div role="alert" className="people-notice people-notice-uncertain">
+            <span>The local account <code>{deleting}</code> was deleted, but retiring {personName} did not finish, so they still hold their access and roles. Finish the removal.</span>
+            <Button compact variant="danger" disabled={deletion.busy} onClick={() => { void deletion.run(() => api.deleteAdminUser(deleting), `Finished removing ${personName}.`, "The removal was not finished"); }}>Finish removing {personName}</Button>
+          </div>
+        )}
         <p>{providerLabel === "local"
           ? `${personName} signs in with a local account. Local accounts are managed by the local account administrator.`
           : `${personName} signs in through ${providerLabel}. Passwords and account details are managed there, not in ELSPETH.`}</p>
@@ -90,9 +115,8 @@ export function SignInSection({ personName, providerLabel, account, canManage, i
           <div className="identity-admin-actions">
             <Button variant="danger" disabled={blocked} onClick={() => {
               const username = account.username;
-              let removed = false;
-              void deletion.run(async () => { await api.deleteAdminUser(username); removed = true; }, `Deleted the local account for ${personName}.`, "Account was not deleted")
-                .then(() => { if (removed) onDeleted(); });
+              setDeleting(username);
+              void deletion.run(() => api.deleteAdminUser(username), `Deleted the local account for ${personName}.`, "Account was not deleted").then((ok) => { if (ok) close(); });
             }}>Delete local account</Button>
             <Button disabled={deletion.busy} onClick={cancel}>Cancel</Button>
           </div>
