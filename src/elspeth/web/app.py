@@ -1140,7 +1140,9 @@ def _build_local_auth_provider(
         # The same retirement collaborator every surface that deletes a local
         # credential binds, so the provider, subject and reason are decided
         # in exactly one place.
-        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
+        # The web surface cannot recover from zero administrators, so a
+        # deletion here may not retire the last one (R5).
+        retire_identity=local_identity_retirer(identity_authority, _record_retirement, protect_last_admin=True),
     )
 
 

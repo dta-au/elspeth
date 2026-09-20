@@ -231,5 +231,6 @@ def build_local_auth_provider(
             principal_is_active=_principal_is_active,
         ),
         admit_identity=_admit_identity,
-        retire_identity=local_identity_retirer(authority, _record_no_retirement),
+        # As app.py binds it: the web surface protects the last administrator.
+        retire_identity=local_identity_retirer(authority, _record_no_retirement, protect_last_admin=True),
     )

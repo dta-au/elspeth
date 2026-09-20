@@ -1945,8 +1945,10 @@ class RepositoryIdentityAuthority:
         subject: str,
         reason: str,
         record: Callable[[IdentityRetired], None],
+        protect_last_admin: bool,
+        delete_credential: Callable[[], None],
     ) -> IdentityRecord | None:
-        """Retire the identity behind a credential that has been deleted.
+        """Delete a credential and retire the identity behind it.
 
         THE ROW IS NOT DELETED, and cannot be: every ownership foreign key to
         ``identities.identity_id`` is ``RESTRICT``, and the row anchors the
@@ -1957,15 +1959,45 @@ class RepositoryIdentityAuthority:
         wall.  Returns ``None`` when no identity ever existed for the key, in
         which case nothing is written and ``record`` is not invoked.
 
+        ``delete_credential`` is the caller's credential-store deletion, and
+        it runs HERE, after the refusal below and before the identity write.
+        Retirement lowers R5's count exactly as ``disable_identity`` does, but
+        a surface that deletes credentials is not necessarily an identity
+        administrator (the dev admin is named by configuration), so none of
+        ``disable_identity``'s refusals sees this path.  The credential store
+        shares no transaction with this one, so the only place the refusal
+        can be decided before the password goes AND under the lock that makes
+        it true is inside this transaction, ahead of the deletion.  A refusal
+        therefore leaves both stores untouched.
+
+        The order is still credential first, identity second.  A credential
+        deleted whose identity write then fails to commit leaves the freed
+        username bound to a live identity; re-running the removal finds no
+        credential, retires the identity it owed, and is the recovery.
+
+        ``protect_last_admin`` is each surface's own decision, stated rather
+        than defaulted: the web surface has no way back from zero
+        administrators, while an operator at the CLI holds
+        ``bootstrap_admin``'s recovery mode.
+
         ``record`` runs INSIDE the transaction like every other mutation's
         callback: a retirement the audit trail cannot hold does not commit.
         """
         _require_provider(provider)
         _require_nonblank(subject, "subject")
         _require_nonblank(reason, "reason")
+        if type(protect_last_admin) is not bool:
+            raise TypeError("protect_last_admin must be a bool")
         with self._engine.begin() as conn:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            # R5's population, locked before anything else (see the constant).
+            admin_holders = conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
             existing = conn.execute(_IDENTITY_BY_NATURAL_KEY_FOR_UPDATE, {"provider": provider, "subject": subject}).one_or_none()
+            if protect_last_admin and existing is not None and existing.kind == "human" and existing.access_state == "active":
+                target_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": existing.identity_id}).all(), now)
+                if _holds_deployment_admin(target_grants) and _active_human_admin_count(admin_holders, now) <= 1:
+                    raise LastActiveAdminProtected()
+            delete_credential()
             if existing is None:
                 return None
             # The identity_id makes the retired subject unique, so retiring
@@ -3024,7 +3056,9 @@ class RepositoryIdentityAuthority:
 def local_identity_retirer(
     authority: RepositoryIdentityAuthority,
     record: Callable[[IdentityRetired], None],
-) -> Callable[[str], None]:
+    *,
+    protect_last_admin: bool,
+) -> Callable[[str, Callable[[], None]], bool]:
     """The ONE retirement collaborator for a deleted local credential.
 
     Every surface that deletes a local credential -- the web app's provider
@@ -3033,12 +3067,24 @@ def local_identity_retirer(
     reason are decided in exactly one place (elspeth-9c171c00fa).  ``record``
     is the surface's audit sink for the retirement, invoked inside the
     authority's transaction; a surface that audits nothing passes an explicit
-    no-op and owns that decision.
+    no-op and owns that decision.  ``protect_last_admin`` is owned the same
+    way: see ``retire_identity``.
+
+    The returned callable takes the username and the caller's credential
+    deletion, and answers whether an identity was retired.
     """
     if type(authority) is not RepositoryIdentityAuthority:
         raise TypeError("authority must be an exact RepositoryIdentityAuthority")
 
-    def retire(username: str) -> None:
-        authority.retire_identity(provider="local", subject=username, reason="local credential deleted", record=record)
+    def retire(username: str, delete_credential: Callable[[], None]) -> bool:
+        retired = authority.retire_identity(
+            provider="local",
+            subject=username,
+            reason="local credential deleted",
+            record=record,
+            protect_last_admin=protect_last_admin,
+            delete_credential=delete_credential,
+        )
+        return retired is not None
 
     return retire

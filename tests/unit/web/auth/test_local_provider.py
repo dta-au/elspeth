@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from typing import Any
@@ -21,7 +22,7 @@ import pytest
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth import local as auth_local
-from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.local import LocalAuthProvider, LocalUserDeletion
 from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityDisabled, UserIdentity, UserProfile
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE
 from elspeth.web.sessions.engine import create_session_engine
@@ -205,7 +206,7 @@ LocalAuthProvider(
         principal_is_active=lambda identity_id: True,
     ),
     admit_identity=lambda claims: (_ for _ in ()).throw(AssertionError("no login happens here")),
-    retire_identity=lambda username: (_ for _ in ()).throw(AssertionError("no deletion happens here")),
+    retire_identity=lambda username, delete_credential: (_ for _ in ()).throw(AssertionError("no deletion happens here")),
 )
 print(oct(stat.S_IMODE(path.stat().st_mode)))
 """
@@ -332,8 +333,10 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         provider.create_user("alice", "password123", display_name="Alice")
         token = await provider.login("alice", "password123")
 
-        assert provider.delete_user("alice") is True
-        assert provider.delete_user("alice") is False
+        first = provider.delete_user("alice")
+        assert first == LocalUserDeletion(credential_deleted=True, identity_retired=True)
+        # Nothing left in either store: the natural key was rewritten.
+        assert provider.delete_user("alice") == LocalUserDeletion(credential_deleted=False, identity_retired=False)
 
         with pytest.raises(AuthenticationError, match="Invalid token"):
             await provider.authenticate(token)
@@ -344,16 +347,53 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         Credential first, then retirement: if the retirement raised after the
         credential row was gone, gating the retry on "a row was deleted"
         would make that identity unreachable forever. So the retirer runs on
-        every delete, and the return value keeps reporting the credential.
+        every delete, and the result reports the credential and the
+        retirement as separate facts: the second pass below is the recovery,
+        and a surface reading only the credential would call it "not found".
         """
         retired: list[str] = []
-        provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retired.append)
+        owed = [False, True]
+
+        def retire(username: str, delete_credential: Callable[[], None]) -> bool:
+            delete_credential()
+            retired.append(username)
+            return owed[len(retired) - 1]
+
+        provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retire)
         provider.create_user("alice", "password123", display_name="Alice")
 
-        assert provider.delete_user("alice") is True
+        assert provider.delete_user("alice") == LocalUserDeletion(credential_deleted=True, identity_retired=False)
         assert retired == ["alice"]
-        assert provider.delete_user("alice") is False
+        recovery = provider.delete_user("alice")
+        assert recovery == LocalUserDeletion(credential_deleted=False, identity_retired=True)
+        assert recovery.removed_anything is True
         assert retired == ["alice", "alice"]
+
+    def test_delete_user_refusal_leaves_the_credential_in_place(self, tmp_path) -> None:
+        """A retirer that refuses raises BEFORE calling the deletion, so the password survives."""
+
+        class _Refused(RuntimeError):
+            pass
+
+        def retire(_username: str, _delete_credential: Callable[[], None]) -> bool:
+            raise _Refused
+
+        provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retire)
+        provider.create_user("alice", "password123", display_name="Alice")
+
+        with pytest.raises(_Refused):
+            provider.delete_user("alice")
+        assert [account.user_id for account in provider.list_users()] == ["alice"]
+
+    def test_delete_user_rejects_a_retirer_that_never_deletes(self, tmp_path) -> None:
+        """Returning without deleting and without refusing would retire an identity whose password still works."""
+        provider = LocalAuthProvider.for_account_administration(
+            tmp_path / "auth.db", retire_identity=lambda _username, _delete_credential: True
+        )
+        provider.create_user("alice", "password123", display_name="Alice")
+
+        with pytest.raises(RuntimeError, match="without calling the credential deletion"):
+            provider.delete_user("alice")
 
     def test_open_registration_audit_failure_removes_the_committed_user(self, provider) -> None:
         """Audit runs after the durable commit; a failed audit compensates.

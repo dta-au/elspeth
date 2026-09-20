@@ -28,6 +28,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.auth.routes import _mark_sensitive_auth_response_uncacheable
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.identity_authority import LastActiveAdminProtected
 from elspeth.web.validation import has_visible_content
 
 _slog = structlog.get_logger(__name__)
@@ -192,10 +193,31 @@ def create_dev_admin_router() -> APIRouter:
             # The admin deleting themself would orphan the surface mid-session.
             raise HTTPException(status_code=400, detail="The dev admin account cannot delete itself")
         provider: LocalAuthProvider = request.app.state.auth_provider
-        deleted = await run_sync_in_worker(provider.delete_user, user_id)
-        if not deleted:
+        try:
+            deletion = await run_sync_in_worker(provider.delete_user, user_id)
+        except LastActiveAdminProtected as exc:
+            # Deleting the account retires its identity, and this one is the
+            # container's last active human administrator (R5). Decided
+            # before the credential was touched, so nothing has changed. The
+            # same closed code the identity surface answers with, so a client
+            # switches on one vocabulary.
+            raise HTTPException(
+                status_code=409,
+                detail={"refusal": "last_active_admin_protected", "detail": str(exc)},
+            ) from exc
+        if not deletion.removed_anything:
             raise HTTPException(status_code=404, detail="User not found")
-        _slog.info("dev_admin_user_deleted", actor=admin.user_id, target=user_id)
+        # ``credential_deleted`` false with ``identity_retired`` true is the
+        # recovery of an earlier deletion whose retirement did not commit: the
+        # account is already gone and this call finished the job, so it is a
+        # success, not a "not found".
+        _slog.info(
+            "dev_admin_user_deleted",
+            actor=admin.user_id,
+            target=user_id,
+            credential_deleted=deletion.credential_deleted,
+            identity_retired=deletion.identity_retired,
+        )
         return Response(status_code=204)
 
     return router

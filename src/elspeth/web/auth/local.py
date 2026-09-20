@@ -51,7 +51,15 @@ AdmitIdentity = Callable[[IdentityClaims], "EnsureIdentityOutcome"]
 # deleted, so the next holder of that username cannot inherit its admission.
 # Injected for the same reason as AdmitIdentity: the write lands in the
 # SESSIONS store, which web.auth does not depend on.
-RetireIdentity = Callable[[str], None]
+#
+# It takes the username AND this provider's credential deletion, and answers
+# whether an identity was retired. The deletion is handed over rather than
+# run first because the collaborator may REFUSE (the last active human
+# administrator), and a refusal has to be decided before the password goes
+# and under the lock that makes it true -- which only the identity store's
+# own transaction can do. The contract: call the deletion exactly once, or
+# raise without calling it.
+RetireIdentity = Callable[[str, Callable[[], None]], bool]
 
 _slog = structlog.get_logger(__name__)
 
@@ -84,6 +92,24 @@ class LocalUserAccount:
     display_name: str
     email: str | None
     email_verified: bool
+
+
+@dataclass(frozen=True)
+class LocalUserDeletion:
+    """What one ``delete_user`` call actually removed.
+
+    Two facts, because the two stores commit separately: a removal re-run
+    after a failed retirement finds no credential and still retires the
+    identity it owed, and a surface that reported only the credential would
+    call that recovery "not found".
+    """
+
+    credential_deleted: bool
+    identity_retired: bool
+
+    @property
+    def removed_anything(self) -> bool:
+        return self.credential_deleted or self.identity_retired
 
 
 class LocalAuthStorageSecurityError(RuntimeError):
@@ -598,7 +624,7 @@ class LocalAuthProvider:
         )
         return cleared.rowcount == 1
 
-    def delete_user(self, user_id: str) -> bool:
+    def delete_user(self, user_id: str) -> LocalUserDeletion:
         """Delete a local auth user, and retire the identity it was bound to.
 
         Deleting the credential is not enough. ``identities`` is a separate
@@ -620,17 +646,36 @@ class LocalAuthProvider:
         the ordering that fails safe for the person who is still using the
         account.
 
+        The deletion is HANDED to the retirer rather than run ahead of it. The
+        retirer can refuse (the last active human administrator), and a
+        refusal that arrived after the password was gone would leave the only
+        administrator with an identity and no way to sign in. The retirer
+        decides first, under its own lock, then calls the deletion, then
+        writes the identity: still credential first, and a refusal touches
+        neither store.
+
         Retirement runs whether or not a credential row was found. That is
         what makes the failure above recoverable: an operator who re-runs
-        the removal after a retirement error gets "not found" for the
-        credential and the retirement it owed. Retiring is idempotent (the
-        natural key is rewritten, so a second pass finds nothing), and a
-        username that never logged in has no identity to retire.
+        the removal after a retirement error finds no credential and still
+        gets the retirement it was owed, which the result reports as its own
+        fact. Retiring is idempotent (the natural key is rewritten, so a
+        second pass finds nothing), and a username that never logged in has
+        no identity to retire.
         """
-        with self._connect() as conn:
-            deleted = self._delete_user_rows(conn, user_id)
-        self._retire_identity(user_id)
-        return deleted
+        credential_deletions: list[bool] = []
+
+        def delete_credential() -> None:
+            if credential_deletions:
+                raise RuntimeError("retire_identity called the credential deletion more than once")
+            with self._connect() as conn:
+                credential_deletions.append(self._delete_user_rows(conn, user_id))
+
+        identity_retired = self._retire_identity(user_id, delete_credential)
+        if not credential_deletions:
+            # A retirer that returns without deleting and without refusing has
+            # retired (or skipped) an identity whose password still works.
+            raise RuntimeError("retire_identity returned without calling the credential deletion")
+        return LocalUserDeletion(credential_deleted=credential_deletions[0], identity_retired=identity_retired)
 
     def list_users(self) -> list[LocalUserAccount]:
         """List every local account, ordered by user_id."""

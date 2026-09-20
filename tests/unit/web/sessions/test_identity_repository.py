@@ -106,7 +106,14 @@ def _ensure(authority: RepositoryIdentityAuthority, *, activate: bool, **claim_o
 
 
 def _retire(authority: RepositoryIdentityAuthority, subject: str = "ada", *, reason: str = "local credential deleted"):
-    return authority.retire_identity(provider="local", subject=subject, reason=reason, record=_record_no_retirement)
+    return authority.retire_identity(
+        provider="local",
+        subject=subject,
+        reason=reason,
+        record=_record_no_retirement,
+        protect_last_admin=False,
+        delete_credential=lambda: None,
+    )
 
 
 # --------------------------------------------------------------------------

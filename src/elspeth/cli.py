@@ -2046,6 +2046,12 @@ def _composer_session_engine(session_db_url: str) -> Engine:
     return create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
 
 
+# An operator at this CLI holds ``bootstrap-admin``'s recovery mode, which is
+# exactly the way back from zero administrators that the web surface lacks, so
+# removing the last administrator's credential stays the operator's call here.
+_CLI_PROTECTS_LAST_ADMIN = False
+
+
 def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> RetireIdentity:
     """A retirer that opens the stores only if it is ever asked to retire.
 
@@ -2060,14 +2066,15 @@ def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> Retir
     from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
 
-    def retire(username: str) -> None:
+    def retire(username: str, delete_credential: Callable[[], None]) -> bool:
         engine = _composer_session_engine(session_db_url)
         try:
             with _composer_auth_audit_recorder(landscape_url) as recorder:
-                local_identity_retirer(
+                return local_identity_retirer(
                     RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
                     _composer_retirement_recorder(recorder),
-                )(username)
+                    protect_last_admin=_CLI_PROTECTS_LAST_ADMIN,
+                )(username, delete_credential)
         finally:
             engine.dispose()
 
@@ -2213,9 +2220,10 @@ def composer_users_remove(
                 retire_identity=local_identity_retirer(
                     RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
                     _composer_retirement_recorder(recorder),
+                    protect_last_admin=_CLI_PROTECTS_LAST_ADMIN,
                 ),
             )
-            if not provider.delete_user(username):
+            if not provider.delete_user(username).removed_anything:
                 typer.echo(f"Error: composer user not found: {username}", err=True)
                 raise typer.Exit(1)
     finally:

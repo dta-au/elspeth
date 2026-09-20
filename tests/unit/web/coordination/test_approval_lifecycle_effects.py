@@ -154,7 +154,14 @@ def test_failure_rolls_back_identity_and_approvals_and_expires_token(engine: Eng
 
 
 def test_retirement_records_operator_provenance(engine: Engine) -> None:
-    _authority(engine).retire_identity(provider="local", subject="approver", reason="credential removed", record=_ignore)
+    _authority(engine).retire_identity(
+        provider="local",
+        subject="approver",
+        reason="credential removed",
+        record=_ignore,
+        protect_last_admin=False,
+        delete_credential=lambda: None,
+    )
     with engine.connect() as conn:
         row = conn.execute(select(approvals_table).where(approvals_table.c.approval_id == "open")).one()
     assert row.decision == "revoked"
@@ -277,7 +284,14 @@ def test_automatic_withdrawal_audit_failure_restores_approvals(engine: Engine, t
     authority = _authority(engine)
     if transition == "operator":
         with pytest.raises(RuntimeError, match="audit unavailable"):
-            authority.retire_identity(provider="local", subject="approver", reason="removed", record=_fail)
+            authority.retire_identity(
+                provider="local",
+                subject="approver",
+                reason="removed",
+                record=_fail,
+                protect_last_admin=False,
+                delete_credential=lambda: None,
+            )
     else:
         with engine.begin() as conn:
             conn.execute(
