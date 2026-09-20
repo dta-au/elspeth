@@ -44,7 +44,7 @@ class TestLoadSkill:
     def test_pipeline_composer_preflight_uses_authored_requirement_shape(self) -> None:
         content = load_skill("pipeline_composer")
 
-        assert "Every requirement object has exactly `kind`, `user_term`, and `draft`." in content
+        assert "Every requirement object has `kind`, `user_term`, and `draft`, plus optional `display_title`." in content
         assert "Every requirement object has `id`, `kind`, `user_term`, `status`, and `draft`." not in content
 
     def test_missing_skill_raises_file_not_found(self) -> None:
