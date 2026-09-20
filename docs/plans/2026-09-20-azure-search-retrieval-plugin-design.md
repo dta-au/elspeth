@@ -1,6 +1,6 @@
-# Design: `azure_search_retrieval` plugin and operator profiles
+# Design: `azure_ai_search` plugin and operator profiles
 
-Status: draft for review. Branch `feature/azure-ai-search-rag` (off
+Status: approved 2026-09-20 (rulings at the end). Branch `feature/azure-ai-search-rag` (off
 `release/0.8.1`). Target release: 0.8.1 unless ruled otherwise.
 
 ## Goal
@@ -64,10 +64,15 @@ This is a behaviour-preserving move for Chroma; the existing
 `tests/unit/plugins/transforms/rag/` suite is the regression net and must pass
 unmodified except for the Azure cases that move.
 
-### 2. `azure_search_retrieval`
+### 2. `azure_ai_search`
 
-`plugins/transforms/azure/search_retrieval.py`, discovered through the existing
-`transforms/azure` directory.
+`plugins/transforms/azure/ai_search.py`, discovered through the existing
+`transforms/azure` directory. The plugin is named for the product
+(`azure_ai_search`), so it must say what it is for: the summary, `usage_when_to_use`,
+composer hints and the profiled `public_summary` arm all describe it as RAG
+retrieval against Azure AI Search, and it carries the `rag` and `retrieval`
+capability tags `rag_retrieval` does, so a planner looking for RAG finds both.
+A test pins that a catalogue search for "rag" returns it.
 
 - Typed, top-level options: the shared retrieval options plus `endpoint`,
   `index`, `api_key`, `use_managed_identity`, `client_id`, `api_version`,
@@ -96,7 +101,8 @@ ELSPETH_WEB__AZURE_SEARCH_PROFILES='[
    "auth": "managed_identity", "client_id": "<client id>",
    "indexes": ["approved-documents"]},
   {"alias": "contracts", "endpoint": "https://b.search.windows.net",
-   "auth": "api_key", "credential_ref": "SEARCH_B_KEY"}
+   "auth": "api_key", "credential_ref": "SEARCH_B_KEY",
+   "indexes": "any"}
 ]'
 ```
 
@@ -105,22 +111,26 @@ ELSPETH_WEB__AZURE_SEARCH_PROFILES='[
   rule), `auth`, `client_id` (managed identity only), `credential_ref` (api key
   only; server-scoped, so the name must be in
   `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST`, the LLM profile precedent),
-  `indexes` (optional pin; absent means any index on that service),
+  `indexes` (**required**: a non-empty list of index names, or the literal
+  `"any"`; an absent, empty or null value fails start-up, so opening a whole
+  service to web authors is a written decision and never a default),
   `api_version` (optional).
 - `_AzureSearchProfileResolver` on `PluginId("transform",
-  "azure_search_retrieval")`:
+  "azure_ai_search")`:
   - public schema: `profile` (enum of usable aliases) plus the author options.
     Private binding names are `endpoint`, `api_key`, `use_managed_identity`,
     `client_id`, `api_version`; an authored node carrying any of them fails
     lowering with `private_profile_option`.
-  - lowering injects the binding; with `indexes` set, an `index` outside the pin
-    is refused.
+  - lowering injects the binding; unless `indexes` is `"any"`, an `index`
+    outside the list is refused. The public schema tells the planner which
+    indexes each alias admits (an `index` enum when one alias is usable, per-alias
+    lists in the `profile` description otherwise), so it never guesses a name.
   - availability: a `managed_identity` profile is usable when `azure-identity`
     is importable; an `api_key` profile when the credential resolves in the
     inventory.
   - `selected_alias`: the only usable alias when there is exactly one, else
     none (the Textract rule; no silent default among several sources).
-- `azure_search_retrieval` is unavailable to web sessions when no profile is
+- `azure_ai_search` is unavailable to web sessions when no profile is
   configured, the `aws_s3` source posture.
 - The rate limiter is keyed `azure_search:<alias>` for profiled nodes (the
   endpoint host for YAML runs), so two services do not share a bucket.
@@ -135,7 +145,7 @@ ELSPETH_WEB__AZURE_SEARCH_PROFILES='[
 the `azure_search` provider they guarded: once `rag_retrieval` cannot reach
 Azure, the check has nothing to fire on. The guarantee moves to the profile
 machinery, which is structural rather than a string match: a web-authored
-`azure_search_retrieval` node without a valid alias never lowers, and one with
+`azure_ai_search` node without a valid alias never lowers, and one with
 a private option is refused. `CHECK_MANAGED_IDENTITY_POLICY` and its validation
 phase go too.
 
@@ -191,14 +201,15 @@ the verb and CHECK-value deletion. The shared core must leave Chroma's
 - Row-templated OData filters, agentic retrieval / knowledge bases, a
   start-up readiness probe per profile.
 
-## Open questions for John
+## Rulings on the draft (John, 2026-09-20)
 
-1. `indexes` absent means "any index on the service". Acceptable, or should the
-   pin be mandatory?
-2. Do the Azure half of Task 7 here (audited probe, `runtime_preflight`), or
-   wait for Task 7 and start on the `on_start` path?
-3. Plugin name: `azure_search_retrieval` (matches `rag_retrieval`) or
-   `azure_ai_search` (matches the product)?
+Design approved, with:
+
+1. The index pin is mandatory; `"any"` is the explicit, written opt-out.
+2. The Azure half of Task 7 is done here: the audited probe on
+   `runtime_preflight`. Task 7 keeps Chroma and the verb / CHECK-value deletion.
+3. The plugin is `azure_ai_search`, and it must advertise itself to the
+   composer as Azure RAG.
 
 ## Verification
 
