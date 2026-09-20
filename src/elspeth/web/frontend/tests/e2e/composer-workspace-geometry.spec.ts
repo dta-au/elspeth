@@ -113,7 +113,7 @@ async function assertScenario(
       expect(await boxWidth(composer.authoringPane())).toBeCloseTo(beforeAuthoring, 0);
       expect(await boxWidth(composer.artifactRegion())).toBeCloseTo(beforeArtifact, 0);
       await expectIntendedPaneScrollers(page, {});
-      await composer.artifactTab("Graph").click();
+      await composer.artifactTab("Workflow").click();
       break;
     }
     case "pending-acknowledgement":
@@ -132,7 +132,7 @@ async function assertScenario(
       await page.getByRole("button", { name: "Runs (1)" }).click();
       await expect(page.getByText("completed", { exact: true })).toBeVisible();
       await page.getByRole("button", { name: "Close runs" }).click();
-      await composer.artifactTab("Graph").click();
+      await composer.artifactTab("Workflow").click();
       break;
     case "multiple-notices":
       await expect(page.getByTestId("app-notice-primary")).toHaveCount(1);
@@ -552,7 +552,7 @@ test.describe("Composer deterministic workspace geometry", () => {
       );
 
       setRunHistoryRequestPhase(page, "inactive");
-      await composer.artifactTab("Graph").click();
+      await composer.artifactTab("Workflow").click();
       await expect.poll(() => activeRunPollingIntervals(page)).toBe(0);
       await page.clock.fastForward(6_001);
       expect(workspaceScenarioTelemetry(page).runHistoryRequests).toBe(
@@ -1089,7 +1089,7 @@ test.describe("Composer deterministic workspace geometry", () => {
         // bar's own buttons keep that register via the bottom-row contract
         // tests.
         const controls: Array<[ReturnType<ComposerPage["catalogButton"]>, number]> = [
-          [composer.artifactTab("Graph"), 36],
+          [composer.artifactTab("Workflow"), 36],
           [composer.artifactTab("Spec"), 36],
           [composer.artifactTab("YAML"), 36],
           [composer.checksTab(), 36],
@@ -1162,11 +1162,11 @@ test.describe("Composer deterministic workspace geometry", () => {
       await palette.getByRole("option", { name: /Show graph/ }).click();
 
       await expect(palette).toBeHidden();
-      await expect(composer.artifactTab("Graph")).toHaveAttribute(
+      await expect(composer.artifactTab("Workflow")).toHaveAttribute(
         "aria-selected",
         "true",
       );
-      await expect(composer.artifactTab("Graph")).toBeFocused();
+      await expect(composer.artifactTab("Workflow")).toBeFocused();
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }

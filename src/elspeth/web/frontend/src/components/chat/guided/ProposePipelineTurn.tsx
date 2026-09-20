@@ -280,7 +280,7 @@ export function ProposePipelineTurn({
           pane is a tab (ArtifactWorkspace's REQUEST_ARTIFACT_VIEW handler
           calls showPipeline before selecting the tab). */}
       <p className="guided-proposal__graph-pointer">
-        The proposed structure is drawn in the Graph pane.{" "}
+        The proposed structure is drawn in the Workflow tab.{" "}
         <Button
           compact
           onClick={() =>

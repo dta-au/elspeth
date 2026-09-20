@@ -147,7 +147,7 @@ test.describe("Composer workspace browser accessibility", () => {
       "populated-long-transcript",
     );
     try {
-      const graph = composer.artifactTab("Graph");
+      const graph = composer.artifactTab("Workflow");
       const spec = composer.artifactTab("Spec");
       const run = composer.artifactTab("Run");
       await expect(spec).toBeEnabled();
@@ -241,7 +241,7 @@ test.describe("Composer workspace browser accessibility", () => {
       await expect(
         page.getByRole("region", { name: "Audit readiness" }),
       ).toBeVisible();
-      await composer.artifactTab("Graph").click();
+      await composer.artifactTab("Workflow").click();
 
       const run = composer.runPipeline();
       await expect(run).toBeEnabled();
@@ -271,7 +271,7 @@ test.describe("Composer workspace browser accessibility", () => {
     try {
       for (const control of [
         composer.chatInput(),
-        composer.artifactTab("Graph"),
+        composer.artifactTab("Workflow"),
         composer.checksTab(),
         composer.runPipeline(),
         composer.collapseAuthoring(),

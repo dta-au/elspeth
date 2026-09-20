@@ -224,19 +224,20 @@ describe("ArtifactWorkspace", () => {
     const tablist = screen.getByRole("tablist", {
       name: "Pipeline artifacts",
     });
-    const graph = within(tablist).getByRole("tab", { name: "Graph" });
+    const graph = within(tablist).getByRole("tab", { name: "Workflow" });
     expect(graph).toHaveAttribute("id", "artifact-tab-graph");
     expect(graph).toHaveAttribute("aria-selected", "true");
     expect(graph).toHaveAttribute("aria-controls", "artifact-panel-graph");
     expect(graph).toHaveAttribute("tabindex", "0");
-    const panel = screen.getByRole("tabpanel", { name: "Graph" });
+    const panel = screen.getByRole("tabpanel", { name: "Workflow" });
     expect(panel).toHaveAttribute("id", "artifact-panel-graph");
     expect(panel).toHaveAttribute("aria-labelledby", "artifact-tab-graph");
     expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
-    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(5);
-    for (const tab of ["graph", "spec", "yaml", "checks", "run"] as const) {
+    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(6);
+    for (const tab of ["graph", "approvals", "spec", "yaml", "checks", "run"] as const) {
       const tabElement = screen.getByRole("tab", {
-        name: tab === "yaml" ? "YAML" : `${tab[0]!.toUpperCase()}${tab.slice(1)}`,
+        // The "graph" tab id is labelled "Workflow"; the id is the stable key.
+        name: tab === "yaml" ? "YAML" : tab === "graph" ? "Workflow" : `${tab[0]!.toUpperCase()}${tab.slice(1)}`,
       });
       const controlledId = tabElement.getAttribute("aria-controls");
       expect(controlledId).toBe(`artifact-panel-${tab}`);
@@ -315,7 +316,7 @@ describe("ArtifactWorkspace", () => {
   it("disables Spec, YAML, and Checks without composition content but keeps Graph and Run available", () => {
     renderArtifactWorkspace();
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toBeEnabled();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toBeEnabled();
     expect(screen.getByRole("tab", { name: "Spec" })).toBeDisabled();
     expect(screen.getByRole("tab", { name: "YAML" })).toBeDisabled();
     expect(screen.getByRole("tab", { name: "Checks" })).toBeDisabled();
@@ -378,11 +379,11 @@ describe("ArtifactWorkspace", () => {
       "No runs yet.",
     );
     await user.keyboard("{ArrowRight}");
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     await user.keyboard("{ArrowLeft}");
     expect(screen.getByRole("tab", { name: "Run" })).toHaveFocus();
     await user.keyboard("{Home}");
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
   });
 
   it("keeps a newer direct Run selection after an older deferred Spec hash loads", async () => {
@@ -453,17 +454,17 @@ describe("ArtifactWorkspace", () => {
     act(() => useSessionStore.setState({ compositionStateLoaded: true }));
     await act(async () => Promise.resolve());
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
   });
 
   it("skips disabled tabs while roving in an empty composition", async () => {
     const user = userEvent.setup();
     renderArtifactWorkspace();
-    screen.getByRole("tab", { name: "Graph" }).focus();
+    screen.getByRole("tab", { name: "Workflow" }).focus();
 
     await user.keyboard("{ArrowRight}");
 
@@ -507,7 +508,7 @@ describe("ArtifactWorkspace", () => {
         sessionId: "another-session",
       });
     });
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -655,10 +656,10 @@ describe("ArtifactWorkspace", () => {
       useSessionStore.setState({ compositionState: null });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     expect(screen.getByRole("tab", { name: "YAML" })).toBeDisabled();
     expect(screen.getByRole("status")).toHaveTextContent(
-      "YAML is unavailable. Showing Graph.",
+      "YAML is unavailable. Showing Workflow.",
     );
   });
 
@@ -811,7 +812,7 @@ describe("ArtifactWorkspace", () => {
       }).not.toThrow();
 
       expect(authorControl).toHaveFocus();
-      expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+      expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
         "aria-selected",
         "true",
       );
@@ -854,9 +855,9 @@ describe("ArtifactWorkspace", () => {
       });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     expect(screen.getByRole("status")).toHaveTextContent(
-      "YAML is unavailable. Showing Graph.",
+      "YAML is unavailable. Showing Workflow.",
     );
   });
 
@@ -870,13 +871,13 @@ describe("ArtifactWorkspace", () => {
       useSessionStore.setState({ compositionState: null });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
     expect(screen.getByRole("status")).toHaveTextContent(
-      "Spec is unavailable. Showing Graph.",
+      "Spec is unavailable. Showing Workflow.",
     );
   });
 
@@ -897,7 +898,7 @@ describe("ArtifactWorkspace", () => {
       });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     expect(
       document.querySelector(".artifact-workspace > [role='status']"),
     ).toBeEmptyDOMElement();
@@ -924,7 +925,7 @@ describe("ArtifactWorkspace", () => {
       });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     expect(
       document.querySelector(".artifact-workspace > [role='status']"),
     ).toBeEmptyDOMElement();
@@ -956,7 +957,7 @@ describe("ArtifactWorkspace", () => {
     await user.click(screen.getByRole("tab", { name: "Spec" }));
     const observations: Array<{ focused: Element | null; selected: string | null }> = [];
     const listener = () => {
-      const graph = screen.getByRole("tab", { name: "Graph" });
+      const graph = screen.getByRole("tab", { name: "Workflow" });
       observations.push({
         focused: document.activeElement,
         selected: graph.getAttribute("aria-selected"),
@@ -970,10 +971,10 @@ describe("ArtifactWorkspace", () => {
     await Promise.resolve();
     expect(observations).toHaveLength(1);
     expect(observations[0]).toEqual({
-      focused: screen.getByRole("tab", { name: "Graph" }),
+      focused: screen.getByRole("tab", { name: "Workflow" }),
       selected: "true",
     });
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -1066,7 +1067,7 @@ describe("ArtifactWorkspace", () => {
       </WorkspacePaneProvider>,
     );
     let workspaceFocusCount = 0;
-    screen.getByRole("tab", { name: "Graph" }).addEventListener("focus", () => {
+    screen.getByRole("tab", { name: "Workflow" }).addEventListener("focus", () => {
       workspaceFocusCount += 1;
     });
     outside.focus();
@@ -1151,7 +1152,7 @@ describe("ArtifactWorkspace", () => {
     await waitFor(() => expect(observations).toHaveLength(1));
     await Promise.resolve();
     expect(observations).toHaveLength(1);
-    expect(observations[0]).toBe(screen.getByRole("tab", { name: "Graph" }));
+    expect(observations[0]).toBe(screen.getByRole("tab", { name: "Workflow" }));
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
   });
 
@@ -1201,7 +1202,7 @@ describe("ArtifactWorkspace", () => {
     expect(screen.getByRole("button", { name: "Validation status" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Run pipeline" })).toBeEnabled();
 
-    await user.click(screen.getByRole("tab", { name: "Graph" }));
+    await user.click(screen.getByRole("tab", { name: "Workflow" }));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     await user.click(screen.getByRole("tab", { name: "Spec" }));
     expect(screen.getByRole("alert")).toHaveTextContent(
@@ -1217,7 +1218,7 @@ describe("ArtifactWorkspace", () => {
         }),
       });
     });
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -1508,7 +1509,7 @@ describe("ArtifactWorkspace", () => {
     act(() => vi.advanceTimersByTime(3000));
     expect(loadRuns).toHaveBeenCalledTimes(2);
 
-    fireEvent.click(screen.getByRole("tab", { name: "Graph" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Workflow" }));
     act(() => vi.advanceTimersByTime(6000));
     expect(loadRuns).toHaveBeenCalledTimes(2);
 
@@ -1525,7 +1526,7 @@ describe("ArtifactWorkspace", () => {
         }),
       });
     });
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -1636,6 +1637,7 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       ).getAllByRole("tab");
       expect(tabs.map((tab) => tab.id)).toEqual([
         "artifact-tab-graph",
+        "artifact-tab-approvals",
         "artifact-tab-spec",
         "artifact-tab-yaml",
         "artifact-tab-checks",

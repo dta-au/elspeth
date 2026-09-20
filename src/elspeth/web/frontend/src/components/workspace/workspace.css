@@ -330,6 +330,14 @@
   padding: var(--space-md);
 }
 
+/* Approvals tab: the approved value under an audit-style row. Prompts are
+   multi-line, so the text keeps its line breaks and reads at body colour. */
+.approvals-view-value {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+}
+
 .artifact-workspace-panel[hidden] {
   display: none;
 }

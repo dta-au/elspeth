@@ -134,7 +134,7 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await page.goto(`/#/${sessionId}/graph`);
         await page.getByTestId("composer-workspace").waitFor();
 
-        const graphTab = page.getByRole("tab", { name: "Graph" });
+        const graphTab = page.getByRole("tab", { name: "Workflow" });
         await expect(page.getByRole("tab", { name: "Pipeline", exact: true })).toHaveAttribute("aria-selected", "true");
         await expect(graphTab).toHaveAttribute("aria-selected", "true");
         await expect(graphTab).toBeFocused();
@@ -177,7 +177,7 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
 
         await page.keyboard.press("Control+Shift+G");
 
-        const graphTab = page.getByRole("tab", { name: "Graph" });
+        const graphTab = page.getByRole("tab", { name: "Workflow" });
         await expect(page.getByRole("tab", { name: "Pipeline", exact: true })).toHaveAttribute("aria-selected", "true");
         await expect(graphTab).toHaveAttribute("aria-selected", "true");
         await expect(graphTab).toBeFocused();

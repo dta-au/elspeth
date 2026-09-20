@@ -28,6 +28,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { RunStatus } from "@/types/index";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
+import { ApprovalsView } from "./ApprovalsView";
 import { ChecksView } from "./ChecksView";
 import { PipelineSpecView } from "./PipelineSpecView";
 import {
@@ -39,7 +40,10 @@ import {
 import { ARTIFACT_TABS, type ArtifactTab } from "./workspaceTypes";
 
 const TAB_LABELS: Record<ArtifactTab, string> = {
-  graph: "Graph",
+  /* The tab id stays "graph" (deep links, the command palette and stored pane
+     state all key on it); only the visible name is "Workflow". */
+  graph: "Workflow",
+  approvals: "Approvals",
   spec: "Spec",
   yaml: "YAML",
   checks: "Checks",
@@ -130,6 +134,8 @@ function activeArtifact(
   switch (tab) {
     case "graph":
       return <GraphView />;
+    case "approvals":
+      return <ApprovalsView />;
     case "spec":
       return <PipelineSpecView />;
     case "yaml":
@@ -222,6 +228,7 @@ export function ArtifactWorkspaceSurface({
   const { activeArtifactTab, availableArtifactTabs } = state;
   const tabRefs = useRef<Record<ArtifactTab, HTMLButtonElement | null>>({
     graph: null,
+    approvals: null,
     spec: null,
     yaml: null,
     checks: null,
@@ -346,7 +353,7 @@ export function ArtifactWorkspaceSurface({
   const announceFallback = useCallback((requested: ArtifactTab): void => {
     setAnnouncement((current) => ({
       id: current.id + 1,
-      message: `${TAB_LABELS[requested]} is unavailable. Showing Graph.`,
+      message: `${TAB_LABELS[requested]} is unavailable. Showing ${TAB_LABELS.graph}.`,
     }));
   }, []);
 
