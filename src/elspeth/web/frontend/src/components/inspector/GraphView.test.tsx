@@ -357,7 +357,7 @@ describe("GraphView", () => {
     expect(within(table).getByRole("row", { name: /Transform: classify/ })).toHaveTextContent(
       "profile sonnetSend to resultsRow processing failsSend to quarantine (not connected)",
     );
-    expect(within(table).getByRole("row", { name: /Output: results/ })).toHaveTextContent(
+    expect(within(table).getByRole("row", { name: /Sink: results/ })).toHaveTextContent(
       "Row writtenRow write failsDiscard row (audit recorded)",
     );
   });

@@ -92,7 +92,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
       : failureAction(node.on_error, destinationName, node.id),
   }));
   const outputs = state.outputs.map((output) => ({
-    kind: "Output",
+    kind: "Sink",
     name: output.name,
     plugin: output.plugin,
     binding: pluginBindingLabel(output.plugin, output.options),
@@ -107,8 +107,8 @@ export function GraphOutputs({ state }: { state: CompositionState }): JSX.Elemen
   const rows = policyRows(state);
   return (
     <details className="graph-detail-table" open>
-      {/* Routing vocabulary throughout: "Output" is a row KIND here (a sink),
-          so it cannot also name the section and its columns. */}
+      {/* Row kinds are the canonical node names (Source, Transform, Gate, ...,
+          Sink); the section and its columns use routing vocabulary. */}
       <summary>Routing ({rows.length})</summary>
       <div className="graph-detail-table-scroll" tabIndex={0} role="group" aria-label="Routing table">
         <table>

@@ -431,7 +431,31 @@ Deliberately not done, per this plan's own sequencing:
 - **P9.** Inferred from the stylesheet; needs a served build of
   `release/0.8.1` before the breakpoint or a container query is chosen.
 - **The live pass** (L3/L6 visually, P5 focus containment, which jsdom cannot
-  enforce). The People & access merge is still local-only.
+  enforce). Partly done; see the 02:55 update below.
+
+**Update, 2026-09-21 02:55 AEST — gate, deploy and a browser-driven pass.**
+
+- Full-suite gate PASS at `793d0f95a`: ruff exit 0, pytest exit 0 (54561
+  passed, 61 skipped, 2 xfailed), `frozen=yes`.
+- Frontend rebuilt and `elspeth-web.service` restarted; the served bundle went
+  `index-BWHaANf9.js` → `index-DiiDGqdX.js`. The service had been up since
+  `721ea0cfe`, so the restart also deployed the People & access panel. No
+  session-schema change was in that range.
+- Driven through the page as `dta_user`: tutorial reset → graduation (session
+  `66b548ac`; the L1 copy and the L7/L10 tables seen live), a two-prompt A/B
+  fork/coalesce (`60ab6a67`), a threshold gate to two sinks (`c9e1d1dd`), and an
+  uploaded-file filter with a follow-up edit (`cfe8b516`). All outputs correct.
+  P6's provider labels and Type filter seen in People & access.
+- Not seen live: L3's Optional/Apply and L5's "Ask the composer about this" (no
+  suggestion or blocker arose), P5's `inert`, P1's reason form (nothing was
+  mutated). L8's clamp and P9 are now unblocked, not done.
+- Observed, not diagnosed: a console 409 on `/validate?state_id=` after a
+  freeform approval click (twice; the flow was unaffected); a system note saying
+  "one choice" with three cards pending; "The LLM invented this source data" on
+  rows the user pasted; the tutorial audit step reporting 4 LLM calls for 3 rows.
+- Follow-up from John during the pass: the Routing table labelled a sink row
+  `Output:`; it now reads `Sink:`, matching the canonical node names the other
+  rows already used.
 
 Found while implementing, and fixed:
 
