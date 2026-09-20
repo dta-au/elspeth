@@ -240,6 +240,16 @@
   min-height: var(--size-control-compact);
 }
 
+/* The Fullscreen control carries a STROKED ui-icon, while @xyflow styles every
+   controls svg as a filled 12px glyph (`fill: currentColor`). Filled, the four
+   open corner brackets close into triangles; keep them as strokes and size
+   the mark to sit with the vendor's zoom and fit glyphs. */
+:root .react-flow__controls-button .ui-icon {
+  max-width: 14px;
+  max-height: 14px;
+  fill: none;
+}
+
 /* Both floating panels (Controls, MiniMap) inset from the canvas edge at
    @xyflow's raw 15px; put them on the spacing scale instead. Every rule in
    this group is :root-prefixed because the vendor rules are bare classes —

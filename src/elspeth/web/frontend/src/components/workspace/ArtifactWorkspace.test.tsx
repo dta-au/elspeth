@@ -11,6 +11,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
+  type ButtonHTMLAttributes,
   type ReactNode,
   Suspense,
   startTransition,
@@ -53,7 +54,12 @@ vi.mock("@xyflow/react", () => ({
   BaseEdge: () => null,
   Handle: () => null,
   Background: () => null,
-  Controls: () => null,
+  // Children render so the Workflow canvas's Fullscreen control (a
+  // ControlButton inside Controls) is reachable, as it is in the browser.
+  Controls: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  ControlButton: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>{children}</button>
+  ),
   MiniMap: () => null,
 }));
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
@@ -982,6 +988,8 @@ describe("ArtifactWorkspace", () => {
   });
 
   it("suppresses a queued Graph modal after a committed session switch", () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace();
     let modalCount = 0;
     const listener = () => {
@@ -1020,6 +1028,8 @@ describe("ArtifactWorkspace", () => {
   });
 
   it("suppresses a queued Graph modal after unmount", () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     const view = renderArtifactWorkspace();
     let modalCount = 0;
     const listener = () => {
@@ -1081,6 +1091,8 @@ describe("ArtifactWorkspace", () => {
   });
 
   it("does not let a suspended speculative session render poison a queued modal", async () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     const never = new Promise<void>(() => {});
     function SuspendAfterArtifact({
       sessionId,
@@ -1550,6 +1562,8 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
   });
 
   it("keeps Plugin catalog in the toolbar and Fullscreen inside the Workflow panel", () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace({ catalogAvailable: true });
 
     const catalog = screen.getByRole("button", { name: "Plugin catalog" });
@@ -1564,14 +1578,21 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     expect(catalog.parentElement).not.toContainElement(fullscreen);
   });
 
+  it("offers no Fullscreen control while there is no pipeline to draw", () => {
+    renderArtifactWorkspace();
+    expect(screen.getByRole("tabpanel", { name: "Workflow" })).toHaveTextContent("No pipeline to visualise.");
+    expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
+  });
+
   it("omits the catalog trigger by default (tutorial/guided mounts)", () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace();
     expect(
       screen.queryByRole("button", { name: "Plugin catalog" }),
     ).toBeNull();
-    // Fullscreen is unconditional on the Workflow tab, empty state included:
-    // it is the only keyboard-operable GraphModal trigger (palette and
-    // Ctrl+Shift+G pass focusMode:false).
+    // Fullscreen needs no catalog: it is the only keyboard-operable GraphModal
+    // trigger (palette and Ctrl+Shift+G pass focusMode:false).
     expect(
       screen.getByRole("button", { name: "Fullscreen" }),
     ).toBeInTheDocument();
@@ -1756,6 +1777,8 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     });
 
     it("mounts the trigger in the toolbar, ahead of the Workflow panel's Fullscreen control", () => {
+      // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+      useSessionStore.setState({ compositionState: makeComposition(1) });
       useSessionStore.setState({
         guidedSession: guidedSessionWithHistory(),
       } as never);

@@ -330,16 +330,6 @@
   padding: var(--space-md);
 }
 
-/* Workflow tab: opens the full-screen graph. Top-left of the panel — the
-   pending-proposal pill owns top-right, the zoom controls bottom-left and the
-   minimap bottom-right. */
-.artifact-graph-fullscreen-btn {
-  position: absolute;
-  z-index: var(--z-panel-controls);
-  top: var(--space-sm);
-  left: var(--space-sm);
-}
-
 /* Approvals tab: the Workflow tab's approvals table (.graph-detail-table
    supplies the table rules) sitting inside the audit-panel card, so it drops
    the disclosure's own top rule and paper fill. */

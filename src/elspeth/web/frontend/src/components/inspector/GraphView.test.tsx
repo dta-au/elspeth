@@ -158,7 +158,7 @@ vi.mock("@xyflow/react", () => ({
       data-size={size}
     />
   ),
-  Controls: ({ showInteractive, fitViewOptions }: any) => (
+  Controls: ({ showInteractive, fitViewOptions, children }: any) => (
     <div
       data-testid="react-flow-controls"
       data-show-interactive={String(showInteractive)}
@@ -166,7 +166,12 @@ vi.mock("@xyflow/react", () => ({
       // <ReactFlow>'s, so the two must be asserted separately
       // (elspeth-a8074a3a7b).
       data-fit-view-options={fitViewOptions ? JSON.stringify(fitViewOptions) : ""}
-    />
+    >
+      {children}
+    </div>
+  ),
+  ControlButton: ({ children, ...props }: any) => (
+    <button type="button" {...props}>{children}</button>
   ),
   MiniMap: ({ nodeColor, nodeStrokeColor, bgColor, nodeStrokeWidth, style }: any) => (
     <div
@@ -3375,6 +3380,22 @@ describe("GraphView", () => {
     // to 2.0x on every click and then disabled the zoom-in button
     // (elspeth-a8074a3a7b). The Controls prop is a SEPARATE surface and needs
     // its own assertion.
+    // GraphModal renders this same component with no handler, so the control
+    // that OPENS the modal must not appear inside it.
+    it("adds a Fullscreen control to the canvas controls only when given a handler", async () => {
+      const onFullscreen = vi.fn();
+      const { unmount } = render(<GraphView onFullscreen={onFullscreen} />);
+      const control = within(screen.getByTestId("react-flow-controls")).getByRole("button", { name: "Fullscreen" });
+      expect(control).toHaveAttribute("title", "Fullscreen");
+      expect(control.querySelector('[data-icon="maximise"]')).not.toBeNull();
+      await userEvent.click(control);
+      expect(onFullscreen).toHaveBeenCalledTimes(1);
+      unmount();
+
+      render(<GraphView />);
+      expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
+    });
+
     it("gives the Controls fit-view button its own copy of the options", () => {
       render(<GraphView />);
       const controls = screen.getByTestId("react-flow-controls");

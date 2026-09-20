@@ -134,21 +134,10 @@ function activeArtifact(
 ): JSX.Element {
   switch (tab) {
     case "graph":
-      // Fullscreen lives on the tab that owns the graph, not in the shared
-      // toolbar. It wraps GraphView rather than sitting inside it because
-      // GraphModal renders the same GraphView (the button must not appear in
-      // the full-screen view it opens) and because it must stay reachable in
-      // every graph state: it is the only keyboard-operable trigger for
-      // GraphModal (palette "Show graph" and Ctrl+Shift+G deliberately pass
-      // focusMode:false, and the canvas's click gestures are already bound).
-      return (
-        <>
-          <Button compact className="artifact-graph-fullscreen-btn" onClick={openFullscreen}>
-            Fullscreen
-          </Button>
-          <GraphView />
-        </>
-      );
+      // Fullscreen is the graph's fourth canvas control (under fit view).
+      // Only this mount passes the handler: GraphModal renders the same
+      // GraphView and must not offer to open itself.
+      return <GraphView onFullscreen={openFullscreen} />;
     case "approvals":
       return <ApprovalsView />;
     case "spec":
@@ -577,7 +566,7 @@ export function ArtifactWorkspaceSurface({
           })}
         </div>
         {/* Right cluster: session-wide tools only. The graph's Fullscreen
-            control moved onto the Workflow tab itself (see activeArtifact). */}
+            control is one of the Workflow canvas's own controls (GraphView). */}
         <div className="artifact-toolbar-actions">
           {/* Sole opener of the History drawer since the action-bar chips
               retired with the Checks tab: gated on the same completed-history
