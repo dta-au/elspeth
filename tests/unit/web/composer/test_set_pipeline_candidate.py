@@ -1826,6 +1826,11 @@ _EXPECTED_STATE_HASHES = {
     # node-level in-use status) instead of the node-level prompt_template alone
     # (session 94f6f00c). Control: swapping that one draft back to the
     # prompt_template text reproduces the previous pin exactly.
+    # Re-pinned 2026-09-21: the fixture's llm node gained a system_prompt
+    # (Stage-1 llm_system_prompt_missing makes both prompt roles mandatory),
+    # which changes the node options and the staged review draft with them.
+    # Control: the same fixture without the system_prompt, on the tree without
+    # the rule, reproduces the previous pin 55dd9ee6… exactly.
     "structured_llm": "41792a2289fccefe64c8e91a8709d3504ea67ba6acce4d0690ae1c056d6ff145",
     "multi_output": "a8e0698429a06efa22423ebc37033b585f1b6cdc225eb2501b4d69ee6b67ad8a",
 }
