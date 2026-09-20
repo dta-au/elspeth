@@ -5,12 +5,14 @@ import userEvent from "@testing-library/user-event";
 import { GraphView } from "./GraphView";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
 import { EMPTY_GUIDED_REVIEWED_COMPONENTS } from "@/stores/guidedReviewedComponents";
 import type { TurnPayload } from "@/types/guided";
 import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "@/types/index";
+import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { projectValidationWorkspaceStatus } from "@/components/workspace/workspaceStatus";
 
@@ -287,6 +289,7 @@ function makeProposal(
 describe("GraphView", () => {
   beforeEach(() => {
     useSessionStore.setState({
+      activeSessionId: null,
       compositionState: null,
       compositionProposals: [],
       // Guided projection inputs (elspeth-9f0873426a): a test that seeds a
@@ -300,6 +303,7 @@ describe("GraphView", () => {
     useSessionStore.setState({ selectedNodeId: null } as never);
     useExecutionStore.setState({ validationResult: null } as never);
     resetStore(usePreferencesStore);
+    resetStore(useInterpretationEventsStore);
     // OptionRows (rendered inside the node config panel) now reads the
     // catalog store's schema cache; reset it so no test's seeded schema
     // leaks into a later one.
@@ -351,6 +355,56 @@ describe("GraphView", () => {
     expect(within(table).getByRole("row", { name: /Output: results/ })).toHaveTextContent(
       "Row write failsDiscard row (audit recorded)",
     );
+  });
+
+  it("shows approved assumption history above failure handling with independent disclosures", async () => {
+    const user = userEvent.setup();
+    const approved: InterpretationEvent = {
+      id: "approval-1", session_id: "session-1", composition_state_id: "state-1",
+      affected_node_id: "classify", tool_call_id: "tool-1", user_term: "category",
+      kind: "vague_term", llm_draft: "initial definitions",
+      accepted_value: "billing, outage, or other", choice: "amended",
+      created_at: "2026-09-20T07:23:00Z", resolved_at: "2026-09-20T07:24:00Z",
+      actor: "user:owner:1", interpretation_source: "user_approved",
+      model_identifier: "model", model_version: "1", provider: "provider",
+      composer_skill_hash: "hash", arguments_hash: "hash", hash_domain_version: "v2",
+      runtime_model_identifier_at_resolve: null, runtime_model_version_at_resolve: null,
+      approved_prompt_artifact_hash: null,
+    };
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode()] }) });
+    useInterpretationEventsStore.setState({
+      resolvedBySession: {
+        "session-1": [
+          approved,
+          {
+            ...approved, id: "prompt-approval", kind: "llm_prompt_template",
+            user_term: "llm_prompt_template:classify", accepted_value: "Classify each complaint",
+          },
+          { ...approved, id: "opted-out", choice: "opted_out" },
+        ],
+        "other-session": [{ ...approved, id: "other-session" }],
+      },
+    });
+
+    render(<GraphView />);
+    const assumptions = screen.getByText("Assumption approvals (2)").closest("details") as HTMLDetailsElement;
+    const failures = screen.getByText("Failure handling").closest("details") as HTMLDetailsElement;
+    expect(assumptions.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(assumptions.open).toBe(false);
+    expect(failures.open).toBe(true);
+    await user.click(screen.getByText("Assumption approvals (2)"));
+    expect(assumptions.open).toBe(true);
+    expect(failures.open).toBe(true);
+    const table = within(assumptions).getByRole("table");
+    expect(within(table).getByRole("row", { name: /category/ })).toHaveTextContent("billing, outage, or other");
+    expect(within(table).getByRole("row", { name: /Prompt for classify/ })).toHaveTextContent("Classify each complaint");
+    expect(within(table).getByRole("columnheader", { name: "Approved at" })).toBeInTheDocument();
+    expect(within(table).getAllByRole("time")).toHaveLength(2);
+    expect(within(table).getAllByRole("time")[0]).toHaveAttribute("datetime", approved.resolved_at);
+    expect(within(table).getAllByRole("row")).toHaveLength(3);
+    await user.click(screen.getByText("Failure handling"));
+    expect(assumptions.open).toBe(true);
+    expect(failures.open).toBe(false);
   });
 
   it("renders a pending proposal pill when proposal affects graph", () => {

@@ -123,10 +123,12 @@ vi.mock("./MessageBubble", () => ({
     message,
     proposalsByToolCallId,
     staleProposalIds,
+    pendingReviewCreatedAt,
   }: {
     message: ChatMessage;
     proposalsByToolCallId?: Map<string, CompositionProposal>;
     staleProposalIds?: string[];
+    pendingReviewCreatedAt?: ReadonlyArray<string>;
   }) => {
     const toolCallId = message.tool_calls?.[0]?.id ?? null;
     const proposal = toolCallId
@@ -136,7 +138,7 @@ vi.mock("./MessageBubble", () => ({
       ? staleProposalIds?.includes(proposal.id) ?? false
       : false;
     return (
-      <div data-testid="message-bubble">
+      <div data-testid="message-bubble" data-pending-review-created-at={JSON.stringify(pendingReviewCreatedAt)}>
         <div>{message.content}</div>
         {proposal && <div>{proposal.summary}</div>}
         {isStale && <div>Stale proposal</div>}
@@ -8828,6 +8830,53 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
       compositionState: null,
       error: null,
     });
+  });
+
+  it("updates the persisted handoff notice when its pending review resolves", () => {
+    const notice = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue.";
+    const event = makeInterpretationEvent({
+      session_id: sessionFixture.id,
+      created_at: "2026-05-18T10:00:01Z",
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: [
+        {
+          id: "user-1", session_id: sessionFixture.id, role: "user",
+          content: "Build a pipeline", tool_calls: null, created_at: "2026-05-18T10:00:00Z",
+        },
+        {
+          id: "assistant-1", session_id: sessionFixture.id, role: "assistant",
+          content: `Pipeline summary\n\n${notice}`, tool_calls: null,
+          created_at: "2026-05-18T10:00:02Z",
+          segments: [
+            { kind: "text", content: "Pipeline summary" },
+            { kind: "trusted_system_notice", content: notice },
+          ],
+        },
+      ],
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [sessionFixture.id]: { [event.id]: event } },
+    });
+    render(<ChatPanel />);
+    expect(screen.getAllByTestId("message-bubble")[1]).toHaveAttribute(
+      "data-pending-review-created-at", '["2026-05-18T10:00:01Z"]',
+    );
+
+    act(() => {
+      useInterpretationEventsStore.setState({
+        pendingBySession: { [sessionFixture.id]: {} },
+        resolvedBySession: {
+          [sessionFixture.id]: [{
+            ...event, choice: "accepted_as_drafted", accepted_value: "accepted meaning",
+            resolved_at: "2026-05-18T10:03:00Z",
+          }],
+        },
+      });
+    });
+    expect(screen.getAllByTestId("message-bubble")[1]).toHaveAttribute("data-pending-review-created-at", "[]");
   });
 
   // Test 13: freeform mode + pending event → inline message rendered.

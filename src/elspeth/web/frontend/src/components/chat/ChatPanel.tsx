@@ -777,6 +777,13 @@ export function ChatPanel({
   const pendingAcknowledgementEvents = usePendingAcknowledgements(
     activeSessionId ?? "",
   );
+  const reviewEventsLoaded = useInterpretationEventsStore((state) =>
+    activeSessionId !== null && state.pendingBySession[activeSessionId] !== undefined,
+  );
+  const pendingReviewCreatedAt = useMemo(
+    () => reviewEventsLoaded ? pendingAcknowledgementEvents.map((event) => event.created_at) : undefined,
+    [reviewEventsLoaded, pendingAcknowledgementEvents],
+  );
   const wirePendingAcknowledgements = useMemo<WireBlockerLink[]>(
     () =>
       pendingAcknowledgementEvents.map((event) => ({
@@ -3504,6 +3511,7 @@ export function ChatPanel({
                       staleProposalIds={staleProposalIds}
                       sourcesCreated={sourcesForThisTurn}
                       onEditInlineSource={handleEditInlineSource}
+                      pendingReviewCreatedAt={pendingReviewCreatedAt}
                     />
                     {confirmedApprovals.map((conf) => (
                       <InterpretationConfirmation

@@ -38,6 +38,7 @@ import dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { selectApprovedInterpretations, useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { projectGuidedGraph } from "@/components/chat/guided/guidedGraphProjection";
 import { GuidedGraphPane } from "./GuidedGraphPane";
 import { useTheme } from "@/hooks/useTheme";
@@ -61,6 +62,7 @@ import type { CompositionState } from "@/types/index";
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphFailurePolicies } from "./GraphFailurePolicies";
+import { GraphAssumptionApprovals } from "./GraphAssumptionApprovals";
 
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
@@ -831,6 +833,12 @@ function layoutGraph(
 
 export function GraphView() {
   const compositionState = useSessionStore((s) => s.compositionState);
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const resolvedInterpretationsBySession = useInterpretationEventsStore((s) => s.resolvedBySession);
+  const approvedInterpretations = useMemo(
+    () => selectApprovedInterpretations(activeSessionId === null ? [] : resolvedInterpretationsBySession[activeSessionId] ?? []),
+    [activeSessionId, resolvedInterpretationsBySession],
+  );
   const pendingProposalCount = useSessionStore(
     (s) =>
       s.compositionProposals.filter(
@@ -2214,7 +2222,12 @@ export function GraphView() {
             />
           )}
         </div>
-        {compositionState && <GraphFailurePolicies state={compositionState} />}
+        {compositionState && (
+          <>
+            <GraphAssumptionApprovals events={approvedInterpretations} />
+            <GraphFailurePolicies state={compositionState} />
+          </>
+        )}
         {selectedConfig && (
           <NodeConfigPanel
             config={selectedConfig}

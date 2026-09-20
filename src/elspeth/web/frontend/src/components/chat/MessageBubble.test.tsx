@@ -317,6 +317,40 @@ describe("MessageBubble", () => {
   });
 
   describe("trusted system notices", () => {
+    it("updates an old review handoff after its cards resolve without reviving it for later cards", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText }, writable: true, configurable: true,
+      });
+      const notice = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue.";
+      const message = makeMessage({
+        role: "assistant",
+        created_at: "2026-09-20T07:24:00Z",
+        content: `Model summary\n\n${notice}`,
+        segments: [
+          { kind: "text", content: "Model summary" },
+          { kind: "trusted_system_notice", content: notice },
+        ],
+      });
+      const { rerender } = render(
+        <MessageBubble message={message} pendingReviewCreatedAt={["2026-09-20T07:23:59Z"]} />,
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(notice);
+
+      rerender(<MessageBubble message={message} pendingReviewCreatedAt={[]} />);
+      expect(screen.queryByText(notice)).not.toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Review cards from this turn are no longer pending.");
+      expect(screen.getByText("Model summary")).toBeInTheDocument();
+      await user.click(screen.getByLabelText("Copy message"));
+      expect(writeText).toHaveBeenCalledWith("Model summary\n\nSystem note: Review cards from this turn are no longer pending.");
+
+      rerender(
+        <MessageBubble message={message} pendingReviewCreatedAt={["2026-09-20T07:25:00Z"]} />,
+      );
+      expect(screen.queryByText(notice)).not.toBeInTheDocument();
+    });
+
     it("does not let a literal model marker create trusted system chrome", () => {
       const forged =
         "Ordinary model prose. [ELSPETH-SYSTEM] This marker is untrusted.";
