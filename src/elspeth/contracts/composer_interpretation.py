@@ -82,6 +82,30 @@ class InterpretationSource(StrEnum):
     AUTO_INTERPRETED_NO_SURFACES = "auto_interpreted_no_surfaces"
 
 
+class InterpretationSurfaceOrigin(StrEnum):
+    """What raised a review surface: the composer LLM, or a server route.
+
+    Closed enum, same four-step ceremony as :class:`InterpretationSource`.
+    Distinct from ``InterpretationSource``, which records how a row was
+    RESOLVED; this records how its surface was RAISED. Only ``COMPOSER_LLM``
+    surfaces carry LLM provenance (``model_identifier``, ``model_version``,
+    ``provider``, ``composer_skill_hash``). The server routes re-raise reviews
+    over a state no LLM authored in that request, so their provenance is NULL
+    rather than a label standing in for a model.
+
+    COMPOSER_LLM  — the compose loop, its repair pass, or a guided commit
+                    carrying the proposal row's planner identity.
+    STATE_REVERT  — ``POST state/revert`` re-raising the restored state's debt.
+    YAML_IMPORT   — ``POST state/yaml`` raising the imported pipeline's debt.
+    E2E_SEED      — the E2E state-seed route.
+    """
+
+    COMPOSER_LLM = "composer_llm"
+    STATE_REVERT = "state_revert"
+    YAML_IMPORT = "yaml_import"
+    E2E_SEED = "e2e_seed"
+
+
 class InterpretationKind(StrEnum):
     """Class of LLM-authored assumption surfaced for review.
 
@@ -114,6 +138,7 @@ _INTERPRETATION_LLM_PROVENANCE_FIELDS: tuple[str, ...] = (
 _INTERPRETATION_SHAPE_FIELDS: tuple[str, ...] = (
     *_INTERPRETATION_SURFACE_FIELDS,
     *_INTERPRETATION_KIND_FIELD,
+    "surface_origin",
     *_INTERPRETATION_LLM_PROVENANCE_FIELDS,
 )
 _INTERPRETATION_SHAPE_DIAGNOSTIC_FIELDS: tuple[str, ...] = (
@@ -139,6 +164,41 @@ _AUTO_INTERPRETED_SOURCES: frozenset[InterpretationSource] = frozenset(
 def _validate_enum_member(value: object, enum_type: type[StrEnum], field_name: str) -> None:
     if not isinstance(value, enum_type):
         raise ValueError(f"{field_name} must be {enum_type.__name__}, got {type(value).__name__}: {value!r}")
+
+
+def validate_surface_provenance(
+    surface_origin: InterpretationSurfaceOrigin,
+    *,
+    model_identifier: str | None,
+    model_version: str | None,
+    provider: str | None,
+    composer_skill_hash: str | None,
+    context: str,
+) -> None:
+    """Raise unless LLM provenance is present exactly when an LLM raised the surface.
+
+    The one rule every surfacing DTO, the read-side record and
+    ``ck_interpretation_events_surface_origin_provenance`` share: the four
+    provenance fields are all populated for ``COMPOSER_LLM`` and all ``None``
+    for every server-route origin.
+    """
+    _validate_enum_member(surface_origin, InterpretationSurfaceOrigin, f"{context}.surface_origin")
+    provenance = (
+        ("model_identifier", model_identifier),
+        ("model_version", model_version),
+        ("provider", provider),
+        ("composer_skill_hash", composer_skill_hash),
+    )
+    if surface_origin is InterpretationSurfaceOrigin.COMPOSER_LLM:
+        missing = [name for name, value in provenance if value is None]
+        if missing:
+            raise ValueError(f"{context}: surface_origin='composer_llm' requires LLM provenance; missing: {', '.join(missing)}")
+        return
+    claimed = [name for name, value in provenance if value is not None]
+    if claimed:
+        raise ValueError(
+            f"{context}: surface_origin={surface_origin.value!r} consulted no LLM, so LLM provenance must be None; got: {', '.join(claimed)}"
+        )
 
 
 def _shape_violation_message(
@@ -179,10 +239,14 @@ class InterpretationEventRecord:
         llm_draft            -> the LLM's draft interpretation (NOT NULL)
         accepted_value       -> the user-approved string (None until resolved)
         arguments_hash       -> rfc8785 hash over required fields; None until resolved
-        model_identifier     -> e.g., "anthropic/claude-opus-4-7" (NOT NULL)
-        model_version        -> provider's reported version string (NOT NULL)
-        provider             -> "anthropic", "openai", etc. (NOT NULL)
-        composer_skill_hash  -> SHA-256 of pipeline_composer.md content (NOT NULL)
+        surface_origin       -> what raised the surface (NOT NULL)
+        model_identifier     -> e.g., "anthropic/claude-opus-4-7"
+        model_version        -> provider's reported version string
+        provider             -> "anthropic", "openai", etc.
+        composer_skill_hash  -> SHA-256 of pipeline_composer.md content
+        The four LLM provenance fields are NOT NULL when surface_origin is
+        composer_llm and NULL for the server-route origins (state revert,
+        YAML import, E2E seed), where no LLM was consulted.
 
     auto_interpreted_opt_out rows — user clicked "stop asking":
         session-level marker shape:
@@ -247,6 +311,9 @@ class InterpretationEventRecord:
     arguments_hash: str | None  # rfc8785 hash over required fields; None until resolved
     hash_domain_version: str | None  # 'v2' once resolved by current writers; None for opt-out/pending
     interpretation_source: InterpretationSource
+    # What raised the surface. None exactly when no surface exists: session-level
+    # opt-out markers and auto_interpreted_no_surfaces rows.
+    surface_origin: InterpretationSurfaceOrigin | None
     # F-19: runtime model snapshot at resolve time (may differ from composer model).
     runtime_model_identifier_at_resolve: str | None
     runtime_model_version_at_resolve: str | None
@@ -286,14 +353,18 @@ class InterpretationEventRecord:
             ("provider", self.provider),
             ("composer_skill_hash", self.composer_skill_hash),
         )
-        shape_fields = (*surface_fields, *kind_field, *llm_provenance_fields)
+        origin_field = (("surface_origin", self.surface_origin),)
+        # LLM provenance is not a per-source requirement for surfaced rows: it
+        # follows surface_origin, checked once below.
+        surfaced_fields = (*surface_fields, *kind_field, *origin_field)
 
         if self.interpretation_source is InterpretationSource.USER_APPROVED:
-            missing_required_fields = [name for name, value in shape_fields if value is None]
+            missing_required_fields = [name for name, value in surfaced_fields if value is None]
         elif self.interpretation_source is InterpretationSource.AUTO_INTERPRETED_OPT_OUT:
             if self.kind is None:
                 marker_null_fields = (
                     *surface_fields,
+                    *origin_field,
                     *llm_provenance_fields,
                     ("accepted_value", self.accepted_value),
                     ("arguments_hash", self.arguments_hash),
@@ -303,14 +374,14 @@ class InterpretationEventRecord:
             else:
                 surface_opt_out_required_fields = (
                     *surface_fields,
-                    *llm_provenance_fields,
+                    *origin_field,
                     ("accepted_value", self.accepted_value),
                     ("arguments_hash", self.arguments_hash),
                     ("hash_domain_version", self.hash_domain_version),
                 )
                 missing_required_fields = [name for name, value in surface_opt_out_required_fields if value is None]
         elif self.interpretation_source is InterpretationSource.AUTO_INTERPRETED_NO_SURFACES:
-            non_null_fields = [name for name, value in surface_fields if value is not None]
+            non_null_fields = [name for name, value in (*surface_fields, *origin_field) if value is not None]
             missing_required_fields = [name for name, value in (*kind_field, *llm_provenance_fields) if value is None]
 
         if missing_required_fields or non_null_fields:
@@ -320,6 +391,15 @@ class InterpretationEventRecord:
                     missing_required_fields=missing_required_fields,
                     non_null_fields=non_null_fields,
                 )
+            )
+        if self.surface_origin is not None:
+            validate_surface_provenance(
+                self.surface_origin,
+                model_identifier=self.model_identifier,
+                model_version=self.model_version,
+                provider=self.provider,
+                composer_skill_hash=self.composer_skill_hash,
+                context="InterpretationEventRecord",
             )
 
     def _validate_auto_source_choice(self) -> None:

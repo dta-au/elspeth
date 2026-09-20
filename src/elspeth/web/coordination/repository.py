@@ -54,6 +54,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
@@ -1003,6 +1004,7 @@ class _RepositoryInterpretationMutations:
             arguments_hash=row.arguments_hash,
             hash_domain_version=row.hash_domain_version,
             interpretation_source=InterpretationSource(row.interpretation_source),
+            surface_origin=InterpretationSurfaceOrigin(row.surface_origin) if row.surface_origin is not None else None,
             runtime_model_identifier_at_resolve=row.runtime_model_identifier_at_resolve,
             runtime_model_version_at_resolve=row.runtime_model_version_at_resolve,
             approved_prompt_artifact_hash=row.approved_prompt_artifact_hash,
@@ -1234,6 +1236,7 @@ class _RepositoryInterpretationMutations:
                     runtime_model_identifier_at_resolve=None,
                     runtime_model_version_at_resolve=None,
                     approved_prompt_artifact_hash=None,
+                    surface_origin=None,
                 )
             )
         connection.execute(
@@ -1261,6 +1264,7 @@ class _RepositoryInterpretationMutations:
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
                 approved_prompt_artifact_hash=decision.approved_prompt_artifact_hash,
+                surface_origin=command.surface_origin.value,
             )
         )
         if appended_state is not None:
@@ -1387,6 +1391,7 @@ class _RepositoryInterpretationMutations:
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
                 approved_prompt_artifact_hash=None,
+                surface_origin=None,
             )
         )
         result = connection.execute(
@@ -1445,6 +1450,7 @@ class _RepositoryInterpretationMutations:
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
                 approved_prompt_artifact_hash=None,
+                surface_origin=None,
             )
         )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(event_id))).one()

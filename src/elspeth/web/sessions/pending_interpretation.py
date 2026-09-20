@@ -91,10 +91,11 @@ class _InterpretationHashDomainV2Payload(TypedDict):
     llm_draft: str
     accepted_value: str
     actor: str
-    model_identifier: str
-    model_version: str
-    provider: str
-    composer_skill_hash: str
+    # None for a surface no LLM raised (state revert, YAML import, E2E seed).
+    model_identifier: str | None
+    model_version: str | None
+    provider: str | None
+    composer_skill_hash: str | None
 
 
 def _interpretation_hash_domain_v2(
@@ -108,10 +109,10 @@ def _interpretation_hash_domain_v2(
     llm_draft: str,
     accepted_value: str,
     actor: str,
-    model_identifier: str,
-    model_version: str,
-    provider: str,
-    composer_skill_hash: str,
+    model_identifier: str | None,
+    model_version: str | None,
+    provider: str | None,
+    composer_skill_hash: str | None,
     context: str,
 ) -> _InterpretationHashDomainV2Payload:
     domain_dict: _InterpretationHashDomainV2Payload = {

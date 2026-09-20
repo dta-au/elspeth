@@ -44,6 +44,8 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
+    validate_surface_provenance,
 )
 from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCall
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
@@ -1495,10 +1497,11 @@ class SessionPendingInterpretationCommand:
     user_term: str
     kind: InterpretationKind
     llm_draft: str
-    model_identifier: str
-    model_version: str
-    provider: str
-    composer_skill_hash: str
+    surface_origin: InterpretationSurfaceOrigin
+    model_identifier: str | None
+    model_version: str | None
+    provider: str | None
+    composer_skill_hash: str | None
     created_at: datetime
 
     def __post_init__(self) -> None:
@@ -1518,18 +1521,40 @@ class SessionPendingInterpretationCommand:
             raise AuditIntegrityError("SessionPendingInterpretationCommand.kind must be exact")
         if type(self.created_at) is not datetime or self.created_at.utcoffset() is None:
             raise AuditIntegrityError("SessionPendingInterpretationCommand.created_at must be timezone-aware")
+        if type(self.surface_origin) is not InterpretationSurfaceOrigin:
+            raise AuditIntegrityError("SessionPendingInterpretationCommand.surface_origin must be exact")
+        # LLM provenance is present exactly when an LLM raised the surface; a
+        # server-route origin carries None, never a label.
+        try:
+            validate_surface_provenance(
+                self.surface_origin,
+                model_identifier=self.model_identifier,
+                model_version=self.model_version,
+                provider=self.provider,
+                composer_skill_hash=self.composer_skill_hash,
+                context="SessionPendingInterpretationCommand",
+            )
+        except ValueError as exc:
+            raise AuditIntegrityError(str(exc)) from exc
+        nonblank_provenance_fields = tuple(
+            (field_name, text)
+            for field_name, text in (
+                ("model_identifier", self.model_identifier),
+                ("model_version", self.model_version),
+                ("provider", self.provider),
+            )
+            if text is not None
+        )
         nonblank_text_fields = (
             ("affected_node_id", self.affected_node_id),
             ("tool_call_id", self.tool_call_id),
             ("user_term", self.user_term),
-            ("model_identifier", self.model_identifier),
-            ("model_version", self.model_version),
-            ("provider", self.provider),
+            *nonblank_provenance_fields,
         )
         text_fields = (
             *nonblank_text_fields,
             ("llm_draft", self.llm_draft),
-            ("composer_skill_hash", self.composer_skill_hash),
+            *((("composer_skill_hash", self.composer_skill_hash),) if self.composer_skill_hash is not None else ()),
         )
         for field_name, text in text_fields:
             if type(text) is not str:
@@ -2214,23 +2239,43 @@ class PreparedInterpretationEventDraft:
     user_term: str
     kind: InterpretationKind
     llm_draft: str
-    model_identifier: str
-    model_version: str
-    provider: str
-    composer_skill_hash: str
+    surface_origin: InterpretationSurfaceOrigin
+    model_identifier: str | None
+    model_version: str | None
+    provider: str | None
+    composer_skill_hash: str | None
 
     def __post_init__(self) -> None:
         if type(self.event_id) is not UUID:
             raise AuditIntegrityError("PreparedInterpretationEventDraft.event_id must be a UUID")
+        if type(self.surface_origin) is not InterpretationSurfaceOrigin:
+            raise AuditIntegrityError("PreparedInterpretationEventDraft.surface_origin must be exact")
+        try:
+            validate_surface_provenance(
+                self.surface_origin,
+                model_identifier=self.model_identifier,
+                model_version=self.model_version,
+                provider=self.provider,
+                composer_skill_hash=self.composer_skill_hash,
+                context="PreparedInterpretationEventDraft",
+            )
+        except ValueError as exc:
+            raise AuditIntegrityError(str(exc)) from exc
         for field_name, value in (
             ("affected_node_id", self.affected_node_id),
             ("tool_call_id", self.tool_call_id),
             ("user_term", self.user_term),
             ("llm_draft", self.llm_draft),
-            ("model_identifier", self.model_identifier),
-            ("model_version", self.model_version),
-            ("provider", self.provider),
-            ("composer_skill_hash", self.composer_skill_hash),
+            *(
+                (field_name, value)
+                for field_name, value in (
+                    ("model_identifier", self.model_identifier),
+                    ("model_version", self.model_version),
+                    ("provider", self.provider),
+                    ("composer_skill_hash", self.composer_skill_hash),
+                )
+                if value is not None
+            ),
         ):
             if type(value) is not str or not value:
                 raise AuditIntegrityError(f"PreparedInterpretationEventDraft.{field_name} must be a non-empty exact string")
@@ -4327,14 +4372,20 @@ class SessionServiceProtocol(Protocol):
         user_term: str,
         kind: InterpretationKind,
         llm_draft: str,
-        model_identifier: str,
-        model_version: str,
-        provider: str,
-        composer_skill_hash: str,
+        model_identifier: str | None,
+        model_version: str | None,
+        provider: str | None,
+        composer_skill_hash: str | None,
         session_operation_context: SessionOperationContext,
         created_at: datetime | None = None,
+        surface_origin: InterpretationSurfaceOrigin = InterpretationSurfaceOrigin.COMPOSER_LLM,
     ) -> InterpretationEventRecord:
         """Insert a PENDING interpretation event.
+
+        ``surface_origin`` defaults to the composer LLM because that default
+        cannot mis-state provenance: the writer rejects ``composer_llm``
+        without all four LLM provenance fields, and rejects every server-route
+        origin that carries any of them.
 
         ``kind`` must be supplied explicitly by the caller. Implementations
         MUST validate the affected component in the parent composition state

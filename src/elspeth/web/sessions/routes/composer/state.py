@@ -9,6 +9,7 @@ from typing import NotRequired, TypedDict
 from pydantic import BaseModel, ConfigDict, Field
 
 from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -98,9 +99,6 @@ from .._helpers import (
 
 router = APIRouter()
 
-_STATE_REVERT_SURFACE_PROVENANCE = "state_revert"
-_E2E_SEED_SURFACE_PROVENANCE = "e2e_seed"
-
 
 class LibraryForkFacts(TypedDict):
     entry_id: str
@@ -147,10 +145,13 @@ async def _surface_reverted_interpretation_reviews(
             sessions_service=service,
             session_id=str(session_id),
             current_state_id=str(state_record.id),
-            model_identifier=_STATE_REVERT_SURFACE_PROVENANCE,
-            model_version=_STATE_REVERT_SURFACE_PROVENANCE,
-            provider=_STATE_REVERT_SURFACE_PROVENANCE,
-            composer_skill_hash=_STATE_REVERT_SURFACE_PROVENANCE,
+            # The revert consults no LLM: the origin names the route and the
+            # LLM provenance stays empty rather than carrying a label.
+            surface_origin=InterpretationSurfaceOrigin.STATE_REVERT,
+            model_identifier=None,
+            model_version=None,
+            provider=None,
+            composer_skill_hash=None,
             only_missing_evidence=True,
             session_operation_context=repair_lease.context,
         )
@@ -951,10 +952,11 @@ async def seed_state_from_runtime_yaml(
             )
             interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
                 imported_state,
-                model_identifier=_YAML_IMPORT_SURFACE_PROVENANCE,
-                model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
-                provider=_YAML_IMPORT_SURFACE_PROVENANCE,
-                composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
+                surface_origin=InterpretationSurfaceOrigin.YAML_IMPORT,
+                model_identifier=None,
+                model_version=None,
+                provider=None,
+                composer_skill_hash=None,
             )
             ingress = compartment_ingress_record(body.yaml, own_compartment_id=request.app.state.settings.compartment_id)
             seed_meta_updates = {"ingress": ingress} if composer_meta_updates is None else {**composer_meta_updates, "ingress": ingress}
@@ -973,9 +975,6 @@ async def seed_state_from_runtime_yaml(
                 return _state_response(response_state, policy_catalog=catalog)
     finally:
         await lease.close()
-
-
-_YAML_IMPORT_SURFACE_PROVENANCE = "yaml_import"
 
 
 def _reject_malformed_interpretation_requirements(state: CompositionState) -> None:
@@ -1132,10 +1131,11 @@ async def seed_state_for_e2e(
             )
             interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
                 seeded_state,
-                model_identifier=_E2E_SEED_SURFACE_PROVENANCE,
-                model_version=_E2E_SEED_SURFACE_PROVENANCE,
-                provider=_E2E_SEED_SURFACE_PROVENANCE,
-                composer_skill_hash=_E2E_SEED_SURFACE_PROVENANCE,
+                surface_origin=InterpretationSurfaceOrigin.E2E_SEED,
+                model_identifier=None,
+                model_version=None,
+                provider=None,
+                composer_skill_hash=None,
             )
             state_record = await service.save_composition_state_with_interpretations(
                 session.id,

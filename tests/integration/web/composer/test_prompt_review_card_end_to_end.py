@@ -44,6 +44,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationEventRecord,
     InterpretationKind,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
@@ -216,6 +217,7 @@ async def _run_surfacer(
             sessions_service=sessions_service,
             session_id=str(session_id),
             current_state_id=str(record.id),
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
             model_identifier="anthropic/claude-opus-4-7",
             model_version="2026-05-01",
             provider="anthropic",

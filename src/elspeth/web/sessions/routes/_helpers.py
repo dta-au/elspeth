@@ -1074,6 +1074,7 @@ def _interpretation_event_response(event: InterpretationEventRecord) -> Interpre
         model_version=event.model_version,
         provider=event.provider,
         composer_skill_hash=event.composer_skill_hash,
+        surface_origin=event.surface_origin,
         arguments_hash=event.arguments_hash,
         hash_domain_version=event.hash_domain_version,
         runtime_model_identifier_at_resolve=event.runtime_model_identifier_at_resolve,

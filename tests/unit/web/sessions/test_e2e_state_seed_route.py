@@ -8,7 +8,7 @@ import structlog
 from fastapi import FastAPI
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSurfaceOrigin
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.progress import ComposerProgressRegistry
@@ -249,6 +249,8 @@ async def test_e2e_state_seed_route_surfaces_pending_review_cards(tmp_path: Path
         InterpretationKind.LLM_MODEL_CHOICE,
     ]
     assert {str(event.composition_state_id) for event in events} == {response.json()["id"]}
+    assert {event.surface_origin for event in events} == {InterpretationSurfaceOrigin.E2E_SEED}
+    assert {event.composer_skill_hash for event in events} == {None}
 
 
 @pytest.mark.asyncio

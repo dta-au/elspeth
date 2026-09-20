@@ -22,6 +22,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 
 
@@ -48,6 +49,7 @@ def _resolved_record_kwargs() -> dict[str, object]:
         "arguments_hash": "b" * 64,
         "hash_domain_version": "v2",
         "interpretation_source": InterpretationSource.USER_APPROVED,
+        "surface_origin": InterpretationSurfaceOrigin.COMPOSER_LLM,
         "runtime_model_identifier_at_resolve": "anthropic/claude-opus-4-7",
         "runtime_model_version_at_resolve": "2026-01-15",
         "approved_prompt_artifact_hash": "c" * 64,
@@ -77,6 +79,7 @@ def _opted_out_record_kwargs() -> dict[str, object]:
         "arguments_hash": None,
         "hash_domain_version": None,
         "interpretation_source": InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
+        "surface_origin": None,
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
         "approved_prompt_artifact_hash": None,
@@ -106,6 +109,7 @@ def _no_surfaces_record_kwargs() -> dict[str, object]:
         "arguments_hash": None,
         "hash_domain_version": None,
         "interpretation_source": InterpretationSource.AUTO_INTERPRETED_NO_SURFACES,
+        "surface_origin": None,
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
         "approved_prompt_artifact_hash": None,
@@ -122,6 +126,7 @@ def _surface_opt_out_record_kwargs() -> dict[str, object]:
         "choice": InterpretationChoice.OPTED_OUT,
         "actor": "composer-llm",
         "interpretation_source": InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
+        "surface_origin": InterpretationSurfaceOrigin.COMPOSER_LLM,
         "arguments_hash": "d" * 64,
         "hash_domain_version": "v2",
         "runtime_model_identifier_at_resolve": None,
@@ -343,12 +348,38 @@ def test_auto_interpreted_rows_require_opted_out_choice(
         InterpretationEventRecord(**kwargs)  # type: ignore[arg-type]
 
 
-def test_user_approved_record_requires_surface_and_provenance_fields() -> None:
+def test_user_approved_record_requires_surface_fields_and_origin() -> None:
     """USER_APPROVED mirrors ck_interpretation_events_user_approved_required."""
     kwargs = _resolved_record_kwargs()
     kwargs["user_term"] = None
+    kwargs["surface_origin"] = None
+    with pytest.raises(ValueError, match=r"user_approved.*user_term.*surface_origin"):
+        InterpretationEventRecord(**kwargs)  # type: ignore[arg-type]
+
+
+def test_composer_llm_record_requires_llm_provenance() -> None:
+    """Mirrors ck_interpretation_events_surface_origin_provenance."""
+    kwargs = _resolved_record_kwargs()
     kwargs["model_identifier"] = None
-    with pytest.raises(ValueError, match=r"user_approved.*user_term.*model_identifier"):
+    with pytest.raises(ValueError, match=r"composer_llm.*requires LLM provenance.*model_identifier"):
+        InterpretationEventRecord(**kwargs)  # type: ignore[arg-type]
+
+
+_SERVER_ROUTE_ORIGINS = tuple(origin for origin in InterpretationSurfaceOrigin if origin is not InterpretationSurfaceOrigin.COMPOSER_LLM)
+_LLM_PROVENANCE_FIELDS = ("model_identifier", "model_version", "provider", "composer_skill_hash")
+
+
+@pytest.mark.parametrize("origin", _SERVER_ROUTE_ORIGINS)
+def test_server_route_record_carries_no_llm_provenance(origin: InterpretationSurfaceOrigin) -> None:
+    kwargs = _resolved_record_kwargs() | dict.fromkeys(_LLM_PROVENANCE_FIELDS) | {"surface_origin": origin}
+    record = InterpretationEventRecord(**kwargs)  # type: ignore[arg-type]
+    assert record.surface_origin is origin
+
+
+@pytest.mark.parametrize("origin", _SERVER_ROUTE_ORIGINS)
+def test_server_route_record_rejects_llm_provenance(origin: InterpretationSurfaceOrigin) -> None:
+    kwargs = _resolved_record_kwargs() | {"surface_origin": origin}
+    with pytest.raises(ValueError, match=r"consulted no LLM.*model_identifier.*composer_skill_hash"):
         InterpretationEventRecord(**kwargs)  # type: ignore[arg-type]
 
 

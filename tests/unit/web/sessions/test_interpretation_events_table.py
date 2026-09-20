@@ -14,6 +14,7 @@ Step "Test shape"). Test numbering mirrors the spec for traceability.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -21,6 +22,7 @@ import pytest
 from sqlalchemy import insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
+from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
@@ -86,7 +88,11 @@ def _user_approved_row(
     approved_prompt_artifact_hash: str | None = None,
     runtime_model_identifier_at_resolve: str | None = None,
     runtime_model_version_at_resolve: str | None = None,
+    surface_origin: str | None = "composer_llm",
 ) -> dict:
+    # LLM provenance follows the origin, as the writers produce it: present for
+    # a composer_llm surface, absent for a server-route surface.
+    llm_raised = surface_origin in (None, "composer_llm")
     return {
         "id": row_id,
         "session_id": session_id,
@@ -101,13 +107,14 @@ def _user_approved_row(
         "created_at": datetime.now(UTC),
         "resolved_at": resolved_at,
         "actor": "alice",
-        "model_identifier": "anthropic/claude-opus-4-7",
-        "model_version": "2026-05-01",
-        "provider": "anthropic",
-        "composer_skill_hash": "0" * 64,
+        "model_identifier": "anthropic/claude-opus-4-7" if llm_raised else None,
+        "model_version": "2026-05-01" if llm_raised else None,
+        "provider": "anthropic" if llm_raised else None,
+        "composer_skill_hash": "0" * 64 if llm_raised else None,
         "arguments_hash": arguments_hash,
         "hash_domain_version": hash_domain_version,
         "interpretation_source": "user_approved",
+        "surface_origin": surface_origin,
         "runtime_model_identifier_at_resolve": runtime_model_identifier_at_resolve,
         "runtime_model_version_at_resolve": runtime_model_version_at_resolve,
         "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
@@ -452,6 +459,7 @@ class TestSchema:
             "runtime_model_identifier_at_resolve",
             "runtime_model_version_at_resolve",
             "approved_prompt_artifact_hash",
+            "surface_origin",
         }
 
     def test_skill_markdown_history_columns(self, engine) -> None:
@@ -770,6 +778,78 @@ class TestSourceNullability:
             )
             with pytest.raises(IntegrityError):
                 conn.execute(insert(interpretation_events_table).values(row))
+
+
+class TestSurfaceOrigin:
+    """LLM provenance is present exactly when an LLM raised the surface."""
+
+    @staticmethod
+    def _seeded(conn) -> tuple[str, str]:
+        session_id = str(uuid.uuid4())
+        state_id = str(uuid.uuid4())
+        _insert_session(conn, session_id)
+        _seed_composition_state(conn, state_id=state_id, session_id=session_id)
+        return session_id, state_id
+
+    @pytest.mark.parametrize("origin", ["state_revert", "yaml_import", "e2e_seed"])
+    def test_server_route_surface_carries_no_llm_provenance(self, engine, origin: str) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id, surface_origin=origin)
+            assert row["composer_skill_hash"] is None
+            conn.execute(insert(interpretation_events_table).values(row))
+
+    @pytest.mark.parametrize("origin", ["state_revert", "yaml_import", "e2e_seed"])
+    def test_server_route_surface_claiming_llm_provenance_raises(self, engine, origin: str) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id) | {"surface_origin": origin}
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_surface_origin_provenance"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_composer_llm_surface_without_provenance_raises(self, engine) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id, surface_origin="yaml_import") | {
+                "surface_origin": "composer_llm"
+            }
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_surface_origin_provenance"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    @pytest.mark.parametrize("dropped", ["model_identifier", "model_version", "provider", "composer_skill_hash"])
+    def test_partial_llm_provenance_raises(self, engine, dropped: str) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id) | {dropped: None}
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_user_approved_without_surface_origin_raises(self, engine) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id, surface_origin=None)
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_user_approved_required"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_unknown_surface_origin_raises(self, engine) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id) | {"surface_origin": "server"}
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_surface_origin"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_no_surfaces_row_with_a_surface_origin_raises(self, engine) -> None:
+        with engine.begin() as conn:
+            session_id = str(uuid.uuid4())
+            _insert_session(conn, session_id)
+            row = _no_surfaces_row(row_id=str(uuid.uuid4()), session_id=session_id) | {"surface_origin": "composer_llm"}
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_no_surfaces_shape"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_check_value_set_matches_the_contract_enum(self) -> None:
+        check = next(c for c in interpretation_events_table.constraints if c.name == "ck_interpretation_events_surface_origin")
+        listed = set(re.findall(r"'([a-z0-9_]+)'", str(check.sqltext)))
+        assert listed == {origin.value for origin in InterpretationSurfaceOrigin}
 
 
 # Tests 5 / 5a / 6 — partial unique index on pending tool calls ----------------

@@ -20,6 +20,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
@@ -1070,12 +1071,14 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
                     id, session_id, composition_state_id, affected_node_id,
                     tool_call_id, user_term, kind, llm_draft, choice,
                     created_at, actor, model_identifier, model_version,
-                    provider, composer_skill_hash, interpretation_source
+                    provider, composer_skill_hash, interpretation_source,
+                    surface_origin
                 ) VALUES (
                     :event_id, :session_id, :state_id, 'llm-node',
                     'pending-tool-call', 'term', 'vague_term', 'draft',
                     'pending', CURRENT_TIMESTAMP, 'trigger-user', 'model-id',
-                    'model-version', 'provider', :skill_hash, 'user_approved'
+                    'model-version', 'provider', :skill_hash, 'user_approved',
+                    'composer_llm'
                 )
                 """
             ),
@@ -1542,7 +1545,7 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             "sink_node_id": "postgres-artifact-sink",
             "artifact_type": "csv",
             "path": "/output/postgres.csv",
-            "content_hash": "sha256:postgres",
+            "content_hash": fake_sha256("postgres"),
             "size_bytes": 128,
             "idempotency_key": "postgres-artifact-row:csv_sink",
         }
@@ -1557,7 +1560,7 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             pytest.raises(AuditIntegrityError, match="content_hash"),
             fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn,
         ):
-            factory.execution.artifacts.register_artifact(**(values | {"content_hash": "sha256:divergent"}), conn=conn)
+            factory.execution.artifacts.register_artifact(**(values | {"content_hash": fake_sha256("divergent")}), conn=conn)
 
         with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
             null_first = factory.execution.artifacts.register_artifact(**(values | {"idempotency_key": None}), conn=conn)
@@ -1659,9 +1662,9 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
         event.listen(db.engine, "begin", _synchronize_contender_transactions)
 
         def _contend(ordinal: int) -> Artifact | AuditIntegrityError:
-            content_hash = "sha256:postgres-contention"
+            content_hash = fake_sha256("postgres-contention")
             if divergent and ordinal == 1:
-                content_hash = "sha256:postgres-divergent"
+                content_hash = fake_sha256("postgres-divergent")
             contender = RecorderFactory(db)
             try:
                 with fenced_member_transaction(db.engine, member_token=members[ordinal], verb="test_artifact") as conn:

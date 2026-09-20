@@ -51,7 +51,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence, BlobNotFoundError, BlobRecord, BlobServiceProtocol
 from elspeth.contracts.chargeable_admission import ChargeableOperation
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
-from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource
+from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource, InterpretationSurfaceOrigin
 from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
@@ -1878,10 +1878,11 @@ async def _auto_surface_prompt_template_reviews_for_state(
     sessions_service: SessionServiceProtocol,
     session_id: str,
     current_state_id: str,
-    model_identifier: str,
-    model_version: str,
-    provider: str,
-    composer_skill_hash: str,
+    surface_origin: InterpretationSurfaceOrigin,
+    model_identifier: str | None,
+    model_version: str | None,
+    provider: str | None,
+    composer_skill_hash: str | None,
     session_operation_context: SessionOperationContext,
     already_surfaced: frozenset[tuple[str, str, InterpretationKind]] = frozenset(),
     repair_mode: bool = False,
@@ -1920,6 +1921,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
                 kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
                 llm_draft=review_draft,
                 session_operation_context=session_operation_context,
+                surface_origin=surface_origin,
                 model_identifier=model_identifier,  # (D2)
                 model_version=model_version,  # (D2)
                 provider=provider,  # (D2)
@@ -2087,10 +2089,11 @@ def unsurfaceable_pending_interpretation_review_sites(
 def prepare_pending_interpretation_event_drafts_for_state(
     state: CompositionState,
     *,
-    model_identifier: str,
-    model_version: str,
-    provider: str,
-    composer_skill_hash: str,
+    surface_origin: InterpretationSurfaceOrigin,
+    model_identifier: str | None,
+    model_version: str | None,
+    provider: str | None,
+    composer_skill_hash: str | None,
 ) -> tuple[PreparedInterpretationEventDraft, ...]:
     """Prepare the generic surfacer's event cohort for atomic settlement.
 
@@ -2121,6 +2124,7 @@ def prepare_pending_interpretation_event_drafts_for_state(
                 user_term=user_term,
                 kind=site.kind,
                 llm_draft=llm_draft,
+                surface_origin=surface_origin,
                 model_identifier=model_identifier,
                 model_version=model_version,
                 provider=provider,
@@ -2136,10 +2140,11 @@ async def surface_pending_interpretation_reviews_for_state(
     sessions_service: SessionServiceProtocol,
     session_id: str | None,
     current_state_id: str | None,
-    model_identifier: str,
-    model_version: str,
-    provider: str,
-    composer_skill_hash: str,
+    surface_origin: InterpretationSurfaceOrigin,
+    model_identifier: str | None,
+    model_version: str | None,
+    provider: str | None,
+    composer_skill_hash: str | None,
     session_operation_context: SessionOperationContext,
     only_missing_evidence: bool = False,
 ) -> None:
@@ -2195,6 +2200,7 @@ async def surface_pending_interpretation_reviews_for_state(
                 sessions_service=sessions_service,
                 session_id=session_id,
                 current_state_id=current_state_id,
+                surface_origin=surface_origin,
                 model_identifier=model_identifier,
                 model_version=model_version,
                 provider=provider,
@@ -2211,6 +2217,7 @@ async def surface_pending_interpretation_reviews_for_state(
         sessions_service=sessions_service,
         session_id=session_id,
         current_state_id=current_state_id,
+        surface_origin=surface_origin,
         model_identifier=model_identifier,
         model_version=model_version,
         provider=provider,
@@ -2242,10 +2249,11 @@ async def _surface_pending_interpretation_reviews_under_writer(
     sessions_service: SessionServiceProtocol,
     session_id: str,
     current_state_id: str,
-    model_identifier: str,
-    model_version: str,
-    provider: str,
-    composer_skill_hash: str,
+    surface_origin: InterpretationSurfaceOrigin,
+    model_identifier: str | None,
+    model_version: str | None,
+    provider: str | None,
+    composer_skill_hash: str | None,
     already_surfaced: frozenset[tuple[str, str, InterpretationKind]],
     only_missing_evidence: bool,
     session_operation_context: SessionOperationContext,
@@ -2258,6 +2266,7 @@ async def _surface_pending_interpretation_reviews_under_writer(
         sessions_service=sessions_service,
         session_id=session_id,
         current_state_id=current_state_id,
+        surface_origin=surface_origin,
         model_identifier=model_identifier,
         model_version=model_version,
         provider=provider,
@@ -2299,6 +2308,7 @@ async def _surface_pending_interpretation_reviews_under_writer(
                 kind=site.kind,
                 llm_draft=llm_draft,
                 session_operation_context=session_operation_context,
+                surface_origin=surface_origin,
                 model_identifier=model_identifier,
                 model_version=model_version,
                 provider=provider,
@@ -2929,6 +2939,7 @@ class ComposerServiceImpl:
             sessions_service=self._require_sessions_service(),
             session_id=session_id,
             current_state_id=current_state_id,
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
             model_identifier=self._model,  # (D2)
             model_version=self._model,  # (D2)
             provider=self._availability.provider or "unknown",  # (D2)
@@ -3026,6 +3037,7 @@ class ComposerServiceImpl:
             sessions_service=self._require_sessions_service(),
             session_id=session_id,
             current_state_id=current_state_id,
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
             model_identifier=self._model,
             model_version=self._model,
             provider=self._availability.provider or "unknown",

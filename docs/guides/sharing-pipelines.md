@@ -115,6 +115,10 @@ four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
 SHA-256 shape rather than the length alone, and gives every remaining session
 digest column its own shape CHECK. Landscape epoch 43 does the same for every
 Landscape digest column.
+It also adds `interpretation_events.surface_origin`: review cards raised by
+the state-revert, YAML-import and E2E-seed routes now record that origin with
+empty LLM provenance, where they previously wrote the route name into the
+model, provider and `composer_skill_hash` columns.
 A Landscape store below epoch 43 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each

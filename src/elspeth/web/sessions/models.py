@@ -349,6 +349,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #     remaining digest column its rule: the nullable composer provenance
 #     hashes, skill_markdown_history.hash, the bare library payload digest
 #     and the ``sha256:``-prefixed review and completion-event digests.
+#     That rule exposed three server routes writing their own name into
+#     interpretation_events' LLM provenance columns; the same cut adds
+#     interpretation_events.surface_origin and ties provenance to it.
 #     Pairs with Landscape epoch 43. Pre-1.0 delete/recreate.
 SESSION_SCHEMA_EPOCH = 63
 
@@ -1486,6 +1489,14 @@ interpretation_events_table = Table(
     # Landscape audit DB; equality across both DBs is the audit-tooling
     # cross-anchor invariant.
     Column("approved_prompt_artifact_hash", String(64), nullable=True),
+    # What raised the surface: the composer LLM, or a server route that
+    # consulted no LLM (state revert, YAML import, E2E seed). NULL exactly when
+    # the row has no surface: session-level opt-out markers and
+    # auto_interpreted_no_surfaces rows. The four LLM provenance columns follow
+    # it (ck_interpretation_events_surface_origin_provenance): before this
+    # column the server routes wrote their own name into all four, so
+    # composer_skill_hash held a label instead of a skill_markdown_history key.
+    Column("surface_origin", String, nullable=True),
     ForeignKeyConstraint(
         ["composition_state_id", "session_id"],
         ["composition_states.id", "composition_states.session_id"],
@@ -1524,44 +1535,68 @@ interpretation_events_table = Table(
         "(interpretation_source NOT IN ('auto_interpreted_opt_out', 'auto_interpreted_no_surfaces')) OR choice = 'opted_out'",
         name="ck_interpretation_events_auto_source_choice",
     ),
+    # Closed enum on surface_origin, mirroring InterpretationSurfaceOrigin.
+    # Same four-step ceremony as choice. NO SILENT EXTENSION.
+    CheckConstraint(
+        "surface_origin IS NULL OR surface_origin IN ('composer_llm', 'state_revert', 'yaml_import', 'e2e_seed')",
+        name="ck_interpretation_events_surface_origin",
+    ),
+    # The four LLM provenance columns describe one LLM call: all or none.
+    CheckConstraint(
+        "(model_identifier IS NULL) = (model_version IS NULL) AND "
+        "(model_version IS NULL) = (provider IS NULL) AND "
+        "(provider IS NULL) = (composer_skill_hash IS NULL)",
+        name="ck_interpretation_events_llm_provenance_all_or_none",
+    ),
+    # A surfaced row carries LLM provenance exactly when an LLM raised it.
+    # Rows with no surface are governed by their source-keyed shape below.
+    # Spelt as two arms rather than ``(origin = 'composer_llm') = (hash IS NOT
+    # NULL)``: PostgreSQL reflects a string comparison used as a boolean
+    # operand with ``::text`` casts the startup shape comparator cannot
+    # normalise, and every fresh PostgreSQL store then reads as stale.
+    CheckConstraint(
+        "surface_origin IS NULL OR "
+        "(surface_origin = 'composer_llm' AND composer_skill_hash IS NOT NULL) OR "
+        "(surface_origin != 'composer_llm' AND composer_skill_hash IS NULL)",
+        name="ck_interpretation_events_surface_origin_provenance",
+    ),
     # F-1/F-12 (source-keyed opt-out shapes): session-level opt-out marker
-    # rows have no LLM context and no hash; surface-specific opt-out rows
-    # are born resolved with kind, surface/provenance fields, accepted_value,
-    # and a V2 arguments_hash.
+    # rows have no surface, no LLM context and no hash; surface-specific
+    # opt-out rows are born resolved with kind, surface fields, a surface
+    # origin, accepted_value, and a V2 arguments_hash.
     CheckConstraint(
         "(interpretation_source != 'auto_interpreted_opt_out') OR "
         "((kind IS NULL AND composition_state_id IS NULL AND affected_node_id IS NULL AND "
         "  tool_call_id IS NULL AND user_term IS NULL AND llm_draft IS NULL AND "
-        "  accepted_value IS NULL AND model_identifier IS NULL AND model_version IS NULL AND "
+        "  accepted_value IS NULL AND surface_origin IS NULL AND model_identifier IS NULL AND model_version IS NULL AND "
         "  provider IS NULL AND composer_skill_hash IS NULL AND arguments_hash IS NULL AND "
         "  hash_domain_version IS NULL) OR "
         " (kind IS NOT NULL AND composition_state_id IS NOT NULL AND affected_node_id IS NOT NULL AND "
         "  tool_call_id IS NOT NULL AND user_term IS NOT NULL AND llm_draft IS NOT NULL AND "
-        "  accepted_value IS NOT NULL AND model_identifier IS NOT NULL AND model_version IS NOT NULL AND "
-        "  provider IS NOT NULL AND composer_skill_hash IS NOT NULL AND arguments_hash IS NOT NULL AND "
+        "  accepted_value IS NOT NULL AND surface_origin IS NOT NULL AND arguments_hash IS NOT NULL AND "
         "  hash_domain_version = 'v2'))",
         name="ck_interpretation_events_opt_out_shape",
     ),
-    # user_approved rows must have kind and all surface/provenance fields
-    # populated.
+    # user_approved rows must have kind, all surface fields and a surface
+    # origin populated; LLM provenance follows the origin (above).
     CheckConstraint(
         "(interpretation_source != 'user_approved') OR "
         "(composition_state_id IS NOT NULL AND affected_node_id IS NOT NULL AND "
         " tool_call_id IS NOT NULL AND user_term IS NOT NULL AND kind IS NOT NULL AND llm_draft IS NOT NULL AND "
-        " model_identifier IS NOT NULL AND model_version IS NOT NULL AND "
-        " provider IS NOT NULL AND composer_skill_hash IS NOT NULL)",
+        " surface_origin IS NOT NULL)",
         name="ck_interpretation_events_user_approved_required",
     ),
     # auto_interpreted_no_surfaces rows: the five surface fields
     # (composition_state_id, affected_node_id, tool_call_id, user_term,
-    # llm_draft) must be NULL (no surfacing occurred); kind and the four
-    # LLM provenance fields must be NOT NULL (the LLM was consulted for
-    # the rate-cap fallback auto-interpretation). This is the middle shape
-    # between session opt-out marker rows and user_approved rows.
+    # llm_draft) and surface_origin must be NULL (no surfacing occurred); kind
+    # and the four LLM provenance fields must be NOT NULL (the LLM was
+    # consulted for the rate-cap fallback auto-interpretation). This is the
+    # middle shape between session opt-out marker rows and user_approved rows.
     CheckConstraint(
         "(interpretation_source != 'auto_interpreted_no_surfaces') OR "
         "(composition_state_id IS NULL AND affected_node_id IS NULL AND "
         " tool_call_id IS NULL AND user_term IS NULL AND kind IS NOT NULL AND llm_draft IS NULL AND "
+        " surface_origin IS NULL AND "
         " model_identifier IS NOT NULL AND model_version IS NOT NULL AND "
         " provider IS NOT NULL AND composer_skill_hash IS NOT NULL)",
         name="ck_interpretation_events_no_surfaces_shape",

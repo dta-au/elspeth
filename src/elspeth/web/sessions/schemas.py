@@ -23,7 +23,12 @@ from uuid import UUID
 import pydantic
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
-from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
+from elspeth.contracts.composer_interpretation import (
+    InterpretationChoice,
+    InterpretationKind,
+    InterpretationSource,
+    InterpretationSurfaceOrigin,
+)
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.composer.guided.protocol import GUIDED_MAX_COMPONENTS_PER_KIND
 from elspeth.web.execution.schemas import (
@@ -1006,11 +1011,15 @@ class InterpretationEventResponse(_StrictResponse):
     # for request-scoped actors, system:{component} for system writers.
     actor: str = Field(min_length=1, max_length=256)
     interpretation_source: InterpretationSource
+    # What raised the surface; NULL for rows with no surface (session-level
+    # opt-out markers, ``auto_interpreted_no_surfaces``).
+    surface_origin: InterpretationSurfaceOrigin | None = None
     # Audit-provenance fields — bound to which LLM produced the draft.
     # Exposed on the wire so the audit-readiness panel and any future
     # reviewer surface can render "drafted by claude-opus-4-7 v… on
-    # 2026-05-18" without a second DB round-trip.  NULL for
-    # ``auto_interpreted_opt_out`` rows (no LLM was consulted).
+    # 2026-05-18" without a second DB round-trip.  NULL when no LLM was
+    # consulted: session-level opt-out markers, and surfaces a server route
+    # raised (``surface_origin`` other than ``composer_llm``).
     model_identifier: str | None = Field(default=None, max_length=256)
     model_version: str | None = Field(default=None, max_length=128)
     provider: str | None = Field(default=None, max_length=64)

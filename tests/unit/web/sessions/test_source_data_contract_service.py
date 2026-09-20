@@ -28,6 +28,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationKind,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
@@ -332,6 +333,7 @@ async def test_settlement_surfacer_mints_the_card_for_a_blocked_uploaded_source(
         session_id=str(sid),
         session_operation_context=seed_live_compose_context(service._engine, sid),
         current_state_id=str(state.id),
+        surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
         model_identifier="anthropic/test-model",
         model_version="1",
         provider="anthropic",
@@ -402,6 +404,7 @@ async def test_settlement_surfacer_rejects_a_pending_legacy_v1_card(
                 arguments_hash=None,
                 hash_domain_version=None,
                 interpretation_source="user_approved",
+                surface_origin="composer_llm",
             )
         )
 
@@ -421,6 +424,7 @@ async def test_settlement_surfacer_rejects_a_pending_legacy_v1_card(
             session_id=str(sid),
             session_operation_context=seed_live_compose_context(service._engine, sid),
             current_state_id=str(state.id),
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
             model_identifier="anthropic/test-model",
             model_version="1",
             provider="anthropic",

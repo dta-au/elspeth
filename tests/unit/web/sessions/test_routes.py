@@ -31,7 +31,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolStatus,
 )
-from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSurfaceOrigin
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
@@ -7822,6 +7822,9 @@ sinks:
             InterpretationKind.LLM_MODEL_CHOICE,
         }
         assert {str(event.composition_state_id) for event in fresh_events} == {reverted.json()["id"]}
+        # The revert consulted no LLM: its cards name the route and claim no model.
+        assert {event.surface_origin for event in fresh_events} == {InterpretationSurfaceOrigin.STATE_REVERT}
+        assert {event.composer_skill_hash for event in fresh_events} == {None}
         for event in fresh_events:
             resolved = client.post(
                 f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
@@ -8695,10 +8698,13 @@ sinks:
         assert pt.user_term == "llm_prompt_template:score"
         assert str(pt.composition_state_id) == str(record.id)
         assert pt.tool_call_id is not None and pt.tool_call_id.startswith("backend_auto_surface:")
-        assert pt.model_identifier == "yaml_import"
-        assert pt.model_version == "yaml_import"
-        assert pt.provider == "yaml_import"
-        assert pt.composer_skill_hash == "yaml_import"
+        # The import consulted no LLM: the origin names the route and the LLM
+        # provenance is empty, not a label standing in for a model.
+        assert pt.surface_origin is InterpretationSurfaceOrigin.YAML_IMPORT
+        assert pt.model_identifier is None
+        assert pt.model_version is None
+        assert pt.provider is None
+        assert pt.composer_skill_hash is None
         mc = by_kind[InterpretationKind.LLM_MODEL_CHOICE]
         assert mc.affected_node_id == "score"
         assert mc.llm_draft == "anthropic/claude-haiku-4.5"
@@ -8830,7 +8836,9 @@ sinks:
         assert [(event.affected_node_id, event.kind) for event in events] == [("source", InterpretationKind.SOURCE_DATA_CONTRACT)]
         event = events[0]
         assert event.llm_draft == build_source_data_contract_draft(["colour"], ("colour", "extra"))
-        assert event.model_identifier == "yaml_import"
+        assert event.surface_origin is InterpretationSurfaceOrigin.YAML_IMPORT
+        assert event.model_identifier is None
+        assert event.composer_skill_hash is None
 
         resolved = client.post(
             f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
@@ -8902,7 +8910,8 @@ sinks:
             ("source", InterpretationKind.SOURCE_DATA_CONTRACT),
             ("score", InterpretationKind.LLM_MODEL_CHOICE),
         ]
-        assert all(event.model_identifier == "yaml_import" for event in events)
+        assert all(event.surface_origin is InterpretationSurfaceOrigin.YAML_IMPORT for event in events)
+        assert all(event.composer_skill_hash is None for event in events)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("failure", [ValueError("writer refused"), RuntimeError("storage failed")])

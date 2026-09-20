@@ -45,6 +45,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
@@ -3161,6 +3162,7 @@ def _interpretation_event_record_from_row(row: Any) -> InterpretationEventRecord
         arguments_hash=row.arguments_hash,
         hash_domain_version=row.hash_domain_version,
         interpretation_source=InterpretationSource(row.interpretation_source),
+        surface_origin=InterpretationSurfaceOrigin(row.surface_origin) if row.surface_origin is not None else None,
         runtime_model_identifier_at_resolve=row.runtime_model_identifier_at_resolve,
         runtime_model_version_at_resolve=row.runtime_model_version_at_resolve,
         approved_prompt_artifact_hash=row.approved_prompt_artifact_hash,
@@ -8524,12 +8526,13 @@ class SessionServiceImpl:
         user_term: str,
         kind: InterpretationKind,
         llm_draft: str,
-        model_identifier: str,
-        model_version: str,
-        provider: str,
-        composer_skill_hash: str,
+        model_identifier: str | None,
+        model_version: str | None,
+        provider: str | None,
+        composer_skill_hash: str | None,
         session_operation_context: SessionOperationContext,
         created_at: datetime | None = None,
+        surface_origin: InterpretationSurfaceOrigin = InterpretationSurfaceOrigin.COMPOSER_LLM,
     ) -> InterpretationEventRecord:
         """Insert one checked pending event in its own locked transaction."""
 
@@ -8547,6 +8550,7 @@ class SessionServiceImpl:
             composer_skill_hash=composer_skill_hash,
             session_operation_context=session_operation_context,
             created_at=created_at,
+            surface_origin=surface_origin,
         )
         return cast(InterpretationEventRecord, result)
 
@@ -8560,11 +8564,12 @@ class SessionServiceImpl:
         user_term: str,
         kind: InterpretationKind,
         llm_draft: str,
-        model_identifier: str,
-        model_version: str,
-        provider: str,
-        composer_skill_hash: str,
+        model_identifier: str | None,
+        model_version: str | None,
+        provider: str | None,
+        composer_skill_hash: str | None,
         session_operation_context: SessionOperationContext,
+        surface_origin: InterpretationSurfaceOrigin,
         created_at: datetime | None = None,
         _event_id: UUID | None = None,
         _prepare_only: bool = False,
@@ -8654,6 +8659,7 @@ class SessionServiceImpl:
             user_term=user_term,
             kind=kind,
             llm_draft=llm_draft,
+            surface_origin=surface_origin,
             model_identifier=model_identifier,
             model_version=model_version,
             provider=provider,
@@ -10028,6 +10034,7 @@ class SessionServiceImpl:
                 model_version=draft.model_version,
                 provider=draft.provider,
                 composer_skill_hash=draft.composer_skill_hash,
+                surface_origin=draft.surface_origin,
                 session_operation_context=session_operation_context,
                 # list_interpretation_events orders by created_at then id.
                 # Preserve the generic surfacer's deterministic call order
@@ -11566,6 +11573,7 @@ class SessionServiceImpl:
                 model_version=draft.model_version,
                 provider=draft.provider,
                 composer_skill_hash=draft.composer_skill_hash,
+                surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
                 session_operation_context=session_operation_context,
                 created_at=now,
                 _event_id=draft.event_id,

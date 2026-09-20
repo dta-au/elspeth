@@ -26,6 +26,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
@@ -64,6 +65,7 @@ def _vague_term_event(*, composition_state_id: UUID, user_term: str, index: int)
         arguments_hash=None,
         hash_domain_version=None,
         interpretation_source=InterpretationSource.USER_APPROVED,
+        surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
         runtime_model_identifier_at_resolve=None,
         runtime_model_version_at_resolve=None,
         approved_prompt_artifact_hash=None,

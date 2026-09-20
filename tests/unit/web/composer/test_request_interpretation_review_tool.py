@@ -42,6 +42,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -457,6 +458,7 @@ async def _fake_create_pending_interpretation_event(**kwargs: Any) -> Interpreta
         arguments_hash=None,
         hash_domain_version=None,
         interpretation_source=InterpretationSource.USER_APPROVED,
+        surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
         runtime_model_identifier_at_resolve=None,
         runtime_model_version_at_resolve=None,
         approved_prompt_artifact_hash=None,

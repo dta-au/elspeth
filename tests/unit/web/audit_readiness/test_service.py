@@ -16,6 +16,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.secrets import SecretInventoryItem
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -375,6 +376,7 @@ def _make_event(
             arguments_hash=None,
             hash_domain_version=None,
             interpretation_source=interpretation_source,
+            surface_origin=None,
             runtime_model_identifier_at_resolve=None,
             runtime_model_version_at_resolve=None,
             approved_prompt_artifact_hash=None,
@@ -401,6 +403,7 @@ def _make_event(
             arguments_hash=None,
             hash_domain_version=None,
             interpretation_source=interpretation_source,
+            surface_origin=None,
             runtime_model_identifier_at_resolve=None,
             runtime_model_version_at_resolve=None,
             approved_prompt_artifact_hash=None,
@@ -428,6 +431,7 @@ def _make_event(
         arguments_hash="a" * 64 if resolved else None,
         hash_domain_version="v1" if resolved else None,
         interpretation_source=interpretation_source,
+        surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
         runtime_model_identifier_at_resolve=(
             ("anthropic/claude-opus-4-7" if resolved else None)
             if runtime_model_identifier_at_resolve is _UNSET

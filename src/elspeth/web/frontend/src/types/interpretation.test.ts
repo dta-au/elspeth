@@ -117,9 +117,9 @@ describe("interpretation protocol types", () => {
     expect(all).toHaveLength(7);
   });
 
-  it("InterpretationEvent has the exhaustive 23-field shape (compile-time exact-keys check)", () => {
+  it("InterpretationEvent has the exhaustive 24-field shape (compile-time exact-keys check)", () => {
     // Adding/removing a field on the TS interface breaks this assignment.
-    // The 23-field count mirrors the InterpretationEventResponse pydantic
+    // The 24-field count mirrors the InterpretationEventResponse pydantic
     // schema in src/elspeth/web/sessions/schemas.py.
     const _exact: Equals<
       keyof InterpretationEvent,
@@ -137,6 +137,7 @@ describe("interpretation protocol types", () => {
       | "resolved_at"
       | "actor"
       | "interpretation_source"
+      | "surface_origin"
       | "model_identifier"
       | "model_version"
       | "provider"

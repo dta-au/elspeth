@@ -20,6 +20,10 @@ Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
 four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
 SHA-256 shape rather than the length alone, and gives every remaining session
 digest column its own shape CHECK.
+It also adds `interpretation_events.surface_origin`: review cards raised by
+the state-revert, YAML-import and E2E-seed routes now record that origin with
+empty LLM provenance, where they previously wrote the route name into the
+model, provider and `composer_skill_hash` columns.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 43 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching

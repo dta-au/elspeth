@@ -36,7 +36,12 @@ from elspeth.contracts.chargeable_admission import (
     ChargeableAdmissionPolicy,
     ChargeableOperation,
 )
-from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
+from elspeth.contracts.composer_interpretation import (
+    InterpretationChoice,
+    InterpretationKind,
+    InterpretationSource,
+    InterpretationSurfaceOrigin,
+)
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -160,6 +165,7 @@ def _pending_interpretation_command(*, composer_skill_hash: str = "a" * 64) -> s
         user_term="ambiguous",
         kind=InterpretationKind.VAGUE_TERM,
         llm_draft="A precise draft",
+        surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
         model_identifier="composer-model",
         model_version="composer-model",
         provider="composer",
@@ -168,10 +174,46 @@ def _pending_interpretation_command(*, composer_skill_hash: str = "a" * 64) -> s
     )
 
 
-@pytest.mark.parametrize("composer_skill_hash", ["yaml_import", ""])
-def test_pending_interpretation_command_preserves_non_hash_provenance_sentinels(composer_skill_hash: str) -> None:
-    command = _pending_interpretation_command(composer_skill_hash=composer_skill_hash)
-    assert command.composer_skill_hash == composer_skill_hash
+_SERVER_ROUTE_ORIGINS = tuple(origin for origin in InterpretationSurfaceOrigin if origin is not InterpretationSurfaceOrigin.COMPOSER_LLM)
+
+
+def _server_route_command(
+    origin: InterpretationSurfaceOrigin, **provenance: str | None
+) -> sessions_protocol.SessionPendingInterpretationCommand:
+    fields: dict[str, str | None] = {"model_identifier": None, "model_version": None, "provider": None, "composer_skill_hash": None}
+    return sessions_protocol.SessionPendingInterpretationCommand(
+        event_id=uuid4(),
+        opt_out_marker_event_id=uuid4(),
+        composition_state_id=uuid4(),
+        affected_node_id="llm_1",
+        tool_call_id="call_1",
+        user_term="ambiguous",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="A precise draft",
+        surface_origin=origin,
+        created_at=datetime.now(UTC),
+        **(fields | provenance),
+    )
+
+
+@pytest.mark.parametrize("origin", _SERVER_ROUTE_ORIGINS)
+def test_pending_interpretation_command_for_a_server_route_carries_no_llm_provenance(origin: InterpretationSurfaceOrigin) -> None:
+    command = _server_route_command(origin)
+    assert command.surface_origin is origin
+    assert command.composer_skill_hash is None
+
+
+@pytest.mark.parametrize("origin", _SERVER_ROUTE_ORIGINS)
+@pytest.mark.parametrize("field", ["model_identifier", "model_version", "provider", "composer_skill_hash"])
+def test_pending_interpretation_command_rejects_a_route_label_as_llm_provenance(origin: InterpretationSurfaceOrigin, field: str) -> None:
+    # The routes used to write their own name into these fields.
+    with pytest.raises(AuditIntegrityError, match="consulted no LLM"):
+        _server_route_command(origin, **{field: origin.value})
+
+
+def test_pending_interpretation_command_for_the_composer_llm_requires_provenance() -> None:
+    with pytest.raises(AuditIntegrityError, match="requires LLM provenance"):
+        _server_route_command(InterpretationSurfaceOrigin.COMPOSER_LLM)
 
 
 def test_pending_interpretation_decision_rejects_cross_mode_fields() -> None:

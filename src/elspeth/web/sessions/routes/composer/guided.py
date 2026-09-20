@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
 from elspeth.contracts import errors as contract_errors
+from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -3139,6 +3140,7 @@ async def post_guided_respond(
                 sessions_service=service,
                 session_id=str(session_id),
                 current_state_id=str(record.id),
+                surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
                 model_identifier=row.composer_model_identifier,
                 model_version=row.composer_model_version,
                 provider=row.composer_provider,
@@ -5210,16 +5212,28 @@ async def post_guided_respond(
                         # failure this pass exists to prevent.
                         from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
 
+                        planner_row = authority.row
+                        if (
+                            planner_row.composer_model_identifier is None
+                            or planner_row.composer_model_version is None
+                            or planner_row.composer_provider is None
+                            or planner_row.composer_skill_hash is None
+                        ):
+                            # Same refusal as the RESPOND replay arm: a planner
+                            # proposal without its planner identity is an audit
+                            # anomaly, never a reason to write a stand-in label.
+                            raise AuditIntegrityError("Guided accepted proposal has incomplete composer provenance")
                         await _await_with_deferred_cancellation(
                             surface_pending_interpretation_reviews_for_state(
                                 prepared.result.updated_state,
                                 sessions_service=service,
                                 session_id=str(session_id),
                                 current_state_id=str(accepted.result_state.id),
-                                model_identifier=authority.row.composer_model_identifier or "guided-planner",
-                                model_version=authority.row.composer_model_version or "guided-planner",
-                                provider=authority.row.composer_provider or "unknown",
-                                composer_skill_hash=authority.row.composer_skill_hash or "",
+                                surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
+                                model_identifier=planner_row.composer_model_identifier,
+                                model_version=planner_row.composer_model_version,
+                                provider=planner_row.composer_provider,
+                                composer_skill_hash=planner_row.composer_skill_hash,
                                 session_operation_context=reserved.session_operation_context,
                             ),
                             state=cancellation_state,
