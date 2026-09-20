@@ -662,6 +662,7 @@ def _not_authoring_ready(code: str = "test_blocker") -> ValidationReadiness:
         completion_ready=False,
         blockers=[
             ValidationReadinessBlocker(
+                suggestion=None,
                 code=code,
                 component_id=None,
                 component_type=None,
@@ -678,6 +679,7 @@ def _pending_interpretation_readiness() -> ValidationReadiness:
         completion_ready=True,
         blockers=[
             ValidationReadinessBlocker(
+                suggestion=None,
                 code=INTERPRETATION_REVIEW_PENDING_CODE,
                 component_id="rate_node",
                 component_type="transform",

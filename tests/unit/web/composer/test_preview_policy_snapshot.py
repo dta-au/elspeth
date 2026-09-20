@@ -184,6 +184,7 @@ async def test_strict_and_tolerant_preview_share_the_admitted_snapshot(tmp_path:
                 if allow_pending_interpretation_placeholders
                 else [
                     ValidationReadinessBlocker(
+                        suggestion=None,
                         code="interpretation_review_pending",
                         component_id="source",
                         component_type="source",

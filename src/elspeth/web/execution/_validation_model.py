@@ -57,6 +57,7 @@ def _blocked_readiness(
         blockers=[
             ValidationReadinessBlocker(
                 code=code,
+                suggestion=None,
                 component_id=component_id,
                 component_type=component_type,
                 detail=detail,

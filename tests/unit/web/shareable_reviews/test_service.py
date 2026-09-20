@@ -401,6 +401,7 @@ def _pending_review_validation() -> ValidationResult:
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="assess",
                     component_type="transform",
@@ -441,6 +442,7 @@ def _completion_blocked_validation() -> ValidationResult:
             completion_ready=False,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
                     code=ADVISOR_SIGNOFF_BLOCKED_CODE,
                     component_id="pipeline",
                     component_type="pipeline",
@@ -643,6 +645,7 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
         composer_meta={
             "completion_gates": {
                 "advisor_signoff": {
+                    "suggestion": None,
                     "status": "blocked",
                     "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                     "for_graph": "0" * 64,
@@ -670,6 +673,7 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
     assert execution_service.validate_state_completion_gates == [
         CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
             )

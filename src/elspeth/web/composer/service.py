@@ -1027,6 +1027,7 @@ def _proof_repair_exhausted_validation(
             blockers=[
                 ValidationReadinessBlocker(
                     code=_PROOF_REPAIR_EXHAUSTED_CODE,
+                    suggestion=None,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -1112,6 +1113,7 @@ def _orphaned_interpretation_review_validation(
             blockers=[
                 ValidationReadinessBlocker(
                     code=_INTERPRETATION_REVIEW_ORPHANED_CODE,
+                    suggestion=None,
                     component_id=component_id,
                     component_type=_component_type_for_kind(kind),
                     detail=detail,
@@ -10574,6 +10576,7 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) 
             blockers=[
                 ValidationReadinessBlocker(
                     code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
+                    suggestion=suggestion,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -10877,7 +10880,7 @@ def _advisor_signoff_pending_validation(
     Applies to every advisor reason. This release's authority decision is
     completion-only: an advisor FLAG does not make execution unsafe.
     """
-    detail, _suggestion = _advisor_signoff_blocked_wording(
+    detail, suggestion = _advisor_signoff_blocked_wording(
         reason=reason,
         findings=findings,
         findings_backend_authored=findings_backend_authored,
@@ -10902,6 +10905,7 @@ def _advisor_signoff_pending_validation(
                     *base.readiness.blockers,
                     ValidationReadinessBlocker(
                         code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
+                        suggestion=suggestion,
                         component_id="pipeline",
                         component_type="pipeline",
                         detail=detail,

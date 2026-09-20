@@ -142,6 +142,7 @@ describe("auditReadiness API client", () => {
               component_id: "first",
               component_type: "transform",
               detail: "first",
+              suggestion: null,
             },
           ],
         },
@@ -162,6 +163,31 @@ describe("auditReadiness API client", () => {
       new Response("server error", { status: 500 }),
     );
     await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({ status: 500 });
+  });
+
+  it.each([null, "Retry the advisory review."])("preserves backend blocker suggestion %s", async (suggestion) => {
+    const body = readyBody();
+    const validation = body.validation_result as Record<string, unknown>;
+    validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
+      code: "advisor_signoff_blocked", component_id: "pipeline",
+      component_type: "pipeline", detail: "Review pending.", suggestion,
+    }] };
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    const snapshot = await fetchAuditReadiness(SESSION_ID);
+    expect(snapshot.validation_result.readiness.blockers[0].suggestion).toBe(suggestion);
+  });
+
+  it.each([undefined, 7, {}, [], true])("rejects malformed or missing blocker suggestion %s", async (suggestion) => {
+    const body = readyBody();
+    const validation = body.validation_result as Record<string, unknown>;
+    validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
+      code: "advisor_signoff_blocked", component_id: "pipeline",
+      component_type: "pipeline", detail: "Review pending.", suggestion,
+    }] };
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({
+      detail: "Unexpected response shape from audit-readiness endpoint",
+    });
   });
 
   it.each([

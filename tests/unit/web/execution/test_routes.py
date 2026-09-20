@@ -529,6 +529,7 @@ class TestValidateEndpoint:
                 composer_meta={
                     "completion_gates": {
                         "advisor_signoff": {
+                            "suggestion": None,
                             "status": "blocked",
                             "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                             "for_graph": "0" * 64,
@@ -547,6 +548,7 @@ class TestValidateEndpoint:
         svc.validate_state.assert_awaited_once()
         assert svc.validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
             )
@@ -904,6 +906,7 @@ class TestExecuteEndpoint:
                 completion_ready=False,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
                         code="graph_structure",
                         component_id="rate",
                         component_type="transform",
@@ -932,6 +935,7 @@ class TestExecuteEndpoint:
         from elspeth.web.execution.schemas import ValidationReadinessBlocker
 
         blocker = ValidationReadinessBlocker(
+            suggestion=None,
             code="runtime_admission",
             component_id="pipeline",
             component_type="pipeline",
@@ -956,6 +960,7 @@ class TestExecuteEndpoint:
                     "component_id": "pipeline",
                     "component_type": "pipeline",
                     "detail": "The selected runtime policy does not admit this pipeline.",
+                    "suggestion": None,
                 }
             ],
         }

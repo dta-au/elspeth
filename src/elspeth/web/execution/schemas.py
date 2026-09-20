@@ -258,6 +258,7 @@ class ValidationReadinessBlocker(_StrictResponse):
     component_id: str | None
     component_type: str | None
     detail: str
+    suggestion: str | None
 
 
 class ValidationReadiness(_StrictResponse):

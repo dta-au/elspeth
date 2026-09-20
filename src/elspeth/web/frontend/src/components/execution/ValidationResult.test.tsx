@@ -199,6 +199,7 @@ describe("ValidationResultBanner", () => {
                 code: "advisor_signoff_blocked",
                 component_id: "pipeline",
                 component_type: "pipeline",
+                suggestion: null,
                 detail:
                   "The evidence-scoped completion advisory review has not covered this pipeline version.",
               },

@@ -715,6 +715,7 @@ def test_validation_row_warns_when_advisor_completion_is_pending():
             completion_ready=False,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
                     code="advisor_signoff_blocked",
                     component_id="pipeline",
                     component_type="pipeline",
@@ -793,6 +794,7 @@ def test_compute_snapshot_passes_persisted_completion_gates():
             composer_meta={
                 "completion_gates": {
                     "advisor_signoff": {
+                        "suggestion": None,
                         "status": "blocked",
                         "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                         "for_graph": "0" * 64,
@@ -817,6 +819,7 @@ def test_compute_snapshot_passes_persisted_completion_gates():
     assert args == (state,)
     assert kwargs["completion_gates"] == CompletionGateFacts(
         advisor_signoff=AdvisorSignoffGateFact(
+            suggestion=None,
             detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
             for_graph="0" * 64,
         )

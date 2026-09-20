@@ -379,6 +379,7 @@ describe("blocked readiness (elspeth-cb0d4b8dba)", () => {
             component_id: "pipeline",
             component_type: "pipeline",
             detail: "Completion advisory review did not clear.",
+            suggestion: null,
           },
         ],
       },

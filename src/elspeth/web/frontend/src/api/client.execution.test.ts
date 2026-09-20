@@ -59,6 +59,29 @@ describe("api/client execution state binding", () => {
     );
   });
 
+  it.each([undefined, 7, {}, true])("rejects malformed live blocker suggestion %s", async (suggestion) => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({
+      is_valid: true, checks: [], errors: [],
+      readiness: { authoring_valid: true, execution_ready: true, completion_ready: false,
+        blockers: [{ code: "advisor_signoff_blocked", component_id: "pipeline",
+          component_type: "pipeline", detail: "Review pending.", suggestion }] },
+    }), { status: 200 }));
+    await expect(validatePipeline("session-1")).rejects.toMatchObject({
+      detail: "Unexpected readiness shape from validate endpoint",
+    });
+  });
+
+  it.each([null, "Retry advisory review."])("preserves live blocker suggestion %s", async (suggestion) => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({
+      is_valid: true, checks: [], errors: [],
+      readiness: { authoring_valid: true, execution_ready: true, completion_ready: false,
+        blockers: [{ code: "advisor_signoff_blocked", component_id: "pipeline",
+          component_type: "pipeline", detail: "Review pending.", suggestion }] },
+    }), { status: 200 }));
+    const result = await validatePipeline("session-1");
+    expect(result.readiness.blockers[0].suggestion).toBe(suggestion);
+  });
+
   it("carries the secret acknowledgement token alongside the fanout token", async () => {
     fetchSpy.mockResolvedValue({
       ok: true,

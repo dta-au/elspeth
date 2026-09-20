@@ -606,6 +606,7 @@ export interface ValidationReadinessBlocker {
   component_id: string | null;
   component_type: string | null;
   detail: string;
+  suggestion: string | null;
 }
 
 export interface ValidationReadiness {

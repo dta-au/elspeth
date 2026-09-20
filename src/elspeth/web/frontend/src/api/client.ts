@@ -7,6 +7,7 @@
 // in development; same-origin serving works in production.
 // ============================================================================
 
+import { isValidationReadiness } from "./validationReadiness";
 import type {
   ApiError,
   ApiStructuredError,
@@ -1380,7 +1381,11 @@ export async function validatePipeline(
     method: "POST",
     headers: authHeaders("application/json"),
   });
-  return parseResponse<ValidationResult>(response);
+  const result = await parseResponse<ValidationResult>(response);
+  if (typeof result !== "object" || result === null || !isValidationReadiness(result.readiness)) {
+    throw { status: response.status, detail: "Unexpected readiness shape from validate endpoint" } satisfies ApiError;
+  }
+  return result;
 }
 
 /**
