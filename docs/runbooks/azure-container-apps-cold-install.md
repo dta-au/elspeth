@@ -59,8 +59,10 @@ release-evidence controller.
    `deployWebApp=false`, then run the `provision-storage` Job;
 6. run the `doctor-schema-init` Job with the schema-owner URLs;
 7. run the `doctor-runtime` Job with the runtime URLs;
-8. deploy `workload.bicep` in the production shape and prove the rollout; and
-9. verify public behaviour and record the operator-local notes.
+8. deploy `workload.bicep` in the production shape and prove the rollout;
+9. verify public behaviour and record the operator-local notes; and
+10. optionally, grant the web identity read access to an Azure AI Search index
+    for `rag_retrieval`.
 
 Every step has a stop condition. Do not skip forward after a failed identity,
 image, doctor or readiness check.
