@@ -15,7 +15,7 @@ describe("tutorialMachine", () => {
     expect(CANONICAL_TUTORIAL_PROMPT).toBe(
       "Scrape these three synthetic project-brief pages and, for each page, " +
         "have an LLM write a short summary of the page. Remove the raw HTML and " +
-        "write the rows to a json file.",
+        "write the rows to a JSON file named project_brief_summaries.json.",
     );
   });
 
