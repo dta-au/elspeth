@@ -1937,16 +1937,16 @@ class ExecutionServiceImpl:
                                 f"{node.node_type.capitalize()} '{node.id}' {key}='{value}' resolves outside allowed output directories"
                             )
 
-        # The managed-identity + sequential-multi-query retry-budget policy gates
-        # were previously evaluated HERE, on the un-lowered ``composition_state``.
+        # The sequential-multi-query retry-budget policy gate
+        # was previously evaluated HERE, on the un-lowered ``composition_state``.
         # That false-positived operator-profiled multi-query LLM nodes: an
         # operator profile supplies the web-safe ``max_capacity_retry_seconds``
-        # (and RAG credential handling) only at LOWERING, so the persisted
+        # only at LOWERING, so the persisted
         # authored-minimal options legitimately omit the retry budget and would
         # trip ``web_llm_retry_budget_policy_error`` before the profile resolved.
-        # Both gates now run below on ``policy_result.executable_state`` (the
+        # The gate now runs below on ``policy_result.executable_state`` (the
         # profile-lowered state), mirroring the authoritative ``validate_pipeline``
-        # checks (validation.py, after its ``state = policy_result.executable_state``
+        # check (validation.py, after its ``state = policy_result.executable_state``
         # rebind).
 
         # Fail-closed pre-run validation gate (notes/composer-advisor-surface-map-2026-06-08.md).
@@ -1988,13 +1988,14 @@ class ExecutionServiceImpl:
         if policy_result.findings:
             raise RuntimeError("Plugin policy validation diverged between execution preflight and runtime preparation.")
 
-        # Defence-in-depth managed-identity + sequential-multi-query retry-budget
-        # gates, evaluated on the PROFILE-LOWERED executable state so an operator
-        # profile's injected retry budget / credential handling is honoured (raw
-        # authored options omit them). ``validate_pipeline`` above already runs the
-        # identical checks on this same lowered state; this mirror keeps the
+        # Defence-in-depth sequential-multi-query retry-budget gate, evaluated on
+        # the PROFILE-LOWERED executable state so an operator profile's injected
+        # retry budget is honoured (raw authored options omit it). Azure AI Search
+        # needs no mirror here: the ``validate_plugin_policy`` call above refuses any
+        # node without a clean operator-profile binding. ``validate_pipeline`` above
+        # already runs the identical check on this same lowered state; this mirror keeps the
         # execution service fail-closed even if that gate were bypassed (the
-        # tutorial path calls ``execute`` directly). Running them on the un-lowered
+        # tutorial path calls ``execute`` directly). Running it on the un-lowered
         # ``composition_state`` false-positived operator-profiled multi-query nodes.
         # Every PLUGIN-BEARING node (elspeth-df8082552d) — same widening as
         # the validate_pipeline gates this mirrors. This loop's own comment

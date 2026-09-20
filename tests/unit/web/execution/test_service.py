@@ -9620,6 +9620,10 @@ class TestTransformProviderConfigPathRestriction:
                     pytest.raises(PipelineValidationError) as raised,
                 ):
                     await _execute(service, session_id=uuid4(), user_id="alice")
+                # The mocked state never yields loadable settings, so a bare
+                # ``raises`` is satisfied by ANY node. Pin the refusal to the
+                # operator-profile gate and to this node.
+                assert [(error.error_code, error.component_id) for error in raised.value.errors] == [("profile_unavailable", "rag")]
                 rendered = " ".join(error.message for error in raised.value.errors)
             else:
                 with pytest.raises(RuntimeError, match="Plugin policy validation diverged") as diverged:
