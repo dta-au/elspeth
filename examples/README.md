@@ -85,6 +85,7 @@ These examples demonstrate Retrieval-Augmented Generation using ChromaDB as a ve
 |---------|---------------------|
 | [`chroma_rag`](chroma_rag/) | Basic RAG retrieval — `./examples/chroma_rag/run.sh` seeds the collection, then runs retrieval |
 | [`chroma_rag_qa`](chroma_rag_qa/) | RAG + LLM via `./examples/chroma_rag_qa/run.sh` (requires `OPENROUTER_API_KEY`) |
+| [`azure_search_rag`](azure_search_rag/) | RAG retrieval against an existing Azure AI Search index — field mapping, search modes, score ranges, managed identity (requires `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_INDEX`, `AZURE_SEARCH_API_KEY`) |
 | [`chroma_rag_indexed`](chroma_rag_indexed/) | **Pipeline dependencies** — `depends_on` runs an indexing pipeline first, commencement gate verifies the collection, then query pipeline retrieves context. Entry point: `query_pipeline.yaml` |
 
 ### 0.6.0 — Multi-Worker & Concurrent Scheduling
@@ -225,5 +226,6 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Stress testing** | [`large_scale_test`](large_scale_test/) or [`chaosllm_endurance`](chaosllm_endurance/) |
 | **RAG retrieval** | [`chroma_rag`](chroma_rag/) — basic vector search against ChromaDB |
 | **RAG + LLM** | [`chroma_rag_qa`](chroma_rag_qa/) — retrieval then LLM-generated answers |
+| **RAG against Azure AI Search** | [`azure_search_rag`](azure_search_rag/) — hybrid retrieval from an existing index |
 | **Pipeline dependencies (`depends_on`)** | [`chroma_rag_indexed`](chroma_rag_indexed/) — index → gate → query in one command |
 | **Commencement gates** | [`chroma_rag_indexed`](chroma_rag_indexed/) — go/no-go check before pipeline starts |

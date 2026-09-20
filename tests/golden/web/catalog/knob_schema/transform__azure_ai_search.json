@@ -130,28 +130,171 @@
         "tier": "common"
       },
       {
-        "description": "Retrieval provider name registered in the RAG provider catalog.",
-        "enum": [
-          "chroma"
-        ],
-        "kind": "enum",
-        "label": "Provider",
-        "name": "provider",
+        "description": "Azure AI Search service URL, https://<service>.search.windows.net.",
+        "kind": "text",
+        "label": "Endpoint",
+        "name": "endpoint",
         "nullable": false,
         "required": true,
         "tier": "common"
       },
       {
-        "description": "Provider-specific retrieval configuration passed to the selected provider.",
-        "kind": "json-object",
-        "label": "Provider",
-        "name": "provider_config",
+        "description": "Name of the existing index to query.",
+        "kind": "text",
+        "label": "Index",
+        "name": "index",
         "nullable": false,
         "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Query key. Mutually exclusive with use_managed_identity.",
+        "kind": "text",
+        "label": "API Key",
+        "name": "api_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Authenticate with the host's managed identity.",
+        "kind": "checkbox",
+        "label": "Use Managed Identity",
+        "name": "use_managed_identity",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Client id of a user-assigned managed identity.",
+        "kind": "text",
+        "label": "Client ID",
+        "name": "client_id",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "2024-07-01",
+        "description": "Azure AI Search REST API version.",
+        "kind": "text",
+        "label": "API Version",
+        "name": "api_version",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "hybrid",
+        "description": "vector and hybrid need an integrated vectorizer on field_vector; semantic needs semantic_config.",
+        "enum": [
+          "vector",
+          "keyword",
+          "hybrid",
+          "semantic"
+        ],
+        "kind": "enum",
+        "label": "Search Mode",
+        "name": "search_mode",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 30.0,
+        "description": "Per-request timeout in seconds.",
+        "kind": "number-float",
+        "label": "Request Timeout",
+        "name": "request_timeout",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "contentVector",
+        "description": "Index vector field queried by vector and hybrid modes.",
+        "kind": "text",
+        "label": "Field Vector",
+        "name": "field_vector",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Semantic configuration name, required for semantic mode.",
+        "kind": "text",
+        "label": "Semantic",
+        "name": "semantic_config",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "content",
+        "description": "Retrievable index string field holding the chunk text.",
+        "kind": "text",
+        "label": "Field Content",
+        "name": "field_content",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "id",
+        "description": "Retrievable index key field.",
+        "kind": "text",
+        "label": "Field ID",
+        "name": "field_id",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional index field emitted as source_name citation metadata.",
+        "kind": "text",
+        "label": "Field Title",
+        "name": "field_title",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional index field emitted as source_link citation metadata.",
+        "kind": "text",
+        "label": "Field URL",
+        "name": "field_url",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fields to return; must include every mapped field.",
+        "kind": "json-value",
+        "label": "Select",
+        "name": "select",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Literal OData $filter sent with every query.",
+        "kind": "text",
+        "label": "Filter",
+        "name": "filter",
+        "nullable": true,
+        "required": false,
         "tier": "common"
       }
     ]
   },
   "plugin_kind": "transform",
-  "plugin_name": "rag_retrieval"
+  "plugin_name": "azure_ai_search"
 }

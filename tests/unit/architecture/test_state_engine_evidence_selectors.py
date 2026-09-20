@@ -156,9 +156,7 @@ def test_derived_lane_identity_matches_the_workflow_lane_mapper() -> None:
     from scripts.state_engine_live_provider_artifact import lane_id_for_case
 
     assert derived_lane_id("source:aws_s3", "default") == lane_id_for_case("source:aws_s3@default")
-    assert derived_lane_id("transform:rag_retrieval", "azure-search-api-key") == lane_id_for_case(
-        "transform:rag_retrieval@azure-search-api-key"
-    )
+    assert derived_lane_id("transform:azure_ai_search", "api-key") == lane_id_for_case("transform:azure_ai_search@api-key")
 
 
 def test_complete_manifest_partitions_every_required_cell_and_collects_exact_nodes() -> None:

@@ -46,6 +46,7 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
         "transform:aws_bedrock_prompt_shield",
         "transform:aws_textract_document_analysis",
         "transform:aws_textract_inline_analysis",
+        "transform:azure_ai_search",
         "transform:azure_content_safety",
         "transform:azure_document_intelligence",
         "transform:azure_prompt_shield",
@@ -104,12 +105,14 @@ OPERATOR_PROFILED_IDENTITIES = frozenset(
         "transform:aws_bedrock_prompt_shield",
         "transform:aws_bedrock_content_safety",
         "transform:aws_textract_document_analysis",
+        "transform:azure_ai_search",
     }
 )
 RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES = frozenset(
     {
         "source:aws_s3",
         "transform:aws_textract_document_analysis",
+        "transform:azure_ai_search",
     }
 )
 WEB_PROFILE_EXAMPLE_IDENTITIES = OPERATOR_PROFILED_IDENTITIES - RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES
@@ -214,10 +217,10 @@ def _operator_profile_registry() -> OperatorProfileRegistry:
 
 
 def test_registry_contains_the_exact_accepted_builtin_inventory() -> None:
-    assert len(REFERENCES) == 55
+    assert len(REFERENCES) == 56
     assert Counter(reference.kind for reference in REFERENCES) == {
         "source": 9,
-        "transform": 37,
+        "transform": 38,
         "sink": 9,
     }
     assert {_identity(reference) for reference in REFERENCES} == EXPECTED_BUILTIN_IDENTITIES
@@ -257,7 +260,7 @@ def test_operator_profiled_exception_set_is_fixed_and_exhaustive() -> None:
             profiled_examples.add(_identity(reference))
 
     assert profiled_examples == WEB_PROFILE_EXAMPLE_IDENTITIES
-    assert len(DIRECT_CONFIG_REFERENCES) == 51
+    assert len(DIRECT_CONFIG_REFERENCES) == 52
 
 
 @pytest.mark.parametrize("reference", DIRECT_CONFIG_REFERENCES, ids=_identity)

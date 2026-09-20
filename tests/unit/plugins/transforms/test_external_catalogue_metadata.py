@@ -42,6 +42,7 @@ EXPECTED_EXTERNAL_TAGS = {
     "aws_bedrock_prompt_shield": ("aws", "bedrock", "prompt-shield"),
     "aws_textract_document_analysis": ("aws", "textract", "document", "ocr", "enrichment"),
     "aws_textract_inline_analysis": ("aws", "textract", "ocr", "inline", "blob", "enrichment"),
+    "azure_ai_search": ("rag", "retrieval", "vector-search", "azure"),
     "azure_content_safety": ("azure", "content-safety", "moderation"),
     "azure_document_intelligence": ("azure", "document", "ocr", "enrichment", "http"),
     "azure_prompt_shield": ("azure", "prompt-shield", "security"),
@@ -75,8 +76,12 @@ _REQUIRED_GUIDANCE = {
         ("provider credentials", "endpoints", "web-authored options"),
     ),
     "rag_retrieval": (
-        ("existing chroma", "azure search", "ranked", "provenance", "untrusted before llm"),
+        ("existing chroma", "ranked", "provenance", "untrusted before llm", "azure_ai_search"),
         ("indexing", "answer generation"),
+    ),
+    "azure_ai_search": (
+        ("rag retrieval", "azure ai search", "ranked", "provenance", "untrusted before llm"),
+        ("indexing", "generating answers", "rag_retrieval for chroma"),
     ),
     "aws_bedrock_prompt_shield": (
         ("pre-llm", "prompt attack", "operator profile", "default aws credential chain"),
@@ -377,18 +382,25 @@ def test_azure_document_intelligence_example_uses_a_supported_secret_ref_marker(
     assert "${" not in example
 
 
-def test_rag_azure_example_keeps_auth_and_index_settings_inside_provider_config() -> None:
-    options = _options(EXTERNAL_BY_NAME["rag_retrieval"])
-    provider_config = cast(Mapping[str, Any], options["provider_config"])
+def test_azure_ai_search_example_names_its_options_at_the_top_level() -> None:
+    options = _options(EXTERNAL_BY_NAME["azure_ai_search"])
 
-    assert options["provider"] == "azure_search"
-    assert provider_config == {
+    assert {name: options[name] for name in ("endpoint", "index", "api_key", "search_mode")} == {
         "endpoint": "https://catalogue-reference.search.windows.net",
         "index": "approved-documents",
         "api_key": {"secret_ref": "AZURE_SEARCH_API_KEY"},
         "search_mode": "hybrid",
     }
-    assert not {"endpoint", "index", "api_key", "search_mode"} & (options.keys() - {"provider_config"})
+    assert "provider" not in options
+    assert "provider_config" not in options
+
+
+def test_rag_example_keeps_collection_settings_inside_provider_config() -> None:
+    options = _options(EXTERNAL_BY_NAME["rag_retrieval"])
+
+    assert options["provider"] == "chroma"
+    assert cast(Mapping[str, Any], options["provider_config"])["collection"] == "approved-documents"
+    assert "collection" not in options
 
 
 @pytest.mark.parametrize("name", sorted(untrusted_content_transform_names()))
@@ -501,10 +513,11 @@ def test_rag_composer_hints_name_only_real_authored_and_provider_config_fields()
     hints = _composer_hints("rag_retrieval")
     provider_fields = {name: set(config_cls.model_fields) for name, (config_cls, _factory) in PROVIDERS.items()}
 
+    assert set(provider_fields) == {"chroma"}
     assert "collection" in provider_fields["chroma"]
-    assert "index" in provider_fields["azure_search"]
     assert "provider_config.collection" in hints
-    assert "provider_config.index" in hints
+    assert "provider_config.index" not in hints
+    assert "azure_ai_search" in hints
     assert "min_score" in hints
     assert "on_no_results" in hints
     assert "collection_name" not in hints

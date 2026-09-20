@@ -10,12 +10,8 @@ def _valid_config(**overrides):
     base = {
         "output_prefix": "policy",
         "query_field": "question",
-        "provider": "azure_search",
-        "provider_config": {
-            "endpoint": "https://test.search.windows.net",
-            "index": "test-index",
-            "api_key": "test-key",
-        },
+        "provider": "chroma",
+        "provider_config": {"collection": "test-index", "mode": "ephemeral"},
         "schema_config": {"mode": "observed"},
     }
     base.update(overrides)
@@ -104,29 +100,23 @@ class TestRetrievalParams:
 
 class TestProviderConfig:
     def test_unknown_provider_rejected(self):
-        with pytest.raises(ValueError, match="Input should be 'azure_search' or 'chroma'"):
+        with pytest.raises(ValueError, match="Input should be 'chroma'"):
             RAGRetrievalConfig(**_valid_config(provider="unknown"))
+
+    def test_azure_search_is_no_longer_a_rag_retrieval_provider(self):
+        """Azure AI Search has one path: the azure_ai_search plugin."""
+        with pytest.raises(ValueError, match="Input should be 'chroma'"):
+            RAGRetrievalConfig(
+                **_valid_config(
+                    provider="azure_search",
+                    provider_config={"endpoint": "https://test.search.windows.net", "index": "i", "api_key": "k"},
+                )
+            )
 
     def test_invalid_provider_config_rejected_eagerly(self):
         """Provider config is validated at YAML load time, not first row."""
         with pytest.raises(ValueError):
-            RAGRetrievalConfig(
-                **_valid_config(
-                    provider_config={"endpoint": "http://no-https.example.com", "index": "test", "api_key": "k"},
-                )
-            )
-
-    def test_managed_identity_rejects_non_azure_search_endpoint_eagerly(self):
-        with pytest.raises(ValueError, match=r"managed identity.*search\.windows\.net"):
-            RAGRetrievalConfig(
-                **_valid_config(
-                    provider_config={
-                        "endpoint": "https://attacker.example.com",
-                        "index": "test",
-                        "use_managed_identity": True,
-                    },
-                )
-            )
+            RAGRetrievalConfig(**_valid_config(provider_config={"collection": "test", "mode": "persistent"}))
 
     def test_max_context_length_ge_1(self):
         config = RAGRetrievalConfig(**_valid_config(max_context_length=1))

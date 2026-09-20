@@ -54,6 +54,8 @@ _PLUGIN_BASE_CLASS_NAMES = frozenset(
         # Azure safety plugins share an abstract project base that inherits
         # BaseTransform; runtime discovery accepts those concrete subclasses.
         "BaseAzureSafetyTransform",
+        # The retrieval transforms share an abstract core the same way.
+        "RetrievalTransformBase",
     }
 )
 

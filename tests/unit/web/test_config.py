@@ -2084,6 +2084,72 @@ def test_settings_from_env_rejects_invalid_textract_profiles_without_echoing_pri
     assert private_bucket not in str(exc_info.value)
 
 
+@pytest.mark.usefixtures("required_web_env")
+def test_settings_from_env_parses_azure_search_profiles_without_repr_leaking_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_endpoint = "https://operator-private-marker.search.windows.net"
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AZURE_SEARCH_PROFILES",
+        json.dumps(
+            [
+                {
+                    "alias": "policies",
+                    "endpoint": private_endpoint,
+                    "auth": "managed_identity",
+                    "indexes": ["approved-documents"],
+                }
+            ]
+        ),
+    )
+
+    settings = web_config.settings_from_env()
+
+    assert settings.azure_search_profiles[0].alias == "policies"
+    assert settings.azure_search_profiles[0].endpoint == private_endpoint
+    assert settings.azure_search_profiles[0].indexes == ("approved-documents",)
+    assert "operator-private-marker" not in repr(settings.azure_search_profiles[0])
+
+
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        pytest.param(
+            [
+                {
+                    "alias": "policies",
+                    "endpoint": "https://operator-private-marker.search.windows.net",
+                    "auth": "managed_identity",
+                    "indexes": "any",
+                },
+                {
+                    "alias": "policies",
+                    "endpoint": "https://operator-private-marker.search.windows.net",
+                    "auth": "managed_identity",
+                    "indexes": "any",
+                },
+            ],
+            id="duplicate-alias",
+        ),
+        pytest.param(
+            [{"alias": "policies", "endpoint": "https://operator-private-marker.search.windows.net", "auth": "managed_identity"}],
+            id="index-pin-absent",
+        ),
+    ],
+)
+def test_settings_from_env_rejects_invalid_azure_search_profiles_without_echoing_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    profiles: list[dict[str, object]],
+) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__AZURE_SEARCH_PROFILES", json.dumps(profiles))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_config.settings_from_env()
+
+    assert "AZURE_SEARCH_PROFILES" in str(exc_info.value).upper()
+    assert "operator-private-marker" not in str(exc_info.value)
+
+
 def test_settings_from_env_rejects_duplicate_s3_profile_aliases_without_echoing_private_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

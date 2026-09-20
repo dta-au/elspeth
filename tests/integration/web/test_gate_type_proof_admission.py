@@ -218,8 +218,8 @@ async def test_validate_and_execute_block_observed_numeric_gate_before_run_creat
     observed = (
         validation_response.status_code,
         validation["is_valid"],
-        validation["checks"][24]["name"],
-        validation["checks"][24]["passed"],
+        validation["checks"][23]["name"],
+        validation["checks"][23]["passed"],
         execution_response.status_code,
         len(runs),
     )

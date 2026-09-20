@@ -154,6 +154,7 @@
         "aws_bedrock_prompt_shield",
         "aws_textract_document_analysis",
         "aws_textract_inline_analysis",
+        "azure_ai_search",
         "azure_content_safety",
         "azure_document_intelligence",
         "azure_prompt_shield",
@@ -21619,9 +21620,9 @@
           }
         },
         {
-          "case_id": "transform:rag_retrieval@azure-search-api-key",
-          "plugin_key": "transform:rag_retrieval",
-          "variant_id": "azure-search-api-key",
+          "case_id": "transform:azure_ai_search@api-key",
+          "plugin_key": "transform:azure_ai_search",
+          "variant_id": "api-key",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -21794,9 +21795,9 @@
           }
         },
         {
-          "case_id": "transform:rag_retrieval@azure-search-managed-identity",
-          "plugin_key": "transform:rag_retrieval",
-          "variant_id": "azure-search-managed-identity",
+          "case_id": "transform:azure_ai_search@managed-identity",
+          "plugin_key": "transform:azure_ai_search",
+          "variant_id": "managed-identity",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {

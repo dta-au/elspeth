@@ -79,6 +79,23 @@ drained and repair this release forward.
   LLM step has no system prompt now fail validation, and adding one reopens
   that step's prompt review. YAML pipelines are unaffected: the runtime
   `system_prompt` option stays optional.
+- **Azure AI Search retrieval is its own transform (breaking).** The new
+  `azure_ai_search` transform (Azure RAG) takes flat options (`endpoint`,
+  `index`, `api_key` or `use_managed_identity` with `client_id`, and
+  `field_content`, `field_id`, `field_title`, `field_url`, `field_vector` for
+  the index field names), and records its readiness probe in the audit trail
+  before the first row. The `azure_search` provider is removed from
+  `rag_retrieval`, which now serves Chroma only: YAML that used
+  `provider: azure_search` must move to the new plugin, and
+  `managed_identity_client_id` is now `client_id`. Web-authored pipelines reach
+  a search service only through an operator profile declared in the new
+  `ELSPETH_WEB__AZURE_SEARCH_PROFILES` setting, whose `indexes` pin is
+  mandatory (`"any"` is the explicit opt-out); the endpoint, key and identity
+  never appear in an authored pipeline. This replaces the blanket refusal of
+  managed identity in web pipelines, and the `managed_identity_policy`
+  validation check is removed with it. See the
+  [environment reference](docs/reference/environment-variables.md#azure-ai-search)
+  and the [Container Apps runbook](docs/runbooks/azure-container-apps-cold-install.md).
 
 - **Coordination deadlines are decided from fresh post-lock database time.**
   Lease deadlines are now issued after locked admission rather than from a

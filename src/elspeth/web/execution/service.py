@@ -186,7 +186,7 @@ from elspeth.web.plugin_policy.coverage import node_has_capability
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
-from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
+from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import (
@@ -1451,7 +1451,7 @@ class ExecutionServiceImpl:
         session_id: UUID | None,
         session_operation_context: SessionOperationContext,
     ) -> ValidationResult:
-        """Run the canonical 24 checks and bounded source proof in one worker."""
+        """Run the canonical 23 checks and bounded source proof in one worker."""
         from elspeth.web.composer.tools.generation import compute_proof_diagnostics
         from elspeth.web.composer.yaml_generator import derive_guided_blob_refs_for_admission_proof
         from elspeth.web.execution.validation import validate_pipeline
@@ -1937,16 +1937,16 @@ class ExecutionServiceImpl:
                                 f"{node.node_type.capitalize()} '{node.id}' {key}='{value}' resolves outside allowed output directories"
                             )
 
-        # The managed-identity + sequential-multi-query retry-budget policy gates
-        # were previously evaluated HERE, on the un-lowered ``composition_state``.
+        # The sequential-multi-query retry-budget policy gate
+        # was previously evaluated HERE, on the un-lowered ``composition_state``.
         # That false-positived operator-profiled multi-query LLM nodes: an
         # operator profile supplies the web-safe ``max_capacity_retry_seconds``
-        # (and RAG credential handling) only at LOWERING, so the persisted
+        # only at LOWERING, so the persisted
         # authored-minimal options legitimately omit the retry budget and would
         # trip ``web_llm_retry_budget_policy_error`` before the profile resolved.
-        # Both gates now run below on ``policy_result.executable_state`` (the
+        # The gate now runs below on ``policy_result.executable_state`` (the
         # profile-lowered state), mirroring the authoritative ``validate_pipeline``
-        # checks (validation.py, after its ``state = policy_result.executable_state``
+        # check (validation.py, after its ``state = policy_result.executable_state``
         # rebind).
 
         # Fail-closed pre-run validation gate (notes/composer-advisor-surface-map-2026-06-08.md).
@@ -1988,13 +1988,14 @@ class ExecutionServiceImpl:
         if policy_result.findings:
             raise RuntimeError("Plugin policy validation diverged between execution preflight and runtime preparation.")
 
-        # Defence-in-depth managed-identity + sequential-multi-query retry-budget
-        # gates, evaluated on the PROFILE-LOWERED executable state so an operator
-        # profile's injected retry budget / credential handling is honoured (raw
-        # authored options omit them). ``validate_pipeline`` above already runs the
-        # identical checks on this same lowered state; this mirror keeps the
+        # Defence-in-depth sequential-multi-query retry-budget gate, evaluated on
+        # the PROFILE-LOWERED executable state so an operator profile's injected
+        # retry budget is honoured (raw authored options omit it). Azure AI Search
+        # needs no mirror here: the ``validate_plugin_policy`` call above refuses any
+        # node without a clean operator-profile binding. ``validate_pipeline`` above
+        # already runs the identical check on this same lowered state; this mirror keeps the
         # execution service fail-closed even if that gate were bypassed (the
-        # tutorial path calls ``execute`` directly). Running them on the un-lowered
+        # tutorial path calls ``execute`` directly). Running it on the un-lowered
         # ``composition_state`` false-positived operator-profiled multi-query nodes.
         # Every PLUGIN-BEARING node (elspeth-df8082552d) — same widening as
         # the validate_pipeline gates this mirrors. This loop's own comment
@@ -2004,33 +2005,6 @@ class ExecutionServiceImpl:
         for node in policy_result.executable_state.nodes:
             if node.plugin is None:
                 continue
-            provider_policy_error = web_rag_provider_config_policy_error(node.options)
-            if provider_policy_error is not None:
-                raise PipelineValidationError(
-                    errors=(
-                        ValidationError(
-                            component_id=node.id,
-                            component_type="transform",
-                            message=provider_policy_error,
-                            suggestion="Use api_key authentication or an operator-controlled named connector/allowlist.",
-                            error_code=None,
-                        ),
-                    ),
-                    readiness=ValidationReadiness(
-                        authoring_valid=False,
-                        execution_ready=False,
-                        completion_ready=False,
-                        blockers=[
-                            ValidationReadinessBlocker(
-                                code="managed_identity_policy",
-                                suggestion=None,
-                                component_id=node.id,
-                                component_type="transform",
-                                detail=f"{node.node_type} {node.id} enables managed identity from web-authored provider_config",
-                            )
-                        ],
-                    ),
-                )
             llm_retry_policy_error = (
                 web_llm_retry_budget_policy_error(node.options) if node_has_capability(node, PluginCapability.LLM) else None
             )

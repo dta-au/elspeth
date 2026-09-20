@@ -671,6 +671,35 @@
       "release_lane": "live-aws"
     },
     {
+      "plugin_key": "transform:azure_ai_search",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.azure.ai_search",
+      "qualname": "AzureAISearchTransform",
+      "source_path": "src/elspeth/plugins/transforms/azure/ai_search.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "process": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "on_complete": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "close": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "api-key",
+        "managed-identity"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-provider"
+    },
+    {
       "plugin_key": "transform:azure_content_safety",
       "kind": "transform",
       "module": "elspeth.plugins.transforms.azure.content_safety",
@@ -1422,17 +1451,15 @@
       "determinism": "external_call",
       "execution_model": "row-transform",
       "lifecycle_owners": {
-        "on_start": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "process": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "on_complete": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "close": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform"
+        "on_start": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "process": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "on_complete": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "close": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase"
       },
       "source_hash_present": true,
       "sink_effect_capability": null,
       "sink_effect_modes": [],
       "variants": [
-        "azure-search-api-key",
-        "azure-search-managed-identity",
         "chroma-ephemeral",
         "chroma-persistent",
         "chroma-client"

@@ -542,6 +542,12 @@ def _lower_profiled_components(
                     f"Plugin '{plugin_id}' requires a canonical relative object key within the selected operator profile. "
                     "Remove absolute, traversal, empty-segment, trailing-separator, or overlong key forms."
                 )
+            elif str(exc) == "profile_index_not_admitted":
+                # Value-free: neither the authored index nor the profile's pin is echoed.
+                message = (
+                    f"Plugin '{plugin_id}': Index is not admitted by the selected Azure AI Search profile; "
+                    "choose an index the profile lists."
+                )
             else:
                 message = f"Plugin '{plugin_id}' operator profile is no longer available."
             findings.append(

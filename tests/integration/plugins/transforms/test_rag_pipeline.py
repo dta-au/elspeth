@@ -12,7 +12,6 @@ import json
 from dataclasses import dataclass, field
 from unittest.mock import patch
 
-import httpx
 import pytest
 
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
@@ -22,8 +21,8 @@ from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
-from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProvider
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
+from elspeth.plugins.transforms.azure.ai_search import AzureAISearchTransform
 from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
 from tests.fixtures.factories import make_context, make_token_info
 
@@ -103,27 +102,15 @@ def _create_transform_with_lifecycle(**config_overrides):
     config = {
         "output_prefix": "policy",
         "query_field": "question",
-        "provider": "azure_search",
-        "provider_config": {
-            "endpoint": "https://test.search.windows.net",
-            "index": "test-index",
-            "api_key": "test-key",
-        },
+        "endpoint": "https://test.search.windows.net",
+        "index": "test-index",
+        "api_key": "test-key",
         "schema_config": {"mode": "observed"},
     }
     config.update(config_overrides)
-    transform = RAGRetrievalTransform(config)
-    # Mock readiness I/O; no real Azure endpoint or DNS is available in tests.
-    mock_resp = httpx.Response(
-        200,
-        text="10",
-        request=httpx.Request("GET", _safe_azure_count_request().connection_url),
-    )
-    with (
-        patch("elspeth.core.security.web.validate_url_for_ssrf", return_value=_safe_azure_count_request()),
-        patch.object(AzureSearchProvider, "_readiness_get", return_value=mock_resp),
-    ):
-        transform.on_start(_mock_lifecycle_ctx())
+    transform = AzureAISearchTransform(config)
+    # on_start makes no network call: readiness is a separate runtime_preflight operation.
+    transform.on_start(_mock_lifecycle_ctx())
     return transform
 
 
@@ -139,7 +126,7 @@ class TestRAGPipelineIntegration:
             RetrievalChunk(content="Policy section 2", score=0.82, source_id="doc2", metadata={"page": 3}),
         ]
 
-        with patch.object(transform._provider, "search", return_value=chunks):
+        with patch.object(transform._searcher, "search", return_value=chunks):
             row = _make_row({"question": "What is the refund policy?"})
             ctx = _mock_ctx()
             result = transform.process(row, ctx)
@@ -167,7 +154,7 @@ class TestRAGPipelineIntegration:
     def test_zero_results_quarantine(self):
         transform = _create_transform_with_lifecycle(on_no_results="quarantine")
 
-        with patch.object(transform._provider, "search", return_value=[]):
+        with patch.object(transform._searcher, "search", return_value=[]):
             row = _make_row({"question": "obscure query"})
             ctx = _mock_ctx()
             result = transform.process(row, ctx)
@@ -178,7 +165,7 @@ class TestRAGPipelineIntegration:
     def test_zero_results_continue_with_sentinels(self):
         transform = _create_transform_with_lifecycle(on_no_results="continue")
 
-        with patch.object(transform._provider, "search", return_value=[]):
+        with patch.object(transform._searcher, "search", return_value=[]):
             row = _make_row({"question": "obscure query"})
             ctx = _mock_ctx()
             result = transform.process(row, ctx)
@@ -198,25 +185,13 @@ class TestRAGPipelineIntegration:
         config = {
             "output_prefix": "policy",
             "query_field": "question",
-            "provider": "azure_search",
-            "provider_config": {
-                "endpoint": "https://test.search.windows.net",
-                "index": "test-index",
-                "api_key": "test-key",
-            },
+            "endpoint": "https://test.search.windows.net",
+            "index": "test-index",
+            "api_key": "test-key",
             "schema_config": {"mode": "observed"},
         }
-        transform = RAGRetrievalTransform(config)
-        mock_resp = httpx.Response(
-            200,
-            text="10",
-            request=httpx.Request("GET", _safe_azure_count_request().connection_url),
-        )
-        with (
-            patch("elspeth.core.security.web.validate_url_for_ssrf", return_value=_safe_azure_count_request()),
-            patch.object(AzureSearchProvider, "_readiness_get", return_value=mock_resp),
-        ):
-            transform.on_start(lifecycle_ctx)
+        transform = AzureAISearchTransform(config)
+        transform.on_start(lifecycle_ctx)
         try:
             transform.on_complete(lifecycle_ctx)
             assert len(telemetry.payloads) == 1
@@ -224,23 +199,15 @@ class TestRAGPipelineIntegration:
             assert isinstance(event, RAGRetrievalStatistics)
             assert event.run_id == "run-1"
             assert event.node_id == "rag-retrieval"
-            assert event.plugin_name == "rag_retrieval"
-            assert event.provider == "azure_search"
+            assert event.plugin_name == "azure_ai_search"
+            assert event.provider == "azure_ai_search"
             assert (event.total_queries, event.total_chunks, event.quarantine_count, event.score_count) == (0, 0, 0, 0)
             assert event.score_mean is None
             assert event.score_std is None
             recorder = lifecycle_ctx.landscape
             assert isinstance(recorder, _LandscapeRecorder)
-            assert recorder.readiness_checks == [
-                {
-                    "name": "rag_retrieval",
-                    "collection": "test-index",
-                    "reachable": True,
-                    "count": 10,
-                    "message": "Index 'test-index' has 10 documents",
-                    "member_token": lifecycle_ctx.require_member_token(),
-                }
-            ]
+            # Readiness runs through runtime_preflight; on_start records no readiness check.
+            assert recorder.readiness_checks == []
         finally:
             transform.close()
 
@@ -362,12 +329,8 @@ class TestRAGExecutionGraphAssembly:
             {
                 "output_prefix": "policy",
                 "query_field": "question",
-                "provider": "azure_search",
-                "provider_config": {
-                    "endpoint": "https://test.search.windows.net",
-                    "index": "test-index",
-                    "api_key": "test-key",
-                },
+                "provider": "chroma",
+                "provider_config": {"collection": "test-index", "mode": "ephemeral"},
                 "schema_config": {"mode": "observed"},
             }
         )

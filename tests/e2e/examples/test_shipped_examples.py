@@ -43,6 +43,7 @@ _EXAMPLES_WITH_ENV_VARS: frozenset[str] = frozenset(
         "azure_blob_sentiment",
         "azure_keyvault_secrets",
         "azure_openai_sentiment",
+        "azure_search_rag",
         "chroma_rag_qa",
         "llm_source",
         "multi_query_assessment",

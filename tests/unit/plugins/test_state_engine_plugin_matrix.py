@@ -35,7 +35,7 @@ def test_checked_golden_matches_live_mechanical_projection_without_writing() -> 
 
     assert result.returncode == 0, result.stderr
     assert GOLDEN.read_bytes() == before
-    assert "55 plugins" in result.stdout
+    assert "56 plugins" in result.stdout
 
 
 def test_checked_golden_has_exact_counts_hashes_and_reviewed_fields() -> None:
@@ -43,7 +43,7 @@ def test_checked_golden_has_exact_counts_hashes_and_reviewed_fields() -> None:
     plugins = matrix["plugins"]
 
     assert matrix["schema_version"] == 1
-    assert [sum(entry["kind"] == kind for entry in plugins) for kind in ("source", "transform", "sink")] == [9, 37, 9]
+    assert [sum(entry["kind"] == kind for entry in plugins) for kind in ("source", "transform", "sink")] == [9, 38, 9]
     assert all(entry["source_hash_present"] is True for entry in plugins)
     assert "UNCLASSIFIED" not in GOLDEN.read_text(encoding="utf-8")
     assert all(

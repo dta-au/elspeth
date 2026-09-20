@@ -456,6 +456,8 @@ files:
     Mapping[str, Any]: 43
     boundary: 2
     dict[str, Any]: 19
+  src/elspeth/plugins/transforms/azure/ai_search.py:
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/azure/base.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/azure/content_safety.py:
@@ -553,10 +555,12 @@ files:
     dict[str, Any]: 4
   src/elspeth/plugins/transforms/rag/config.py:
     dict[str, Any]: 1
+  src/elspeth/plugins/transforms/rag/core.py:
+    dict[str, Any]: 4
   src/elspeth/plugins/transforms/rag/query.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/rag/transform.py:
-    dict[str, Any]: 5
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/reference_join.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
@@ -958,15 +962,15 @@ files:
     Mapping[str, object]: 3
   src/elspeth/web/plugin_policy/profiles.py:
     Mapping[str, object]: 2
-    dict[str, Any]: 17
-    dict[str, object]: 8
+    dict[str, Any]: 21
+    dict[str, object]: 10
   src/elspeth/web/plugin_policy/validation.py:
     Mapping[str, object]: 1
     dict[str, object]: 2
   src/elspeth/web/preferences/service.py:
     dict[str, object]: 2
   src/elspeth/web/provider_config_policy.py:
-    Mapping[str, Any]: 5
+    Mapping[str, Any]: 4
   src/elspeth/web/readiness.py:
     dict[str, Any]: 2
   src/elspeth/web/schema_probe.py:
@@ -1038,10 +1042,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 876
+  Mapping[str, Any]: 875
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1136
-  dict[str, object]: 406
-  soft: 2737
+  dict[str, Any]: 1143
+  dict[str, object]: 408
+  soft: 2745

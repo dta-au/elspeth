@@ -14,6 +14,7 @@ from elspeth.contracts.aws_s3 import (
     s3_profiled_binding_fingerprint,
 )
 from elspeth.contracts.aws_textract import textract_profiled_binding_fingerprint
+from elspeth.contracts.azure_ai_search import AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.core.llm_profiles import lower_llm_profile_options
@@ -30,7 +31,12 @@ from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginId
-from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.plugin_policy.profiles import (
+    AzureSearchProfileSettings,
+    OperatorProfileRegistry,
+    ProfileUnavailableReason,
+    RuntimeWebPluginConfig,
+)
 
 
 def _settings(**overrides: object) -> WebSettings:
@@ -428,11 +434,367 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
         "bedrock_guardrail_default_profiles",
         "aws_s3_source_profiles",
         "aws_textract_profiles",
+        "azure_search_profiles",
         "deployment_aws_region",
     }
     runtime_fields = set(RuntimeWebPluginConfig.__dataclass_fields__)
 
     assert settings_fields == runtime_fields
+
+
+_SEARCH_MI: dict[str, object] = {
+    "alias": "policies",
+    "endpoint": "https://svc-a.search.windows.net",
+    "auth": "managed_identity",
+    "client_id": "11111111-2222-3333-4444-555555555555",
+    "indexes": ["approved-documents"],
+}
+_SEARCH_KEY: dict[str, object] = {
+    "alias": "contracts",
+    "endpoint": "https://svc-b.search.windows.net",
+    "auth": "api_key",
+    "credential_ref": "SEARCH_B_KEY",
+    "indexes": "any",
+}
+
+
+@pytest.mark.parametrize("bad", [{}, {"indexes": []}, {"indexes": None}], ids=["absent", "empty", "null"])
+def test_search_profile_index_pin_is_mandatory(bad: dict[str, object]) -> None:
+    payload = {k: v for k, v in _SEARCH_MI.items() if k != "indexes"} | bad
+    with pytest.raises(ValidationError, match="indexes"):
+        AzureSearchProfileSettings.model_validate(payload)
+
+
+def test_search_profile_any_is_an_explicit_opt_out() -> None:
+    assert AzureSearchProfileSettings.model_validate(_SEARCH_KEY).admits_index("whatever") is True
+    pinned = AzureSearchProfileSettings.model_validate(_SEARCH_MI)
+    assert pinned.admits_index("approved-documents") is True
+    assert pinned.admits_index("other") is False
+    # "any" is the opt-out only as the whole value: an index that happens to be NAMED "any" is an ordinary pin.
+    named_any = AzureSearchProfileSettings.model_validate(_SEARCH_MI | {"indexes": ["any"]})
+    assert named_any.admits_index("any") is True
+    assert named_any.admits_index("other") is False
+
+
+@pytest.mark.parametrize(
+    ("override", "reason"),
+    [
+        ({"auth": "managed_identity", "credential_ref": "X", "client_id": None}, "must not set credential_ref"),
+        ({"auth": "api_key", "client_id": "abc", "credential_ref": "SEARCH_B_KEY"}, "must not set client_id"),
+        ({"auth": "api_key", "client_id": None, "credential_ref": None}, "require credential_ref"),
+        ({"endpoint": "http://svc-a.search.windows.net"}, "endpoint"),
+        ({"endpoint": "https://evil.example.com"}, "managed identity"),
+        ({"indexes": ["bad name"]}, r"rules at: index \["),
+        ({"indexes": "every"}, "indexes"),
+        ({"api_version": "not-a-version"}, "api_version"),
+    ],
+)
+def test_search_profile_rejects_inconsistent_bindings(override: dict[str, object], reason: str) -> None:
+    with pytest.raises(ValidationError, match=reason):
+        AzureSearchProfileSettings.model_validate(_SEARCH_MI | override)
+
+
+def test_search_profile_api_key_binding_may_name_any_https_host() -> None:
+    # The Azure-suffix rule protects the server's managed identity token; a query key carries no such risk.
+    profile = AzureSearchProfileSettings.model_validate(_SEARCH_KEY | {"endpoint": "https://search.internal.example.com"})
+    assert profile.auth == "api_key"
+
+
+def test_search_profile_errors_and_repr_do_not_echo_the_binding() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        AzureSearchProfileSettings.model_validate(_SEARCH_MI | {"endpoint": "https://evil.example.com"})
+    assert "evil.example.com" not in str(excinfo.value)
+    rendered = repr(AzureSearchProfileSettings.model_validate(_SEARCH_KEY))
+    assert "svc-b" not in rendered
+    assert "SEARCH_B_KEY" not in rendered
+
+
+def test_search_profile_aliases_must_be_unique() -> None:
+    with pytest.raises(ValidationError, match="Azure Search profile aliases must be unique"):
+        _settings(azure_search_profiles=(_SEARCH_MI, _SEARCH_MI))
+
+
+def test_runtime_config_carries_search_profiles_sorted() -> None:
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(azure_search_profiles=(_SEARCH_MI, _SEARCH_KEY)))
+    assert [profile.alias for profile in runtime.azure_search_profiles] == ["contracts", "policies"]
+    assert "svc-a" not in repr(runtime)
+
+
+def _search_registry(**overrides: object) -> tuple[OperatorProfileRegistry, PluginId]:
+    defaults: dict[str, object] = {
+        "plugin_allowlist": ("transform:azure_ai_search",),
+        "azure_search_profiles": (_SEARCH_MI, _SEARCH_KEY),
+        "server_secret_allowlist": ("SEARCH_B_KEY",),
+    }
+    defaults.update(overrides)
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(**defaults))
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+    return registry, PluginId("transform", "azure_ai_search")
+
+
+_SEARCH_AUTHORED: dict[str, object] = {
+    "output_prefix": "policy",
+    "query_field": "question",
+    "index": "approved-documents",
+    "schema": {"mode": "observed"},
+}
+
+
+class _SearchInventory:
+    """Server secret inventory holding exactly the names it is given."""
+
+    def __init__(self, *server_refs: str) -> None:
+        self._server_refs = frozenset(server_refs)
+
+    def has_server_ref(self, name: str) -> bool:
+        return name in self._server_refs
+
+    def has_user_ref(self, principal: str, name: str) -> bool:
+        return False
+
+    def server_generation(self, name: str) -> str | None:
+        return f"generation-of-{name}" if name in self._server_refs else None
+
+    def user_generation(self, principal: str, name: str) -> str | None:
+        return None
+
+
+def _search_public_schema(*aliases: str) -> PluginSchemaInfo:
+    registry, plugin_id = _search_registry()
+    return registry.public_schema(
+        plugin_id,
+        create_catalog_service().get_schema("transform", "azure_ai_search"),
+        available_aliases=aliases,
+    )
+
+
+def test_search_public_schema_hides_every_private_binding() -> None:
+    public = _search_public_schema("contracts", "policies")
+    properties = public.json_schema["properties"]
+
+    assert properties["profile"]["enum"] == ["contracts", "policies"]
+    assert not set(properties) & AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
+    assert {"index", "search_mode", "field_content", "select", "filter", "output_prefix", "query_field"} <= set(properties)
+    assert public.json_schema["additionalProperties"] is False
+    assert "profile" in public.json_schema["required"]
+    assert "index" in public.json_schema["required"]
+    assert "endpoint" not in public.json_schema["required"]
+    knob_names = {knob["name"] for knob in public.knob_schema["fields"]}
+    assert knob_names == set(properties)
+    assert public.secret_requirements == ()
+    assert any("Azure RAG" in hint for hint in public.composer_hints)
+    Draft202012Validator.check_schema(public.json_schema)
+
+
+def test_search_public_schema_tells_the_author_which_indexes_each_profile_admits() -> None:
+    description = _search_public_schema("contracts", "policies").json_schema["properties"]["profile"]["description"]
+
+    assert "policies: approved-documents" in description
+    assert "contracts: any index" in description
+    # The binding itself stays private.
+    assert "svc-a" not in description
+    assert "SEARCH_B_KEY" not in description
+
+
+def test_search_public_schema_lists_only_the_available_profiles() -> None:
+    description = _search_public_schema("policies").json_schema["properties"]["profile"]["description"]
+
+    assert "policies" in description
+    assert "contracts" not in description
+
+
+def test_search_index_becomes_a_choice_only_for_a_sole_pinned_profile() -> None:
+    assert _search_public_schema("policies").json_schema["properties"]["index"]["enum"] == ["approved-documents"]
+    # Two profiles admit different indexes, and "any" admits all of them: neither can be one closed list.
+    assert "enum" not in _search_public_schema("contracts", "policies").json_schema["properties"]["index"]
+    assert "enum" not in _search_public_schema("contracts").json_schema["properties"]["index"]
+    # Two CLOSED pins are still two lists: offering the first profile's indexes would
+    # steer an author who picks the second profile onto an index it does not admit.
+    second_pin = _SEARCH_MI | {"alias": "hr", "indexes": ["hr-records"]}
+    registry, plugin_id = _search_registry(azure_search_profiles=(_SEARCH_MI, second_pin))
+    both_pinned = registry.public_schema(
+        plugin_id,
+        create_catalog_service().get_schema("transform", "azure_ai_search"),
+        available_aliases=("hr", "policies"),
+    )
+    assert "enum" not in both_pinned.json_schema["properties"]["index"]
+    assert all("choices" not in knob for knob in both_pinned.knob_schema["fields"] if knob["name"] == "index")
+
+
+def test_search_public_schema_rejects_non_mapping_properties() -> None:
+    registry, plugin_id = _search_registry()
+    full = create_catalog_service().get_schema("transform", "azure_ai_search")
+    malformed = full.model_copy(update={"json_schema": {**full.json_schema, "properties": ["endpoint"]}})
+
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        registry.public_schema(plugin_id, malformed, available_aliases=("policies",))
+
+
+def test_search_lowering_injects_managed_identity_binding() -> None:
+    registry, plugin_id = _search_registry()
+
+    lowered = registry.lower_options(plugin_id, alias="policies", safe_options=dict(_SEARCH_AUTHORED))
+
+    executable = deep_thaw(lowered.executable_options)
+    assert executable["endpoint"] == "https://svc-a.search.windows.net"
+    assert executable["use_managed_identity"] is True
+    assert executable["client_id"] == "11111111-2222-3333-4444-555555555555"
+    assert "api_key" not in executable
+    assert deep_thaw(lowered.audit_safe_options) == {"profile": "policies", **_SEARCH_AUTHORED}
+    assert "svc-a" not in repr(lowered)
+
+
+def test_search_lowering_injects_a_server_secret_reference_not_a_value() -> None:
+    registry, plugin_id = _search_registry()
+
+    lowered = registry.lower_options(plugin_id, alias="contracts", safe_options={**_SEARCH_AUTHORED, "index": "anything"})
+
+    executable = deep_thaw(lowered.executable_options)
+    assert executable["endpoint"] == "https://svc-b.search.windows.net"
+    assert executable["api_key"] == {"secret_ref": "SEARCH_B_KEY", "secret_scope": "server"}
+    assert "use_managed_identity" not in executable
+    assert "client_id" not in executable
+
+
+def test_search_lowering_carries_the_profile_api_version_only_when_set() -> None:
+    registry, plugin_id = _search_registry(azure_search_profiles=(_SEARCH_MI | {"api_version": "2024-05-01-preview"}, _SEARCH_KEY))
+
+    pinned = deep_thaw(registry.lower_options(plugin_id, alias="policies", safe_options=dict(_SEARCH_AUTHORED)).executable_options)
+    default = deep_thaw(registry.lower_options(plugin_id, alias="contracts", safe_options=dict(_SEARCH_AUTHORED)).executable_options)
+
+    assert pinned["api_version"] == "2024-05-01-preview"
+    assert "api_version" not in default
+
+
+def test_search_lowered_options_construct_the_real_plugin_config() -> None:
+    from elspeth.plugins.transforms.azure.ai_search import AzureAISearchConfig
+
+    registry, plugin_id = _search_registry()
+    lowered = registry.lower_options(plugin_id, alias="policies", safe_options=dict(_SEARCH_AUTHORED))
+
+    config = AzureAISearchConfig.from_dict(deep_thaw(lowered.executable_options), plugin_name="azure_ai_search")
+
+    assert config.provider_config().auth_mode == "managed_identity"
+    assert config.index == "approved-documents"
+
+
+def test_two_profiles_lower_to_two_services() -> None:
+    registry, plugin_id = _search_registry()
+
+    a = deep_thaw(registry.lower_options(plugin_id, alias="policies", safe_options=dict(_SEARCH_AUTHORED)).executable_options)
+    b = deep_thaw(registry.lower_options(plugin_id, alias="contracts", safe_options=dict(_SEARCH_AUTHORED)).executable_options)
+
+    assert {a["endpoint"], b["endpoint"]} == {"https://svc-a.search.windows.net", "https://svc-b.search.windows.net"}
+
+
+@pytest.mark.parametrize("option", sorted(AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES))
+def test_search_lowering_refuses_an_authored_private_option(option: str) -> None:
+    registry, plugin_id = _search_registry()
+
+    with pytest.raises(ValueError, match=r"^private_profile_option$"):
+        registry.lower_options(plugin_id, alias="policies", safe_options={**_SEARCH_AUTHORED, option: "x"})
+
+
+@pytest.mark.parametrize(
+    "index",
+    ["hr-records", "Approved-Documents", "approved-documents ", "any", None, ["approved-documents"], 7],
+    ids=["other", "case-variant", "padded", "the-word-any", "null", "list", "int"],
+)
+def test_search_lowering_refuses_an_index_outside_the_pin(index: object) -> None:
+    registry, plugin_id = _search_registry()
+
+    with pytest.raises(ValueError, match=r"^profile_index_not_admitted$"):
+        registry.lower_options(plugin_id, alias="policies", safe_options={**_SEARCH_AUTHORED, "index": index})
+
+
+def test_search_lowering_refuses_a_missing_index_even_for_an_any_profile() -> None:
+    registry, plugin_id = _search_registry()
+    authored = {name: value for name, value in _SEARCH_AUTHORED.items() if name != "index"}
+
+    with pytest.raises(ValueError, match=r"^profile_index_not_admitted$"):
+        registry.lower_options(plugin_id, alias="contracts", safe_options=authored)
+
+
+def test_search_unknown_alias_is_unavailable() -> None:
+    registry, plugin_id = _search_registry()
+
+    with pytest.raises(ValueError, match=r"^profile_unavailable$"):
+        registry.lower_options(plugin_id, alias="nope", safe_options=dict(_SEARCH_AUTHORED))
+
+
+def test_search_has_no_silent_default_among_several_sources() -> None:
+    registry, plugin_id = _search_registry()
+
+    assert registry.selected_profile_alias(plugin_id, usable_aliases=("contracts", "policies")) is None
+    assert registry.selected_profile_alias(plugin_id, usable_aliases=("policies",)) == "policies"
+
+
+def test_no_profiles_means_no_resolver_and_no_web_availability() -> None:
+    registry, plugin_id = _search_registry(azure_search_profiles=())
+
+    assert registry.profile_availability(plugin_id, principal="local:alice", inventory=_SearchInventory()) == ()
+    with pytest.raises(ValueError, match=r"^plugin_has_no_operator_profile$"):
+        registry.lower_options(plugin_id, alias="policies", safe_options=dict(_SEARCH_AUTHORED))
+
+
+def test_search_api_key_profile_is_usable_only_when_the_server_holds_its_secret() -> None:
+    registry, plugin_id = _search_registry()
+
+    held = {
+        item.alias: item
+        for item in registry.profile_availability(plugin_id, principal="local:alice", inventory=_SearchInventory("SEARCH_B_KEY"))
+    }
+    missing = {item.alias: item for item in registry.profile_availability(plugin_id, principal="local:alice", inventory=_SearchInventory())}
+
+    assert held["contracts"].usable is True
+    assert held["contracts"].credential_scope == "server"
+    assert missing["contracts"].usable is False
+    assert missing["contracts"].reason is ProfileUnavailableReason.CREDENTIAL_MISSING
+    assert missing["contracts"].generation is None
+    # Managed identity needs no stored secret.
+    assert missing["policies"].usable is True
+    assert missing["policies"].credential_scope is None
+
+
+def test_search_binding_generation_moves_with_the_binding_and_the_secret() -> None:
+    def generations(registry: OperatorProfileRegistry, plugin_id: PluginId, inventory: _SearchInventory) -> dict[str, str | None]:
+        return {
+            item.alias: item.generation for item in registry.profile_availability(plugin_id, principal="local:alice", inventory=inventory)
+        }
+
+    registry, plugin_id = _search_registry()
+    base = generations(registry, plugin_id, _SearchInventory("SEARCH_B_KEY"))
+    assert base["policies"] is not None and base["contracts"] is not None
+    assert base["policies"] != base["contracts"]
+
+    repinned, _ = _search_registry(azure_search_profiles=(_SEARCH_MI | {"indexes": ["approved-documents", "hr-records"]}, _SEARCH_KEY))
+    assert generations(repinned, plugin_id, _SearchInventory("SEARCH_B_KEY"))["policies"] != base["policies"]
+
+    class _Rotated(_SearchInventory):
+        def server_generation(self, name: str) -> str | None:
+            return f"rotated-{name}" if self.has_server_ref(name) else None
+
+    assert generations(registry, plugin_id, _Rotated("SEARCH_B_KEY"))["contracts"] != base["contracts"]
+    assert generations(registry, plugin_id, _Rotated("SEARCH_B_KEY"))["policies"] == base["policies"]
+
+
+def test_search_managed_identity_profile_needs_the_azure_identity_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    registry, plugin_id = _search_registry()
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: None if name == "azure.identity" else real_find_spec(name, *args))
+
+    managed = registry.check_local_requirements(plugin_id, "policies")
+    keyed = registry.check_local_requirements(plugin_id, "contracts")
+
+    assert managed.available is False
+    assert managed.reason is ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING
+    assert keyed.available is True
+    assert registry.check_local_requirements(plugin_id, "nope").available is False
 
 
 def _textract_runtime(**overrides: object) -> RuntimeWebPluginConfig:

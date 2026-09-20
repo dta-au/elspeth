@@ -35,7 +35,11 @@ from elspeth.web.auth.urls import (
 )
 from elspeth.web.compartments import COMPARTMENT_ID_PATTERN, is_compartment_id
 from elspeth.web.composer.reasoning import ReasoningEffort
-from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings, AWSTextractProfileSettings
+from elspeth.web.plugin_policy.profiles import (
+    AWSS3SourceProfileSettings,
+    AWSTextractProfileSettings,
+    AzureSearchProfileSettings,
+)
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
@@ -482,6 +486,7 @@ class WebSettings(BaseModel):
     bedrock_guardrail_default_profiles: Mapping[str, str] = Field(default_factory=dict)
     aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = ()
     aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = ()
+    azure_search_profiles: tuple[AzureSearchProfileSettings, ...] = ()
     orphan_run_max_age_seconds: int = Field(default=3600, ge=60)
     orphan_run_check_interval_seconds: int = Field(default=300, ge=30)
     # External-call rate limits for web-executed runs: the same block a CLI
@@ -972,6 +977,17 @@ class WebSettings(BaseModel):
             raise ValueError("AWS Textract profile aliases must be unique")
         return profiles
 
+    @field_validator("azure_search_profiles")
+    @classmethod
+    def _validate_azure_search_profiles(
+        cls,
+        profiles: tuple[AzureSearchProfileSettings, ...],
+    ) -> tuple[AzureSearchProfileSettings, ...]:
+        aliases = [profile.alias for profile in profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("Azure Search profile aliases must be unique")
+        return profiles
+
     @field_validator("operator_telemetry_service_name")
     @classmethod
     def _validate_operator_telemetry_service_name(cls, value: str) -> str:
@@ -1401,6 +1417,7 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
         "bedrock_guardrail_profiles",
         "aws_s3_source_profiles",
         "aws_textract_profiles",
+        "azure_search_profiles",
         "secret_wiring_allowlist",
     }
 )
@@ -1548,6 +1565,7 @@ def settings_from_env() -> WebSettings:
             "bedrock_guardrail_default_profiles",
             "aws_s3_source_profiles",
             "aws_textract_profiles",
+            "azure_search_profiles",
         }
         safe_paths = {
             str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))
