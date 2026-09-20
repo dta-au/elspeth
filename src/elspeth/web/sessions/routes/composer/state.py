@@ -85,6 +85,7 @@ from .._helpers import (
     _state_data_from_composer_state,
     _state_from_record,
     _state_response,
+    _validation_entry_responses,
     _verify_session_ownership,
     datetime,
     generate_public_yaml,
@@ -613,7 +614,15 @@ async def get_current_state(
     if state is None:
         return None
     with _named_guided_custody_projection():
-        return _state_response(state, policy_catalog=catalog)
+        response = _state_response(state, policy_catalog=catalog)
+        # Suggestions belong to this graph version, so reload recomputes the
+        # same Stage-1 advice used after composing. Preserve policy/custody
+        # admission before reconstructing the owned record for validation.
+        composition = _state_from_record(state)
+        validation = await run_sync_in_worker(composition.validate)
+        response.validation_warnings = _validation_entry_responses(validation.warnings)
+        response.validation_suggestions = _validation_entry_responses(validation.suggestions)
+        return response
 
 
 @router.get(

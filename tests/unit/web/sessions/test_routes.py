@@ -8384,6 +8384,7 @@ sinks:
                 sources=sources,
                 nodes=nodes,
                 outputs=outputs,
+                metadata_={"name": "Corrupt plugin projection", "description": ""},
                 is_valid=False,
             ),
             provenance="session_seed",
@@ -8422,9 +8423,12 @@ sinks:
                         "plugin": "batch_stats",
                         "input": "pages",
                         "on_success": "out",
+                        "on_error": "discard",
+                        "options": {},
                     }
                 ],
-                outputs=[{"name": "out", "plugin": "json"}],
+                outputs=[{"name": "out", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
+                metadata_={"name": "Collector state read", "description": ""},
                 is_valid=False,
             ),
             provenance="session_seed",
@@ -11245,7 +11249,11 @@ class TestNewStateHasNoLineage:
         await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(sources=sources, is_valid=True),
+            CompositionStateData(
+                sources=sources,
+                metadata_={"name": "Multi-source", "description": ""},
+                is_valid=True,
+            ),
             provenance="session_seed",
         )
 
@@ -12669,6 +12677,7 @@ def _advisor_blocked_preflight(state: CompositionState) -> ValidationResultModel
             completion_ready=False,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
                     code=ADVISOR_SIGNOFF_BLOCKED_CODE,
                     component_id="pipeline",
                     component_type="pipeline",
@@ -12738,7 +12747,9 @@ async def test_state_data_overwrites_carried_forward_gate() -> None:
     state = _make_authoring_valid_partial("gate-overwrite")
     stale_meta = {
         "repair_turns_used": 2,
-        "completion_gates": {"advisor_signoff": {"status": "blocked", "detail": "stale verdict", "for_graph": "0" * 64}},
+        "completion_gates": {
+            "advisor_signoff": {"status": "blocked", "detail": "stale verdict", "for_graph": "0" * 64, "suggestion": None}
+        },
     }
     state_data = await _state_data_with_preflight(
         state,
@@ -12761,7 +12772,7 @@ async def test_state_data_preserves_prior_gate_on_non_adjudicating_save(monkeypa
     from elspeth.web.sessions.routes import _helpers as routes
 
     state = _make_authoring_valid_partial("gate-preserve")
-    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64}}
+    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64, "suggestion": None}}
 
     async def fake_preflight(*args: Any, **kwargs: Any) -> ValidationResult:
         del args, kwargs
@@ -12780,7 +12791,7 @@ async def test_state_data_adjudicated_clean_save_still_clears_prior_gate() -> No
     """An adjudicated clean compose result overwrites: offering a prior fact
     must not make a blocked verdict sticky across a clean advisor turn."""
     state = _make_authoring_valid_partial("gate-clear-adjudicated")
-    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64}}
+    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64, "suggestion": None}}
 
     state_data = await _state_data_with_preflight(
         state,
