@@ -460,6 +460,40 @@ hit, and what was done:
   second one. Role writes now refresh it.
 - A typed cap survived a change of dimension. It is cleared.
 
+Implementation review, 2026-09-20
+(`docs/plans/2026-09-20-people-access-implementation-review.md`, against
+`a76afb5cf`): nine findings, all reproduced and all repaired on the branch. Each
+repair has a regression that goes red when the repair is reverted.
+
+- Generated passwords leave the screen when the local-accounts capability is
+  lost, and a reset that answers after the loss is dropped: the callback a
+  section captured when it sent the request belongs to the old generation.
+- Role grants and approver links are read to the end (pages of 200, bounded at
+  2000 with a stated "more not shown"), because both lists answer questions of
+  absence.
+- A change report names the person it came from. A write for one person that
+  finishes after the administrator moved on refreshes the list and leaves the
+  selection alone; a key migration applies only to the person still selected.
+- Search finds a person prepared ahead of sign-in by the account name and email
+  they are shown under. The route names the matching linked accounts and the
+  authority joins them before slicing, under the same never-admitted rule as the
+  profile.
+- The last-administrator refusal asks the credential store whether a credential
+  exists. A last administrator with none is the residue of a deletion whose
+  retirement failed; retiring them is the documented recovery and is what lets
+  `bootstrap-admin` work again. A last administrator who can sign in is refused
+  as before. Known limit: an administrator in that residue state still counts
+  toward the total, so the other administrator can be removed while they exist.
+- A failed "Check current details" keeps its control and the block. A 5xx on a
+  write is reported as unknown, not as a refusal that changed nothing.
+- Checking an unanswered deletion re-reads the person. A person who is gone is
+  the deletion having landed; an account gone with the identity still live
+  offers "Finish removing".
+- Changing section asks before discarding a draft, by pointer and by keyboard.
+- Case folding in search is Unicode on SQLite (a connection function, not a
+  redefined `lower`) and the account segment folds with `lower` too, so both
+  segments agree. "ß" no longer matches "SS" in the account segment.
+
 Not done:
 
 - A manual screen-reader pass with a human listener. The accessibility tree was
