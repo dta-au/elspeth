@@ -17,7 +17,7 @@ import pytest
 import structlog
 from sqlalchemy import Connection, Engine, create_engine, event, func, insert, inspect, select, text, update
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import leader_coordination_token
@@ -52,6 +52,8 @@ from elspeth.web.schema_probe import (
 )
 from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
+    blob_inline_resolutions_table,
+    blob_replacement_cleanups_table,
     guided_operation_events_table,
     guided_operations_table,
     skill_markdown_history_table,
@@ -109,6 +111,81 @@ def test_fresh_create_reaches_current(postgres_engine: Engine, kind: str) -> Non
         assert probe_landscape_schema(postgres_engine) is SchemaState.MISSING
         init_landscape_schema(postgres_engine)
         assert probe_landscape_schema(postgres_engine) is SchemaState.CURRENT
+
+
+def _inline_resolution_values(content_hash: str) -> dict[str, object]:
+    return {
+        "run_id": "absent-run",
+        "attempt": 1,
+        "field_path": "source.options.system_prompt",
+        "blob_id": "blob",
+        "content_hash": content_hash,
+        "byte_length": 1,
+        "mime_type": "text/plain",
+        "encoding": "utf-8",
+        "resolved_at": datetime.now(UTC),
+    }
+
+
+def _replacement_cleanup_values(column: str, value: str) -> dict[str, object]:
+    now = datetime.now(UTC)
+    values: dict[str, object] = {
+        "blob_id": "blob",
+        "replacement_id": "replacement",
+        "session_id": "absent-session",
+        "storage_path": "/data/blobs/a",
+        "staging_path": "/data/blobs/a.staging",
+        "backup_path": "/data/blobs/a.backup",
+        "operation_id": "operation-1",
+        "operation_epoch": 1,
+        "operation_kind": "compose",
+        "lease_token": "lease-1",
+        "owner_instance_id": "instance-1",
+        "phase": "intent",
+        "old_blob_snapshot": {},
+        "replacement_blob_snapshot": {},
+        "old_blob_snapshot_hash": "a" * 64,
+        "replacement_blob_snapshot_hash": "b" * 64,
+        "old_size_bytes": 1,
+        "old_content_hash": "c" * 64,
+        "replacement_size_bytes": 1,
+        "replacement_content_hash": "d" * 64,
+        "created_at": now,
+        "updated_at": now,
+    }
+    values[column] = value
+    return values
+
+
+@pytest.mark.parametrize("bad_hash", ["A" * 64, "g" * 64, "a" * 63], ids=["uppercase-hex", "non-hex-letter", "too-short"])
+def test_postgres_blob_evidence_hash_checks_require_lowercase_sha256(postgres_engine: Engine, bad_hash: str) -> None:
+    # The PostgreSQL arm of ``_lower_sha256_constraints`` is a POSIX regex the
+    # SQLite suite never executes. The parent rows are deliberately absent:
+    # PostgreSQL evaluates a row's CHECKs before its foreign keys, so a bad hash
+    # must fail on the named CHECK while a well-formed hash gets past every
+    # CHECK and fails on the foreign key instead -- the positive control.
+    init_session_schema(postgres_engine)
+    cases = [
+        (blob_inline_resolutions_table, _inline_resolution_values, "ck_blob_inline_resolutions_hash_format"),
+        *(
+            (
+                blob_replacement_cleanups_table,
+                lambda value, column=column: _replacement_cleanup_values(column, value),
+                f"ck_blob_replacement_cleanups_{stem}_hash_format",
+            )
+            for column, stem in (
+                ("old_blob_snapshot_hash", "old_snapshot"),
+                ("replacement_blob_snapshot_hash", "replacement_snapshot"),
+                ("old_content_hash", "old_content"),
+                ("replacement_content_hash", "replacement_content"),
+            )
+        ),
+    ]
+    for table, build, constraint in cases:
+        with pytest.raises(IntegrityError, match=constraint), postgres_engine.begin() as conn:
+            conn.execute(insert(table).values(**build(bad_hash)))
+        with pytest.raises(IntegrityError, match="violates foreign key constraint"), postgres_engine.begin() as conn:
+            conn.execute(insert(table).values(**build("e" * 64)))
 
 
 def test_preferences_omitted_mode_uses_freeform_database_default(postgres_engine: Engine) -> None:

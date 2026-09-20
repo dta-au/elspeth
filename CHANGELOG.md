@@ -16,8 +16,9 @@ container-wide quota scans, durable guided fork failure diagnostics, and the
 freeform default preference with removal of the retired mode banner field.
 Session epoch 62 requires nullable backend suggestions in durable advisor
 completion gates and rejects earlier stores at startup before session reload.
-Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK enforce
-the full lowercase SHA-256 shape rather than the length alone.
+Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
+four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
+SHA-256 shape rather than the length alone.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 42 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching

@@ -15,6 +15,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
     blob_deletion_cleanups_table,
+    blob_replacement_cleanups_table,
     blobs_table,
     composition_states_table,
     metadata,
@@ -232,6 +233,71 @@ def test_blob_deletion_cleanup_rejects_invalid_exact_ledger_constraints(
         values.update(overrides)
         with pytest.raises(IntegrityError):
             conn.execute(insert(blob_deletion_cleanups_table).values(**values))
+
+
+def _blob_replacement_cleanup_values(session_id: str) -> dict[str, object]:
+    now = datetime.now(UTC)
+    blob_id = str(uuid.uuid4())
+    storage_path = f"/data/blobs/{session_id}/{blob_id}_artifact.txt"
+    return {
+        "blob_id": blob_id,
+        "replacement_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "storage_path": storage_path,
+        "staging_path": f"{storage_path}.staging",
+        "backup_path": f"{storage_path}.backup",
+        "operation_id": "operation-1",
+        "operation_epoch": 1,
+        "operation_kind": "compose",
+        "lease_token": "lease-1",
+        "owner_instance_id": "instance-1",
+        "phase": "intent",
+        "old_blob_snapshot": {},
+        "replacement_blob_snapshot": {},
+        "old_blob_snapshot_hash": "a" * 64,
+        "replacement_blob_snapshot_hash": "b" * 64,
+        "old_size_bytes": 4,
+        "old_content_hash": "c" * 64,
+        "replacement_size_bytes": 5,
+        "replacement_content_hash": "d" * 64,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def test_blob_replacement_cleanup_accepts_lowercase_sha256_evidence(engine) -> None:
+    # Positive control for the rejection matrix below: the baseline row those
+    # cases mutate must itself be admissible, or every rejection is vacuous.
+    with engine.begin() as conn:
+        session_id, _state_id = _seed_session_state(conn)
+        conn.execute(insert(blob_replacement_cleanups_table).values(**_blob_replacement_cleanup_values(session_id)))
+
+
+@pytest.mark.parametrize(
+    ("column", "constraint"),
+    [
+        ("old_blob_snapshot_hash", "ck_blob_replacement_cleanups_old_snapshot_hash_format"),
+        ("replacement_blob_snapshot_hash", "ck_blob_replacement_cleanups_replacement_snapshot_hash_format"),
+        ("old_content_hash", "ck_blob_replacement_cleanups_old_content_hash_format"),
+        ("replacement_content_hash", "ck_blob_replacement_cleanups_replacement_content_hash_format"),
+    ],
+)
+@pytest.mark.parametrize("bad_hash", ["A" * 64, "g" * 64, "a" * 63], ids=["uppercase-hex", "non-hex-letter", "too-short"])
+def test_blob_replacement_cleanup_rejects_non_lowercase_sha256_evidence(
+    engine,
+    column: str,
+    constraint: str,
+    bad_hash: str,
+) -> None:
+    # The replacement ledger is recovery evidence: a hash that is 64 characters
+    # of anything but lowercase hex can never match real bytes, so recovery
+    # would compare against a value no file can produce.
+    with engine.begin() as conn:
+        session_id, _state_id = _seed_session_state(conn)
+        values = _blob_replacement_cleanup_values(session_id)
+        values[column] = bad_hash
+        with pytest.raises(IntegrityError, match=constraint):
+            conn.execute(insert(blob_replacement_cleanups_table).values(**values))
 
 
 @pytest.mark.parametrize(

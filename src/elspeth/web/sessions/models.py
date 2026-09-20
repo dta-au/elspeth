@@ -344,7 +344,8 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #     Semantic-only JSON grammar cut: reject earlier stores at startup before
 #     an old blocked envelope can fail during session reload. No migration.
 # 63: blob_inline_resolutions.content_hash carries the full lowercase SHA-256
-#     shape, not the length alone (elspeth-f99b16fc2f). Pre-1.0 delete/recreate.
+#     shape, not the length alone (elspeth-f99b16fc2f), and so do the four
+#     blob_replacement_cleanups evidence hashes. Pre-1.0 delete/recreate.
 SESSION_SCHEMA_EPOCH = 63
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
@@ -3026,15 +3027,15 @@ blob_replacement_cleanups_table = Table(
     CheckConstraint("old_size_bytes >= 0", name="ck_blob_replacement_cleanups_old_size_nonnegative"),
     CheckConstraint("replacement_size_bytes >= 0", name="ck_blob_replacement_cleanups_replacement_size_nonnegative"),
     CheckConstraint("updated_at >= created_at", name="ck_blob_replacement_cleanups_monotonic_timestamps"),
-    CheckConstraint("length(old_blob_snapshot_hash) = 64", name="ck_blob_replacement_cleanups_old_snapshot_hash_length"),
-    CheckConstraint(
-        "length(replacement_blob_snapshot_hash) = 64",
-        name="ck_blob_replacement_cleanups_replacement_snapshot_hash_length",
+    *_lower_sha256_constraints("old_blob_snapshot_hash", name="ck_blob_replacement_cleanups_old_snapshot_hash_format"),
+    *_lower_sha256_constraints(
+        "replacement_blob_snapshot_hash",
+        name="ck_blob_replacement_cleanups_replacement_snapshot_hash_format",
     ),
-    CheckConstraint("length(old_content_hash) = 64", name="ck_blob_replacement_cleanups_old_content_hash_length"),
-    CheckConstraint(
-        "length(replacement_content_hash) = 64",
-        name="ck_blob_replacement_cleanups_replacement_content_hash_length",
+    *_lower_sha256_constraints("old_content_hash", name="ck_blob_replacement_cleanups_old_content_hash_format"),
+    *_lower_sha256_constraints(
+        "replacement_content_hash",
+        name="ck_blob_replacement_cleanups_replacement_content_hash_format",
     ),
 )
 

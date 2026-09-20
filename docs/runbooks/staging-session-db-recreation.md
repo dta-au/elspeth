@@ -33,8 +33,9 @@ do not migrate stored preferences.
 Session epoch 62 requires the backend-computed nullable suggestion in durable
 advisor completion-gate facts. This semantic JSON format change rejects older
 stores at startup; it does not change the Landscape schema.
-Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK enforce
-the full lowercase SHA-256 shape rather than the length alone.
+Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
+four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
+SHA-256 shape rather than the length alone.
 These intermediate definitions
 share one prepared 0.8.1 cutover; installing the intermediate ACA pair is not
 required. This procedure describes an operator action, not an already
