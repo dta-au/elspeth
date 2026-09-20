@@ -441,7 +441,7 @@ Deliberately not done, per this plan's own sequencing:
   `index-BWHaANf9.js` → `index-DiiDGqdX.js`. The service had been up since
   `721ea0cfe`, so the restart also deployed the People & access panel. No
   session-schema change was in that range.
-- Driven through the page as `dta_user`: tutorial reset → graduation (session
+- Driven through the page as the DTA test account: tutorial reset → graduation (session
   `66b548ac`; the L1 copy and the L7/L10 tables seen live), a two-prompt A/B
   fork/coalesce (`60ab6a67`), a threshold gate to two sinks (`c9e1d1dd`), and an
   uploaded-file filter with a follow-up edit (`cfe8b516`). All outputs correct.
