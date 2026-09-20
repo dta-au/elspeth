@@ -22,6 +22,7 @@ from elspeth.plugins.llm.config_validation import (
     OPENROUTER_BASE_URL_APPLIES_WHEN,
     OPENROUTER_MODEL_VALUE_SOURCES,
     normalize_openrouter_base_url,
+    validate_bedrock_credential_fields,
 )
 from elspeth.plugins.sources.llm.config import (
     AzureOpenAILLMSourceConfig,
@@ -442,3 +443,38 @@ def test_provider_value_sources_use_shared_declarations() -> None:
     assert BedrockConfig.VALUE_SOURCES is BEDROCK_VALUE_SOURCES
     assert GatewayLLMSourceConfig.VALUE_SOURCES is GATEWAY_VALUE_SOURCES
     assert GatewayConfig.VALUE_SOURCES is GATEWAY_VALUE_SOURCES
+
+
+_NO_BEDROCK_CREDENTIALS: dict[str, str | None] = {
+    "api_key": None,
+    "aws_access_key_id": None,
+    "aws_secret_access_key": None,
+    "aws_session_token": None,
+}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"api_key": "os.environ/ELSPETH_FINGERPRINT_KEY"},
+        {"aws_access_key_id": "os.environ/ELSPETH_FINGERPRINT_KEY", "aws_secret_access_key": "literal"},
+        {"aws_access_key_id": "literal", "aws_secret_access_key": "os.environ/ELSPETH_FINGERPRINT_KEY"},
+        {"aws_access_key_id": "literal", "aws_secret_access_key": "literal", "aws_session_token": "os.environ/HOME"},
+    ],
+    ids=["api-key", "access-key-id", "secret-access-key", "session-token"],
+)
+def test_bedrock_credentials_refuse_litellm_environment_indirection(overrides: dict[str, str]) -> None:
+    """LiteLLM dereferences an ``os.environ/NAME`` credential from the server's own environment."""
+    with pytest.raises(ValueError, match="environment-variable indirection") as excinfo:
+        validate_bedrock_credential_fields(**{**_NO_BEDROCK_CREDENTIALS, **overrides})
+
+    assert "ELSPETH_FINGERPRINT_KEY" not in str(excinfo.value)
+
+
+def test_bedrock_literal_credentials_are_admitted() -> None:
+    """Positive control for the refusal above: the same shapes with literal values pass."""
+    validate_bedrock_credential_fields(**{**_NO_BEDROCK_CREDENTIALS, "api_key": "literal"})
+    validate_bedrock_credential_fields(
+        **{**_NO_BEDROCK_CREDENTIALS, "aws_access_key_id": "literal", "aws_secret_access_key": "literal", "aws_session_token": "literal"}
+    )
+    validate_bedrock_credential_fields(**_NO_BEDROCK_CREDENTIALS)

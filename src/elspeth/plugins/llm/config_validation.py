@@ -49,6 +49,7 @@ BEDROCK_API_KEY_MAX_LENGTH = 16384
 BEDROCK_ACCESS_KEY_ID_MAX_LENGTH = 256
 BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH = 4096
 BEDROCK_SESSION_TOKEN_MAX_LENGTH = 16384
+_LITELLM_ENV_INDIRECTION_PREFIX = "os.environ/"
 
 
 def validate_bedrock_credential_fields(
@@ -67,7 +68,20 @@ def validate_bedrock_credential_fields(
     IAM pair (``aws_access_key_id`` + ``aws_secret_access_key``, with
     ``aws_session_token`` admitted only alongside the pair). Raises
     ``ValueError`` with a field-precise message that never echoes a value.
+
+    A value beginning ``os.environ/`` is refused: LiteLLM's Bedrock
+    credential resolver treats that prefix as an instruction to read the
+    named variable from the PROCESS environment, so a user-supplied secret
+    of that shape would make the server dereference its own environment.
     """
+    for field_name, value in (
+        ("api_key", api_key),
+        ("aws_access_key_id", aws_access_key_id),
+        ("aws_secret_access_key", aws_secret_access_key),
+        ("aws_session_token", aws_session_token),
+    ):
+        if value is not None and value.startswith(_LITELLM_ENV_INDIRECTION_PREFIX):
+            raise ValueError(f"{field_name} must be a literal credential, not an environment-variable indirection")
     access_present = aws_access_key_id is not None
     secret_present = aws_secret_access_key is not None
     session_present = aws_session_token is not None
