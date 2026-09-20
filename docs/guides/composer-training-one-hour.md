@@ -184,7 +184,7 @@ of these. Say it now; they will see all three in the next ten minutes.
 - Every new account starts on it. Five steps: welcome → guided build → run → audit story → graduation.
 - Fixed script: "Scrape these three synthetic project-brief pages and, for each
   page, have an LLM write a short summary of the page. Remove the raw HTML and
-  write the rows to a json file."
+  write the rows to a JSON file named project_brief_summaries.json."
 - It is the *same* machinery as every real session — its only privilege is a frozen prompt (ADR-031).
 - `Composer preferences → Reset tutorial` brings it back any time.
 

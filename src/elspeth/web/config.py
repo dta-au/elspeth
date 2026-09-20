@@ -222,10 +222,9 @@ class WebSettings(BaseModel):
     # authentication. Generate with ``openssl rand -base64 32``.
     operator_metrics_bearer_token: SecretStr | None = None
     registration_mode: Literal["open", "email_verified", "closed"] = "open"
-    # Short-term dev deployments only: names the ONE local-auth user granted
-    # the in-app user-management surface (/api/auth/admin/users). Unset (the
-    # default) removes the surface entirely; production deployments use the
-    # IdP (Entra/OIDC) and must leave this unset.
+    # Optional credential-management grant for one local development account,
+    # independent of identity roles. Local-auth administrators also have this
+    # capability through their live admin role. IdP deployments leave it unset.
     dev_admin_user: str | None = None
     cors_origins: tuple[str, ...] = ("http://localhost:5173",)
     data_dir: Path = Field(default=Path("data"), validate_default=True)

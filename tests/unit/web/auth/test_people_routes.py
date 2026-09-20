@@ -214,10 +214,31 @@ async def test_a_local_only_administrator_sees_accounts_and_no_identity_data(tmp
 # ── Identity admin only ──────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("dev_admin_user", [None, "devadmin"])
+async def test_a_local_identity_administrator_can_create_local_accounts(tmp_path, dev_admin_user) -> None:
+    harness = _build(tmp_path, dev_admin_user=dev_admin_user)
+    async with _client(harness.app) as client:
+        headers = await _bearer(client, "root")
+        capabilities = await client.get("/api/auth/admin/people/capabilities", headers=headers)
+        assert capabilities.status_code == 200
+        assert capabilities.json()["local_accounts"] is True
+        response = await client.post("/api/auth/admin/users", headers=headers, json={"username": "alex", "display_name": "Alex Kim"})
+        assert response.status_code == 201, response.text
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json()["user_id"] == "alex"
+        assert len(response.json()["password"]) >= 16
+        person = await client.get("/api/auth/admin/people/local/alex", headers=headers)
+        assert person.status_code == 200
+        assert person.json()["person"]["access"] == "not_set_up"
+        assert person.json()["person"]["actions"]["manage_credentials"] is True
+
+
 async def test_an_identity_only_administrator_sees_no_credential_inventory(tmp_path) -> None:
     harness = _build(tmp_path)
     async with _client(harness.app) as client:
         headers = await _bearer(client, "root")
+        # External-auth deployments expose identity administration only.
+        harness.app.state.settings = harness.app.state.settings.model_copy(update={"auth_provider": "oidc", "dev_admin_user": None})
         response = await client.get("/api/auth/admin/people", headers=headers)
         assert response.status_code == 200, response.text
         body = response.json()
@@ -249,7 +270,7 @@ async def test_the_sole_administrator_is_named_per_person_not_only_counted(tmp_p
 
         async def sole_flags() -> dict[str, bool]:
             body = (await client.get("/api/auth/admin/people", headers=headers)).json()
-            return {person["key"]: person["sole_active_admin"] for person in body["people"]}
+            return {person["key"]: person["sole_active_admin"] for person in body["people"] if person["record_type"] == "identity"}
 
         root_key, nobody_key = f"identity:{harness.root_identity_id}", f"identity:{nobody_id}"
         assert await sole_flags() == {root_key: True, nobody_key: False}
@@ -388,8 +409,9 @@ async def test_a_label_borrows_the_linked_account_name_only_where_nothing_is_wit
         assert labels[pending_id]["label"] == "nobody"
         assert "No Body" not in str(labels[pending_id])
 
-        # An identity-only caller is never shown an account-sourced name.
+        # An external-auth deployment never exposes account-sourced names.
         root_headers = await _bearer(client, "root")
+        harness.app.state.settings = harness.app.state.settings.model_copy(update={"auth_provider": "oidc", "dev_admin_user": None})
         root_view = (await client.get(f"/api/auth/admin/people/labels?identity_id={jane_id}", headers=root_headers)).json()["labels"][0]
         assert root_view["label"] == "jane"
 

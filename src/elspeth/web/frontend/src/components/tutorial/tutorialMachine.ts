@@ -12,7 +12,7 @@
 export const CANONICAL_TUTORIAL_PROMPT =
   "Scrape these three synthetic project-brief pages and, for each page, " +
   "have an LLM write a short summary of the page. Remove the raw HTML and " +
-  "write the rows to a json file.";
+  "write the rows to a JSON file named project_brief_summaries.json.";
 
 // Per-stage prelocked prompts — each phase gets ONLY its stage's intent so the
 // light composer model can focus on one task. Verified live against the
@@ -24,7 +24,8 @@ export const TUTORIAL_SOURCE_PROMPT =
   "project-brief pages; each row carries the page's address in a `url` column:";
 
 export const TUTORIAL_SINK_PROMPT =
-  "Save the pipeline's results to a JSON file.";
+  "Save the pipeline's results to a JSON file named " +
+  "project_brief_summaries.json.";
 
 export const TUTORIAL_TRANSFORMS_PROMPT =
   "For each row, fetch the page at its `url` into a `page_content` field, then have an LLM write a short " +

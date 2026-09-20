@@ -148,7 +148,7 @@ class UserProfileResponse(_StrictResponse):
     email: str | None = None
     groups: list[str] = []
     # True only for the local-auth user named by WebSettings.dev_admin_user;
-    # the frontend uses it to reveal the dev user-management menu entry.
+    # People capabilities separately include authority from live admin roles.
     dev_admin: bool = False
 
 
@@ -790,8 +790,8 @@ def create_auth_router() -> APIRouter:
             groups=list(profile.groups),
             # Username, not user_id: ``dev_admin_user`` names a local account,
             # while user_id is the identity_id. Must agree with the same
-            # comparison in admin_routes._require_dev_admin, or the frontend
-            # shows an admin surface the backend then 404s.
+            # comparison in admin_routes.is_dev_admin. This names the explicit
+            # development grant, not all local account administrators.
             dev_admin=(
                 settings.auth_provider == "local" and settings.dev_admin_user is not None and profile.username == settings.dev_admin_user
             ),
