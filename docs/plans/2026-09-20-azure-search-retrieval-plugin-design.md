@@ -132,8 +132,10 @@ ELSPETH_WEB__AZURE_SEARCH_PROFILES='[
     none (the Textract rule; no silent default among several sources).
 - `azure_ai_search` is unavailable to web sessions when no profile is
   configured, the `aws_s3` source posture.
-- The rate limiter is keyed `azure_search:<alias>` for profiled nodes (the
-  endpoint host for YAML runs), so two services do not share a bucket.
+- The rate limiter is keyed `azure_ai_search:<endpoint host>`, so two services
+  do not share a bucket. The host, not the alias: the alias is deliberately
+  absent from the lowered options the plugin sees, the host maps one-to-one to
+  a service, and the same key then serves YAML runs.
 - Audit: `audit_safe_options` records `profile: <alias>`. No new
   `Profiled*AuditIdentity` type: the endpoint is already in every recorded
   search call, unlike a Textract bucket, so the alias adds the only missing
