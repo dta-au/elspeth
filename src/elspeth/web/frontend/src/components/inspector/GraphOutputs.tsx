@@ -8,7 +8,7 @@ import { buildConnectionIndex } from "@/components/workspace/specRouting";
 interface PolicyRow {
   kind: string;
   name: string;
-  plugin?: string;
+  plugin: string | null;
   model: string | null;
   success: ReactNode[];
   condition: string;
@@ -72,6 +72,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
   const sources = sortedSourceEntries(state).map(([name, source]) => ({
     kind: "Source",
     name,
+    plugin: source.plugin,
     model: source.plugin === "llm" ? llmBindingLabel(source.options) : null,
     success: [successAction(source.on_success, destinationName)],
     condition: "Row fails validation",
@@ -80,6 +81,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
   const nodes = state.nodes.map((node) => ({
     kind: NODE_LABELS[node.node_type],
     name: node.id,
+    plugin: node.plugin,
     model: node.plugin === "llm" ? llmBindingLabel(node.options) : null,
     success: nodeSuccessActions(node, destinationName),
     condition: node.node_type === "coalesce" && node.policy === "require_all"
@@ -115,7 +117,8 @@ export function GraphOutputs({ state }: { state: CompositionState }): JSX.Elemen
             {rows.map((row) => (
               <tr key={`${row.kind}:${row.name}`}>
                 <th scope="row">
-                  {row.kind}: <code>{row.name}</code>{row.plugin && ` (${row.plugin})`}
+                  {row.kind}: <code>{row.name}</code>
+                  {row.plugin && <span className="graph-output-detail">{row.plugin}</span>}
                   {row.model && <span className="graph-output-detail">{row.model}</span>}
                 </th>
                 <td>{row.success.map((action, index) => <div key={index}>{action}</div>)}</td>

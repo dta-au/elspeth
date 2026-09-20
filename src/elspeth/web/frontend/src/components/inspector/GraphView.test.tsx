@@ -323,7 +323,7 @@ describe("GraphView", () => {
     // The node ID as display name
     expect(within(screen.getByTestId("node-classify")).getByText("classify")).toBeInTheDocument();
     // The plugin name
-    expect(screen.getByText("llm_transform")).toBeInTheDocument();
+    expect(within(screen.getByTestId("node-classify")).getByText("llm_transform")).toBeInTheDocument();
   });
 
   it("counts nodes and shows success and failure outputs with LLM selection in the Graph tab", () => {
@@ -349,6 +349,8 @@ describe("GraphView", () => {
     expect(within(table).getByRole("columnheader", { name: "Node" })).toBeInTheDocument();
     expect(within(table).getByRole("columnheader", { name: "Success output" })).toBeInTheDocument();
     expect(within(table).getByRole("columnheader", { name: "Failure output" })).toBeInTheDocument();
+    expect(within(table).getByText("llm")).toHaveClass("graph-output-detail");
+    expect(within(table).getByText("profile sonnet")).toHaveClass("graph-output-detail");
     expect(within(table).getByRole("row", { name: /Source: source/ })).toHaveTextContent(
       "Send to classifyRow fails validationDiscard row (audit recorded)",
     );
