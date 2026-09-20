@@ -3157,17 +3157,22 @@ class ComposerServiceImpl:
             )
 
         async def worker() -> ValidationResult:
-            preflight: Callable[..., ValidationResult] = (
-                functools.partial(
+            preflight: Callable[..., ValidationResult]
+            blob_operation_context = session_operation_context if contains_blob_ref else None
+            if interpretation_tolerant and blob_operation_context is not None:
+                preflight = functools.partial(
                     self._runtime_preflight,
-                    session_operation_context=session_operation_context,
+                    session_operation_context=blob_operation_context,
                     allow_pending_interpretation_placeholders=True,
                 )
-                if interpretation_tolerant
-                else functools.partial(self._runtime_preflight, session_operation_context=session_operation_context)
-            )
+            elif interpretation_tolerant:
+                preflight = functools.partial(self._runtime_preflight, allow_pending_interpretation_placeholders=True)
+            elif blob_operation_context is not None:
+                preflight = functools.partial(self._runtime_preflight, session_operation_context=blob_operation_context)
+            else:
+                preflight = self._runtime_preflight
             args = (state, user_id, session_id) if plugin_snapshot is None else (state, user_id, session_id, plugin_snapshot)
-            return await run_sync_in_worker(preflight, *args)
+            return await run_sync_in_worker(cast(Callable[..., ValidationResult], preflight), *args)
 
         # ``deadline`` (event-loop clock, elspeth-ac85b0ab0e review) caps the
         # per-caller timeout at the compose budget's remaining share so a

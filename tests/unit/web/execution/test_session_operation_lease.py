@@ -1492,11 +1492,11 @@ def _is_exact_envelope_blob_verifier_edge(call: ast.Call, keyword: ast.keyword) 
 
 
 def _is_exact_blob_metadata_callback_edge(call: ast.Call, keyword: ast.keyword) -> bool:
-    """``validate_pipeline(..., blob_get_metadata=<local def>)``: the validator's per-ref metadata lookup."""
+    """Follow the validator's exact metadata and content-read callbacks."""
     return (
         isinstance(call.func, ast.Name)
         and call.func.id == "validate_pipeline"
-        and keyword.arg == "blob_get_metadata"
+        and keyword.arg in {"blob_get_metadata", "blob_get_content"}
         and any(candidate is keyword for candidate in call.keywords)
         and isinstance(keyword.value, ast.Name)
     )
@@ -2350,6 +2350,7 @@ class _EdgeControlCase:
     body: str
     closure: str
     admitted: bool
+    effect_name: str = "get_blob"
     context_offenders: tuple[str, ...] = ()
     unresolved_receiver_count: int = 0
     escaped_class_helpers: tuple[str, ...] = ()
@@ -2371,7 +2372,7 @@ def _assert_edge_control(case: _EdgeControlCase) -> None:
         assert case.closure in reachable_names, f"{case.closure} was not admitted as live: {reachable_names}"
         assert findings.escaped_local_helpers == (), findings.escaped_local_helpers
         assert decoy_names == [], decoy_names
-        assert live_effects == ["get_blob"], live_effects
+        assert live_effects == [case.effect_name], live_effects
     else:
         assert case.closure not in reachable_names, f"{case.closure} was admitted through a non-exact shape: {reachable_names}"
         assert findings.escaped_local_helpers == (case.closure,), findings.escaped_local_helpers
@@ -2426,6 +2427,31 @@ def _blob_metadata_case(
 )
 def test_blob_metadata_callback_edge_admits_only_the_exact_validate_pipeline_keyword(case_id: str, case: _EdgeControlCase) -> None:
     _assert_edge_control(case)
+
+
+_BLOB_CONTENT_EDGE = """
+    def _entry(self, state, *, session_id, session_operation_context):
+        from {module} import validate_pipeline
+
+        def _blob_get_content(blob_id):
+            return self._call_async(self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context))
+
+        return validate_pipeline(state, session_id=session_id, {keyword}=_blob_get_content)
+"""
+
+
+@pytest.mark.parametrize(("keyword", "admitted"), [("blob_get_content", True), ("blob_content", False)])
+def test_blob_content_callback_edge_requires_exact_validator_keyword(keyword: str, admitted: bool) -> None:
+    """A renamed content callback is again an unreachable effect, not an accepted shortcut."""
+    _assert_edge_control(
+        _EdgeControlCase(
+            body=_BLOB_CONTENT_EDGE.format(module=_VALIDATE_PIPELINE_MODULE, keyword=keyword),
+            closure="_blob_get_content",
+            admitted=admitted,
+            effect_name="read_blob_content",
+            escaped_decoys=("read_blob_content",),
+        )
+    )
 
 
 _PROOF_RESOLVER_EDGE = """

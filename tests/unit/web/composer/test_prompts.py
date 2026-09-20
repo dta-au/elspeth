@@ -664,14 +664,16 @@ class TestBuildSystemPrompt:
         assert "Do not stop by saying the source contract is incomplete" in flattened
 
     def test_core_skill_requires_uploaded_blob_discovery_before_mutation(self) -> None:
-        """Uploaded files must be discovered and inspected before the first build mutation."""
+        """Uploaded files must be discovered and handled according to their role."""
         result = build_system_prompt(None)
         flattened = " ".join(result.split())
 
         assert "If the user says they uploaded, attached, provided, or already have a file in the session" in flattened
-        assert "discover it before the first source-binding or `set_pipeline` mutation" in flattened
+        assert "discover its role before the first binding mutation" in flattened
         assert "Call `list_blobs` or `list_composer_blobs`" in flattened
-        assert "then call `inspect_source` before declaring fields, schema facts, or gate conditions" in flattened
+        assert "For a pipeline input, call `inspect_source` before declaring fields, schema facts, or gate conditions" in flattened
+        assert "For a `reference_join` table, use `get_blob_metadata` and wire the existing uploaded blob" in flattened
+        assert "For a user-uploaded LLM prompt, wire the ready user-verbatim blob" in flattened
         assert "Do not synthesize a replacement artifact" in flattened
         assert "ask one narrow file-selection question" in flattened
 

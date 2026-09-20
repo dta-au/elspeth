@@ -437,8 +437,8 @@ def materialize_validation_yaml(
         content_violations: list[BlobInlineValidationViolation] = []
         actual_total_bytes = 0
         for ref in refs:
-            previous_failure = content_failure_by_blob_id.get(ref.blob_id)
-            if previous_failure is not None:
+            if ref.blob_id in content_failure_by_blob_id:
+                previous_failure = content_failure_by_blob_id[ref.blob_id]
                 content_violations.append(
                     BlobInlineValidationViolation(
                         category=previous_failure.category, field_path=ref.field_path, detail=previous_failure.detail
