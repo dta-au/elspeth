@@ -21,6 +21,16 @@ param minReplicas = 1
 param maxReplicas = 1
 param terminationGracePeriodSeconds = 60
 param composerTransportIdleCeilingSeconds = 210
+param composerMaxCompositionTurns = 50
+param composerMaxDiscoveryTurns = 20
+param composerTimeoutSeconds = 180
+param composerRateLimitPerMinute = 10
+// Disposable acceptance registers its test user through the local-auth harness.
+// Production uses SSO with registration closed; never reuse this auth shape there.
+param authProvider = 'local'
+param registrationMode = 'open'
+param composerModel = 'gpt-5.5'
+param composerAdvisorModel = 'anthropic/claude-sonnet-4-6'
 param runtimeRoleLabel = 'a'
 param acceptanceRuntimeSecretUrls = {
   a: {

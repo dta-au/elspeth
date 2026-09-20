@@ -448,11 +448,38 @@ elif args[:3] != ["deployment", "group", "what-if"]:
     azure.chmod(0o755)
     candidate = "b" * 40
     params = tmp_path / "workload.parameters.json"
+    application = tmp_path / "application.json"
+    application.write_text(
+        json.dumps(
+            {
+                "composerMaxCompositionTurns": 15,
+                "composerMaxDiscoveryTurns": 10,
+                "composerTimeoutSeconds": 180,
+                "composerRateLimitPerMinute": 10,
+                "authProvider": "entra",
+                "registrationMode": "closed",
+            }
+        )
+    )
+    for secret_name in (
+        "elspeth-session-db-url-runtime",
+        "elspeth-landscape-url-runtime",
+        "elspeth-session-db-url-schema-owner",
+        "elspeth-landscape-url-schema-owner",
+        "elspeth-secret-key",
+        "elspeth-shareable-link-signing-key",
+        "elspeth-fingerprint-key",
+        "elspeth-operator-metrics-bearer-token",
+    ):
+        vault = "aca-schema-vault" if secret_name.endswith("-schema-owner") else "aca-vault"
+        (tmp_path / f"{secret_name}.version").write_text(f"https://{vault}.vault.azure.net/secrets/{secret_name}/" + "a" * 32)
     env = {
         **os.environ,
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "OPERATOR_DIR": str(tmp_path),
         "WORKLOAD_PARAMETERS": str(params),
+        "APPLICATION_PARAMETERS": str(application),
+        "SECRET_VERSION_DIR": str(tmp_path),
         "CANDIDATE_SHA": candidate,
         "CANDIDATE_IMAGE": "registry.azurecr.io/elspeth@sha256:" + "c" * 64,
         "PROVISION_STORAGE_IMAGE": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "d" * 64,
@@ -506,6 +533,12 @@ def test_parameter_validator_rejects_unresolved_configuration(tmp_path: Path, pa
         "candidateSourceSha": "d" * 40,
         "revisionSuffix": "r" + "d" * 12,
         "composerTransportIdleCeilingSeconds": 210,
+        "composerMaxCompositionTurns": 15,
+        "composerMaxDiscoveryTurns": 10,
+        "composerTimeoutSeconds": 180,
+        "composerRateLimitPerMinute": 10,
+        "authProvider": "entra",
+        "registrationMode": "closed",
         "composerEndpointApiKeySecretUrl": "",
         "minReplicas": 2,
         "maxReplicas": 4,
@@ -646,11 +679,25 @@ else:
     sleeper.write_text('#!/bin/bash\nif [[ "$FAKE_RBAC" != delayed ]]; then exec /bin/sleep "$@"; fi\n')
     sleeper.chmod(0o755)
     output = tmp_path / "parameters"
+    application = tmp_path / "application.json"
+    application.write_text(
+        json.dumps(
+            {
+                "composerMaxCompositionTurns": 15,
+                "composerMaxDiscoveryTurns": 10,
+                "composerTimeoutSeconds": 180,
+                "composerRateLimitPerMinute": 10,
+                "authProvider": "entra",
+                "registrationMode": "closed",
+            }
+        )
+    )
     env = {
         **os.environ,
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "FAKE_STATE": str(tmp_path),
         "MAIN_PARAMETERS": str(main),
+        "APPLICATION_PARAMETERS": str(application),
         "PGSSLROOTCERT": "/operator/trust.pem",
         "BOOTSTRAP_PRINCIPAL_ID": "12345678-1234-1234-1234-123456789abc",
         "BOOTSTRAP_PRINCIPAL_TYPE": "User",
@@ -660,7 +707,9 @@ else:
         "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS": "210",
         "FAIL_SQL": str(fail_sql).lower(),
         "FAKE_RBAC": rbac,
-        "KEY_VAULT_RBAC_WAIT_SECONDS": "1",
+        # Successful retries also launch several mock CLI processes; allow host
+        # scheduling time while keeping the permanent-denial timeout bounded.
+        "KEY_VAULT_RBAC_WAIT_SECONDS": "1" if rbac == "permanent" else "10",
     }
     result = subprocess.run(
         ["bash", str(REPO_ROOT / "deploy/azure-container-apps/scripts/bootstrap-acceptance.sh"), str(inventory), str(secrets), str(output)],

@@ -124,10 +124,22 @@ testcontainer files for doctor, schema, startup and readiness. Run them with
 
 ### 3. Publish by digest
 
+For building the ACA image and publishing it to GHCR, use
+[Build and push the ACA container](references/build-and-push-ghcr.md), including
+its Docker configuration, Buildx builder and source-archive traps.
+
 - Resolve the GHCR digest for the exact commit.
 - Copy it into the registry with `docker buildx imagetools create` and assert
   `az acr manifest show-metadata` returns the same digest.
-- `cosign verify` the registry reference against the GHCR-signed identity.
+- Pull by digest, compare `org.opencontainers.image.revision` to the image
+  source SHA, and run `--version` and `health --json` in that image.
+- An unsigned RC is supported when selected by the user. CI signing is not a
+  prerequisite. For a signed release, `cosign verify` the signed GHCR
+  reference; an image-index copy does not copy separate signature artifacts.
+  Only verify an ACR signature when that ACR reference was actually signed.
+- The image source SHA may differ from the checkout containing deployment
+  configuration repairs. Preserve and report both; configuration-only fixes
+  do not force a rebuild of an existing RC.
 
 ### 4. Run the doctor Job with the candidate digest
 
@@ -141,6 +153,15 @@ what-if. Never deploy the tracked placeholder example. Update Jobs using
 or version, PostgreSQL connectivity or TLS, schema state, NFS mount or
 ownership, identity role assignment (role assignments can take up to 24 h to
 reach a cached token), or a missing image.
+
+For a cold start the resolver also requires `APPLICATION_PARAMETERS` (flat
+Bicep parameter names to values) and `SECRET_VERSION_DIR` containing captured
+`<secret-name>.version` files. Use `application.example.json` as the editable
+operator input. Four mandatory Composer budgets must reach web and both
+doctors; `extraEnvironment` only reaches web. Choose nonlocal authentication,
+closed registration, quota defaults and the first administrator subject.
+Complete both Composer model roles, pipeline LLM profiles and versioned
+`extraSecrets` for every SSO/provider `secretRef`.
 
 ### 5. Roll the revision
 
@@ -157,6 +178,11 @@ At minimum the two probes, `/api/system/status`, an authenticated browser or
 API flow appropriate to the change, and a console-log query by revision name
 without a new unhandled startup or runtime failure (Log Analytics lags by
 minutes).
+For a first launch, verify first-admin login and grant an explicit workload
+role, then make a real Composer request and a small LLM pipeline run. An admin
+grant alone does not grant author/run access. The ACA doctor does not emit
+`session_tls`/`landscape_tls`; keep verified TLS URLs and use the cold-install
+runbook's separate connection check.
 
 For the disposable acceptance, `scripts/acceptance.sh all` includes the final
 `single-revision` stage after the labelled P1/P2/P4/P3 probes. It deploys

@@ -240,6 +240,8 @@ tracked placeholder example to a deployment.
 | --- | --- |
 | `MAIN_PARAMETERS` | Local subscription-scope ARM parameter JSON with real environment inputs |
 | `WORKLOAD_PARAMETERS` | Local production ARM parameters from the cold-install resolver |
+| `APPLICATION_PARAMETERS` | Exported path to flat application JSON completed from `application.example.json`: budgets, nonlocal auth, SSO, both Composer roles and pipeline profiles |
+| `ELSPETH_ACCEPTANCE_BEARER_TOKEN` | Authenticated session token for an admitted user with the required workload role; required for generated nonlocal-auth workloads before `prepare`, `probes` and `single-revision` |
 | `WORKLOAD_A_PARAMETERS`, `WORKLOAD_B_PARAMETERS` | Local role-specific workload ARM parameters with pinned secret versions |
 | `COMPATIBILITY_RECORD` | Candidate-bound compatibility record; the driver produces `TESTCONTAINER_RECEIPT` against the provisioned Flexible Server |
 | `ELSPETH_ACCEPTANCE_PYTHON` | Existing venv Python; bind both worktree source roots with `PYTHONPATH` |
@@ -259,7 +261,10 @@ tracked placeholder example to a deployment.
 | `BOOTSTRAP_PRINCIPAL_ID`, `BOOTSTRAP_PRINCIPAL_TYPE` | Explicit operator object ID and `User` or `ServicePrincipal`, granted Key Vault Secrets Officer on both disposable vaults |
 
 The `all` path invokes `scripts/bootstrap-acceptance.sh` after environment and
-image publication. `ACCEPTANCE_SECRET_DIR` must contain four distinct password
+image publication. Export `APPLICATION_PARAMETERS` before calling the driver;
+the helper supplies `SECRET_VERSION_DIR` from the secret versions it captures.
+Prepare SSO/provider `extraSecrets` version URLs and corresponding environment
+bindings as described in the cold-install runbook. `ACCEPTANCE_SECRET_DIR` must contain four distinct password
 files (`elspeth-schema-owner-password`, `elspeth-runtime-password`,
 `elspeth-runtime-a-password`, `elspeth-runtime-b-password`) and the application
 value files `elspeth-secret-key`, `elspeth-shareable-link-signing-key`,
@@ -287,7 +292,35 @@ secret versions and probe fixtures. The `all` path runs `prepare` through the
 public API after rollout: it uploads the source and imports the supplied YAML
 into fresh sessions, including one session for each P2 trial. It writes
 `prepared-sessions.json` and `p2-session-ids.json` under the evidence directory.
-Use an existing acceptance bearer or the driver login/registration inputs.
+Generated workloads retain the selected nonlocal authentication provider.
+They require an existing `ELSPETH_ACCEPTANCE_BEARER_TOKEN`: the driver's
+username/password fallback calls local registration/login and cannot perform
+SSO. The local/open `workload.acceptance.bicepparam` is a disposable compilation
+fixture, not a production authentication setting to copy into the generated
+parameters.
+
+For a fresh SSO installation, use the staged workflow instead of `all`, which
+does not pause for first login:
+
+1. Run `environment`, `image`, `bootstrap`, `jobs`, `testcontainer`,
+   `workload-production`, then `receipts`, using
+   `bash deploy/azure-container-apps/scripts/acceptance.sh <stage>` with the
+   same exported inputs and `EVIDENCE_DIR`. Resume after any already completed
+   stage rather than rerunning the cold-only bootstrap.
+2. Sign in through the configured public origin using SSO. Bootstrap the first
+   administrator and admit the acceptance user with the required workload role
+   as described in the cold-install runbook. Obtain that user's application
+   session bearer through the authenticated login flow and export
+   `ELSPETH_ACCEPTANCE_BEARER_TOKEN` privately; do not use an IdP access token
+   or print the application token into evidence.
+3. Run `workload-probes`, then `prepare`, `probes`, `single-revision`,
+   `evidence`, `cleanup`, and `bundle`. Retain the same bearer in the calling
+   shell for each stage; renew it through SSO if it expires. `prepare` targets
+   the `a` revision's labeled origin and uses the shared Sessions identity.
+
+Keep the configured SSO provider throughout these stages. Neither local
+registration credentials nor an anonymous readiness response establishes an
+admitted acceptance user.
 The standalone `probes` stage can consume the prepared session inputs listed
 above. The driver stops at the first
 failure; inspect retained evidence before resuming. Explicit cleanup remains

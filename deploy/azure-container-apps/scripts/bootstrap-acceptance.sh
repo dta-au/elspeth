@@ -11,6 +11,7 @@ test "$#" -eq 3 || { echo 'usage: bootstrap-acceptance.sh INVENTORY_JSON SECRET_
 : "${CANDIDATE_IMAGE:?verified digest-pinned candidate image required}"
 : "${CANDIDATE_SHA:?full candidate source SHA required}"
 : "${PROVISION_STORAGE_IMAGE:?verified digest-pinned root provisioner required}"
+: "${APPLICATION_PARAMETERS:?operator application parameter JSON required}"
 : "${ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS:?explicit transport ceiling required}"
 case "$BOOTSTRAP_PRINCIPAL_TYPE" in User|ServicePrincipal) ;; *) echo 'invalid bootstrap principal type' >&2; exit 2 ;; esac
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -129,11 +130,12 @@ done
 for name in elspeth-secret-key elspeth-shareable-link-signing-key elspeth-fingerprint-key elspeth-operator-metrics-bearer-token; do
   cp -- "$secret_dir/$name" "$private_dir/$name"
 done
-if [[ -n ${COMPOSER_ENDPOINT_SECRET_NAME:-} ]]; then
-  [[ "$COMPOSER_ENDPOINT_SECRET_NAME" =~ ^[a-zA-Z0-9-]+$ ]]
-  test -s "$secret_dir/$COMPOSER_ENDPOINT_SECRET_NAME"
-  cp -- "$secret_dir/$COMPOSER_ENDPOINT_SECRET_NAME" "$private_dir/$COMPOSER_ENDPOINT_SECRET_NAME"
-fi
+for endpoint_secret in "${COMPOSER_ENDPOINT_SECRET_NAME:-}" "${COMPOSER_ADVISOR_ENDPOINT_SECRET_NAME:-}"; do
+  if [[ -z "$endpoint_secret" ]]; then continue; fi
+  [[ "$endpoint_secret" =~ ^[a-zA-Z0-9-]+$ ]]
+  test -s "$secret_dir/$endpoint_secret"
+  cp -- "$secret_dir/$endpoint_secret" "$private_dir/$endpoint_secret"
+done
 for value_file in "$private_dir"/elspeth-*-url-* "$private_dir"/elspeth-secret-key \
   "$private_dir"/elspeth-shareable-link-signing-key "$private_dir"/elspeth-fingerprint-key \
   "$private_dir"/elspeth-operator-metrics-bearer-token; do
@@ -147,11 +149,13 @@ for value_file in "$private_dir"/elspeth-*-url-* "$private_dir"/elspeth-secret-k
   capture "$private_dir/$name.version" az keyvault secret set --vault-name "$secret_vault" --name "$name" \
     --file "$value_file" --encoding utf-8 --query id --output tsv --only-show-errors
 done
-if [[ -n ${COMPOSER_ENDPOINT_SECRET_NAME:-} ]]; then
-  capture "$private_dir/composer.version" az keyvault secret set --vault-name "$vault" --name "$COMPOSER_ENDPOINT_SECRET_NAME" \
-    --file "$private_dir/$COMPOSER_ENDPOINT_SECRET_NAME" --encoding utf-8 --query id --output tsv --only-show-errors
-fi
-capture "$private_dir/resolve.log" bash "$script_dir/resolve-workload-parameters.sh" "$inventory" "$output_dir/workload.parameters.json"
+for endpoint_secret in "${COMPOSER_ENDPOINT_SECRET_NAME:-}" "${COMPOSER_ADVISOR_ENDPOINT_SECRET_NAME:-}"; do
+  if [[ -z "$endpoint_secret" ]]; then continue; fi
+  capture "$private_dir/$endpoint_secret.version" az keyvault secret set --vault-name "$vault" --name "$endpoint_secret" \
+    --file "$private_dir/$endpoint_secret" --encoding utf-8 --query id --output tsv --only-show-errors
+done
+capture "$private_dir/resolve.log" env SECRET_VERSION_DIR="$private_dir" \
+  bash "$script_dir/resolve-workload-parameters.sh" "$inventory" "$output_dir/workload.parameters.json"
 document=$(jq --slurpfile inventory "$inventory" '
   .parameters.verifyBlobManagedIdentity.value = true |
   .parameters.blobAccountUrl.value = ("https://" + $inventory[0].blobStorageAccountName.value + ".blob.core.windows.net") |
