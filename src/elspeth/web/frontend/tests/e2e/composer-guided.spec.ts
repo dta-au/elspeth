@@ -13,7 +13,7 @@ import {
   tokenFromStorageState,
   uploadBlob,
 } from "./helpers/api";
-import { switchToGuidedWithGoal } from "./helpers/guided-entry";
+import { startGuidedWithGoal } from "./helpers/guided-entry";
 import { ComposerPage } from "./page-objects/composer-page";
 
 const BLOB_FILENAME = "playwright-orders.csv";
@@ -132,7 +132,7 @@ test.describe("composer-guided — source/output live walk", () => {
         const composer = new ComposerPage(page);
         await composer.goto(sessionId);
         await composer.waitForChatReady();
-        await switchToGuidedWithGoal(
+        await startGuidedWithGoal(
           page,
           "Read a CSV of sample rows and save every row to a JSON file.",
         );
@@ -201,13 +201,12 @@ test.describe("composer-guided — source/output live walk", () => {
         const blob = await uploadBlob(ctx, sessionId, BLOB_FILENAME, SAMPLE_CSV);
 
         // ── Navigate + enter guided mode ─────────────────────────────────────
-        // "Switch to guided" collects the goal, then resolves to the live/empty
-        // profile via GET /guided and starts the wizard with that goal. This
-        // walk is a pure pass-through, and the goal says so.
+        // Seed the wizard through the guided-start API. This walk is a pure
+        // pass-through, and the goal says so.
         const composer = new ComposerPage(page);
         await composer.goto(sessionId);
         await composer.waitForChatReady();
-        await switchToGuidedWithGoal(
+        await startGuidedWithGoal(
           page,
           "Write every row of the uploaded CSV to a JSONL file, unchanged.",
         );

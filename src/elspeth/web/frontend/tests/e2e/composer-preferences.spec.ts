@@ -31,7 +31,7 @@ test.describe("composer preferences", () => {
     }
   });
 
-  test("Guided is deliberately discovered with keyboard at narrow width", async ({ page }) => {
+  test("mode preferences are available from the account menu at narrow width", async ({ page }) => {
     const composer = new ComposerPage(page);
     await composer.goto();
     await composer.createSession("Discovery");
@@ -40,12 +40,17 @@ test.describe("composer preferences", () => {
     page.on("request", (request) => {
       if (request.method() === "POST" && /\/guided\//.test(request.url())) requests.push(request.url());
     });
-    const options = page.getByRole("button", { name: "Composer options", exact: true });
-    await options.focus();
+    await expect(page.getByRole("button", { name: "Composer options", exact: true })).toHaveCount(0);
+    const account = page.getByRole("button", { name: /account/i });
+    await account.focus();
     await page.keyboard.press("Enter");
-    await expect(page.getByRole("button", { name: "Switch to guided", exact: true })).toBeVisible();
+    const preferences = page.getByRole("button", { name: /composer preferences/i });
+    await preferences.focus();
+    await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", { name: /composer preferences/i });
+    await expect(dialog.getByRole("radio", { name: /guided/i })).toBeVisible();
     await page.keyboard.press("Escape");
-    await expect(options).toBeFocused();
+    await expect(dialog).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Switch to guided", exact: true })).toHaveCount(0);
     expect(requests).toEqual([]);
   });

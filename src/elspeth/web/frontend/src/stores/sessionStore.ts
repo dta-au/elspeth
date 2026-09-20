@@ -1569,8 +1569,7 @@ interface SessionState {
   // session 409s rather than silently discarding the caller's goal, so this must
   // be reached only through enterGuided's GET-first probe.
   convertToGuided: (sessionId: string, intent: string) => Promise<void>;
-  // Unified entry point bound by the "Switch to guided" button in ChatPanel's
-  // freeform body and by createSession's guided-default arm. GET-FIRST
+  // Unified entry point used by createSession's guided-default arm. GET-FIRST
   // (elspeth-378cfa0e18): it probes GET /guided and branches on what came back,
   // so no path writes a rootless wizard the user never asked for.
   //   * terminal.kind === "exited_to_freeform"   => reenterGuided
@@ -1744,7 +1743,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // resolveDefaultMode() awaits the preferences bootstrap if it
     // hasn't completed yet (Ctrl+N race: user hits "new session" before
     // App.tsx's bootstrap effect has resolved). Guided users enter via
-    // the same enterGuided() the manual "Switch to guided" button uses.
+    // enterGuided().
     // A failure here surfaces a *prefs-specific* error; the session is
     // already live and usable in freeform, so the message reflects only
     // the secondary failure (couldn't honour your guided default).
@@ -1760,7 +1759,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       set({
         error:
           "Session created, but couldn't apply your default mode. " +
-          "You're in freeform; mode options are in Composer options.",
+          "You're in freeform; set the default mode for new sessions in Preferences.",
       });
     }
   },

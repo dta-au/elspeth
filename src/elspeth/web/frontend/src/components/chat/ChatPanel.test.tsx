@@ -6462,45 +6462,7 @@ assistant_message_kind: "synthetic_failure",
       screen.queryByRole("button", { name: "Exit to freeform" }),
     ).toBeNull();
     expect(screen.queryByRole("button", { name: "Switch to guided" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Composer options" })).toHaveAttribute("aria-expanded", "false");
-  });
-
-  it("'Switch to guided' collects a goal from the freeform body and passes it to enterGuided()", async () => {
-    // Goal-first (elspeth-378cfa0e18): the fresh-wizard direction always opens
-    // the confirm card, because the new wizard needs a goal to be rooted on and
-    // this is where the user types it. The old single-click switch produced a
-    // rootless wizard.
-    const enterGuidedSpy = vi.fn().mockResolvedValue(undefined);
-    useSessionStore.setState({
-      activeSessionId: "session-guided",
-      sessions: [guidedSessionFixture],
-      messages: [],
-      guidedSession: null,
-      guidedNextTurn: null,
-      enterGuided: enterGuidedSpy,
-    });
-
-    render(<ChatPanel />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Composer options" }));
-    const button = screen.getByRole("button", { name: "Switch to guided" });
-    await act(async () => {
-      button.click();
-    });
-    expect(enterGuidedSpy).not.toHaveBeenCalled();
-
-    const goalBox = screen.getByLabelText("What should this pipeline produce?");
-    fireEvent.change(goalBox, {
-      target: { value: "Summarise every page as one JSON row." },
-    });
-    await act(async () => {
-      screen.getByRole("button", { name: "Confirm switch to guided" }).click();
-    });
-
-    expect(enterGuidedSpy).toHaveBeenCalledTimes(1);
-    expect(enterGuidedSpy).toHaveBeenCalledWith(
-      "Summarise every page as one JSON row.",
-    );
+    expect(screen.queryByRole("button", { name: "Composer options" })).toBeNull();
   });
 
   it("falls through to the freeform body when terminal.kind === 'exited_to_freeform'", () => {
@@ -6775,10 +6737,7 @@ assistant_message_kind: "synthetic_failure",
     ).toHaveLength(1);
   });
 
-  it("keeps 'Switch to guided' enabled (reenterable) when the terminal reason is user_pressed_exit", () => {
-    // Reversible operator exit — POST /guided/reenter still honours it
-    // (routes/composer/guided.py post_guided_reenter). Disabling here would
-    // be false: the switch genuinely works via reenterGuided.
+  it("does not offer a guided switch in chat after exiting to freeform", () => {
     const terminal: TerminalState = {
       kind: "exited_to_freeform",
       reason: "user_pressed_exit",
@@ -6804,69 +6763,8 @@ assistant_message_kind: "synthetic_failure",
 
     render(<ChatPanel />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Composer options" }));
-    expect(
-      screen.getByRole("button", { name: "Switch to guided" }),
-    ).not.toBeDisabled();
-  });
-
-  it("clicking 'Switch to guided' on a user_pressed_exit terminal session actually resumes guided (C-4b — the old silent no-op)", async () => {
-    // The old bug: guidedSession was null until the user clicked (no C-4a
-    // restore-on-load), so the FIRST click always mis-routed through
-    // enterGuided()'s startGuided/GET branch instead of reenterGuided,
-    // observing the same terminal and landing back in freeform with zero
-    // feedback. With guidedSession already populated (as selectSession now
-    // does on load — sessionStore's C-4a fix), enterGuided() sees
-    // terminal.kind === "exited_to_freeform" up front and correctly calls
-    // reenterGuided() instead. This test pins the click reaching
-    // enterGuided at all; enterGuided's internal branch to reenterGuided is
-    // covered in sessionStore.guided.test.ts.
-    const terminal: TerminalState = {
-      kind: "exited_to_freeform",
-      reason: "user_pressed_exit",
-      pipeline_yaml: null,
-    };
-    const enterGuidedSpy = vi.fn().mockResolvedValue(undefined);
-
-    useSessionStore.setState({
-      activeSessionId: "session-guided",
-      sessions: [guidedSessionFixture],
-      messages: [],
-      guidedSession: {
-        step: "step_1_source",
-        history: [],
-        terminal,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      },
-      guidedNextTurn: null,
-      guidedTerminal: terminal,
-      enterGuided: enterGuidedSpy,
-    });
-
-    render(<ChatPanel />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Composer options" }));
-    const button = screen.getByRole("button", { name: "Switch to guided" });
-    expect(button).not.toBeDisabled();
-    await act(async () => {
-      button.click();
-    });
-
-    // A RESUME asks for no goal: the saved wizard already has its root
-    // (goal-first, elspeth-378cfa0e18). Only the fresh-wizard direction
-    // collects one, so the card here is the ordinary two-step confirm.
-    expect(
-      screen.queryByLabelText("What should this pipeline produce?"),
-    ).toBeNull();
-    await act(async () => {
-      screen.getByRole("button", { name: "Confirm switch to guided" }).click();
-    });
-
-    expect(enterGuidedSpy).toHaveBeenCalledTimes(1);
-    expect(enterGuidedSpy).toHaveBeenCalledWith(undefined);
+    expect(screen.queryByRole("button", { name: "Composer options" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Switch to guided" })).toBeNull();
   });
 
   it("wraps the guided turn surface in a role=log aria-live=polite region (Task 8.2 a11y)", () => {

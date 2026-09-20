@@ -46,7 +46,6 @@ import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
 import { CompletionSummary } from "./guided/CompletionSummary";
 import { ModeSwitchButton } from "./guided/ModeSwitchButton";
-import { ComposerOptions } from "./ComposerOptions";
 import { actionableProposals } from "./actionableProposals";
 import { GuidedChatHistory } from "./guided/GuidedChatHistory";
 import { GuidedDecisionSheet } from "./guided/GuidedDecisionSheet";
@@ -763,7 +762,6 @@ export function ChatPanel({
     (guidedSession !== null &&
       (guidedSession.chat_history.length > 0 ||
         guidedSession.history.length > 0));
-  const guidedSwitchDisabledReason = undefined;
   // D12 / P3.6: block guided advancement while any pending user_approved
   // interpretation card remains in the store. Hook is unconditional (called at
   // the component top, not inside the conditional guided return); the empty
@@ -3351,7 +3349,7 @@ export function ChatPanel({
       data-composing={isComposing ? "true" : undefined}
     >
       {decisionLiveRegion}
-      {/* Authority stays visible; Guided is a deliberate Composer options action. */}
+      {/* Persistent composer authority. Mode preferences live in Preferences. */}
       <div className="chat-panel-header">
         {/* Layout lives in chat.css, NOT in a style prop (elspeth-0b70269ccc).
             As an inline style this row was `inline-flex` with no wrap and no
@@ -3363,11 +3361,6 @@ export function ChatPanel({
               this session auto-applies mutations or gates them behind
               proposals — named in the chrome. */}
           <AuthorityChip />
-          <ComposerOptions
-            key={activeSessionId}
-            hasWork={currentChatHasWork}
-            disabledReason={guidedSwitchDisabledReason}
-          />
         </div>
       </div>
 

@@ -46,7 +46,7 @@ import {
   tokenFromStorageState,
   uploadBlob,
 } from "./helpers/api";
-import { switchToGuidedWithGoal } from "./helpers/guided-entry";
+import { startGuidedWithGoal } from "./helpers/guided-entry";
 import { ComposerPage } from "./page-objects/composer-page";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -110,13 +110,13 @@ test.describe("composer guided live — the colour test (staging)", () => {
       const composer = new ComposerPage(page);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
-      // Goal-first (elspeth-378cfa0e18): the switch card collects the session's
-      // goal, and the wizard is rooted on it — without a root intent the step-2
+      // Goal-first (elspeth-378cfa0e18): seed the wizard with the session's
+      // goal — without a root intent the step-2
       // finish refuses to plan. This walk is the colour PASS-THROUGH, so the
       // goal names the source's own rows and no processing: the planner's one
       // run at "Finish outputs" is expected to propose the empty transform set
       // the wire stage below accepts.
-      await switchToGuidedWithGoal(
+      await startGuidedWithGoal(
         page,
         "Write every colour row from the uploaded CSV to a JSON file, unchanged.",
       );

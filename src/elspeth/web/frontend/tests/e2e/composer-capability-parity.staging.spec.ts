@@ -58,7 +58,7 @@ import {
   tokenFromStorageState,
   uploadBlob,
 } from "./helpers/api";
-import { switchToGuidedWithGoal } from "./helpers/guided-entry";
+import { startGuidedWithGoal } from "./helpers/guided-entry";
 import { ComposerPage } from "./page-objects/composer-page";
 
 // ── Paths ───────────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ test.describe("composer capability parity — guided_staged live acceptance (sta
       // full request still arrives as the chat message below, which is what the
       // parity oracle measures. Parity is against the freeform surface reading
       // that request, so the goal must not add or drop an outcome.
-      await switchToGuidedWithGoal(page, GUIDED_GOAL);
+      await startGuidedWithGoal(page, GUIDED_GOAL);
       await expect(page.getByLabel(/guided composer/i)).toBeVisible();
 
       // Staging seam: interpose any deterministic source/sink stages the deployed
