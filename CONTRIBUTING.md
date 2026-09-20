@@ -100,7 +100,7 @@ commit hashes, ticket ids, measured numbers — is kept in
 links back to the headings here. Read this section before writing code; read
 the appendix when you need the history behind a rule.
 
-### Why a green scoped run proves nothing
+### Choosing test scope and whole-tree gates
 
 A large share of the test suite asserts over the **entire tree with exact
 expected sets**: the set of dynamic-attribute sites, the set of unadjudicated
@@ -109,9 +109,16 @@ the hash of a plugin's source. A change can be locally green, fully typed, and
 lint-clean and still fail one of these for everyone on the branch, because the
 gate that catches it lives in a test file you did not run.
 
-- Run the full `pytest tests/` (the selection CI's `Test` job runs) before
-  you consider a commit done. At an absolute minimum run every gate listed
-  below whose tree you touched.
+- Run affected tests and every gate listed below whose scanned inputs could
+  change. Run the full `pytest tests/` (CI's `Test` selection) when a change
+  has broad or hard-to-bound effects across runtime behavior, contracts,
+  schemas, plugin registration, graph construction, or shared test/scan
+  infrastructure. Isolated test, fixture, documentation, and frontend edits
+  can use focused checks and their relevant whole-tree gates. A previously
+  passing full run on the same production tree does not need repeating after
+  an isolated test repair; run that test and its negative controls instead.
+  Diagnose and rerun a failed case directly rather than repeating the entire
+  suite to obtain a green summary.
 - The default selection deselects the `testcontainer` marker. If you touched
   schema, SQL, session or Landscape persistence, or a lock, also run
   `pytest tests/ -m testcontainer -n 0` (Docker required; serial because the
@@ -122,9 +129,10 @@ gate that catches it lives in a test file you did not run.
   `source_file_hash` check): a green local suite and a green pre-commit hook
   prove nothing about them. Run the CI command yourself; the commands are
   given under each gate.
-- Every whole-tree gate scans `.agents/skills/**/*.py` and `scripts/` as
-  production code. Only `.claude/worktrees/` is excluded. A helper script
-  under those paths obeys the same rules as `src/`.
+- Whole-tree gates scan `scripts/` and other tracked Python tooling as
+  production code. Check the shared walker's exclusion list before assuming
+  a workspace artifact is outside a scan. Tracked helpers follow the same
+  rules as `src/`.
 - Whole-tree measurements are only evidence when the tree was frozen for the
   duration: on a shared checkout, record `git rev-parse HEAD` and a hash of
   the files you are measuring before and after the run, and discard any run
