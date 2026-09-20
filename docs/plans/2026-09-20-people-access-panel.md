@@ -494,6 +494,16 @@ repair has a regression that goes red when the repair is reverted.
   redefined `lower`) and the account segment folds with `lower` too, so both
   segments agree. "ß" no longer matches "SS" in the account segment.
 
+Gate for the repairs, run by `scripts/full-suite-gate.sh` at `42d5d0fd2`, tree
+frozen across the run: ruff 0, mypy 0, contracts 0, pytest 0 (54442 passed, 87
+skipped, 2 xfailed), testcontainer 0 (538 passed, 1 skipped). The new
+regressions appear in both JUnit files. That gate has no frontend stage and
+the `lints` stage was not selected: the frontend suite (272 files, 4916 tests),
+typecheck, ESLint, stylelint and build were run at `fa7aeb67a`, and the
+trust-tier corpus was compared before and after by hand (2198 lines each side,
+no new finding). The gate measured the branch tree, not a tree merged onto a
+later release tip. No browser pass was made on the repairs.
+
 Not done:
 
 - A manual screen-reader pass with a human listener. The accessibility tree was
