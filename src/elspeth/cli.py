@@ -2060,14 +2060,14 @@ def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> Retir
     from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
 
-    def retire(username: str, delete_credential: Callable[[], None]) -> bool:
+    def retire(username: str, credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
         engine = _composer_session_engine(session_db_url)
         try:
             with _composer_auth_audit_recorder(landscape_url) as recorder:
                 return local_identity_retirer(
                     RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
                     _composer_retirement_recorder(recorder),
-                )(username, delete_credential)
+                )(username, credential_exists, delete_credential)
         finally:
             engine.dispose()
 

@@ -58,8 +58,10 @@ AdmitIdentity = Callable[[IdentityClaims], "EnsureIdentityOutcome"]
 # administrator), and a refusal has to be decided before the password goes
 # and under the lock that makes it true -- which only the identity store's
 # own transaction can do. The contract: call the deletion exactly once, or
-# raise without calling it.
-RetireIdentity = Callable[[str, Callable[[], None]], bool]
+# raise without calling it. The probe in between answers whether a credential
+# row exists: the refusal protects an administrator who can still sign in, and
+# only this store knows whether one can.
+RetireIdentity = Callable[[str, Callable[[], bool], Callable[[], None]], bool]
 
 _slog = structlog.get_logger(__name__)
 
@@ -658,11 +660,18 @@ class LocalAuthProvider:
         what makes the failure above recoverable: an operator who re-runs
         the removal after a retirement error finds no credential and still
         gets the retirement it was owed, which the result reports as its own
-        fact. Retiring is idempotent (the natural key is rewritten, so a
+        fact. The retirer is handed ``credential_exists`` for the same reason:
+        its last-administrator refusal must not block that re-run, because an
+        administrator with no credential protects nobody and their live row
+        keeps bootstrap recovery inert. Retiring is idempotent (the natural key is rewritten, so a
         second pass finds nothing), and a username that never logged in has
         no identity to retire.
         """
         credential_deletions: list[bool] = []
+
+        def credential_exists() -> bool:
+            with self._connect() as conn:
+                return conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone() is not None
 
         def delete_credential() -> None:
             if credential_deletions:
@@ -670,7 +679,7 @@ class LocalAuthProvider:
             with self._connect() as conn:
                 credential_deletions.append(self._delete_user_rows(conn, user_id))
 
-        identity_retired = self._retire_identity(user_id, delete_credential)
+        identity_retired = self._retire_identity(user_id, credential_exists, delete_credential)
         if not credential_deletions:
             # A retirer that returns without deleting and without refusing has
             # retired (or skipped) an identity whose password still works.

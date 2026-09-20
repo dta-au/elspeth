@@ -49,7 +49,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Final, Literal, TypedDict, cast, final, get_args
 
-from sqlalchemy import and_, bindparam, case, delete, func, insert, not_, or_, select, update
+from sqlalchemy import ColumnElement, and_, bindparam, case, delete, func, insert, not_, or_, select, update
 from sqlalchemy.engine import Connection, Engine, Row
 from sqlalchemy.exc import IntegrityError
 
@@ -64,6 +64,7 @@ from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.coordination.identity_lifecycle import IdentityAuthorityRevoked, IdentityLifecycleEffect
 from elspeth.web.coordination.membership_authority import _database_clock_value, _ensure_utc
 from elspeth.web.coordination.mutation_connection_registry import _register_mutation_connection, _unregister_mutation_connection
+from elspeth.web.sessions.engine import session_unicode_lower
 from elspeth.web.sessions.identity_repository import (
     _IDENTITY_COLUMNS,
     EnsureIdentityOutcome,
@@ -347,8 +348,21 @@ class IdentityDirectoryQuery:
     access_state: IdentityAccessState | None
     provider: IdentityProviderType | None
     kind: Literal["human", "service"] | None
+    # Local usernames whose LINKED ACCOUNT matched ``text``.  An identity
+    # prepared ahead of its first sign-in has no profile of its own and is
+    # shown under its local account's name, which lives in a store this
+    # authority cannot search; the caller that may read that store names the
+    # matches, and they join the page BEFORE it is sliced.  Meaningless
+    # without ``text``, so refused without it.
+    linked_local_subjects: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if type(self.linked_local_subjects) is not tuple:
+            raise TypeError("IdentityDirectoryQuery.linked_local_subjects must be a tuple")
+        if self.linked_local_subjects and self.text is None:
+            raise ValueError("IdentityDirectoryQuery.linked_local_subjects requires text")
+        for subject in self.linked_local_subjects:
+            _require_nonblank(subject, "IdentityDirectoryQuery.linked_local_subjects")
         if self.text is not None:
             _require_nonblank(self.text, "IdentityDirectoryQuery.text")
             if len(self.text) > DIRECTORY_TEXT_MAX:
@@ -1357,7 +1371,9 @@ class RepositoryIdentityAuthority:
         _require_limit(limit, offset)
         never_admitted = and_(identities_table.c.access_state == "pending", identities_table.c.activated_at.is_(None))
         shown_name = func.coalesce(func.nullif(identities_table.c.display_name, ""), identities_table.c.username)
-        label = func.lower(case((never_admitted, identities_table.c.subject), else_=shown_name))
+        # SQLite's own lower() folds ASCII only, so the engine supplies one that matches str.lower.
+        lower = session_unicode_lower(self._engine)
+        label = lower(case((never_admitted, identities_table.c.subject), else_=shown_name))
         statement = select(identities_table)
         if query.access_state is not None:
             statement = statement.where(identities_table.c.access_state == query.access_state)
@@ -1370,18 +1386,22 @@ class RepositoryIdentityAuthority:
                 query.text.lower().replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2).replace("%", f"{_LIKE_ESCAPE}%").replace("_", f"{_LIKE_ESCAPE}_")
             )
             needle = f"%{escaped}%"
+            shown_profile: list[ColumnElement[bool]] = [
+                lower(identities_table.c.username).like(needle, escape=_LIKE_ESCAPE),
+                lower(func.coalesce(identities_table.c.display_name, "")).like(needle, escape=_LIKE_ESCAPE),
+                lower(func.coalesce(identities_table.c.email, "")).like(needle, escape=_LIKE_ESCAPE),
+            ]
+            if query.linked_local_subjects:
+                # A linked account's name is shown under the same condition
+                # as the profile, so it is matched under that condition too.
+                shown_profile.append(
+                    and_(identities_table.c.provider == "local", identities_table.c.subject.in_(query.linked_local_subjects))
+                )
             statement = statement.where(
                 or_(
-                    func.lower(identities_table.c.subject).like(needle, escape=_LIKE_ESCAPE),
-                    func.lower(func.coalesce(identities_table.c.organisation_id, "")).like(needle, escape=_LIKE_ESCAPE),
-                    and_(
-                        not_(never_admitted),
-                        or_(
-                            func.lower(identities_table.c.username).like(needle, escape=_LIKE_ESCAPE),
-                            func.lower(func.coalesce(identities_table.c.display_name, "")).like(needle, escape=_LIKE_ESCAPE),
-                            func.lower(func.coalesce(identities_table.c.email, "")).like(needle, escape=_LIKE_ESCAPE),
-                        ),
-                    ),
+                    lower(identities_table.c.subject).like(needle, escape=_LIKE_ESCAPE),
+                    lower(func.coalesce(identities_table.c.organisation_id, "")).like(needle, escape=_LIKE_ESCAPE),
+                    and_(not_(never_admitted), or_(*shown_profile)),
                 )
             )
         statement = statement.order_by(label, identities_table.c.identity_id).limit(limit).offset(offset)
@@ -2083,6 +2103,7 @@ class RepositoryIdentityAuthority:
         subject: str,
         reason: str,
         record: Callable[[IdentityRetired], None],
+        credential_exists: Callable[[], bool],
         delete_credential: Callable[[], None],
     ) -> IdentityRecord | None:
         """Delete a credential and retire the identity behind it.
@@ -2112,6 +2133,22 @@ class RepositoryIdentityAuthority:
         username bound to a live identity; re-running the removal finds no
         credential, retires the identity it owed, and is the recovery.
 
+        THE REFUSAL PROTECTS AN ADMINISTRATOR WHO CAN SIGN IN, which is a
+        fact only the credential store holds, so the caller hands in
+        ``credential_exists`` as well.  The recovery above would otherwise be
+        refused in exactly the case that needs it: an administrator whose
+        credential went and whose retirement failed still counts toward R5,
+        so once every other administrator is removed the retry is "the last
+        administrator", can never complete, and the phantom row also keeps
+        ``bootstrap_admin``'s recovery mode inert.  A last administrator with
+        NO credential is therefore retired: nobody can sign in as them, and
+        retiring the row is what lets an operator bootstrap a working one.
+        The probe runs under R5's lock and only when the refusal is otherwise
+        decided.  A registration of the same username landing between the
+        probe and the deletion has its fresh credential deleted with the rest
+        and registers again to a fresh identity: inconvenient, and the
+        opposite of the inheritance this method exists to prevent.
+
         The refusal holds on EVERY surface, the operator's CLI included.
         ``bootstrap_admin``'s recovery mode is a way back from zero
         administrators, not a reason to let one command get there: a
@@ -2131,7 +2168,7 @@ class RepositoryIdentityAuthority:
             existing = conn.execute(_IDENTITY_BY_NATURAL_KEY_FOR_UPDATE, {"provider": provider, "subject": subject}).one_or_none()
             if existing is not None and existing.kind == "human" and existing.access_state == "active":
                 target_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": existing.identity_id}).all(), now)
-                if _holds_deployment_admin(target_grants) and _active_human_admin_count(admin_holders, now) <= 1:
+                if _holds_deployment_admin(target_grants) and _active_human_admin_count(admin_holders, now) <= 1 and credential_exists():
                     raise LastActiveAdminProtected()
             delete_credential()
             if existing is None:
@@ -3192,7 +3229,7 @@ class RepositoryIdentityAuthority:
 def local_identity_retirer(
     authority: RepositoryIdentityAuthority,
     record: Callable[[IdentityRetired], None],
-) -> Callable[[str, Callable[[], None]], bool]:
+) -> Callable[[str, Callable[[], bool], Callable[[], None]], bool]:
     """The ONE retirement collaborator for a deleted local credential.
 
     Every surface that deletes a local credential -- the web app's provider
@@ -3204,18 +3241,19 @@ def local_identity_retirer(
     no-op and owns that decision.  No surface chooses whether the last active
     human administrator is protected: see ``retire_identity``.
 
-    The returned callable takes the username and the caller's credential
-    deletion, and answers whether an identity was retired.
+    The returned callable takes the username, the caller's credential probe
+    and its credential deletion, and answers whether an identity was retired.
     """
     if type(authority) is not RepositoryIdentityAuthority:
         raise TypeError("authority must be an exact RepositoryIdentityAuthority")
 
-    def retire(username: str, delete_credential: Callable[[], None]) -> bool:
+    def retire(username: str, credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
         retired = authority.retire_identity(
             provider="local",
             subject=username,
             reason="local credential deleted",
             record=record,
+            credential_exists=credential_exists,
             delete_credential=delete_credential,
         )
         return retired is not None

@@ -23,8 +23,15 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.local import LocalAuthProvider, LocalUserDeletion
-from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityDisabled, UserIdentity, UserProfile
+from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityClaims, IdentityDisabled, UserIdentity, UserProfile
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.identity_authority import (
+    IdentityAdminActor,
+    IdentityRetired,
+    RepositoryIdentityAuthority,
+    local_identity_retirer,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -206,7 +213,7 @@ LocalAuthProvider(
         principal_is_active=lambda identity_id: True,
     ),
     admit_identity=lambda claims: (_ for _ in ()).throw(AssertionError("no login happens here")),
-    retire_identity=lambda username, delete_credential: (_ for _ in ()).throw(AssertionError("no deletion happens here")),
+    retire_identity=lambda username, credential_exists, delete_credential: (_ for _ in ()).throw(AssertionError("no deletion happens here")),
 )
 print(oct(stat.S_IMODE(path.stat().st_mode)))
 """
@@ -354,7 +361,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         retired: list[str] = []
         owed = [False, True]
 
-        def retire(username: str, delete_credential: Callable[[], None]) -> bool:
+        def retire(username: str, _credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
             delete_credential()
             retired.append(username)
             return owed[len(retired) - 1]
@@ -369,13 +376,108 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert recovery.removed_anything is True
         assert retired == ["alice", "alice"]
 
+    def test_delete_user_probe_reports_the_credential_row_as_the_store_holds_it(self, tmp_path) -> None:
+        """The retirer decides its last-administrator refusal on this answer, so it must be the store's."""
+        seen: list[bool] = []
+
+        def retire(_username: str, credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
+            seen.append(credential_exists())
+            delete_credential()
+            seen.append(credential_exists())
+            return True
+
+        provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retire)
+        provider.create_user("alice", "password123", display_name="Alice")
+        provider.create_user("bob", "password123", display_name="Bob")
+
+        provider.delete_user("alice")
+        provider.delete_user("alice")
+        # Present, gone, and on the re-run absent from the start; bob's row never answers for alice.
+        assert seen == [True, False, False, False]
+
+    def test_a_failed_retirement_of_the_last_administrator_can_still_be_completed(self, tmp_path) -> None:
+        """Both real stores, one injected audit outage (the 2026-09-20 review's reproduction).
+
+        alice's credential goes and her retirement fails, so she stays an
+        active administrator nobody can sign in as. bob is then removed
+        normally. Re-running alice's removal is the documented recovery, and
+        refusing it as "the last administrator" left a deployment with no
+        working administrator, no retry, and a bootstrap recovery held inert
+        by alice's live row.
+        """
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        initialize_session_schema(engine)
+        authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+
+        def _noop(*_args: object) -> None:
+            return None
+
+        root = authority.bootstrap_admin(
+            claims=IdentityClaims(provider="local", subject="alice", username="alice"),
+            note="test",
+            quota_tokens_per_day=None,
+            quota_storage_bytes=None,
+            record=_noop,
+        )
+        actor = IdentityAdminActor(identity_id=root.record.identity_id, on_behalf_of=None, console_request_id=None)
+        bob = authority.pre_provision_identity(
+            actor=actor,
+            provider="local",
+            subject="bob",
+            username=None,
+            organisation_id=None,
+            role="none",
+            note="test",
+            quota_tokens_per_day=None,
+            quota_storage_bytes=None,
+            record=_noop,
+        )
+        authority.grant_role(
+            actor=actor, identity_id=bob.record.identity_id, role="admin", scope=None, expires_at=None, note=None, record=_noop
+        )
+        audit_is_down = [True]
+
+        def record(_outcome: IdentityRetired) -> None:
+            if audit_is_down[0]:
+                raise RuntimeError("simulated retirement audit outage")
+
+        provider = LocalAuthProvider.for_account_administration(
+            tmp_path / "auth.db", retire_identity=local_identity_retirer(authority, record)
+        )
+        provider.create_user("alice", "password123", display_name="Alice")
+        provider.create_user("bob", "password123", display_name="Bob")
+
+        with pytest.raises(RuntimeError, match="audit outage"):
+            provider.delete_user("alice")
+        assert [account.user_id for account in provider.list_users()] == ["bob"]
+        assert authority.count_active_human_admins() == 2
+        audit_is_down[0] = False
+        assert provider.delete_user("bob") == LocalUserDeletion(credential_deleted=True, identity_retired=True)
+
+        # alice is now the last active administrator, with no credential. (A
+        # last administrator who HAS one is refused: see the CLI and authority tests.)
+        assert authority.count_active_human_admins() == 1
+        assert provider.list_users() == []
+
+        assert provider.delete_user("alice") == LocalUserDeletion(credential_deleted=False, identity_retired=True)
+        assert authority.count_active_human_admins() == 0
+        authority.bootstrap_admin(
+            claims=IdentityClaims(provider="local", subject="recovery", username="recovery"),
+            note="recovery",
+            quota_tokens_per_day=None,
+            quota_storage_bytes=None,
+            record=_noop,
+        )
+        assert authority.count_active_human_admins() == 1
+        engine.dispose()
+
     def test_delete_user_refusal_leaves_the_credential_in_place(self, tmp_path) -> None:
         """A retirer that refuses raises BEFORE calling the deletion, so the password survives."""
 
         class _Refused(RuntimeError):
             pass
 
-        def retire(_username: str, _delete_credential: Callable[[], None]) -> bool:
+        def retire(_username: str, _credential_exists: Callable[[], bool], _delete_credential: Callable[[], None]) -> bool:
             raise _Refused
 
         provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retire)
@@ -388,7 +490,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
     def test_delete_user_rejects_a_retirer_that_never_deletes(self, tmp_path) -> None:
         """Returning without deleting and without refusing would retire an identity whose password still works."""
         provider = LocalAuthProvider.for_account_administration(
-            tmp_path / "auth.db", retire_identity=lambda _username, _delete_credential: True
+            tmp_path / "auth.db", retire_identity=lambda _username, _credential_exists, _delete_credential: True
         )
         provider.create_user("alice", "password123", display_name="Alice")
 
