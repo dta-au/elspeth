@@ -13,6 +13,7 @@ from time import monotonic, sleep
 import pytest
 from sqlalchemy import event, func, select, update
 from sqlalchemy.engine import Connection
+from tests.fixtures.audit_hashing import fake_error_hash
 from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 from tests.helpers.postgres_target import postgres_test_target
 
@@ -614,7 +615,7 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(
             TerminalOutcome.FAILURE,
             TerminalPath.SINK_DISCARDED,
             sink_name=DISCARD_SINK_NAME,
-            error_hash="outcome-race",
+            error_hash=fake_error_hash("outcome-race"),
             coordination_token=leader_coordination_token(outcome_factory, run.run_id),
         )
         try:
@@ -1225,7 +1226,7 @@ def test_legacy_state_linked_artifact_outcome_contention_single_winner(
             sink_name="failsink",
             sink_node_id=failsink,
             artifact_id=artifact.artifact_id,
-            error_hash="fallback-error",
+            error_hash=fake_error_hash("fallback-error"),
             coordination_token=leader_coordination_token(factory, run.run_id),
         )
 

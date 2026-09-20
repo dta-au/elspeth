@@ -36,6 +36,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import insert, select
 from sqlalchemy.exc import DataError
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.engine.test_processor import _make_factory, _make_processor, _persist_token_for_scheduler
@@ -104,7 +105,7 @@ def _seed_row_and_token(db: LandscapeDB, *, run_id: str, row_id: str, token_id: 
                 node_type=NodeType.SOURCE.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 config_json="{}",
                 registered_at=NOW,
             )
@@ -117,7 +118,7 @@ def _seed_row_and_token(db: LandscapeDB, *, run_id: str, row_id: str, token_id: 
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )

@@ -18,6 +18,7 @@ from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine, insert, inspect, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ProgrammingError
+from tests.fixtures.audit_hashing import fake_sha256
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.scheduler import GroupLossSpec
@@ -283,7 +284,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                 insert(runs_table).values(
                     run_id="scheduler-postgres-run",
                     started_at=now,
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="running",
@@ -307,7 +308,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                         "node_type": NodeType.SOURCE.value,
                         "plugin_version": "1.0",
                         "determinism": "deterministic",
-                        "config_hash": "config",
+                        "config_hash": fake_sha256("config"),
                         "config_json": "{}",
                         "registered_at": now,
                     },
@@ -318,7 +319,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                         "node_type": NodeType.TRANSFORM.value,
                         "plugin_version": "1.0",
                         "determinism": "nondeterministic",
-                        "config_hash": "config",
+                        "config_hash": fake_sha256("config"),
                         "config_json": "{}",
                         "registered_at": now,
                     },
@@ -332,7 +333,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="hash-row-1",
+                    source_data_hash=fake_sha256("hash-row-1"),
                     created_at=now,
                 )
             )
@@ -398,7 +399,7 @@ def test_postgres_group_loss_insert_is_dialect_safe(
                 insert(runs_table).values(
                     run_id="coalesce-loss-postgres-run",
                     started_at=now,
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="running",
@@ -416,7 +417,7 @@ def test_postgres_group_loss_insert_is_dialect_safe(
                     node_type=NodeType.SOURCE.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -429,7 +430,7 @@ def test_postgres_group_loss_insert_is_dialect_safe(
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="hash-row-1",
+                    source_data_hash=fake_sha256("hash-row-1"),
                     created_at=now,
                 )
             )

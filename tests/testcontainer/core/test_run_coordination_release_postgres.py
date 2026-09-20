@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from sqlalchemy import event, func, insert, select, update
 from sqlalchemy.engine import Connection
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, expire_leader_seat, landscape_database_now, stamp_inside_next_transaction
 from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.run_coordination import register_run_leader
@@ -49,7 +50,7 @@ def _seed_run(db: LandscapeDB, *, run_id: str, now: datetime, status: str = "run
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=status,
@@ -416,7 +417,7 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
         follower = repo.admit_follower(
             run_id=run_id,
             worker_id=follower_id,
-            config_hash="config",
+            config_hash=fake_sha256("config"),
             window_seconds=30,
         )
         with db.read_only_connection() as conn:
@@ -480,7 +481,7 @@ def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="failed",
@@ -613,7 +614,7 @@ def _seed_run_with_follower(db: LandscapeDB, *, run_id: str) -> WorkerMembership
     return repo.admit_follower(
         run_id=run_id,
         worker_id=mint_worker_id(run_id),
-        config_hash="config",
+        config_hash=fake_sha256("config"),
         window_seconds=300,
     )
 

@@ -16,6 +16,7 @@ from sqlalchemy import delete, event, insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import Executable, Select
+from tests.fixtures.audit_hashing import fake_error_hash
 from tests.fixtures.landscape import leader_coordination_token, register_test_node
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.postgres_target import postgres_test_target
@@ -386,7 +387,7 @@ def _record_unrouted_failure(factory: RecorderFactory, *, member_token: WorkerMe
         ref=TokenRef(token_id=work_item.token_id, run_id=member_token.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.UNROUTED,
-        error_hash="e" * 64,
+        error_hash="e" * 16,
     )
 
 
@@ -597,7 +598,7 @@ def test_postgres_locks_discard_node_states_until_outcome_insert(
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
         sink_name=DISCARD_SINK_NAME,
-        error_hash="discard-error",
+        error_hash=fake_error_hash("discard-error"),
     )
 
     with db.read_only_connection() as conn:
@@ -634,7 +635,7 @@ def test_postgres_token_lock_blocks_phantom_node_state_until_outcome_insert(
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
         sink_name=DISCARD_SINK_NAME,
-        error_hash="discard-error",
+        error_hash=fake_error_hash("discard-error"),
     )
 
     with db.read_only_connection() as conn:
@@ -689,7 +690,7 @@ def test_postgres_locks_failsink_artifact_witness_until_outcome_insert(
         sink_name="failsink",
         sink_node_id=sink_id,
         artifact_id=artifact.artifact_id,
-        error_hash="failsink-error",
+        error_hash=fake_error_hash("failsink-error"),
     )
 
     with db.read_only_connection() as conn:

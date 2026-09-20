@@ -12,6 +12,7 @@ from typing import Literal
 import pytest
 from sqlalchemy import event, func, insert, select, update
 from sqlalchemy.engine import Connection
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import expire_leader_seat
 from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.run_coordination import register_run_leader
@@ -59,7 +60,7 @@ def test_admission_waiting_for_seat_reads_committed_run_status(
                 insert(runs_table).values(
                     run_id=run_id,
                     started_at=datetime.now(UTC),
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="failed" if transition == "resume-before-export" else "running",

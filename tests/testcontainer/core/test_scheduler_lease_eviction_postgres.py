@@ -33,6 +33,7 @@ import pytest
 from scripts.state_engine_profile_reporter import RuntimeProfileReporter
 from sqlalchemy import event, func, insert, select, update
 from sqlalchemy.engine import Connection
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     assert_stamped_between,
     expire_leader_seat,
@@ -95,7 +96,7 @@ def _seed(
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -112,7 +113,7 @@ def _seed(
                     node_type=node_type,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -169,7 +170,7 @@ def _enqueue_ready_item(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash=f"hash-{token_id}",
+                source_data_hash=fake_sha256(f"hash-{token_id}"),
                 created_at=now,
             )
         )
@@ -555,7 +556,7 @@ def test_postgresql_enqueue_and_claim_in_one_transaction_replay_enqueue_then_cla
                         row_index=index,
                         source_row_index=index,
                         ingest_sequence=index,
-                        source_data_hash=f"hash-{token_id}",
+                        source_data_hash=fake_sha256(f"hash-{token_id}"),
                         created_at=now,
                     )
                 )
