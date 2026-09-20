@@ -168,6 +168,8 @@ async def test_a_caller_with_neither_capability_sees_no_directory(tmp_path) -> N
         assert capabilities.status_code == 200
         assert capabilities.headers["cache-control"] == "no-store"
         assert (capabilities.json()["identity_admin"], capabilities.json()["local_accounts"]) == (False, False)
+        # No quota setting is configured in this harness, and the panel is told so.
+        assert capabilities.json()["quotas_enabled"] is False
         assert (await client.get("/api/auth/admin/people")).status_code == 401
 
 

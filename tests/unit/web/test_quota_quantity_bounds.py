@@ -23,6 +23,10 @@ def test_quota_settings_accept_representable_large_quantities(field: str, value:
             "composer_timeout_seconds": 85.0,
             "composer_rate_limit_per_minute": 10,
             "shareable_link_signing_key": b"\x00" * 32,
+            # Quotas on requires both per-identity defaults; the field under
+            # test overrides its own entry.
+            "quota_default_tokens_per_day": 1,
+            "quota_default_storage_bytes": 1,
             field: value,
         }
     )

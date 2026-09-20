@@ -234,7 +234,7 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
                   <AddPersonForm capabilities={capabilities} onCredential={addCredential} onCancel={() => { setAdding(false); setView("list"); setTimeout(() => addButtonRef.current?.focus(), 0); }}
                     onAdded={(key) => { dirtyOwners.current.clear(); setAdding(false); setSelected({ key, seed: null }); setView("detail"); setRefreshTick((value) => value + 1); }} />
                 ) : selected !== null ? (
-                  <PersonDetail key={selected.key} personKey={selected.key} initial={selected.seed} activeAdminCount={activeAdminCount} onCredential={addCredential} onPersonChanged={onPersonChanged} onGone={onGone} />
+                  <PersonDetail key={selected.key} personKey={selected.key} initial={selected.seed} activeAdminCount={activeAdminCount} quotasEnabled={capabilities.quotas_enabled} onCredential={addCredential} onPersonChanged={onPersonChanged} onGone={onGone} />
                 ) : (
                   <p className="people-empty-detail">Select a person to manage their access, roles, approvers, limits and sign-in.</p>
                 )}

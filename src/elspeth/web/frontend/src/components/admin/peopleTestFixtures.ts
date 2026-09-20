@@ -2,7 +2,7 @@
 import type { IdentityView, RoleView } from "@/types/identityAdmin";
 import type { IdentityPerson, LocalAccountPerson, PeopleCapabilities, PeopleListResponse, PersonRecord } from "@/types/people";
 
-export const BOTH: PeopleCapabilities = { identity_admin: true, local_accounts: true, auth_provider: "local", self_identity_id: "root-id", self_username: "root" };
+export const BOTH: PeopleCapabilities = { identity_admin: true, local_accounts: true, auth_provider: "local", quotas_enabled: true, self_identity_id: "root-id", self_username: "root" };
 export const IDENTITY_ONLY: PeopleCapabilities = { ...BOTH, local_accounts: false };
 export const LOCAL_ONLY: PeopleCapabilities = { ...BOTH, identity_admin: false };
 export const NEITHER: PeopleCapabilities = { ...BOTH, identity_admin: false, local_accounts: false };

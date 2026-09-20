@@ -21,8 +21,7 @@ from elspeth.web.sessions.models import identities_table, quota_policies_table
 
 
 @pytest.mark.parametrize("explicit_quota", [False, True])
-@pytest.mark.parametrize("storage_defaults", [False, True])
-def test_cli_quota_policy_is_not_disabled_by_absent_issuance_defaults(tmp_path, explicit_quota, storage_defaults):
+def test_cli_quota_policy_is_not_disabled_by_absent_issuance_defaults(tmp_path, explicit_quota):
     arguments = [
         "--no-dotenv",
         "composer",
@@ -48,8 +47,12 @@ def test_cli_quota_policy_is_not_disabled_by_absent_issuance_defaults(tmp_path, 
         shareable_link_signing_key=SecretBytes(b"\x00" * 32),
         quota_default_tokens_per_day=None,
         quota_container_tokens_per_day=None,
-        quota_default_storage_bytes=1000000 if storage_defaults else None,
-        quota_container_storage_bytes=10000000 if storage_defaults else None,
+        # A storage default WITHOUT a token default used to be a second arm
+        # of this test. It is no longer a configuration the server starts
+        # with (quotas on requires both defaults), so absent issuance
+        # defaults now means the whole quota system is off.
+        quota_default_storage_bytes=None,
+        quota_container_storage_bytes=None,
     )
     policy = ChargeableAdmissionPolicy(
         identity_token_quota_configured=settings.quota_default_tokens_per_day is not None,

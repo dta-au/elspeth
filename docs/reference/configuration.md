@@ -386,13 +386,21 @@ consulted.
 | `sso_transaction_secret` | secret | Yes (every IdP) | - | Seals the login transaction cookie carrying the PKCE verifier, state, and nonce. Independent of `secret_key`, so rotating one does not invalidate the other. Generate with `openssl rand -base64 32` and place the value in a secret store; supply by reference, never as an environment literal |
 | `public_base_url` | string | Yes (every IdP) | - | This deployment's externally visible origin. Must be a bare origin — scheme, host, and optional port, with no path, query, or fragment — and must be public HTTPS unless it is an HTTP loopback address for local development. A trailing slash is stripped |
 | `compartment_id` | string | Yes (every IdP; also when workflow governance is on) | - | Operator-declared marking for this container's identities and artifacts. It must match `[a-z0-9][a-z0-9-]{0,62}`; readiness requires it when workflow governance is on because library rows and audit metadata carry the marking |
-| `quota_default_tokens_per_day` | int | Yes (every IdP) | - | Daily LLM token allowance written into each identity's quota policy row at activation. Must be greater than 0 |
-| `quota_default_storage_bytes` | int | Yes (every IdP) | - | Blob storage allowance written into the same row. Must be greater than 0 |
+| `quota_default_tokens_per_day` | int | Yes (every IdP; also whenever any `quota_*` setting is configured) | - | Daily LLM token allowance written into each identity's quota policy row at activation. Must be greater than 0 |
+| `quota_default_storage_bytes` | int | Yes (every IdP; also whenever any `quota_*` setting is configured) | - | Blob storage allowance written into the same row. Must be greater than 0 |
 
 The two quota defaults are required rather than defaulted because an activated
 identity spends the container's shared LLM credential: without a policy row
 there is no ceiling to enforce. An administrator may override either number per
 identity afterwards.
+
+There is no separate switch for the quota system: configuring **any** of the four
+`quota_*` settings turns it on, and the server then refuses to start unless
+**both** per-identity defaults are set. A policy row stores a value for tokens
+and for storage, and an administrator sets one at a time, so the value they do
+not type for a person's first cap comes from these defaults. A local-auth
+deployment with none of the four configured runs with quotas off: usage is
+still shown in People & access, and no personal cap can be stored.
 
 A blank value is never treated as a value. `sso_client_id`, `sso_issuer`,
 `entra_tenant_id`, `google_hosted_domain`, `compartment_id` and the four
@@ -503,8 +511,8 @@ stating it can still break the glass.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `sso_admin_subjects` | JSON array of strings | No | `[]` | Provider `sub` claims that may seed the first `admin` role at first login, and **only** while the container has zero active human admins. The gate is a live count re-evaluated at every login, not a record that a bootstrap has happened, so the list **re-arms** if the container ever returns to zero active human admins. Delete it once the first administrator is activated. Entries are matched exactly and are not validated at load |
-| `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Enforced for every chargeable LLM operation when configured |
-| `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Enforced for every chargeable LLM operation when configured |
+| `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Validated only; no runtime path reads it in this release |
 | `identity_dormancy_days` | int | No | `90` | Dormancy window for an activated identity (R9). A login by an `active` identity whose previous login is **older than** this many days drops it back to `pending` with `disable_reason='dormant'`, writes an `identity_disabled` audit row, and refuses the login at the admission gate; an administrator must re-activate it. A re-pend takes the identity's **admission**, not its roles, quota or org-tree edges — the same posture R3's rebound disable takes — so re-activating it restores the access it already held, whichever role the administrator picks (including `none`), and the `identity_activated` audit row names those retained roles in its metadata. Use `POST /api/auth/admin/roles/{role_id}/revoke` to remove one; activation is not a way to strip authority. Exactly this many days is still admitted. An identity that has never logged in (`last_login_at` is NULL — a pre-provisioned row) is not dormant, and becomes measurable from its second login. The **last active human administrator is exempt** (D34): they are not re-pended and their login proceeds, so a single-admin container cannot walk itself to zero administrators by being left alone; the exemption writes its own `auth_events` row (`identity_disabled` with `outcome='failure'` and `failure_category='dormancy_last_admin_exempt'`). Must be greater than 0 |
 | `identity_pending_retention_days` | int | No | `90` | Intended retention for a never-activated pending identity before it is purged. Must be greater than 0. Validated only; no runtime path reads it in this release |
 

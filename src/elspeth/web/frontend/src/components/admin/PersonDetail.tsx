@@ -22,6 +22,7 @@ interface Props {
   /** The record the directory already holds, shown at once while the direct read runs. */
   initial: PersonRecord | null;
   activeAdminCount: number | null;
+  quotasEnabled: boolean;
   onCredential: (credential: GeneratedCredential) => void;
   /** The person's key changed (access was set up) or their record changed: refresh the directory too. */
   onPersonChanged: (key: string) => void;
@@ -93,7 +94,7 @@ function CopyId({ value }: { value: string }): JSX.Element {
 }
 
 /** Everything about one person. Bound to a stable key, never to a row position. */
-export function PersonDetail({ personKey, initial, activeAdminCount, onCredential, onPersonChanged, onGone }: Props): JSX.Element {
+export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabled, onCredential, onPersonChanged, onGone }: Props): JSX.Element {
   const [person, setPerson] = useState<PersonRecord | null>(initial?.key === personKey ? initial : null);
   const [load, setLoad] = useState<Load>({ status: "loading" });
   const [tab, setTab] = useState<Tab>("roles");
@@ -206,7 +207,7 @@ export function PersonDetail({ personKey, initial, activeAdminCount, onCredentia
                 {tab === "roles" && <RolesEditor key={`${person.key}:${person.identity.access_state}`} identityId={person.identity.identity_id} personName={name} kind={person.identity.kind} onChanged={notifyChanged} />}
                 {tab === "approvers" && <RelationshipsEditor key={person.key} identityId={person.identity.identity_id} personName={name} />}
                 {tab === "usage" && (person.identity.access_state === "active"
-                  ? <QuotaEditor key={person.key} identityId={person.identity.identity_id} personName={name} />
+                  ? <QuotaEditor key={person.key} identityId={person.identity.identity_id} personName={name} capsEnabled={quotasEnabled} />
                   : <p>Usage and limits are shown once {name}'s access is active.</p>)}
               </div>
             </>

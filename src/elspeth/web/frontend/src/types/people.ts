@@ -7,6 +7,8 @@ export interface PeopleCapabilities {
   identity_admin: boolean;
   local_accounts: boolean;
   auth_provider: string;
+  /** The deployment runs the quota system; off, no personal cap can be stored. */
+  quotas_enabled: boolean;
   self_identity_id: string;
   self_username: string;
 }

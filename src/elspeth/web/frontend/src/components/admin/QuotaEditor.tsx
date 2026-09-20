@@ -14,7 +14,7 @@ function parseCap(value: string): number | null {
 }
 
 /** Edit one quota dimension; the server preserves the other inside its audit transaction. */
-export function QuotaEditor({ identityId, personName, onSaved }: { identityId: string; personName: string; onSaved?: (quota: IdentityQuota) => void }): JSX.Element {
+export function QuotaEditor({ identityId, personName, capsEnabled, onSaved }: { identityId: string; personName: string; capsEnabled: boolean; onSaved?: (quota: IdentityQuota) => void }): JSX.Element {
   const [quota, setQuota] = useState<IdentityQuota | null>(null);
   const [dimension, setDimension] = useState<QuotaDimension>("tokens");
   const [value, setValue] = useState("");
@@ -62,12 +62,13 @@ export function QuotaEditor({ identityId, personName, onSaved }: { identityId: s
     {quota !== null && <>
       <p>Tokens per day: {quota.tokens_per_day ?? "no cap"} ({quota.tokens_used_today ?? "unknown"} used today; {quota.container_tokens_per_day === null ? "no container ceiling" : `container ceiling ${quota.container_tokens_per_day}`})</p>
       <p>Storage: {quota.storage_bytes === null ? "no cap" : formatBytes(quota.storage_bytes)} ({formatBytes(quota.storage_bytes_used)} used; {quota.container_storage_bytes === null ? "no container ceiling" : `container ceiling ${formatBytes(quota.container_storage_bytes)}`})</p>
-      {quota.tokens_per_day === null && quota.storage_bytes === null && <p className="people-grant-purpose">{personName} has no personal caps yet. A first cap is stored with a value for both tokens and storage, and the other value comes from this deployment's default limits. If no defaults are configured, saving is refused until an operator sets them.</p>}
+      {capsEnabled && quota.tokens_per_day === null && quota.storage_bytes === null && <p className="people-grant-purpose">{personName} has no personal caps yet. Setting one also gives the other a starting value, taken from this deployment's default limits.</p>}
     </>}
     {error !== null && <p role="alert" className="composer-preferences-error">{error}</p>}
     {quota === null && error !== null && <div><Button compact onClick={() => setAttempt((value) => value + 1)}>Retry</Button></div>}
     {saved && <p role="status">Quota updated.</p>}
-    <form className="identity-admin-fields" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+    {!capsEnabled && <p className="people-grant-purpose">Personal caps are not enabled on this deployment, so there is nothing to set here. An operator enables them by setting default limits for tokens per day and storage in the server configuration.</p>}
+    {capsEnabled && <form className="identity-admin-fields" onSubmit={(event) => { event.preventDefault(); void save(); }}>
       <label className="identity-admin-field">Dimension
         <select className="input" value={dimension} disabled={busy || quota === null} onChange={(event) => { setDimension(event.target.value as QuotaDimension); setValue(""); }}>
           <option value="tokens">Tokens per day</option>
@@ -76,6 +77,6 @@ export function QuotaEditor({ identityId, personName, onSaved }: { identityId: s
       </label>
       <Input label="New cap" type="text" inputMode="numeric" value={value} disabled={busy || quota === null} onChange={(event) => setValue(event.target.value)} />
       <Button type="submit" variant="primary" disabled={busy || quota === null || cap === null}>Save cap</Button>
-    </form>
+    </form>}
   </section>;
 }

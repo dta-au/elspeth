@@ -86,6 +86,9 @@ class PeopleCapabilities(_StrictModel):
     # The deployment's configured sign-in provider, so the panel can explain
     # how people here are identified without guessing from the caller's name.
     auth_provider: AuthProviderType
+    # Whether the deployment runs the quota system (``WebSettings.quotas_enabled``).
+    # Off, the panel shows usage and offers no cap form it knows would be refused.
+    quotas_enabled: bool
     self_identity_id: str
     self_username: str
 
@@ -299,6 +302,7 @@ async def _resolve(request: Request) -> tuple[UserIdentity, PeopleCapabilities]:
         identity_admin=identity_admin,
         local_accounts=is_dev_admin(settings, user),
         auth_provider=settings.auth_provider,
+        quotas_enabled=settings.quotas_enabled,
         self_identity_id=user.user_id,
         self_username=user.username,
     )

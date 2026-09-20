@@ -251,9 +251,9 @@ class RepositoryQuotaPolicyAuthority:
         storage_bytes = value if dimension == "storage" else (previous.storage_bytes if previous is not None else default_storage_bytes)
         if tokens_per_day is None or storage_bytes is None:
             raise QuotaDefaultMissing(
-                "a first personal cap needs a value for both tokens and storage, and this deployment has no default for the "
-                "other one; an operator sets ELSPETH_WEB__QUOTA_DEFAULT_TOKENS_PER_DAY and "
-                "ELSPETH_WEB__QUOTA_DEFAULT_STORAGE_BYTES, after which either cap can be set on its own"
+                "personal caps are not enabled on this deployment; an operator enables them by setting both "
+                "ELSPETH_WEB__QUOTA_DEFAULT_TOKENS_PER_DAY and ELSPETH_WEB__QUOTA_DEFAULT_STORAGE_BYTES "
+                "in the server configuration"
             )
         if current is not None:
             conn.execute(update(quota_policies_table).where(quota_policies_table.c.policy_id == current.policy_id).values(revoked_at=now))
