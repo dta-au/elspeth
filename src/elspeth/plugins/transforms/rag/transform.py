@@ -60,7 +60,7 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:08baab28843851f1"
+    source_file_hash: str | None = "sha256:4d1f4cd24c69f2e2"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
@@ -541,6 +541,8 @@ class RAGRetrievalTransform(BaseTransform):
                 summary="Vector retrieval against a configured backend (Chroma, etc). Builds a query from row fields, returns ranked chunks for downstream LLM grounding.",
                 composer_hints=(
                     "Name the Chroma collection in provider_config.collection or the Azure Search index in provider_config.index.",
+                    "Azure Search reads provider_config.content_field and id_field (defaults content / id); an index built by the portal import wizard needs chunk / chunk_id. Set title_field and url_field to emit source_name and source_link citation metadata.",
+                    "Azure Search vector and hybrid modes send the query as text, so the index must define an integrated vectorizer on vector_field; semantic mode needs semantic_config and scores by the 0-4 reranker score.",
                     "Query template uses row-field interpolation; document what fields are read so downstream consumers can wire them.",
                     "top_k and min_score interact — high min_score plus low top_k may return zero chunks. Configure on_no_results to handle the empty-result case.",
                     "The transform emits running mean/variance telemetry for retrieval scores — watch these to catch retrieval-quality regressions.",

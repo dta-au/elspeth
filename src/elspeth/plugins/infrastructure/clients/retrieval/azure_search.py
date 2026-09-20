@@ -8,7 +8,7 @@ import urllib.parse
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 
 import httpx
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.probes import CollectionReadinessResult
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 _AZURE_SEARCH_MANAGED_IDENTITY_SUFFIX = ".search.windows.net"
 _AZURE_SEARCH_TOKEN_SCOPE = "https://search.azure.com/.default"
+_AZURE_FIELD_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 AzureSearchAuthMode = Literal["api_key", "managed_identity"]
 
@@ -69,6 +70,48 @@ class AzureSearchProviderConfig(BaseModel):
 
     vector_field: str = "contentVector"
     semantic_config: str | None = None
+
+    # Index field mapping. Defaults match the historical hardcoded names; an
+    # index built by the portal's import wizard uses chunk / chunk_id / title.
+    content_field: str = "content"
+    id_field: str = "id"
+    title_field: str | None = None
+    url_field: str | None = None
+    select: tuple[str, ...] | None = None
+    # Operator-authored OData $filter, sent verbatim. Never built from row data.
+    filter: str | None = None
+
+    # Client id of a user-assigned managed identity; unset selects the
+    # system-assigned identity.
+    managed_identity_client_id: str | None = None
+
+    @field_validator("content_field", "id_field", "title_field", "url_field", "vector_field")
+    @classmethod
+    def validate_field_name(cls, v: str | None, info: ValidationInfo) -> str | None:
+        if v is not None and not _AZURE_FIELD_NAME.match(v):
+            raise ValueError(f"{info.field_name} must be an Azure AI Search field name (letters, digits, underscores), got {v!r}")
+        return v
+
+    @field_validator("select")
+    @classmethod
+    def validate_select(cls, v: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if v is not None:
+            if not v:
+                raise ValueError("select must name at least one field when set")
+            for name in v:
+                if not _AZURE_FIELD_NAME.match(name):
+                    raise ValueError(f"select entries must be Azure AI Search field names, got {name!r}")
+        return v
+
+    @field_validator("filter")
+    @classmethod
+    def validate_filter(cls, v: str | None) -> str | None:
+        if v is not None:
+            if not v.strip():
+                raise ValueError("filter must not be blank when set")
+            if any(c in v for c in "\r\n\x00"):
+                raise ValueError("filter must not contain newlines or null bytes")
+        return v
 
     @field_validator("endpoint")
     @classmethod
@@ -131,6 +174,8 @@ class AzureSearchProviderConfig(BaseModel):
         inferred_mode: AzureSearchAuthMode = "managed_identity" if self.use_managed_identity else "api_key"
         if self.auth_mode is not None and self.auth_mode != inferred_mode:
             raise ValueError(f"auth_mode {self.auth_mode!r} does not match configured authentication method {inferred_mode!r}")
+        if self.managed_identity_client_id is not None and not self.use_managed_identity:
+            raise ValueError("managed_identity_client_id requires use_managed_identity=true")
         object.__setattr__(self, "auth_mode", inferred_mode)
         return self
 
@@ -140,13 +185,35 @@ class AzureSearchProviderConfig(BaseModel):
             raise ValueError("semantic search_mode requires semantic_config")
         return self
 
+    @model_validator(mode="after")
+    def validate_select_covers_mapped_fields(self) -> Self:
+        if self.select is not None:
+            mapped = [name for name in (self.content_field, self.id_field, self.title_field, self.url_field) if name is not None]
+            missing = [name for name in mapped if name not in self.select]
+            if missing:
+                raise ValueError(f"select must include the mapped fields {missing!r}; Azure returns only selected fields")
+        return self
 
-# Score normalization ranges per search mode.
+
+# Score normalization ranges per search mode
+# (https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking).
+# BM25 has no upper limit, so the keyword ceiling is a clamp, not a bound.
+# Hybrid @search.score is an RRF sum: each fused query contributes at most
+# 1/(1 + 60), and this provider fuses one text and one vector query.
+_RRF_K = 60
 _SCORE_RANGES: dict[str, tuple[float, float]] = {
     "keyword": (0.0, 50.0),
     "vector": (0.0, 1.0),
-    "hybrid": (0.0, 50.0),
+    "hybrid": (0.0, 2 / (1 + _RRF_K)),
     "semantic": (0.0, 4.0),
+}
+
+# Semantic ranking reports its 0-4 score separately; @search.score stays BM25.
+_SCORE_KEYS: dict[str, str] = {
+    "keyword": "@search.score",
+    "vector": "@search.score",
+    "hybrid": "@search.score",
+    "semantic": "@search.rerankerScore",
 }
 
 
@@ -178,6 +245,7 @@ class AzureSearchProvider:
 
         self._search_url = f"{config.endpoint.rstrip('/')}/indexes/{config.index}/docs/search?api-version={config.api_version}"
         self._score_range = _SCORE_RANGES[config.search_mode]
+        self._score_key = _SCORE_KEYS[config.search_mode]
 
         # Per-search skipped item tracking — allows callers to include
         # skip counts in audit records without changing the protocol.
@@ -219,15 +287,21 @@ class AzureSearchProvider:
 
     def _get_managed_identity_credential(self) -> _ManagedIdentityCredential:
         if self._managed_identity_credential is None:
+            # ManagedIdentityCredential, never DefaultAzureCredential: the default
+            # chain tries EnvironmentCredential first, so a host carrying service
+            # principal variables would authenticate as that principal while the
+            # audit trail records auth_mode=managed_identity.
             try:
-                from azure.identity import DefaultAzureCredential
+                from azure.identity import ManagedIdentityCredential
             except ImportError as exc:
                 raise RetrievalError(
                     "Azure managed identity token acquisition failed: azure-identity is not installed. "
                     "Install elspeth with the 'azure' extra or use api_key authentication.",
                     retryable=False,
                 ) from exc
-            self._managed_identity_credential = cast(_ManagedIdentityCredential, DefaultAzureCredential())
+            client_id = self._config.managed_identity_client_id
+            credential = ManagedIdentityCredential(client_id=client_id) if client_id is not None else ManagedIdentityCredential()
+            self._managed_identity_credential = cast(_ManagedIdentityCredential, credential)
         return self._managed_identity_credential
 
     def search(
@@ -340,6 +414,11 @@ class AzureSearchProvider:
             body["queryType"] = "semantic"
             body["semanticConfiguration"] = self._config.semantic_config
 
+        if self._config.select is not None:
+            body["select"] = ",".join(self._config.select)
+        if self._config.filter is not None:
+            body["filter"] = self._config.filter
+
         return body
 
     @trust_boundary(
@@ -378,34 +457,40 @@ class AzureSearchProvider:
                 skipped_items.append({"reason": "invalid_item_type", "type": type(item).__name__})
                 continue
 
-            raw_score = item.get("@search.score")
+            content_field = self._config.content_field
+            id_field = self._config.id_field
+            item_id = item.get(id_field)
+
+            # Semantic mode reads @search.rerankerScore; an item the ranker did
+            # not score is a recorded skip, never ranked on its BM25 score.
+            raw_score = item.get(self._score_key)
             if raw_score is None:
-                skipped_items.append({"reason": "missing_score", "id": item.get("id")})
+                skipped_items.append({"reason": "missing_score", "id": item_id})
                 continue
 
             # Tier 3 boundary: validate score type before arithmetic.
             # Azure returns JSON — score could be string, bool, list, etc.
             # bool check required because isinstance(True, int) is True in Python.
             if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
-                skipped_items.append({"reason": "invalid_score_type", "id": item.get("id"), "type": type(raw_score).__name__})
+                skipped_items.append({"reason": "invalid_score_type", "id": item_id, "type": type(raw_score).__name__})
                 continue
 
             normalized_score = self._normalize_score(raw_score)
             if normalized_score < min_score:
                 continue
 
-            content = item.get("content")
+            content = item.get(content_field)
             if content is None:
-                skipped_items.append({"reason": "missing_content", "id": item.get("id")})
+                skipped_items.append({"reason": "missing_content", "id": item_id})
                 continue
             if not isinstance(content, str):
-                skipped_items.append({"reason": "invalid_content_type", "id": item.get("id"), "type": type(content).__name__})
+                skipped_items.append({"reason": "invalid_content_type", "id": item_id, "type": type(content).__name__})
                 continue
             if not content:
-                skipped_items.append({"reason": "empty_content", "id": item.get("id")})
+                skipped_items.append({"reason": "empty_content", "id": item_id})
                 continue
 
-            source_id = item.get("id") or item.get("@search.documentId")
+            source_id = item_id or item.get("@search.documentId")
             if source_id is None:
                 # No identifier available — skip rather than fabricate "unknown".
                 # "record what we didn't get": absence is captured by the count
@@ -416,8 +501,15 @@ class AzureSearchProvider:
             metadata: dict[str, Any] = {
                 k: str(v) if not isinstance(v, (str, int, float, bool, type(None), list, dict)) else v
                 for k, v in item.items()
-                if k not in ("@search.score", "content", "id")
+                if k not in (self._score_key, content_field, id_field)
             }
+            # Citation fields under provider-neutral names. A missing or
+            # non-string value is omitted, never fabricated.
+            for citation_key, field_name in (("source_name", self._config.title_field), ("source_link", self._config.url_field)):
+                if field_name is not None:
+                    citation_value = item.get(field_name)
+                    if isinstance(citation_value, str) and citation_value:
+                        metadata[citation_key] = citation_value
 
             try:
                 chunks.append(
@@ -479,7 +571,7 @@ class AzureSearchProvider:
 
         Auth modes:
         - api_key: sends api-key header
-        - use_managed_identity: acquires a Bearer token via DefaultAzureCredential
+        - use_managed_identity: acquires a Bearer token via ManagedIdentityCredential
         """
         from elspeth.core.security.web import NetworkError, SSRFBlockedError, validate_url_for_ssrf
 

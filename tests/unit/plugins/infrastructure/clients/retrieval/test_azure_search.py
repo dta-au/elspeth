@@ -659,7 +659,7 @@ class TestAzureSearchProviderReadiness:
         with (
             patch.object(provider, "_readiness_get", return_value=self._mock_response(text="10")) as mock_get,
             patch(
-                "azure.identity.DefaultAzureCredential",
+                "azure.identity.ManagedIdentityCredential",
                 return_value=credential,
             ),
         ):
@@ -723,7 +723,7 @@ class TestAzureSearchProviderReadiness:
         credential = _FakeAzureCredential(error=auth_error)
 
         with (
-            patch("azure.identity.DefaultAzureCredential", return_value=credential),
+            patch("azure.identity.ManagedIdentityCredential", return_value=credential),
             patch.object(provider, "_readiness_get") as mock_get,
             pytest.raises(RetrievalError, match="Azure managed identity token acquisition failed") as exc_info,
         ):
@@ -936,7 +936,7 @@ class TestExecuteSearchHTTP:
         credential = _FakeAzureCredential()
 
         with (
-            patch("azure.identity.DefaultAzureCredential", return_value=credential),
+            patch("azure.identity.ManagedIdentityCredential", return_value=credential),
             respx.mock,
         ):
             route = respx.post(self.PINNED_SEARCH_URL).mock(return_value=httpx.Response(200, json=response_body))
@@ -958,7 +958,7 @@ class TestExecuteSearchHTTP:
         credential = _FakeAzureCredential(error=auth_error)
 
         with (
-            patch("azure.identity.DefaultAzureCredential", return_value=credential),
+            patch("azure.identity.ManagedIdentityCredential", return_value=credential),
             respx.mock,
         ):
             route = respx.post(self.PINNED_SEARCH_URL).mock(return_value=httpx.Response(200, json={"value": []}))
@@ -980,7 +980,7 @@ class TestExecuteSearchHTTP:
         credential = _FakeAzureCredential()
 
         with (
-            patch("azure.identity.DefaultAzureCredential", return_value=credential) as credential_cls,
+            patch("azure.identity.ManagedIdentityCredential", return_value=credential) as credential_cls,
             respx.mock,
         ):
             respx.post(self.PINNED_SEARCH_URL).mock(return_value=httpx.Response(200, json=response_body))
@@ -1090,3 +1090,164 @@ class TestExecuteSearchHTTP:
                 provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
             assert not exc_info.value.retryable
+
+
+def _provider(**overrides: Any) -> AzureSearchProvider:
+    config_data: dict[str, Any] = {
+        "endpoint": "https://test.search.windows.net",
+        "index": "test-index",
+        "api_key": "test-key",
+    }
+    config_data.update(overrides)
+    return AzureSearchProvider(
+        config=AzureSearchProviderConfig(**config_data),
+        execution=_FakeExecutionRecorder(),
+        run_id="run-1",
+        telemetry_emit=_TelemetrySink(),
+    )
+
+
+class TestModeScoring:
+    """Score ranges per https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking.
+
+    Semantic ranking reports ``@search.rerankerScore`` (0.00 - 4.00) separately from
+    ``@search.score``; hybrid ``@search.score`` is an RRF sum where each fused query
+    contributes at most 1/(1 + 60), so one text plus one vector query tops out at 2/61.
+    """
+
+    def test_semantic_mode_scores_by_reranker_score_not_bm25(self):
+        provider = _provider(search_mode="semantic", semantic_config="cfg")
+        response = {"value": [{"@search.score": 31.7, "@search.rerankerScore": 1.0, "content": "c", "id": "d1"}]}
+        chunks, skipped = provider._parse_response(response, min_score=0.0)
+        assert skipped == []
+        assert chunks[0].score == pytest.approx(0.25)
+
+    def test_semantic_mode_orders_by_reranker_score(self):
+        provider = _provider(search_mode="semantic", semantic_config="cfg")
+        response = {
+            "value": [
+                {"@search.score": 40.0, "@search.rerankerScore": 0.4, "content": "low", "id": "d1"},
+                {"@search.score": 2.0, "@search.rerankerScore": 3.6, "content": "high", "id": "d2"},
+            ]
+        }
+        chunks, _ = provider._parse_response(response, min_score=0.0)
+        assert [c.source_id for c in chunks] == ["d2", "d1"]
+
+    def test_semantic_mode_without_reranker_score_is_recorded_skip(self):
+        provider = _provider(search_mode="semantic", semantic_config="cfg")
+        response = {"value": [{"@search.score": 31.7, "content": "c", "id": "d1"}]}
+        chunks, skipped = provider._parse_response(response, min_score=0.0)
+        assert chunks == []
+        assert skipped == [{"reason": "missing_score", "id": "d1"}]
+
+    def test_hybrid_top_rrf_score_normalizes_to_one(self):
+        provider = _provider(search_mode="hybrid")
+        assert provider._normalize_score(2 / 61) == pytest.approx(1.0)
+
+    def test_hybrid_realistic_score_survives_a_mid_threshold(self):
+        provider = _provider(search_mode="hybrid")
+        response = {"value": [{"@search.score": 1 / 61 + 1 / 63, "content": "c", "id": "d1"}]}
+        chunks, _ = provider._parse_response(response, min_score=0.5)
+        assert [c.source_id for c in chunks] == ["d1"]
+
+
+class TestFieldMapping:
+    def test_defaults_keep_content_and_id(self):
+        config = AzureSearchProviderConfig(endpoint="https://test.search.windows.net", index="i", api_key="k")
+        assert (config.content_field, config.id_field, config.title_field, config.url_field) == ("content", "id", None, None)
+        assert config.select is None
+        assert config.filter is None
+
+    def test_custom_content_and_id_fields(self):
+        provider = _provider(content_field="chunk", id_field="chunk_id")
+        response = {"value": [{"@search.score": 1.0, "chunk": "body", "chunk_id": "c-7", "title": "Doc"}]}
+        chunks, skipped = provider._parse_response(response, min_score=0.0)
+        assert skipped == []
+        assert chunks[0].content == "body"
+        assert chunks[0].source_id == "c-7"
+        assert dict(chunks[0].metadata) == {"title": "Doc"}
+
+    def test_skip_evidence_names_the_configured_id_field(self):
+        provider = _provider(content_field="chunk", id_field="chunk_id")
+        response = {"value": [{"@search.score": 1.0, "chunk_id": "c-7"}]}
+        _, skipped = provider._parse_response(response, min_score=0.0)
+        assert skipped == [{"reason": "missing_content", "id": "c-7"}]
+
+    def test_title_and_url_become_citation_metadata(self):
+        provider = _provider(title_field="doc_title", url_field="doc_url")
+        response = {"value": [{"@search.score": 1.0, "content": "c", "id": "d1", "doc_title": "Returns", "doc_url": "https://x.example/r"}]}
+        chunks, _ = provider._parse_response(response, min_score=0.0)
+        metadata = dict(chunks[0].metadata)
+        assert metadata["source_name"] == "Returns"
+        assert metadata["source_link"] == "https://x.example/r"
+
+    def test_non_string_citation_value_is_omitted_not_fabricated(self):
+        provider = _provider(title_field="doc_title")
+        response = {"value": [{"@search.score": 1.0, "content": "c", "id": "d1", "doc_title": 7}]}
+        chunks, _ = provider._parse_response(response, min_score=0.0)
+        assert "source_name" not in dict(chunks[0].metadata)
+
+    @pytest.mark.parametrize("field_name", ["content_field", "id_field", "title_field", "url_field", "vector_field"])
+    def test_field_names_must_be_azure_identifiers(self, field_name: str):
+        with pytest.raises(ValueError, match=field_name):
+            AzureSearchProviderConfig(endpoint="https://test.search.windows.net", index="i", api_key="k", **{field_name: "bad name,x"})
+
+    def test_select_and_filter_reach_the_request_body(self):
+        provider = _provider(
+            select=("chunk", "chunk_id", "title"),
+            content_field="chunk",
+            id_field="chunk_id",
+            filter="category eq 'policy'",
+        )
+        body = provider._build_request_body("q", top_k=3)
+        assert body["select"] == "chunk,chunk_id,title"
+        assert body["filter"] == "category eq 'policy'"
+
+    def test_select_and_filter_absent_by_default(self):
+        body = _provider()._build_request_body("q", top_k=3)
+        assert "select" not in body
+        assert "filter" not in body
+
+    def test_select_must_include_the_mapped_fields(self):
+        with pytest.raises(ValueError, match="select must include"):
+            AzureSearchProviderConfig(
+                endpoint="https://test.search.windows.net",
+                index="i",
+                api_key="k",
+                content_field="chunk",
+                select=("title",),
+            )
+
+
+class TestManagedIdentityCredentialClass:
+    """Managed identity means ManagedIdentityCredential, never the DefaultAzureCredential chain."""
+
+    def test_uses_managed_identity_credential_with_client_id(self):
+        provider = _provider(
+            api_key=None,
+            use_managed_identity=True,
+            managed_identity_client_id="11111111-2222-3333-4444-555555555555",
+        )
+        credential = _FakeAzureCredential()
+        with (
+            patch("azure.identity.ManagedIdentityCredential", return_value=credential) as mi_cls,
+            patch("azure.identity.DefaultAzureCredential") as default_cls,
+        ):
+            assert provider._auth_headers() == {"Authorization": "Bearer managed-identity-token-123"}
+        mi_cls.assert_called_once_with(client_id="11111111-2222-3333-4444-555555555555")
+        default_cls.assert_not_called()
+
+    def test_system_assigned_passes_no_client_id(self):
+        provider = _provider(api_key=None, use_managed_identity=True)
+        with patch("azure.identity.ManagedIdentityCredential", return_value=_FakeAzureCredential()) as mi_cls:
+            provider._auth_headers()
+        mi_cls.assert_called_once_with()
+
+    def test_client_id_requires_managed_identity(self):
+        with pytest.raises(ValueError, match="managed_identity_client_id"):
+            AzureSearchProviderConfig(
+                endpoint="https://test.search.windows.net",
+                index="i",
+                api_key="k",
+                managed_identity_client_id="abc",
+            )

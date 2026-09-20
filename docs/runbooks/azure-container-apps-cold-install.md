@@ -381,6 +381,72 @@ running replicas, HTTP 200 on both probes and the expected
 digest in operator-local notes under
 `~/.local/state/elspeth/azure-container-apps/`, not in a tracked file.
 
+## 10. Optional: grant Azure AI Search access for RAG retrieval
+
+The `rag_retrieval` transform's `azure_search` provider queries an existing
+Azure AI Search index; the default image already carries it
+(`INSTALL_EXTRAS=all` includes `azure-identity`). The bundle does not create a
+search service or an index. Keeping to "no static credential in any
+container", the supported credential on this target is the web app's
+user-assigned identity, not a Search API key: the bundle has no Key Vault slot
+for a plugin key, and `extraEnvironment` entries are plain values.
+
+Enable role-based access on the search service and grant the identity read
+access to index data:
+
+```bash
+: "${SEARCH_SERVICE_NAME:?set the existing search service name}"
+: "${SEARCH_RESOURCE_GROUP:?set the resource group of the search service}"
+IDENTITY_PRINCIPAL_ID=$(jq -er '.identityPrincipalId.value' "$OPERATOR_DIR/environment-outputs.json")
+IDENTITY_CLIENT_ID=$(jq -er '.identityClientId.value' "$OPERATOR_DIR/environment-outputs.json")
+SEARCH_RESOURCE_ID=$(az search service show --name "$SEARCH_SERVICE_NAME" \
+  --resource-group "$SEARCH_RESOURCE_GROUP" --query id --output tsv)
+az search service update --name "$SEARCH_SERVICE_NAME" --resource-group "$SEARCH_RESOURCE_GROUP" \
+  --auth-options aadOrApiKey --aad-auth-failure-mode http401WithBearerChallenge --output none
+az role assignment create --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role 'Search Index Data Reader' --scope "$SEARCH_RESOURCE_ID" --output none
+printf 'managed_identity_client_id: %s\n' "$IDENTITY_CLIENT_ID"
+```
+
+A pipeline then names the identity explicitly. `managed_identity_client_id` is
+required here: the identity is user-assigned, and the provider uses
+`ManagedIdentityCredential`, which does not read `AZURE_CLIENT_ID` on Container
+Apps.
+
+```yaml
+provider: azure_search
+provider_config:
+  endpoint: https://<service>.search.windows.net
+  index: <index>
+  use_managed_identity: true
+  managed_identity_client_id: <identityClientId>
+  search_mode: hybrid
+```
+
+Index field mapping, search modes and score ranges are in
+[`examples/azure_search_rag`](../../examples/azure_search_rag/README.md).
+
+Limits on this target:
+
+- **Web-authored pipelines cannot use it yet.** The Web Composer refuses
+  `use_managed_identity` when a pipeline is authored, validated and executed
+  (`web/provider_config_policy.py`), because a server identity's token would
+  otherwise follow any endpoint a user types. The operator-controlled endpoint
+  allowlist that refusal names is not implemented, and this bundle deploys no
+  other run surface, so the grant above is a prerequisite, not a working path,
+  until that allowlist lands.
+- **No private endpoint for the search service.** The provider resolves the
+  endpoint and refuses private addresses before every request and at start-up,
+  so a `privatelink.search.windows.net` answer is blocked as SSRF. Leave the
+  service on its public endpoint and restrict it with the Search IP firewall.
+  The environment's outbound address is not static without a NAT gateway,
+  which the bundle does not create.
+- A run that stops at start-up with `RetrievalNotReadyError` and
+  `unreachable: HTTPStatusError` naming 403 means the role assignment has not
+  propagated or role-based access is off; a missing index reports `not found`,
+  an empty one `is empty`.
+
 ## Troubleshooting
 
 ### The runtime doctor fails TLS or authentication
