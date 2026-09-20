@@ -50,6 +50,10 @@ from elspeth.web.composer.source_inspection import (
     inspect_csv_source_content,
 )
 from elspeth.web.composer.state import (
+    _LLM_SYSTEM_PROMPT_MISSING_EXPLANATION,
+    _LLM_SYSTEM_PROMPT_MISSING_FIX,
+    _LLM_USER_PROMPT_MISSING_EXPLANATION,
+    _LLM_USER_PROMPT_MISSING_FIX,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
     _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION,
@@ -1773,6 +1777,20 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
         "or satisfy the fields it names), or splice at a position whose producer supplies them, then retry "
         "splice_transform.",
+    ),
+    # Prompt-role presence (session 60ab6a67): a composer-authored llm node
+    # carries BOTH roles. Serves the state.py constants rather than a copy —
+    # the rejection message ends with the same FIX, and the planner's redacted
+    # repair turn sees only this record.
+    DirectValidationGuidance(
+        "llm_system_prompt_missing",
+        _LLM_SYSTEM_PROMPT_MISSING_EXPLANATION,
+        _LLM_SYSTEM_PROMPT_MISSING_FIX,
+    ),
+    DirectValidationGuidance(
+        "llm_user_prompt_missing",
+        _LLM_USER_PROMPT_MISSING_EXPLANATION,
+        _LLM_USER_PROMPT_MISSING_FIX,
     ),
     *_direct_plugin_policy_guidance(),
 )

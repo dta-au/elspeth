@@ -98,12 +98,24 @@ const FIXED_TIME = "2026-08-11T08:00:00.000Z";
 // count are recorded in the commit that set it). Exported so the visual
 // spec's graph node count derives from it.
 export const TALL_DIALOG_NODE_COUNT = 88;
+// Every composer llm node carries BOTH prompt roles (Stage-1
+// llm_system_prompt_missing, 2026-09-21); a seed without a system prompt is no
+// longer a validated pipeline.
+const TALL_DIALOG_SYSTEM_PROMPT =
+  "You review product categories. Reply with one concise classification and nothing else.";
 const TALL_DIALOG_PROMPT_TEMPLATE =
   "Review category {{ row.category }} and return a concise classification.";
-// elspeth.core.canonical.stable_hash(TALL_DIALOG_PROMPT_TEMPLATE), 2026-09-05,
-// release/0.8.0 @ b00674f5d. Re-derive if the prompt text above changes.
+// With a system prompt present the reviewed surface is the labelled pair, and
+// so is the anchor: interpretation_state.prompt_review_draft_from_options and
+// prompt_review_anchor_hash_from_options (domain
+// elspeth.single-prompt-review.v1), both computed in the worktree venv for the
+// exact two strings above, 2026-09-21. Control for that derivation: with no
+// system prompt it reproduced the previous pin, stable_hash(template) =
+// be07c8ba…d2b6. Re-derive BOTH if either prompt changes.
+const TALL_DIALOG_PROMPT_REVIEW_DRAFT =
+  `System prompt:\n${TALL_DIALOG_SYSTEM_PROMPT}\n\nPrompt template:\n${TALL_DIALOG_PROMPT_TEMPLATE}`;
 const TALL_DIALOG_PROMPT_TEMPLATE_HASH =
-  "be07c8ba62144f98ae93e15a63d3e745393e8a388053db74e4bd3491267ad2b6";
+  "87501a0726a4fb95c5b20f5157a4884bf76ae62539753535dda5aa2faf5082f8";
 
 function deferredSignal(): DeferredSignal {
   let release: (() => void) | undefined;
@@ -170,6 +182,7 @@ async function seedCanonicalComposition(
         // playwright.config.ts. Authoring provider/model alongside a profile
         // is correctly rejected by live preflight.
         profile: "e2e-bedrock",
+        system_prompt: TALL_DIALOG_SYSTEM_PROMPT,
         prompt_template: TALL_DIALOG_PROMPT_TEMPLATE,
         required_input_fields: ["category"],
         // One output field per stage: graph_structure rejects a transform
@@ -183,18 +196,17 @@ async function seedCanonicalComposition(
         // review debt the backend cannot surface. The fixture's intent is a
         // validated pipeline, so the review is RESOLVED against the prompt's
         // own hash rather than left pending (which would gate Run behind
-        // TALL_DIALOG_NODE_COUNT interpretation cards). The hash is stable_hash(prompt_template) —
-        // interpretation_state._validate_prompt_template_review — computed
-        // in the worktree venv for the exact prompt above; change both or
-        // neither.
+        // TALL_DIALOG_NODE_COUNT interpretation cards). The draft and the
+        // anchor hash cover the system/user PAIR — see the constants above;
+        // change all three or none.
         interpretation_requirements: [
           {
             id: `prompt-template-review-${String(index + 1).padStart(3, "0")}`,
             kind: "llm_prompt_template",
             user_term: `llm_prompt_template:${id}`,
             status: "resolved",
-            draft: TALL_DIALOG_PROMPT_TEMPLATE,
-            accepted_value: TALL_DIALOG_PROMPT_TEMPLATE,
+            draft: TALL_DIALOG_PROMPT_REVIEW_DRAFT,
+            accepted_value: TALL_DIALOG_PROMPT_REVIEW_DRAFT,
             accepted_artifact_hash: null,
             resolved_prompt_template_hash: TALL_DIALOG_PROMPT_TEMPLATE_HASH,
             event_id: null,

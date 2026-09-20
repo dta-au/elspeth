@@ -1937,6 +1937,41 @@ _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION: Final[str] = (
 )
 _QUERY_INPUT_COLUMNS_UNDECLARED_FIX: Final[str] = MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY
 
+# Catalogue guidance for the two prompt-role codes. The plugin runtime accepts
+# an llm node with no system prompt (a YAML author may omit one); the composer
+# does not, because every composer-authored llm node is reviewed role by role
+# and an absent role is a decision nobody saw. Session 60ab6a67 shipped two
+# nodes with a user prompt only: the skill said to fill the missing role and
+# nothing at Stage 1 pushed back. The FIX never offers a default text — the
+# planner authors the role or asks the user; the server writes neither.
+_LLM_SYSTEM_PROMPT_MISSING_EXPLANATION: Final[str] = (
+    "An llm node has no system prompt. Every composer-authored llm node carries both prompt roles — "
+    "options.system_prompt (the model's role and task constraints) and a user prompt (the row data and the requested "
+    "reply) — and both are shown to the user for approval. An absent, null, or blank system_prompt sends the model "
+    "the user prompt alone, with a role nobody wrote or reviewed. This applies in single-prompt and multi-query mode "
+    "alike: system_prompt is shared by every query on the node."
+)
+_LLM_SYSTEM_PROMPT_MISSING_FIX: Final[str] = (
+    "Change ONLY that node: set options.system_prompt with patch_node_options. If the user supplied system-prompt "
+    "text, use it verbatim. If they supplied only the user prompt, keep their user prompt unchanged and author a "
+    "short task-specific system prompt from what they asked the LLM to do — the role and the constraints on the "
+    "reply — and tell them you drafted it; it appears on the prompt approval card for them to edit or accept. If you "
+    "cannot tell what role the LLM should take, ask the user before proceeding. Never send an empty or placeholder "
+    "system prompt, and never move the user's prompt text into system_prompt to satisfy this check."
+)
+_LLM_USER_PROMPT_MISSING_EXPLANATION: Final[str] = (
+    "An llm node has no user prompt. Every composer-authored llm node carries both prompt roles, and the user prompt "
+    "is the one that passes row data to the model: options.prompt_template in single-prompt mode, or in multi-query "
+    "mode each query's own template, falling back to the node-level options.prompt_template for a query without "
+    "one. The rejection names the node and, in multi-query mode, each query left without a template."
+)
+_LLM_USER_PROMPT_MISSING_FIX: Final[str] = (
+    "Change ONLY that node: set options.prompt_template (or the named queries' template) with patch_node_options. "
+    "Use the user's prompt text verbatim if they supplied it; otherwise author a template that passes the upstream "
+    "fields the task needs as '{{ row.<field> }}', declares them in options.required_input_fields, and asks for the "
+    "requested reply. If the user has not said what the LLM should do, ask before proceeding."
+)
+
 
 def _is_plugin_config_probe_exception(exc: Exception, *, config_error_prefix: str) -> bool:
     """Return True only for expected draft/config failures from probe construction.
@@ -3678,6 +3713,106 @@ def _unregistered_pipeline_decision_term_errors(node: NodeSpec) -> tuple[Validat
 # top-level template name hits StrictUndefined and raises TemplateError live.
 _PROMPT_TEMPLATE_CONTEXT_NAMES: frozenset[str] = frozenset({"row", "lookup"})
 _PROMPT_TEMPLATE_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_environment().globals)
+
+
+@observation_boundary(
+    tier=3,
+    source="one web-authored llm prompt option value (system_prompt, prompt_template, or a query's template)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only for None or a whitespace-only string; every other shape, including an "
+        "inline-blob marker mapping or a mistyped value, is reported as supplied, and this never raises"
+    ),
+)
+def _prompt_role_is_unsupplied(value: object) -> bool:
+    """Whether a prompt option holds no prompt: absent/None, or a blank string.
+
+    Any other shape counts as supplied. A user-uploaded inline-blob marker
+    (ADR-034) is a mapping and is a real prompt; a mistyped value is the plugin
+    schema's rejection to report, not this rule's.
+    """
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored llm options (untrusted system_prompt, prompt_template and queries values)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "emits one high-severity ValidationEntry per prompt role an llm node leaves absent, None, or blank — "
+        "system_prompt in either mode; prompt_template in single-prompt mode; in multi-query mode the well-formed "
+        "queries with neither their own template nor a node-level prompt_template — and yields () for non-llm "
+        "nodes; any other value shape counts as supplied (sibling rules report it) and this never raises"
+    ),
+)
+def _validate_llm_prompt_roles_present(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """Reject a composer-authored ``llm`` node that lacks either prompt role.
+
+    The runtime sends the system message only ``if self.system_prompt`` and
+    ``LLMConfig`` types it ``str | None``, so a YAML author may omit it. The
+    composer may not: each role is reviewed on the prompt approval card, and an
+    omitted role is a choice the user never saw (session 60ab6a67 shipped two
+    A/B arms with the user's prompt and no system prompt, against the skill's
+    instruction to fill the missing role). This is a rejection the planner
+    repairs by authoring the role or asking the user — the server supplies no
+    text, which would be server-side authoring.
+
+    The user-prompt limb restates ``LLMConfig``'s "required unless every query
+    has a template" rule for the same reason the binding rules above exist:
+    the plugin probe sees that rejection and the probe-tolerance taxonomy
+    swallows it, so it never reaches Stage 1 on its own.
+    """
+    if node.plugin != "llm":
+        return ()
+
+    errors: list[ValidationEntry] = []
+    if _prompt_role_is_unsupplied(node.options.get("system_prompt")):
+        errors.append(
+            ValidationEntry(
+                component=f"node:{node.id}",
+                message=(
+                    f"LLM node '{node.id}' has no options.system_prompt. Every llm node needs both a system prompt "
+                    "(the model's role and task constraints) and a user prompt, and both are shown to the user for "
+                    f"approval. {_LLM_SYSTEM_PROMPT_MISSING_FIX}"
+                ),
+                severity="high",
+                error_code="llm_system_prompt_missing",
+            )
+        )
+
+    node_template_unsupplied = _prompt_role_is_unsupplied(node.options.get("prompt_template"))
+    queries = node.options.get("queries")
+    if queries is None:
+        missing_user_prompt = "options.prompt_template" if node_template_unsupplied else None
+    else:
+        unprompted = sorted(
+            label
+            for label, entry in _well_formed_query_entries(queries)
+            if node_template_unsupplied and _prompt_role_is_unsupplied(entry.get("template"))
+        )
+        missing_user_prompt = (
+            "a template for "
+            + ", ".join(f"'{label}'" for label in unprompted)
+            + " (and no node-level options.prompt_template to fall back on)"
+            if unprompted
+            else None
+        )
+    if missing_user_prompt is not None:
+        errors.append(
+            ValidationEntry(
+                component=f"node:{node.id}",
+                message=(
+                    f"LLM node '{node.id}' has no user prompt: it is missing {missing_user_prompt}. Every llm node "
+                    "needs both a system prompt and a user prompt, and the user prompt is what passes row data to "
+                    f"the model. {_LLM_USER_PROMPT_MISSING_FIX}"
+                ),
+                severity="high",
+                error_code="llm_user_prompt_missing",
+            )
+        )
+    return tuple(errors)
 
 
 @observation_boundary(
@@ -7366,6 +7501,7 @@ class CompositionState:
                 errors.append(abuse_contact_error)
             errors.extend(_validate_web_scrape_http_identity_not_placeholder(node))
 
+            errors.extend(_validate_llm_prompt_roles_present(node))
             errors.extend(_validate_prompt_template_variable_bindings(node))
             errors.extend(_validate_multi_query_template_variable_bindings(node))
             errors.extend(_validate_multi_query_required_input_columns(node))

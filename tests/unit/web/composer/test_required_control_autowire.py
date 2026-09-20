@@ -65,6 +65,7 @@ def _bare_llm_candidate(**llm_option_overrides: Any) -> dict[str, Any]:
     """csv -> llm -> json with NO controls: both coverage findings fire."""
     options: dict[str, Any] = {
         "profile": "sonnet",
+        "system_prompt": "You assess support tickets. Reply with a brief assessment only.",
         "prompt_template": "Assess support ticket {{ row.ticket_id }}: {{ row.body }}. Reply briefly.",
         "required_input_fields": ["ticket_id", "body"],
         "response_field": "assessment",

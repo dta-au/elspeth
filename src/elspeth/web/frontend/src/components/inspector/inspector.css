@@ -740,6 +740,31 @@
   gap: var(--space-xs);
 }
 
+/* A prompt role an llm step is missing (session 60ab6a67). Warning, not
+   error: the row states a requirement; the blocking rejection itself is
+   reported by validation in the decision panel. Colour is never the only
+   signal — the sentence says "Not set". */
+/* The two prompt roles lead every llm step's box as their own block; the rule
+   below separates them from the generic option rows that follow. */
+.option-rows-prompt-roles {
+  padding-bottom: var(--space-xs);
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* A multi-query step shows one user prompt per query; the query's own name
+   captions each one on its own line above the prompt text. */
+.option-rows-query-name {
+  display: block;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.option-rows-prompt-missing {
+  color: var(--color-warning);
+  font-style: italic;
+}
+
 /* Advanced settings / Raw options (JSON) disclosures — same idiom as
    .guided-schema-advanced and .wire-stage__raw: a top rule separates the
    disclosure from the essential rows above it, and the summary picks up the

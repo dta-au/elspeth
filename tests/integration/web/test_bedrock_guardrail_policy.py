@@ -400,6 +400,7 @@ def test_profiled_prompt_shield_contract_uses_executable_binding_without_mutatin
                 on_error="discard",
                 options={
                     "profile": "llm-default",
+                    "system_prompt": "You summarise web pages. Reply with a short summary only.",
                     "prompt_template": "{{ row['page_text'] }}",
                     "required_input_fields": ["page_text"],
                     "schema": {"mode": "observed", "fields": None},

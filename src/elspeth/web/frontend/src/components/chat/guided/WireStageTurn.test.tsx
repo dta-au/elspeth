@@ -385,7 +385,7 @@ describe("WireStageTurn", () => {
     expect(screen.getByText(/You are a careful reviewer\./).closest("details")).toBeNull();
     expect(screen.getByText(/Step 1: consider the passage carefully\./).closest("details")).toBeNull();
     expect(screen.queryByText(/Step 12: consider/)).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for node-1" }));
+    await userEvent.click(screen.getByRole("button", { name: "Show full user prompt for node-1" }));
     expect(screen.getByText(/Step 12: consider the passage carefully\./)).toBeInTheDocument();
     // No correction path offered → no Edit.
     expect(screen.queryByRole("button", { name: /Edit prompt/ })).toBeNull();

@@ -23,7 +23,13 @@ _CODE = "query_input_columns_undeclared"
 
 
 def _options(required: list[str] | None, queries: Any, template: str = "Classify") -> dict[str, Any]:
-    options: dict[str, Any] = {"provider": "azure", "prompt_template": template, "schema": {"mode": "observed"}, "queries": queries}
+    options: dict[str, Any] = {
+        "provider": "azure",
+        "system_prompt": "You classify documents. Reply with one category label.",
+        "prompt_template": template,
+        "schema": {"mode": "observed"},
+        "queries": queries,
+    }
     if required is not None:
         options["required_input_fields"] = required
     return options

@@ -101,9 +101,13 @@ backend-owned prompt or model review rows just to add a title.
 
 ## LLM node field declarations
 
-When proposing an LLM transform, include a task-specific `system_prompt` and
-user `prompt_template` unless the user explicitly asked to omit a system
-prompt. Keep any prompt the user supplied and propose the missing role. The
+When proposing an LLM transform, always include BOTH a task-specific
+`system_prompt` and a user `prompt_template`: validation rejects an `llm` node
+missing either role, and both are shown to the user. Keep verbatim any prompt
+the user supplied — "the prompt" for a step is the user prompt — and propose
+the missing role, saying that you drafted it. A multi-query node (`queries`)
+has ONE shared `system_prompt` and one user prompt per query
+(`queries.<name>.template`, else the node-level `prompt_template`). The
 system prompt states the role and constraints; the user template passes the
 reviewed upstream fields and requests the intended reply. If the goal does
 not say what the LLM should do or what kind of answer it should produce, ask

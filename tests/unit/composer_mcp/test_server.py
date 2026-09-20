@@ -699,6 +699,7 @@ class TestDispatchTool:
                     on_error="discard",
                     options={
                         "profile": "operator-owned-alias",
+                        "system_prompt": "You summarise records in one sentence.",
                         "prompt_template": "Summarise {{ row }}",
                         "schema": {"mode": "observed"},
                     },
@@ -849,6 +850,7 @@ class TestDispatchTool:
                     on_error="discard",
                     options={
                         "profile": "operator-owned-alias",
+                        "system_prompt": "You describe the looked-up file reference in one sentence.",
                         "prompt_template": "{{ lookup.path }} {{ lookup.file }} {{ lookup.mode }}",
                         "lookup": {
                             "path": "north",

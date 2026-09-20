@@ -1390,6 +1390,7 @@ def _llm_node(**overrides: object) -> NodeSpec:
             "provider": "openrouter",
             "model": "anthropic/claude-3.7-sonnet",
             "api_key": "sk-test-key",
+            "system_prompt": "You write public announcements. Reply with the announcement text only.",
             "prompt_template": "Write an announcement about {{ row['topic'] }}",
             "temperature": 0,
             "response_field": "announcement",

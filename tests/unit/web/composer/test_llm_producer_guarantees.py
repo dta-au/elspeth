@@ -140,6 +140,7 @@ def _llm_node(
     profile: str | None = "sonnet",
 ) -> NodeSpec:
     options: dict[str, Any] = {
+        "system_prompt": "You answer one question about a colour. Reply with a single short value.",
         "prompt_template": "For {{ row.colour }} answer.",
         "response_field": response_field,
         "required_input_fields": ["colour"],

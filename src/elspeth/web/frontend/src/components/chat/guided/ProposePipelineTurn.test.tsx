@@ -452,7 +452,7 @@ describe("ProposePipelineTurn", () => {
     // Not detail-level gated: a decision input, not technical detail.
     expect(screen.getByText(/Step 1: consider/).closest("details")).toBeNull();
     expect(screen.queryByText(/Step 12: consider/)).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Show full prompt for node-1" }));
+    await user.click(screen.getByRole("button", { name: "Show full user prompt for node-1" }));
     expect(screen.getByText(/Step 12: consider the passage carefully\./)).toBeVisible();
   });
 

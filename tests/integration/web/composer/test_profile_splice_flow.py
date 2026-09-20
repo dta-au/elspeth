@@ -11,7 +11,6 @@ import yaml
 from elspeth.config_loading import load_settings_from_config_dict
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import begin_dispatch, finish_success
@@ -28,6 +27,7 @@ from elspeth.web.interpretation_state import (
     PROMPT_SHIELD_USER_TERM,
     WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
     pipeline_decision_artifact_hash,
+    prompt_review_anchor_hash_from_options,
 )
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
@@ -140,6 +140,7 @@ def _reviewed_state() -> CompositionState:
     }
     llm_options: dict[str, object] = {
         "profile": "llm-default",
+        "system_prompt": "You summarise web pages. Reply with a short summary only.",
         "prompt_template": "Summarise {{ row['page_text'] }}",
         "required_input_fields": ["page_text"],
         "schema": {"mode": "observed", "fields": None},
@@ -188,12 +189,16 @@ def _reviewed_state() -> CompositionState:
         draft="Insert a prompt shield.",
         accepted_hash=pipeline_decision_artifact_hash(llm, (scrape, llm), user_term=PROMPT_SHIELD_USER_TERM),
     )
+    # A node carrying both prompt roles anchors its review on the pair, not on
+    # prompt_template alone.
+    prompt_anchor = prompt_review_anchor_hash_from_options(llm_options)
+    assert prompt_anchor is not None
     prompt_review = _resolved_requirement(
         requirement_id="prompt-template:llm",
         kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
         user_term="llm_prompt_template:llm",
         draft="Summarise the page text.",
-        accepted_hash=stable_hash(llm_options["prompt_template"]),
+        accepted_hash=prompt_anchor,
         prompt_hash=True,
     )
     scrape = replace(scrape, options={**scrape_options, INTERPRETATION_REQUIREMENTS_KEY: [http_review]})
