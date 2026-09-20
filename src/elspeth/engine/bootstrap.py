@@ -45,12 +45,20 @@ def resolve_preflight(
     dependency_results: list[DependencyRunResult] = []
     gate_results: list[CommencementGateResult] = []
 
-    # Validate gate expressions early — before any dependency resolution.
+    # Validate gate preconditions early — before any dependency resolution.
     # ExpressionParser validates syntax and security at construction time.
-    # If a gate condition is malformed, we reject it here rather than after
-    # dependency pipelines have already run and mutated external state.
+    # If a gate condition is malformed or the caller failed to inject probes,
+    # we reject it here rather than after dependency pipelines have already
+    # run and mutated external state.
+    gate_probes: list[CollectionProbe] = []
     if config.commencement_gates:
         from elspeth.engine.commencement import validate_gate_expressions
+
+        if probes is None:
+            raise FrameworkBugError(
+                "probes is required when commencement_gates is configured — caller must inject pre-built CollectionProbe instances"
+            )
+        gate_probes = probes
 
         validate_gate_expressions(config.commencement_gates)
 
@@ -89,14 +97,9 @@ def resolve_preflight(
     if config.commencement_gates:
         from elspeth.engine.commencement import build_preflight_context, evaluate_commencement_gates
 
-        if probes is None:
-            raise FrameworkBugError(
-                "probes is required when commencement_gates is configured — caller must inject pre-built CollectionProbe instances"
-            )
-
         # Execute probes (caller provides pre-built probes from L3)
         probe_results = {}
-        for probe in probes:
+        for probe in gate_probes:
             result = probe.probe()
             if result.collection in probe_results:
                 raise FrameworkBugError(
