@@ -30,7 +30,11 @@ from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginId
-from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.plugin_policy.profiles import (
+    AzureSearchProfileSettings,
+    OperatorProfileRegistry,
+    RuntimeWebPluginConfig,
+)
 
 
 def _settings(**overrides: object) -> WebSettings:
@@ -428,11 +432,90 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
         "bedrock_guardrail_default_profiles",
         "aws_s3_source_profiles",
         "aws_textract_profiles",
+        "azure_search_profiles",
         "deployment_aws_region",
     }
     runtime_fields = set(RuntimeWebPluginConfig.__dataclass_fields__)
 
     assert settings_fields == runtime_fields
+
+
+_SEARCH_MI: dict[str, object] = {
+    "alias": "policies",
+    "endpoint": "https://svc-a.search.windows.net",
+    "auth": "managed_identity",
+    "client_id": "11111111-2222-3333-4444-555555555555",
+    "indexes": ["approved-documents"],
+}
+_SEARCH_KEY: dict[str, object] = {
+    "alias": "contracts",
+    "endpoint": "https://svc-b.search.windows.net",
+    "auth": "api_key",
+    "credential_ref": "SEARCH_B_KEY",
+    "indexes": "any",
+}
+
+
+@pytest.mark.parametrize("bad", [{}, {"indexes": []}, {"indexes": None}], ids=["absent", "empty", "null"])
+def test_search_profile_index_pin_is_mandatory(bad: dict[str, object]) -> None:
+    payload = {k: v for k, v in _SEARCH_MI.items() if k != "indexes"} | bad
+    with pytest.raises(ValidationError, match="indexes"):
+        AzureSearchProfileSettings.model_validate(payload)
+
+
+def test_search_profile_any_is_an_explicit_opt_out() -> None:
+    assert AzureSearchProfileSettings.model_validate(_SEARCH_KEY).admits_index("whatever") is True
+    pinned = AzureSearchProfileSettings.model_validate(_SEARCH_MI)
+    assert pinned.admits_index("approved-documents") is True
+    assert pinned.admits_index("other") is False
+    # "any" is the opt-out only as the whole value: an index that happens to be NAMED "any" is an ordinary pin.
+    named_any = AzureSearchProfileSettings.model_validate(_SEARCH_MI | {"indexes": ["any"]})
+    assert named_any.admits_index("any") is True
+    assert named_any.admits_index("other") is False
+
+
+@pytest.mark.parametrize(
+    ("override", "reason"),
+    [
+        ({"auth": "managed_identity", "credential_ref": "X", "client_id": None}, "must not set credential_ref"),
+        ({"auth": "api_key", "client_id": "abc", "credential_ref": "SEARCH_B_KEY"}, "must not set client_id"),
+        ({"auth": "api_key", "client_id": None, "credential_ref": None}, "require credential_ref"),
+        ({"endpoint": "http://svc-a.search.windows.net"}, "endpoint"),
+        ({"endpoint": "https://evil.example.com"}, "managed identity"),
+        ({"indexes": ["bad name"]}, r"rules at: index \["),
+        ({"indexes": "every"}, "indexes"),
+        ({"api_version": "not-a-version"}, "api_version"),
+    ],
+)
+def test_search_profile_rejects_inconsistent_bindings(override: dict[str, object], reason: str) -> None:
+    with pytest.raises(ValidationError, match=reason):
+        AzureSearchProfileSettings.model_validate(_SEARCH_MI | override)
+
+
+def test_search_profile_api_key_binding_may_name_any_https_host() -> None:
+    # The Azure-suffix rule protects the server's managed identity token; a query key carries no such risk.
+    profile = AzureSearchProfileSettings.model_validate(_SEARCH_KEY | {"endpoint": "https://search.internal.example.com"})
+    assert profile.auth == "api_key"
+
+
+def test_search_profile_errors_and_repr_do_not_echo_the_binding() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        AzureSearchProfileSettings.model_validate(_SEARCH_MI | {"endpoint": "https://evil.example.com"})
+    assert "evil.example.com" not in str(excinfo.value)
+    rendered = repr(AzureSearchProfileSettings.model_validate(_SEARCH_KEY))
+    assert "svc-b" not in rendered
+    assert "SEARCH_B_KEY" not in rendered
+
+
+def test_search_profile_aliases_must_be_unique() -> None:
+    with pytest.raises(ValidationError, match="Azure Search profile aliases must be unique"):
+        _settings(azure_search_profiles=(_SEARCH_MI, _SEARCH_MI))
+
+
+def test_runtime_config_carries_search_profiles_sorted() -> None:
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(azure_search_profiles=(_SEARCH_MI, _SEARCH_KEY)))
+    assert [profile.alias for profile in runtime.azure_search_profiles] == ["contracts", "policies"]
+    assert "svc-a" not in repr(runtime)
 
 
 def _textract_runtime(**overrides: object) -> RuntimeWebPluginConfig:

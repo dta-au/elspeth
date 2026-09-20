@@ -10,9 +10,9 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.aws_s3 import (
     S3_MAX_KEY_BYTES,
@@ -40,8 +40,10 @@ from elspeth.core.llm_profiles import (
     lower_llm_profile_options,
     validate_profile_alias,
 )
+from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region, is_well_formed_aws_region
+from elspeth.web.validation import validate_secret_name
 
 if TYPE_CHECKING:
     from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
@@ -122,6 +124,74 @@ class AWSTextractProfileSettings(BaseModel):
         return validated
 
 
+class AzureSearchProfileSettings(BaseModel):
+    """Operator-owned binding for one Web-authorable Azure AI Search service.
+
+    ``indexes`` has no default. A profile lends the deployment's credential to
+    every web author allowed to use the plugin, so which indexes it reaches is a
+    decision the operator states: a list of names, or the literal ``"any"``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    alias: str
+    endpoint: str = Field(repr=False)
+    auth: Literal["managed_identity", "api_key"]
+    client_id: str | None = Field(default=None, repr=False)
+    credential_ref: str | None = Field(default=None, repr=False)
+    indexes: tuple[str, ...] | Literal["any"]
+    api_version: str | None = None
+
+    @field_validator("alias")
+    @classmethod
+    def _validate_alias(cls, value: str) -> str:
+        validate_profile_alias(value)
+        return value
+
+    @field_validator("indexes")
+    @classmethod
+    def _validate_indexes(cls, value: tuple[str, ...] | str) -> tuple[str, ...] | str:
+        if not value:
+            raise ValueError('indexes must list at least one index, or be the literal "any"')
+        return value
+
+    @model_validator(mode="after")
+    def _validate_binding(self) -> Self:
+        if self.auth == "managed_identity" and self.credential_ref is not None:
+            raise ValueError("managed_identity profiles must not set credential_ref")
+        if self.auth == "api_key" and self.client_id is not None:
+            raise ValueError("api_key profiles must not set client_id")
+        if self.auth == "api_key" and self.credential_ref is None:
+            raise ValueError("api_key profiles require credential_ref")
+        if self.credential_ref is not None:
+            validate_secret_name(self.credential_ref, field_name="azure_search_profiles credential_ref")
+        # The provider's own config model owns the endpoint, managed-identity host,
+        # index-name and api_version rules. Its messages quote the offending value,
+        # so only the failing option NAMES are carried out of here.
+        for index in ("profile-validation",) if self.indexes == "any" else self.indexes:
+            try:
+                AzureSearchProviderConfig(
+                    endpoint=self.endpoint,
+                    index=index,
+                    api_key=None if self.auth == "managed_identity" else "profile-validation",
+                    use_managed_identity=self.auth == "managed_identity",
+                    client_id=self.client_id,
+                    **({} if self.api_version is None else {"api_version": self.api_version}),
+                )
+            except ValidationError as error:
+                rejected = sorted({str(part) for detail in error.errors(include_input=False) for part in detail["loc"]})
+                # The one cross-field rule reachable from here is the managed-identity host suffix.
+                named = ", ".join(rejected) if rejected else "endpoint (not an Azure AI Search host, as managed identity requires)"
+                raise ValueError(f"binding rejected by the Azure AI Search provider rules at: {named}") from None
+        return self
+
+    def admits_index(self, index: str) -> bool:
+        """Whether a web author using this profile may query ``index``."""
+        if isinstance(self.indexes, str):
+            return True
+        return index in self.indexes
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeWebPluginConfig:
     plugin_allowlist: tuple[str, ...]
@@ -133,6 +203,7 @@ class RuntimeWebPluginConfig:
     bedrock_guardrail_default_profiles: tuple[tuple[str, str], ...]
     aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = field(repr=False)
     aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = field(repr=False)
+    azure_search_profiles: tuple[AzureSearchProfileSettings, ...] = field(repr=False)
     deployment_aws_region: str | None
 
     @property
@@ -157,6 +228,7 @@ class RuntimeWebPluginConfig:
             bedrock_guardrail_default_profiles=tuple(sorted(settings.bedrock_guardrail_default_profiles.items())),
             aws_s3_source_profiles=tuple(sorted(settings.aws_s3_source_profiles, key=lambda profile: profile.alias)),
             aws_textract_profiles=tuple(sorted(settings.aws_textract_profiles, key=lambda profile: profile.alias)),
+            azure_search_profiles=tuple(sorted(settings.azure_search_profiles, key=lambda profile: profile.alias)),
             deployment_aws_region=settings.deployment_aws_region,
         )
 
