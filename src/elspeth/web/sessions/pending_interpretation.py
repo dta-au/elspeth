@@ -13,8 +13,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, final
 from uuid import UUID
 
-from sqlalchemy import Connection
-
 from elspeth.contracts.composer_interpretation import (
     INTERPRETATION_HASH_DOMAIN_V2,
     InterpretationChoice,
@@ -1692,9 +1690,10 @@ class _SessionPendingInterpretationValidator:
         if self.__expected_live is not None and snapshot.live_state != self.__expected_live:
             raise AuditIntegrityError("pending interpretation live state changed after inline blob snapshot")
 
-    def assert_current_blob_rows(self, conn: Connection, session_id: UUID) -> None:
-        if self.__inline_blob_snapshot is not None:
-            self.__inline_blob_snapshot.assert_current_rows(conn, session_id=session_id)
+    @property
+    def inline_blob_snapshot(self) -> SessionInlineBlobSnapshot | None:
+        """Expose immutable preflight evidence to the DB-owning repository."""
+        return self.__inline_blob_snapshot
 
     def __call__(
         self,
