@@ -691,6 +691,17 @@ class LocalAuthProvider:
             for row in rows
         ]
 
+    def read_user(self, user_id: str) -> LocalUserAccount | None:
+        """One local account by its exact username, or ``None``."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT user_id, display_name, email, email_verified FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return LocalUserAccount(user_id=row[0], display_name=row[1], email=row[2], email_verified=bool(row[3]))
+
     def set_password(self, user_id: str, password: str) -> None:
         """Replace a user's password hash (dev-admin reset path).
 

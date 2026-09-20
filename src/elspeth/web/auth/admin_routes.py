@@ -95,6 +95,24 @@ class GeneratedPasswordResponse(_StrictResponse):
     password: str
 
 
+def dev_admin_surface_enabled(settings: WebSettings) -> bool:
+    """Whether this deployment has the dev-admin credential surface at all."""
+    return settings.auth_provider == "local" and settings.dev_admin_user is not None
+
+
+def is_dev_admin(settings: WebSettings, user: UserIdentity) -> bool:
+    """Whether ``user`` is the configured dev admin.
+
+    Compared against USERNAME, not user_id. ``dev_admin_user`` names a
+    local-auth account (its validator says so), while ``user_id`` is now the
+    identity_id -- an opaque uuid that no operator ever configures. Comparing
+    the two would silently 404 the admin out of their own surface. The ONE
+    definition, shared with the people directory, so the two surfaces cannot
+    disagree about who holds this capability.
+    """
+    return dev_admin_surface_enabled(settings) and user.username == settings.dev_admin_user
+
+
 async def _require_dev_admin(request: Request) -> UserIdentity:
     """Admit only the flagged dev-admin user; hide the surface otherwise.
 
@@ -104,14 +122,10 @@ async def _require_dev_admin(request: Request) -> UserIdentity:
     from 404 (authenticated but not the admin -- hidden, not forbidden).
     """
     settings: WebSettings = request.app.state.settings
-    if settings.auth_provider != "local" or settings.dev_admin_user is None:
+    if not dev_admin_surface_enabled(settings):
         raise HTTPException(status_code=404, detail="Not found")
     user = await get_current_user(request)
-    # Compared against USERNAME, not user_id. ``dev_admin_user`` names a
-    # local-auth account (its validator says so), while ``user_id`` is now the
-    # identity_id — an opaque uuid that no operator ever configures. Comparing
-    # the two would silently 404 the admin out of their own surface.
-    if user.username != settings.dev_admin_user:
+    if not is_dev_admin(settings, user):
         raise HTTPException(status_code=404, detail="Not found")
     return user
 

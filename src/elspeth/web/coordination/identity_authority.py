@@ -49,7 +49,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Final, Literal, TypedDict, cast, final, get_args
 
-from sqlalchemy import bindparam, delete, insert, or_, select, update
+from sqlalchemy import and_, bindparam, case, delete, func, insert, not_, or_, select, update
 from sqlalchemy.engine import Connection, Engine, Row
 from sqlalchemy.exc import IntegrityError
 
@@ -106,6 +106,13 @@ _SERVICE_ROLES: Final = frozenset({"admin", "oversight"})
 # R7: the ancestor walk is bounded; a chain this long is refused as unprovable.
 _ANCESTOR_WALK_BOUND: Final = 64
 _LIST_LIMIT_MAX: Final = 200
+# The directory's free-text needle and its by-id label lookup are both bounded:
+# a search string is a filter, not a document, and a label lookup serves the
+# handful of counterparts on one person's approver list, not an export.
+DIRECTORY_TEXT_MAX: Final = 128
+DIRECTORY_LOOKUP_MAX: Final = 200
+_LIKE_ESCAPE: Final = "\\"
+_RETIRED_SUBJECT_MARKER: Final = "#retired-"
 # R3/D32: the ``disable_reason`` an automatic rebound disable writes.  Named
 # rather than spelled at each site because ``enable_identity`` DISPATCHES on
 # it -- re-enabling a rebound is the one re-enable that rebases the identity's
@@ -323,6 +330,49 @@ class IdentitySummary:
     disabled_at: datetime | None
     disabled_by_identity_id: str | None
     disable_reason: str | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class IdentityDirectoryQuery:
+    """One directory search: every field narrows, ``None`` does not.
+
+    ``text`` is matched LITERALLY and case-insensitively -- ``%`` and ``_``
+    are characters, not wildcards -- against what an administrator is allowed
+    to see of each row, never against what the row stores (see
+    ``search_identities``).
+    """
+
+    text: str | None
+    access_state: IdentityAccessState | None
+    provider: IdentityProviderType | None
+    kind: Literal["human", "service"] | None
+
+    def __post_init__(self) -> None:
+        if self.text is not None:
+            _require_nonblank(self.text, "IdentityDirectoryQuery.text")
+            if len(self.text) > DIRECTORY_TEXT_MAX:
+                raise ValueError(f"IdentityDirectoryQuery.text must be at most {DIRECTORY_TEXT_MAX} characters")
+        if self.access_state is not None:
+            _require_access_state(self.access_state)
+        if self.provider is not None:
+            _require_provider(self.provider)
+        if self.kind is not None and self.kind not in ("human", "service"):
+            raise ValueError("IdentityDirectoryQuery.kind must be 'human', 'service' or None")
+
+
+def retired_subject(subject: str, identity_id: str) -> str:
+    """The subject a retired identity is rewritten to: a form no login can produce."""
+    return f"{subject}{_RETIRED_SUBJECT_MARKER}{identity_id}"
+
+
+def is_retired_identity(summary: IdentitySummary) -> bool:
+    """Whether ``retire_identity`` wrote this row's subject.
+
+    Exact, not a substring sniff: the marker is followed by the row's OWN
+    identity_id, which no provider subject can anticipate.
+    """
+    return summary.subject.endswith(f"{_RETIRED_SUBJECT_MARKER}{summary.identity_id}")
 
 
 @final
@@ -1287,6 +1337,94 @@ class RepositoryIdentityAuthority:
             ).all()
         return tuple(_summary_from_row(row) for row in rows)
 
+    def search_identities(self, *, query: IdentityDirectoryQuery, limit: int, offset: int) -> tuple[IdentitySummary, ...]:
+        """One page of the directory, filtered and ordered BEFORE it is sliced.
+
+        THE NEEDLE SEES ONLY WHAT THE ADMINISTRATOR MAY SEE.  A never-admitted
+        ``pending`` row shows its subject and organisation and nothing else
+        (spec rev2.2), so it is matched and ordered on those alone: a search
+        for an email address that found such a row would disclose, by
+        matching, exactly the field the projection withholds.  Every other
+        row is matched on its profile as well.  The predicate is the one
+        ``_PENDING_ROWS`` and the route's projection already share.
+
+        Ordered by the label the row is shown under, then ``identity_id``, so
+        a page boundary is stable and two people with one name stay in a
+        fixed order.
+        """
+        if type(query) is not IdentityDirectoryQuery:
+            raise TypeError("query must be an exact IdentityDirectoryQuery")
+        _require_limit(limit, offset)
+        never_admitted = and_(identities_table.c.access_state == "pending", identities_table.c.activated_at.is_(None))
+        shown_name = func.coalesce(func.nullif(identities_table.c.display_name, ""), identities_table.c.username)
+        label = func.lower(case((never_admitted, identities_table.c.subject), else_=shown_name))
+        statement = select(identities_table)
+        if query.access_state is not None:
+            statement = statement.where(identities_table.c.access_state == query.access_state)
+        if query.provider is not None:
+            statement = statement.where(identities_table.c.provider == query.provider)
+        if query.kind is not None:
+            statement = statement.where(identities_table.c.kind == query.kind)
+        if query.text is not None:
+            escaped = (
+                query.text.lower().replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2).replace("%", f"{_LIKE_ESCAPE}%").replace("_", f"{_LIKE_ESCAPE}_")
+            )
+            needle = f"%{escaped}%"
+            statement = statement.where(
+                or_(
+                    func.lower(identities_table.c.subject).like(needle, escape=_LIKE_ESCAPE),
+                    func.lower(func.coalesce(identities_table.c.organisation_id, "")).like(needle, escape=_LIKE_ESCAPE),
+                    and_(
+                        not_(never_admitted),
+                        or_(
+                            func.lower(identities_table.c.username).like(needle, escape=_LIKE_ESCAPE),
+                            func.lower(func.coalesce(identities_table.c.display_name, "")).like(needle, escape=_LIKE_ESCAPE),
+                            func.lower(func.coalesce(identities_table.c.email, "")).like(needle, escape=_LIKE_ESCAPE),
+                        ),
+                    ),
+                )
+            )
+        statement = statement.order_by(label, identities_table.c.identity_id).limit(limit).offset(offset)
+        with self._engine.connect() as conn:
+            rows = conn.execute(statement).all()
+        return tuple(_summary_from_row(row) for row in rows)
+
+    def read_identity_summaries(self, *, identity_ids: Sequence[str]) -> tuple[IdentitySummary, ...]:
+        """The rows behind a bounded set of ids, in ``identity_id`` order; absent ids are simply absent."""
+        wanted = tuple(identity_ids)
+        if len(wanted) > DIRECTORY_LOOKUP_MAX:
+            raise ValueError(f"at most {DIRECTORY_LOOKUP_MAX} identities may be read at once")
+        for identity_id in wanted:
+            _require_nonblank(identity_id, "identity_id")
+        if not wanted:
+            return ()
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(identities_table).where(identities_table.c.identity_id.in_(wanted)).order_by(identities_table.c.identity_id)
+            ).all()
+        return tuple(_summary_from_row(row) for row in rows)
+
+    def read_local_identity_summaries(self, *, usernames: Sequence[str]) -> tuple[IdentitySummary, ...]:
+        """The identities LIVE-BOUND to local usernames: exactly ``provider='local'`` and ``subject == username``.
+
+        A retired identity's subject was rewritten, so it cannot match and a
+        recycled username correlates with its fresh identity only.
+        """
+        wanted = tuple(usernames)
+        if len(wanted) > DIRECTORY_LOOKUP_MAX:
+            raise ValueError(f"at most {DIRECTORY_LOOKUP_MAX} usernames may be correlated at once")
+        for username in wanted:
+            _require_nonblank(username, "username")
+        if not wanted:
+            return ()
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(identities_table)
+                .where(identities_table.c.provider == "local", identities_table.c.subject.in_(wanted))
+                .order_by(identities_table.c.identity_id)
+            ).all()
+        return tuple(_summary_from_row(row) for row in rows)
+
     def active_roles(self, *, identity_id: str) -> tuple[RoleGrant, ...]:
         """Unrevoked grants that have not expired at database time."""
         _require_nonblank(identity_id, "identity_id")
@@ -2002,18 +2140,18 @@ class RepositoryIdentityAuthority:
                 return None
             # The identity_id makes the retired subject unique, so retiring
             # the same username twice cannot collide on the natural key.
-            retired_subject = f"{subject}#retired-{existing.identity_id}"
+            rewritten_subject = retired_subject(subject, existing.identity_id)
             conn.execute(
                 update(identities_table)
                 .where(identities_table.c.identity_id == existing.identity_id)
-                .values(subject=retired_subject, access_state="disabled", disabled_at=now, disable_reason=reason)
+                .values(subject=rewritten_subject, access_state="disabled", disabled_at=now, disable_reason=reason)
             )
             bound = _record_from_row(existing, access_state="disabled")
             outcome = IdentityRetired(
                 record=IdentityRecord(
                     identity_id=bound.identity_id,
                     provider=bound.provider,
-                    subject=retired_subject,
+                    subject=rewritten_subject,
                     username=bound.username,
                     access_state="disabled",
                 ),
