@@ -753,11 +753,26 @@ class TestSystemStatusEndpoint:
     @pytest.mark.parametrize("enabled", [True, False])
     def test_reports_server_only_secret_mode_and_enforces_it(self, tmp_path, enabled: bool) -> None:
         """The SPA hides the add-a-key form from this flag; the API enforces it."""
+        from elspeth.web.auth.middleware import get_current_user
+        from elspeth.web.auth.models import UserIdentity
+
         app = create_app(_settings(tmp_path, user_secrets_enabled=enabled))
         client = TestClient(app)
 
         assert client.get("/api/system/status").json()["user_secrets_enabled"] is enabled
         assert app.state.secret_service.user_secrets_enabled is enabled
+
+        if not enabled:
+            # Through the REAL app: its StarletteHTTPException handler rewrites
+            # structured error bodies, so the typed discriminator must survive it.
+            async def _mock_user() -> UserIdentity:
+                return UserIdentity(user_id="alice", username="alice")
+
+            app.dependency_overrides[get_current_user] = _mock_user
+            refused = client.post("/api/secrets", json={"name": "MY_KEY", "value": "super-secret-value"})
+            assert refused.status_code == 403
+            assert refused.json()["detail"]["error_type"] == "user_secrets_disabled"
+            assert "super-secret-value" not in refused.text
 
     def test_classification_banner_defaults_to_null(self, tmp_path) -> None:
         """An undeclared deployment renders no protective-marking banner."""
