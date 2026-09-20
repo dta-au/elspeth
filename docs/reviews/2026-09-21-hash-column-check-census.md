@@ -55,43 +55,73 @@ form is also the shortest to type, and a new table copies whichever neighbour
 the author looked at. The defect recurs by construction rather than by
 carelessness; fixing instances does not stop the next one.
 
-The leverage point is a whole-tree test, in the style of the existing AST and
-shape gates, that walks both metadata objects and fails when a column in a
-declared set of digest columns lacks both anchors on either dialect. The census
-script is most of that test. It needs an explicit column inventory rather than
-name matching, which is the decision it is waiting on (see below).
+That leverage point now exists:
+`tests/unit/architecture/test_digest_column_shape_checks.py` carries an explicit
+inventory of every digest column with its shape, and fails when a digest-named
+column is neither inventoried nor excluded with a reason, or when a listed
+column's CHECKs stop rejecting malformed values. It is behavioural (it evaluates
+the live SQLite CHECK expressions against probe values), so it does not care
+which declaration style produced the constraint. Mutation-checked: restoring the
+ticket's original `length(content_hash) = 64` turns it red, as does removing an
+inventory entry.
 
-## Not fixed: 61 columns with no shape CHECK
+## The 61 columns with no shape CHECK (second wave, session 63 / Landscape 43)
 
-These were identified, not changed. Whether each is a gap depends on facts not
-established here (what the writer produces, whether NULL is meaningful), so
-treat this as a worklist, not a defect list.
+The first pass listed these as a worklist. They were then constrained, after
+two measurements decided what each column really holds.
 
-**Landscape, 47 columns.** 44 are `String(64)` and 3 are `String(32)`.
-Measured: SQLite accepts a 200-character value into a `VARCHAR(64)` column, so
-on the default Landscape store the declared width enforces nothing, and on
-PostgreSQL it bounds the maximum only. 15 Landscape columns do carry the full
-CHECK, all in the newer export, admission, coalesce and aggregation tables; the
-core audit tables (`rows`, `node_states`, `calls`, `operations`, `nodes`,
-`runs`, `sink_effects`, `sink_effect_members`, `artifacts`, `token_outcomes`,
-`routing_events`) carry none. The three 32-character columns
-(`nodes.source_file_hash`, `nodes.output_contract_hash`,
-`run_sources.schema_contract_hash`) are not SHA-256 hex and would need their
-own rule. Changing any of these is a Landscape epoch bump and a paired cutover.
+**Measured before constraining.** A read-only scan (`mode=ro&immutable=1`) of
+430 real `audit.db` / `sessions.db` files on the development host tallied every
+non-null value in these columns against the lowercase-hex rule. 49 columns held
+nothing but lowercase hex of the declared width. The scan is also what found the
+columns a blanket 64-hex rule would have broken:
 
-**Sessions, 14 columns.** Nine are nullable provenance hashes
-(`blobs.creating_*_hash`, `composition_proposals.*_hash`,
-`interpretation_events.*_hash`, `composer_completion_events.payload_digest`,
-`user_preferences.tutorial_source_data_hash`). Three are `NOT NULL` digests
-(`library_entries.payload_digest`, `review_attestations.payload_digest`,
-`skill_markdown_history.hash`). `web_instances.image_digest` is very likely an
-OCI `sha256:<hex>` reference and `interpretation_events.hash_domain_version` is
-a version label; neither fits the lowercase-hex rule.
+| column | what it holds | rule |
+|---|---|---|
+| `token_outcomes.error_hash`, `token_work_items.pending_error_hash` | 16 hex | `_OptionalLowerHex16Check` (already used by `aggregation_result_members`) |
+| `nodes.output_contract_hash`, `run_sources.schema_contract_hash` | 32 hex, `SchemaContract.version_hash()` | new `_OptionalLowerHex32Check` |
+| `nodes.source_file_hash` | `sha256:` + 16 hex | new `_OptionalSha256Ref16Check` |
+| `review_attestations.payload_digest`, `composer_completion_events.payload_digest` | `sha256:` + 64 hex | new `_prefixed_sha256_constraints` |
+| `library_entries.payload_digest` | bare 64 hex (the payload store address) | `_lower_sha256_constraints` |
 
-One pair deserves first look: `interpretation_events.approved_prompt_artifact_hash`
-and Landscape `calls.approved_prompt_artifact_hash` are the link between the two
-stores (`docs/runbooks/staging-session-db-recreation.md`, epochs 57 and 41), and
-neither side constrains the value's shape.
+`payload_digest` is one column name carrying two shapes. Columns with no sample
+data were constrained only after reading their writer.
+
+**Landscape, 47 columns — all constrained.** SQLite accepts a 200-character
+value into a `VARCHAR(64)` column (measured), so on the default Landscape store
+the declared width enforced nothing, and on PostgreSQL it bounded the maximum
+only. Before this, 15 Landscape columns carried a full CHECK, all in the newer
+export, admission, coalesce and aggregation tables; the core audit tables
+carried none.
+
+**Sessions, 11 of 14 constrained.** Three are excluded, each with its reason
+recorded in the gate: `interpretation_events.hash_domain_version` (a version
+label), `web_instances.image_digest` (an OCI reference supplied by the platform)
+and `user_preferences.tutorial_source_data_hash`. The last is echoed back by the
+client with no server-side format validation, so a CHECK would turn a malformed
+request into a 500; the honest fix is a validator at the request model, which is
+not part of this change.
+
+`interpretation_events.approved_prompt_artifact_hash` and Landscape
+`calls.approved_prompt_artifact_hash` — the link between the two stores — now
+carry the identical rule on both sides.
+
+**Cost.** Production writers already conformed; what broke was tests seeding
+placeholders such as `config_hash="test"`. Those now derive a real digest from a
+readable label through `tests/fixtures/audit_hashing.py`
+(`fake_sha256("config")`), which is also closer to the project's rule that a
+fixture must have the shape its producer emits.
+
+## Unwired column found on the way: `nodes.schema_hash`
+
+Present since RC2 (`f4f348de1`, 2026-02-02) as a column plus an optional
+registration parameter documented as an "input/output schema hash". No caller
+has ever supplied it (NULL in 480 of 480 sampled node rows); the only write-site
+change in its history removed a literal `schema_hash=None`. It was never
+finished rather than removed, and it was superseded almost at once: `aa555c7cb`
+added `input_contract_json` / `output_contract_json` the next day and
+`84d296d5b` added `output_contract_hash`, which are populated. Nothing compares
+or verifies it; `engine/orchestrator/export.py` asserts that it is `None`.
 
 ## Related, not fixed
 

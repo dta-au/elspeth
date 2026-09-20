@@ -18,14 +18,17 @@ Session epoch 62 requires nullable backend suggestions in durable advisor
 completion gates and rejects earlier stores at startup before session reload.
 Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
 four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
-SHA-256 shape rather than the length alone.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 42 for immutable web
+SHA-256 shape rather than the length alone, and gives every remaining session
+digest column its own shape CHECK.
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 43 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
 approved prompt artifact link on LLM calls. The artifact identifies effective
 query templates and the system prompt; it no longer hashes an unused fallback.
 Epoch 42 requires admission evidence v2 with per-principal token quota usage
 and limits; stored v1 evidence is incompatible and must not be relabelled.
+Epoch 43 gives every Landscape digest column a shape CHECK: SQLite ignores the
+declared `VARCHAR` width, so `String(64)` alone admitted any text.
 These
 changes share one paired cutover; the intermediate ACA epochs are not a
 separate deployment requirement.
@@ -33,7 +36,7 @@ separate deployment requirement.
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 63 and Landscape databases below epoch 42 must be recreated together.
+epoch 63 and Landscape databases below epoch 43 must be recreated together.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service

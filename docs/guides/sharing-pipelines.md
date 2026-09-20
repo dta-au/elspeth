@@ -71,7 +71,7 @@ accept this trade-off.
 
 For 0.8.1, shareable-review state is part of the broader web session database
 contract. The release expects `SESSION_SCHEMA_EPOCH=63` and
-`SQLITE_SCHEMA_EPOCH=42`. Session epoch 29 introduced durable guided
+`SQLITE_SCHEMA_EPOCH=43`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed
 proposal admission, retryable blob cleanup, ordinary guided-plan decline
@@ -112,8 +112,10 @@ Session epoch 62 requires nullable backend suggestions in durable advisor
 completion gates and rejects older stores at startup before session reload.
 Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
 four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
-SHA-256 shape rather than the length alone.
-A Landscape store below epoch 42 is stale and must be recreated. When
+SHA-256 shape rather than the length alone, and gives every remaining session
+digest column its own shape CHECK. Landscape epoch 43 does the same for every
+Landscape digest column.
+A Landscape store below epoch 43 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this

@@ -40,6 +40,7 @@ from elspeth.contracts.trust_boundary import observation_boundary, trust_boundar
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler.payload_codec import serialize_row_payload
+from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator import prepare_for_run
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.transforms.aws.guardrails_live_check import run_guardrail_live_check
@@ -806,7 +807,10 @@ def run_bedrock_guardrails_live(
 
                 def record_guardrails_failure() -> None:
                     duration_ms = max(0.0, (time.monotonic() - started) * 1000)
-                    error_hash = _sha256(b"bedrock-guardrails-acceptance-failed")
+                    # The engine's 16-character error fingerprint of the message
+                    # recorded on the node state below, not a full digest of an
+                    # unrelated label: ``token_outcomes.error_hash`` is 16 hex.
+                    error_hash = compute_error_hash("acceptance check failed", exception_type="AcceptanceCheckError")
                     repositories.execution.complete_node_state(
                         state.state_id,
                         NodeStateStatus.FAILED,

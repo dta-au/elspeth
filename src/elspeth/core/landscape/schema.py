@@ -174,6 +174,50 @@ def _compile_postgres_optional_lower_hex16(element: _OptionalLowerHex16Check, _c
     return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{16}}$'"
 
 
+class _OptionalLowerHex32Check(ColumnElement[bool]):
+    """Dialect-exact optional 32-character ``SchemaContract.version_hash`` value."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalLowerHex32Check, "sqlite")
+def _compile_sqlite_optional_lower_hex32(element: _OptionalLowerHex32Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=32 AND {name} NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalLowerHex32Check, "postgresql")
+def _compile_postgres_optional_lower_hex32(element: _OptionalLowerHex32Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{32}}$'"
+
+
+class _OptionalSha256Ref16Check(ColumnElement[bool]):
+    """Dialect-exact optional ``sha256:<16 hex>`` plugin source fingerprint."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalSha256Ref16Check, "sqlite")
+def _compile_sqlite_optional_sha256_ref16(element: _OptionalSha256Ref16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=23 AND substr({name}, 1, 7) = 'sha256:' AND substr({name}, 8) NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalSha256Ref16Check, "postgresql")
+def _compile_postgres_optional_sha256_ref16(element: _OptionalSha256Ref16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^sha256:[0-9a-f]{{16}}$'"
+
+
 def _sql_string_literal(value: str) -> str:
     """Render one deterministic SQL string literal for generated CHECK clauses."""
     return "'" + value.replace("'", "''") + "'"
@@ -397,7 +441,12 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        Its decoder rejects stored v1 run_web_plugin_policy evidence, so even
 #        an unchanged table layout requires a pre-1.0 delete/recreate boundary.
 #        Deploy with Sessions epoch 59; never relabel old evidence as v2.
-SQLITE_SCHEMA_EPOCH = 42
+#  43 → Every digest column carries a shape CHECK. SQLite ignores the declared
+#        VARCHAR width, so String(64) alone admitted any text: 64-hex, the
+#        16-hex error fingerprints, the 32-hex SchemaContract.version_hash
+#        values and the ``sha256:<16 hex>`` plugin source fingerprint now each
+#        have their own rule. Deploy with Sessions epoch 63; delete/recreate.
+SQLITE_SCHEMA_EPOCH = 43
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -507,6 +556,8 @@ runs_table = Table(
         "openrouter_catalog_source IN ('live', 'bundled')",
         name="ck_runs_openrouter_catalog_source",
     ),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_runs_config_hash_hex"),
+    CheckConstraint(_LowerHex64Check("openrouter_catalog_sha256"), name="ck_runs_openrouter_catalog_sha256_hex"),
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
 
@@ -562,6 +613,16 @@ run_web_plugin_policy_table = Table(
         name="ck_run_web_plugin_policy_admission_pair",
     ),
     CheckConstraint("schema_version >= 1", name="ck_run_web_plugin_policy_schema_version"),
+    CheckConstraint(_LowerHex64Check("policy_hash"), name="ck_run_web_plugin_policy_policy_hash_hex"),
+    CheckConstraint(_LowerHex64Check("snapshot_hash"), name="ck_run_web_plugin_policy_snapshot_hash_hex"),
+    CheckConstraint(
+        _LowerHex64Check("binding_generation_fingerprint"),
+        name="ck_run_web_plugin_policy_binding_generation_fingerprint_hex",
+    ),
+    CheckConstraint(
+        _OptionalLowerHex64Check("admission_decision_hash"),
+        name="ck_run_web_plugin_policy_admission_decision_hash_hex",
+    ),
 )
 
 run_sources_table = Table(
@@ -587,6 +648,8 @@ run_sources_table = Table(
         _enum_in_check("lifecycle_state", RunSourceLifecycleState),
         name="ck_run_sources_lifecycle_state",
     ),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_run_sources_config_hash_hex"),
+    CheckConstraint(_OptionalLowerHex32Check("schema_contract_hash"), name="ck_run_sources_schema_contract_hash_hex"),
     ForeignKeyConstraint(["source_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
 )
 Index("ix_run_sources_run", run_sources_table.c.run_id)
@@ -621,6 +684,10 @@ nodes_table = Table(
     # Composite PK: same node config can exist in multiple runs
     # This allows running the same pipeline multiple times against the same database
     PrimaryKeyConstraint("node_id", "run_id"),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_nodes_config_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("schema_hash"), name="ck_nodes_schema_hash_hex"),
+    CheckConstraint(_OptionalLowerHex32Check("output_contract_hash"), name="ck_nodes_output_contract_hash_hex"),
+    CheckConstraint(_OptionalSha256Ref16Check("source_file_hash"), name="ck_nodes_source_file_hash_ref"),
 )
 
 # === Edges ===
@@ -701,6 +768,7 @@ rows_table = Table(
     UniqueConstraint("row_id", "run_id"),
     UniqueConstraint("run_id", "source_node_id", "source_row_index"),
     UniqueConstraint("run_id", "ingest_sequence"),
+    CheckConstraint(_LowerHex64Check("source_data_hash"), name="ck_rows_source_data_hash_hex"),
     # Composite FK to nodes (node_id, run_id)
     ForeignKeyConstraint(["source_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
 )
@@ -765,6 +833,7 @@ token_outcomes_table = Table(
     Column("error_hash", String(64)),
     # Optional extended context
     Column("context_json", Text),
+    CheckConstraint(_OptionalLowerHex16Check("error_hash"), name="ck_token_outcomes_error_hash_hex"),
     # Composite FK: batch outcomes must point at a batch from the same run.
     ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
 )
@@ -866,6 +935,7 @@ token_work_items_table = Table(
     ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
     ForeignKeyConstraint(["coalesce_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(_OptionalLowerHex16Check("pending_error_hash"), name="ck_token_work_items_pending_error_hash_hex"),
 )
 Index("ix_token_work_items_ready", token_work_items_table.c.run_id, token_work_items_table.c.status, token_work_items_table.c.available_at)
 Index(
@@ -1376,6 +1446,8 @@ node_states_table = Table(
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
     # Composite FK to nodes (node_id, run_id)
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(_LowerHex64Check("input_hash"), name="ck_node_states_input_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("output_hash"), name="ck_node_states_output_hash_hex"),
 )
 Index(
     "uq_node_states_coalesce_member_identity",
@@ -1504,6 +1576,8 @@ sink_effect_streams_table = Table(
     UniqueConstraint("stream_id", "run_id"),
     CheckConstraint("role IN ('primary','failsink')", name="ck_sink_effect_streams_role"),
     CheckConstraint("next_sequence >= 0", name="ck_sink_effect_streams_next_sequence"),
+    CheckConstraint(_LowerHex64Check("requested_target_hash"), name="ck_sink_effect_streams_requested_target_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("head_descriptor_hash"), name="ck_sink_effect_streams_head_descriptor_hash_hex"),
     ForeignKeyConstraint(["run_id"], ["runs.run_id"]),
     ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
 )
@@ -1564,6 +1638,8 @@ audit_export_snapshots_table = Table(
     CheckConstraint(_LowerHex64Check("last_chunk_seal_hash"), name="ck_audit_export_snapshots_last_chunk_seal_hash_hex"),
     CheckConstraint(_LowerHex64Check("final_hash"), name="ck_audit_export_snapshots_final_hash_hex"),
     CheckConstraint(_LowerHex64Check("signed_manifest_hash"), name="ck_audit_export_snapshots_signed_manifest_hash_hex"),
+    CheckConstraint(_LowerHex64Check("registry_key_hash"), name="ck_audit_export_snapshots_registry_key_hash_hex"),
+    CheckConstraint(_LowerHex64Check("public_export_config_hash"), name="ck_audit_export_snapshots_public_export_config_hash_hex"),
     CheckConstraint(
         _Sha256ContentRefCheck("signed_manifest_ref", "signed_manifest_hash"),
         name="ck_audit_export_snapshots_signed_manifest_ref",
@@ -1762,6 +1838,14 @@ sink_effects_table = Table(
         name="ck_sink_effects_reconcile_kind",
     ),
     ForeignKeyConstraint(["run_id"], ["runs.run_id"]),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_sink_effects_config_hash_hex"),
+    CheckConstraint(_LowerHex64Check("membership_or_manifest_hash"), name="ck_sink_effects_membership_or_manifest_hash_hex"),
+    CheckConstraint(_LowerHex64Check("group_payload_hash"), name="ck_sink_effects_group_payload_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("plan_hash"), name="ck_sink_effects_plan_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("expected_descriptor_hash"), name="ck_sink_effects_expected_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("precondition_hash"), name="ck_sink_effects_precondition_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("result_descriptor_hash"), name="ck_sink_effects_result_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("reconcile_evidence_hash"), name="ck_sink_effects_reconcile_evidence_hash_hex"),
     ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
     ForeignKeyConstraint(["primary_effect_id"], ["sink_effects.effect_id"]),
     ForeignKeyConstraint(["stream_id", "run_id"], ["sink_effect_streams.stream_id", "sink_effect_streams.run_id"]),
@@ -1829,6 +1913,11 @@ sink_effect_members_table = Table(
     ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
     ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
     ForeignKeyConstraint(["primary_effect_id", "run_id"], ["sink_effects.effect_id", "sink_effects.run_id"]),
+    CheckConstraint(_LowerHex64Check("lineage_hash"), name="ck_sink_effect_members_lineage_hash_hex"),
+    CheckConstraint(_LowerHex64Check("payload_hash"), name="ck_sink_effect_members_payload_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("descriptor_hash"), name="ck_sink_effect_members_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("evidence_hash"), name="ck_sink_effect_members_evidence_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("reason_hash"), name="ck_sink_effect_members_reason_hash_hex"),
 )
 Index(
     "uq_sink_effect_member_binding",
@@ -1874,6 +1963,8 @@ sink_effect_attempts_table = Table(
     CheckConstraint("generation >= 0", name="ck_sink_effect_attempts_generation"),
     CheckConstraint("action IN ('inspect','commit','reconcile')", name="ck_sink_effect_attempts_action"),
     CheckConstraint("state IN ('intent','returned','response_lost','error')", name="ck_sink_effect_attempts_state"),
+    CheckConstraint(_LowerHex64Check("request_hash"), name="ck_sink_effect_attempts_request_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("evidence_hash"), name="ck_sink_effect_attempts_evidence_hash_hex"),
     ForeignKeyConstraint(["effect_id"], ["sink_effects.effect_id"]),
     ForeignKeyConstraint(["effect_id", "member_ordinal"], ["sink_effect_members.effect_id", "sink_effect_members.ordinal"]),
 )
@@ -2091,6 +2182,8 @@ operations_table = Table(
         "sink_effect_id IS NULL OR operation_type = 'sink_write'",
         name="ck_operations_sink_effect_type",
     ),
+    CheckConstraint(_OptionalLowerHex64Check("input_data_hash"), name="ck_operations_input_data_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("output_data_hash"), name="ck_operations_output_data_hash_hex"),
 )
 Index("uq_operations_sink_effect_id", operations_table.c.sink_effect_id, unique=True)
 
@@ -2147,6 +2240,11 @@ calls_table = Table(
         "(state_id IS NOT NULL AND operation_id IS NULL) OR (state_id IS NULL AND operation_id IS NOT NULL)",
         name="calls_has_parent",
     ),
+    CheckConstraint(_LowerHex64Check("request_hash"), name="ck_calls_request_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("response_hash"), name="ck_calls_response_hash_hex"),
+    # The cross-store link to the session ``interpretation_events`` row of the
+    # same name; both sides carry the identical shape rule.
+    CheckConstraint(_OptionalLowerHex64Check("approved_prompt_artifact_hash"), name="ck_calls_approved_prompt_artifact_hash_hex"),
 )
 
 # Partial unique indexes for call_index uniqueness within each parent type.
@@ -2210,6 +2308,7 @@ artifacts_table = Table(
         "publication_evidence_kind IN ('returned','reconciled','inherited','virtual','legacy_returned')",
         name="ck_artifacts_publication_evidence_kind",
     ),
+    CheckConstraint(_LowerHex64Check("content_hash"), name="ck_artifacts_content_hash_hex"),
 )
 Index(
     "uq_artifacts_run_idempotency_key",
@@ -2239,6 +2338,7 @@ routing_events_table = Table(
     # Composite FKs: routed state and edge must belong to the same run.
     ForeignKeyConstraint(["state_id", "run_id"], ["node_states.state_id", "node_states.run_id"]),
     ForeignKeyConstraint(["edge_id", "run_id"], ["edges.edge_id", "edges.run_id"]),
+    CheckConstraint(_OptionalLowerHex64Check("reason_hash"), name="ck_routing_events_reason_hash_hex"),
 )
 
 # === Batches (Aggregation) ===
@@ -2436,6 +2536,7 @@ validation_errors_table = Table(
         ["rows.row_id", "rows.run_id"],
         ondelete="RESTRICT",
     ),
+    CheckConstraint(_LowerHex64Check("row_hash"), name="ck_validation_errors_row_hash_hex"),
 )
 
 Index("ix_validation_errors_run", validation_errors_table.c.run_id)
@@ -2468,6 +2569,7 @@ transform_errors_table = Table(
         ["nodes.node_id", "nodes.run_id"],
         ondelete="RESTRICT",
     ),
+    CheckConstraint(_LowerHex64Check("row_hash"), name="ck_transform_errors_row_hash_hex"),
 )
 
 Index("ix_transform_errors_run", transform_errors_table.c.run_id)
@@ -2500,6 +2602,7 @@ checkpoints_table = Table(
     # the dropped per-barrier buffer blob columns; buffered tokens live in
     # token_work_items journal BLOCKED rows.
     Column("barrier_scalars_json", Text, nullable=True),
+    CheckConstraint(_LowerHex64Check("upstream_topology_hash"), name="ck_checkpoints_upstream_topology_hash_hex"),
 )
 
 Index("ix_checkpoints_run", checkpoints_table.c.run_id)
@@ -2533,6 +2636,7 @@ secret_resolutions_table = Table(
     Column("secret_name", String(256), nullable=True),  # Secret name in vault
     Column("fingerprint", String(64), nullable=False),  # HMAC fingerprint of secret value
     Column("resolution_latency_ms", Float, nullable=True),  # Time to fetch from vault
+    CheckConstraint(_LowerHex64Check("fingerprint"), name="ck_secret_resolutions_fingerprint_hex"),
 )
 
 Index("ix_secret_resolutions_run", secret_resolutions_table.c.run_id)

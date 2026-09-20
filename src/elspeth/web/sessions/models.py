@@ -345,7 +345,11 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #     an old blocked envelope can fail during session reload. No migration.
 # 63: blob_inline_resolutions.content_hash carries the full lowercase SHA-256
 #     shape, not the length alone (elspeth-f99b16fc2f), and so do the four
-#     blob_replacement_cleanups evidence hashes. Pre-1.0 delete/recreate.
+#     blob_replacement_cleanups evidence hashes. The same cut gives every
+#     remaining digest column its rule: the nullable composer provenance
+#     hashes, skill_markdown_history.hash, the bare library payload digest
+#     and the ``sha256:``-prefixed review and completion-event digests.
+#     Pairs with Landscape epoch 43. Pre-1.0 delete/recreate.
 SESSION_SCHEMA_EPOCH = 63
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
@@ -386,10 +390,38 @@ def _lower_sha256_check(column_name: str, *, dialect: Literal["sqlite", "postgre
     return f"{base} AND {column_name} ~ '^[a-f0-9]+$'"
 
 
-def _lower_sha256_constraints(column_name: str, *, name: str) -> tuple[CheckConstraint, CheckConstraint]:
+def _lower_sha256_constraints(
+    column_name: str,
+    *,
+    name: str,
+    nullable: bool = False,
+) -> tuple[CheckConstraint, CheckConstraint]:
+    def expression(dialect: Literal["sqlite", "postgresql"]) -> str:
+        shape = _lower_sha256_check(column_name, dialect=dialect)
+        return f"{column_name} IS NULL OR ({shape})" if nullable else shape
+
     return (
-        CheckConstraint(_lower_sha256_check(column_name, dialect="sqlite"), name=name).ddl_if(dialect="sqlite"),
-        CheckConstraint(_lower_sha256_check(column_name, dialect="postgresql"), name=name).ddl_if(dialect="postgresql"),
+        CheckConstraint(expression("sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(expression("postgresql"), name=name).ddl_if(dialect="postgresql"),
+    )
+
+
+def _prefixed_sha256_constraints(column_name: str, *, name: str, nullable: bool = False) -> tuple[CheckConstraint, CheckConstraint]:
+    """CHECK a ``sha256:<64 lowercase hex>`` reference, the shape ``review_payload_digest`` emits."""
+
+    def expression(dialect: Literal["sqlite", "postgresql"]) -> str:
+        if dialect == "sqlite":
+            shape = (
+                f"length({column_name}) = 71 AND substr({column_name}, 1, 7) = 'sha256:' "
+                f"AND substr({column_name}, 8) NOT GLOB '*[^a-f0-9]*'"
+            )
+        else:
+            shape = f"{column_name} ~ '^sha256:[a-f0-9]{{64}}$'"
+        return f"{column_name} IS NULL OR ({shape})" if nullable else shape
+
+    return (
+        CheckConstraint(expression("sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(expression("postgresql"), name=name).ddl_if(dialect="postgresql"),
     )
 
 
@@ -956,6 +988,8 @@ composition_proposals_table = Table(
         _composition_proposals_composer_provenance_check(dialect="postgresql"),
         name="ck_composition_proposals_composer_provenance_all_or_none",
     ).ddl_if(dialect="postgresql"),
+    *_lower_sha256_constraints("composer_skill_hash", name="ck_composition_proposals_composer_skill_hash_format", nullable=True),
+    *_lower_sha256_constraints("tool_arguments_hash", name="ck_composition_proposals_tool_arguments_hash_format", nullable=True),
 )
 # Durable negative admission authority for a guided start whose client lost
 # its request body before the server ever reserved an operation row. The row
@@ -1547,6 +1581,15 @@ interpretation_events_table = Table(
         "= (accepted_value IS NOT NULL)",
         name="ck_interpretation_events_accepted_value_status",
     ),
+    *_lower_sha256_constraints("composer_skill_hash", name="ck_interpretation_events_composer_skill_hash_format", nullable=True),
+    *_lower_sha256_constraints("arguments_hash", name="ck_interpretation_events_arguments_hash_format", nullable=True),
+    # The cross-store link to the Landscape ``calls`` row of the same name;
+    # both sides carry the identical shape rule.
+    *_lower_sha256_constraints(
+        "approved_prompt_artifact_hash",
+        name="ck_interpretation_events_approved_prompt_artifact_hash_format",
+        nullable=True,
+    ),
 )
 
 # Partial unique index: only one pending interpretation per
@@ -1721,6 +1764,7 @@ composer_completion_events_table = Table(
         ["composition_states.id", "composition_states.session_id"],
         name="fk_composer_completion_events_state_session",
     ),
+    *_prefixed_sha256_constraints("payload_digest", name="ck_composer_completion_events_payload_digest_format", nullable=True),
 )
 
 Index(
@@ -1749,6 +1793,7 @@ skill_markdown_history_table = Table(
     Column("filename", String, nullable=False),
     Column("content", Text, nullable=False),
     Column("first_seen_at", DateTime(timezone=True), nullable=False),
+    *_lower_sha256_constraints("hash", name="ck_skill_markdown_history_hash_format"),
 )
 
 
@@ -2903,6 +2948,8 @@ blobs_table = Table(
         "status != 'ready' OR (content_hash IS NOT NULL AND length(content_hash) = 64 AND content_hash ~ '^[a-f0-9]+$')",
         name="ck_blobs_ready_hash",
     ).ddl_if(dialect="postgresql"),
+    *_lower_sha256_constraints("creating_composer_skill_hash", name="ck_blobs_creating_composer_skill_hash_format", nullable=True),
+    *_lower_sha256_constraints("creating_arguments_hash", name="ck_blobs_creating_arguments_hash_format", nullable=True),
 )
 
 # A blob delete spans database and filesystem durability domains. Persist the
@@ -3797,6 +3844,7 @@ review_attestations_table = Table(
         "reviewer_identity_id <> author_identity_id",
         name="ck_review_attestations_reviewer_is_not_author",
     ),
+    *_prefixed_sha256_constraints("payload_digest", name="ck_review_attestations_payload_digest_format"),
 )
 
 
@@ -3845,6 +3893,9 @@ library_entries_table = Table(
         "curated_by_identity_id IS NULL OR curated_by_identity_id <> published_by_identity_id",
         name="ck_library_entries_curator_is_not_publisher",
     ),
+    # Bare hex, unlike the ``sha256:``-prefixed ``payload_digest`` on reviews
+    # and completion events: this one is the payload store's content address.
+    *_lower_sha256_constraints("payload_digest", name="ck_library_entries_payload_digest_format"),
 )
 Index("ix_library_entries_compartment", library_entries_table.c.compartment_id)
 

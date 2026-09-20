@@ -2167,7 +2167,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 42
+### Landscape schema epoch 43
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2220,7 +2220,9 @@ quota-policy/secret-wiring admission evidence in the same prepared window as
 Sessions epoch 55. Epoch 41 replaces the fallback-template digest with the
 approved prompt artifact anchor, paired with session epoch 57. Epoch 42 requires
 admission evidence v2 with token quota usage and limits; its decoder rejects
-stored v1 evidence, requiring recreation even with an unchanged table layout. See the
+stored v1 evidence, requiring recreation even with an unchanged table layout.
+Epoch 43 gives every digest column a shape CHECK, paired with session epoch 63;
+SQLite ignores a declared `VARCHAR` width, so the width alone admitted any text. See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
@@ -2229,7 +2231,7 @@ Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-42 database.
+an older epoch must not be rolled back over an epoch-43 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

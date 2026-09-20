@@ -41,7 +41,8 @@ def test_current_epoch_preserves_token_row_run_ownership_for_sqlite_and_postgres
     # Epoch 40 adds call usage and admission policy evidence, retaining this FK.
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence, retaining this FK.
-    assert SQLITE_SCHEMA_EPOCH == 42
+    # Epoch 43 adds digest shape CHECKs, retaining this FK.
+    assert SQLITE_SCHEMA_EPOCH == 43
     assert (
         "tokens",
         ("row_id", "run_id"),
