@@ -53,7 +53,13 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
   const [selected, setSelected] = useState<{ key: string; seed: PersonRecord | null } | null>(null);
   const [adding, setAdding] = useState(false);
   const [view, setView] = useState<"list" | "detail">("list");
-  const [credential, setCredential] = useState<GeneratedCredential | null>(null);
+  // Every undismissed one-time password stays on screen. A second account's
+  // password must not replace the first: neither can be shown again. A new
+  // password for the SAME account does replace the old one, which no longer works.
+  const [credentials, setCredentials] = useState<GeneratedCredential[]>([]);
+  const addCredential = useCallback((next: GeneratedCredential) => {
+    setCredentials((current) => [...current.filter((held) => held.username !== next.username), next]);
+  }, []);
   const [leave, setLeave] = useState<Leave | null>(null);
   const [status, setStatus] = useState<string | null>(null);
 
@@ -129,9 +135,9 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
 
   const requestClose = useCallback(() => {
     if (dirtyOwners.current.size > 0) setLeave({ reason: "unsaved", proceed: onClose });
-    else if (credential !== null) setLeave({ reason: "password", proceed: onClose });
+    else if (credentials.length > 0) setLeave({ reason: "password", proceed: onClose });
     else onClose();
-  }, [credential, onClose]);
+  }, [credentials, onClose]);
 
   useEffect(() => { if (leave !== null) leaveRef.current?.focus(); }, [leave]);
 
@@ -201,14 +207,14 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
           {leave !== null && (
             <div ref={leaveRef} tabIndex={-1} role="alertdialog" aria-labelledby="people-leave-title" className="people-notice people-notice-uncertain">
               <span id="people-leave-title">{leave.reason === "password"
-                ? `The password for ${credential?.username ?? "this account"} is still on screen and cannot be shown again. Close anyway?`
+                ? `The password for ${credentials.map((held) => held.username).join(" and ") || "this account"} is still on screen and cannot be shown again. Close anyway?`
                 : "You have unsaved changes. Discard them?"}</span>
               <Button compact variant="danger" onClick={() => { const { proceed } = leave; dirtyOwners.current.clear(); setLeave(null); proceed(); }}>{leave.reason === "password" ? "Close without the password" : "Discard changes"}</Button>
               <Button compact onClick={() => setLeave(null)}>{leave.reason === "password" ? "Keep open" : "Keep editing"}</Button>
             </div>
           )}
 
-          {credential !== null && <GeneratedPassword credential={credential} onDismiss={() => setCredential(null)} />}
+          {credentials.map((held) => <GeneratedPassword key={held.username} credential={held} onDismiss={() => setCredentials((current) => current.filter((other) => other !== held))} />)}
           {status !== null && <p role="status" className="people-notice people-notice-saved">{status}</p>}
           {activeAdminCount === 1 && <p role="status" className="identity-admin-advisory">This deployment has one active human administrator. Add another before changing that administrator's access.</p>}
 
@@ -225,10 +231,10 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
               <div className="people-pane people-pane-detail">
                 <Button compact className="people-back" onClick={backToList}>{query.status === "pending" ? "Back to pending access" : "Back to people"}</Button>
                 {adding ? (
-                  <AddPersonForm capabilities={capabilities} onCredential={setCredential} onCancel={() => { setAdding(false); setView("list"); setTimeout(() => addButtonRef.current?.focus(), 0); }}
+                  <AddPersonForm capabilities={capabilities} onCredential={addCredential} onCancel={() => { setAdding(false); setView("list"); setTimeout(() => addButtonRef.current?.focus(), 0); }}
                     onAdded={(key) => { dirtyOwners.current.clear(); setAdding(false); setSelected({ key, seed: null }); setView("detail"); setRefreshTick((value) => value + 1); }} />
                 ) : selected !== null ? (
-                  <PersonDetail key={selected.key} personKey={selected.key} initial={selected.seed} activeAdminCount={activeAdminCount} onCredential={setCredential} onPersonChanged={onPersonChanged} onGone={onGone} />
+                  <PersonDetail key={selected.key} personKey={selected.key} initial={selected.seed} activeAdminCount={activeAdminCount} onCredential={addCredential} onPersonChanged={onPersonChanged} onGone={onGone} />
                 ) : (
                   <p className="people-empty-detail">Select a person to manage their access, roles, approvers, limits and sign-in.</p>
                 )}

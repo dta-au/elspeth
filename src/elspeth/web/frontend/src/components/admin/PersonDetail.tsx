@@ -203,7 +203,7 @@ export function PersonDetail({ personKey, initial, activeAdminCount, onCredentia
                 {tabs.map((value) => <Button key={value} id={`${tabsId}-tab-${value}`} role="tab" tabIndex={tab === value ? 0 : -1} aria-selected={tab === value} aria-controls={`${tabsId}-panel`} variant="bare" className="identity-admin-tab" onClick={() => setTab(value)}>{TAB_LABEL[value]}</Button>)}
               </div>
               <div id={`${tabsId}-panel`} role="tabpanel" aria-labelledby={`${tabsId}-tab-${tab}`}>
-                {tab === "roles" && <RolesEditor key={person.key} identityId={person.identity.identity_id} personName={name} kind={person.identity.kind} onChanged={notifyChanged} />}
+                {tab === "roles" && <RolesEditor key={`${person.key}:${person.identity.access_state}`} identityId={person.identity.identity_id} personName={name} kind={person.identity.kind} onChanged={notifyChanged} />}
                 {tab === "approvers" && <RelationshipsEditor key={person.key} identityId={person.identity.identity_id} personName={name} />}
                 {tab === "usage" && (person.identity.access_state === "active"
                   ? <QuotaEditor key={person.key} identityId={person.identity.identity_id} personName={name} />

@@ -324,6 +324,21 @@ describe("PeopleAccessDialog", () => {
       expect(screen.queryByTestId("generated-password")).not.toBeInTheDocument();
     });
 
+    it("keeps an earlier person's password on screen when a second one is generated", async () => {
+      const sam = identityPerson({ identity_id: "sam-id", subject: "sam.lee", username: "sam.lee", display_name: "Sam Lee" }, { local_account: { username: "sam.lee", display_name: "Sam Lee", email: null, email_verified: false }, actions: { manage_access: true, manage_credentials: true, set_up_access: false, is_self: false } });
+      vi.mocked(people.listPeople).mockResolvedValue(page([linked, sam], BOTH));
+      await resetPassword();
+      await screen.findByTestId("generated-password");
+      vi.mocked(people.fetchPerson).mockResolvedValue(respond(sam));
+      vi.mocked(client.resetAdminUserPassword).mockResolvedValue({ user_id: "sam.lee", password: "0ther-Pass" });
+      await userEvent.click(screen.getByRole("button", { name: /Sam Lee/ }));
+      await userEvent.click(await screen.findByRole("button", { name: "Reset password for Sam Lee" }));
+      await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
+      await screen.findByRole("heading", { name: "Password reset for sam.lee" });
+      // Neither can be shown again, so neither may replace the other.
+      expect(screen.getAllByTestId("generated-password").map((node) => node.textContent)).toEqual(["s3cret-Pass", "0ther-Pass"]);
+    });
+
     it("warns before closing while the only copy of a password is on screen", async () => {
       await resetPassword();
       await screen.findByTestId("generated-password");

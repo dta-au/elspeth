@@ -4317,7 +4317,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "10050ea6a0b8cacb",
         1,
         "QuotaAuthority",
-        line=316,
+        line=320,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/quota_policy_authority.py",
@@ -4327,7 +4327,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "237ea48d83d9cf37",
         1,
         "QuotaAuthority",
-        line=258,
+        line=262,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/quota_policy_authority.py",
@@ -4337,7 +4337,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "7dbb450913ed841e",
         1,
         "QuotaAuthority",
-        line=255,
+        line=259,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/quota_policy_authority.py",
@@ -4347,7 +4347,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "dceb76e38470da07",
         1,
         "QuotaAuthority",
-        line=296,
+        line=300,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/quota_policy_authority.py",

@@ -231,7 +231,7 @@ class RelationshipSelfEdge(IdentityAuthorityRefusal):
 
 @final
 class ApproverRoleRequired(IdentityAuthorityRefusal):
-    _MESSAGE = "the overseeing identity must hold an active approver role"
+    _MESSAGE = "the person who approves must hold an active Approver role; give them that role first, then assign them"
 
 
 @final

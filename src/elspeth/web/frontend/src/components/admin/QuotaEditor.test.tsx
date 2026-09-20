@@ -40,6 +40,14 @@ describe("QuotaEditor", () => {
     expect(await screen.findByText(/Storage: 2.9 KB/)).toBeInTheDocument();
   });
 
+  it("clears the typed cap when the dimension changes, so 50000 tokens cannot become 50000 bytes", async () => {
+    render(<QuotaEditor identityId="member" personName="Jane Doe" />);
+    await screen.findByText(/Tokens per day: 500/);
+    await userEvent.type(screen.getByLabelText("New cap"), "50000");
+    await userEvent.selectOptions(screen.getByLabelText("Dimension"), "storage");
+    expect(screen.getByLabelText("New cap")).toHaveValue("");
+  });
+
   it("reports the saved quota to the parent row", async () => {
     const updated = { ...quota, tokens_per_day: 750 };
     const onSaved = vi.fn();

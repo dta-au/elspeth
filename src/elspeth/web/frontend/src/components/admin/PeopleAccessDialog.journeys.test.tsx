@@ -156,6 +156,9 @@ describe("People & access journeys", () => {
     await waitFor(() => expect(admin.activateIdentity).toHaveBeenCalledWith("p-1", "user", "Admit for work"));
     expect(await screen.findByRole("heading", { name: "Sam Lee" })).toBeInTheDocument();
     expect(screen.getByText("Active", { selector: ".people-access-status *" })).toBeInTheDocument();
+    // The approval granted the initial role server-side, so the roles list is
+    // re-read: showing "holds no roles" beside "Approved" invites a duplicate grant.
+    await waitFor(() => expect(vi.mocked(admin.listRoles).mock.calls.length).toBeGreaterThanOrEqual(2));
   });
 
   it("shows a returning person's retained roles before the approval is confirmed", async () => {

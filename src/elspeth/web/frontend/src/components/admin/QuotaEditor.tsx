@@ -62,13 +62,14 @@ export function QuotaEditor({ identityId, personName, onSaved }: { identityId: s
     {quota !== null && <>
       <p>Tokens per day: {quota.tokens_per_day ?? "no cap"} ({quota.tokens_used_today ?? "unknown"} used today; {quota.container_tokens_per_day === null ? "no container ceiling" : `container ceiling ${quota.container_tokens_per_day}`})</p>
       <p>Storage: {quota.storage_bytes === null ? "no cap" : formatBytes(quota.storage_bytes)} ({formatBytes(quota.storage_bytes_used)} used; {quota.container_storage_bytes === null ? "no container ceiling" : `container ceiling ${formatBytes(quota.container_storage_bytes)}`})</p>
+      {quota.tokens_per_day === null && quota.storage_bytes === null && <p className="people-grant-purpose">{personName} has no personal caps yet. A first cap is stored with a value for both tokens and storage, and the other value comes from this deployment's default limits. If no defaults are configured, saving is refused until an operator sets them.</p>}
     </>}
     {error !== null && <p role="alert" className="composer-preferences-error">{error}</p>}
     {quota === null && error !== null && <div><Button compact onClick={() => setAttempt((value) => value + 1)}>Retry</Button></div>}
     {saved && <p role="status">Quota updated.</p>}
     <form className="identity-admin-fields" onSubmit={(event) => { event.preventDefault(); void save(); }}>
       <label className="identity-admin-field">Dimension
-        <select className="input" value={dimension} disabled={busy || quota === null} onChange={(event) => setDimension(event.target.value as QuotaDimension)}>
+        <select className="input" value={dimension} disabled={busy || quota === null} onChange={(event) => { setDimension(event.target.value as QuotaDimension); setValue(""); }}>
           <option value="tokens">Tokens per day</option>
           <option value="storage">Storage bytes</option>
         </select>

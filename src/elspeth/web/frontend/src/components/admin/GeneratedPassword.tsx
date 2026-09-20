@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui";
 
 export interface GeneratedCredential {
@@ -17,6 +17,7 @@ export interface GeneratedCredential {
  */
 export function GeneratedPassword({ credential, onDismiss }: { credential: GeneratedCredential; onDismiss: () => void }): JSX.Element {
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const headingId = useId();
   const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle");
   useEffect(() => {
     setCopy("idle");
@@ -24,8 +25,8 @@ export function GeneratedPassword({ credential, onDismiss }: { credential: Gener
   }, [credential]);
 
   return (
-    <section aria-labelledby="people-password-heading" className="user-admin-password-banner">
-      <h3 id="people-password-heading" ref={headingRef} tabIndex={-1} className="people-password-heading">
+    <section aria-labelledby={headingId} className="user-admin-password-banner">
+      <h3 id={headingId} ref={headingRef} tabIndex={-1} className="people-password-heading">
         {credential.cause === "created" ? "Account created" : "Password reset"} for {credential.username}
       </h3>
       <p className="people-password-note">
