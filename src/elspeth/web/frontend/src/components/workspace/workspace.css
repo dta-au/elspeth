@@ -340,12 +340,12 @@
   left: var(--space-sm);
 }
 
-/* Approvals tab: the approved value under an audit-style row. Prompts are
-   multi-line, so the text keeps its line breaks and reads at body colour. */
-.approvals-view-value {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  color: var(--color-text);
+/* Approvals tab: the Workflow tab's approvals table (.graph-detail-table
+   supplies the table rules) sitting inside the audit-panel card, so it drops
+   the disclosure's own top rule and paper fill. */
+.approvals-view-table {
+  border-top: 0;
+  background: transparent;
 }
 
 .artifact-workspace-panel[hidden] {

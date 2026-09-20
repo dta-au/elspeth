@@ -45,33 +45,39 @@ describe("ApprovalsView", () => {
     resetStore(useInterpretationEventsStore);
   });
 
-  it("lists each approval in the audit panel's row style, with its value, time and current binding", () => {
+  it("shows the Workflow tab's approvals table: Name, Approved value, Approved at", () => {
     seed([event]);
     render(<ApprovalsView />);
 
     const region = screen.getByRole("region", { name: "Approvals" });
     expect(within(region).getByRole("heading", { level: 2, name: "Approvals" })).toBeInTheDocument();
-    const row = within(region).getByRole("group", { name: "Prompt injection protection for summarize_page" });
-    expect(row.closest("li")).toHaveClass("audit-readiness-row", "audit-readiness-row--ok");
+    expect(within(region).getAllByRole("columnheader").map((th) => th.textContent)).toEqual([
+      "Name", "Approved value", "Approved at",
+    ]);
+    const row = within(region).getByRole("row", { name: /Prompt injection protection for summarize_page/ });
     expect(row).toHaveTextContent("Now: profile sonnet");
-    expect(within(row).getByText(/Review untrusted\s+page content\./)).toHaveClass("approvals-view-value");
+    expect(within(row).getByText(/Review untrusted\s+page content\./)).toHaveClass("graph-approvals-value");
     expect(row.querySelector("time")).toHaveAttribute("datetime", "2026-09-20T07:01:00Z");
+    // The whole panel is available here, so no 12rem scroller caps the table.
+    expect(region.querySelector(".graph-detail-table-scroll")).toBeNull();
   });
 
-  it("is a copy of the Workflow tab's table: same name and value from the one derivation", () => {
+  it("is a copy of the Workflow tab's table: identical cells from the one component", () => {
     seed([event]);
+    const cells = (): (string | null)[] =>
+      screen.getAllByRole("row").flatMap((r) => Array.from(r.children).map((c) => c.textContent));
     const { unmount } = render(<GraphApprovals events={[event]} state={state} />);
-    const tableName = screen.getByRole("rowheader").textContent;
+    const workflowCells = cells();
     unmount();
     render(<ApprovalsView />);
-    expect(tableName).toContain("Prompt injection protection for summarize_page");
-    expect(screen.getByRole("group", { name: "Prompt injection protection for summarize_page" })).toBeInTheDocument();
+    expect(workflowCells.length).toBeGreaterThan(3);
+    expect(cells()).toEqual(workflowCells);
   });
 
   it("leaves out rejected interpretations and says so when nothing is approved", () => {
     seed([{ ...event, choice: "opted_out" }]);
     render(<ApprovalsView />);
     expect(screen.getByText(/Nothing has been approved for this pipeline yet/)).toBeInTheDocument();
-    expect(screen.queryByRole("list")).not.toBeInTheDocument();
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
   });
 });

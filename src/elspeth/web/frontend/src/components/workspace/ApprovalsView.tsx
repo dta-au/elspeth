@@ -1,14 +1,16 @@
 import { useMemo } from "react";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { approvalRows } from "@/components/inspector/approvalRows";
+import { ApprovalsTable } from "@/components/inspector/GraphApprovals";
 import { selectApprovedInterpretations, useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types";
 import type { InterpretationEvent } from "@/types/interpretation";
 
-/** The Approvals artifact tab: the same approvals the Workflow tab's table
- *  lists (one shared derivation, approvalRows), drawn in the Checks tab's
- *  audit-panel style so the two record surfaces read as one family. */
+/** The Approvals artifact tab: the SAME table the Workflow tab shows under its
+ *  Approvals disclosure (ApprovalsTable — one component, same columns and
+ *  content), given the whole panel instead of a 12rem scroller, inside the
+ *  Checks tab's audit-panel card so the record surfaces read as one family. */
 function ApprovalsList({
   events,
   state,
@@ -16,31 +18,10 @@ function ApprovalsList({
   events: ReadonlyArray<InterpretationEvent>;
   state: CompositionState;
 }): JSX.Element {
-  const rows = approvalRows(events, state);
   return (
-    <ul className="audit-readiness-rows">
-      {rows.map((row) => {
-        const heading = row.nodeName ? `${row.name} for ${row.nodeName}` : row.name;
-        return (
-          <li key={row.id} className="audit-readiness-row audit-readiness-row--ok">
-            <div className="audit-readiness-row-static" role="group" aria-label={heading}>
-              <span className="audit-readiness-glyph" aria-hidden="true">✓</span>
-              <span className="sr-only">Approved.</span>
-              <span className="audit-readiness-row-label">
-                {row.name}
-                {row.nodeName && <> for <code>{row.nodeName}</code></>}
-              </span>
-              <span className="audit-readiness-row-summary">
-                Approved <time dateTime={row.resolvedAt}>{row.dateLabel}</time>
-                {row.plugin && <> · {row.plugin}</>}
-                {row.binding && <> · {`Now: ${row.binding}`}</>}
-              </span>
-              <span className="audit-readiness-row-summary approvals-view-value">{row.value}</span>
-            </div>
-          </li>
-        );
-      })}
-    </ul>
+    <div className="graph-detail-table approvals-view-table">
+      <ApprovalsTable rows={approvalRows(events, state)} />
+    </div>
   );
 }
 
