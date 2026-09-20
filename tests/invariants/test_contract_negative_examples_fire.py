@@ -86,9 +86,6 @@ def test_negative_example_fires_violation(contract) -> None:
         method = _dispatch_method(contract, bundle.site)
         with pytest.raises(contract.violation_class) as exc_info:
             method(*bundle.args)
-        assert exc_info.value is not None, (
-            f"Contract {contract.name!r}'s runtime_check did not raise on its own negative_example — VAL is dormant for this contract."
-        )
         violation = exc_info.value
         _assert_exception_passed_through_dispatch_method(violation, contract_name=contract.name, bundle=bundle)
         assert type(violation) is contract.violation_class, (
