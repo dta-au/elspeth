@@ -13,7 +13,6 @@ import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
 
 const PENDING_REVIEW_NOTICE =
   "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue.";
-const RESOLVED_REVIEW_NOTICE = "Review cards from this turn are no longer pending.";
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -68,10 +67,8 @@ export function MessageBubble({
     if (Number.isNaN(handoffAt) || pendingReviewCreatedAt.some((createdAt) => Date.parse(createdAt) <= handoffAt)) {
       return segments;
     }
-    return segments.map((segment) =>
-      segment.kind === "trusted_system_notice" && segment.content === PENDING_REVIEW_NOTICE
-        ? { ...segment, content: RESOLVED_REVIEW_NOTICE }
-        : segment,
+    return segments.filter((segment) =>
+      !(segment.kind === "trusted_system_notice" && segment.content === PENDING_REVIEW_NOTICE),
     );
   }, [message.content, message.created_at, message.segments, pendingReviewCreatedAt]);
   const [copied, setCopied] = useState(false);

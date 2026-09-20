@@ -317,7 +317,7 @@ describe("MessageBubble", () => {
   });
 
   describe("trusted system notices", () => {
-    it("updates an old review handoff after its cards resolve without reviving it for later cards", async () => {
+    it("removes an old review handoff after its cards resolve without reviving it for later cards", async () => {
       const user = userEvent.setup();
       const writeText = vi.fn().mockResolvedValue(undefined);
       Object.defineProperty(navigator, "clipboard", {
@@ -340,15 +340,16 @@ describe("MessageBubble", () => {
 
       rerender(<MessageBubble message={message} pendingReviewCreatedAt={[]} />);
       expect(screen.queryByText(notice)).not.toBeInTheDocument();
-      expect(screen.getByRole("status")).toHaveTextContent("Review cards from this turn are no longer pending.");
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
       expect(screen.getByText("Model summary")).toBeInTheDocument();
       await user.click(screen.getByLabelText("Copy message"));
-      expect(writeText).toHaveBeenCalledWith("Model summary\n\nSystem note: Review cards from this turn are no longer pending.");
+      expect(writeText).toHaveBeenCalledWith("Model summary");
 
       rerender(
         <MessageBubble message={message} pendingReviewCreatedAt={["2026-09-20T07:25:00Z"]} />,
       );
       expect(screen.queryByText(notice)).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
     });
 
     it("does not let a literal model marker create trusted system chrome", () => {
