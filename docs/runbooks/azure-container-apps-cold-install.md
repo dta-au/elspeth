@@ -65,8 +65,10 @@ deployment fixes may differ; keep both identities explicit.
    `deployWebApp=false`, then run the `provision-storage` Job;
 6. run the `doctor-schema-init` Job with the schema-owner URLs;
 7. run the `doctor-runtime` Job with the runtime URLs;
-8. deploy `workload.bicep` in the production shape and prove the rollout; and
-9. verify public behaviour and record the operator-local notes.
+8. deploy `workload.bicep` in the production shape and prove the rollout;
+9. verify public behaviour and record the operator-local notes; and
+10. optionally, grant the web identity read access to an Azure AI Search index
+    and declare it as an operator profile for the `azure_ai_search` transform.
 
 Every step has a stop condition. Do not skip forward after a failed identity,
 image, doctor or readiness check.
@@ -546,6 +548,74 @@ real Composer request, save the pipeline, execute a small input through the
 configured standard LLM profile, and inspect output and audit history.
 Require `composer_available=true`, no missing keys and `tutorial_ready=true`
 when offering the tutorial. Public health probes alone do not prove this flow.
+
+## 10. Optional: grant Azure AI Search access for RAG retrieval
+
+The `azure_ai_search` transform queries an existing Azure AI Search index; the default image already carries it
+(`INSTALL_EXTRAS=all` includes `azure-identity`). The bundle does not create a
+search service or an index. Keeping to "no static credential in any
+container", the recommended credential on this target is the web app's
+user-assigned identity, not a Search API key.
+
+Enable role-based access on the search service and grant the identity read
+access to index data:
+
+```bash
+: "${SEARCH_SERVICE_NAME:?set the existing search service name}"
+: "${SEARCH_RESOURCE_GROUP:?set the resource group of the search service}"
+IDENTITY_PRINCIPAL_ID=$(jq -er '.identityPrincipalId.value' "$OPERATOR_DIR/environment-outputs.json")
+IDENTITY_CLIENT_ID=$(jq -er '.identityClientId.value' "$OPERATOR_DIR/environment-outputs.json")
+SEARCH_RESOURCE_ID=$(az search service show --name "$SEARCH_SERVICE_NAME" \
+  --resource-group "$SEARCH_RESOURCE_GROUP" --query id --output tsv)
+az search service update --name "$SEARCH_SERVICE_NAME" --resource-group "$SEARCH_RESOURCE_GROUP" \
+  --auth-options aadOrApiKey --aad-auth-failure-mode http401WithBearerChallenge --output none
+az role assignment create --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role 'Search Index Data Reader' --scope "$SEARCH_RESOURCE_ID" --output none
+printf 'client_id: %s\n' "$IDENTITY_CLIENT_ID"
+```
+
+Declare the service to the web app as an operator profile. It is not a secret,
+so it travels as a plain `extraEnvironment` entry in the operator-local
+application parameter file (`$APPLICATION_PARAMETERS`); `indexes` is mandatory, and `"any"` is the written decision to open every
+index on the service to web authors. `client_id` is required here: the identity
+is user-assigned, and the transform uses `ManagedIdentityCredential`, which does
+not read `AZURE_CLIENT_ID` on Container Apps.
+
+```json
+{"name": "ELSPETH_WEB__AZURE_SEARCH_PROFILES",
+ "value": "[{\"alias\":\"policies\",\"endpoint\":\"https://<service>.search.windows.net\",\"auth\":\"managed_identity\",\"client_id\":\"<identityClientId>\",\"indexes\":[\"<index>\"]}]"}
+```
+
+Add `transform:azure_ai_search` to `ELSPETH_WEB__PLUGIN_ALLOWLIST`, which is
+another `extraEnvironment` entry on this target. A web author then selects
+`profile: policies` and an index the profile lists; the endpoint and identity
+never appear in an authored pipeline, and `endpoint`, `api_key`,
+`use_managed_identity`, `client_id` and `api_version` are refused there.
+Several services are several entries in the array. A managed-identity profile
+needs no `ELSPETH_WEB__SECRET_WIRING_ALLOWLIST` rule; neither does an `api_key`
+profile, whose server secret the profile injects rather than the author wiring
+it. If a query key is unavoidable, hold it in Key Vault as an `extraSecrets`
+entry, expose it through `extraEnvironment` with `secretRef`, name that
+variable as the profile's `credential_ref`, and list it in
+`ELSPETH_WEB__SERVER_SECRET_ALLOWLIST`; a profile whose secret does not resolve
+reads as unavailable instead of failing start-up.
+
+Index field mapping, search modes and score ranges are in
+[`examples/azure_search_rag`](../../examples/azure_search_rag/README.md).
+
+Limits on this target:
+
+- **No private endpoint for the search service.** The transform resolves the
+  endpoint and refuses private addresses before every request and before the
+  first row, so a `privatelink.search.windows.net` answer is blocked as SSRF.
+  Leave the service on its public endpoint and restrict it with the Search IP
+  firewall. The environment's outbound address is not static without a NAT
+  gateway, which the bundle does not create.
+- A run that stops before the first row with `pre_flight_failed`
+  (`RuntimePreflightFailedError`) and `Authentication failed ... HTTP 403`
+  means the role assignment has not propagated or role-based access is off; a
+  missing index reports `not found`, an empty one `is empty`.
 
 ## Troubleshooting
 

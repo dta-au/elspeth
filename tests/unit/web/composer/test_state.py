@@ -4292,6 +4292,175 @@ class TestPromptTemplateUndeclaredRowFields:
             assert "withdraws the contract for every field" in text
 
 
+class TestLLMPromptRolesRequired:
+    """Every composer-authored ``llm`` node carries BOTH prompt roles.
+
+    Session 60ab6a67 (2026-09-20): the user supplied a user prompt per A/B arm
+    and the planner shipped both nodes with ``prompt_template`` only. The
+    skill told it to fill the missing role; the plugin schema it read last
+    called the field "Optional system prompt", and nothing at Stage 1 pushed
+    back, so the omission reached the approval card unseen. A rejection the
+    planner must repair is the enforcement; the server never writes the text.
+    """
+
+    def _state_with_llm(self, options: dict[str, Any]) -> CompositionState:
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="classified",
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _errors(self, state: CompositionState, code: str) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == code]
+
+    def test_user_prompt_without_system_prompt_is_rejected(self) -> None:
+        """The session-60ab6a67 shape: a supplied user prompt, no system role."""
+        state = self._state_with_llm(
+            {"profile": "sonnet", "prompt_template": "Classify: {{ row.text }}", "required_input_fields": ["text"]}
+        )
+        errors = self._errors(state, "llm_system_prompt_missing")
+        assert len(errors) == 1
+        entry = errors[0]
+        assert entry.component == "node:classify"
+        assert entry.severity == "high"
+        assert "options.system_prompt" in entry.message
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    @pytest.mark.parametrize("blank", [None, "", "   \n\t"])
+    def test_blank_system_prompt_is_not_a_system_prompt(self, blank: str | None) -> None:
+        """``transform.py`` sends the system message only ``if self.system_prompt``."""
+        state = self._state_with_llm({"prompt_template": "Classify: {{ row.text }}", "system_prompt": blank})
+        assert len(self._errors(state, "llm_system_prompt_missing")) == 1
+
+    def test_both_roles_present_is_accepted(self) -> None:
+        state = self._state_with_llm(
+            {"prompt_template": "Classify: {{ row.text }}", "system_prompt": "You classify support tickets by sentiment."}
+        )
+        assert not self._errors(state, "llm_system_prompt_missing")
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    def test_system_prompt_without_user_prompt_is_rejected(self) -> None:
+        state = self._state_with_llm({"system_prompt": "You classify support tickets by sentiment."})
+        errors = self._errors(state, "llm_user_prompt_missing")
+        assert len(errors) == 1
+        assert errors[0].component == "node:classify"
+        assert errors[0].severity == "high"
+        assert "options.prompt_template" in errors[0].message
+        assert not self._errors(state, "llm_system_prompt_missing")
+
+    def test_node_with_neither_role_reports_both(self) -> None:
+        state = self._state_with_llm({"profile": "sonnet"})
+        assert len(self._errors(state, "llm_system_prompt_missing")) == 1
+        assert len(self._errors(state, "llm_user_prompt_missing")) == 1
+
+    def test_multi_query_node_needs_the_shared_system_prompt(self) -> None:
+        """``system_prompt`` is shared by every query, so one rule covers both modes."""
+        state = self._state_with_llm({"queries": {"tone": {"template": "Tone of {{ row.text }}?", "input_fields": {"text": "text"}}}})
+        assert len(self._errors(state, "llm_system_prompt_missing")) == 1
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    @pytest.mark.parametrize(
+        "queries",
+        [
+            pytest.param(
+                {
+                    "tone": {"template": "Tone of {{ row.text }}?", "input_fields": {"text": "text"}},
+                    "urgency": {"template": "Urgency of {{ row.text }}?", "input_fields": {"text": "text"}},
+                },
+                id="mapping-form",
+            ),
+            pytest.param(
+                [
+                    {"name": "tone", "template": "Tone of {{ row.text }}?", "input_fields": {"text": "text"}},
+                    {"name": "urgency", "template": "Urgency of {{ row.text }}?", "input_fields": {"text": "text"}},
+                ],
+                id="list-form",
+            ),
+        ],
+    )
+    def test_multi_query_one_system_prompt_many_user_prompts_is_the_supported_shape(self, queries: Any) -> None:
+        """One shared ``system_prompt`` plus a user prompt per query needs no node-level ``prompt_template``."""
+        state = self._state_with_llm({"system_prompt": "You assess support tickets.", "queries": queries})
+        assert not self._errors(state, "llm_system_prompt_missing")
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    def test_multi_query_without_any_user_template_names_the_query(self) -> None:
+        """A query with no ``template`` falls back to the node-level ``prompt_template``; with neither it has no user prompt."""
+        state = self._state_with_llm(
+            {
+                "system_prompt": "You assess support tickets.",
+                "queries": {
+                    "tone": {"template": "Tone of {{ row.text }}?", "input_fields": {"text": "text"}},
+                    "urgency": {"input_fields": {"text": "text"}},
+                },
+            }
+        )
+        errors = self._errors(state, "llm_user_prompt_missing")
+        assert len(errors) == 1
+        assert "'urgency'" in errors[0].message
+        assert "'tone'" not in errors[0].message
+
+    def test_multi_query_falls_back_to_the_node_level_template(self) -> None:
+        state = self._state_with_llm(
+            {
+                "system_prompt": "You assess support tickets.",
+                "prompt_template": "Assess {{ row.text }}",
+                "queries": {"urgency": {"input_fields": {"text": "text"}}},
+            }
+        )
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    def test_user_uploaded_blob_marker_counts_as_supplied(self) -> None:
+        """ADR-034 lets a user-uploaded prompt artifact back either role as an inline marker mapping.
+
+        Whether the marker is well formed and user-authored is owned by the
+        inline-blob rules; this rule only asks whether the role was supplied.
+        """
+        marker = {"inline_content": {"blob_id": "00000000-0000-0000-0000-000000000001"}}
+        state = self._state_with_llm({"prompt_template": marker, "system_prompt": marker})
+        assert not self._errors(state, "llm_system_prompt_missing")
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    def test_non_llm_transform_is_not_subject_to_the_rule(self) -> None:
+        node = NodeSpec(
+            id="tidy",
+            node_type="transform",
+            plugin="field_mapper",
+            input="rows",
+            on_success="tidied",
+            on_error="discard",
+            options={"mapping": {"id": "id"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(source=None, nodes=(node,), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        codes = {e.error_code for e in state.validate().errors}
+        assert "llm_system_prompt_missing" not in codes
+        assert "llm_user_prompt_missing" not in codes
+
+
 class TestMultiQueryTemplateVariableBindings:
     """Multi-query LLM templates render with ``row`` bound to the query's
     synthetic context (``build_template_context``: input_fields variables plus
@@ -8415,6 +8584,7 @@ class TestSchemaContractValidation:
             "model": "anthropic/claude-sonnet-4.6",
             "endpoint": "https://gateway.example.invalid/v1",
             "api_key": "${LLM_API_KEY}",
+            "system_prompt": "You rewrite headlines. Reply with the rewritten headline only.",
             "prompt_template": "Title-case this: {headline}",
             "response_field": response_field,
             "schema": {"mode": "observed"},
@@ -10328,6 +10498,7 @@ class TestCompositionStateRowUnion:
                 "schema": {"mode": "observed"},
                 "provider": "openrouter",
                 "model": "anthropic/claude-sonnet-4.6",
+                "system_prompt": "You judge each row. Reply with a one-word verdict.",
                 "prompt_template": "Judge this row.",
                 "api_key": "env:OPENROUTER_API_KEY",
                 "response_field": response_field,

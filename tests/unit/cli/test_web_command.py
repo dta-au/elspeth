@@ -257,6 +257,8 @@ class TestComposerUsersCommand:
                 "users",
                 "remove",
                 "alice",
+                "--reason",
+                "left the team",
                 "--data-dir",
                 str(tmp_path),
                 "--auth-db",
@@ -283,6 +285,8 @@ class TestComposerUsersCommand:
                 "users",
                 "remove",
                 "alice",
+                "--reason",
+                "left the team",
                 "--data-dir",
                 str(tmp_path),
                 "--auth-db",
@@ -318,6 +322,33 @@ class TestComposerUsersCommand:
         assert result.exit_code != 0
         assert not auth_db.exists()
 
+    @pytest.mark.parametrize(("reason_args", "exit_code"), [([], 2), (["--reason", "   "], 1)])
+    def test_remove_without_a_reason_is_refused_and_removes_nothing(self, tmp_path: Path, reason_args: list[str], exit_code: int) -> None:
+        """The CLI records the same reason People & access does; neither deletes without one."""
+        auth_db = tmp_path / "auth.db"
+        _cli_add(auth_db=auth_db, data_dir=tmp_path)
+
+        result = runner.invoke(
+            app,
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                *reason_args,
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--yes",
+            ],
+        )
+
+        assert result.exit_code == exit_code
+        with closing(sqlite3.connect(str(auth_db))) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM users WHERE user_id = 'alice'").fetchone() == (1,)
+
     def test_remove_retires_the_identity_so_the_recreated_username_is_fresh(self, tmp_path: Path) -> None:
         """A CLI-deleted username must not hand its admission to its next holder.
 
@@ -346,7 +377,20 @@ class TestComposerUsersCommand:
 
         result = runner.invoke(
             app,
-            ["--no-dotenv", "composer", "users", "remove", "alice", "--data-dir", str(tmp_path), "--auth-db", str(auth_db), "--yes"],
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                "--reason",
+                "left the team",
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--yes",
+            ],
         )
         assert result.exit_code == 0, result.output
         assert _auth_user_row(auth_db, "alice") is None
@@ -395,6 +439,8 @@ class TestComposerUsersCommand:
                 "users",
                 "remove",
                 "alice",
+                "--reason",
+                "left the team",
                 "--data-dir",
                 str(tmp_path),
                 "--auth-db",
@@ -427,7 +473,20 @@ class TestComposerUsersCommand:
 
         result = runner.invoke(
             app,
-            ["--no-dotenv", "composer", "users", "remove", "alice", "--data-dir", str(tmp_path), "--auth-db", str(auth_db), "--yes"],
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                "--reason",
+                "left the team",
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--yes",
+            ],
         )
 
         assert result.exit_code == 1
@@ -452,7 +511,20 @@ class TestComposerUsersBootstrapAdmin:
 
         result = runner.invoke(
             app,
-            ["--no-dotenv", "composer", "users", "remove", "alice", "--data-dir", str(tmp_path), "--auth-db", str(auth_db), "--yes"],
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                "--reason",
+                "left the team",
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--yes",
+            ],
         )
 
         assert result.exit_code == 1, result.output

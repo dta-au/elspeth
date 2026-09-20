@@ -98,6 +98,7 @@ def _document_abstract_pipeline(session_id: str) -> dict[str, object]:
                 "options": {
                     "schema": {"mode": "observed"},
                     "profile": "task-role",
+                    "system_prompt": "You write abstracts of documents. Reply with the abstract only.",
                     "prompt_template": "Write an abstract of {{ row.document_content }}",
                     "required_input_fields": ["document_content"],
                     "response_field": "abstract",

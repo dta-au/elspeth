@@ -11,7 +11,7 @@ import { RelationshipsEditor } from "./RelationshipsEditor";
 import { RolesEditor } from "./RolesEditor";
 import { SignInSection } from "./SignInSection";
 import { ROLE_LABEL, formatInstant } from "./peopleFormat";
-import { useCancelToTrigger, usePeoplePanel, useSubview } from "./peoplePanel";
+import { useCancelToTrigger, useCopiedReset, usePeoplePanel, useSubview } from "./peoplePanel";
 
 type Tab = "roles" | "approvers" | "usage";
 const TAB_LABEL: Record<Tab, string> = { roles: "Roles", approvers: "Approvers", usage: "Usage & limits" };
@@ -21,7 +21,6 @@ interface Props {
   personKey: string;
   /** The record the directory already holds, shown at once while the direct read runs. */
   initial: PersonRecord | null;
-  activeAdminCount: number | null;
   quotasEnabled: boolean;
   onCredential: (credential: GeneratedCredential) => void;
   /** This person's record changed, or (with `to`) access was set up and their key moved: refresh the directory too. */
@@ -84,6 +83,7 @@ function SetUpAccess({ person, onDone }: { person: LocalAccountPerson; onDone: (
 
 function CopyId({ value }: { value: string }): JSX.Element {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+  useCopiedReset(state === "copied", () => setState("idle"));
   return (
     <>
       <code className="people-wrap">{value}</code>{" "}
@@ -94,7 +94,7 @@ function CopyId({ value }: { value: string }): JSX.Element {
 }
 
 /** Everything about one person. Bound to a stable key, never to a row position. */
-export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabled, onCredential, onPersonChanged, onGone }: Props): JSX.Element {
+export function PersonDetail({ personKey, initial, quotasEnabled, onCredential, onPersonChanged, onGone }: Props): JSX.Element {
   const { guardLeave } = usePeoplePanel();
   const [person, setPerson] = useState<PersonRecord | null>(initial?.key === personKey ? initial : null);
   const [load, setLoad] = useState<Load>({ status: "loading" });
@@ -137,7 +137,15 @@ export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabl
 
   useEffect(() => { headingRef.current?.focus(); }, [personKey]);
 
-  const notifyChanged = useCallback(() => onPersonChanged(personKey), [onPersonChanged, personKey]);
+  // A role write can change what the person record says (granting a second
+  // administrator ends "the only active administrator"), so it re-reads this
+  // person as well as telling the directory. Best effort and silent: the role
+  // editor has already reported its own write, the flag is advisory, and the
+  // next open reads it again.
+  const notifyChanged = useCallback(() => {
+    onPersonChanged(personKey);
+    read().catch(() => undefined);
+  }, [onPersonChanged, personKey, read]);
 
   const reloadPerson = useCallback(async () => {
     await read();
@@ -185,12 +193,17 @@ export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabl
             <section aria-label={`Access for ${name}`} className="people-section"><p>Access is managed by an access administrator. You can manage this person's local sign-in account below.</p></section>
           )}
           <h4>Sign-in</h4>
-          <SignInSection personName={name} providerLabel="local" account={person.local_account} identityRetired={null} canManage={person.actions.manage_credentials} isSelf={person.actions.is_self} onCredential={onCredential} onChanged={reloadPerson} onGone={() => onGone(`The local account for ${name} is deleted.`)} />
+          <SignInSection personName={name} provider="local" account={person.local_account} identityRetired={null} canManage={person.actions.manage_credentials} isSelf={person.actions.is_self} onCredential={onCredential} onChanged={reloadPerson} onGone={() => onGone(`The local account for ${name} is deleted.`)} />
         </>
       ) : (
         <>
           <h4>Access</h4>
-          <AccessSection person={person} personName={name} soleAdministrator={activeAdminCount === 1} onChanged={reloadPerson} />
+          <AccessSection person={person} personName={name} onChanged={reloadPerson} />
+
+          {/* The two fixed sections sit together; the tabs end the page. With
+              Sign-in below the tabs it moved every time the tab height changed. */}
+          <h4>Sign-in</h4>
+          <SignInSection personName={name} provider={person.identity.provider} account={person.local_account} identityRetired={person.retired} canManage={person.actions.manage_credentials} isSelf={person.actions.is_self} onCredential={onCredential} onChanged={reloadPerson} onGone={() => onGone("That person is no longer available to you.")} />
 
           {!person.retired && (
             <>
@@ -214,9 +227,6 @@ export function PersonDetail({ personKey, initial, activeAdminCount, quotasEnabl
               </div>
             </>
           )}
-
-          <h4>Sign-in</h4>
-          <SignInSection personName={name} providerLabel={person.identity.provider} account={person.local_account} identityRetired={person.retired} canManage={person.actions.manage_credentials} isSelf={person.actions.is_self} onCredential={onCredential} onChanged={reloadPerson} onGone={() => onGone("That person is no longer available to you.")} />
 
           <details className="people-advanced">
             <summary>Advanced details</summary>

@@ -142,7 +142,7 @@ export async function expectPrimaryControlsInViewport(
   composer: ComposerPage,
   capabilities: WorkspaceControlCapabilities,
 ): Promise<void> {
-  for (const name of ["Graph", "Spec", "YAML", "Run"] as const) {
+  for (const name of ["Workflow", "Spec", "YAML", "Run"] as const) {
     await expectControlReachable(composer.artifactTab(name));
   }
   // The Checks tab replaced the action-bar status chips; it is present in

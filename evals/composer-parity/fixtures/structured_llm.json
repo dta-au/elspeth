@@ -20,6 +20,7 @@
           "profile": "task-role",
           "temperature": 0.0,
           "required_input_fields": ["color_name", "hex"],
+          "system_prompt": "You assess how blue a colour appears. Reply only with the requested structured fields.",
           "prompt_template": "Assess the perceptible amount of blue in the colour {{ row.color_name }} ({{ row.hex }}).",
           "queries": {
             "blue": {

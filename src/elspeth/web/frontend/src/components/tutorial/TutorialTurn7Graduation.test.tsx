@@ -364,7 +364,7 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
   // The copy must name a surface that EXISTS and that renders the record
   // (elspeth-4f69b267dd). Ruling D2 (2026-09-20): that surface is the Graph
   // tab's Approvals table — Checks shows only a count row.
-  it("both variants point at the Graph tab's Approvals table — never Checks, a nonexistent 'Audit page' or the retired Audit drawer", () => {
+  it("both variants point at the pipeline's Approvals tab — never Checks, a nonexistent 'Audit page' or the retired Audit drawer", () => {
     const { unmount } = render(
       <TutorialTurn7Graduation
         sessionId="sess-new"
@@ -373,7 +373,7 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       />,
     );
     expect(
-      screen.getByText(/the Approvals table on your pipeline's Graph tab/),
+      screen.getByText(/on your pipeline's Approvals tab/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Checks tab/)).toBeNull();
     expect(screen.queryByText(/Audit page/)).toBeNull();
@@ -388,7 +388,7 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       />,
     );
     expect(
-      screen.getByText(/the Approvals table on each pipeline's Graph tab/),
+      screen.getByText(/on each pipeline's Approvals tab/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Checks tab/)).toBeNull();
     expect(screen.queryByText(/Audit page/)).toBeNull();

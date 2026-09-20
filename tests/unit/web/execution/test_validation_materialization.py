@@ -22,7 +22,6 @@ from elspeth.web.execution._validation_materialization import (
     validate_llm_base_url_policy,
     validate_llm_retry_budget_policy,
     validate_llm_tracing_policy,
-    validate_managed_identity_policy,
 )
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
@@ -246,7 +245,7 @@ def test_provider_pass_through_retains_detached_materialized_semantic_evidence()
     )
     assert isinstance(materialization, PhaseReport)
 
-    provider_report = validate_managed_identity_policy(materialization.artifact)
+    provider_report = validate_llm_retry_budget_policy(materialization.artifact)
     assert isinstance(provider_report, PhaseReport)
     interpretation.authored.semantic_contracts[0].outcome = "conflict"
 
@@ -448,19 +447,6 @@ def test_materialization_rejects_non_dict_yaml_as_an_uncaught_invariant() -> Non
 @pytest.mark.parametrize(
     ("phase_name", "policy_state", "check_name", "error_code"),
     [
-        (
-            "managed",
-            _state(
-                nodes=(
-                    _node(
-                        plugin="rag_retrieval",
-                        options={"provider": "azure_search", "provider_config": {"use_managed_identity": True}},
-                    ),
-                )
-            ),
-            "managed_identity_policy",
-            None,
-        ),
         ("retry", _state(nodes=(_node(plugin="llm", options={"queries": [{}]}),)), "llm_retry_budget_policy", None),
         (
             "base_url",
@@ -491,9 +477,7 @@ def test_provider_policy_phases_read_authored_policy_and_preserve_failure_eviden
 ) -> None:
     artifact = _materialized(policy_state, materialized_state=_state())
     snapshot = _web_snapshot()
-    if phase_name == "managed":
-        result = validate_managed_identity_policy(artifact)
-    elif phase_name == "retry":
+    if phase_name == "retry":
         result = validate_llm_retry_budget_policy(artifact)
     elif phase_name == "base_url":
         result = validate_llm_base_url_policy(artifact)
@@ -516,7 +500,6 @@ def test_provider_policy_phases_read_authored_policy_and_preserve_failure_eviden
 @pytest.mark.parametrize(
     ("phase_name", "check_name"),
     [
-        ("managed", "managed_identity_policy"),
         ("retry", "llm_retry_budget_policy"),
         ("base_url", "llm_base_url_policy"),
         ("tracing", "llm_tracing_policy"),
@@ -527,9 +510,7 @@ def test_provider_policy_phases_read_authored_policy_and_preserve_failure_eviden
 def test_provider_policy_successes_detach_materialized_semantic_evidence(phase_name: str, check_name: str) -> None:
     artifact = _materialized(_state())
     snapshot = _web_snapshot()
-    if phase_name == "managed":
-        result = validate_managed_identity_policy(artifact)
-    elif phase_name == "retry":
+    if phase_name == "retry":
         result = validate_llm_retry_budget_policy(artifact)
     elif phase_name == "base_url":
         result = validate_llm_base_url_policy(artifact)
@@ -577,14 +558,11 @@ def test_s3_source_policy_accepts_profile_lowered_source_evidence() -> None:
 # Node-kind widening of the materialization-phase gates
 # (elspeth-df8082552d, sites a / a2 / a3).
 #
-# All three pre-filtered to ``node_type == "transform"``. Two distinct
-# shapes, and only one of them is latent:
+# These pre-filtered to ``node_type == "transform"``. The option-shaped
+# managed-identity gate that shared the defect is gone: Azure AI Search is
+# reached only through an operator profile, and that requirement's own
+# node-kind sweep lives in ``tests/unit/web/plugin_policy/test_validation.py``.
 #
-#   - ``validate_managed_identity_policy`` is OPTION-shaped (it reads
-#     ``options["provider"]`` / ``options["provider_config"]`` and never the
-#     plugin name), so ``node_type`` was its ONLY limiter. Measured before
-#     the fix, with a transform control: transform FIRES, aggregation and
-#     collector SILENT.
 #   - ``_llm_policy_components`` feeds the base-URL and tracing egress gates.
 #     Its collector half is unreachable for today's builtin ``llm`` (which is
 #     not batch-aware), but the helper must keep node-kind and capability
@@ -593,11 +571,6 @@ def test_s3_source_policy_accepts_profile_lowered_source_evidence() -> None:
 #     subject tests for alternate plugin names live in
 #     ``test_llm_capability_security_gates.py`` (elspeth-c7626ae109).
 # ---------------------------------------------------------------------------
-
-_MANAGED_IDENTITY_OPTIONS: dict[str, object] = {
-    "provider": "azure_search",
-    "provider_config": {"use_managed_identity": True},
-}
 
 
 def _kind_node(node_type: str, *, plugin: str, options: dict[str, object]) -> NodeSpec:
@@ -616,31 +589,6 @@ def _kind_node(node_type: str, *, plugin: str, options: dict[str, object]) -> No
         policy=None,
         merge=None,
     )
-
-
-@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
-def test_managed_identity_gate_fires_on_every_plugin_bearing_node_kind(node_type: str) -> None:
-    """Credential-egress gate. ``transform`` is the control."""
-    plugin = "rag_retrieval" if node_type == "transform" else "batch_stats"
-    state = _state(nodes=(_kind_node(node_type, plugin=plugin, options=_MANAGED_IDENTITY_OPTIONS),))
-
-    result = validate_managed_identity_policy(_materialized(state))
-
-    assert isinstance(result, PhaseFailure)
-    assert result.failed_check.name == "managed_identity_policy"
-    assert result.errors[0].component_id == "n1"
-    assert node_type in result.failed_check.detail.lower()
-
-
-def test_managed_identity_gate_skips_plugin_less_structural_nodes() -> None:
-    """Subject set is ``node.plugin is not None``. A gate's options are inert
-    — nothing resolves a plugin for it, so nothing can act on the value.
-    """
-    gate_node = _kind_node("gate", plugin=cast(Any, None), options=_MANAGED_IDENTITY_OPTIONS)
-
-    result = validate_managed_identity_policy(_materialized(_state(nodes=(gate_node,))))
-
-    assert isinstance(result, PhaseReport)
 
 
 @pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])

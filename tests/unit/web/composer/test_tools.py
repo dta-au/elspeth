@@ -8703,20 +8703,6 @@ class TestTransformProviderConfigPathSecurity:
             "query_field": "text",
         }
 
-    @staticmethod
-    def _azure_search_managed_identity_options() -> dict[str, Any]:
-        return {
-            "provider": "azure_search",
-            "provider_config": {
-                "endpoint": "https://tenant-b.search.windows.net",
-                "index": "payroll",
-                "use_managed_identity": True,
-            },
-            "schema": {"mode": "observed"},
-            "output_prefix": "rag_",
-            "query_field": "text",
-        }
-
     def test_helper_rejects_persist_directory_outside_allowed(self) -> None:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_path
 
@@ -8796,45 +8782,62 @@ class TestTransformProviderConfigPathSecurity:
         )
         assert error is None
 
-    def test_helper_rejects_azure_search_managed_identity(self) -> None:
-        from elspeth.web.composer.tools._common import _validate_transform_provider_config_policy
+    @staticmethod
+    def _azure_ai_search_managed_identity_node(*, input_name: str, on_success: str) -> dict[str, Any]:
+        return {
+            "id": "rag",
+            "node_type": "transform",
+            "plugin": "azure_ai_search",
+            "input": input_name,
+            "on_success": on_success,
+            "on_error": "discard",
+            "options": {
+                "endpoint": "https://tenant-b.search.windows.net",
+                "index": "payroll",
+                "use_managed_identity": True,
+                "schema": {"mode": "observed"},
+                "output_prefix": "rag_",
+                "query_field": "text",
+            },
+        }
 
-        error = _validate_transform_provider_config_policy(self._azure_search_managed_identity_options())
-        assert error is not None
-        assert "managed identity" in error.lower()
+    @staticmethod
+    def _azure_ai_search_without_a_profile() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+        # What build_plugin_snapshot records for an operator-profiled plugin with no usable alias.
+        catalog = _mock_catalog()
+        catalog.list_transforms.return_value = [
+            *catalog.list_transforms.return_value,
+            PluginSummary(
+                name="azure_ai_search",
+                description="Azure AI Search RAG retrieval transform",
+                plugin_type="transform",
+                config_fields=[],
+            ),
+        ]
+        return _restricted_policy_pair(
+            catalog,
+            PluginId("transform", "azure_ai_search"),
+            PluginUnavailableReason.PROFILE_UNAVAILABLE,
+        )
 
-    def test_helper_rejects_string_true_managed_identity(self) -> None:
-        from elspeth.web.composer.tools._common import _validate_transform_provider_config_policy
-
-        options = self._azure_search_managed_identity_options()
-        options["provider_config"]["use_managed_identity"] = "true"
-
-        error = _validate_transform_provider_config_policy(options)
-        assert error is not None
-        assert "managed identity" in error.lower()
-
-    def test_upsert_node_rejects_azure_search_managed_identity(self) -> None:
+    def test_upsert_node_rejects_raw_azure_ai_search_managed_identity(self) -> None:
         state = _empty_state()
-        catalog = self._catalog_with_rag()
+        view, snapshot = self._azure_ai_search_without_a_profile()
         result = execute_tool(
             "upsert_node",
-            {
-                "id": "rag",
-                "node_type": "transform",
-                "plugin": "rag_retrieval",
-                "input": "rows",
-                "on_success": "retrieved",
-                "on_error": "discard",
-                "options": self._azure_search_managed_identity_options(),
-            },
+            self._azure_ai_search_managed_identity_node(input_name="rows", on_success="retrieved"),
             state,
-            catalog,
+            view,
             data_dir="/data",
+            plugin_snapshot=snapshot,
         )
         assert result.success is False
-        assert "managed identity" in result.validation.errors[0].message.lower()
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
-    def test_patch_node_options_rejects_azure_search_managed_identity(self) -> None:
+    def test_patch_node_options_cannot_repoint_rag_retrieval_at_azure_search(self) -> None:
+        # rag_retrieval used to reach Azure through provider="azure_search"; that arm is gone,
+        # so a patch can no longer move an admitted Chroma node onto the server's identity.
         state = _empty_state()
         catalog = self._catalog_with_rag()
         created = execute_tool(
@@ -8873,11 +8876,12 @@ class TestTransformProviderConfigPathSecurity:
         )
 
         assert result.success is False
-        assert "managed identity" in result.validation.errors[0].message.lower()
+        assert result.updated_state is created.updated_state
+        assert "provider: Input should be 'chroma'" in result.validation.errors[0].message
 
-    def test_set_pipeline_rejects_azure_search_managed_identity(self) -> None:
+    def test_set_pipeline_rejects_raw_azure_ai_search_managed_identity(self) -> None:
         state = _empty_state()
-        catalog = self._catalog_with_rag()
+        view, snapshot = self._azure_ai_search_without_a_profile()
         args = {
             "source": {
                 "plugin": "csv",
@@ -8885,17 +8889,7 @@ class TestTransformProviderConfigPathSecurity:
                 "options": {"path": "/data/blobs/test-session/in.csv", "schema": {"mode": "observed"}},
                 "on_validation_failure": "quarantine",
             },
-            "nodes": [
-                {
-                    "id": "rag",
-                    "node_type": "transform",
-                    "plugin": "rag_retrieval",
-                    "input": "source_out",
-                    "on_success": "main",
-                    "on_error": "discard",
-                    "options": self._azure_search_managed_identity_options(),
-                }
-            ],
+            "nodes": [self._azure_ai_search_managed_identity_node(input_name="source_out", on_success="main")],
             "edges": [{"id": "e1", "from_node": "source", "to_node": "rag", "edge_type": "on_success", "label": None}],
             "outputs": [
                 {
@@ -8910,20 +8904,167 @@ class TestTransformProviderConfigPathSecurity:
                 }
             ],
         }
-        result = execute_tool("set_pipeline", args, state, catalog, data_dir="/data")
+        result = execute_tool("set_pipeline", args, state, view, data_dir="/data", plugin_snapshot=snapshot)
         assert result.success is False
-        assert "managed identity" in result.validation.errors[0].message.lower()
+        assert result.updated_state is state
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
-    def test_helper_allows_azure_search_api_key(self) -> None:
-        from elspeth.web.composer.tools._common import _validate_transform_provider_config_policy
+    @staticmethod
+    def _azure_ai_search_profiled_view() -> PolicyCatalogView:
+        """A REAL policy view: production snapshot builder, real registry, one managed-identity profile."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+        from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 
-        options = self._azure_search_managed_identity_options()
-        options["provider_config"] = {
-            "endpoint": "https://tenant-a.search.windows.net",
-            "index": "docs",
-            "api_key": "test-key",
+        class _NoSecrets:
+            def has_server_ref(self, name: str) -> bool:
+                return False
+
+            def has_user_ref(self, principal: str, name: str) -> bool:
+                return False
+
+            def has_ref(self, principal: str, name: str) -> bool:
+                return False
+
+            def server_generation(self, name: str) -> str | None:
+                return None
+
+            def user_generation(self, principal: str, name: str) -> str | None:
+                return None
+
+        settings = WebSettings.model_validate(
+            {
+                "composer_max_composition_turns": 4,
+                "composer_max_discovery_turns": 4,
+                "composer_timeout_seconds": 60,
+                "composer_rate_limit_per_minute": 20,
+                "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+                "plugin_allowlist": ["source:csv", "sink:csv", "transform:azure_ai_search"],
+                "azure_search_profiles": [
+                    {
+                        "alias": "policies",
+                        "endpoint": "https://operator-private-marker.search.windows.net",
+                        "auth": "managed_identity",
+                        "indexes": ["approved-documents"],
+                    }
+                ],
+            }
+        )
+        runtime = RuntimeWebPluginConfig.from_settings(settings)
+        policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+        catalog = create_catalog_service()
+        snapshot = build_plugin_snapshot(
+            policy=policy,
+            catalog=catalog,
+            profiles=profiles,
+            principal_scope="local:test-user",
+            secret_inventory=_NoSecrets(),
+            generation_key=b"azure-search-tool-layer-proof",
+        )
+        return PolicyCatalogView(catalog, snapshot, profiles)
+
+    @staticmethod
+    def _profiled_azure_ai_search_node(**extra: Any) -> dict[str, Any]:
+        return {
+            "id": "rag",
+            "node_type": "transform",
+            "plugin": "azure_ai_search",
+            "input": "rows",
+            "on_success": "retrieved",
+            "on_error": "discard",
+            "options": {
+                "profile": "policies",
+                "index": "approved-documents",
+                "query_field": "text",
+                "output_prefix": "rag",
+                "schema": {"mode": "observed"},
+                **extra,
+            },
         }
-        assert _validate_transform_provider_config_policy(options) is None
+
+    def test_upsert_node_admits_a_profiled_azure_ai_search_node(self) -> None:
+        """Control for the refusals below: the same call without a private option succeeds."""
+        view = self._azure_ai_search_profiled_view()
+        result = execute_tool(
+            "upsert_node", self._profiled_azure_ai_search_node(), _empty_state(), view, data_dir="/data", plugin_snapshot=view.snapshot
+        )
+
+        assert result.success is True
+        stored = dict(result.updated_state.nodes[0].options)
+        assert stored["profile"] == "policies"
+        assert "endpoint" not in stored
+        assert "use_managed_identity" not in stored
+
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("endpoint", "https://evil.example.com"),
+            ("use_managed_identity", True),
+            ("client_id", "11111111-2222-3333-4444-555555555555"),
+            ("api_key", "stolen"),
+            ("api_version", "2020-06-30"),
+        ],
+    )
+    def test_upsert_node_refuses_a_private_option_beside_a_profile(self, option: str, value: object) -> None:
+        from elspeth.contracts.azure_ai_search import AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
+
+        assert option in AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
+        view = self._azure_ai_search_profiled_view()
+        state = _empty_state()
+
+        result = execute_tool(
+            "upsert_node",
+            self._profiled_azure_ai_search_node(**{option: value}),
+            state,
+            view,
+            data_dir="/data",
+            plugin_snapshot=view.snapshot,
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        rendered = " ".join(entry.message for entry in result.validation.errors)
+        assert option in rendered
+        assert "evil.example.com" not in rendered
+        assert "stolen" not in rendered
+
+    def test_the_private_option_cases_above_cover_the_whole_private_set(self) -> None:
+        from elspeth.contracts.azure_ai_search import AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
+
+        assert (
+            frozenset({"endpoint", "use_managed_identity", "client_id", "api_key", "api_version"})
+            == AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
+        )
+
+    def test_upsert_node_refuses_a_raw_azure_ai_search_node_when_a_profile_exists(self) -> None:
+        view = self._azure_ai_search_profiled_view()
+        state = _empty_state()
+        node = self._azure_ai_search_managed_identity_node(input_name="rows", on_success="retrieved")
+
+        result = execute_tool("upsert_node", node, state, view, data_dir="/data", plugin_snapshot=view.snapshot)
+
+        assert result.success is False
+        assert result.updated_state is state
+
+    def test_patch_node_options_cannot_add_a_private_option_to_a_profiled_node(self) -> None:
+        view = self._azure_ai_search_profiled_view()
+        created = execute_tool(
+            "upsert_node", self._profiled_azure_ai_search_node(), _empty_state(), view, data_dir="/data", plugin_snapshot=view.snapshot
+        )
+        assert created.success is True
+
+        result = execute_tool(
+            "patch_node_options",
+            {"node_id": "rag", "patch": {"endpoint": "https://evil.example.com"}},
+            created.updated_state,
+            view,
+            data_dir="/data",
+            plugin_snapshot=view.snapshot,
+        )
+
+        assert result.success is False
+        assert result.updated_state is created.updated_state
 
     def test_upsert_node_rejects_persist_directory_outside_allowed(self) -> None:
         state = _empty_state()

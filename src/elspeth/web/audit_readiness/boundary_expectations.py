@@ -223,6 +223,7 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "passthrough": Determinism.DETERMINISTIC,
     "pdf_rasterize": Determinism.IO_READ,
     "rag_retrieval": Determinism.EXTERNAL_CALL,
+    "azure_ai_search": Determinism.EXTERNAL_CALL,
     # DETERMINISTIC, not IO_READ: reference_join's table is materialized into its
     # config at load, so the transform opens nothing at row time.
     "reference_join": Determinism.DETERMINISTIC,

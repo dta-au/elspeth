@@ -1506,9 +1506,7 @@ def build_set_pipeline_candidate(
             # private budget and make every web-authored multi-query LLM node
             # uncommittable, so it is skipped for profiled nodes.
             #
-            # Skipping the whole policy (which also covers the RAG
-            # ``web_rag_provider_config_policy_error`` base_url/managed-identity
-            # egress checks) is safe here: the public operator-profile schema is
+            # Skipping the whole policy is safe here: the public operator-profile schema is
             # ``additionalProperties: false`` (see ``_LLMProfileResolver.public_schema``),
             # so a profiled node's authored options CANNOT carry ``base_url`` /
             # ``provider`` / ``endpoint`` at all, and ``_prevalidate_transform_for_context``

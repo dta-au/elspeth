@@ -262,7 +262,7 @@ class TestDiscoverAllPlugins:
 
         # Expected counts verified during migration from hookimpl files
         EXPECTED_SOURCE_COUNT = 9  # Seven original sources plus llm plus blob_rows (elspeth-0c6a343921)
-        EXPECTED_TRANSFORM_COUNT = 37  # Existing 34 plus reference_join, blob_json_expand and blob_text_expand
+        EXPECTED_TRANSFORM_COUNT = 38  # Existing 34 plus reference_join, blob_json_expand, blob_text_expand and azure_ai_search
         EXPECTED_SINK_COUNT = 9  # csv, json, text, document, database, aws_s3, azure_blob, dataverse, chroma_sink
 
         discovered = discover_all_plugins()
@@ -297,7 +297,7 @@ class TestDiscoverAllPlugins:
         pb09 = next(leg for leg in catalog["legs"] if leg["id"] == "PB-09")
         catalog_keys = {case["plugin_key"] for case in pb09["required_cases"]}
 
-        assert len(live_keys) == 55
+        assert len(live_keys) == 56
         assert live_keys == golden_keys == catalog_keys
 
         dataverse_modes = get_args(DataverseAuthConfig.model_fields["method"].annotation)
@@ -307,11 +307,9 @@ class TestDiscoverAllPlugins:
             "source:llm": set(LLMSource.discriminated_variants()[1]),
             "transform:aws_textract_document_analysis": set(get_args(TextractAuthMode)),
             "transform:aws_textract_inline_analysis": set(get_args(TextractAuthMode)),
+            "transform:azure_ai_search": {mode.replace("_", "-") for mode in get_args(AzureSearchAuthMode)},
             "transform:llm": set(LLMTransform.discriminated_variants()[1]),
-            "transform:rag_retrieval": {
-                *(f"azure-search-{mode.replace('_', '-')}" for mode in get_args(AzureSearchAuthMode)),
-                *(f"chroma-{mode}" for mode in get_args(ChromaSearchMode)),
-            },
+            "transform:rag_retrieval": {f"chroma-{mode}" for mode in get_args(ChromaSearchMode)},
             "sink:azure_blob": set(get_args(AzureAuthMethod)),
             "sink:chroma_sink": set(get_args(ChromaConnectionMode)),
             "sink:dataverse": set(dataverse_modes),

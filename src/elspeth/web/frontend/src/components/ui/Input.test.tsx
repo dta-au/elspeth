@@ -32,6 +32,21 @@ describe("Input", () => {
     expect(screen.getByText("absolute path")).toHaveClass("field-hint");
   });
 
+  it("announces the hint, merged after any describedby the caller already set", () => {
+    render(<><p id="scope">Scope</p><Input label="Search" hint="Name or email." aria-describedby="scope" /></>);
+    const input = screen.getByLabelText("Search");
+    const ids = (input.getAttribute("aria-describedby") ?? "").split(" ");
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).toBe("scope");
+    expect(document.getElementById(ids[1])).toHaveTextContent("Name or email.");
+    expect(input).toHaveAccessibleDescription("Scope Name or email.");
+  });
+
+  it("sets no describedby when there is neither a hint nor a caller value", () => {
+    render(<Input label="Plain" />);
+    expect(screen.getByLabelText("Plain")).not.toHaveAttribute("aria-describedby");
+  });
+
   it("applies .input-mono when mono is set", () => {
     const { container } = render(<Input mono />);
     expect(container.querySelector("input")).toHaveClass("input-mono");

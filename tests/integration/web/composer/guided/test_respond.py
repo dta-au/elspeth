@@ -291,6 +291,14 @@ def _full_guided_session(body: dict) -> dict:
     return body["composition_state"]["composer_meta"]["guided_session"]
 
 
+_LLM_REVIEW_SYSTEM_PROMPT = "You summarise data rows. Reply with the summary only."
+
+
+def _llm_prompt_review_draft(prompt: str) -> str:
+    """The review draft for a node carrying both prompt roles: one two-section surface."""
+    return f"System prompt:\n{_LLM_REVIEW_SYSTEM_PROMPT}\n\nPrompt template:\n{prompt}"
+
+
 def _llm_prompt_template_planner(
     prompt: str,
     *,
@@ -355,6 +363,7 @@ def _llm_prompt_template_planner(
                     "options": {
                         "schema": {"mode": "observed"},
                         "profile": "task-role",
+                        "system_prompt": _LLM_REVIEW_SYSTEM_PROMPT,
                         "prompt_template": prompt,
                         "response_field": node_response_field,
                         "interpretation_requirements": [
@@ -363,7 +372,7 @@ def _llm_prompt_template_planner(
                                 "kind": "llm_prompt_template",
                                 "user_term": f"llm_prompt_template:{node_id}",
                                 "status": "pending",
-                                "draft": prompt,
+                                "draft": _llm_prompt_review_draft(prompt),
                             }
                         ],
                     },
@@ -2717,7 +2726,7 @@ class TestStep2IntraStep:
         # The prompt review requirement follows the live prompt, so the
         # post-commit review sees the revised instruction, never the stale one.
         (requirement,) = selected_after.options["interpretation_requirements"]
-        assert requirement["draft"] == revised_prompt
+        assert requirement["draft"] == _llm_prompt_review_draft(revised_prompt)
         assert requirement["status"] == "pending"
 
     def test_substituted_unchanged_planner_cannot_supersede_predecessor(
@@ -5765,7 +5774,7 @@ class TestStep2IntraStep:
         assert len(prompt_events) == 1, [(event.affected_node_id, str(event.kind), event.user_term) for event in events]
         event = prompt_events[0]
         assert event.kind is not None and event.kind.value == "llm_prompt_template"
-        assert event.llm_draft == prompt
+        assert event.llm_draft == _llm_prompt_review_draft(prompt)
         # Bound to the accepted durable state — the writer boundary validated
         # the node against that state's persisted nodes JSON.
         current = asyncio.run(session_service.get_current_state(UUID(session_id)))
@@ -5851,7 +5860,7 @@ class TestStep2IntraStep:
         assert len(prompt_events) == 1, [(event.affected_node_id, str(event.kind), event.user_term) for event in events]
         event = prompt_events[0]
         assert event.kind is not None and event.kind.value == "llm_prompt_template"
-        assert event.llm_draft == prompt
+        assert event.llm_draft == _llm_prompt_review_draft(prompt)
         current = asyncio.run(session_service.get_current_state(UUID(session_id)))
         assert current is not None
         assert str(event.composition_state_id) == str(current.id)
@@ -7263,6 +7272,7 @@ class TestStep2IntraStep:
                         "options": {
                             "schema": {"mode": "observed"},
                             "profile": "task-role",
+                            "system_prompt": _LLM_REVIEW_SYSTEM_PROMPT,
                             "prompt_template": prompt,
                             "response_field": "summary",
                         },

@@ -437,6 +437,17 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "downstream consumer sets input to the coalesce id. Do not author "
     "on_success on a coalesce unless it routes directly to a sink.",
     "Give each branch transform its own output field (an llm node's response_field) so the union merge carries every branch's result on one row.",
+    # Session 60ab6a67: this exemplar modelled llm branches with a user prompt
+    # only, and a planner asked for an A/B of two prompts cloned it key for
+    # key — both arms shipped with no system prompt.
+    "Every llm node carries BOTH prompt roles: options.system_prompt (the "
+    "model's role and task constraints) and options.prompt_template (the row "
+    "data and the requested reply). Validation rejects an llm node missing "
+    "either. When the user supplies only one role, keep theirs verbatim and "
+    "author the other from the task, or ask. Arms that differ only in role or "
+    "persona keep the SAME prompt_template and vary system_prompt — which is "
+    "itself a reason to fork: system_prompt is shared by every query on a "
+    "node, so a per-arm system prompt cannot be expressed as multi_query.",
     "Do not author interpretation_requirements rows for llm_prompt_template "
     "or llm_model_choice — required LLM reviews auto-stage on every llm "
     "node. Author rows only for the planner-owned kinds (vague_term wired "
@@ -2246,6 +2257,7 @@ def fork_coalesce_exemplar_args(
         node_id: str,
         branch: str,
         response_field: str,
+        system_prompt: str,
         question: str,
         *,
         prompt_template_parts: list[dict[str, Any]] | None = None,
@@ -2253,6 +2265,12 @@ def fork_coalesce_exemplar_args(
     ) -> _ExemplarNode:
         options: dict[str, Any] = {
             "profile": profile_alias,
+            # BOTH prompt roles, on every llm node. This exemplar once modelled
+            # a user prompt only; session 60ab6a67 (an A/B of two prompts)
+            # cloned it key for key and shipped both arms with no system
+            # prompt. The role and reply constraints live here; the row data
+            # and the question live in prompt_template.
+            "system_prompt": system_prompt,
             "prompt_template": question,
             "required_input_fields": ["ticket_id", "body"],
             "response_field": response_field,
@@ -2292,12 +2310,14 @@ def fork_coalesce_exemplar_args(
                 "assess_sentiment",
                 "branch_a",
                 "sentiment",
+                "You assess the sentiment of customer support tickets. Reply with one short phrase and nothing else.",
                 "What is the sentiment of support ticket {{ row.ticket_id }}: {{ row.body }}? Reply with one short phrase.",
             ),
             _branch_llm(
                 "assess_urgency",
                 "branch_b",
                 "urgency",
+                "You triage customer support tickets by urgency. Reply with the single category word and nothing else.",
                 # Authored CLASSIFICATION semantics: the category set is the
                 # planner's invention, so the vague_term review is staged and
                 # wired below — the review-staging pattern in miniature.

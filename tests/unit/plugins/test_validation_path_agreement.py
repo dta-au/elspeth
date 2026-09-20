@@ -381,6 +381,22 @@ _TRANSFORM_REJECTION_CASES = [
         "output_field.*collides",
         id="blob_text_expand-output-field-blob-ref-collision",
     ),
+    # ── azure_ai_search ──────────────────────────────────────────────────
+    pytest.param(
+        "azure_ai_search",
+        {
+            "schema": _make_observed_schema(),
+            "output_prefix": "policy",
+            "query_field": "question",
+            "endpoint": "https://matrix.search.windows.net",
+            "index": "approved-documents",
+            "api_key": "k",
+            "field_content": "chunk",
+            "select": ["title"],  # omits the mapped content and id fields
+        },
+        "select must include",
+        id="azure_ai_search-select-omits-mapped-fields",
+    ),
     # ── pdf_rasterize ────────────────────────────────────────────────────
     pytest.param(
         "pdf_rasterize",

@@ -14,7 +14,6 @@ type Action = "approve" | "enable" | "disable";
 interface Props {
   person: IdentityPerson;
   personName: string;
-  soleAdministrator: boolean;
   /** Re-read the person. The panel keeps showing them even when their new state no longer matches the list filter. */
   onChanged: () => Promise<void>;
 }
@@ -22,7 +21,7 @@ interface Props {
 const STATE_LABEL = { pending: "Pending access", active: "Active", disabled: "Disabled" } as const;
 
 /** Status always visible; one reversible action at a time, confirmed inline with the person named. */
-export function AccessSection({ person, personName, soleAdministrator, onChanged }: Props): JSX.Element {
+export function AccessSection({ person, personName, onChanged }: Props): JSX.Element {
   const { identity } = person;
   const [action, setAction] = useState<Action | null>(null);
   const [text, setText] = useState("");
@@ -67,7 +66,9 @@ export function AccessSection({ person, personName, soleAdministrator, onChanged
         )}
       </div>
       {selfBlocked && <p className="people-grant-purpose">You cannot disable your own access. Another administrator can do it.</p>}
-      {available === "disable" && !selfBlocked && soleAdministrator && <p className="people-grant-purpose">If {personName} is the only active administrator, disabling them is refused. Add another administrator first.</p>}
+      {/* Said on the one person it is about, as a fact (the server names the
+          sole administrator per person) — not as "if" on everyone. */}
+      {available === "disable" && !selfBlocked && person.sole_active_admin && <p className="people-grant-purpose">{personName} is the only active administrator, so disabling them is refused. Add another administrator first.</p>}
       <MutationNoticeView mutation={mutation} />
 
       {action !== null && (
@@ -82,7 +83,7 @@ export function AccessSection({ person, personName, soleAdministrator, onChanged
               : [() => admin.disableIdentity(id, value), `Disabled access for ${personName}.`, "Access was not disabled"] as const;
           void mutation.run(write, done, failed).then((ok) => { if (ok) close(); });
         }}>
-          <h4>{buttonLabel[action]} for {personName}?</h4>
+          <h5>{buttonLabel[action]} for {personName}?</h5>
           {action === "approve" && (
             <>
               {returning && (

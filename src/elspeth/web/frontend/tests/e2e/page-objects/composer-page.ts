@@ -61,7 +61,7 @@ export class ComposerPage {
     return this.page.getByRole("region", { name: "Pipeline artifact" });
   }
 
-  artifactTab(name: "Graph" | "Spec" | "YAML" | "Run"): Locator {
+  artifactTab(name: "Workflow" | "Approvals" | "Spec" | "YAML" | "Run"): Locator {
     return this.page.getByRole("tab", { name, exact: true });
   }
 
@@ -113,7 +113,7 @@ export class ComposerPage {
   }
 
   focusGraph(): Locator {
-    return this.page.getByRole("button", { name: "Focus graph" });
+    return this.page.getByRole("button", { name: "Fullscreen" });
   }
 
   runPipeline(): Locator {

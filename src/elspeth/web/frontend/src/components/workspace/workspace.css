@@ -330,6 +330,14 @@
   padding: var(--space-md);
 }
 
+/* Approvals tab: the Workflow tab's approvals table (.graph-detail-table
+   supplies the table rules) sitting inside the audit-panel card, so it drops
+   the disclosure's own top rule and paper fill. */
+.approvals-view-table {
+  border-top: 0;
+  background: transparent;
+}
+
 .artifact-workspace-panel[hidden] {
   display: none;
 }

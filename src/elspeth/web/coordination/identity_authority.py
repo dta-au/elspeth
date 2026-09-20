@@ -1468,6 +1468,19 @@ class RepositoryIdentityAuthority:
             rows = conn.execute(_ADMIN_HOLDER_ROWS).all()
         return _active_human_admin_count(rows, now)
 
+    def active_human_admin_ids(self) -> frozenset[str]:
+        """R5's population BY IDENTITY: who the active human administrators are, not only how many.
+
+        A surface that knows only the count must warn about the last
+        administrator on every person it shows. One read, one clock, the same
+        population ``count_active_human_admins`` counts. Advisory for display:
+        the mutations decide R5 for themselves, under their own lock.
+        """
+        with self._engine.connect() as conn:
+            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            rows = conn.execute(_ADMIN_HOLDER_ROWS).all()
+        return frozenset(row.identity_id for row in rows if _is_active(row.expires_at, row.revoked_at, now))
+
     def configured_admin_seed_consumed(self) -> bool:
         """Retained human admin grants permanently consume configured seeding."""
         with self._engine.connect() as conn:
@@ -3226,32 +3239,65 @@ class RepositoryIdentityAuthority:
             return outcome
 
 
+_LOCAL_DELETION_REASON_PREFIX: Final = "local credential deleted: "
+
+LOCAL_DELETION_REASON_MAX_LENGTH: Final = 480
+"""The longest reason a deleting surface may hand the retirer.
+
+The recorded reason is the fixed prefix plus this text, and the auth audit
+trail bounds a text field at 512 characters (``MAX_AUTH_AUDIT_TEXT_LENGTH``,
+which this package cannot import: ``web.auth`` depends on it, not the
+reverse). A test holds the sum under that bound, so the administrator's words
+are never the part ``_bounded_text`` cuts off.
+"""
+
+
 def local_identity_retirer(
     authority: RepositoryIdentityAuthority,
     record: Callable[[IdentityRetired], None],
-) -> Callable[[str, Callable[[], bool], Callable[[], None]], bool]:
+) -> Callable[[str, str, Callable[[], bool], Callable[[], None]], bool]:
     """The ONE retirement collaborator for a deleted local credential.
 
     Every surface that deletes a local credential -- the web app's provider
     and the ``elspeth composer users remove`` command -- takes its
     ``retire_identity`` collaborator from here, so the provider, subject and
-    reason are decided in exactly one place (elspeth-9c171c00fa).  ``record``
+    reason are decided in exactly one place (elspeth-9c171c00fa).  A surface
+    supplies the words of the person deleting the account -- deleting must
+    cost what disabling costs, a stated reason -- and this function, not the
+    surface, composes what is recorded from them: the cause stays a fixed,
+    searchable prefix and the surface cannot record a bare string of its own.
+    ``record``
     is the surface's audit sink for the retirement, invoked inside the
     authority's transaction; a surface that audits nothing passes an explicit
     no-op and owns that decision.  No surface chooses whether the last active
     human administrator is protected: see ``retire_identity``.
 
-    The returned callable takes the username, the caller's credential probe
-    and its credential deletion, and answers whether an identity was retired.
+    The returned callable takes the username, the deleting person's reason,
+    the caller's credential probe and its credential deletion, and answers
+    whether an identity was retired. A blank or over-long reason is the
+    surface's bug (each validates at its own boundary), so it raises before
+    either store is touched.
     """
     if type(authority) is not RepositoryIdentityAuthority:
         raise TypeError("authority must be an exact RepositoryIdentityAuthority")
 
-    def retire(username: str, credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
+    def retire(
+        username: str,
+        operator_reason: str,
+        credential_exists: Callable[[], bool],
+        delete_credential: Callable[[], None],
+    ) -> bool:
+        if type(operator_reason) is not str:
+            raise TypeError("operator_reason must be a str")
+        stated = operator_reason.strip()
+        if not stated:
+            raise ValueError("operator_reason must state why the account is being deleted")
+        if len(stated) > LOCAL_DELETION_REASON_MAX_LENGTH:
+            raise ValueError(f"operator_reason must be at most {LOCAL_DELETION_REASON_MAX_LENGTH} characters")
         retired = authority.retire_identity(
             provider="local",
             subject=username,
-            reason="local credential deleted",
+            reason=f"{_LOCAL_DELETION_REASON_PREFIX}{stated}",
             record=record,
             credential_exists=credential_exists,
             delete_credential=delete_credential,

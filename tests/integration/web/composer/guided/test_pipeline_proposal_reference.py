@@ -1116,6 +1116,7 @@ def _profile_bound_pipeline() -> dict[str, object]:
                 "options": {
                     "schema": {"mode": "observed"},
                     "profile": "task-role",
+                    "system_prompt": "You summarise data rows. Reply with one short sentence only.",
                     "prompt_template": "Summarise this row in one short sentence.",
                     "response_field": "summary",
                 },

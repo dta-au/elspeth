@@ -1183,7 +1183,10 @@ def _authoring_valid_pipeline_dict() -> dict:
                 input="input",
                 on_success="out",
                 on_error="discard",
-                options={"prompt_template": "Rate how {{interpretation:cool}} this is."},
+                options={
+                    "system_prompt": "You rate items against the user's criterion. Reply with a score from 1 to 5.",
+                    "prompt_template": "Rate how {{interpretation:cool}} this is.",
+                },
                 condition=None,
                 routes=None,
                 fork_to=None,
@@ -1848,7 +1851,10 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         catalog=create_catalog_service(),
     )
 
+    system_prompt = "You summarise web pages. Reply with a short summary only."
     prompt_template = "Summarize {{ row.page_text }}."
+    # A node carrying both roles is reviewed as one two-section prompt surface.
+    review_draft = f"System prompt:\n{system_prompt}\n\nPrompt template:\n{prompt_template}"
     user_term = "llm_prompt_template:llm1"
     state = CompositionState(
         source=SourceSpec(
@@ -1870,6 +1876,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
                 on_error="discard",
                 options={
                     "profile": "tutorial",
+                    "system_prompt": system_prompt,
                     "prompt_template": prompt_template,
                     "required_input_fields": ["page_text"],
                     "response_field": "summary",
@@ -1880,7 +1887,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
                             "kind": InterpretationKind.LLM_PROMPT_TEMPLATE.value,
                             "user_term": user_term,
                             "status": "pending",
-                            "draft": prompt_template,
+                            "draft": review_draft,
                             "event_id": None,
                             "accepted_value": None,
                             "accepted_artifact_hash": None,
@@ -1962,7 +1969,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
             tool_call_id="call_profiled_prompt_template",
             user_term=user_term,
             kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-            llm_draft=prompt_template,
+            llm_draft=review_draft,
             model_identifier="composer-model",
             model_version="composer-model",
             provider="openrouter",
@@ -1990,7 +1997,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
             tool_call_id="call_profiled_prompt_template_opt_out",
             user_term=user_term,
             kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-            llm_draft=prompt_template,
+            llm_draft=review_draft,
             model_identifier="composer-model",
             model_version="composer-model",
             provider="openrouter",

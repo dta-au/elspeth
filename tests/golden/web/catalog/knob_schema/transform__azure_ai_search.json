@@ -1,0 +1,300 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Required Input Fields",
+        "name": "required_input_fields",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Prefix used for fields emitted by retrieval, such as contexts and scores.",
+        "kind": "text",
+        "label": "Output Prefix",
+        "name": "output_prefix",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "description": "Input row field containing the retrieval query text.",
+        "kind": "text",
+        "label": "Query Field",
+        "name": "query_field",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional template used to build the retrieval query from row fields.",
+        "kind": "text",
+        "label": "Query Template",
+        "name": "query_template",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional regular expression used to extract the retrieval query from query_field.",
+        "kind": "text",
+        "label": "Query Pattern",
+        "name": "query_pattern",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 5,
+        "description": "Maximum number of matching documents to return for each query.",
+        "kind": "number-int",
+        "label": "Top K",
+        "name": "top_k",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 0.0,
+        "description": "Minimum relevance score required for a retrieved document.",
+        "kind": "number-float",
+        "label": "Min Score",
+        "name": "min_score",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "quarantine",
+        "description": "Behavior when no retrieval results satisfy the score threshold.",
+        "enum": [
+          "quarantine",
+          "continue"
+        ],
+        "kind": "enum",
+        "label": "On No Results",
+        "name": "on_no_results",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "numbered",
+        "description": "Formatting style used when combining retrieved contexts into output text.",
+        "enum": [
+          "numbered",
+          "separated",
+          "raw"
+        ],
+        "kind": "enum",
+        "label": "Context Format",
+        "name": "context_format",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "\n---\n",
+        "description": "Separator inserted between retrieved contexts when applicable.",
+        "kind": "text",
+        "label": "Context Separator",
+        "name": "context_separator",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional maximum character length for the combined context output.",
+        "kind": "number-int",
+        "label": "Max Context Length",
+        "name": "max_context_length",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Azure AI Search service URL, https://<service>.search.windows.net.",
+        "kind": "text",
+        "label": "Endpoint",
+        "name": "endpoint",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "description": "Name of the existing index to query.",
+        "kind": "text",
+        "label": "Index",
+        "name": "index",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Query key. Mutually exclusive with use_managed_identity.",
+        "kind": "text",
+        "label": "API Key",
+        "name": "api_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Authenticate with the host's managed identity.",
+        "kind": "checkbox",
+        "label": "Use Managed Identity",
+        "name": "use_managed_identity",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Client id of a user-assigned managed identity.",
+        "kind": "text",
+        "label": "Client ID",
+        "name": "client_id",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "2024-07-01",
+        "description": "Azure AI Search REST API version.",
+        "kind": "text",
+        "label": "API Version",
+        "name": "api_version",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "hybrid",
+        "description": "vector and hybrid need an integrated vectorizer on field_vector; semantic needs semantic_config.",
+        "enum": [
+          "vector",
+          "keyword",
+          "hybrid",
+          "semantic"
+        ],
+        "kind": "enum",
+        "label": "Search Mode",
+        "name": "search_mode",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 30.0,
+        "description": "Per-request timeout in seconds.",
+        "kind": "number-float",
+        "label": "Request Timeout",
+        "name": "request_timeout",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "contentVector",
+        "description": "Index vector field queried by vector and hybrid modes.",
+        "kind": "text",
+        "label": "Field Vector",
+        "name": "field_vector",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Semantic configuration name, required for semantic mode.",
+        "kind": "text",
+        "label": "Semantic",
+        "name": "semantic_config",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "content",
+        "description": "Retrievable index string field holding the chunk text.",
+        "kind": "text",
+        "label": "Field Content",
+        "name": "field_content",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "id",
+        "description": "Retrievable index key field.",
+        "kind": "text",
+        "label": "Field ID",
+        "name": "field_id",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional index field emitted as source_name citation metadata.",
+        "kind": "text",
+        "label": "Field Title",
+        "name": "field_title",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional index field emitted as source_link citation metadata.",
+        "kind": "text",
+        "label": "Field URL",
+        "name": "field_url",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fields to return; must include every mapped field.",
+        "kind": "json-value",
+        "label": "Select",
+        "name": "select",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Literal OData $filter sent with every query.",
+        "kind": "text",
+        "label": "Filter",
+        "name": "filter",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      }
+    ]
+  },
+  "plugin_kind": "transform",
+  "plugin_name": "azure_ai_search"
+}

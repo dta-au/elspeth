@@ -2207,6 +2207,7 @@ async def test_wire_confirm_commit_preserves_accepted_proposal_transform_nodes(
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                    "system_prompt": "You summarise web pages. Reply with a short summary only.",
                     "prompt_template": "Summarise {{ row.page_content }}",
                     "required_input_fields": ["page_content"],
                 },

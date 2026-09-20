@@ -415,6 +415,74 @@ Between the two, the list column holds at its 260px minimum. Confirm live,
 then either raise the breakpoint or switch the pane collapse to a container
 query on the dialog.
 
+## Status (2026-09-21)
+
+Implemented on local `release/0.8.1` in two commits: the composer half
+(L1–L12) and the People & access half (P1–P8), each with tests that pin the
+fix.
+
+Deliberately not done, per this plan's own sequencing:
+
+- **L8, the value clamp and the default-open policy.** Both scroll wrappers
+  are keyboard-focusable and named. Clamping long approved values and choosing
+  one default-open policy still wait for the live look (short laptop viewport,
+  one long prompt approval); `GraphView.test.tsx` pins today's policy
+  (Approvals closed, Routing open).
+- **P9.** Inferred from the stylesheet; needs a served build of
+  `release/0.8.1` before the breakpoint or a container query is chosen.
+- **The live pass** (L3/L6 visually, P5 focus containment, which jsdom cannot
+  enforce). Partly done; see the 02:55 update below.
+
+**Update, 2026-09-21 02:55 AEST — gate, deploy and a browser-driven pass.**
+
+- Full-suite gate PASS at `793d0f95a`: ruff exit 0, pytest exit 0 (54561
+  passed, 61 skipped, 2 xfailed), `frozen=yes`.
+- Frontend rebuilt and `elspeth-web.service` restarted; the served bundle went
+  `index-BWHaANf9.js` → `index-DiiDGqdX.js`. The service had been up since
+  `721ea0cfe`, so the restart also deployed the People & access panel. No
+  session-schema change was in that range.
+- Driven through the page as the DTA test account: tutorial reset → graduation (session
+  `66b548ac`; the L1 copy and the L7/L10 tables seen live), a two-prompt A/B
+  fork/coalesce (`60ab6a67`), a threshold gate to two sinks (`c9e1d1dd`), and an
+  uploaded-file filter with a follow-up edit (`cfe8b516`). All outputs correct.
+  P6's provider labels and Type filter seen in People & access.
+- Not seen live: L3's Optional/Apply and L5's "Ask the composer about this" (no
+  suggestion or blocker arose), P5's `inert`, P1's reason form (nothing was
+  mutated). L8's clamp and P9 are now unblocked, not done.
+- Observed, not diagnosed: a console 409 on `/validate?state_id=` after a
+  freeform approval click (twice; the flow was unaffected); a system note saying
+  "one choice" with three cards pending; "The LLM invented this source data" on
+  rows the user pasted; the tutorial audit step reporting 4 LLM calls for 3 rows.
+- Follow-up from John during the pass: the Routing table labelled a sink row
+  `Output:`; it now reads `Sink:`, matching the canonical node names the other
+  rows already used.
+
+Found while implementing, and fixed:
+
+- A fifth raw-provider-token site for P6: the server's `PersonLabel.detail`
+  was formatted `"sam.lee · oidc"`. It now carries `provider` as data and the
+  panel names it from the one map (`PROVIDER_LABEL`, in `api/people.ts` beside
+  `personDisambiguator`, which needs it — not `peopleFormat.ts`).
+- P2 moved the warning off a list-level count that every directory refresh
+  renewed, so a role write now re-reads the open person as well as notifying
+  the directory.
+- P1 needed no schema change: `identities.disable_reason` is an unbounded
+  nullable `String` with no CHECK on it (measured), so the testcontainer
+  selection was not owed. The reason is bounded at 480 characters so that the
+  fixed prefix plus the administrator's words fits the audit trail's 512.
+- P2's new authority read shifted 48 line pins in
+  `tests/unit/architecture/test_session_db_mutation_authority.py` by +13 with
+  every fingerprint unchanged; re-pinned mechanically and proved with the
+  gate's own drift function.
+
+Open, for John:
+
+- `IdentityRetired` still names no actor, so the deletion reason is audited
+  without its author (see P1). Not widened here.
+- No CHANGELOG line was written; which release these belong to is not an
+  inference from the checkout. `elspeth composer users remove` now REQUIRES
+  `--reason`, which is operator-visible.
+
 ## Suggested order
 
 1. L3, L4, L10, L12, P6, P8 — small and independent.

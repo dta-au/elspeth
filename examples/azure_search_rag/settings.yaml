@@ -1,0 +1,66 @@
+# RAG retrieval against an existing Azure AI Search index.
+#
+# Requires AZURE_SEARCH_ENDPOINT, AZURE_SEARCH_INDEX and AZURE_SEARCH_API_KEY.
+# See README.md for the index shape this expects and the managed-identity form.
+sources:
+  primary:
+    plugin: csv
+    on_success: rag_in
+    options:
+      path: examples/azure_search_rag/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'question: str'
+      on_validation_failure: discard
+
+transforms:
+- name: rag_0
+  plugin: azure_ai_search
+  input: rag_in
+  on_success: output
+  on_error: quarantine
+  options:
+    query_field: question
+    output_prefix: policy
+    endpoint: ${AZURE_SEARCH_ENDPOINT}
+    index: ${AZURE_SEARCH_INDEX}
+    api_key: ${AZURE_SEARCH_API_KEY}
+    search_mode: hybrid
+    # Index field names of an index built by the portal "Import and vectorize data" wizard.
+    field_content: chunk
+    field_id: chunk_id
+    field_title: title
+    field_vector: text_vector
+    select: [chunk, chunk_id, title]
+    top_k: 3
+    min_score: 0.0
+    on_no_results: continue
+    context_format: numbered
+    schema:
+      mode: flexible
+      fields:
+      - 'id: int'
+      - 'question: str'
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/azure_search_rag/output/results.jsonl
+      schema:
+        mode: observed
+      format: jsonl
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/azure_search_rag/output/quarantined.jsonl
+      schema:
+        mode: observed
+      format: jsonl
+
+landscape:
+  url: sqlite:///examples/azure_search_rag/runs/audit.db

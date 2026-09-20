@@ -194,16 +194,27 @@ describe("People & access journeys", () => {
     expect(new Date(sent.expires_at as string).getTime()).toBe(new Date(local).getTime());
   });
 
-  it("drops the single-administrator warning once a role write makes a second administrator", async () => {
-    let admins = 1;
-    vi.mocked(people.listPeople).mockImplementation(() => Promise.resolve(page(roster, BOTH, { active_human_admin_count: admins })));
-    vi.mocked(admin.grantRole).mockImplementation(() => { admins = 2; return Promise.resolve(roleView({ role: "admin" })); });
+  it("warns about the sole administrator on that person only, and stops once a second administrator exists", async () => {
+    const soleJane = identityPerson({}, { sole_active_admin: true });
+    serve([soleJane, sam]);
+    vi.mocked(admin.grantRole).mockImplementation(() => {
+      // The server's next read of Jane says she is no longer the only one.
+      roster = [identityPerson(), sam];
+      return Promise.resolve(roleView({ role: "admin" }));
+    });
     await openPerson(/Jane Doe/);
-    expect(screen.getByText(/one active human administrator/)).toBeInTheDocument();
+    expect(await screen.findByText(/Jane Doe is the only active administrator, so disabling them is refused/)).toBeInTheDocument();
     await userEvent.click(await screen.findByRole("button", { name: "Add role" }));
     await userEvent.selectOptions(screen.getByLabelText("Role"), "admin");
     await userEvent.click(screen.getByRole("button", { name: "Grant role" }));
-    await waitFor(() => expect(screen.queryByText(/one active human administrator/)).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText(/is the only active administrator/)).not.toBeInTheDocument());
+  });
+
+  it("does not warn about the sole administrator on anyone else", async () => {
+    serve([identityPerson({}, { sole_active_admin: true }), sam]);
+    await openPerson(/Sam Lee/);
+    await screen.findByRole("button", { name: "Disable access" });
+    expect(screen.queryByText(/is the only active administrator/)).toBeNull();
   });
 
   it("explains a combination the server will refuse, and restricts a service account's roles", async () => {
@@ -235,7 +246,7 @@ describe("People & access journeys", () => {
     expect(screen.queryByRole("textbox", { name: /identity id/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Assign approver" })).toBeDisabled();
     await userEvent.type(screen.getByLabelText("Approver"), "sam");
-    const result = await screen.findByRole("button", { name: /Sam Lee sam\.lee · oidc/ });
+    const result = await screen.findByRole("button", { name: /Sam Lee sam\.lee · OpenID Connect/ });
     // The picker searched the server, for active people, not the loaded page.
     expect(vi.mocked(people.listPeople).mock.lastCall?.[0]).toMatchObject({ q: "sam", status: "active", type: "people" });
     await userEvent.click(result);
@@ -253,8 +264,8 @@ describe("People & access journeys", () => {
       { relationship_id: "r2", from_identity_id: "jane-id", to_identity_id: "sam-id", relationship_type: "approver", asserted_by_identity_id: "root-id", asserted_at: "2026-09-02T00:00:00Z", effective_from: null, effective_until: null, note: null, revoked_at: null, revoked_by_identity_id: null },
     ] });
     vi.mocked(people.fetchPersonLabels).mockResolvedValue([
-      { identity_id: "boss-id", label: "Pat Boss", detail: "pboss · oidc", kind: "human", access_state: "active", retired: false },
-      { identity_id: "sam-id", label: "Sam Lee", detail: "sam.lee · oidc", kind: "human", access_state: "active", retired: false },
+      { identity_id: "boss-id", label: "Pat Boss", detail: "pboss", provider: "oidc", kind: "human", access_state: "active", retired: false },
+      { identity_id: "sam-id", label: "Sam Lee", detail: "sam.lee", provider: "oidc", kind: "human", access_state: "active", retired: false },
     ]);
     await openPerson(/Jane Doe/);
     await userEvent.click(await screen.findByRole("tab", { name: "Approvers" }));
@@ -292,6 +303,35 @@ describe("People & access journeys", () => {
     expect(form).toHaveTextContent("The identity is retired. Its history is kept");
     expect(form).toHaveTextContent("does not receive this person's roles, limits or history");
     expect(client.deleteAdminUser).not.toHaveBeenCalled();
+    // Deleting costs what disabling costs: a stated reason (ruling D3).
+    const confirmDelete = screen.getByRole("button", { name: "Delete local account" });
+    expect(confirmDelete).toBeDisabled();
+    await userEvent.type(screen.getByLabelText("Reason (required)"), "   ");
+    expect(confirmDelete).toBeDisabled();
+    await userEvent.type(screen.getByLabelText("Reason (required)"), "left the team");
+    vi.mocked(client.deleteAdminUser).mockResolvedValue(undefined);
+    await userEvent.click(confirmDelete);
+    expect(client.deleteAdminUser).toHaveBeenCalledExactlyOnceWith("jane.doe", "left the team");
+  });
+
+  it("keeps the two fixed sections together above the tabs, with confirmations one heading level down", async () => {
+    const linked = identityPerson({}, { local_account: { username: "jane.doe", display_name: "Jane Doe", email: null, email_verified: false }, actions: { manage_access: true, manage_credentials: true, set_up_access: false, is_self: false } });
+    serve([linked]);
+    await openPerson(/Jane Doe/);
+    const signIn = await screen.findByRole("heading", { level: 4, name: "Sign-in" });
+    const tablist = screen.getByRole("tablist");
+    expect(screen.getByRole("heading", { level: 4, name: "Access" }).compareDocumentPosition(signIn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(signIn.compareDocumentPosition(tablist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Disable access" }));
+    expect(screen.getByRole("heading", { level: 5, name: "Disable access for Jane Doe?" })).toBeInTheDocument();
+  });
+
+  it("names sign-in methods in words everywhere, and leaves service accounts to the Type filter", async () => {
+    await openPerson(/Sam Lee/);
+    const method = screen.getByLabelText("Sign-in method");
+    expect(within(method).getAllByRole("option").map((option) => option.textContent)).toEqual(["All", "Local account", "OpenID Connect", "Microsoft Entra ID", "VANguard", "Google"]);
+    expect(await screen.findByText(/Sam Lee signs in through OpenID Connect\./)).toBeInTheDocument();
+    expect(screen.queryByText(/signs in through oidc/)).toBeNull();
   });
 
   it("shows the server's last-administrator refusal for a deletion and changes nothing", async () => {
@@ -300,6 +340,7 @@ describe("People & access journeys", () => {
     vi.mocked(client.deleteAdminUser).mockRejectedValue(refusal(409, "the last active human administrator cannot be removed"));
     await openPerson(/Jane Doe/);
     await userEvent.click(await screen.findByRole("button", { name: "Delete local account for Jane Doe" }));
+    await userEvent.type(screen.getByLabelText("Reason (required)"), "left the team");
     await userEvent.click(screen.getByRole("button", { name: "Delete local account" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("last active human administrator");
     expect(screen.getByRole("heading", { name: "Jane Doe" })).toBeInTheDocument();

@@ -253,7 +253,7 @@ describe("ProposePipelineTurn", () => {
         />,
       );
       expect(container.querySelector(".guided-readonly-graph")).toBeNull();
-      expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+      expect(screen.getByText("The proposed structure is drawn in the Workflow tab.")).toBeVisible();
 
       await user.click(screen.getByRole("button", { name: "Show graph" }));
       expect(received).toEqual([
@@ -273,7 +273,7 @@ describe("ProposePipelineTurn", () => {
       />,
     );
 
-    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.getByText("The proposed structure is drawn in the Workflow tab.")).toBeVisible();
     expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
     expect(container.querySelector(".guided-readonly-graph")).toBeNull();
     expect(screen.getByText("2 sources · 4 nodes · 13 routes · 2 outputs")).toBeVisible();
@@ -452,7 +452,7 @@ describe("ProposePipelineTurn", () => {
     // Not detail-level gated: a decision input, not technical detail.
     expect(screen.getByText(/Step 1: consider/).closest("details")).toBeNull();
     expect(screen.queryByText(/Step 12: consider/)).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Show full prompt for node-1" }));
+    await user.click(screen.getByRole("button", { name: "Show full user prompt for node-1" }));
     expect(screen.getByText(/Step 12: consider the passage carefully\./)).toBeVisible();
   });
 
@@ -942,7 +942,7 @@ describe("ProposePipelineTurn", () => {
         isTutorial
       />,
     );
-    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.getByText("The proposed structure is drawn in the Workflow tab.")).toBeVisible();
     expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
     expect(screen.getByText("source-1 · CSV")).toBeVisible();
     expect(screen.getByText(/press Review wiring to continue/i)).toBeVisible();
@@ -986,7 +986,7 @@ describe("ProposePipelineTurn", () => {
       />,
     );
     expect(payload().supersedes_draft_hash).toBeNull();
-    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.getByText("The proposed structure is drawn in the Workflow tab.")).toBeVisible();
     expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     // Off-script affordances stay withheld for the passive learner.

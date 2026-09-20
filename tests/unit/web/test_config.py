@@ -1930,6 +1930,60 @@ def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch
     assert settings.operator_metrics_bearer_token.get_secret_value() == "operator-metrics-token-from-environment-0001"
 
 
+_REQUIRED_ENV_FOR_RATE_LIMIT_TESTS = {
+    "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "30",
+    "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+    "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "20.0",
+    "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+}
+
+
+def test_settings_from_env_reads_execution_rate_limit_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operator's run rate-limit block must be settable from the environment.
+
+    A composition cannot carry ``rate_limit``, so this is the only place a web
+    deployment can raise the engine's 60 calls/minute default. ``WebSettings``
+    is loaded by a hand-rolled env reader: a nested-model field that is not
+    registered as a JSON object reaches pydantic as a raw string and crash-loops
+    the service at startup.
+    """
+    from elspeth.web.config import settings_from_env
+
+    for key, value in _REQUIRED_ENV_FOR_RATE_LIMIT_TESTS.items():
+        monkeypatch.setenv(key, value)
+
+    assert settings_from_env().execution_rate_limit.get_service_config("openrouter").requests_per_minute == 60
+
+    monkeypatch.setenv("ELSPETH_WEB__EXECUTION_RATE_LIMIT", '{"services":{"openrouter":{"requests_per_minute":60000}}}')
+    configured = settings_from_env().execution_rate_limit
+
+    assert configured.get_service_config("openrouter").requests_per_minute == 60000
+    assert configured.get_service_config("bedrock").requests_per_minute == 60
+
+
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        pytest.param("not json", RuntimeError, id="not-json"),
+        pytest.param("[1, 2]", RuntimeError, id="array-not-object"),
+        pytest.param('{"default_requests_per_minute": 0}', ValidationError, id="zero-rate"),
+        pytest.param('{"bogus": 1}', ValidationError, id="unknown-key"),
+    ],
+)
+def test_settings_from_env_rejects_malformed_execution_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, raw: str, error: type[Exception]
+) -> None:
+    from elspeth.web.config import settings_from_env
+
+    for key, value in _REQUIRED_ENV_FOR_RATE_LIMIT_TESTS.items():
+        monkeypatch.setenv(key, value)
+    assert settings_from_env().execution_rate_limit.default_requests_per_minute == 60
+
+    monkeypatch.setenv("ELSPETH_WEB__EXECUTION_RATE_LIMIT", raw)
+    with pytest.raises(error):
+        settings_from_env()
+
+
 def test_settings_from_env_derives_deployment_region_only_from_ambient_aws_region(monkeypatch: pytest.MonkeyPatch) -> None:
     import base64
 
@@ -2028,6 +2082,72 @@ def test_settings_from_env_rejects_invalid_textract_profiles_without_echoing_pri
 
     assert "AWS_TEXTRACT_PROFILES" in str(exc_info.value).upper()
     assert private_bucket not in str(exc_info.value)
+
+
+@pytest.mark.usefixtures("required_web_env")
+def test_settings_from_env_parses_azure_search_profiles_without_repr_leaking_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_endpoint = "https://operator-private-marker.search.windows.net"
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AZURE_SEARCH_PROFILES",
+        json.dumps(
+            [
+                {
+                    "alias": "policies",
+                    "endpoint": private_endpoint,
+                    "auth": "managed_identity",
+                    "indexes": ["approved-documents"],
+                }
+            ]
+        ),
+    )
+
+    settings = web_config.settings_from_env()
+
+    assert settings.azure_search_profiles[0].alias == "policies"
+    assert settings.azure_search_profiles[0].endpoint == private_endpoint
+    assert settings.azure_search_profiles[0].indexes == ("approved-documents",)
+    assert "operator-private-marker" not in repr(settings.azure_search_profiles[0])
+
+
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        pytest.param(
+            [
+                {
+                    "alias": "policies",
+                    "endpoint": "https://operator-private-marker.search.windows.net",
+                    "auth": "managed_identity",
+                    "indexes": "any",
+                },
+                {
+                    "alias": "policies",
+                    "endpoint": "https://operator-private-marker.search.windows.net",
+                    "auth": "managed_identity",
+                    "indexes": "any",
+                },
+            ],
+            id="duplicate-alias",
+        ),
+        pytest.param(
+            [{"alias": "policies", "endpoint": "https://operator-private-marker.search.windows.net", "auth": "managed_identity"}],
+            id="index-pin-absent",
+        ),
+    ],
+)
+def test_settings_from_env_rejects_invalid_azure_search_profiles_without_echoing_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    profiles: list[dict[str, object]],
+) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__AZURE_SEARCH_PROFILES", json.dumps(profiles))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_config.settings_from_env()
+
+    assert "AZURE_SEARCH_PROFILES" in str(exc_info.value).upper()
+    assert "operator-private-marker" not in str(exc_info.value)
 
 
 def test_settings_from_env_rejects_duplicate_s3_profile_aliases_without_echoing_private_binding(

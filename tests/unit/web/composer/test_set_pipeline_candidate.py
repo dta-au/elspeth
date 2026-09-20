@@ -1179,6 +1179,7 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                    "system_prompt": "You summarise web pages. Reply with a short summary only.",
                     "prompt_template": "Summarise {{ row.page_content }}",
                     "required_input_fields": ["page_content"],
                     "interpretation_requirements": [_short_form_shield_review()],
@@ -1693,6 +1694,7 @@ def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
                 "deployment_name": "candidate-test",
                 "endpoint": "https://candidate-test.openai.azure.com",
                 "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
+                "system_prompt": "You classify text by colour. Reply in the requested structure only.",
                 "prompt_template": "Classify {{ row.text }}",
                 "required_input_fields": ["text"],
                 # Multi-query execution must use the pooled path so capacity
@@ -1739,6 +1741,7 @@ def _secret_bearing_structured_fork_coalesce_args(tmp_path: Path) -> dict[str, A
             "deployment_name": "candidate-test",
             "endpoint": "https://candidate-test.openai.azure.com",
             "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
+            "system_prompt": "You classify text by colour. Reply in the requested structure only.",
             "prompt_template": "Classify {{ row.text }}",
             "required_input_fields": ["text"],
             "pool_size": 2,
@@ -1823,7 +1826,12 @@ _EXPECTED_STATE_HASHES = {
     # node-level in-use status) instead of the node-level prompt_template alone
     # (session 94f6f00c). Control: swapping that one draft back to the
     # prompt_template text reproduces the previous pin exactly.
-    "structured_llm": "55dd9ee642bcc414e77a6801e83be943f92cfbf1913eff06ba102a6ce9a13143",
+    # Re-pinned 2026-09-21: the fixture's llm node gained a system_prompt
+    # (Stage-1 llm_system_prompt_missing makes both prompt roles mandatory),
+    # which changes the node options and the staged review draft with them.
+    # Control: the same fixture without the system_prompt, on the tree without
+    # the rule, reproduces the previous pin 55dd9ee6… exactly.
+    "structured_llm": "41792a2289fccefe64c8e91a8709d3504ea67ba6acce4d0690ae1c056d6ff145",
     "multi_output": "a8e0698429a06efa22423ebc37033b585f1b6cdc225eb2501b4d69ee6b67ad8a",
 }
 
@@ -2703,6 +2711,7 @@ def _ab_multi_query_args(tmp_path: Path) -> dict[str, Any]:
                     "profile": "sonnet",
                     "schema": {"mode": "observed"},
                     "required_input_fields": ["color_name", "hex"],
+                    "system_prompt": "You assess colours for designers. Reply with JSON only.",
                     "prompt_template": "Assess the colour {{ row.input_1 }} ({{ row.input_2 }}).",
                     "queries": {
                         "tone": {

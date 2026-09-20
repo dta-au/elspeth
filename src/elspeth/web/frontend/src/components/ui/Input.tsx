@@ -64,6 +64,13 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
 ) {
   const generatedId = useId();
   const inputId = id ?? generatedId;
+  // A hint that is not referenced is never announced: a screen-reader user
+  // gets the label and nothing else. Merged with the caller's own
+  // aria-describedby, which comes first so its reading order is unchanged.
+  const hintId = `${inputId}-hint`;
+  const describedBy = hint
+    ? [rest["aria-describedby"], hintId].filter(Boolean).join(" ")
+    : rest["aria-describedby"];
   const nonText =
     rest.type !== undefined && NON_TEXT_INPUT_TYPES.has(rest.type);
   const cls = [
@@ -74,7 +81,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
     .filter(Boolean)
     .join(" ");
   const control = (
-    <input ref={ref} id={inputId} className={cls || undefined} {...rest} />
+    <input ref={ref} id={inputId} className={cls || undefined} {...rest} aria-describedby={describedBy} />
   );
   if (!label && !hint) return control;
   return (
@@ -85,7 +92,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
         </label>
       ) : null}
       {control}
-      {hint ? <div className="field-hint">{hint}</div> : null}
+      {hint ? <div id={hintId} className="field-hint">{hint}</div> : null}
     </div>
   );
 });

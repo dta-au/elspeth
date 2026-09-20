@@ -48,7 +48,7 @@ const BLOB_REF_FRIENDLY_LABEL = "Uploaded sample data";
 // visible text). Anything not listed falls back to titleCaseLabel(key), the
 // frontend's single title-casing implementation (elspeth-d2de348437).
 export const OPTION_LABELS: Readonly<Record<string, string>> = {
-  prompt_template: "Prompt",
+  prompt_template: "User prompt",
   system_prompt: "System prompt",
   profile: "Model profile",
   model: "Model",
@@ -132,6 +132,86 @@ function OptionDl({ rows }: { rows: Record<string, unknown> }): JSX.Element {
   );
 }
 
+// Every llm step carries BOTH prompt roles, and the box always shows both,
+// system first — present or not. The generic rows below are key-driven, so a
+// step authored with a user prompt only used to render a lone prompt row with
+// no sign a role was missing (session 60ab6a67). The not-set sentences are the
+// reader-facing twin of Stage-1's llm_system_prompt_missing /
+// llm_user_prompt_missing rejections.
+const LLM_PROMPT_ROLE_KEYS: readonly string[] = ["system_prompt", "prompt_template"];
+const SYSTEM_PROMPT_NOT_SET = "Not set. Every LLM step needs a system prompt.";
+const USER_PROMPT_NOT_SET = "Not set. Every LLM step needs a user prompt.";
+
+function isUnsuppliedPrompt(value: unknown): boolean {
+  return value === undefined || value === null || (typeof value === "string" && value.trim() === "");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// A multi-query step has ONE system prompt and one user prompt PER QUERY. Both
+// authoring forms the plugin accepts (a mapping keyed by query name, or a list
+// of named entries) resolve to [name, entry] pairs; a malformed entry is
+// skipped here and reported by validation, not by this box. Mirrors the
+// backend's `_well_formed_query_entries`, positional label included.
+function queryEntries(queries: unknown): Array<[string, Record<string, unknown>]> {
+  if (Array.isArray(queries)) {
+    return queries.flatMap((entry, index): Array<[string, Record<string, unknown>]> =>
+      isRecord(entry) ? [[typeof entry.name === "string" && entry.name !== "" ? entry.name : `#${index}`, entry]] : [],
+    );
+  }
+  if (isRecord(queries)) {
+    return Object.entries(queries).flatMap(([name, entry]): Array<[string, Record<string, unknown>]> =>
+      isRecord(entry) ? [[name, entry]] : [],
+    );
+  }
+  return [];
+}
+
+function PromptRoleValue({ label, value, notSet }: { label: string; value: unknown; notSet: string }): JSX.Element {
+  if (isUnsuppliedPrompt(value)) return <span className="option-rows-prompt-missing">{notSet}</span>;
+  return <OptionValue label={label} value={value} />;
+}
+
+function LlmPromptRoles({ options }: { options: Record<string, unknown> }): JSX.Element {
+  const systemLabel = optionLabel("system_prompt");
+  const userLabel = optionLabel("prompt_template");
+  const queries = queryEntries(options.queries);
+  return (
+    <dl className="graph-config-rows option-rows-prompt-roles">
+      <div>
+        <dt>{systemLabel}</dt>
+        <dd><PromptRoleValue label={systemLabel} value={options.system_prompt} notSet={SYSTEM_PROMPT_NOT_SET} /></dd>
+      </div>
+      {queries.length === 0 ? (
+        <div>
+          <dt>{userLabel}</dt>
+          <dd><PromptRoleValue label={userLabel} value={options.prompt_template} notSet={USER_PROMPT_NOT_SET} /></dd>
+        </div>
+      ) : (
+        // The user prompt a query actually sends: its own template, else the
+        // node-level fallback — the same resolution the runtime applies. The
+        // query name is the reader's own identifier, so it is shown verbatim
+        // in the value cell, never humanised into the label.
+        queries.map(([name, entry]) => (
+          <div key={name}>
+            <dt>{userLabel}</dt>
+            <dd>
+              <span className="option-rows-query-name">{name}</span>
+              <PromptRoleValue
+                label={userLabel}
+                value={isUnsuppliedPrompt(entry.template) ? options.prompt_template : entry.template}
+                notSet={USER_PROMPT_NOT_SET}
+              />
+            </dd>
+          </div>
+        ))
+      )}
+    </dl>
+  );
+}
+
 export function OptionRows({
   options,
   ariaLabel,
@@ -160,11 +240,14 @@ export function OptionRows({
     }
   }, [pluginKind, pluginName, catalogKey, loadSchema]);
 
-  const candidateKeys = Object.keys(options).filter((key) => !INTERNAL_OPTION_KEYS.has(key));
+  const isLlmStep = plugin !== null && plugin.kind === "transform" && plugin.name === "llm";
+  const candidateKeys = Object.keys(options).filter(
+    (key) => !INTERNAL_OPTION_KEYS.has(key) && !(isLlmStep && LLM_PROMPT_ROLE_KEYS.includes(key)),
+  );
   let visibleKeys: string[];
   let advancedKeys: string[];
   if (schema === undefined) {
-    visibleKeys = FALLBACK_VISIBLE_OPTION_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(options, key));
+    visibleKeys = FALLBACK_VISIBLE_OPTION_KEYS.filter((key) => candidateKeys.includes(key));
     advancedKeys = candidateKeys.filter((key) => !FALLBACK_VISIBLE_OPTION_KEYS.includes(key));
   } else {
     // A discriminated schema repeats same-named fields once per variant. Only
@@ -194,7 +277,7 @@ export function OptionRows({
   }
   const visible = pick(options, visibleKeys);
   const advanced = pick(options, advancedKeys);
-  const isEmpty = Object.keys(visible).length === 0 && advancedKeys.length === 0;
+  const isEmpty = !isLlmStep && Object.keys(visible).length === 0 && advancedKeys.length === 0;
 
   return (
     <div className="option-rows" role="region" aria-label={ariaLabel}>
@@ -202,6 +285,7 @@ export function OptionRows({
         <p className="graph-config-empty-value">No settings for this step.</p>
       ) : (
         <>
+          {isLlmStep && <LlmPromptRoles options={options} />}
           {Object.keys(visible).length > 0 && <OptionDl rows={visible} />}
           {advancedKeys.length > 0 && (
             <details className="option-rows-advanced" open={showAdvanced}>

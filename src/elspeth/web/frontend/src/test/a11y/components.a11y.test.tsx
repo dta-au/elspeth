@@ -615,7 +615,7 @@ describe("WireStageTurn", () => {
     );
     screen.getByText("Model: anthropic/claude-sonnet-4");
     expect(await axe(container)).toHaveNoViolations();
-    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for summarise" }));
+    await userEvent.click(screen.getByRole("button", { name: "Show full user prompt for summarise" }));
     await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
     expect(screen.getByLabelText("Component")).toHaveValue(nodeId);
     expect(await axe(container)).toHaveNoViolations();
@@ -1115,7 +1115,7 @@ describe("ProposePipelineTurn", () => {
     );
     screen.getByText("Model: anthropic/claude-sonnet-4");
     expect(await axe(container)).toHaveNoViolations();
-    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for summarise" }));
+    await userEvent.click(screen.getByRole("button", { name: "Show full user prompt for summarise" }));
     await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
     expect(screen.getByRole("textbox", { name: "What should change?" })).toHaveFocus();
     expect(await axe(container)).toHaveNoViolations();

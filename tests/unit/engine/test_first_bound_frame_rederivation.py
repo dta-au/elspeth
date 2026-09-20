@@ -63,23 +63,29 @@ def _registry(*, closer_node: NodeID = COLLECTOR) -> GroupBindingRegistry:
 _STEPS = {NodeID("source-0"): 0, OPENER: 1, OTHER_OPENER: 2, COLLECTOR: 3, PLAIN: 4, OTHER_COLLECTOR: 5}
 
 
-def _mint(factory: Any, *, opener_node: NodeID, registry: GroupBindingRegistry | None) -> tuple[list[TokenInfo], str]:
+def _mint(
+    factory: Any, *, opener_node: NodeID, registry: GroupBindingRegistry | None, record_opener_state: bool = True
+) -> tuple[list[TokenInfo], str]:
     """Run the opener at ``opener_node`` in a minting processor: a completed
     node_state for the parent at that node, then expand_token (durable
     group_records + children frames). ``registry`` None models an UNDECLARED
-    opener (the minting process registers nothing)."""
+    opener (the minting process registers nothing). ``record_opener_state``
+    False withholds the parent's node_state — the state production cannot
+    write (begin_node_state commits before the transform runs), which the
+    re-derivation must refuse rather than read as "undeclared"."""
     minting = _make_processor(factory, node_step_map=_STEPS, group_bindings=registry)
     parent = make_token_info(row_id="row-1", token_id=f"parent-{opener_node}")
     _persist_token_for_scheduler(factory, parent)
-    factory.execution.record_completed_node_state(
-        token_id=parent.token_id,
-        node_id=str(opener_node),
-        coordination_token=leader_coordination_token(factory, "test-run"),
-        step_index=_STEPS[opener_node],
-        input_data={"value": 1},
-        output_data={"value": 1},
-        duration_ms=1.0,
-    )
+    if record_opener_state:
+        factory.execution.record_completed_node_state(
+            token_id=parent.token_id,
+            node_id=str(opener_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+            step_index=_STEPS[opener_node],
+            input_data={"value": 1},
+            output_data={"value": 1},
+            duration_ms=1.0,
+        )
     children, group_id = minting._token_manager.expand_token(
         parent_token=parent,
         expanded_rows=[{"value": 1}, {"value": 2}],
@@ -123,6 +129,52 @@ def test_no_declared_openers_means_no_durable_read_at_all() -> None:
     settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=GroupBindingRegistry(bindings=()))
     with patch.object(settling._barrier_restore_reads, "get_group_record", side_effect=AssertionError("re-read")):
         assert settling._first_bound_frame(children[0]) is None
+
+
+def test_declared_opener_missing_its_node_state_fails_closed_and_is_never_memoised_inert() -> None:
+    """elspeth-353d097dbb: the members' mint step names a DECLARED opener, so
+    the opener token must hold a node_state there. Its absence used to read
+    as "undeclared" and was memoised — every later member loss staged
+    nothing and the roster stranded (the META-9.1 defect, as a fail-open
+    default). Inert needs positive evidence; absence is an integrity error."""
+    _db, factory = _make_factory()
+    children, group_id = _mint(factory, opener_node=OPENER, registry=_registry(), record_opener_state=False)
+    settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
+
+    with pytest.raises(AuditIntegrityError, match="holds no node_state there"):
+        settling._first_bound_frame(children[0])
+
+    assert group_id not in settling._inert_expand_groups
+    # Not remembered as anything: the sibling's lookup refuses again.
+    with pytest.raises(AuditIntegrityError, match="holds no node_state there"):
+        settling._first_bound_frame(children[1])
+
+
+def test_inert_verdict_keys_on_the_mint_step_not_on_node_state_presence() -> None:
+    """Control for the raise above: an UNDECLARED expansion whose opener has
+    no node_state either is still inert — its members were minted at a step
+    no declared opener occupies, which is the positive evidence."""
+    _db, factory = _make_factory()
+    children, group_id = _mint(factory, opener_node=PLAIN, registry=None, record_opener_state=False)
+    settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
+
+    assert settling._first_bound_frame(children[0]) is None
+    assert settling._inert_expand_groups == {group_id}
+
+
+def test_member_without_a_mint_step_cannot_be_classified_and_fails_closed() -> None:
+    """TokenManager.expand_token always stamps the expanding node's step; a
+    member without one leaves nothing to classify the group by."""
+    _db, factory = _make_factory()
+    children, group_id = _mint(factory, opener_node=PLAIN, registry=None)
+    settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
+
+    with (
+        patch.object(settling._barrier_restore_reads, "get_token_mint_step", return_value=None),
+        pytest.raises(AuditIntegrityError, match="records no mint step"),
+    ):
+        settling._first_bound_frame(children[0])
+    assert group_id not in settling._inert_expand_groups
 
 
 def _complete_member_at(factory: Any, token_id: str, node_id: NodeID) -> None:

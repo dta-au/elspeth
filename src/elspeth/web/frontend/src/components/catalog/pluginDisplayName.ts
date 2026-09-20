@@ -44,6 +44,7 @@ const ACRONYMS: ReadonlySet<string> = new Set([
  * so ids like "constructor" can never collide with Object.prototype.
  */
 const DISPLAY_NAME_OVERRIDES: ReadonlyMap<string, string> = new Map([
+  ["azure_ai_search", "Azure AI Search (RAG)"],
   ["azure_blob", "Azure Blob Storage"],
   ["dataverse", "Microsoft Dataverse"],
   ["chroma_sink", "Chroma Vector Store"],

@@ -78,6 +78,9 @@ class GroupRecordRow:
     kind: str
     opener_token_id: str
     member_count: int
+    # META-38's written release fact: non-NULL only for a collector RELEASE
+    # group, whose "opener" is a group member, never a declared scope opener.
+    closes_group_id: str | None
 
 
 def collector_scoped_completion_conflict(
@@ -305,6 +308,7 @@ class BarrierRestoreReadModel:
             group_records_table.c.kind,
             group_records_table.c.opener_token_id,
             group_records_table.c.member_count,
+            group_records_table.c.closes_group_id,
         ).where(
             group_records_table.c.run_id == run_id,
             group_records_table.c.group_id == group_id,
@@ -318,7 +322,29 @@ class BarrierRestoreReadModel:
             kind=row.kind,
             opener_token_id=row.opener_token_id,
             member_count=row.member_count,
+            closes_group_id=row.closes_group_id,
         )
+
+    def get_token_mint_step(self, *, run_id: str, token_id: str) -> int | None:
+        """``tokens.step_in_pipeline`` of one token: the step of the node that minted it.
+
+        For an EXPAND member this is the EXPANDING node's step, written in the
+        same transaction as the group's ``group_records`` row
+        (``expand_token``) — the one durable fact that places an expansion at
+        a node without consulting ``node_states``. That independence is what
+        ``RowProcessor._rederive_expand_binding`` needs to tell an undeclared
+        expansion from a declared opener whose node_state is missing
+        (elspeth-353d097dbb). ``None`` for an unknown token or a NULL step;
+        the caller fails closed on either.
+        """
+        query = select(tokens_table.c.step_in_pipeline).where(
+            tokens_table.c.token_id == token_id,
+            tokens_table.c.run_id == run_id,
+        )
+        row = self._ops.execute_fetchone(query)
+        if row is None or row.step_in_pipeline is None:
+            return None
+        return int(row.step_in_pipeline)
 
     def get_group_member_keys(self, *, run_id: str, group_id: str) -> frozenset[str]:
         """DISTINCT member identities minted into one group (identity set, never a count).

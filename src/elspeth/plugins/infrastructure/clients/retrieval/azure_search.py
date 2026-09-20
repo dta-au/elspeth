@@ -8,16 +8,15 @@ import urllib.parse
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 
 import httpx
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
 
-from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.security.web import (
     NetworkError,
     SSRFBlockedError,
-    SSRFSafeRequest,
     validate_literal_ip_for_ssrf,
     validate_url_for_ssrf,
 )
@@ -25,13 +24,14 @@ from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 
 if TYPE_CHECKING:
+    from elspeth.contracts.audit_protocols import CallRecorder
     from elspeth.contracts.contexts import LimiterProtocol
-    from elspeth.core.landscape.execution_repository import ExecutionRepository
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 
 _AZURE_SEARCH_MANAGED_IDENTITY_SUFFIX = ".search.windows.net"
 _AZURE_SEARCH_TOKEN_SCOPE = "https://search.azure.com/.default"
+_AZURE_FIELD_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 AzureSearchAuthMode = Literal["api_key", "managed_identity"]
 
@@ -69,6 +69,48 @@ class AzureSearchProviderConfig(BaseModel):
 
     vector_field: str = "contentVector"
     semantic_config: str | None = None
+
+    # Index field mapping. Defaults match the historical hardcoded names; an
+    # index built by the portal's import wizard uses chunk / chunk_id / title.
+    content_field: str = "content"
+    id_field: str = "id"
+    title_field: str | None = None
+    url_field: str | None = None
+    select: tuple[str, ...] | None = None
+    # Operator-authored OData $filter, sent verbatim. Never built from row data.
+    filter: str | None = None
+
+    # Client id of a user-assigned managed identity; unset selects the
+    # system-assigned identity.
+    client_id: str | None = None
+
+    @field_validator("content_field", "id_field", "title_field", "url_field", "vector_field")
+    @classmethod
+    def validate_field_name(cls, v: str | None, info: ValidationInfo) -> str | None:
+        if v is not None and not _AZURE_FIELD_NAME.match(v):
+            raise ValueError(f"{info.field_name} must be an Azure AI Search field name (letters, digits, underscores), got {v!r}")
+        return v
+
+    @field_validator("select")
+    @classmethod
+    def validate_select(cls, v: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if v is not None:
+            if not v:
+                raise ValueError("select must name at least one field when set")
+            for name in v:
+                if not _AZURE_FIELD_NAME.match(name):
+                    raise ValueError(f"select entries must be Azure AI Search field names, got {name!r}")
+        return v
+
+    @field_validator("filter")
+    @classmethod
+    def validate_filter(cls, v: str | None) -> str | None:
+        if v is not None:
+            if not v.strip():
+                raise ValueError("filter must not be blank when set")
+            if any(c in v for c in "\r\n\x00"):
+                raise ValueError("filter must not contain newlines or null bytes")
+        return v
 
     @field_validator("endpoint")
     @classmethod
@@ -131,6 +173,8 @@ class AzureSearchProviderConfig(BaseModel):
         inferred_mode: AzureSearchAuthMode = "managed_identity" if self.use_managed_identity else "api_key"
         if self.auth_mode is not None and self.auth_mode != inferred_mode:
             raise ValueError(f"auth_mode {self.auth_mode!r} does not match configured authentication method {inferred_mode!r}")
+        if self.client_id is not None and not self.use_managed_identity:
+            raise ValueError("client_id requires use_managed_identity=true")
         object.__setattr__(self, "auth_mode", inferred_mode)
         return self
 
@@ -140,18 +184,40 @@ class AzureSearchProviderConfig(BaseModel):
             raise ValueError("semantic search_mode requires semantic_config")
         return self
 
+    @model_validator(mode="after")
+    def validate_select_covers_mapped_fields(self) -> Self:
+        if self.select is not None:
+            mapped = [name for name in (self.content_field, self.id_field, self.title_field, self.url_field) if name is not None]
+            missing = [name for name in mapped if name not in self.select]
+            if missing:
+                raise ValueError(f"select must include the mapped fields {missing!r}; Azure returns only selected fields")
+        return self
 
-# Score normalization ranges per search mode.
+
+# Score normalization ranges per search mode
+# (https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking).
+# BM25 has no upper limit, so the keyword ceiling is a clamp, not a bound.
+# Hybrid @search.score is an RRF sum: each fused query contributes at most
+# 1/(1 + 60), and this provider fuses one text and one vector query.
+_RRF_K = 60
 _SCORE_RANGES: dict[str, tuple[float, float]] = {
     "keyword": (0.0, 50.0),
     "vector": (0.0, 1.0),
-    "hybrid": (0.0, 50.0),
+    "hybrid": (0.0, 2 / (1 + _RRF_K)),
     "semantic": (0.0, 4.0),
+}
+
+# Semantic ranking reports its 0-4 score separately; @search.score stays BM25.
+_SCORE_KEYS: dict[str, str] = {
+    "keyword": "@search.score",
+    "vector": "@search.score",
+    "hybrid": "@search.score",
+    "semantic": "@search.rerankerScore",
 }
 
 
 class AzureSearchProvider:
-    """Azure AI Search implementation of RetrievalProvider.
+    """Azure AI Search implementation of RetrievalSearcher.
 
     Uses a single AuditedHTTPClient for connection pooling across searches.
     The client's state_id and token_id are updated per-call for correct
@@ -163,7 +229,7 @@ class AzureSearchProvider:
         self,
         config: AzureSearchProviderConfig,
         *,
-        execution: ExecutionRepository,
+        execution: CallRecorder,
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: LimiterProtocol | None = None,
@@ -178,6 +244,7 @@ class AzureSearchProvider:
 
         self._search_url = f"{config.endpoint.rstrip('/')}/indexes/{config.index}/docs/search?api-version={config.api_version}"
         self._score_range = _SCORE_RANGES[config.search_mode]
+        self._score_key = _SCORE_KEYS[config.search_mode]
 
         # Per-search skipped item tracking — allows callers to include
         # skip counts in audit records without changing the protocol.
@@ -219,15 +286,21 @@ class AzureSearchProvider:
 
     def _get_managed_identity_credential(self) -> _ManagedIdentityCredential:
         if self._managed_identity_credential is None:
+            # ManagedIdentityCredential, never DefaultAzureCredential: the default
+            # chain tries EnvironmentCredential first, so a host carrying service
+            # principal variables would authenticate as that principal while the
+            # audit trail records auth_mode=managed_identity.
             try:
-                from azure.identity import DefaultAzureCredential
+                from azure.identity import ManagedIdentityCredential
             except ImportError as exc:
                 raise RetrievalError(
                     "Azure managed identity token acquisition failed: azure-identity is not installed. "
                     "Install elspeth with the 'azure' extra or use api_key authentication.",
                     retryable=False,
                 ) from exc
-            self._managed_identity_credential = cast(_ManagedIdentityCredential, DefaultAzureCredential())
+            client_id = self._config.client_id
+            credential = ManagedIdentityCredential(client_id=client_id) if client_id is not None else ManagedIdentityCredential()
+            self._managed_identity_credential = cast(_ManagedIdentityCredential, credential)
         return self._managed_identity_credential
 
     def search(
@@ -340,6 +413,11 @@ class AzureSearchProvider:
             body["queryType"] = "semantic"
             body["semanticConfiguration"] = self._config.semantic_config
 
+        if self._config.select is not None:
+            body["select"] = ",".join(self._config.select)
+        if self._config.filter is not None:
+            body["filter"] = self._config.filter
+
         return body
 
     @trust_boundary(
@@ -378,34 +456,40 @@ class AzureSearchProvider:
                 skipped_items.append({"reason": "invalid_item_type", "type": type(item).__name__})
                 continue
 
-            raw_score = item.get("@search.score")
+            content_field = self._config.content_field
+            id_field = self._config.id_field
+            item_id = item.get(id_field)
+
+            # Semantic mode reads @search.rerankerScore; an item the ranker did
+            # not score is a recorded skip, never ranked on its BM25 score.
+            raw_score = item.get(self._score_key)
             if raw_score is None:
-                skipped_items.append({"reason": "missing_score", "id": item.get("id")})
+                skipped_items.append({"reason": "missing_score", "id": item_id})
                 continue
 
             # Tier 3 boundary: validate score type before arithmetic.
             # Azure returns JSON — score could be string, bool, list, etc.
             # bool check required because isinstance(True, int) is True in Python.
             if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
-                skipped_items.append({"reason": "invalid_score_type", "id": item.get("id"), "type": type(raw_score).__name__})
+                skipped_items.append({"reason": "invalid_score_type", "id": item_id, "type": type(raw_score).__name__})
                 continue
 
             normalized_score = self._normalize_score(raw_score)
             if normalized_score < min_score:
                 continue
 
-            content = item.get("content")
+            content = item.get(content_field)
             if content is None:
-                skipped_items.append({"reason": "missing_content", "id": item.get("id")})
+                skipped_items.append({"reason": "missing_content", "id": item_id})
                 continue
             if not isinstance(content, str):
-                skipped_items.append({"reason": "invalid_content_type", "id": item.get("id"), "type": type(content).__name__})
+                skipped_items.append({"reason": "invalid_content_type", "id": item_id, "type": type(content).__name__})
                 continue
             if not content:
-                skipped_items.append({"reason": "empty_content", "id": item.get("id")})
+                skipped_items.append({"reason": "empty_content", "id": item_id})
                 continue
 
-            source_id = item.get("id") or item.get("@search.documentId")
+            source_id = item_id or item.get("@search.documentId")
             if source_id is None:
                 # No identifier available — skip rather than fabricate "unknown".
                 # "record what we didn't get": absence is captured by the count
@@ -416,8 +500,15 @@ class AzureSearchProvider:
             metadata: dict[str, Any] = {
                 k: str(v) if not isinstance(v, (str, int, float, bool, type(None), list, dict)) else v
                 for k, v in item.items()
-                if k not in ("@search.score", "content", "id")
+                if k not in (self._score_key, content_field, id_field)
             }
+            # Citation fields under provider-neutral names. A missing or
+            # non-string value is omitted, never fabricated.
+            for citation_key, field_name in (("source_name", self._config.title_field), ("source_link", self._config.url_field)):
+                if field_name is not None:
+                    citation_value = item.get(field_name)
+                    if isinstance(citation_value, str) and citation_value:
+                        metadata[citation_key] = citation_value
 
             try:
                 chunks.append(
@@ -447,103 +538,72 @@ class AzureSearchProvider:
         normalized = (raw_score - min_val) / (max_val - min_val)
         return max(0.0, min(1.0, normalized))
 
-    @staticmethod
-    def _readiness_get(
-        safe_request: SSRFSafeRequest,
-        *,
-        headers: dict[str, str],
-        timeout: float,
-    ) -> httpx.Response:
-        request_headers = {**headers, "Host": safe_request.host_header}
-        extensions: dict[str, str] | None = None
-        if safe_request.scheme == "https":
-            extensions = {"sni_hostname": safe_request.sni_hostname}
+    def runtime_preflight(self, *, operation_id: str, coordination_token: CoordinationToken) -> CollectionReadinessResult:
+        """Count the index's documents as an audited call under an operation parent.
 
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-            return client.get(
-                safe_request.connection_url,
-                headers=request_headers,
-                extensions=extensions,
-            )
-
-    def check_readiness(self) -> CollectionReadinessResult:
-        """Check that the Azure Search index exists and has documents.
-
-        Uses raw httpx (NOT AuditedHTTPClient) because this is a startup
-        probe, not a row-level operation. There is no state_id or token_id
-        available during on_start().
-
-        SSRF protection: validates the endpoint URL resolves to a public IP
-        before making the request, preventing DNS rebinding attacks where
-        a config-authored hostname resolves to an internal IP.
-
-        Auth modes:
-        - api_key: sends api-key header
-        - use_managed_identity: acquires a Bearer token via DefaultAzureCredential
+        Returns a result for 200 and 404 (the caller decides whether a missing
+        or empty index is fatal); raises RetrievalError for everything else,
+        retryable only for transport failures, 429 and 5xx.
         """
-        from elspeth.core.security.web import NetworkError, SSRFBlockedError, validate_url_for_ssrf
+        from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 
         index_name = self._config.index
-
+        count_url = f"{self._config.endpoint.rstrip('/')}/indexes/{index_name}/docs/$count?api-version={self._config.api_version}"
         try:
-            count_url = f"{self._config.endpoint.rstrip('/')}/indexes/{index_name}/docs/$count?api-version={self._config.api_version}"
+            safe_request = validate_url_for_ssrf(count_url)
+        except SSRFBlockedError as exc:
+            raise RetrievalError(f"Azure AI Search endpoint blocked by SSRF validation: {exc}", retryable=False) from exc
+        except NetworkError as exc:
+            raise RetrievalError(f"Azure AI Search endpoint DNS validation failed: {exc}", retryable=True) from exc
 
-            # SSRF validation: resolve DNS and reject internal IPs before
-            # making the request. The request uses the returned IP-pinned URL
-            # with Host and TLS SNI set to the original hostname to avoid a
-            # validation-to-use DNS gap.
-            try:
-                safe_request = validate_url_for_ssrf(count_url)
-            except (SSRFBlockedError, NetworkError) as exc:
-                return CollectionReadinessResult(
-                    collection=index_name,
-                    reachable=False,
-                    count=None,
-                    message=f"Index '{index_name}' endpoint blocked by SSRF validation: {exc}",
-                )
+        client = AuditedHTTPClient(
+            execution=self._execution,
+            state_id=None,
+            run_id=self._run_id,
+            telemetry_emit=self._telemetry_emit,
+            timeout=10.0,
+            limiter=self._limiter,
+            operation_id=operation_id,
+            coordination_token=coordination_token,
+        )
+        try:
+            response, _final_url, _call = client.get_ssrf_safe(safe_request, headers=self._auth_headers())
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            raise RetrievalError(f"Readiness probe failed: {exc}", retryable=True) from exc
+        except httpx.HTTPError as exc:
+            raise RetrievalError(f"HTTP error during readiness probe: {exc}", retryable=True) from exc
+        finally:
+            client.close()
 
-            headers = self._auth_headers()
-
-            response = self._readiness_get(safe_request, headers=headers, timeout=10.0)
-
-            if response.status_code == 404:
-                # Index absent — count is unknown, not zero.
-                return CollectionReadinessResult(
-                    collection=index_name,
-                    reachable=True,
-                    count=None,
-                    message=f"Index '{index_name}' not found",
-                )
-
-            response.raise_for_status()
-
-            # Tier 3 boundary: $count response body is external data.
-            # Parse defensively — malformed body should be distinguishable
-            # from a genuine network outage.
-            try:
-                count = int(response.text.strip())
-            except ValueError:
-                # Malformed $count response — count is unknown, not zero.
-                return CollectionReadinessResult(
-                    collection=index_name,
-                    reachable=True,
-                    count=None,
-                    message=f"Index '{index_name}' returned non-integer $count body: {response.text!r}",
-                )
-
+        status_code = response.status_code
+        if status_code == 404:
+            return CollectionReadinessResult(collection=index_name, reachable=True, count=None, message=f"Index '{index_name}' not found")
+        if status_code in (401, 403):
+            raise RetrievalError(
+                f"Authentication failed for {self._config.endpoint} index {index_name!r}: HTTP {status_code}",
+                retryable=False,
+                status_code=status_code,
+            )
+        if status_code == 429 or status_code >= 500:
+            raise RetrievalError(f"Azure AI Search readiness probe: HTTP {status_code}", retryable=True, status_code=status_code)
+        if status_code >= 400:
+            raise RetrievalError(f"Azure AI Search readiness probe: HTTP {status_code}", retryable=False, status_code=status_code)
+        try:
+            count = int(response.text.strip())
+        except ValueError:
+            # The body is not echoed: an HTML error page does not belong in an audit message.
             return CollectionReadinessResult(
                 collection=index_name,
                 reachable=True,
-                count=count,
-                message=(f"Index '{index_name}' has {count} documents" if count > 0 else f"Index '{index_name}' is empty"),
-            )
-        except (httpx.HTTPError, ConnectionError, OSError) as exc:
-            return CollectionReadinessResult(
-                collection=index_name,
-                reachable=False,
                 count=None,
-                message=f"Index '{index_name}' unreachable: {type(exc).__name__}: {exc}",
+                message=f"Index '{index_name}' returned a non-integer $count body",
             )
+        return CollectionReadinessResult(
+            collection=index_name,
+            reachable=True,
+            count=count,
+            message=(f"Index '{index_name}' has {count} documents" if count > 0 else f"Index '{index_name}' is empty"),
+        )
 
     def close(self) -> None:
         """Release the shared HTTP client and its connection pool."""

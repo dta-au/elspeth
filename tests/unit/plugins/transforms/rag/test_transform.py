@@ -16,7 +16,6 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError, RetrievalProvider
 from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProviderConfig
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
@@ -70,12 +69,8 @@ def _make_transform(**overrides: Any) -> RAGRetrievalTransform:
     config = {
         "output_prefix": "policy",
         "query_field": "question",
-        "provider": "azure_search",
-        "provider_config": {
-            "endpoint": "https://test.search.windows.net",
-            "index": "test-index",
-            "api_key": "test-key",
-        },
+        "provider": "chroma",
+        "provider_config": {"collection": "test-index", "mode": "ephemeral"},
         "schema_config": {"mode": "observed"},
     }
     config.update(overrides)
@@ -299,30 +294,24 @@ class TestTransformLifecycle:
     def test_declares_truthful_pass_through(self) -> None:
         assert RAGRetrievalTransform.passes_through_input is True
 
-    def test_collection_audit_identity_dispatches_by_provider_and_owned_config(self) -> None:
+    def test_collection_audit_identity_reads_the_owned_chroma_config(self) -> None:
         transform = _make_transform()
         chroma = ChromaSearchProviderConfig(collection="test-collection")
-        azure = AzureSearchProviderConfig(
-            endpoint="https://test.search.windows.net",
-            index="test-index",
-            api_key="test-key",
-        )
 
         assert transform._configured_collection_name("chroma", chroma) == "test-collection"
-        assert transform._configured_collection_name("azure_search", azure) == "test-index"
 
     def test_shape_impostor_is_rejected_as_provider_config(self) -> None:
         transform = _make_transform()
-        impostor = type("ProviderConfigImpostor", (), {"index": "test-index"})()
+        impostor = type("ProviderConfigImpostor", (), {"collection": "test-index"})()
 
-        with pytest.raises(FrameworkBugError, match="provider azure_search requires AzureSearchProviderConfig"):
-            transform._configured_collection_name("azure_search", impostor)
+        with pytest.raises(FrameworkBugError, match="provider chroma requires ChromaSearchProviderConfig"):
+            transform._configured_collection_name("chroma", impostor)
 
-    def test_provider_config_category_mismatch_is_rejected(self) -> None:
+    def test_provider_without_a_readiness_identity_contract_is_a_framework_bug(self) -> None:
         transform = _make_transform()
         chroma = ChromaSearchProviderConfig(collection="test-collection")
 
-        with pytest.raises(FrameworkBugError, match="provider azure_search requires AzureSearchProviderConfig"):
+        with pytest.raises(FrameworkBugError, match="no readiness identity contract for provider 'azure_search'"):
             transform._configured_collection_name("azure_search", chroma)
 
     def test_declared_output_fields(self):
@@ -371,7 +360,7 @@ class TestTransformLifecycle:
     def test_forward_probe_preserves_query_field_and_close_remains_safe(self) -> None:
         transform = RAGRetrievalTransform(RAGRetrievalTransform.probe_config())
         original_provider = _RetrievalProviderFake()
-        transform._provider = original_provider
+        transform._searcher = original_provider
 
         result = transform.execute_forward_invariant_probe(
             transform.forward_invariant_probe_rows(
@@ -387,7 +376,7 @@ class TestTransformLifecycle:
         assert result.row["policy__rag_context"] == "1. Probe context"
         assert result.row["policy__rag_count"] == 1
         assert result.row["policy__rag_score"] == 0.95
-        assert transform._provider is original_provider
+        assert transform._searcher is original_provider
         assert transform._on_start_called is False
         assert original_provider.search_calls == []
 
@@ -455,7 +444,7 @@ def _setup_transform_with_mock_provider(chunks=None, **config_overrides):
     (which passes the readiness check) instead of a real Azure provider.
     """
     mock_provider = _RetrievalProviderFake(chunks=list(chunks or []))
-    mock_config_cls = AzureSearchProviderConfig
+    mock_config_cls = ChromaSearchProviderConfig
     mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
     transform = _make_transform(**config_overrides)
@@ -463,7 +452,7 @@ def _setup_transform_with_mock_provider(chunks=None, **config_overrides):
 
     with patch.dict(
         "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-        {"azure_search": (mock_config_cls, mock_factory)},
+        {"chroma": (mock_config_cls, mock_factory)},
     ):
         transform.on_start(lifecycle_ctx)
 
@@ -600,55 +589,6 @@ class TestProcessFlow:
         assert result.status == "error"
         assert result.reason["reason"] == "retrieval_failed"
 
-    def test_managed_identity_token_failure_returns_retrieval_error_result(self):
-        from azure.core.exceptions import ClientAuthenticationError
-
-        from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
-            AzureSearchProvider,
-            AzureSearchProviderConfig,
-        )
-
-        transform = _make_transform(
-            provider_config={
-                "endpoint": "https://test.search.windows.net",
-                "index": "test-index",
-                "use_managed_identity": True,
-            }
-        )
-        provider = AzureSearchProvider(
-            config=AzureSearchProviderConfig(
-                endpoint="https://test.search.windows.net",
-                index="test-index",
-                use_managed_identity=True,
-            ),
-            execution=_LandscapeRecorderFake(),
-            run_id="run-1",
-            telemetry_emit=_TelemetrySinkFake(),
-        )
-        transform._provider = provider
-        transform._on_start_called = True
-        auth_error = ClientAuthenticationError("DefaultAzureCredential failed")
-        mock_credential = _FailingCredential(auth_error)
-        row = _make_row({"question": "test"})
-        ctx = _mock_ctx()
-
-        try:
-            with (
-                patch("azure.identity.DefaultAzureCredential", return_value=mock_credential),
-                patch(
-                    "elspeth.plugins.infrastructure.clients.retrieval.azure_search.validate_url_for_ssrf",
-                    return_value=_safe_request_fake(),
-                ),
-            ):
-                result = transform.process(row, ctx)
-        finally:
-            provider.close()
-
-        assert result.status == "error"
-        assert result.reason["reason"] == "retrieval_failed"
-        assert "Azure managed identity token acquisition failed" in result.reason["error"]
-        assert result.reason["provider"] == "azure_search"
-
     def test_missing_query_field_diverts_with_audit_record(self):
         """A row lacking query_field must divert with audit record, not crash.
 
@@ -724,7 +664,7 @@ class TestOnComplete:
         try:
             with patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (AzureSearchProviderConfig, factory)},
+                {"chroma": (ChromaSearchProviderConfig, factory)},
             ):
                 for run_id in ("first-run", "second-run"):
                     ctx = make_context(run_id=run_id, node_id="retrieval")
@@ -743,7 +683,7 @@ class TestOnComplete:
                     assert payload["run_id"] == run_id
                     assert payload["node_id"] == "retrieval"
                     assert payload["plugin_name"] == "rag_retrieval"
-                    assert payload["provider"] == "azure_search"
+                    assert payload["provider"] == "chroma"
                     assert "private-" not in output
                     expected_scores = scores if run_id == "first-run" else []
                     assert payload["total_queries"] == len(expected_scores)
@@ -774,7 +714,7 @@ class TestOnComplete:
         try:
             with patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (AzureSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
+                {"chroma": (ChromaSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
             ):
                 transform.on_start(ctx)
             assert transform.process(_make_row({"question": "private-query"}), _mock_ctx()).status == "success"
@@ -865,7 +805,7 @@ class TestRAGTransformReadinessGuard:
 
     def _run_on_start_with_mock(self, mock_provider: _RetrievalProviderFake) -> RAGRetrievalTransform:
         """Patch PROVIDERS registry and call on_start()."""
-        mock_config_cls = AzureSearchProviderConfig
+        mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -873,7 +813,7 @@ class TestRAGTransformReadinessGuard:
 
         with patch.dict(
             "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-            {"azure_search": (mock_config_cls, mock_factory)},
+            {"chroma": (mock_config_cls, mock_factory)},
         ):
             transform.on_start(lifecycle_ctx)
 
@@ -884,13 +824,13 @@ class TestRAGTransformReadinessGuard:
         mock_provider = self._make_mock_provider(count=10)
         transform = self._run_on_start_with_mock(mock_provider)
 
-        assert transform._provider is mock_provider
+        assert transform._searcher is mock_provider
         assert mock_provider.check_readiness_calls == 1
 
     def test_readiness_recorded_in_landscape(self) -> None:
         """on_start() records the readiness check outcome in the audit trail."""
         mock_provider = self._make_mock_provider(count=42, collection="my-index")
-        mock_config_cls = AzureSearchProviderConfig
+        mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -898,7 +838,7 @@ class TestRAGTransformReadinessGuard:
 
         with patch.dict(
             "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-            {"azure_search": (mock_config_cls, mock_factory)},
+            {"chroma": (mock_config_cls, mock_factory)},
         ):
             transform.on_start(lifecycle_ctx)
 
@@ -921,7 +861,7 @@ class TestRAGTransformReadinessGuard:
 
         with patch.dict(
             "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-            {"azure_search": (AzureSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
+            {"chroma": (ChromaSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
         ):
             transform.on_start(ctx)
 
@@ -945,7 +885,7 @@ class TestRAGTransformReadinessGuard:
         with (
             patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (AzureSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
+                {"chroma": (ChromaSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
             ),
             pytest.raises(FrameworkBugError, match="member token"),
         ):
@@ -956,7 +896,7 @@ class TestRAGTransformReadinessGuard:
         from elspeth.contracts.errors import RetrievalNotReadyError
 
         mock_provider = self._make_mock_provider(count=0, reachable=True)
-        mock_config_cls = AzureSearchProviderConfig
+        mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -965,7 +905,7 @@ class TestRAGTransformReadinessGuard:
         with (
             patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (mock_config_cls, mock_factory)},
+                {"chroma": (mock_config_cls, mock_factory)},
             ),
             pytest.raises(RetrievalNotReadyError) as exc_info,
         ):
@@ -978,7 +918,7 @@ class TestRAGTransformReadinessGuard:
         from elspeth.contracts.errors import RetrievalNotReadyError
 
         mock_provider = self._make_mock_provider(count=0, reachable=False)
-        mock_config_cls = AzureSearchProviderConfig
+        mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -987,7 +927,7 @@ class TestRAGTransformReadinessGuard:
         with (
             patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (mock_config_cls, mock_factory)},
+                {"chroma": (mock_config_cls, mock_factory)},
             ),
             pytest.raises(RetrievalNotReadyError) as exc_info,
         ):
@@ -1001,7 +941,7 @@ class TestRAGTransformReadinessGuard:
         from elspeth.contracts.errors import RetrievalNotReadyError
 
         mock_provider = self._make_mock_provider(count=0, collection="my-vectors")
-        mock_config_cls = AzureSearchProviderConfig
+        mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -1010,7 +950,7 @@ class TestRAGTransformReadinessGuard:
         with (
             patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (mock_config_cls, mock_factory)},
+                {"chroma": (mock_config_cls, mock_factory)},
             ),
             pytest.raises(RetrievalNotReadyError) as exc_info,
         ):
@@ -1022,7 +962,7 @@ class TestRAGTransformReadinessGuard:
     def test_failed_readiness_still_recorded_in_landscape(self) -> None:
         """record_readiness_check is called even when the check fails (audit before raise)."""
         mock_provider = self._make_mock_provider(count=0, reachable=True, collection="empty-col")
-        mock_config_cls = AzureSearchProviderConfig
+        mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -1031,7 +971,7 @@ class TestRAGTransformReadinessGuard:
         with (
             patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (mock_config_cls, mock_factory)},
+                {"chroma": (mock_config_cls, mock_factory)},
             ),
             pytest.raises(RetrievalNotReadyError),
         ):
@@ -1051,7 +991,7 @@ class TestRAGTransformReadinessGuard:
 
     def test_provider_construction_failure_is_recorded_before_raise(self) -> None:
         """Constructor-time provider failures still emit a failed readiness audit row."""
-        mock_config_cls = AzureSearchProviderConfig
+        mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(error=RetrievalError("missing collection", retryable=False))
 
         transform = _make_transform()
@@ -1060,7 +1000,7 @@ class TestRAGTransformReadinessGuard:
         with (
             patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (mock_config_cls, mock_factory)},
+                {"chroma": (mock_config_cls, mock_factory)},
             ),
             pytest.raises(RetrievalNotReadyError, match="missing collection"),
         ):
@@ -1084,7 +1024,7 @@ class TestRAGTransformReadinessGuard:
                 retryable=False,
             )
         )
-        mock_config_cls = AzureSearchProviderConfig
+        mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -1093,7 +1033,7 @@ class TestRAGTransformReadinessGuard:
         with (
             patch.dict(
                 "elspeth.plugins.transforms.rag.transform.PROVIDERS",
-                {"azure_search": (mock_config_cls, mock_factory)},
+                {"chroma": (mock_config_cls, mock_factory)},
             ),
             pytest.raises(RetrievalNotReadyError, match="Azure managed identity token acquisition failed"),
         ):
@@ -1114,7 +1054,7 @@ class TestRAGTransformReadinessGuard:
         mock_provider = self._make_mock_provider(count=1)
         transform = self._run_on_start_with_mock(mock_provider)
 
-        assert transform._provider is mock_provider
+        assert transform._searcher is mock_provider
 
     def test_negative_count_raises(self) -> None:
         """count=-1 (corrupted response) is rejected at CollectionReadinessResult construction."""
