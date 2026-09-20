@@ -56,8 +56,10 @@ export function PeopleDirectory({ capabilities, query, draftText, load, selected
   return (
     <section aria-label="People" className="people-directory">
       <form role="search" className="people-filters" onSubmit={(event) => { event.preventDefault(); onQuery({ q: draftText, offset: 0 }); }}>
-        <Input label="Search people" type="search" value={draftText} maxLength={128} autoComplete="off" aria-describedby={scopeId} hint="Name, username or email. Searches everyone, not only this page." onChange={(event) => onDraftText(event.target.value)} />
-        <Button type="submit" compact>Search</Button>
+        <div className="people-search">
+          <Input label="Search people" type="search" value={draftText} maxLength={128} autoComplete="off" aria-describedby={scopeId} hint="Name, username or email. Searches everyone, not only this page." onChange={(event) => onDraftText(event.target.value)} />
+          <Button type="submit" className="people-search-submit">Search</Button>
+        </div>
         {statusOptions.length > 1 && (
           <label className="identity-admin-field">Status
             <select className="input" value={query.status} onChange={(event) => onQuery({ status: event.target.value as PeopleStatusFilter, offset: 0 })}>

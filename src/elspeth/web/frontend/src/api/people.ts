@@ -79,8 +79,17 @@ export function personName(person: PersonRecord): string {
   if (person.record_type === "local_account") {
     return person.local_account.display_name.trim() || person.local_account.username;
   }
-  const { display_name, username, subject } = person.identity;
-  return display_name?.trim() || username || subject;
+  const { display_name, username, subject, access_state, activated_at } = person.identity;
+  const shown = display_name?.trim() ?? "";
+  if (shown !== "") return shown;
+  // An identity prepared ahead of its first sign-in has no profile yet. The
+  // linked local account's name fills that gap, but NEVER for a never-admitted
+  // pending row: that profile is withheld on purpose, and a separately
+  // authorized source must not put back what the projection left out.
+  const withheld = access_state === "pending" && activated_at === null;
+  const accountName = person.local_account?.display_name.trim() ?? "";
+  if (!withheld && accountName !== "") return accountName;
+  return username || subject;
 }
 
 /** The line that tells two people with one name apart: never the name again. */

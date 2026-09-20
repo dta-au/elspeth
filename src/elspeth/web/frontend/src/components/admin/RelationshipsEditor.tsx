@@ -156,6 +156,7 @@ export function RelationshipsEditor({ identityId, personName }: Props): JSX.Elem
             <label><Input type="radio" name={`direction-${identityId}`} checked={direction === "approver_for_person"} onChange={() => setDirection("approver_for_person")} /> Someone approves for {personName}</label>
             <label><Input type="radio" name={`direction-${identityId}`} checked={direction === "person_approves_for"} onChange={() => setDirection("person_approves_for")} /> {personName} approves for someone</label>
           </fieldset>
+          <p className="people-grant-purpose">The person who approves must hold the Approver role. {direction === "person_approves_for" ? `Check ${personName}'s roles first.` : "Check their roles first if you are unsure."}</p>
           <PersonPicker label={direction === "approver_for_person" ? "Approver" : "Person they approve for"} excludeIdentityId={identityId} selected={counterpart} onSelect={setCounterpart} disabled={mutation.busy} />
           <Input label="Note (optional)" value={note} maxLength={512} onChange={(event) => setNote(event.target.value)} />
           <p className="people-confirm-sentence" aria-live="polite">{counterpart === null ? "Choose a person to see what will be assigned." : `Assign ${approverName} to approve for ${memberName}.`}</p>

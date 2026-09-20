@@ -158,6 +158,17 @@ describe("PeopleAccessDialog", () => {
     expect(rows[1]).toHaveTextContent("jdoe@partner.example · oidc");
   });
 
+  it("names a person prepared ahead of first sign-in from their linked account, but never a withheld one", async () => {
+    const account = { username: "alex.kim", display_name: "Alex Kim", email: null, email_verified: false };
+    const prepared = identityPerson({ identity_id: "alex-id", subject: "alex.kim", username: "alex.kim", display_name: null }, { local_account: account });
+    const withheld = identityPerson({ identity_id: "w-id", subject: "w.subject", username: null, display_name: null, access_state: "pending", activated_at: null }, { local_account: { ...account, display_name: "Withheld Name" } });
+    vi.mocked(people.listPeople).mockResolvedValue(page([prepared, withheld], BOTH));
+    open();
+    expect(await screen.findByRole("button", { name: /Alex Kim/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /w\.subject/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Withheld Name/)).not.toBeInTheDocument();
+  });
+
   it("shows a never-admitted person by subject only", async () => {
     const pending = identityPerson({ identity_id: "p-1", provider: "oidc", subject: "subject-opaque", username: null, display_name: null, email: null, access_state: "pending", activated_at: null, last_login_at: null });
     vi.mocked(people.listPeople).mockResolvedValue(page([pending], BOTH, { active_human_admin_count: 1 }));

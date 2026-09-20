@@ -37,7 +37,10 @@ interface Props {
  */
 export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Element {
   const modalRef = useRef<HTMLDivElement>(null);
-  useFocusTrap(modalRef, true);
+  // Capabilities have not loaded when the trap chooses its first target, so
+  // "first focusable" would be the close button. Start on the title instead:
+  // it names the dialog and is there from the first paint.
+  useFocusTrap(modalRef, true, "#people-access-title");
 
   const [capabilities, setCapabilities] = useState<PeopleCapabilities | null>(null);
   const [capabilityError, setCapabilityError] = useState<string | null>(null);
@@ -186,7 +189,7 @@ export function PeopleAccessDialog({ onClose, onUnavailable }: Props): JSX.Eleme
       <div role="presentation" className="app-dialog-backdrop" onClick={requestClose} />
       <div ref={modalRef} role="dialog" aria-modal="true" aria-labelledby="people-access-title" aria-describedby="people-access-intro" className="app-dialog settings-dialog people-dialog">
         <div className="secrets-panel-header">
-          <h2 id="people-access-title" className="secrets-panel-title">People &amp; access</h2>
+          <h2 id="people-access-title" tabIndex={-1} className="secrets-panel-title">People &amp; access</h2>
           <div className="people-header-actions">
             {canAdd && <Button ref={addButtonRef} compact disabled={adding} onClick={() => guard(() => { setStatus(null); setAdding(true); setView("detail"); })}>Add person</Button>}
             <Button variant="bare" aria-label="Close People & access" className="dialog-close" onClick={requestClose}>×</Button>

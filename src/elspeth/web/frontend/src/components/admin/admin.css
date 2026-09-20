@@ -14,10 +14,16 @@
   gap: var(--space-sm);
 }
 
+/* A bare Button carries no chrome of its own, so without these the browser's
+   default grey button face shows through. */
 .identity-admin-tab {
   padding: var(--space-sm);
-  color: var(--color-text-secondary);
+  border: 0;
   border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font: inherit;
 }
 
 .identity-admin-tab[aria-selected="true"] {
@@ -99,11 +105,26 @@
   min-width: 0;
 }
 
+/* The search field takes the row and its button sits beside it; the selects
+   share the next row evenly instead of wrapping wherever they run out. */
 .people-filters {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   align-items: end;
   gap: var(--space-sm);
+}
+
+.people-search {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--space-sm);
+}
+
+/* Level with the input, not with the hint line under it. */
+.people-search-submit {
+  margin-top: var(--space-lg);
 }
 
 .people-list,
@@ -125,6 +146,15 @@
   text-align: left;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
+  background: transparent;
+  color: var(--color-text);
+  cursor: pointer;
+  font: inherit;
+}
+
+.people-row:hover,
+.people-picker-result:hover {
+  border-color: var(--color-accent);
 }
 
 .people-row[aria-current="true"] {
@@ -280,6 +310,10 @@
   text-align: left;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
+  background: transparent;
+  color: var(--color-text);
+  cursor: pointer;
+  font: inherit;
   overflow-wrap: anywhere;
 }
 
