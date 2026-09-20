@@ -18,19 +18,17 @@ import { WordMark } from "@/components/ui";
 interface AppHeaderProps {
   onOpenSettings: () => void;
   onSignOut: () => void;
-  /** Forwarded to UserMenu; present only for the env-flagged dev admin. */
-  onOpenUserManagement?: () => void;
+  /** Forwarded to UserMenu; present only when the caller can administer people. */
+  onOpenPeopleAccess?: () => void;
   onOpenMailbox?: () => void;
-  onOpenIdentityAdmin?: () => void;
   onOpenLibrary?: () => void;
 }
 
 export function AppHeader({
   onOpenSettings,
   onSignOut,
-  onOpenUserManagement,
+  onOpenPeopleAccess,
   onOpenMailbox,
-  onOpenIdentityAdmin,
   onOpenLibrary,
 }: AppHeaderProps): JSX.Element {
   return (
@@ -53,9 +51,8 @@ export function AppHeader({
         <UserMenu
           onOpenSettings={onOpenSettings}
           onSignOut={onSignOut}
-          onOpenUserManagement={onOpenUserManagement}
+          onOpenPeopleAccess={onOpenPeopleAccess}
           onOpenMailbox={onOpenMailbox}
-          onOpenIdentityAdmin={onOpenIdentityAdmin}
           onOpenLibrary={onOpenLibrary}
         />
       </div>

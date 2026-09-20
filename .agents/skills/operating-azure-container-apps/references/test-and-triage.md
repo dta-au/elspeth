@@ -33,26 +33,38 @@ lane explicitly.
 
 ### 2. Image copy
 
-`imagetools create` fails: the GHCR digest for the commit does not exist
-(CI did not publish) or `az acr login` expired. A digest mismatch after the
+`imagetools create` fails: the selected GHCR digest does not exist
+or `az acr login` expired. A digest mismatch after the
 copy means something rebuilt instead of copying; stop.
+Unsigned RCs use digest/source-label/CLI verification; missing CI signatures
+are expected. Only run signature verification for a selected signed release.
 
 ### 3. Revision provisioning
 
 `Provisioning failed` with `ErrImagePull`: the user-assigned identity lacks
 `AcrPull` on this registry (role assignments can take up to 24 h to reach a
-cached token) or the digest is absent. `ContainerCrashing`: read the console
+cached token), the registry is ABAC-enabled and ignores that role, ARM-token
+authentication is disabled, the VNet cannot reach the registry, or the digest
+is absent. Inspect the registry before changing shared settings.
+`ContainerCrashing`: read the console
 logs, then run the doctor Job. `Timeout`: the startup budget (15 s × 10) is
 too small for the SKU; raise CPU/memory before the period.
 
 ### 4. Doctor or startup
 
+If `settings_load` fails, check all four mandatory Composer budgets in the
+shared Bicep contract environment. Web-only extras do not flow to doctors.
+Check endpoint URL/key pairing independently for primary and advisor roles.
 Classify from the `--json` report: `session_schema`/`landscape_schema`
 (`MISSING` needs the schema-owner init Job; `STALE` is a compatibility
-decision), `session_tls`/`landscape_tls` (`verify-full` hostname mismatch
-through the private endpoint → `verify-ca`), `payload_store_writable`/
+decision), `payload_store_writable`/
 `blob_writable` (NFS ownership; the `provision-storage` Job runs as root
 with `NoRootSquash`), or a Key Vault reference version that does not exist.
+The ACA doctor emits no `session_tls`/`landscape_tls` checks. For TLS errors,
+retain `sslmode=verify-full&sslrootcert=system`; fix the server FQDN, private
+DNS and CA trust. Weaker modes with system roots are rejected by libpq.
+The cold-install runbook gives a separate `pg_stat_ssl` query for an operator
+connection; it must not be presented as a measurement of the runtime's socket.
 
 ### 5. Readiness
 

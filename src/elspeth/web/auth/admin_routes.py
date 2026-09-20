@@ -28,6 +28,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.auth.routes import _mark_sensitive_auth_response_uncacheable
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.identity_authority import LOCAL_DELETION_REASON_MAX_LENGTH, LastActiveAdminProtected
 from elspeth.web.validation import has_visible_content
 
 _slog = structlog.get_logger(__name__)
@@ -68,6 +69,25 @@ class CreateUserRequest(BaseModel):
         return trimmed
 
 
+class DeleteUserRequest(BaseModel):
+    """Request body for DELETE /api/auth/admin/users/{user_id}.
+
+    A body, not a query parameter: a reason can name a person or an incident,
+    and query strings are written to access logs.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=LOCAL_DELETION_REASON_MAX_LENGTH)
+
+    @field_validator("reason")
+    @classmethod
+    def _must_state_a_reason(cls, v: str) -> str:
+        if not has_visible_content(v):
+            raise ValueError("must contain at least one visible character")
+        return v
+
+
 class _StrictResponse(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -94,6 +114,24 @@ class GeneratedPasswordResponse(_StrictResponse):
     password: str
 
 
+def dev_admin_surface_enabled(settings: WebSettings) -> bool:
+    """Whether this deployment has the dev-admin credential surface at all."""
+    return settings.auth_provider == "local" and settings.dev_admin_user is not None
+
+
+def is_dev_admin(settings: WebSettings, user: UserIdentity) -> bool:
+    """Whether ``user`` is the configured dev admin.
+
+    Compared against USERNAME, not user_id. ``dev_admin_user`` names a
+    local-auth account (its validator says so), while ``user_id`` is now the
+    identity_id -- an opaque uuid that no operator ever configures. Comparing
+    the two would silently 404 the admin out of their own surface. The ONE
+    definition, shared with the people directory, so the two surfaces cannot
+    disagree about who holds this capability.
+    """
+    return dev_admin_surface_enabled(settings) and user.username == settings.dev_admin_user
+
+
 async def _require_dev_admin(request: Request) -> UserIdentity:
     """Admit only the flagged dev-admin user; hide the surface otherwise.
 
@@ -103,14 +141,10 @@ async def _require_dev_admin(request: Request) -> UserIdentity:
     from 404 (authenticated but not the admin -- hidden, not forbidden).
     """
     settings: WebSettings = request.app.state.settings
-    if settings.auth_provider != "local" or settings.dev_admin_user is None:
+    if not dev_admin_surface_enabled(settings):
         raise HTTPException(status_code=404, detail="Not found")
     user = await get_current_user(request)
-    # Compared against USERNAME, not user_id. ``dev_admin_user`` names a
-    # local-auth account (its validator says so), while ``user_id`` is now the
-    # identity_id — an opaque uuid that no operator ever configures. Comparing
-    # the two would silently 404 the admin out of their own surface.
-    if user.username != settings.dev_admin_user:
+    if not is_dev_admin(settings, user):
         raise HTTPException(status_code=404, detail="Not found")
     return user
 
@@ -181,6 +215,7 @@ def create_dev_admin_router() -> APIRouter:
     @router.delete("/{user_id}", status_code=204)
     async def delete_user(
         user_id: str,
+        body: DeleteUserRequest,
         request: Request,
         admin: UserIdentity = Depends(_require_dev_admin),  # noqa: B008
     ) -> Response:
@@ -192,10 +227,31 @@ def create_dev_admin_router() -> APIRouter:
             # The admin deleting themself would orphan the surface mid-session.
             raise HTTPException(status_code=400, detail="The dev admin account cannot delete itself")
         provider: LocalAuthProvider = request.app.state.auth_provider
-        deleted = await run_sync_in_worker(provider.delete_user, user_id)
-        if not deleted:
+        try:
+            deletion = await run_sync_in_worker(provider.delete_user, user_id, reason=body.reason)
+        except LastActiveAdminProtected as exc:
+            # Deleting the account retires its identity, and this one is the
+            # container's last active human administrator (R5). Decided
+            # before the credential was touched, so nothing has changed. The
+            # same closed code the identity surface answers with, so a client
+            # switches on one vocabulary.
+            raise HTTPException(
+                status_code=409,
+                detail={"refusal": "last_active_admin_protected", "detail": str(exc)},
+            ) from exc
+        if not deletion.removed_anything:
             raise HTTPException(status_code=404, detail="User not found")
-        _slog.info("dev_admin_user_deleted", actor=admin.user_id, target=user_id)
+        # ``credential_deleted`` false with ``identity_retired`` true is the
+        # recovery of an earlier deletion whose retirement did not commit: the
+        # account is already gone and this call finished the job, so it is a
+        # success, not a "not found".
+        _slog.info(
+            "dev_admin_user_deleted",
+            actor=admin.user_id,
+            target=user_id,
+            credential_deleted=deletion.credential_deleted,
+            identity_retired=deletion.identity_retired,
+        )
         return Response(status_code=204)
 
     return router

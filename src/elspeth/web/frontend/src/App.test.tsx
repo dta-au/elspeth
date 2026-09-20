@@ -309,6 +309,21 @@ vi.mock("./api/shareableReviews", () => ({
   fetchShareableLink: vi.fn(),
 }));
 
+// ── People directory API stub ────────────────────────────────────────────────
+// App asks the server's capability projection whether to offer People &
+// access. Default: the signed-in test operator holds neither capability, so
+// no other test grows an account-menu entry. The mount test below grants one.
+
+const peopleCapabilities = vi.hoisted(() => ({
+  current: { identity_admin: false, local_accounts: false, auth_provider: "local", self_identity_id: "test-001", self_username: "test-operator" },
+}));
+
+vi.mock("./api/people", async () => ({
+  ...(await vi.importActual<typeof import("./api/people")>("./api/people")),
+  fetchPeopleCapabilities: vi.fn(() => Promise.resolve(peopleCapabilities.current)),
+  listPeople: vi.fn(() => Promise.resolve({ people: [], limit: 25, offset: 0, has_more: false, capabilities: peopleCapabilities.current, active_human_admin_count: 2 })),
+}));
+
 // ── Store subscriptions ──────────────────────────────────────────────────────
 // initStoreSubscriptions() runs at module load when App is imported and is
 // idempotent (guarded by `initialized` flag), so it is benign here.
@@ -337,6 +352,7 @@ describe("App banner roles", () => {
       } as never,
     } as never);
     useMailboxStore.getState().reset();
+    peopleCapabilities.current = { ...peopleCapabilities.current, identity_admin: false, local_accounts: false };
     localStorage.clear();
     window.history.replaceState(null, "", "/");
     // Restore the default (backend up, composer available) after any
@@ -357,10 +373,13 @@ describe("App banner roles", () => {
     artifactWorkspacePropsSpy.mockClear();
   });
 
-  it("mounts mailbox and live-role identity administration from the account menu", async () => {
+  it("mounts mailbox, library and People & access from the account menu", async () => {
+    // The mailbox reports NO admin role: the entry comes from the server's
+    // capability projection, not from whatever the mailbox happened to load.
     useMailboxStore.setState({ summary: {
-      governance: "on", roles: ["admin"], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0,
+      governance: "on", roles: [], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0,
     } });
+    peopleCapabilities.current = { ...peopleCapabilities.current, identity_admin: true };
     render(<App />);
     await userEvent.click(screen.getByRole("button", { name: "account menu" }));
     await userEvent.click(screen.getByRole("button", { name: "Mailbox" }));
@@ -371,12 +390,18 @@ describe("App banner roles", () => {
     expect(screen.getByRole("dialog", { name: "Shared library" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Close shared library" }));
     await userEvent.click(screen.getByRole("button", { name: "account menu" }));
-    await userEvent.click(screen.getByRole("button", { name: "Identity administration" }));
-    expect(screen.getByRole("dialog", { name: "Identity administration" })).toBeInTheDocument();
-    act(() => useMailboxStore.setState({ summary: {
-      governance: "on", roles: [], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0,
-    } }));
-    expect(screen.queryByRole("dialog", { name: "Identity administration" })).not.toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "People & access" }));
+    expect(screen.getByRole("dialog", { name: "People & access" })).toBeInTheDocument();
+    // Sign-out unmounts the panel, and with it every piece of administrative state.
+    act(() => useAuthStore.setState({ token: null, user: null } as never));
+    expect(screen.queryByRole("dialog", { name: "People & access" })).not.toBeInTheDocument();
+  });
+
+  it("offers no People & access entry to a user who holds neither capability", async () => {
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    expect(screen.getByRole("button", { name: "Mailbox" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "People & access" })).not.toBeInTheDocument();
   });
 
   it("uses role=alert for the backend-unavailable banner (hard outage)", async () => {

@@ -15,13 +15,14 @@ export AZURE_CORE_OUTPUT=json
 : "${RESOURCE_GROUP:?export the resource group}"
 : "${CONTAINER_APP:?export the container app name}"
 : "${DEPLOY_REF:?export the user-selected branch, tag, or commit to deploy}"
+: "${GHCR_DIGEST:?export the selected published image digest}"
 : "${WORKLOAD_PARAMETERS:?absolute path to the retained concrete workload ARM JSON}"
 OPERATOR_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/elspeth/azure-container-apps/${RESOURCE_GROUP}"
 mkdir -p "$OPERATOR_DIR"
 chmod 700 "$OPERATOR_DIR"
 
 DEPLOY_SHA=$(git rev-parse "${DEPLOY_REF}^{commit}")
-test "$(git rev-parse HEAD)" = "$DEPLOY_SHA"
+DEPLOYMENT_CONFIG_SHA=$(git rev-parse HEAD)
 test -z "$(git status --porcelain)"
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 az account show --query '{subscription:id,tenant:tenantId,user:user.name}'
@@ -63,13 +64,23 @@ export PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src"
 
 ```bash
 ACR_LOGIN_SERVER=$(jq -r '.properties.configuration.registries[0].server' "$OPERATOR_DIR/live-app.json")
-GHCR_DIGEST=$(docker buildx imagetools inspect "ghcr.io/dta-au/elspeth:sha-${DEPLOY_SHA}" --format '{{.Manifest.Digest}}')
+test "$(docker buildx imagetools inspect "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" --format '{{.Manifest.Digest}}')" = "$GHCR_DIGEST"
+docker pull --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}"
+test "$(docker image inspect "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$DEPLOY_SHA"
+docker run --rm --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" --version
+docker run --rm --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" health --json
 az acr login --name "${ACR_LOGIN_SERVER%%.*}"
 docker buildx imagetools create --tag "${ACR_LOGIN_SERVER}/elspeth:sha-${DEPLOY_SHA}" "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}"
 ACR_DIGEST=$(az acr manifest show-metadata "${ACR_LOGIN_SERVER}/elspeth:sha-${DEPLOY_SHA}" --query digest --output tsv)
 test "$ACR_DIGEST" = "$GHCR_DIGEST"
 CANDIDATE_IMAGE="${ACR_LOGIN_SERVER}/elspeth@${ACR_DIGEST}"
 ```
+
+Unsigned RCs can proceed with these checks. For a signed release additionally
+verify the signed GHCR reference using the release workflow identity; separate
+signature artifacts are not copied by `imagetools create`. `DEPLOY_SHA` names
+the image source; the deployment configuration checkout may have a newer
+`DEPLOYMENT_CONFIG_SHA` without requiring an image rebuild.
 
 ## 4. Doctor Job with the candidate digest
 

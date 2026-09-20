@@ -62,6 +62,7 @@ import type { CompositionState } from "@/types/index";
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphOutputs } from "./GraphOutputs";
+import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { GraphApprovals } from "./GraphApprovals";
 
 const NODE_WIDTH = 260;
@@ -2234,8 +2235,15 @@ export function GraphView() {
         </div>
         {compositionState && (
           <>
-            <GraphApprovals events={approvedInterpretations} state={compositionState} />
-            <GraphOutputs state={compositionState} />
+            {/* GraphApprovals throws on a malformed approval (fail closed).
+                The boundary keeps that failure in the table that owns it, so
+                the graph above survives it. */}
+            <ErrorBoundary label="Approvals table">
+              <GraphApprovals events={approvedInterpretations} state={compositionState} />
+            </ErrorBoundary>
+            <ErrorBoundary label="Routing table">
+              <GraphOutputs state={compositionState} />
+            </ErrorBoundary>
           </>
         )}
         {selectedConfig && (

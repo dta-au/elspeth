@@ -131,6 +131,7 @@ describe("projectDecisionRows", () => {
         suggestion: null,
         id: expect.stringContaining("blocker:"),
         code: "advisor_signoff_blocked",
+        componentId: "pipeline",
         detail: "Completion advisory review did not clear after the available attempts.",
       },
       {

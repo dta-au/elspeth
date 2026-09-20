@@ -116,7 +116,7 @@ describe("ComposerPreferencesForm", () => {
     expect(alert).toBeInTheDocument();
     expect(alert).toHaveTextContent(/503 Service Unavailable/);
     // The affordance is the shared stylesheet rule, not a one-off inline
-    // style: the same class ships on UserAdminDialog, and only this call
+    // style: the same class ships on the People & access quota editor, and only this call
     // site used to carry inline colour,
     // so the same error rendered two different ways (elspeth-b9871d3648).
     expect(alert).toHaveClass("composer-preferences-error");

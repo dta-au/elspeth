@@ -792,7 +792,7 @@ _R11_DETAIL = (
 )
 _CYCLE = {"refusal": "relationship_cycle", "detail": "the relationship would close a cycle in the org tree"}
 _ROLE_FORBIDDEN = {"refusal": "role_forbidden_for_identity", "detail": "that role cannot be held by this identity"}
-_APPROVER_REQUIRED = {"refusal": "approver_role_required", "detail": "the overseeing identity must hold an active approver role"}
+_APPROVER_REQUIRED = {"refusal": "approver_role_required", "detail": "the person who approves must hold an active Approver role; give them that role first, then assign them"}
 # root and erin administer; bob and carol approve; anna/bert/cleo form the R7 chain;
 # piet/quin carry the seeded cycle; dave holds a workload role; alice and milo hold none.
 _PEOPLE = ("root", "alice", "bob", "carol", "anna", "bert", "cleo", "dave", "erin", "piet", "quin", "milo")

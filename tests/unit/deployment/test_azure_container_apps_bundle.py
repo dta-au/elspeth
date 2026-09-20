@@ -18,13 +18,18 @@ import functools
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import yaml
+from pydantic import ValidationError
+
+from elspeth.web.config import WebSettings, settings_from_env
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = REPO_ROOT / "deploy" / "azure-container-apps"
@@ -40,6 +45,7 @@ VERSIONED_SECRET_URL_RE = re.compile(r"^https://[a-z0-9-]+\.vault\.azure\.net/se
 
 EXPECTED_FILES = {
     "README.md",
+    "application.example.json",
     "main.bicep",
     "environment.bicep",
     "workload.bicep",
@@ -447,6 +453,11 @@ def _workload_regression_parameters(role: str = "") -> dict[str, Any]:
         "provisionStorageImage": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "c" * 64,
         "revisionSuffix": "candidate" + role,
         "composerTransportIdleCeilingSeconds": 210,
+        "composerMaxCompositionTurns": 50,
+        "composerMaxDiscoveryTurns": 20,
+        "composerTimeoutSeconds": 180,
+        "composerRateLimitPerMinute": 10,
+        "authProvider": "local",
         "runtimeRoleLabel": role,
         "acceptanceRuntimeSecretUrls": {
             label: {
@@ -469,6 +480,115 @@ def _workload_regression_parameters(role: str = "") -> dict[str, Any]:
             )
         },
     }
+
+
+def _settings_for_compiled_container(module: dict[str, Any]) -> WebSettings:
+    """Resolve only declared secret references with ephemeral synthetic values."""
+    declared_secrets = {entry["name"] for entry in module["secrets"]}
+    environment = {}
+    for entry in module["containers"][0]["env"]:
+        name = entry["name"]
+        assert name not in environment, f"Duplicate environment variable: {name}"
+        if "secretRef" in entry:
+            assert entry["secretRef"] in declared_secrets
+            if name in {"ELSPETH_WEB__SESSION_DB_URL", "ELSPETH_WEB__LANDSCAPE_URL"}:
+                value = "postgresql://synthetic@database.example.test/" + entry["secretRef"].replace("-", "_")
+            else:
+                value = secrets.token_hex(32)
+        else:
+            value = entry["value"]
+        environment[name] = value
+    # Ambient development settings must never make an incomplete deployment pass.
+    with patch.dict(os.environ, environment, clear=True):
+        return settings_from_env()
+
+
+@pytest.mark.parametrize("deployment_name", ["elspeth-web-app", "doctor-schema-init-job", "doctor-runtime-job"])
+def test_compiled_workloads_load_required_composer_settings(deployment_name: str) -> None:
+    module = _module_parameters_with_values("workload", _workload_regression_parameters(), deployment_name)
+    settings = _settings_for_compiled_container(module)
+    assert settings.composer_max_composition_turns == 50
+    assert settings.composer_max_discovery_turns == 20
+    assert settings.composer_timeout_seconds == 180
+    assert settings.composer_rate_limit_per_minute == 10
+
+
+@pytest.mark.parametrize("parameter_file", ["workload.production", "workload.acceptance"])
+def test_example_web_and_doctor_environments_load_without_ambient_config(parameter_file: str) -> None:
+    parameters = _parameters(parameter_file)
+    app = _module_parameters("workload", parameter_file, "elspeth-web-app")
+    settings = _settings_for_compiled_container(app)
+    assert settings.auth_provider == parameters["authProvider"]
+    assert settings.registration_mode == parameters["registrationMode"]
+    if parameter_file == "workload.production":
+        assert settings.registration_mode == "closed"
+        assert settings.auth_provider != "local"
+        assert settings.sso_client_secret is not None
+        assert settings.sso_transaction_secret is not None
+        assert settings.composer_endpoint_base_url == parameters["composerEndpointBaseUrl"]
+        assert settings.composer_advisor_endpoint_base_url == parameters["composerAdvisorEndpointBaseUrl"]
+    suffix = "-" + parameters["runtimeRoleLabel"] if parameters["runtimeRoleLabel"] else ""
+    for name in ("doctor-schema-init-job", f"doctor-runtime{suffix}-job"):
+        doctor = _module_parameters("workload", parameter_file, name)
+        doctor_settings = _settings_for_compiled_container(doctor)
+        assert doctor_settings.composer_timeout_seconds == parameters["composerTimeoutSeconds"]
+        assert doctor_settings.composer_endpoint_base_url is None
+        assert doctor_settings.composer_advisor_endpoint_base_url is None
+        environment = _env_map(doctor["containers"][0]["env"])
+        assert "ELSPETH_WEB__AUTH_PROVIDER" not in environment
+        assert "ELSPETH_WEB__SSO_CLIENT_SECRET" not in environment
+        assert "ELSPETH_WEB__SSO_TRANSACTION_SECRET" not in environment
+        if name == "doctor-schema-init-job":
+            assert not ({entry["name"] for entry in doctor["secrets"]} & {"sso-client-secret", "sso-transaction-secret"})
+
+
+@pytest.mark.parametrize("role", ["", "Advisor"])
+@pytest.mark.parametrize("supplied", ["both", "url", "key"])
+def test_compiled_composer_endpoint_credentials_are_paired(role: str, supplied: str) -> None:
+    parameters = _workload_regression_parameters()
+    if supplied in {"both", "url"}:
+        parameters[f"composer{role}EndpointBaseUrl"] = "https://models.example.com/v1"
+    if supplied in {"both", "key"}:
+        parameters[f"composer{role}EndpointApiKeySecretUrl"] = "https://runtime.vault.azure.net/secrets/composer-key/" + "a" * 32
+    module = _module_parameters_with_values("workload", parameters, "elspeth-web-app")
+    if supplied != "both":
+        with pytest.raises(ValidationError, match="must be configured together"):
+            _settings_for_compiled_container(module)
+    else:
+        settings = _settings_for_compiled_container(module)
+        if role:
+            assert settings.composer_advisor_endpoint_base_url == "https://models.example.com/v1"
+            assert settings.composer_advisor_endpoint_api_key is not None
+        else:
+            assert settings.composer_endpoint_base_url == "https://models.example.com/v1"
+            assert settings.composer_endpoint_api_key is not None
+
+
+def test_native_azure_application_example_loads_from_compiled_environment() -> None:
+    parameters = _workload_regression_parameters()
+    parameters.update(json.loads((BUNDLE / "application.example.json").read_text()))
+    app = _module_parameters_with_values("workload", parameters, "elspeth-web-app")
+    settings = _settings_for_compiled_container(app)
+    assert settings.auth_provider == "entra"
+    assert settings.registration_mode == "closed"
+    assert settings.composer_model.startswith("azure/")
+    assert settings.composer_advisor_model.startswith("azure/")
+    assert settings.composer_endpoint_base_url is None
+    assert settings.composer_advisor_endpoint_base_url is None
+    assert settings.default_llm_profile == "standard"
+    assert settings.llm_profiles["standard"].provider == "azure"
+    assert settings.llm_profiles["standard"].credential_ref == "AZURE_API_KEY"
+    environment = _env_map(app["containers"][0]["env"])
+    assert environment["AZURE_API_KEY"]["secretRef"] == "azure-api-key"
+
+
+def test_required_startup_parameters_are_explicit_and_positive() -> None:
+    parameters = _template("workload")["parameters"]
+    for name in ("composerMaxCompositionTurns", "composerMaxDiscoveryTurns", "composerTimeoutSeconds", "composerRateLimitPerMinute"):
+        assert parameters[name]["type"] == "int"
+        assert parameters[name]["minValue"] == 1
+        assert "defaultValue" not in parameters[name]
+    assert "defaultValue" not in parameters["authProvider"]
 
 
 @pytest.mark.parametrize("role", ["", "a"])
@@ -659,16 +779,14 @@ def test_container_app_binds_the_runtime_contract_from_compiled_arm(parameter_fi
     database_names = {"session-db-url", "landscape-url"}
     if suffix:
         database_names |= {"session-db-url-a", "landscape-url-a", "session-db-url-b", "landscape-url-b"}
-    assert (
-        set(secrets)
-        == {
-            "secret-key",
-            "shareable-link-signing-key",
-            "fingerprint-key",
-            "operator-metrics-bearer-token",
-        }
-        | database_names
-    )
+    assert set(secrets) == {
+        "secret-key",
+        "shareable-link-signing-key",
+        "fingerprint-key",
+        "operator-metrics-bearer-token",
+    } | database_names | {entry["name"] for entry in values.get("extraSecrets", [])} | (
+        {"composer-endpoint-api-key"} if values["composerEndpointApiKeySecretUrl"] else set()
+    ) | ({"composer-advisor-endpoint-api-key"} if values.get("composerAdvisorEndpointApiKeySecretUrl") else set())
     for entry in secrets.values():
         assert set(entry) == {"name", "keyVaultUrl", "identity"}, entry
         assert entry["identity"] == values["identityResourceId"]

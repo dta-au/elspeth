@@ -142,4 +142,14 @@
     background-color: Canvas;
     color: CanvasText;
   }
+
+  /* People & access tabs — forced-colors paints a transparent border, so
+     every tab would carry the selected tab's underline. */
+  .identity-admin-tab {
+    border-bottom-color: Canvas;
+  }
+
+  .identity-admin-tab[aria-selected="true"] {
+    border-bottom-color: Highlight;
+  }
 }

@@ -269,9 +269,14 @@ describe("SecretsPanel", () => {
       expect(
         screen.queryByRole("button", { name: /^Delete secret/ }),
       ).not.toBeInTheDocument();
-      expect(screen.getByTestId("secrets-server-only")).toHaveTextContent(
-        /server-only mode/,
+      const notice = screen.getByTestId("secrets-server-only");
+      expect(notice).toHaveTextContent(
+        "Secrets are configured by an administrator on this deployment. Personal keys cannot be added here.",
       );
+      // A notice that leads the body, in the user's words: no mode name.
+      expect(notice).toHaveClass("secrets-notice");
+      expect(notice).not.toHaveTextContent(/server-only/);
+      expect(notice.parentElement?.firstElementChild).toBe(notice);
       // The inventory itself stays visible: read-only, not hidden.
       expect(screen.getByText("SERVER_KEY")).toBeInTheDocument();
     });

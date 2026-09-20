@@ -553,7 +553,8 @@ class WebSettings(BaseModel):
     # Every activation writes a quota_policies row from these, so an
     # activated identity can never hold unbounded spend on the container's
     # shared LLM credential. Required for an IdP deployment; None is only
-    # coherent for local auth.
+    # coherent for local auth, and only with the WHOLE quota system off:
+    # see ``quotas_enabled`` and its validator.
     quota_default_tokens_per_day: int | None = Field(default=None, gt=0, le=2**63 - 1)
     quota_default_storage_bytes: int | None = Field(default=None, gt=0, le=2**63 - 1)
     # Optional container ceiling rows, distinct from the per-identity level.
@@ -1214,6 +1215,44 @@ class WebSettings(BaseModel):
                 "composer_advisor_model must differ from composer_model "
                 f"(both resolve to {_canonical(self.composer_model)!r}); the advisor "
                 "is the independent reviewer and cannot be the primary composer"
+            )
+        return self
+
+    @property
+    def quotas_enabled(self) -> bool:
+        """Whether this deployment runs the quota system at all.
+
+        There is no separate switch: configuring ANY quota setting turns it
+        on. ``_validate_quota_defaults_when_enabled`` then guarantees both
+        per-identity defaults exist, so "on" always means a person's first
+        cap can be written.
+        """
+        return any(
+            value is not None
+            for value in (
+                self.quota_default_tokens_per_day,
+                self.quota_default_storage_bytes,
+                self.quota_container_tokens_per_day,
+                self.quota_container_storage_bytes,
+            )
+        )
+
+    @model_validator(mode="after")
+    def _validate_quota_defaults_when_enabled(self) -> WebSettings:
+        """Quotas on means BOTH per-identity defaults are configured.
+
+        A ``quota_policies`` row stores a value for tokens AND storage. An
+        administrator sets one dimension at a time, so the other value of a
+        person's first cap comes from these defaults. With one default, or
+        with only a container ceiling, the system looks enabled and every
+        first cap is refused for a reason no administrator can fix from the
+        panel. Refuse to start instead.
+        """
+        if self.quotas_enabled and (self.quota_default_tokens_per_day is None or self.quota_default_storage_bytes is None):
+            raise ValueError(
+                "the quota system is enabled (a quota_* setting is configured), so both quota_default_tokens_per_day "
+                "and quota_default_storage_bytes must be set: a person's first cap stores a value for both, and the "
+                "one an administrator does not type comes from these defaults"
             )
         return self
 

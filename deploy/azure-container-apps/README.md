@@ -59,6 +59,7 @@ Single/sticky remains the operating configuration.
 | `main.example.bicepparam` / `environment.example.bicepparam` | | production stack parameters |
 | `main.acceptance.bicepparam` | | disposable acceptance group: zone redundancy off, purge protection off, Burstable server with public access + operator firewall rule, 30-day retention |
 | `workload.production.bicepparam` | | `Single` mode, `sticky` affinity, 2–4 replicas, ceiling 210 s |
+| `application.example.json` | | operator application input example: required budgets, Entra login, Azure OpenAI roles and pipeline profile; replace placeholders outside Git |
 | `workload.acceptance.bicepparam` | | `Multiple` mode, `none` affinity, 1 replica, `runtimeRoleLabel` a (deploy again with b) |
 | `kql/*.kql` | | doctor report by execution; run sentinel by replica; replica lifecycle; fence-conflict 409s — SHA-256 bound into the receipt; column names verified live, never pinned by a test |
 | `scripts/acceptance.sh` | | the stage driver (environment → image copy → bootstrap → Jobs → PostgreSQL tests → production rollout/receipts → labelled probes → Single-revision probes → evidence → cleanup → bundle validation) |
@@ -88,7 +89,9 @@ including after restart.
 
 `scripts/resolve-workload-parameters.sh` writes concrete operator-local ARM
 JSON from environment outputs, verified image digests and Key Vault version
-IDs. `scripts/validate-workload-parameters.jq` rejects placeholders before
+IDs captured in `<secret-name>.version` files under `SECRET_VERSION_DIR`,
+plus a flat JSON object of application parameters from `APPLICATION_PARAMETERS`.
+It does not reselect latest secret versions. `scripts/validate-workload-parameters.jq` rejects placeholders before
 what-if. Redeployment reuses the retained file to preserve secret versions and
 configuration. `scripts/run-job.sh` waits on the exact newly started execution.
 The acceptance driver uses the landed probe facade; claiming live evidence
@@ -131,6 +134,19 @@ against each parameter file, never on Bicep text.
 
 ## Parameters the operator must decide
 
+- `composerMaxCompositionTurns`, `composerMaxDiscoveryTurns`,
+  `composerTimeoutSeconds`, `composerRateLimitPerMinute` — required runtime
+  budgets, supplied to web and both doctors. `extraEnvironment` is web-only.
+- `authProvider` — explicit nonlocal production authentication, with SSO
+  settings, first administrator subject and quota defaults in `extraEnvironment`;
+  keep `registrationMode=closed`. Local authentication would put SQLite on NFS.
+- `composerModel` / `composerAdvisorModel` and credentials for both roles.
+  Custom endpoint URLs and key references are paired independently per role;
+  native Azure uses the `AZURE_API_*` environment values instead.
+- `extraSecrets` — `{name, keyVaultUrl}` entries for SSO/provider secrets;
+  `extraEnvironment` references these with `secretRef`. Configure pipeline
+  `ELSPETH_WEB__LLM_PROFILES` and its standard `ELSPETH_WEB__DEFAULT_LLM_PROFILE`
+  separately from Composer roles.
 - `composerTransportIdleCeilingSeconds` — required, no default, at most 240:
   the Container Apps ingress request timeout is a fixed 240 seconds; a Front
   Door or other hop in front lowers it further.
@@ -142,6 +158,20 @@ against each parameter file, never on Bicep text.
 - `provisionStorageImage` — a digest-pinned root image; the runtime image is
   `USER 1654` and the platform offers no `runAsUser`.
 - Every secret URL — a **versioned** Key Vault reference.
+
+An unsigned RC can use this same bundle: digest identity, the source OCI label
+and image smoke checks are required; CI signing and an acceptance receipt are
+not cold-install prerequisites. A newer deployment checkout can configure an
+older RC image without rebuilding it. Record the deployment checkout commit
+separately from `candidateSourceSha`, which always names the image's source.
+
+Before the window, verify the existing ACR supports the bundle's `AcrPull`
+assignments (`LegacyRegistryPermissions`) and ARM audience authentication,
+and that the ACA VNet can reach its login/data endpoints. The bundle creates
+no ACR private endpoint, VPN or operator host. The operator needs deployment
+and role-assignment rights in the target group and registry scope, nested
+deployment rights in the registry's group, and registry push rights. See the
+cold-install runbook for exact read-only checks and private SQL/Key Vault access.
 
 ## Exclusions on the record (plan D4)
 

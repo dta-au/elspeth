@@ -2388,3 +2388,38 @@ class TestCompartmentId:
     def test_rejects_bad_shape(self, value: str) -> None:
         with pytest.raises(ValidationError, match="compartment_id must match"):
             _settings(compartment_id=value)
+
+
+class TestQuotaDefaultsWhenEnabled:
+    """Quotas on means a first personal cap can always be written.
+
+    A policy row stores tokens AND storage; an administrator sets one at a
+    time and the other comes from the deployment default. A half-configured
+    deployment therefore refuses every first cap for a reason nobody can fix
+    from the panel, so it must not start.
+    """
+
+    def test_no_quota_setting_at_all_is_quotas_off(self) -> None:
+        assert _settings().quotas_enabled is False
+
+    def test_both_defaults_is_quotas_on(self) -> None:
+        settings = _settings(quota_default_tokens_per_day=1000, quota_default_storage_bytes=2000)
+        assert settings.quotas_enabled is True
+
+    @pytest.mark.parametrize(
+        "partial",
+        [
+            {"quota_default_tokens_per_day": 1000},
+            {"quota_default_storage_bytes": 2000},
+            {"quota_container_tokens_per_day": 1000},
+            {"quota_container_storage_bytes": 2000},
+            {"quota_container_tokens_per_day": 1000, "quota_default_tokens_per_day": 10},
+        ],
+    )
+    def test_any_quota_setting_without_both_defaults_refuses_to_start(self, partial: dict[str, int]) -> None:
+        with pytest.raises(ValidationError, match="both quota_default_tokens_per_day and quota_default_storage_bytes must be set"):
+            _settings(**partial)
+
+    def test_a_container_ceiling_is_accepted_beside_both_defaults(self) -> None:
+        settings = _settings(quota_default_tokens_per_day=10, quota_default_storage_bytes=20, quota_container_tokens_per_day=1000)
+        assert settings.quotas_enabled is True

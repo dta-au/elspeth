@@ -64,6 +64,7 @@ from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.identity_admin_routes import create_identity_admin_router
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.auth.people_routes import create_people_router
 from elspeth.web.auth.protocol import AuthProvider
 from elspeth.web.auth.quota_routes import create_quota_router
 from elspeth.web.auth.routes import create_auth_router
@@ -1140,6 +1141,8 @@ def _build_local_auth_provider(
         # The same retirement collaborator every surface that deletes a local
         # credential binds, so the provider, subject and reason are decided
         # in exactly one place.
+        # The web surface cannot recover from zero administrators, so a
+        # deletion here may not retire the last one (R5).
         retire_identity=local_identity_retirer(identity_authority, _record_retirement),
     )
 
@@ -1833,6 +1836,7 @@ def _create_app(
     app.include_router(create_auth_router())
     app.include_router(create_dev_admin_router())
     app.include_router(create_identity_admin_router())
+    app.include_router(create_people_router())
     app.include_router(create_quota_router())
     app.include_router(create_approvals_router())
     app.include_router(create_workflow_inspect_router())

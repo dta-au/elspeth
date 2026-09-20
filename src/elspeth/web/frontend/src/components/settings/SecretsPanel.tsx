@@ -244,11 +244,14 @@ export function SecretsPanel({
 
         {/* Scrollable body */}
         <div className="secrets-panel-body">
-          {/* Entry form — not rendered in server-only mode. */}
+          {/* Entry form — not rendered in server-only mode. The sentence that
+              says why is the first thing in the body and is styled as a
+              notice: it explains an absent form, so it is not a footnote. It
+              names no mode — "server-only" is our word, not the user's. */}
           {!userSecretsEnabled && (
-            <p className="secrets-footnote" data-testid="secrets-server-only">
-              This deployment is in server-only mode: secrets are configured by
-              an administrator, and personal keys cannot be added here.
+            <p className="secrets-notice" data-testid="secrets-server-only">
+              Secrets are configured by an administrator on this deployment.
+              Personal keys cannot be added here.
             </p>
           )}
           {userSecretsEnabled && (

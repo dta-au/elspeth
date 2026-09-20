@@ -201,6 +201,7 @@ def test_a_blank_setting_does_not_count_as_configured() -> None:
         sso_client_secret=SecretStr("s3cret"),
         sso_endpoint_origins=("https://origin.example",),
         quota_default_tokens_per_day=100_000,
+        quota_default_storage_bytes=1_000_000,
     )
     values = configured_auth_settings(configured)
     assert values["sso_client_secret"] is True

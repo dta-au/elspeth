@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Cold-install parameter materialisation. All Azure calls read secret IDs only.
-# Redeploy reuses this file to preserve pinned secret versions and configuration.
+# Materialise launch configuration with the exact IDs captured during upload.
+# APPLICATION_PARAMETERS is a flat JSON map of launch parameter names to values.
+# SECRET_VERSION_DIR contains <secret-name>.version files; Azure is never queried.
 set -Eeuo pipefail
 umask 077
 test "$#" -eq 2 || { echo 'usage: resolve-workload-parameters.sh ENVIRONMENT_OUTPUTS OUTPUT_JSON' >&2; exit 2; }
@@ -8,6 +9,8 @@ test "$#" -eq 2 || { echo 'usage: resolve-workload-parameters.sh ENVIRONMENT_OUT
 : "${CANDIDATE_SHA:?full source SHA required}"
 : "${PROVISION_STORAGE_IMAGE:?digest-pinned root provisioner image required}"
 : "${ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS:?explicit transport ceiling required}"
+: "${SECRET_VERSION_DIR:?directory of captured secret version IDs required}"
+: "${APPLICATION_PARAMETERS:?flat application parameter JSON file required}"
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 output=$2
 test ! -e "$output" || { echo 'output already exists; use a new candidate file' >&2; exit 2; }
@@ -15,22 +18,41 @@ vault=$(jq -er '.keyVaultName.value' "$1")
 schema_vault=$(jq -er '.schemaOwnerKeyVaultName.value' "$1")
 parameters=$(mktemp)
 trap 'rm -f -- "$parameters"' EXIT
-# Start with an ARM parameter envelope, not the tracked compilation fixture.
-# Optional sizing/probe settings retain the workload template defaults.
-jq -n '{
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
-  contentVersion: "1.0.0.0",
-  parameters: {
-    containerAppName: {value: "elspeth-web"},
-    activeRevisionsMode: {value: "Single"}, stickySessionsAffinity: {value: "sticky"},
-    minReplicas: {value: 2}, maxReplicas: {value: 4}
-  }
-}' >"$parameters"
-# Freeze the version returned now. No secret value is written or printed.
+# Infrastructure, image, database URLs and secret version pins are never supplied
+# by this file. Reject unknown keys rather than silently dropping misspellings.
+jq -e '
+  ["containerAppName", "minReplicas", "maxReplicas", "webCpu", "webMemory",
+   "terminationGracePeriodSeconds", "tags", "composerMaxCompositionTurns",
+   "composerMaxDiscoveryTurns", "composerTimeoutSeconds", "composerRateLimitPerMinute",
+   "authProvider", "registrationMode", "composerEndpointBaseUrl",
+   "composerAdvisorEndpointBaseUrl", "composerModel", "composerAdvisorModel",
+   "extraSecrets", "extraEnvironment"] as $allowed |
+  if type != "object" then error("application parameters must be a flat JSON object")
+  elif ((keys - $allowed) | length) != 0 then error("unknown or reserved application parameter")
+  else . end |
+  {containerAppName: "elspeth-web", minReplicas: 2, maxReplicas: 4,
+   activeRevisionsMode: "Single", stickySessionsAffinity: "sticky",
+   registrationMode: "closed", composerEndpointBaseUrl: "",
+   composerAdvisorEndpointBaseUrl: "", extraSecrets: [], extraEnvironment: []} + . |
+  {"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+   contentVersion: "1.0.0.0", parameters: map_values({value: .})}
+' "$APPLICATION_PARAMETERS" >"$parameters"
+
+captured_secret_id() {
+  local name=$1 secret_vault=$2 secret_id
+  [[ "$name" =~ ^[a-zA-Z0-9-]+$ ]] || { echo 'invalid secret name' >&2; return 2; }
+  secret_id=$(cat -- "$SECRET_VERSION_DIR/$name.version")
+  # Match the expected vault AND name; a swapped or malformed capture must fail.
+  [[ "$secret_id" =~ ^https://[a-z0-9-]+\.vault\.azure\.net/secrets/[a-zA-Z0-9-]+/[0-9a-f]{32}$ ]] &&
+    [[ "$secret_id" == "https://$secret_vault.vault.azure.net/secrets/$name/"* ]] || {
+      echo "invalid captured version ID for $name" >&2; return 2;
+    }
+  printf '%s' "$secret_id"
+}
 while read -r parameter secret_name; do
   secret_vault=$vault
   if [[ "$secret_name" == *-schema-owner ]]; then secret_vault=$schema_vault; fi
-  secret_id=$(az keyvault secret show --vault-name "$secret_vault" --name "$secret_name" --query id --output tsv --only-show-errors)
+  secret_id=$(captured_secret_id "$secret_name" "$secret_vault")
   document=$(jq --arg key "$parameter" --arg id "$secret_id" '.parameters[$key] = {value: $id}' "$parameters")
   printf '%s\n' "$document" >"$parameters"
 done <<'SECRETS'
@@ -43,14 +65,17 @@ shareableLinkSigningKeySecretUrl elspeth-shareable-link-signing-key
 fingerprintKeySecretUrl elspeth-fingerprint-key
 operatorMetricsBearerTokenSecretUrl elspeth-operator-metrics-bearer-token
 SECRETS
-# Set COMPOSER_ENDPOINT_SECRET_NAME only if the deployment uses that endpoint.
 composer_secret=''
+advisor_secret=''
 if [[ -n ${COMPOSER_ENDPOINT_SECRET_NAME:-} ]]; then
-  composer_secret=$(az keyvault secret show --vault-name "$vault" --name "$COMPOSER_ENDPOINT_SECRET_NAME" --query id --output tsv --only-show-errors)
+  composer_secret=$(captured_secret_id "$COMPOSER_ENDPOINT_SECRET_NAME" "$vault")
+fi
+if [[ -n ${COMPOSER_ADVISOR_ENDPOINT_SECRET_NAME:-} ]]; then
+  advisor_secret=$(captured_secret_id "$COMPOSER_ADVISOR_ENDPOINT_SECRET_NAME" "$vault")
 fi
 document=$(jq --slurpfile outputs "$1" --arg image "$CANDIDATE_IMAGE" \
   --arg sha "$CANDIDATE_SHA" --arg provisioner "$PROVISION_STORAGE_IMAGE" \
-  --arg composer "$composer_secret" \
+  --arg composer "$composer_secret" --arg advisor "$advisor_secret" \
   --argjson ceiling "$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" '
   .parameters.environmentResourceId = {value: $outputs[0].environmentResourceId.value} |
   .parameters.identityResourceId = {value: $outputs[0].identityResourceId.value} |
@@ -62,11 +87,11 @@ document=$(jq --slurpfile outputs "$1" --arg image "$CANDIDATE_IMAGE" \
   .parameters.candidateSourceSha.value = $sha |
   .parameters.revisionSuffix.value = ("r" + $sha[0:12]) |
   .parameters.composerTransportIdleCeilingSeconds.value = $ceiling |
-  .parameters.composerEndpointApiKeySecretUrl.value = $composer
+  .parameters.composerEndpointApiKeySecretUrl.value = $composer |
+  .parameters.composerAdvisorEndpointApiKeySecretUrl.value = $advisor
   ' "$parameters")
 printf '%s\n' "$document" >"$parameters"
 jq -e -f "$script_dir/validate-workload-parameters.jq" "$parameters" >/dev/null || {
   echo 'unresolved or invalid workload parameters; no output written' >&2; exit 2;
 }
-# Noclobber also protects against an output appearing during the read-only work.
 (set -o noclobber; cat "$parameters" >"$output")

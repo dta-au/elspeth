@@ -67,8 +67,10 @@ credential isolation migration below. An image-only update cannot change
 vault access, Job identities or the web container's `AZURE_CLIENT_ID`.
 
 - Azure CLI with the `containerapp` extension, `jq`, `curl`, Docker Buildx,
-  `cosign`, and an authenticated `az login` context with `Contributor` on the
+  and an authenticated `az login` context with `Contributor` on the
   resource group and `AcrPush` (or an existing copy) on the registry.
+  Install `cosign` only for a signed release. An unsigned RC is supported;
+  verify its digest, source label and CLI smoke below.
 - A clean source checkout; Python imports bound to it with `PYTHONPATH`.
 - The current app is stable: one active revision at 100 % with all replicas
   `Running`.
@@ -83,10 +85,11 @@ export AZURE_CORE_OUTPUT=json
 : "${RESOURCE_GROUP:?set the resource group}"
 : "${CONTAINER_APP:?set the container app name}"
 : "${DEPLOY_REF:?set the exact branch, tag, or commit to deploy}"
+: "${GHCR_DIGEST:?set the published digest for that image source commit}"
 : "${ELSPETH_BASE_URL:?set the exact public HTTPS origin without a trailing slash}"
 
 CANDIDATE_SHA=$(git rev-parse "${DEPLOY_REF}^{commit}")
-test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+DEPLOYMENT_CONFIG_SHA=$(git rev-parse HEAD)
 test -z "$(git status --porcelain)"
 : "${WORKLOAD_PARAMETERS:?absolute path to the concrete workload ARM JSON retained from cold install}"
 OPERATOR_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/elspeth/azure-container-apps/${RESOURCE_GROUP}"
@@ -161,20 +164,39 @@ applies to the migrated configuration.
 
 ## 2. Verify and publish the exact source
 
+`CANDIDATE_SHA` is the image source; `DEPLOYMENT_CONFIG_SHA` is the checkout
+containing the deployment templates. They may differ when deploying an
+existing RC with corrected Bicep. Use the cold-install registry checks for
+ACR role assignment mode, ARM audience authentication and network access.
+
 ```bash
-GHCR_DIGEST=$(docker buildx imagetools inspect "ghcr.io/dta-au/elspeth:sha-${CANDIDATE_SHA}" \
-  --format '{{.Manifest.Digest}}')
+test "$(docker buildx imagetools inspect "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" \
+  --format '{{.Manifest.Digest}}')" = "$GHCR_DIGEST"
+docker pull --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}"
+test "$(docker image inspect "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$CANDIDATE_SHA"
+docker run --rm --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" --version
+docker run --rm --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" health --json
 az acr login --name "${ACR_LOGIN_SERVER%%.*}"
 docker buildx imagetools create --tag "${ACR_LOGIN_SERVER}/elspeth:sha-${CANDIDATE_SHA}" \
   "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}"
 ACR_DIGEST=$(az acr manifest show-metadata "${ACR_LOGIN_SERVER}/elspeth:sha-${CANDIDATE_SHA}" \
   --query digest --output tsv)
 test "$ACR_DIGEST" = "$GHCR_DIGEST"
-cosign verify "${ACR_LOGIN_SERVER}/elspeth@${ACR_DIGEST}" \
-  --certificate-identity-regexp '^https://github.com/dta-au/elspeth/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
 CANDIDATE_IMAGE="${ACR_LOGIN_SERVER}/elspeth@${ACR_DIGEST}"
 ```
+
+For a signed release, additionally verify its signature before deployment:
+
+```bash
+cosign verify "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" \
+  --certificate-identity-regexp '^https://github.com/dta-au/elspeth/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
+```
+
+Skip that signature command for an unsigned RC. Copying an OCI image index
+does not automatically copy separate Cosign signature artifacts; an ACR
+signature check is meaningful only when that reference was separately signed.
 
 ## 3. Review the change with what-if
 
@@ -262,7 +284,11 @@ curl --silent --fail-with-body "$ELSPETH_BASE_URL/api/system/status" \
 
 Require HTTP 200 on both probes, an `X-Elspeth-Instance` header (6b-3) and
 `deployment_target: azure-container-apps`. Then run the authenticated flow
-appropriate to the change.
+appropriate to the change: verify `/api/auth/me`, perform a real Composer
+request as a user with a workload role, execute a small pipeline through the
+configured LLM profile, and inspect its output/audit history. Check
+`composer_available`, `composer_missing_keys` and `tutorial_ready` in system
+status; health alone does not prove LLM or login setup.
 
 > **LIVE:** the console-log query by revision name that shows no new
 > unhandled startup or runtime failure.

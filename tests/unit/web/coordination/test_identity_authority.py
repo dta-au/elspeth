@@ -24,6 +24,7 @@ from sqlalchemy import select, update
 from elspeth.web.auth.models import AuthenticationError, IdentityClaims
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
+    LOCAL_DELETION_REASON_MAX_LENGTH,
     AdminAlreadyBootstrapped,
     AdminAuthorityRequired,
     ApproverRoleRequired,
@@ -1260,11 +1261,23 @@ def test_the_loser_of_a_first_login_race_binds_to_the_winner(engine, authority, 
 
 def test_retire_disables_and_retires_the_binding(engine, authority) -> None:
     pending = _pending(authority, "ada")
-    retired = authority.retire_identity(provider="local", subject="ada", reason="local credential deleted", record=_noop)
+    retired = authority.retire_identity(
+        provider="local",
+        subject="ada",
+        reason="local credential deleted",
+        record=_noop,
+        credential_exists=lambda: True,
+        delete_credential=lambda: None,
+    )
     assert retired is not None and retired.access_state == "disabled"
     assert retired.subject == f"ada#retired-{pending.identity_id}"
     assert authority.read_identity_by_natural_key(provider="local", subject="ada") is None
-    assert authority.retire_identity(provider="local", subject="ada", reason="again", record=_noop) is None
+    assert (
+        authority.retire_identity(
+            provider="local", subject="ada", reason="again", record=_noop, credential_exists=lambda: True, delete_credential=lambda: None
+        )
+        is None
+    )
     fresh = _pending(authority, "ada")
     assert fresh.identity_id != pending.identity_id
 
@@ -1273,7 +1286,14 @@ def test_retire_records_one_typed_outcome_and_nothing_for_an_unknown_key(engine,
     """The one mutation the pre-review found unaudited: retirement emits its event like the other eleven."""
     pending = _pending(authority, "ada")
     recorder = _Recorder()
-    retired = authority.retire_identity(provider="local", subject="ada", reason="local credential deleted", record=recorder)
+    retired = authority.retire_identity(
+        provider="local",
+        subject="ada",
+        reason="local credential deleted",
+        record=recorder,
+        credential_exists=lambda: True,
+        delete_credential=lambda: None,
+    )
     assert retired is not None
     assert len(recorder.outcomes) == 1
     outcome = recorder.outcomes[0]
@@ -1286,14 +1306,26 @@ def test_retire_records_one_typed_outcome_and_nothing_for_an_unknown_key(engine,
     # SQLite hands the stored timestamp back naive; the outcome carries the database clock as UTC.
     assert outcome.retired_at == _identity_row(engine, pending.identity_id).disabled_at.replace(tzinfo=UTC)
     # No row, no write, no event: an absent identity is not a retirement.
-    assert authority.retire_identity(provider="local", subject="nobody", reason="x", record=recorder) is None
+    assert (
+        authority.retire_identity(
+            provider="local", subject="nobody", reason="x", record=recorder, credential_exists=lambda: True, delete_credential=lambda: None
+        )
+        is None
+    )
     assert len(recorder.outcomes) == 1
 
 
 def test_a_failed_retirement_audit_rolls_the_retirement_back(engine, authority) -> None:
     pending = _pending(authority, "ada")
     with pytest.raises(_AuditOutage):
-        authority.retire_identity(provider="local", subject="ada", reason="local credential deleted", record=_refuse_audit)
+        authority.retire_identity(
+            provider="local",
+            subject="ada",
+            reason="local credential deleted",
+            record=_refuse_audit,
+            credential_exists=lambda: True,
+            delete_credential=lambda: None,
+        )
     row = _identity_row(engine, pending.identity_id)
     assert row.access_state == "pending"
     assert row.subject == "ada"
@@ -1306,16 +1338,194 @@ def test_local_identity_retirer_binds_the_local_provider_reason_and_recorder(eng
     pending = _pending(authority, "ada")
     recorder = _Recorder()
     retire = local_identity_retirer(authority, recorder)
-    retire("ada")
+    deletions: list[str] = []
+    assert retire("ada", "  left the team  ", lambda: True, lambda: deletions.append("ada")) is True
+    assert deletions == ["ada"]
     row = _identity_row(engine, pending.identity_id)
     assert row.access_state == "disabled"
-    assert row.disable_reason == "local credential deleted"
+    # The retirer composes the recorded reason: a fixed, searchable cause, then
+    # the deleting person's words. The surface never writes the reason itself.
+    assert row.disable_reason == "local credential deleted: left the team"
     assert [type(outcome) for outcome in recorder.outcomes] == [IdentityRetired]
+    assert recorder.outcomes[0].reason == "local credential deleted: left the team"
     assert recorder.outcomes[0].record.provider == "local"
     assert recorder.outcomes[0].previous_subject == "ada"
+    # No identity behind the name: the credential still goes, nothing is retired.
+    assert retire("nobody", "left the team", lambda: False, lambda: deletions.append("nobody")) is False
+    assert deletions == ["ada", "nobody"]
     impostor: Any = object()
     with pytest.raises(TypeError):
         local_identity_retirer(impostor, recorder)
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "x" * (LOCAL_DELETION_REASON_MAX_LENGTH + 1)])
+def test_local_identity_retirer_refuses_an_unusable_reason_before_touching_either_store(engine, authority, reason) -> None:
+    pending = _pending(authority, "ada")
+    recorder = _Recorder()
+    deletions: list[str] = []
+    with pytest.raises(ValueError, match="operator_reason"):
+        local_identity_retirer(authority, recorder)("ada", reason, lambda: True, lambda: deletions.append("ada"))
+    assert deletions == []
+    assert recorder.outcomes == []
+    assert _identity_row(engine, pending.identity_id).access_state == "pending"
+
+
+def test_the_longest_permitted_deletion_reason_fits_the_audit_text_bound() -> None:
+    # The audit trail truncates a text field at its bound; the administrator's
+    # words must never be the part that is cut.
+    from elspeth.web.auth.audit import MAX_AUTH_AUDIT_TEXT_LENGTH
+
+    assert len("local credential deleted: ") + LOCAL_DELETION_REASON_MAX_LENGTH <= MAX_AUTH_AUDIT_TEXT_LENGTH
+
+
+def test_retirement_refuses_the_last_active_human_admin_before_the_credential_goes(engine, authority) -> None:
+    """R5 on the retirement path, and the ORDER of the refusal.
+
+    ``disable_identity`` is refused for the last administrator, but a deleted
+    credential retires its identity without passing through it. The refusal
+    has to precede the credential deletion: the two stores share no
+    transaction, so a refusal that came afterwards could not give the
+    password back.
+    """
+    root = _bootstrap(authority)
+    deletions: list[str] = []
+    recorder = _Recorder()
+
+    with pytest.raises(LastActiveAdminProtected):
+        authority.retire_identity(
+            provider="local",
+            subject="root",
+            reason="local credential deleted",
+            record=recorder,
+            credential_exists=lambda: True,
+            delete_credential=lambda: deletions.append("root"),
+        )
+
+    assert deletions == []
+    assert recorder.outcomes == []
+    row = _identity_row(engine, root.record.identity_id)
+    assert (row.access_state, row.subject) == ("active", "root")
+    assert authority.count_active_human_admins() == 1
+
+
+def test_retirement_of_the_last_admin_completes_when_their_credential_is_already_gone(engine, authority) -> None:
+    """The recovery the two-store ordering promises, for the one person R5 would refuse.
+
+    A credential deleted whose retirement then failed leaves an active
+    administrator nobody can sign in as. Once they are the last one, refusing
+    the re-run protects no one and strands the deployment: the live row also
+    keeps ``bootstrap_admin``'s recovery inert. The probe is what tells that
+    state from a working last administrator, so it must be ASKED, and asked
+    before the deletion.
+    """
+    root = _bootstrap(authority)
+    order: list[str] = []
+
+    def credential_exists() -> bool:
+        order.append("probed")
+        return False
+
+    retired = authority.retire_identity(
+        provider="local",
+        subject="root",
+        reason="local credential deleted",
+        record=_noop,
+        credential_exists=credential_exists,
+        delete_credential=lambda: order.append("deleted"),
+    )
+
+    assert retired is not None and retired.identity_id == root.record.identity_id
+    assert order == ["probed", "deleted"]
+    assert _identity_row(engine, root.record.identity_id).access_state == "disabled"
+    assert authority.count_active_human_admins() == 0
+    # Zero administrators is the state operator recovery exists for.
+    recovered = authority.bootstrap_admin(
+        claims=IdentityClaims(provider="local", subject="recovery", username="recovery"),
+        note="recovery",
+        quota_tokens_per_day=None,
+        quota_storage_bytes=None,
+        record=_noop,
+    )
+    assert recovered.record.is_active
+
+
+def test_the_credential_probe_is_not_consulted_when_the_refusal_is_not_in_question(authority) -> None:
+    """The probe opens the other store, so it runs only when it decides something."""
+    root = _bootstrap(authority)
+    _active_sso_admin(authority, _actor(root.record.identity_id), "second")
+
+    def credential_exists() -> bool:
+        raise AssertionError("another administrator remains: nothing to probe")
+
+    assert (
+        authority.retire_identity(
+            provider="local",
+            subject="root",
+            reason="local credential deleted",
+            record=_noop,
+            credential_exists=credential_exists,
+            delete_credential=lambda: None,
+        )
+        is not None
+    )
+
+
+def test_retirement_of_an_admin_proceeds_once_another_active_human_admin_exists(engine, authority) -> None:
+    """The refusal is about the LAST administrator, not about administrators."""
+    root = _bootstrap(authority)
+    _active_sso_admin(authority, _actor(root.record.identity_id), "second")
+    deletions: list[str] = []
+
+    retired = authority.retire_identity(
+        provider="local",
+        subject="root",
+        reason="local credential deleted",
+        record=_noop,
+        credential_exists=lambda: True,
+        delete_credential=lambda: deletions.append("root"),
+    )
+
+    assert retired is not None and retired.identity_id == root.record.identity_id
+    assert deletions == ["root"]
+    assert authority.count_active_human_admins() == 1
+
+
+def test_retirement_deletes_the_credential_before_it_writes_the_identity(engine, authority) -> None:
+    """Credential first: the deletion runs before the retirement is written and recorded."""
+    pending = _pending(authority, "ada")
+    order: list[str] = []
+
+    authority.retire_identity(
+        provider="local",
+        subject="ada",
+        reason="local credential deleted",
+        record=lambda _outcome: order.append("identity retired"),
+        credential_exists=lambda: True,
+        delete_credential=lambda: order.append("credential deleted"),
+    )
+
+    assert order == ["credential deleted", "identity retired"]
+    assert _identity_row(engine, pending.identity_id).access_state == "disabled"
+
+
+def test_a_failed_credential_deletion_retires_nothing(engine, authority) -> None:
+    pending = _pending(authority, "ada")
+
+    def delete_credential() -> None:
+        raise _AuditOutage("credential store down")
+
+    with pytest.raises(_AuditOutage):
+        authority.retire_identity(
+            provider="local",
+            subject="ada",
+            reason="local credential deleted",
+            record=_noop,
+            credential_exists=lambda: True,
+            delete_credential=delete_credential,
+        )
+
+    row = _identity_row(engine, pending.identity_id)
+    assert (row.access_state, row.subject) == ("pending", "ada")
 
 
 # --------------------------------------------------------------------------

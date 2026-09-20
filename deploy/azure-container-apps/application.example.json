@@ -1,0 +1,88 @@
+{
+  "composerMaxCompositionTurns": 15,
+  "composerMaxDiscoveryTurns": 10,
+  "composerTimeoutSeconds": 180,
+  "composerRateLimitPerMinute": 10,
+  "authProvider": "entra",
+  "registrationMode": "closed",
+  "composerModel": "azure/REPLACE_PRIMARY_DEPLOYMENT",
+  "composerAdvisorModel": "azure/REPLACE_ADVISOR_DEPLOYMENT",
+  "composerEndpointBaseUrl": "",
+  "composerAdvisorEndpointBaseUrl": "",
+  "extraSecrets": [
+    {
+      "name": "azure-api-key",
+      "keyVaultUrl": "https://replace-runtime-vault.vault.azure.net/secrets/elspeth-azure-api-key/00000000000000000000000000000000"
+    },
+    {
+      "name": "sso-client-secret",
+      "keyVaultUrl": "https://replace-runtime-vault.vault.azure.net/secrets/elspeth-sso-client-secret/00000000000000000000000000000000"
+    },
+    {
+      "name": "sso-transaction-secret",
+      "keyVaultUrl": "https://replace-runtime-vault.vault.azure.net/secrets/elspeth-sso-transaction-secret/00000000000000000000000000000000"
+    }
+  ],
+  "extraEnvironment": [
+    {
+      "name": "AZURE_API_BASE",
+      "value": "https://REPLACE_AZURE_RESOURCE.openai.azure.com"
+    },
+    {
+      "name": "AZURE_API_VERSION",
+      "value": "REPLACE_AZURE_API_VERSION"
+    },
+    {
+      "name": "AZURE_API_KEY",
+      "secretRef": "azure-api-key"
+    },
+    {
+      "name": "ELSPETH_WEB__ENTRA_TENANT_ID",
+      "value": "REPLACE_ENTRA_TENANT_ID"
+    },
+    {
+      "name": "ELSPETH_WEB__SSO_CLIENT_ID",
+      "value": "REPLACE_ENTRA_CLIENT_ID"
+    },
+    {
+      "name": "ELSPETH_WEB__SSO_CLIENT_SECRET",
+      "secretRef": "sso-client-secret"
+    },
+    {
+      "name": "ELSPETH_WEB__SSO_TRANSACTION_SECRET",
+      "secretRef": "sso-transaction-secret"
+    },
+    {
+      "name": "ELSPETH_WEB__PUBLIC_BASE_URL",
+      "value": "https://REPLACE_APP_FQDN"
+    },
+    {
+      "name": "ELSPETH_WEB__COMPARTMENT_ID",
+      "value": "elspeth-rc"
+    },
+    {
+      "name": "ELSPETH_WEB__QUOTA_DEFAULT_TOKENS_PER_DAY",
+      "value": "100000"
+    },
+    {
+      "name": "ELSPETH_WEB__QUOTA_DEFAULT_STORAGE_BYTES",
+      "value": "1073741824"
+    },
+    {
+      "name": "ELSPETH_WEB__SSO_ADMIN_SUBJECTS",
+      "value": "[\"REPLACE_FIRST_ADMIN_SUBJECT\"]"
+    },
+    {
+      "name": "ELSPETH_WEB__USER_SECRETS_ENABLED",
+      "value": "false"
+    },
+    {
+      "name": "ELSPETH_WEB__LLM_PROFILES",
+      "value": "{\"standard\":{\"provider\":\"azure\",\"model\":\"REPLACE_PRIMARY_DEPLOYMENT\",\"deployment_name\":\"REPLACE_PRIMARY_DEPLOYMENT\",\"endpoint\":\"https://REPLACE_AZURE_RESOURCE.openai.azure.com\",\"api_version\":\"REPLACE_AZURE_API_VERSION\",\"credential_scope\":\"server\",\"credential_ref\":\"AZURE_API_KEY\"}}"
+    },
+    {
+      "name": "ELSPETH_WEB__DEFAULT_LLM_PROFILE",
+      "value": "standard"
+    }
+  ]
+}

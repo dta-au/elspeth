@@ -678,7 +678,7 @@ class TestRegisterEndpoint:
 
         assert response.status_code == 422
         assert not (tmp_path / "email-verifications.jsonl").exists()
-        assert provider.delete_user("bob") is False
+        assert provider.delete_user("bob", reason="left the team").removed_anything is False
 
     async def test_register_email_verified_mode_uses_configured_public_base_url(self, tmp_path) -> None:
         provider = build_local_auth_provider(tmp_path / "auth.db")

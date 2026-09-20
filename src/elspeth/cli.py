@@ -2060,14 +2060,19 @@ def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> Retir
     from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
 
-    def retire(username: str) -> None:
+    def retire(
+        username: str,
+        operator_reason: str,
+        credential_exists: Callable[[], bool],
+        delete_credential: Callable[[], None],
+    ) -> bool:
         engine = _composer_session_engine(session_db_url)
         try:
             with _composer_auth_audit_recorder(landscape_url) as recorder:
-                local_identity_retirer(
+                return local_identity_retirer(
                     RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
                     _composer_retirement_recorder(recorder),
-                )(username)
+                )(username, operator_reason, credential_exists, delete_credential)
         finally:
             engine.dispose()
 
@@ -2150,6 +2155,11 @@ def composer_users_add(
 @composer_users_app.command("remove")
 def composer_users_remove(
     username: str = typer.Argument(..., help="Local composer username to remove."),
+    reason: str = typer.Option(
+        ...,
+        "--reason",
+        help="Why the account is being removed. Recorded in the audit trail, as People & access records it.",
+    ),
     data_dir: Path = typer.Option(
         Path("data"),
         "--data-dir",
@@ -2179,9 +2189,21 @@ def composer_users_remove(
 ) -> None:
     """Remove a local Composer web user and retire the identity it was bound to."""
     from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
-    from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
+    from elspeth.web.coordination.identity_authority import (
+        LOCAL_DELETION_REASON_MAX_LENGTH,
+        LastActiveAdminProtected,
+        RepositoryIdentityAuthority,
+        local_identity_retirer,
+    )
     from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 
+    # Checked before anything is opened: a refusal here touches neither store.
+    if not reason.strip():
+        typer.echo("Error: --reason must say why the account is being removed.", err=True)
+        raise typer.Exit(1)
+    if len(reason.strip()) > LOCAL_DELETION_REASON_MAX_LENGTH:
+        typer.echo(f"Error: --reason must be at most {LOCAL_DELETION_REASON_MAX_LENGTH} characters.", err=True)
+        raise typer.Exit(1)
     db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
     if not db_path.exists():
         typer.echo(f"Error: composer auth database not found: {db_path}", err=True)
@@ -2215,7 +2237,20 @@ def composer_users_remove(
                     _composer_retirement_recorder(recorder),
                 ),
             )
-            if not provider.delete_user(username):
+            try:
+                deletion = provider.delete_user(username, reason=reason)
+            except LastActiveAdminProtected as exc:
+                # Refused before the credential was touched. ``bootstrap-admin``
+                # only answers when NO active administrator exists, so it is
+                # not the way to make the second one.
+                typer.echo(
+                    f"Error: {username} is the last active administrator, and removing this account would leave "
+                    "the deployment with nobody able to administer it. Nothing was removed.\n"
+                    "Give another person the admin role first (People & access, Roles), then run this command again.",
+                    err=True,
+                )
+                raise typer.Exit(1) from exc
+            if not deletion.removed_anything:
                 typer.echo(f"Error: composer user not found: {username}", err=True)
                 raise typer.Exit(1)
     finally:

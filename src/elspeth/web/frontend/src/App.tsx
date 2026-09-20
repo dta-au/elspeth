@@ -32,8 +32,8 @@ import { RecoveryPanel } from "./components/recovery/RecoveryPanel";
 import { RunOutcomeNotice } from "./components/execution/RunOutcomeNotice";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferencesPanel";
-import { UserAdminDialog } from "./components/settings/UserAdminDialog";
-import { AdminDialog } from "./components/admin/AdminDialog";
+import { PeopleAccessDialog } from "./components/admin/PeopleAccessDialog";
+import { fetchPeopleCapabilities } from "./api/people";
 import { MailboxDialog } from "./components/workflow/MailboxDialog";
 import { LibraryDialog } from "./components/library/LibraryDialog";
 import { HelloWorldTutorial } from "./components/tutorial";
@@ -123,15 +123,32 @@ function App() {
   const [catalogOpen, setCatalogOpen] = useState(false);
   const logout = useAuthStore((s) => s.logout);
   const authUser = useAuthStore((s) => s.user);
-  const [showUserAdmin, setShowUserAdmin] = useState(false);
-  const [showIdentityAdmin, setShowIdentityAdmin] = useState(false);
+  const [showPeopleAccess, setShowPeopleAccess] = useState(false);
+  // Whether the account menu offers People & access. Asked of the server's
+  // capability projection, once per signed-in identity: the entry must not
+  // depend on the mailbox having loaded, and it is advice only, since the
+  // panel re-reads capabilities when it opens and every route re-checks.
+  const [canAdministerPeople, setCanAdministerPeople] = useState(false);
   const [showMailbox, setShowMailbox] = useState(false);
   const [showLibrary, setShowLibrary] = useState(false);
-  const identityAdminRole = useMailboxStore((state) => state.summary?.roles.includes("admin") ?? false);
-  const openUserAdmin = useCallback(() => setShowUserAdmin(true), []);
-  const closeUserAdmin = useCallback(() => setShowUserAdmin(false), []);
-  const openIdentityAdmin = useCallback(() => setShowIdentityAdmin(true), []);
-  const closeIdentityAdmin = useCallback(() => setShowIdentityAdmin(false), []);
+  const openPeopleAccess = useCallback(() => setShowPeopleAccess(true), []);
+  const closePeopleAccess = useCallback(() => setShowPeopleAccess(false), []);
+  const peopleAccessUnavailable = useCallback(() => {
+    setShowPeopleAccess(false);
+    setCanAdministerPeople(false);
+  }, []);
+  const authIdentityId = authUser?.user_id ?? null;
+  useEffect(() => {
+    setCanAdministerPeople(false);
+    if (authIdentityId === null) return;
+    const controller = new AbortController();
+    void fetchPeopleCapabilities(controller.signal).then(
+      (capabilities) => setCanAdministerPeople(capabilities.identity_admin || capabilities.local_accounts),
+      // Unknown is not "yes": with no answer the entry stays hidden.
+      () => undefined,
+    );
+    return () => controller.abort();
+  }, [authIdentityId]);
   const openMailbox = useCallback(() => setShowMailbox(true), []);
   const closeMailbox = useCallback(() => setShowMailbox(false), []);
   const openLibrary = useCallback(() => setShowLibrary(true), []);
@@ -166,13 +183,11 @@ function App() {
   useEffect(() => {
     if (isAuthenticated) return;
     setShowMailbox(false);
-    setShowIdentityAdmin(false);
+    // Unmounting the panel is what clears its selection, its cached
+    // administrative data and any password still on screen.
+    setShowPeopleAccess(false);
     setShowLibrary(false);
   }, [isAuthenticated]);
-
-  useEffect(() => {
-    if (!identityAdminRole) setShowIdentityAdmin(false);
-  }, [identityAdminRole]);
 
   // Sync URL hash ↔ session/tab state for deep linking & back/forward
   const { redirectToast } = useHashRouter({
@@ -779,11 +794,8 @@ function App() {
           onOpenSettings={openComposerSettings}
           onSignOut={logout}
           onOpenMailbox={openMailbox}
-          onOpenIdentityAdmin={openIdentityAdmin}
           onOpenLibrary={openLibrary}
-          onOpenUserManagement={
-            authUser?.dev_admin === true ? openUserAdmin : undefined
-          }
+          onOpenPeopleAccess={canAdministerPeople ? openPeopleAccess : undefined}
         />
         {showTutorial ? (
           <div id="composer-main" className="app-main" tabIndex={-1}>
@@ -881,16 +893,10 @@ function App() {
             onResetTutorialComplete={handleResetTutorialComplete}
           />
         )}
-        {showUserAdmin && authUser !== null && (
-          <UserAdminDialog
-            onClose={closeUserAdmin}
-            currentUsername={authUser.username}
-          />
-        )}
         {showMailbox && <MailboxDialog onClose={closeMailbox} />}
         {showLibrary && <LibraryDialog onClose={closeLibrary} />}
-        {showIdentityAdmin && identityAdminRole && authUser !== null && (
-          <AdminDialog onClose={closeIdentityAdmin} currentIdentityId={authUser.user_id} />
+        {showPeopleAccess && authUser !== null && (
+          <PeopleAccessDialog onClose={closePeopleAccess} onUnavailable={peopleAccessUnavailable} />
         )}
         <CommandPalette
           isOpen={showPalette}

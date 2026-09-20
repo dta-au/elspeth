@@ -30,6 +30,7 @@ const blockerRow: DecisionRow = {
   kind: "blocker",
   id: "blocker:advisor_signoff_blocked:pipeline",
   code: "advisor_signoff_blocked",
+  componentId: "pipeline",
   detail: "Completion advisory review did not clear after the available attempts.",
   suggestion: null,
 };
@@ -140,7 +141,7 @@ describe("DecisionPanel", () => {
   it("offers Apply on a suggestion and hands back the suggestion object", () => {
     const { handlers } = renderPanel();
     fireEvent.click(
-      screen.getByRole("button", { name: /^Apply suggestion: Pipeline/ }),
+      screen.getByRole("button", { name: /^Apply optional suggestion: Pipeline/ }),
     );
     expect(handlers.onApplySuggestion).toHaveBeenCalledExactlyOnceWith(S1);
   });
@@ -160,18 +161,78 @@ describe("DecisionPanel", () => {
       applyDisabled: true,
       applyDisabledReason: "Connecting to the composer…",
     });
-    const apply = screen.getByRole("button", { name: /^Apply suggestion/ });
+    const apply = screen.getByRole("button", { name: /^Apply optional suggestion/ });
     expect(apply).toBeDisabled();
     expect(screen.getByRole("status")).toHaveTextContent("Connecting to the composer…");
     fireEvent.click(apply);
     expect(handlers.onApplySuggestion).not.toHaveBeenCalled();
   });
 
-  it("relabels Apply while a compose is in flight", () => {
-    renderPanel({ isComposing: true, applyDisabled: true });
-    expect(screen.getByRole("button", { name: /^Apply suggestion/ })).toHaveTextContent(
-      "Applying...",
+  it("relabels only the Apply that started the compose (L10)", () => {
+    const second: DecisionRow = {
+      kind: "suggestion",
+      id: "suggestion:1",
+      suggestion: { component: "other_step", message: "Second nudge.", severity: "low" } as ValidationEntryDTO,
+    };
+    const props = { rows: [blockerRow, suggestionRow, second], count: 3 };
+    const { rerender, handlers } = renderPanel(props);
+    const [first, other] = screen.getAllByRole("button", { name: /^Apply optional suggestion/ });
+    // Several suggestions: filled secondary, never bare (L3).
+    expect(first).toHaveClass("btn-compact");
+    expect(first).not.toHaveClass("btn-primary");
+    fireEvent.click(first);
+    rerender(
+      <DecisionPanel
+        {...props}
+        blockedVerbs={["save_for_review"]}
+        proposals={[]}
+        staleProposalIds={[]}
+        proposalActionPendingIds={[]}
+        isComposing
+        applyDisabled
+        applyDisabledReason={null}
+        phraseFor={phraseFor}
+        stepLabelFor={stepLabelFor}
+        {...handlers}
+      />,
     );
+    expect(first).toHaveTextContent("Applying...");
+    expect(other).toHaveTextContent("Apply");
+    expect(other).not.toHaveTextContent("Applying...");
+    expect(other).toBeDisabled();
+  });
+
+  it("does not claim a compose no row started", () => {
+    renderPanel({ isComposing: true, applyDisabled: true });
+    expect(screen.getByRole("button", { name: /^Apply optional suggestion/ })).toHaveTextContent(/^Apply$/);
+  });
+
+  it("makes a lone Apply primary and marks the suggestion optional in words (L3, L6)", () => {
+    renderPanel();
+    expect(screen.getByRole("button", { name: /^Apply optional suggestion/ })).toHaveClass("btn-primary");
+    expect(screen.getByText("Optional")).toBeInTheDocument();
+  });
+
+  it("drafts a question about a blocker and sends nothing (D4)", () => {
+    const onAskAboutBlocker = vi.fn();
+    const { handlers } = renderPanel({ onAskAboutBlocker });
+    fireEvent.click(screen.getByRole("button", {
+      name: "Ask the composer about this: Completion advisory review did not clear after the available attempts.",
+    }));
+    expect(onAskAboutBlocker).toHaveBeenCalledWith(blockerRow.kind === "blocker" ? blockerRow.detail : "", "pipeline");
+    expect(handlers.onApplySuggestion).not.toHaveBeenCalled();
+  });
+
+  it("holds Ask closed, with a visible reason, while the input holds a draft it would replace", () => {
+    const onAskAboutBlocker = vi.fn();
+    renderPanel({ onAskAboutBlocker, askDisabledReason: "Send or clear your draft before asking about a blocker." });
+    expect(screen.getByRole("button", { name: /^Ask the composer about this/ })).toBeDisabled();
+    expect(screen.getByText("Send or clear your draft before asking about a blocker.")).toBeInTheDocument();
+  });
+
+  it("renders no Ask button where there is no input to draft into", () => {
+    renderPanel();
+    expect(screen.queryByRole("button", { name: /^Ask the composer about this/ })).toBeNull();
   });
 
   it("hosts interpretation controls once without a pointer action", () => {
@@ -261,7 +322,7 @@ describe("DecisionPanel", () => {
       phraseFor, stepLabelFor, ...makeHandlers(), onEmptyFocus,
     };
     const { rerender } = render(<DecisionPanel {...props} />);
-    screen.getByRole("button", { name: /^Apply suggestion/ }).focus();
+    screen.getByRole("button", { name: /^Apply optional suggestion/ }).focus();
     rerender(<DecisionPanel {...props} rows={[blockerRow]} count={1} />);
     expect(screen.getByRole("button", { name: "Open checks" })).toHaveFocus();
     rerender(<DecisionPanel {...props} rows={[]} count={0} />);

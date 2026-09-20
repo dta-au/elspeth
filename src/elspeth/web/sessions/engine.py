@@ -19,16 +19,37 @@ busy_timeout + synchronous=NORMAL settings.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import MethodType
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event, text
+from sqlalchemy import ColumnElement, Engine, create_engine, event, func, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine.interfaces import DBAPIConnection
 
 _SESSION_WRITE_INTENT_OPTION = "elspeth_session_write_intent"
+
+# SQLite's built-in ``lower()`` folds ASCII only, so ``lower('Élodie')`` keeps
+# its capital and a case-insensitive search for the name as displayed finds
+# nothing. Every SQLite session connection carries this Unicode-aware
+# replacement under its OWN name: redefining ``lower`` itself would change the
+# meaning of any expression already stored in the schema.
+# The name is spelled again in ``session_unicode_lower``: SQLAlchemy names a
+# function by attribute, and this tree does not reach attributes dynamically.
+_SQLITE_UNICODE_LOWER = "elspeth_unicode_lower"
+
+
+def _unicode_lower(value: str | None) -> str | None:
+    return None if value is None else value.lower()
+
+
+def session_unicode_lower(engine: Engine) -> Callable[..., ColumnElement[str]]:
+    """The SQL ``lower`` that folds what Python's ``str.lower`` folds, on this engine's dialect."""
+    if engine.dialect.name == "sqlite":
+        lowered: Callable[..., ColumnElement[str]] = func.elspeth_unicode_lower
+        return lowered
+    return func.lower
 
 
 def create_session_engine(url: str, **kwargs: Any) -> Engine:
@@ -90,6 +111,7 @@ def create_session_engine(url: str, **kwargs: Any) -> Engine:
         # its own deferred BEGIN before the first DML statement, preserving the
         # read-then-write lock-upgrade race this engine is meant to close.
         dbapi_conn.isolation_level = None
+        dbapi_conn.create_function(_SQLITE_UNICODE_LOWER, 1, _unicode_lower, deterministic=True)
 
     @event.listens_for(engine, "begin")
     def _begin_immediate(conn: Connection) -> None:

@@ -5,6 +5,12 @@
 //   target="guided"   -> "Switch to guided"
 //   target="freeform" -> "Exit to freeform"  (guided body header)
 //
+// ONLY target="freeform" IS MOUNTED TODAY (ChatPanel). Ruling D1, 2026-09-20:
+// Freeform is the first-class surface for the soft launch and guided mode is
+// reached through Preferences, for new sessions. The target="guided" arm is
+// unfinished intent, not dead code — the in-session switch is to be revisited
+// after the soft launch. Do not delete it as unreferenced.
+//
 // guided -> freeform (exitToFreeform) is always non-destructive: the server
 // retains the guided state on the session. freeform -> guided (enterGuided)
 // BRANCHES on the session's history (F10b): a session that previously exited

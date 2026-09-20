@@ -14,13 +14,13 @@ describe("workflow account entries", () => {
     useMailboxStore.getState().reset();
   });
 
-  it("opens mailbox, library and live-role admin with focus returned to Account", async () => {
+  it("opens mailbox, library and People & access with focus returned to Account", async () => {
     useAuthStore.setState({ token: "test-token", user });
     useMailboxStore.setState({ summary });
     const onOpenMailbox = vi.fn();
     const onOpenLibrary = vi.fn();
-    const onOpenIdentityAdmin = vi.fn();
-    render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} onOpenMailbox={onOpenMailbox} onOpenLibrary={onOpenLibrary} onOpenIdentityAdmin={onOpenIdentityAdmin} />);
+    const onOpenPeopleAccess = vi.fn();
+    render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} onOpenMailbox={onOpenMailbox} onOpenLibrary={onOpenLibrary} onOpenPeopleAccess={onOpenPeopleAccess} />);
     const trigger = screen.getByRole("button", { name: "account menu" });
     await userEvent.click(trigger);
     await userEvent.click(screen.getByRole("button", { name: "Mailbox" }));
@@ -31,19 +31,23 @@ describe("workflow account entries", () => {
     expect(onOpenLibrary).toHaveBeenCalledOnce();
     expect(trigger).toHaveFocus();
     await userEvent.click(trigger);
-    await userEvent.click(screen.getByRole("button", { name: "Identity administration" }));
-    expect(onOpenIdentityAdmin).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole("button", { name: "People & access" }));
+    expect(onOpenPeopleAccess).toHaveBeenCalledOnce();
     expect(trigger).toHaveFocus();
   });
 
-  it("hides admin as soon as its live role leaves the summary", async () => {
+  it("never infers People & access from the mailbox summary's roles", async () => {
+    // The mailbox says "admin", but the App has not offered the entry. The
+    // menu follows the App's capability decision and nothing else: a mailbox
+    // that is slow, stale or failed must not decide whether administration exists.
     useAuthStore.setState({ token: "test-token", user });
     useMailboxStore.setState({ summary });
-    render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} onOpenMailbox={vi.fn()} onOpenIdentityAdmin={vi.fn()} />);
+    const { rerender } = render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} onOpenMailbox={vi.fn()} />);
     await userEvent.click(screen.getByRole("button", { name: "account menu" }));
-    expect(screen.getByRole("button", { name: "Identity administration" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "People & access" })).not.toBeInTheDocument();
     act(() => useMailboxStore.setState({ summary: { ...summary, roles: [] } }));
-    expect(screen.queryByRole("button", { name: "Identity administration" })).not.toBeInTheDocument();
+    rerender(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} onOpenMailbox={vi.fn()} onOpenPeopleAccess={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "People & access" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Mailbox" })).toBeInTheDocument();
   });
 });

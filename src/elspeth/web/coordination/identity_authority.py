@@ -49,7 +49,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Final, Literal, TypedDict, cast, final, get_args
 
-from sqlalchemy import bindparam, delete, insert, or_, select, update
+from sqlalchemy import ColumnElement, and_, bindparam, case, delete, func, insert, not_, or_, select, update
 from sqlalchemy.engine import Connection, Engine, Row
 from sqlalchemy.exc import IntegrityError
 
@@ -64,6 +64,7 @@ from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.coordination.identity_lifecycle import IdentityAuthorityRevoked, IdentityLifecycleEffect
 from elspeth.web.coordination.membership_authority import _database_clock_value, _ensure_utc
 from elspeth.web.coordination.mutation_connection_registry import _register_mutation_connection, _unregister_mutation_connection
+from elspeth.web.sessions.engine import session_unicode_lower
 from elspeth.web.sessions.identity_repository import (
     _IDENTITY_COLUMNS,
     EnsureIdentityOutcome,
@@ -106,6 +107,13 @@ _SERVICE_ROLES: Final = frozenset({"admin", "oversight"})
 # R7: the ancestor walk is bounded; a chain this long is refused as unprovable.
 _ANCESTOR_WALK_BOUND: Final = 64
 _LIST_LIMIT_MAX: Final = 200
+# The directory's free-text needle and its by-id label lookup are both bounded:
+# a search string is a filter, not a document, and a label lookup serves the
+# handful of counterparts on one person's approver list, not an export.
+DIRECTORY_TEXT_MAX: Final = 128
+DIRECTORY_LOOKUP_MAX: Final = 200
+_LIKE_ESCAPE: Final = "\\"
+_RETIRED_SUBJECT_MARKER: Final = "#retired-"
 # R3/D32: the ``disable_reason`` an automatic rebound disable writes.  Named
 # rather than spelled at each site because ``enable_identity`` DISPATCHES on
 # it -- re-enabling a rebound is the one re-enable that rebases the identity's
@@ -224,7 +232,7 @@ class RelationshipSelfEdge(IdentityAuthorityRefusal):
 
 @final
 class ApproverRoleRequired(IdentityAuthorityRefusal):
-    _MESSAGE = "the overseeing identity must hold an active approver role"
+    _MESSAGE = "the person who approves must hold an active Approver role; give them that role first, then assign them"
 
 
 @final
@@ -323,6 +331,62 @@ class IdentitySummary:
     disabled_at: datetime | None
     disabled_by_identity_id: str | None
     disable_reason: str | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class IdentityDirectoryQuery:
+    """One directory search: every field narrows, ``None`` does not.
+
+    ``text`` is matched LITERALLY and case-insensitively -- ``%`` and ``_``
+    are characters, not wildcards -- against what an administrator is allowed
+    to see of each row, never against what the row stores (see
+    ``search_identities``).
+    """
+
+    text: str | None
+    access_state: IdentityAccessState | None
+    provider: IdentityProviderType | None
+    kind: Literal["human", "service"] | None
+    # Local usernames whose LINKED ACCOUNT matched ``text``.  An identity
+    # prepared ahead of its first sign-in has no profile of its own and is
+    # shown under its local account's name, which lives in a store this
+    # authority cannot search; the caller that may read that store names the
+    # matches, and they join the page BEFORE it is sliced.  Meaningless
+    # without ``text``, so refused without it.
+    linked_local_subjects: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.linked_local_subjects) is not tuple:
+            raise TypeError("IdentityDirectoryQuery.linked_local_subjects must be a tuple")
+        if self.linked_local_subjects and self.text is None:
+            raise ValueError("IdentityDirectoryQuery.linked_local_subjects requires text")
+        for subject in self.linked_local_subjects:
+            _require_nonblank(subject, "IdentityDirectoryQuery.linked_local_subjects")
+        if self.text is not None:
+            _require_nonblank(self.text, "IdentityDirectoryQuery.text")
+            if len(self.text) > DIRECTORY_TEXT_MAX:
+                raise ValueError(f"IdentityDirectoryQuery.text must be at most {DIRECTORY_TEXT_MAX} characters")
+        if self.access_state is not None:
+            _require_access_state(self.access_state)
+        if self.provider is not None:
+            _require_provider(self.provider)
+        if self.kind is not None and self.kind not in ("human", "service"):
+            raise ValueError("IdentityDirectoryQuery.kind must be 'human', 'service' or None")
+
+
+def retired_subject(subject: str, identity_id: str) -> str:
+    """The subject a retired identity is rewritten to: a form no login can produce."""
+    return f"{subject}{_RETIRED_SUBJECT_MARKER}{identity_id}"
+
+
+def is_retired_identity(summary: IdentitySummary) -> bool:
+    """Whether ``retire_identity`` wrote this row's subject.
+
+    Exact, not a substring sniff: the marker is followed by the row's OWN
+    identity_id, which no provider subject can anticipate.
+    """
+    return summary.subject.endswith(f"{_RETIRED_SUBJECT_MARKER}{summary.identity_id}")
 
 
 @final
@@ -1287,6 +1351,100 @@ class RepositoryIdentityAuthority:
             ).all()
         return tuple(_summary_from_row(row) for row in rows)
 
+    def search_identities(self, *, query: IdentityDirectoryQuery, limit: int, offset: int) -> tuple[IdentitySummary, ...]:
+        """One page of the directory, filtered and ordered BEFORE it is sliced.
+
+        THE NEEDLE SEES ONLY WHAT THE ADMINISTRATOR MAY SEE.  A never-admitted
+        ``pending`` row shows its subject and organisation and nothing else
+        (spec rev2.2), so it is matched and ordered on those alone: a search
+        for an email address that found such a row would disclose, by
+        matching, exactly the field the projection withholds.  Every other
+        row is matched on its profile as well.  The predicate is the one
+        ``_PENDING_ROWS`` and the route's projection already share.
+
+        Ordered by the label the row is shown under, then ``identity_id``, so
+        a page boundary is stable and two people with one name stay in a
+        fixed order.
+        """
+        if type(query) is not IdentityDirectoryQuery:
+            raise TypeError("query must be an exact IdentityDirectoryQuery")
+        _require_limit(limit, offset)
+        never_admitted = and_(identities_table.c.access_state == "pending", identities_table.c.activated_at.is_(None))
+        shown_name = func.coalesce(func.nullif(identities_table.c.display_name, ""), identities_table.c.username)
+        # SQLite's own lower() folds ASCII only, so the engine supplies one that matches str.lower.
+        lower = session_unicode_lower(self._engine)
+        label = lower(case((never_admitted, identities_table.c.subject), else_=shown_name))
+        statement = select(identities_table)
+        if query.access_state is not None:
+            statement = statement.where(identities_table.c.access_state == query.access_state)
+        if query.provider is not None:
+            statement = statement.where(identities_table.c.provider == query.provider)
+        if query.kind is not None:
+            statement = statement.where(identities_table.c.kind == query.kind)
+        if query.text is not None:
+            escaped = (
+                query.text.lower().replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2).replace("%", f"{_LIKE_ESCAPE}%").replace("_", f"{_LIKE_ESCAPE}_")
+            )
+            needle = f"%{escaped}%"
+            shown_profile: list[ColumnElement[bool]] = [
+                lower(identities_table.c.username).like(needle, escape=_LIKE_ESCAPE),
+                lower(func.coalesce(identities_table.c.display_name, "")).like(needle, escape=_LIKE_ESCAPE),
+                lower(func.coalesce(identities_table.c.email, "")).like(needle, escape=_LIKE_ESCAPE),
+            ]
+            if query.linked_local_subjects:
+                # A linked account's name is shown under the same condition
+                # as the profile, so it is matched under that condition too.
+                shown_profile.append(
+                    and_(identities_table.c.provider == "local", identities_table.c.subject.in_(query.linked_local_subjects))
+                )
+            statement = statement.where(
+                or_(
+                    lower(identities_table.c.subject).like(needle, escape=_LIKE_ESCAPE),
+                    lower(func.coalesce(identities_table.c.organisation_id, "")).like(needle, escape=_LIKE_ESCAPE),
+                    and_(not_(never_admitted), or_(*shown_profile)),
+                )
+            )
+        statement = statement.order_by(label, identities_table.c.identity_id).limit(limit).offset(offset)
+        with self._engine.connect() as conn:
+            rows = conn.execute(statement).all()
+        return tuple(_summary_from_row(row) for row in rows)
+
+    def read_identity_summaries(self, *, identity_ids: Sequence[str]) -> tuple[IdentitySummary, ...]:
+        """The rows behind a bounded set of ids, in ``identity_id`` order; absent ids are simply absent."""
+        wanted = tuple(identity_ids)
+        if len(wanted) > DIRECTORY_LOOKUP_MAX:
+            raise ValueError(f"at most {DIRECTORY_LOOKUP_MAX} identities may be read at once")
+        for identity_id in wanted:
+            _require_nonblank(identity_id, "identity_id")
+        if not wanted:
+            return ()
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(identities_table).where(identities_table.c.identity_id.in_(wanted)).order_by(identities_table.c.identity_id)
+            ).all()
+        return tuple(_summary_from_row(row) for row in rows)
+
+    def read_local_identity_summaries(self, *, usernames: Sequence[str]) -> tuple[IdentitySummary, ...]:
+        """The identities LIVE-BOUND to local usernames: exactly ``provider='local'`` and ``subject == username``.
+
+        A retired identity's subject was rewritten, so it cannot match and a
+        recycled username correlates with its fresh identity only.
+        """
+        wanted = tuple(usernames)
+        if len(wanted) > DIRECTORY_LOOKUP_MAX:
+            raise ValueError(f"at most {DIRECTORY_LOOKUP_MAX} usernames may be correlated at once")
+        for username in wanted:
+            _require_nonblank(username, "username")
+        if not wanted:
+            return ()
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(identities_table)
+                .where(identities_table.c.provider == "local", identities_table.c.subject.in_(wanted))
+                .order_by(identities_table.c.identity_id)
+            ).all()
+        return tuple(_summary_from_row(row) for row in rows)
+
     def active_roles(self, *, identity_id: str) -> tuple[RoleGrant, ...]:
         """Unrevoked grants that have not expired at database time."""
         _require_nonblank(identity_id, "identity_id")
@@ -1309,6 +1467,19 @@ class RepositoryIdentityAuthority:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
             rows = conn.execute(_ADMIN_HOLDER_ROWS).all()
         return _active_human_admin_count(rows, now)
+
+    def active_human_admin_ids(self) -> frozenset[str]:
+        """R5's population BY IDENTITY: who the active human administrators are, not only how many.
+
+        A surface that knows only the count must warn about the last
+        administrator on every person it shows. One read, one clock, the same
+        population ``count_active_human_admins`` counts. Advisory for display:
+        the mutations decide R5 for themselves, under their own lock.
+        """
+        with self._engine.connect() as conn:
+            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            rows = conn.execute(_ADMIN_HOLDER_ROWS).all()
+        return frozenset(row.identity_id for row in rows if _is_active(row.expires_at, row.revoked_at, now))
 
     def configured_admin_seed_consumed(self) -> bool:
         """Retained human admin grants permanently consume configured seeding."""
@@ -1945,8 +2116,10 @@ class RepositoryIdentityAuthority:
         subject: str,
         reason: str,
         record: Callable[[IdentityRetired], None],
+        credential_exists: Callable[[], bool],
+        delete_credential: Callable[[], None],
     ) -> IdentityRecord | None:
-        """Retire the identity behind a credential that has been deleted.
+        """Delete a credential and retire the identity behind it.
 
         THE ROW IS NOT DELETED, and cannot be: every ownership foreign key to
         ``identities.identity_id`` is ``RESTRICT``, and the row anchors the
@@ -1957,6 +2130,44 @@ class RepositoryIdentityAuthority:
         wall.  Returns ``None`` when no identity ever existed for the key, in
         which case nothing is written and ``record`` is not invoked.
 
+        ``delete_credential`` is the caller's credential-store deletion, and
+        it runs HERE, after the refusal below and before the identity write.
+        Retirement lowers R5's count exactly as ``disable_identity`` does, but
+        a surface that deletes credentials is not necessarily an identity
+        administrator (the dev admin is named by configuration), so none of
+        ``disable_identity``'s refusals sees this path.  The credential store
+        shares no transaction with this one, so the only place the refusal
+        can be decided before the password goes AND under the lock that makes
+        it true is inside this transaction, ahead of the deletion.  A refusal
+        therefore leaves both stores untouched.
+
+        The order is still credential first, identity second.  A credential
+        deleted whose identity write then fails to commit leaves the freed
+        username bound to a live identity; re-running the removal finds no
+        credential, retires the identity it owed, and is the recovery.
+
+        THE REFUSAL PROTECTS AN ADMINISTRATOR WHO CAN SIGN IN, which is a
+        fact only the credential store holds, so the caller hands in
+        ``credential_exists`` as well.  The recovery above would otherwise be
+        refused in exactly the case that needs it: an administrator whose
+        credential went and whose retirement failed still counts toward R5,
+        so once every other administrator is removed the retry is "the last
+        administrator", can never complete, and the phantom row also keeps
+        ``bootstrap_admin``'s recovery mode inert.  A last administrator with
+        NO credential is therefore retired: nobody can sign in as them, and
+        retiring the row is what lets an operator bootstrap a working one.
+        The probe runs under R5's lock and only when the refusal is otherwise
+        decided.  A registration of the same username landing between the
+        probe and the deletion has its fresh credential deleted with the rest
+        and registers again to a fresh identity: inconvenient, and the
+        opposite of the inheritance this method exists to prevent.
+
+        The refusal holds on EVERY surface, the operator's CLI included.
+        ``bootstrap_admin``'s recovery mode is a way back from zero
+        administrators, not a reason to let one command get there: a
+        container whose only administrator was removed by accident serves
+        nobody until an operator with shell access repairs it.
+
         ``record`` runs INSIDE the transaction like every other mutation's
         callback: a retirement the audit trail cannot hold does not commit.
         """
@@ -1965,23 +2176,30 @@ class RepositoryIdentityAuthority:
         _require_nonblank(reason, "reason")
         with self._engine.begin() as conn:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            # R5's population, locked before anything else (see the constant).
+            admin_holders = conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
             existing = conn.execute(_IDENTITY_BY_NATURAL_KEY_FOR_UPDATE, {"provider": provider, "subject": subject}).one_or_none()
+            if existing is not None and existing.kind == "human" and existing.access_state == "active":
+                target_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": existing.identity_id}).all(), now)
+                if _holds_deployment_admin(target_grants) and _active_human_admin_count(admin_holders, now) <= 1 and credential_exists():
+                    raise LastActiveAdminProtected()
+            delete_credential()
             if existing is None:
                 return None
             # The identity_id makes the retired subject unique, so retiring
             # the same username twice cannot collide on the natural key.
-            retired_subject = f"{subject}#retired-{existing.identity_id}"
+            rewritten_subject = retired_subject(subject, existing.identity_id)
             conn.execute(
                 update(identities_table)
                 .where(identities_table.c.identity_id == existing.identity_id)
-                .values(subject=retired_subject, access_state="disabled", disabled_at=now, disable_reason=reason)
+                .values(subject=rewritten_subject, access_state="disabled", disabled_at=now, disable_reason=reason)
             )
             bound = _record_from_row(existing, access_state="disabled")
             outcome = IdentityRetired(
                 record=IdentityRecord(
                     identity_id=bound.identity_id,
                     provider=bound.provider,
-                    subject=retired_subject,
+                    subject=rewritten_subject,
                     username=bound.username,
                     access_state="disabled",
                 ),
@@ -3021,24 +3239,69 @@ class RepositoryIdentityAuthority:
             return outcome
 
 
+_LOCAL_DELETION_REASON_PREFIX: Final = "local credential deleted: "
+
+LOCAL_DELETION_REASON_MAX_LENGTH: Final = 480
+"""The longest reason a deleting surface may hand the retirer.
+
+The recorded reason is the fixed prefix plus this text, and the auth audit
+trail bounds a text field at 512 characters (``MAX_AUTH_AUDIT_TEXT_LENGTH``,
+which this package cannot import: ``web.auth`` depends on it, not the
+reverse). A test holds the sum under that bound, so the administrator's words
+are never the part ``_bounded_text`` cuts off.
+"""
+
+
 def local_identity_retirer(
     authority: RepositoryIdentityAuthority,
     record: Callable[[IdentityRetired], None],
-) -> Callable[[str], None]:
+) -> Callable[[str, str, Callable[[], bool], Callable[[], None]], bool]:
     """The ONE retirement collaborator for a deleted local credential.
 
     Every surface that deletes a local credential -- the web app's provider
     and the ``elspeth composer users remove`` command -- takes its
     ``retire_identity`` collaborator from here, so the provider, subject and
-    reason are decided in exactly one place (elspeth-9c171c00fa).  ``record``
+    reason are decided in exactly one place (elspeth-9c171c00fa).  A surface
+    supplies the words of the person deleting the account -- deleting must
+    cost what disabling costs, a stated reason -- and this function, not the
+    surface, composes what is recorded from them: the cause stays a fixed,
+    searchable prefix and the surface cannot record a bare string of its own.
+    ``record``
     is the surface's audit sink for the retirement, invoked inside the
     authority's transaction; a surface that audits nothing passes an explicit
-    no-op and owns that decision.
+    no-op and owns that decision.  No surface chooses whether the last active
+    human administrator is protected: see ``retire_identity``.
+
+    The returned callable takes the username, the deleting person's reason,
+    the caller's credential probe and its credential deletion, and answers
+    whether an identity was retired. A blank or over-long reason is the
+    surface's bug (each validates at its own boundary), so it raises before
+    either store is touched.
     """
     if type(authority) is not RepositoryIdentityAuthority:
         raise TypeError("authority must be an exact RepositoryIdentityAuthority")
 
-    def retire(username: str) -> None:
-        authority.retire_identity(provider="local", subject=username, reason="local credential deleted", record=record)
+    def retire(
+        username: str,
+        operator_reason: str,
+        credential_exists: Callable[[], bool],
+        delete_credential: Callable[[], None],
+    ) -> bool:
+        if type(operator_reason) is not str:
+            raise TypeError("operator_reason must be a str")
+        stated = operator_reason.strip()
+        if not stated:
+            raise ValueError("operator_reason must state why the account is being deleted")
+        if len(stated) > LOCAL_DELETION_REASON_MAX_LENGTH:
+            raise ValueError(f"operator_reason must be at most {LOCAL_DELETION_REASON_MAX_LENGTH} characters")
+        retired = authority.retire_identity(
+            provider="local",
+            subject=username,
+            reason=f"{_LOCAL_DELETION_REASON_PREFIX}{stated}",
+            record=record,
+            credential_exists=credential_exists,
+            delete_credential=delete_credential,
+        )
+        return retired is not None
 
     return retire

@@ -50,8 +50,9 @@ describe("GraphApprovals", () => {
     state.nodes[0].options.profile = "approved-documents";
     render(<><GraphApprovals events={[event]} state={state} /><GraphOutputs state={state} /></>);
     await userEvent.setup().click(screen.getByText("Approvals (1)"));
-    const labels = screen.getAllByText("profile approved-documents");
-    expect(labels).toHaveLength(2);
+    // Routing shows the binding; Approvals says in words that it is the
+    // CURRENT one, beside a value approved earlier (L4).
+    const labels = [screen.getByText("profile approved-documents"), screen.getByText("Now: profile approved-documents")];
     for (const label of labels) expect(label).toHaveClass("graph-output-detail");
   });
 
@@ -64,7 +65,8 @@ describe("GraphApprovals", () => {
     } };
     render(<><GraphApprovals events={[{ ...event, affected_node_id: "source:documents" }]} state={state} /><GraphOutputs state={state} /></>);
     await userEvent.setup().click(screen.getByText("Approvals (1)"));
-    expect(screen.getAllByText("profile approved-documents")).toHaveLength(2);
+    expect(screen.getByText("profile approved-documents")).toBeInTheDocument();
+    expect(screen.getByText("Now: profile approved-documents")).toBeInTheDocument();
   });
 
   it("shows Azure Document Intelligence model selection in both tables", async () => {
@@ -73,8 +75,7 @@ describe("GraphApprovals", () => {
     state.nodes[0].options = { model_id: "prebuilt-layout" };
     render(<><GraphApprovals events={[event]} state={state} /><GraphOutputs state={state} /></>);
     await userEvent.setup().click(screen.getByText("Approvals (1)"));
-    const labels = screen.getAllByText("model prebuilt-layout");
-    expect(labels).toHaveLength(2);
+    const labels = [screen.getByText("model prebuilt-layout"), screen.getByText("Now: model prebuilt-layout")];
     for (const label of labels) expect(label).toHaveClass("graph-output-detail");
   });
 
@@ -85,7 +86,11 @@ describe("GraphApprovals", () => {
     expect(name).toHaveTextContent("Protect the summary from page instructions for summarize_page");
     expect(within(name).getByText("summarize_page").tagName).toBe("CODE");
     expect(within(name).getByText("llm")).toHaveClass("graph-output-detail");
-    expect(within(name).getByText("profile sonnet")).toHaveClass("graph-output-detail");
+    const binding = within(name).getByText("Now: profile sonnet");
+    expect(binding).toHaveClass("graph-output-detail");
+    // Visible words, not a hover title.
+    expect(binding).not.toHaveAttribute("title");
+    expect(screen.getByRole("group", { name: "Approvals table" })).toHaveAttribute("tabindex", "0");
     expect(screen.getByText(event.accepted_value!)).toBeInTheDocument();
   });
 
