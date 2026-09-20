@@ -1229,9 +1229,29 @@ hosted server, which is why the web boundary pins `base_url` separately.
 
 ### AWS Bedrock LLM
 
-Bedrock uses LiteLLM with the ordinary AWS default credential chain. On ECS,
-grant Bedrock permissions to the task role; do not put access keys in plugin
-configuration.
+Bedrock uses LiteLLM. With no credential option set it authenticates through
+the ordinary AWS default credential chain — on ECS, grant Bedrock permissions
+to the task role and configure no keys at all. That remains the recommended
+deployment shape.
+
+Where a task role is not available, the `bedrock` provider (on both the `llm`
+transform and the `llm` source) accepts exactly one explicit credential:
+
+| Option | Meaning |
+| ------ | ------- |
+| `api_key` | An Amazon Bedrock API key, sent as a bearer token. Mutually exclusive with the three options below. |
+| `aws_access_key_id`, `aws_secret_access_key` | A static IAM credential pair; required together. |
+| `aws_session_token` | Optional; only alongside the pair, for temporary credentials. |
+
+Supply these as references, never literals: `${AWS_BEARER_TOKEN_BEDROCK}`
+expansion in batch/CLI settings, or a `{secret_ref: NAME}` marker in the web
+Composer (each destination must be authorised by
+`ELSPETH_WEB__SECRET_WIRING_ALLOWLIST`). Credential values are fingerprinted,
+never stored, and never enter the recorded LLM call. A value beginning
+`os.environ/` is refused. See
+[LLM profiles](environment-variables.md) for the profile form, which supports
+the API key only, and for the caveat that a process-level
+`AWS_BEARER_TOKEN_BEDROCK` takes precedence over IAM signing.
 
 ```yaml
 transforms:

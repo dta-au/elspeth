@@ -327,7 +327,8 @@ interactively:
   history
 - upload or create blobs, inspect schema hints, and wire blob-backed sources
 - store user secrets and wire `{secret_ref: NAME}` references without exposing raw
-  values to the composer
+  values to the composer (an operator can disable user-added secrets for a
+  server-only deployment with `ELSPETH_WEB__USER_SECRETS_ENABLED=false`)
 - ask the LLM composer to build or modify a pipeline through audited tools
 - preview validation, graph, spec, YAML, semantic contracts, and repair hints
 - start a background run, watch progress over WebSocket, cancel safely, and read

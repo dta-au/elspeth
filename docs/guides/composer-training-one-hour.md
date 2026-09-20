@@ -332,7 +332,7 @@ becomes visible on screen.
 **Slide 21 — What you can and cannot set on an LLM node.**
 - You set: the prompt, the field the answer is written to, the `Model profile`
 - The operator sets: provider, credentials, endpoint, concurrency, timeouts — via a **profile** you pick by name
-- You never type an API key into a pipeline. `API keys & secrets` (chat `More actions`) stores them; the pipeline carries a *reference*
+- You never type an API key into a pipeline. `API keys & secrets` (chat `More actions`) stores them; the pipeline carries a *reference*. On a server-only deployment the panel is read-only: it lists the keys your administrator provisioned and offers no way to add your own
 
 *Notes.* The `Composer: <model>` chip in the chat header is the model the
 *planner* uses — it is display-only, set by the deployment. The model your
