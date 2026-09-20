@@ -1422,10 +1422,10 @@
       "determinism": "external_call",
       "execution_model": "row-transform",
       "lifecycle_owners": {
-        "on_start": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "process": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "on_complete": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "close": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform"
+        "on_start": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "process": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "on_complete": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "close": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase"
       },
       "source_hash_present": true,
       "sink_effect_capability": null,

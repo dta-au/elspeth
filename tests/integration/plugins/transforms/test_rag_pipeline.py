@@ -139,7 +139,7 @@ class TestRAGPipelineIntegration:
             RetrievalChunk(content="Policy section 2", score=0.82, source_id="doc2", metadata={"page": 3}),
         ]
 
-        with patch.object(transform._provider, "search", return_value=chunks):
+        with patch.object(transform._searcher, "search", return_value=chunks):
             row = _make_row({"question": "What is the refund policy?"})
             ctx = _mock_ctx()
             result = transform.process(row, ctx)
@@ -167,7 +167,7 @@ class TestRAGPipelineIntegration:
     def test_zero_results_quarantine(self):
         transform = _create_transform_with_lifecycle(on_no_results="quarantine")
 
-        with patch.object(transform._provider, "search", return_value=[]):
+        with patch.object(transform._searcher, "search", return_value=[]):
             row = _make_row({"question": "obscure query"})
             ctx = _mock_ctx()
             result = transform.process(row, ctx)
@@ -178,7 +178,7 @@ class TestRAGPipelineIntegration:
     def test_zero_results_continue_with_sentinels(self):
         transform = _create_transform_with_lifecycle(on_no_results="continue")
 
-        with patch.object(transform._provider, "search", return_value=[]):
+        with patch.object(transform._searcher, "search", return_value=[]):
             row = _make_row({"question": "obscure query"})
             ctx = _mock_ctx()
             result = transform.process(row, ctx)

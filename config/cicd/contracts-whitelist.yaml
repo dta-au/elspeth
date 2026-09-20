@@ -471,6 +471,8 @@ allowed_dict_patterns:
 
   # RAG retrieval transform (config is user YAML — Tier 3 boundary, parsed into RAGRetrievalConfig)
   - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.__init__:config"
+  # Shared retrieval core — forwards the same raw plugin config to BaseTransform
+  - "src/elspeth/plugins/transforms/rag/core.py:RetrievalTransformBase.__init__:config"
   # _process_fn.work is now Mapping[str, Any] (IM-2 fix — the pool hands off
   # ctx.row, which is MappingProxyType after RowContext.__post_init__
   # freezes it). _QuerySuccess.fields is likewise Mapping[str, Any].

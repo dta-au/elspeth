@@ -371,7 +371,7 @@ class TestTransformLifecycle:
     def test_forward_probe_preserves_query_field_and_close_remains_safe(self) -> None:
         transform = RAGRetrievalTransform(RAGRetrievalTransform.probe_config())
         original_provider = _RetrievalProviderFake()
-        transform._provider = original_provider
+        transform._searcher = original_provider
 
         result = transform.execute_forward_invariant_probe(
             transform.forward_invariant_probe_rows(
@@ -387,7 +387,7 @@ class TestTransformLifecycle:
         assert result.row["policy__rag_context"] == "1. Probe context"
         assert result.row["policy__rag_count"] == 1
         assert result.row["policy__rag_score"] == 0.95
-        assert transform._provider is original_provider
+        assert transform._searcher is original_provider
         assert transform._on_start_called is False
         assert original_provider.search_calls == []
 
@@ -625,7 +625,7 @@ class TestProcessFlow:
             run_id="run-1",
             telemetry_emit=_TelemetrySinkFake(),
         )
-        transform._provider = provider
+        transform._searcher = provider
         transform._on_start_called = True
         auth_error = ClientAuthenticationError("DefaultAzureCredential failed")
         mock_credential = _FailingCredential(auth_error)
@@ -884,7 +884,7 @@ class TestRAGTransformReadinessGuard:
         mock_provider = self._make_mock_provider(count=10)
         transform = self._run_on_start_with_mock(mock_provider)
 
-        assert transform._provider is mock_provider
+        assert transform._searcher is mock_provider
         assert mock_provider.check_readiness_calls == 1
 
     def test_readiness_recorded_in_landscape(self) -> None:
@@ -1114,7 +1114,7 @@ class TestRAGTransformReadinessGuard:
         mock_provider = self._make_mock_provider(count=1)
         transform = self._run_on_start_with_mock(mock_provider)
 
-        assert transform._provider is mock_provider
+        assert transform._searcher is mock_provider
 
     def test_negative_count_raises(self) -> None:
         """count=-1 (corrupted response) is rejected at CollectionReadinessResult construction."""

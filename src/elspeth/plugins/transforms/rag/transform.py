@@ -1,51 +1,32 @@
 """RAG retrieval transform — enriches rows with context from vector/keyword search.
 
-Lifecycle:
-    __init__: Parse config, build QueryBuilder, initialize accumulators.
-    on_start: Construct provider via PROVIDERS registry factory.
-    process: Build query -> search -> format -> attach to row.
-    on_complete: Emit telemetry with run statistics.
-    close: Release provider and query builder resources.
+The provider-neutral work (query, search, formatting, output fields,
+telemetry) lives in ``core.RetrievalTransformBase``. This module selects the
+provider from the PROVIDERS registry and runs its on_start readiness check.
 """
 
 from __future__ import annotations
 
-import json
-import math
-from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-import structlog
-
-from elspeth.contracts import Determinism, TransformResult, propagate_contract
+from elspeth.contracts import Determinism, TransformResult
 from elspeth.contracts.coordination import WorkerMembershipToken
-from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError, TransformErrorReason
-from elspeth.contracts.events import RAGRetrievalStatistics, TelemetryEvent
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
-from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
-from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
 from elspeth.plugins.transforms.rag.config import PROVIDERS, RAGRetrievalConfig
-from elspeth.plugins.transforms.rag.formatter import format_context
-from elspeth.plugins.transforms.rag.query import QueryBuilder
+from elspeth.plugins.transforms.rag.core import RetrievalTransformBase
 
 if TYPE_CHECKING:
-    from elspeth.contracts.contexts import LifecycleContext, TransformContext
-    from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalProvider
-
-logger = structlog.get_logger(__name__)
+    from elspeth.contracts.contexts import LifecycleContext
+    from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalProvider, RetrievalSearcher
 
 
-_warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
-
-
-class RAGRetrievalTransform(BaseTransform):
+class RAGRetrievalTransform(RetrievalTransformBase):
     """Enriches rows with retrieval-augmented context from search providers.
 
     Registered as plugin name="rag_retrieval". Uses synchronous process()
@@ -60,12 +41,11 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4d1f4cd24c69f2e2"
+    source_file_hash: str | None = "sha256:505b39c4063685ec"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
-    _provider: RetrievalProvider | None
     capability_tags: tuple[str, ...] = ("rag", "retrieval", "vector-search")
 
     usage_when_to_use = (
@@ -159,104 +139,46 @@ class RAGRetrievalTransform(BaseTransform):
             def close(self) -> None:
                 return None
 
-        original_provider = self._provider
+        original_provider = self._searcher
         original_on_start_called = self._on_start_called
         probe_provider = _InvariantProvider()
         try:
-            self.__dict__["_provider"] = probe_provider
+            self.__dict__["_searcher"] = probe_provider
             self._on_start_called = True
             return super().execute_forward_invariant_probe(probe_rows, ctx)
         finally:
             self._on_start_called = original_on_start_called
-            self.__dict__["_provider"] = original_provider
+            self.__dict__["_searcher"] = original_provider
             probe_provider.close()
 
     def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__(config)
-
         self._rag_config = RAGRetrievalConfig.from_dict(config, plugin_name=self.name)
-        self._initialize_declared_input_fields(self._rag_config)
-        prefix = self._rag_config.output_prefix
+        super().__init__(config, self._rag_config)
+        self._provider_label = self._rag_config.provider
 
-        # Output field names
-        self._field_context = f"{prefix}__rag_context"
-        self._field_score = f"{prefix}__rag_score"
-        self._field_count = f"{prefix}__rag_count"
-        self._field_sources = f"{prefix}__rag_sources"
-
-        self.declared_output_fields = frozenset(
-            [
-                self._field_context,
-                self._field_score,
-                self._field_count,
-                self._field_sources,
-            ]
-        )
-        self._reject_input_options_naming_created_fields({"query_field": self._rag_config.query_field})
-
-        # Schemas — RAG adds fields, so output uses observed mode
-        self.input_schema, self.output_schema = self._create_schemas(
-            self._rag_config.schema_config,
-            self.name,
-            adds_fields=True,
-        )
-
-        # Output schema config for DAG contract propagation.
-        self._output_schema_config = self._build_output_schema_config(self._rag_config.schema_config)
-
-        # Query builder
-        self._query_builder = QueryBuilder(
-            self._rag_config.query_field,
-            query_template=self._rag_config.query_template,
-            query_pattern=self._rag_config.query_pattern,
-        )
-
-        # Welford online accumulators for telemetry
-        self._total_queries = 0
-        self._quarantine_count = 0
-        self._total_chunks = 0
-        self._score_count = 0
-        self._score_mean = 0.0
-        self._score_m2 = 0.0
-
-        # Provider — deferred to on_start()
-        self._provider: RetrievalProvider | None = None
-
-        # Lifecycle dependencies — set in on_start()
-        self._run_id: str = ""
-        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
-
-    def on_start(self, ctx: LifecycleContext) -> None:
-        """Capture lifecycle context and construct the search provider."""
-        super().on_start(ctx)
-        self._run_id = ctx.run_id
-        self._telemetry_emit = ctx.telemetry_emit
-        self._total_queries = 0
-        self._quarantine_count = 0
-        self._total_chunks = 0
-        self._score_count = 0
-        self._score_mean = 0.0
-        self._score_m2 = 0.0
-
-        # Construct provider from registry
+    def _build_searcher(self, ctx: LifecycleContext) -> RetrievalSearcher:
+        """Construct the provider from the registry and refuse an unready collection."""
         provider_name = self._rag_config.provider
         config_cls, factory = PROVIDERS[provider_name]
         provider_config = config_cls(**self._rag_config.provider_config)
         collection_name = self._configured_collection_name(provider_name, provider_config)
 
         try:
-            self._provider = factory(
+            provider: RetrievalProvider = factory(
                 provider_config,
                 execution=ctx.landscape,
                 run_id=ctx.run_id,
                 telemetry_emit=ctx.telemetry_emit,
                 limiter=(ctx.rate_limit_registry.get_limiter(provider_name) if ctx.rate_limit_registry is not None else None),
             )
+            # Held before the readiness check so close() releases a provider
+            # whose collection turns out not to be ready.
+            self._searcher = provider
 
             # Readiness check — refuse to start against empty/missing collection.
             # Two distinct failure modes: unreachable (infra problem) and empty
             # (operator error). Both crash startup, but the message distinguishes them.
-            readiness = self._provider.check_readiness()
+            readiness = provider.check_readiness()
         except RetrievalError as exc:
             self._record_readiness_check(
                 ctx,
@@ -284,170 +206,7 @@ class RAGRetrievalTransform(BaseTransform):
                 collection=readiness.collection,
                 reason=readiness.message,
             )
-
-    def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
-        """Process a single row: build query, search, format, attach."""
-        if not self._on_start_called:
-            raise RuntimeError(
-                f"{self.__class__.__name__}.process() called before on_start(). "
-                f"The orchestrator must call on_start() before processing rows."
-            )
-        if self._provider is None:
-            raise RuntimeError(
-                f"{self.__class__.__name__} provider not initialized. on_start() must construct the provider before process() is called."
-            )
-        if ctx.state_id is None:
-            raise RuntimeError(f"{self.__class__.__name__} requires state_id on TransformContext.")
-
-        # Orchestrator always provides token — None is a calling-code bug.
-        # Consistent with the state_id guard above.
-        if ctx.token is None:
-            raise RuntimeError(f"{self.__class__.__name__} requires token on TransformContext.")
-        token_id = ctx.token.token_id
-
-        # 1. Build query from row data
-        query_result = self._query_builder.build(row.to_dict())
-        if query_result.error is not None:
-            self._quarantine_count += 1
-            return TransformResult.error(
-                query_result.error,
-                retryable=False,
-            )
-
-        query = query_result.query
-        assert query is not None  # guaranteed when error is None
-
-        # 2. Search via provider — Tier 3 boundary (external call)
-        self._total_queries += 1
-        try:
-            chunks = self._provider.search(
-                query,
-                self._rag_config.top_k,
-                self._rag_config.min_score,
-                state_id=ctx.state_id,
-                token_id=token_id,
-                member_token=ctx.require_member_token(),
-                work_item=ctx.require_work_item(),
-            )
-        except RetrievalError as e:
-            if e.retryable:
-                raise  # Engine retry handles transient failures
-            self._quarantine_count += 1
-            retrieval_error_reason: TransformErrorReason = {
-                "reason": "retrieval_failed",
-                "error": str(e),
-                "cause": f"{type(e).__name__}: {e.__cause__}" if e.__cause__ else str(e),
-                "provider": self._rag_config.provider,
-            }
-            if e.status_code is not None:
-                retrieval_error_reason["status_code"] = e.status_code
-            return TransformResult.error(retrieval_error_reason, retryable=False)
-
-        # Providers surface skip evidence on the instance so the transform can
-        # persist why candidate hits were rejected even when no usable chunks remain.
-        skipped_count = self._provider.last_skipped_count
-        skipped_reasons = self._provider.last_skipped_reasons
-
-        # 3. Handle zero results
-        if not chunks:
-            if self._rag_config.on_no_results == "quarantine":
-                self._quarantine_count += 1
-                no_results_error_reason: TransformErrorReason = {
-                    "reason": "no_results",
-                    "query": query,
-                    "provider": self._rag_config.provider,
-                }
-                if skipped_count > 0:
-                    no_results_error_reason["skipped_count"] = skipped_count
-                if skipped_reasons:
-                    no_results_error_reason["skipped_reasons"] = skipped_reasons
-                return TransformResult.error(no_results_error_reason, retryable=False)
-            # on_no_results == "continue" — None sentinels preserve semantic
-            # distinction: None means "no retrieval happened", 0.0/"" would
-            # fabricate a result indistinguishable from "zero relevance".
-            output = row.to_dict()
-            output[self._field_context] = None
-            output[self._field_score] = None
-            output[self._field_count] = 0
-            output[self._field_sources] = json.dumps({"v": 1, "sources": []})
-
-            output_contract = propagate_contract(
-                input_contract=row.contract,
-                output_row=output,
-                transform_adds_fields=True,
-            )
-            output_contract = self._apply_declared_output_field_contracts(output_contract)
-            output_contract = self._align_output_contract(output_contract)
-            no_results_success_metadata: dict[str, Any] = {"chunk_count": 0, "no_results": True}
-            if skipped_count > 0:
-                no_results_success_metadata["skipped_count"] = skipped_count
-            if skipped_reasons:
-                no_results_success_metadata["skipped_reasons"] = skipped_reasons
-            return TransformResult.success(
-                PipelineRow(output, output_contract),
-                success_reason={
-                    "action": "rag_retrieval",
-                    "metadata": no_results_success_metadata,
-                },
-            )
-
-        # 4. Format context
-        self._total_chunks += len(chunks)
-        best_score = chunks[0].score  # chunks are ordered by descending score
-        self._update_score_stats(best_score)
-
-        formatted = format_context(
-            chunks,
-            format_mode=self._rag_config.context_format,
-            separator=self._rag_config.context_separator,
-            max_length=self._rag_config.max_context_length,
-        )
-
-        # 5. Build sources envelope
-        sources_envelope = {
-            "v": 1,
-            "sources": [
-                {
-                    "source_id": chunk.source_id,
-                    "score": chunk.score,
-                    "metadata": deep_thaw(chunk.metadata),
-                }
-                for chunk in chunks
-            ],
-        }
-
-        # 6. Build output row
-        output = row.to_dict()
-        output[self._field_context] = formatted.text
-        output[self._field_score] = best_score
-        output[self._field_count] = len(chunks)
-        output[self._field_sources] = json.dumps(sources_envelope)
-
-        output_contract = propagate_contract(
-            input_contract=row.contract,
-            output_row=output,
-            transform_adds_fields=True,
-        )
-        output_contract = self._apply_declared_output_field_contracts(output_contract)
-        output_contract = self._align_output_contract(output_contract)
-
-        success_metadata: dict[str, Any] = {
-            "chunk_count": len(chunks),
-            "best_score": best_score,
-            "truncated": formatted.truncated,
-        }
-        if skipped_count > 0:
-            success_metadata["skipped_count"] = skipped_count
-        if skipped_reasons:
-            success_metadata["skipped_reasons"] = skipped_reasons
-
-        return TransformResult.success(
-            PipelineRow(output, output_contract),
-            success_reason={
-                "action": "rag_retrieval",
-                "metadata": success_metadata,
-            },
-        )
+        return provider
 
     def _configured_collection_name(self, provider_name: str, provider_config: Any) -> str:
         """Read readiness identity from the nominal config for a known provider."""
@@ -489,48 +248,6 @@ class RAGRetrievalTransform(BaseTransform):
                 count=count,
                 message=message,
             )
-
-    def on_complete(self, ctx: LifecycleContext) -> None:
-        """Emit telemetry with run statistics."""
-        super().on_complete(ctx)
-        if ctx.node_id is None:
-            raise FrameworkBugError("RAG completion requires a node_id")
-        score_std = 0.0
-        if self._score_count >= 2:
-            score_std = math.sqrt(self._score_m2 / (self._score_count - 1))
-
-        event = RAGRetrievalStatistics(
-            timestamp=datetime.now(UTC),
-            run_id=self._run_id,
-            node_id=ctx.node_id,
-            plugin_name=self.name,
-            provider=self._rag_config.provider,
-            total_queries=self._total_queries,
-            total_chunks=self._total_chunks,
-            quarantine_count=self._quarantine_count,
-            score_count=self._score_count,
-            score_mean=self._score_mean if self._score_count > 0 else None,
-            score_std=score_std if self._score_count >= 2 else None,
-        )
-        self._telemetry_emit(event)
-
-    def close(self) -> None:
-        """Release provider and query builder resources."""
-        # Provider may be None if close() is called before on_start() —
-        # this is a valid lifecycle path (e.g., config validation failure
-        # before the pipeline starts). But if on_start() was called, the
-        # provider must exist — that's guaranteed by on_start's construction.
-        if self._provider is not None:
-            self._provider.close()
-        self._query_builder.close()
-
-    def _update_score_stats(self, score: float) -> None:
-        """Welford online algorithm for running mean and variance."""
-        self._score_count += 1
-        delta = score - self._score_mean
-        self._score_mean += delta / self._score_count
-        delta2 = score - self._score_mean
-        self._score_m2 += delta * delta2
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

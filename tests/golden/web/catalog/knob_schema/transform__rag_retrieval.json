@@ -61,28 +61,6 @@
         "tier": "common"
       },
       {
-        "description": "Retrieval provider name registered in the RAG provider catalog.",
-        "enum": [
-          "azure_search",
-          "chroma"
-        ],
-        "kind": "enum",
-        "label": "Provider",
-        "name": "provider",
-        "nullable": false,
-        "required": true,
-        "tier": "common"
-      },
-      {
-        "description": "Provider-specific retrieval configuration passed to the selected provider.",
-        "kind": "json-object",
-        "label": "Provider",
-        "name": "provider_config",
-        "nullable": false,
-        "required": true,
-        "tier": "common"
-      },
-      {
         "default": 5,
         "description": "Maximum number of matching documents to return for each query.",
         "kind": "number-int",
@@ -149,6 +127,28 @@
         "name": "max_context_length",
         "nullable": true,
         "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Retrieval provider name registered in the RAG provider catalog.",
+        "enum": [
+          "azure_search",
+          "chroma"
+        ],
+        "kind": "enum",
+        "label": "Provider",
+        "name": "provider",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "description": "Provider-specific retrieval configuration passed to the selected provider.",
+        "kind": "json-object",
+        "label": "Provider",
+        "name": "provider_config",
+        "nullable": false,
+        "required": true,
         "tier": "common"
       }
     ]
