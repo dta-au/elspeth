@@ -1930,6 +1930,60 @@ def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch
     assert settings.operator_metrics_bearer_token.get_secret_value() == "operator-metrics-token-from-environment-0001"
 
 
+_REQUIRED_ENV_FOR_RATE_LIMIT_TESTS = {
+    "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "30",
+    "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+    "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "20.0",
+    "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+}
+
+
+def test_settings_from_env_reads_execution_rate_limit_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operator's run rate-limit block must be settable from the environment.
+
+    A composition cannot carry ``rate_limit``, so this is the only place a web
+    deployment can raise the engine's 60 calls/minute default. ``WebSettings``
+    is loaded by a hand-rolled env reader: a nested-model field that is not
+    registered as a JSON object reaches pydantic as a raw string and crash-loops
+    the service at startup.
+    """
+    from elspeth.web.config import settings_from_env
+
+    for key, value in _REQUIRED_ENV_FOR_RATE_LIMIT_TESTS.items():
+        monkeypatch.setenv(key, value)
+
+    assert settings_from_env().execution_rate_limit.get_service_config("openrouter").requests_per_minute == 60
+
+    monkeypatch.setenv("ELSPETH_WEB__EXECUTION_RATE_LIMIT", '{"services":{"openrouter":{"requests_per_minute":60000}}}')
+    configured = settings_from_env().execution_rate_limit
+
+    assert configured.get_service_config("openrouter").requests_per_minute == 60000
+    assert configured.get_service_config("bedrock").requests_per_minute == 60
+
+
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        pytest.param("not json", RuntimeError, id="not-json"),
+        pytest.param("[1, 2]", RuntimeError, id="array-not-object"),
+        pytest.param('{"default_requests_per_minute": 0}', ValidationError, id="zero-rate"),
+        pytest.param('{"bogus": 1}', ValidationError, id="unknown-key"),
+    ],
+)
+def test_settings_from_env_rejects_malformed_execution_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, raw: str, error: type[Exception]
+) -> None:
+    from elspeth.web.config import settings_from_env
+
+    for key, value in _REQUIRED_ENV_FOR_RATE_LIMIT_TESTS.items():
+        monkeypatch.setenv(key, value)
+    assert settings_from_env().execution_rate_limit.default_requests_per_minute == 60
+
+    monkeypatch.setenv("ELSPETH_WEB__EXECUTION_RATE_LIMIT", raw)
+    with pytest.raises(error):
+        settings_from_env()
+
+
 def test_settings_from_env_derives_deployment_region_only_from_ambient_aws_region(monkeypatch: pytest.MonkeyPatch) -> None:
     import base64
 
