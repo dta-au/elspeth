@@ -30,10 +30,10 @@ epoch changes, worktree setup, dependency installation or broad staging commands
 ## Scope and precedence
 
 This document governs resumption of the ACA/multi-replica portions of the
-[July implementation plan](2026-07-26-finish-deferred-deployment-platforms.md),
-[September resume brief](2026-09-03-multi-replica-resume-brief.md),
+archived [July implementation plan](https://github.com/dta-au/elspeth/blob/888bfab53f298648379a92bc06e7bd996cae2ed9/docs/plans/2026-07-26-finish-deferred-deployment-platforms.md),
+[September resume brief](https://github.com/dta-au/elspeth/blob/888bfab53f298648379a92bc06e7bd996cae2ed9/docs/plans/2026-09-03-multi-replica-resume-brief.md),
 [release readiness plan](2026-09-04-release-0.8.0-readiness-plan.md), and
-[Phase 6b design](2026-09-04-release-0.8.0-phase6b-azure-container-apps-plan.md).
+[Phase 6b design](https://github.com/dta-au/elspeth/blob/888bfab53f298648379a92bc06e7bd996cae2ed9/docs/plans/2026-09-04-release-0.8.0-phase6b-azure-container-apps-plan.md).
 Their historical measurements remain useful history, not current task lists.
 This does not re-plan the unrelated release, Composer or signing programmes.
 

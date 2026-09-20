@@ -57,6 +57,13 @@ it only after review and wire confirmation. Closed rejection codes return
 contract facts to a bounded repair round instead of letting the model silently
 replace the operator's intent.
 
+The desktop workspace keeps authoring beside the pipeline artifact. Its
+resizable authoring pane can collapse and reopen while the Graph, Spec, YAML,
+Checks, and Run views remain available in the artifact pane. Checks collects
+readiness details; the inspector opens additional context without replacing
+the artifact. Guided and freeform sessions use this same workspace. On narrower
+screens, the views remain reachable through the workspace tabs and controls.
+
 ## How Composer Keeps Work Auditable
 
 Composer treats authoring as part of the evidence chain.

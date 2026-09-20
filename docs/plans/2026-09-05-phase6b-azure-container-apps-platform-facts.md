@@ -1,7 +1,7 @@
 # Phase 6b — Azure Container Apps platform facts (spike 6b-0)
 
 Ticket `elspeth-f966f9dc2b` (6b-0), plan of record
-`2026-09-04-release-0.8.0-phase6b-azure-container-apps-plan.md` §16. Measured
+[the archived Phase 6b plan](https://github.com/dta-au/elspeth/blob/888bfab53f298648379a92bc06e7bd996cae2ed9/docs/plans/2026-09-04-release-0.8.0-phase6b-azure-container-apps-plan.md) §16. Measured
 2026-09-05 on branch `p6b/0` at `02d10e0c1` from a host with **no Azure
 subscription, no `az`, no `psql`** (Docker 29.7.2, `jq`, `curl`, buildx v0.36.1
 present). Everything obtainable without a subscription is measured here; the

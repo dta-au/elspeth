@@ -56,6 +56,25 @@ Terraform package, the ACA Bicep bundle, and their acceptance controllers.
 
 Web startup validates existing schemas; it does not create or repair them.
 
+### Qualifying a multi-replica web target
+
+More than one web replica requires distinct external PostgreSQL databases for
+sessions and Landscape; a shared-volume SQLite database is not a replica
+coordination mode. Replicas and any jobs that read or write payloads must see
+the same persistent `data/`, `data/blobs/`, and `payloads/` tree with the
+atomic replacement and cross-client visibility that blob publication needs.
+Keep one web process per replica. Session ownership and takeover use
+database-backed fences; run execution also requires fresh Landscape
+leadership. A web lease alone cannot authorize a second engine leader.
+
+A target earns a multi-replica support claim only after its deployment package
+proves schema compatibility before readiness, safe revision overlap and drain,
+cross-replica session conflicts and dead-owner recovery, and shared blob
+visibility with real PostgreSQL and the target's storage. Qualifying routing
+without session affinity is separate from qualifying a sticky-session
+deployment. The ACA configuration below is the currently documented
+multi-replica target; the Kubernetes BYO profile below remains one replica.
+
 ## Docker Compose
 
 The maintained Compose bundle starts a local PostgreSQL container. It uses

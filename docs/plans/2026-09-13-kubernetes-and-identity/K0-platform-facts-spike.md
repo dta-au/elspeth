@@ -22,7 +22,7 @@
 
 - [ ] **Step 1: Install the pinned `kubectl` and `kind` into the lane directory, verifying both against the upstream-published checksums.**
 
-The July pins (`docs/plans/2026-07-26-finish-deferred-deployment-platforms.md:65-67`: kubectl `v1.36.3`, kind `v0.32.0`, node `v1.36.1`) have moved; the values below were fetched from `https://dl.k8s.io/release/stable.txt` and `https://api.github.com/repos/kubernetes-sigs/kind/releases/latest` on 2026-09-13. Re-run the two fetches first; if either has moved, the values they print replace these everywhere in this task and in the document (the document is the authority, this plan is the starting value).
+The July pins ([archived plan](https://github.com/dta-au/elspeth/blob/888bfab53f298648379a92bc06e7bd996cae2ed9/docs/plans/2026-07-26-finish-deferred-deployment-platforms.md), lines 65–67: kubectl `v1.36.3`, kind `v0.32.0`, node `v1.36.1`) have moved; the values below were fetched from `https://dl.k8s.io/release/stable.txt` and `https://api.github.com/repos/kubernetes-sigs/kind/releases/latest` on 2026-09-13. Re-run the two fetches first; if either has moved, the values they print replace these everywhere in this task and in the document (the document is the authority, this plan is the starting value).
 
 ```bash
 cd "$(git rev-parse --show-toplevel)" && mkdir -p .claude/lanes/k8s/bin .claude/lanes/k8s/spike && cd .claude/lanes/k8s/bin
@@ -493,7 +493,7 @@ assignments and which the `kubernetes-kind` job runs; K1's `job-provision-storag
 
 | # | plan / July design says | measured | consequence |
 |---|---|---|---|
-| C1 | July tool pins kubectl `v1.36.3`, kind `v0.32.0`, node `v1.36.1` (`docs/plans/2026-07-26-finish-deferred-deployment-platforms.md:65-67`) | `stable.txt` → `v1.37.0`; kind latest → `v0.33.0` (published 2026-08-26); default node image `v1.37.0` `[local]` §1 | every K task installs from §1; the July table is a historical record and is not edited by workstream K |
+| C1 | July tool pins kubectl `v1.36.3`, kind `v0.32.0`, node `v1.36.1` ([archived plan](https://github.com/dta-au/elspeth/blob/888bfab53f298648379a92bc06e7bd996cae2ed9/docs/plans/2026-07-26-finish-deferred-deployment-platforms.md), lines 65–67) | `stable.txt` → `v1.37.0`; kind latest → `v0.33.0` (published 2026-08-26); default node image `v1.37.0` `[local]` §1 | every K task installs from §1; the July table is a historical record and is not edited by workstream K |
 | C2 | — | the kind `v0.33.0` release body's summary line says "defaults to Kubernetes 1.36.1" while its Breaking Changes section and image list say `kindest/node:v1.37.0@sha256:a1ed56cf…` `[local]` | the image list is what `kind create cluster` pulls; the digest is authoritative, the prose is stale |
 | C3 | a clusterless `kubectl apply --dry-run=client` could validate the render in a unit test or the render job | client dry-run performs REST-mapper discovery and exits 1 with `dial tcp 127.0.0.1:8080: connect: connection refused` `[local]` §2.4 | no unit test and no clusterless CI job runs a dry-run; server admission is proven by K4's `kubectl apply -k` in kind |
 | C4 | `fsGroup: 1654` on the pod could make the share writable | `fsGroup` is not applied to `hostPath`; the share root arrives `0:0 0755` and a 1654 pod cannot `mkdir` under it until the root Job runs `[local]` §2.3 | K1 provisions the subtree from a root Job (`job-provision-storage.yaml`), never from the application pod or an initContainer |

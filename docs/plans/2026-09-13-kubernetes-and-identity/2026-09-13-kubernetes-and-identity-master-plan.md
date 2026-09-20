@@ -34,10 +34,11 @@ testcontainers (PostgreSQL 16), Kustomize via `kubectl kustomize`, kind,
 GitHub Actions, TypeScript/React/vitest for the frontend, Azure Files NFS CSI
 and Key Vault CSI for the AKS overlay.
 
-**Spec:** Workstream K argues from
-[docs/plans/2026-09-04-release-0.8.0-phase6b-azure-container-apps-plan.md](../2026-09-04-release-0.8.0-phase6b-azure-container-apps-plan.md)
-§3.5 Rollout and §4 Storage and multi-replica contract (the provider-neutral
-multi-replica bar), applied to Kubernetes. The July design
+**Spec:** Workstream K applies the
+[multi-replica qualification contract](../../reference/deployment-platforms.md#qualifying-a-multi-replica-web-target)
+to Kubernetes. The [ACA redeploy runbook](../../runbooks/azure-container-apps-existing-service-redeploy.md)
+records the rollout precedent; Kubernetes must prove its own storage and
+rollout behavior. The July design
 [docs/specs/2026-07-26-finish-deferred-deployment-platforms-design.md](../../specs/2026-07-26-finish-deferred-deployment-platforms-design.md)
 §Kubernetes Bundle still specifies `strategy: Recreate` and `replicas: 1` on
 HEAD and its §Non-Goals still excludes multiple steady-state replicas
