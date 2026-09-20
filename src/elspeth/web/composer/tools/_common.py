@@ -112,7 +112,7 @@ from elspeth.web.paths import (
 )
 from elspeth.web.plugin_policy.coverage import transform_plugin_has_capability
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
-from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
+from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
 from elspeth.web.secrets.ref_policy import (
     allowed_secret_ref_fields,
     allowed_secret_ref_fields_text,
@@ -2193,9 +2193,6 @@ def _validate_transform_provider_config_path(
 
 def _validate_transform_provider_config_policy(options: Mapping[str, Any], *, plugin: str | None = None) -> str | None:
     """Validate non-path web transform configuration policy constraints."""
-    provider_policy_error = web_rag_provider_config_policy_error(options)
-    if provider_policy_error is not None:
-        return provider_policy_error
     if transform_plugin_has_capability(plugin, PluginCapability.LLM):
         return web_llm_retry_budget_policy_error(options)
     return None

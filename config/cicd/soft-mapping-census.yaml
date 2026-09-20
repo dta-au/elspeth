@@ -970,7 +970,7 @@ files:
   src/elspeth/web/preferences/service.py:
     dict[str, object]: 2
   src/elspeth/web/provider_config_policy.py:
-    Mapping[str, Any]: 5
+    Mapping[str, Any]: 4
   src/elspeth/web/readiness.py:
     dict[str, Any]: 2
   src/elspeth/web/schema_probe.py:
@@ -1042,10 +1042,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 876
+  Mapping[str, Any]: 875
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1143
   dict[str, object]: 408
-  soft: 2746
+  soft: 2745

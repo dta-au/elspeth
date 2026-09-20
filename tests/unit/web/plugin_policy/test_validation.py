@@ -838,3 +838,52 @@ def test_validate_plugin_policy_admits_any_index_under_an_any_profile() -> None:
     executable = dict(result.executable_state.nodes[0].options)
     assert executable["api_key"] == {"secret_ref": "SEARCH_B_KEY", "secret_scope": "server"}
     assert executable["index"] == "hr-records"
+
+
+def test_trained_operator_snapshot_admits_a_raw_azure_ai_search_node() -> None:
+    """MEASURED, not assumed: the local operator surface keeps explicit raw config.
+
+    ``for_trained_operator`` is the CLI / local-MCP trust domain, where the person
+    authoring the pipeline is the person whose identity the process runs as. Web
+    requests never receive this snapshot, so admitting raw managed identity here
+    lends nobody a credential they do not already hold. It mirrors
+    ``test_trained_operator_textract_summary_retains_explicit_raw_config``.
+    """
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+    catalog = create_catalog_service()
+    trained = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    state = _search_node_state(endpoint="https://svc-a.search.windows.net", index="approved-documents", use_managed_identity=True)
+
+    result = _validate_search(state, (None, trained, catalog))
+
+    assert result.findings == ()
+    assert result.executable_state is state
+
+
+@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
+def test_raw_azure_ai_search_is_refused_on_every_plugin_bearing_node_kind(node_type: str) -> None:
+    """Successor to the managed-identity gate's node-kind sweep (elspeth-df8082552d).
+
+    That gate was option-shaped, so it fired wherever the options sat. The profile
+    requirement is keyed by plugin, so it must hold wherever the PLUGIN sits: a raw
+    managed-identity binding hosted by an aggregation or collector is refused exactly
+    like one on a transform. ``transform`` is the control.
+    """
+    from dataclasses import replace
+    from typing import Any, cast
+
+    from elspeth.web.composer.state import CompositionState
+
+    raw = cast(
+        CompositionState,
+        _search_node_state(endpoint="https://tenant-b.search.windows.net", index="payroll", use_managed_identity=True),
+    )
+    state = replace(raw, nodes=(replace(raw.nodes[0], node_type=cast(Any, node_type)),))
+
+    result = _validate_search(state)
+
+    assert [finding.error_code for finding in result.findings] == ["profile_unavailable"]
+    assert result.findings[0].component_id == "rag_1"
+    assert result.executable_state is state

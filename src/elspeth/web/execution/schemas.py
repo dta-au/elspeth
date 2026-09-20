@@ -44,7 +44,6 @@ ValidationCheckName = Literal[
     "batch_transform_options",
     "interpretation_review",
     "blob_inline_refs",
-    "managed_identity_policy",
     "llm_retry_budget_policy",
     "llm_base_url_policy",
     "llm_tracing_policy",
@@ -77,7 +76,6 @@ CHECK_SEMANTIC_CONTRACTS: Final[ValidationCheckName] = "semantic_contracts"
 CHECK_BATCH_TRANSFORM_OPTIONS: Final[ValidationCheckName] = "batch_transform_options"
 CHECK_INTERPRETATION_REVIEW: Final[ValidationCheckName] = "interpretation_review"
 CHECK_BLOB_INLINE_REFS: Final[ValidationCheckName] = "blob_inline_refs"
-CHECK_MANAGED_IDENTITY_POLICY: Final[ValidationCheckName] = "managed_identity_policy"
 CHECK_LLM_RETRY_BUDGET_POLICY: Final[ValidationCheckName] = "llm_retry_budget_policy"
 CHECK_LLM_BASE_URL_POLICY: Final[ValidationCheckName] = "llm_base_url_policy"
 CHECK_LLM_TRACING_POLICY: Final[ValidationCheckName] = "llm_tracing_policy"
@@ -114,7 +112,6 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_BATCH_TRANSFORM_OPTIONS,
     CHECK_INTERPRETATION_REVIEW,
     CHECK_BLOB_INLINE_REFS,
-    CHECK_MANAGED_IDENTITY_POLICY,
     CHECK_LLM_RETRY_BUDGET_POLICY,
     CHECK_LLM_BASE_URL_POLICY,
     CHECK_LLM_TRACING_POLICY,

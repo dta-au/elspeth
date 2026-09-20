@@ -182,7 +182,6 @@ def test_core_names_are_the_24_name_canonical_prefix() -> None:
         "batch_transform_options",
         "interpretation_review",
         "blob_inline_refs",
-        "managed_identity_policy",
         "llm_retry_budget_policy",
         "llm_base_url_policy",
         "llm_tracing_policy",
@@ -384,7 +383,7 @@ def test_pass_after_terminal_failure_raises() -> None:
 def test_advisory_before_all_core_passes_raises() -> None:
     ledger = ValidationLedger()
 
-    with pytest.raises(RuntimeError, match="all 24 core checks"):
+    with pytest.raises(RuntimeError, match="all 23 core checks"):
         ledger.record_advisory(_check(CHECK_IDENTITY_NODE_ADVISORY, passed=True))
 
 
@@ -454,7 +453,7 @@ def test_finish_success_accepts_each_registered_advisory_name() -> None:
 
     result = ledger.finish_success(readiness=_ready_readiness())
 
-    assert [check.name for check in result.checks[24:]] == [
+    assert [check.name for check in result.checks[23:]] == [
         CHECK_IDENTITY_NODE_ADVISORY,
         CHECK_GATE_FAN_OUT_ADVISORY,
     ]
@@ -482,8 +481,8 @@ def test_finish_success_permits_zero_or_more_identity_advisories(advisory_count:
     )
 
     assert result.is_valid is True
-    assert [check.name for check in result.checks[:24]] == list(CORE_VALIDATION_CHECK_NAMES)
-    assert [check.name for check in result.checks[24:]] == [CHECK_IDENTITY_NODE_ADVISORY] * advisory_count
+    assert [check.name for check in result.checks[:23]] == list(CORE_VALIDATION_CHECK_NAMES)
+    assert [check.name for check in result.checks[23:]] == [CHECK_IDENTITY_NODE_ADVISORY] * advisory_count
     assert result.errors == []
     assert result.warnings == [_warning("graph.warning")]
     assert result.readiness == _ready_readiness()
@@ -607,7 +606,7 @@ def test_finish_success_before_all_core_passes_raises() -> None:
     ledger = ValidationLedger()
     ledger.record_pass(_check(CHECK_PLUGIN_ENABLEMENT, passed=True))
 
-    with pytest.raises(RuntimeError, match="all 24 core checks"):
+    with pytest.raises(RuntimeError, match="all 23 core checks"):
         ledger.finish_success(readiness=_ready_readiness())
 
 

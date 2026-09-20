@@ -186,7 +186,7 @@ from elspeth.web.plugin_policy.coverage import node_has_capability
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
-from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
+from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import (
@@ -1451,7 +1451,7 @@ class ExecutionServiceImpl:
         session_id: UUID | None,
         session_operation_context: SessionOperationContext,
     ) -> ValidationResult:
-        """Run the canonical 24 checks and bounded source proof in one worker."""
+        """Run the canonical 23 checks and bounded source proof in one worker."""
         from elspeth.web.composer.tools.generation import compute_proof_diagnostics
         from elspeth.web.composer.yaml_generator import derive_guided_blob_refs_for_admission_proof
         from elspeth.web.execution.validation import validate_pipeline
@@ -2004,33 +2004,6 @@ class ExecutionServiceImpl:
         for node in policy_result.executable_state.nodes:
             if node.plugin is None:
                 continue
-            provider_policy_error = web_rag_provider_config_policy_error(node.options)
-            if provider_policy_error is not None:
-                raise PipelineValidationError(
-                    errors=(
-                        ValidationError(
-                            component_id=node.id,
-                            component_type="transform",
-                            message=provider_policy_error,
-                            suggestion="Use api_key authentication or an operator-controlled named connector/allowlist.",
-                            error_code=None,
-                        ),
-                    ),
-                    readiness=ValidationReadiness(
-                        authoring_valid=False,
-                        execution_ready=False,
-                        completion_ready=False,
-                        blockers=[
-                            ValidationReadinessBlocker(
-                                code="managed_identity_policy",
-                                suggestion=None,
-                                component_id=node.id,
-                                component_type="transform",
-                                detail=f"{node.node_type} {node.id} enables managed identity from web-authored provider_config",
-                            )
-                        ],
-                    ),
-                )
             llm_retry_policy_error = (
                 web_llm_retry_budget_policy_error(node.options) if node_has_capability(node, PluginCapability.LLM) else None
             )
