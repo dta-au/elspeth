@@ -768,7 +768,7 @@ array of operator-owned search-service profiles. Each entry carries:
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `alias` | yes | the opaque name a web author selects as `profile`; unique across the array |
-| `endpoint` | yes | `https://<service>.search.windows.net`; never shown to web authors |
+| `endpoint` | yes | `https://<service>.search.windows.net`; never authored or offered on the authoring surface. It is not a secret: recorded search calls and authentication-failure messages name it |
 | `auth` | yes | `managed_identity` or `api_key` |
 | `client_id` | no | user-assigned identity client id; only with `managed_identity` |
 | `credential_ref` | with `api_key` | name of the server-scoped secret holding the query key; refused with `managed_identity` |
@@ -786,7 +786,11 @@ admits, and the ordinary retrieval options. `endpoint`, `api_key`,
 `use_managed_identity`, `client_id` and `api_version` are operator-owned
 bindings lowered only for execution and are refused in a web-authored pipeline.
 An `api_key` profile injects its server secret itself, so it needs no
-`ELSPETH_WEB__SECRET_WIRING_ALLOWLIST` rule.
+`ELSPETH_WEB__SECRET_WIRING_ALLOWLIST` rule. The secret still has to resolve:
+`credential_ref` must be listed in `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST`, the
+variable it names must be set, and `ELSPETH_FINGERPRINT_KEY` must be present.
+None of these is checked at start-up; a profile whose secret does not resolve
+simply reads as unavailable.
 
 Two other things gate it:
 

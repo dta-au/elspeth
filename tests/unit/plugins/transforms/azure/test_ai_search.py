@@ -11,8 +11,11 @@ import pytest
 from elspeth.contracts.azure_ai_search import AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.core.landscape.plugin_audit_writer import PluginAuditWriterAdapter
+from elspeth.core.rate_limit.registry import RateLimitRegistry
 from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProvider
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -157,8 +160,10 @@ def test_limiter_is_keyed_by_search_service_host() -> None:
 
 
 def test_build_searcher_asks_the_registry_for_the_host_keyed_limiter() -> None:
-    registry = MagicMock()
-    ctx = SimpleNamespace(landscape=MagicMock(), run_id="run-1", telemetry_emit=lambda event: None, rate_limit_registry=registry)
+    registry = MagicMock(spec=RateLimitRegistry)
+    ctx = SimpleNamespace(
+        landscape=MagicMock(spec=PluginAuditWriterAdapter), run_id="run-1", telemetry_emit=lambda event: None, rate_limit_registry=registry
+    )
     searcher = AzureAISearchTransform(_BASE)._build_searcher(ctx)
     try:
         assert isinstance(searcher, AzureSearchProvider)
@@ -170,7 +175,7 @@ def test_build_searcher_asks_the_registry_for_the_host_keyed_limiter() -> None:
 def test_declares_runtime_preflight_and_never_records_a_readiness_check() -> None:
     assert AzureAISearchTransform.requires_runtime_preflight is True
     transform = AzureAISearchTransform(_BASE)
-    ctx = _ctx(record_readiness_check=MagicMock())
+    ctx = _ctx(record_readiness_check=MagicMock(spec=PluginContext.record_readiness_check))
     searcher = _ready(transform, CollectionReadinessResult(collection="approved-documents", reachable=True, count=3, message="ok"))
     transform.runtime_preflight(ctx)
     ctx.record_readiness_check.assert_not_called()
