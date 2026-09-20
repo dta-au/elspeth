@@ -143,12 +143,11 @@ def client_anonymous() -> Iterator[TestClient]:
 # ---------------------------------------------------------------------------
 
 
-def test_get_returns_guided_default_for_brand_new_user(client_as_alice: TestClient) -> None:
+def test_get_returns_freeform_default_for_brand_new_user(client_as_alice: TestClient) -> None:
     response = client_as_alice.get("/api/composer-preferences")
     assert response.status_code == 200
     body = response.json()
-    assert body["default_mode"] == "guided"
-    assert body["banner_dismissed_at"] is None
+    assert body["default_mode"] == "freeform"
     assert body["freeform_intro_dismissed_at"] is None
     assert body["tutorial_completed_at"] is None
 
@@ -165,16 +164,16 @@ def test_patch_updates_default_mode(client_as_alice: TestClient) -> None:
     assert follow_up.json()["default_mode"] == "freeform"
 
 
-def test_patch_persists_banner_dismissal(client_as_alice: TestClient) -> None:
+def test_patch_persists_intro_dismissal(client_as_alice: TestClient) -> None:
     response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"banner_dismissed_at": "2026-05-15T12:00:00Z"},
+        json={"freeform_intro_dismissed_at": "2026-05-15T12:00:00Z"},
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["banner_dismissed_at"] is not None
+    assert body["freeform_intro_dismissed_at"] is not None
     # SQLite strips tzinfo; the value is preserved either way.
-    assert "2026-05-15T12:00:00" in body["banner_dismissed_at"]
+    assert "2026-05-15T12:00:00" in body["freeform_intro_dismissed_at"]
 
 
 def test_patch_persists_freeform_intro_dismissal(client_as_alice: TestClient) -> None:
@@ -192,7 +191,7 @@ def test_patch_persists_freeform_intro_dismissal(client_as_alice: TestClient) ->
 def test_patch_sets_tutorial_completed_at(client_as_alice: TestClient) -> None:
     response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"tutorial_completed_at": "2026-05-15T12:30:00Z"},
+        json={"default_mode": "freeform", "tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T12:30:00Z"},
     )
     assert response.status_code == 200
     assert "2026-05-15T12:30:00" in response.json()["tutorial_completed_at"]
@@ -203,6 +202,7 @@ def test_patch_atomic_finalisation_payload(client_as_alice: TestClient) -> None:
         "/api/composer-preferences",
         json={
             "default_mode": "freeform",
+            "tutorial_completed_via": "complete",
             "tutorial_completed_at": "2026-05-15T12:35:00Z",
         },
     )
@@ -212,31 +212,31 @@ def test_patch_atomic_finalisation_payload(client_as_alice: TestClient) -> None:
     assert "2026-05-15T12:35:00" in body["tutorial_completed_at"]
 
 
-def test_patch_with_explicit_null_clears_banner_dismissal(client_as_alice: TestClient) -> None:
-    """PATCH ``{"banner_dismissed_at": null}`` re-shows the banner. Symmetric
+def test_patch_with_explicit_null_clears_intro_dismissal(client_as_alice: TestClient) -> None:
+    """PATCH ``{"freeform_intro_dismissed_at": null}`` re-shows the intro. Symmetric
     with the tutorial-clear route test below."""
     set_response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"banner_dismissed_at": "2026-05-15T12:45:00Z"},
+        json={"freeform_intro_dismissed_at": "2026-05-15T12:45:00Z"},
     )
     assert set_response.status_code == 200
-    assert set_response.json()["banner_dismissed_at"] is not None
+    assert set_response.json()["freeform_intro_dismissed_at"] is not None
 
     clear_response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"banner_dismissed_at": None},
+        json={"freeform_intro_dismissed_at": None},
     )
     assert clear_response.status_code == 200
-    assert clear_response.json()["banner_dismissed_at"] is None
+    assert clear_response.json()["freeform_intro_dismissed_at"] is None
 
     follow_up = client_as_alice.get("/api/composer-preferences")
-    assert follow_up.json()["banner_dismissed_at"] is None
+    assert follow_up.json()["freeform_intro_dismissed_at"] is None
 
 
 def test_patch_with_explicit_null_clears_tutorial(client_as_alice: TestClient) -> None:
     set_response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"tutorial_completed_at": "2026-05-15T12:40:00Z"},
+        json={"default_mode": "freeform", "tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T12:40:00Z"},
     )
     assert set_response.status_code == 200
     assert set_response.json()["tutorial_completed_at"] is not None
@@ -305,14 +305,14 @@ def test_users_cannot_see_each_others_preferences(
     # Alice sets freeform on the shared DB.
     resp = cross_user_alice.patch(
         "/api/composer-preferences",
-        json={"default_mode": "freeform"},
+        json={"default_mode": "guided"},
     )
     assert resp.status_code == 200
 
-    # Bob on the SAME DB still sees the guided default.
+    # Bob on the SAME DB still sees the Freeform default.
     bob_resp = cross_user_bob.get("/api/composer-preferences")
     assert bob_resp.status_code == 200
-    assert bob_resp.json()["default_mode"] == "guided"
+    assert bob_resp.json()["default_mode"] == "freeform"
 
 
 def test_patch_enforces_rate_limit_returns_429() -> None:
@@ -456,7 +456,7 @@ def test_completion_clears_tutorial_progress_over_http(client_as_alice: TestClie
 
     response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"tutorial_completed_at": "2026-05-15T13:00:00Z"},
+        json={"default_mode": "freeform", "tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T13:00:00Z"},
     )
     assert response.status_code == 200
     body = response.json()
@@ -471,3 +471,51 @@ def test_patch_persists_show_advanced(client_as_alice: TestClient) -> None:
     assert response.status_code == 200
     assert response.json()["show_advanced"] is True
     assert client_as_alice.get("/api/composer-preferences").json()["show_advanced"] is True
+
+
+@pytest.mark.parametrize("intent", ["complete", "skip", "exit"])
+def test_completion_requires_intent_and_freeform_over_http(client_as_alice: TestClient, intent: str) -> None:
+    payload = {
+        "tutorial_completed_at": "2026-09-20T00:00:00Z",
+        "tutorial_completed_via": intent,
+        "default_mode": "freeform",
+    }
+    for missing in ("tutorial_completed_via", "default_mode"):
+        response = client_as_alice.patch(
+            "/api/composer-preferences",
+            json={key: value for key, value in payload.items() if key != missing},
+        )
+        assert response.status_code == 422
+    response = client_as_alice.patch("/api/composer-preferences", json={**payload, "default_mode": "guided"})
+    assert response.status_code == 422
+    response = client_as_alice.patch("/api/composer-preferences", json=payload)
+    assert response.status_code == 200
+    assert response.json()["default_mode"] == "freeform"
+    assert response.json()["tutorial_completed_at"] is not None
+    assert "tutorial_completed_via" not in response.json()
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [{"tutorial_stage": "guided"}, {"tutorial_session_id": "stale"}, {"tutorial_run_id": "stale"}, {"tutorial_source_data_hash": "stale"}],
+)
+def test_late_progress_cannot_resurrect_completed_tutorial(client_as_alice: TestClient, progress: dict[str, str]) -> None:
+    endpoint = "/api/composer-preferences"
+    completed = client_as_alice.patch(
+        endpoint,
+        json={
+            "tutorial_completed_at": "2026-09-20T00:00:00Z",
+            "tutorial_completed_via": "exit",
+            "default_mode": "freeform",
+        },
+    )
+    assert completed.status_code == 200
+    stored_before = client_as_alice.get(endpoint).json()
+    response = client_as_alice.patch(endpoint, json={**progress, "default_mode": "guided"})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "tutorial_progress_conflict"
+    assert client_as_alice.get(endpoint).json() == stored_before
+    # Clearing progress remains harmless; an explicit reset permits a retake.
+    assert client_as_alice.patch(endpoint, json=dict.fromkeys(progress)).status_code == 200
+    assert client_as_alice.patch(endpoint, json={"tutorial_completed_at": None}).status_code == 200
+    assert client_as_alice.patch(endpoint, json=progress).status_code == 200

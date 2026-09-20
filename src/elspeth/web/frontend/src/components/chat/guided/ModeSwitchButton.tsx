@@ -2,7 +2,7 @@
 // ModeSwitchButton — the symmetric guided<->freeform mode toggle.
 //
 // One component for BOTH directions:
-//   target="guided"   -> "Switch to guided"  (freeform body header)
+//   target="guided"   -> "Switch to guided"  (Composer options disclosure)
 //   target="freeform" -> "Exit to freeform"  (guided body header)
 //
 // guided -> freeform (exitToFreeform) is always non-destructive: the server

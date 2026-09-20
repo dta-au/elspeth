@@ -1590,7 +1590,7 @@ def _create_app(
     app.state.auth_provider = auth_provider
 
     # --- Preferences service ---
-    # Per-user composer settings (default_composer_mode, banner_dismissed_at,
+    # Per-user composer settings (default_composer_mode, freeform_intro_dismissed_at,
     # tutorial_completed_at).
     # Shares the session engine; preferences live on the same metadata.
     app.state.preferences_service = PreferencesService(session_engine)

@@ -1,5 +1,5 @@
 import { StrictMode, type ReactNode } from "react";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TutorialGuidedShell } from "./TutorialGuidedShell";
 import {
@@ -456,6 +456,8 @@ describe("TutorialGuidedShell", () => {
     const sessionId = "00000000-0000-4000-8000-000000000701";
     let resolveStart: (value: unknown) => void = () => undefined;
     const exitRequestedRef = { current: false };
+    const onExited = vi.fn();
+    const onCompleted = vi.fn();
     seedGuidedMock.mockReturnValueOnce(
       new Promise((resolve) => {
         resolveStart = resolve;
@@ -464,7 +466,8 @@ describe("TutorialGuidedShell", () => {
     render(
       <TutorialGuidedShell
         sessionId={sessionId}
-        onCompleted={vi.fn()}
+        onCompleted={onCompleted}
+        onExited={onExited}
         exitRequestedRef={exitRequestedRef}
       />,
     );
@@ -476,6 +479,7 @@ describe("TutorialGuidedShell", () => {
       ),
     );
 
+    expect(useSessionStore.getState().guidedSession).toBeNull();
     exitRequestedRef.current = true;
     resolveStart({});
 
@@ -492,6 +496,9 @@ describe("TutorialGuidedShell", () => {
         control_signal: "exit_to_freeform",
       }),
     );
+    await waitFor(() => expect(onExited).toHaveBeenCalledExactlyOnceWith(sessionId));
+    expect(onCompleted).not.toHaveBeenCalled();
+    expect(useSessionStore.getState().guidedSession?.terminal?.kind).toBe("exited_to_freeform");
     expect(getTutorialSampleMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId("chat-panel-stub")).not.toBeInTheDocument();
   });
@@ -950,6 +957,24 @@ describe("TutorialGuidedShell", () => {
     );
     await Promise.resolve();
     expect(onExited).not.toHaveBeenCalled();
+  });
+
+  it("retries failed startup and completes a queued exit without observing a live wizard", async () => {
+    const onExited = vi.fn();
+    const onCompleted = vi.fn();
+    const exitRequestedRef = { current: false };
+    seedGuidedMock.mockRejectedValueOnce(new Error("start failed"));
+    render(<TutorialGuidedShell sessionId="00000000-0000-4000-8000-000000000711" onCompleted={onCompleted} onExited={onExited} exitRequestedRef={exitRequestedRef} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("start failed");
+    expect(useSessionStore.getState().guidedSession).toBeNull();
+    exitRequestedRef.current = true;
+    fireEvent.click(screen.getByRole("button", { name: "Retry tutorial startup" }));
+    await waitFor(() => expect(onExited).toHaveBeenCalledExactlyOnceWith("00000000-0000-4000-8000-000000000711"));
+    expect(seedGuidedMock).toHaveBeenCalledTimes(2);
+    expect(respondGuidedMock).toHaveBeenCalledTimes(1);
+    expect(useSessionStore.getState().guidedSession?.terminal?.kind).toBe("exited_to_freeform");
+    expect(onCompleted).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("shows a user-visible error if guided startup fails", async () => {

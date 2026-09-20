@@ -7,7 +7,7 @@ PATCH /api/composer-preferences must emit:
   - ``record_mode_opted_in`` when ``default_mode == "guided"`` in the
     response.
   - **Neither** when the PATCH did not include ``default_mode``
-    (banner-dismissal-only PATCH).
+    (intro-dismissal-only PATCH).
 
 Semantic pinning (B3-r3, load-bearing). The emit is a **set-rate**, not
 a transition-rate: a PATCH with ``{"default_mode": "freeform"}`` against
@@ -137,21 +137,21 @@ def test_patch_with_default_mode_guided_emits_mode_opted_in_total(
 
 
 # ---------------------------------------------------------------------------
-# Negative — banner-dismissal-only PATCH must NOT emit either counter
+# Negative — intro-dismissal-only PATCH must NOT emit either counter
 # ---------------------------------------------------------------------------
 
 
 def test_patch_without_default_mode_emits_neither_mode_counter(
     client: TestClient,
 ) -> None:
-    """A PATCH that only sets ``banner_dismissed_at`` must not fire
+    """A PATCH that only sets ``freeform_intro_dismissed_at`` must not fire
     either mode-related counter (the ``mode_changed`` field-presence
     flag is False in this case)."""
     telemetry = client.app.state.sessions_telemetry
 
     response = client.patch(
         "/api/composer-preferences",
-        json={"banner_dismissed_at": "2026-05-19T12:00:00Z"},
+        json={"freeform_intro_dismissed_at": "2026-05-19T12:00:00Z"},
     )
     assert response.status_code == 200
 

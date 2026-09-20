@@ -35,7 +35,6 @@ import { axe } from "./axe-config";
 const AUDITED_COMPONENTS = [
   "ComposerPreferencesPanel",
   "UserMenu",
-  "DefaultModeChangedBanner",
   "AuditReadinessPanel",
   "ReadinessRowDetail",
   "ExplainDialog",
@@ -124,7 +123,6 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "ComposerPreferencesPanel",
   "CompletionBar",
   "ConfirmDialog",
-  "DefaultModeChangedBanner",
   "ExplainDialog",
   "FilterChipStrip",
   "GraphMiniView",
@@ -296,7 +294,6 @@ vi.mock("@/hooks/useWebSocket", () => ({
 
 import { ComposerPreferencesPanel } from "@/components/settings/ComposerPreferencesPanel";
 import { UserMenu } from "@/components/common/UserMenu";
-import { DefaultModeChangedBanner } from "@/components/common/DefaultModeChangedBanner";
 import { AuditReadinessPanel } from "@/components/audit/AuditReadinessPanel";
 import { ReadinessRowDetail } from "@/components/audit/ReadinessRowDetail";
 import { ExplainDialog } from "@/components/audit/ExplainDialog";
@@ -387,10 +384,9 @@ function resetAllStores() {
   usePreferencesStore.setState({
     loaded: true,
     defaultMode: "guided",
-    bannerDismissedAt: null,
     writing: false,
     writeError: null,
-    optedOutAtSessionId: null,
+    bootstrapError: null,
   });
   useSessionStore.setState({
     activeSessionId: "sess-a11y",
@@ -658,21 +654,6 @@ describe("SchemaFormTurn", () => {
 
   it("has no axe violations in tutorial summary mode", async () => {
     const { container } = render(<SchemaFormTurn payload={auditPayload} onSubmit={() => {}} isTutorial />);
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("DefaultModeChangedBanner", () => {
-  it("has no axe violations", async () => {
-    // Banner only renders when the user has opted out (defaultMode=freeform)
-    // and the banner hasn't been dismissed and the user is not in the
-    // session of opt-out. Configure the store so the banner mounts.
-    usePreferencesStore.setState({
-      defaultMode: "freeform",
-      bannerDismissedAt: null,
-      optedOutAtSessionId: "other-session",
-    });
-    const { container } = render(<DefaultModeChangedBanner />);
     expect(await axe(container)).toHaveNoViolations();
   });
 });

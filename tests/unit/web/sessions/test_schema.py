@@ -23,6 +23,7 @@ from elspeth.web.sessions.models import (
     runs_table,
     session_operation_fences_table,
     sessions_table,
+    user_preferences_table,
     user_secrets_table,
     web_instances_table,
     websocket_tickets_table,
@@ -105,6 +106,13 @@ def _seed_session_state(conn) -> tuple[str, str]:
         )
     )
     return session_id, state_id
+
+
+def test_preferences_omitted_mode_uses_freeform_database_default(engine) -> None:
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="default-mode")
+        conn.execute(insert(user_preferences_table).values(user_id="default-mode", updated_at=datetime.now(UTC)))
+        assert conn.execute(select(user_preferences_table.c.default_composer_mode)).scalar_one() == "freeform"
 
 
 def _seed_run(conn) -> str:
@@ -283,7 +291,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
-    assert SESSION_SCHEMA_EPOCH == 60
+    # Epoch 61 defaults preferences to freeform and retires the mode banner.
+    assert SESSION_SCHEMA_EPOCH == 61
     expected_tables = frozenset(
         {
             "web_instances",

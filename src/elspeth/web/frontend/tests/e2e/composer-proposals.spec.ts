@@ -101,7 +101,6 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
     await route.fulfill({
       json: {
         default_mode: "freeform",
-        banner_dismissed_at: null,
         freeform_intro_dismissed_at: null,
         tutorial_completed_at: "2026-05-14T00:00:00Z",
         tutorial_stage: null,

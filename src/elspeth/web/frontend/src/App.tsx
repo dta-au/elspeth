@@ -26,7 +26,6 @@ import {
 } from "./components/common/AppNoticeCenter";
 import { ShortcutsHelp } from "./components/common/ShortcutsHelp";
 import { ClassificationBanner } from "./components/common/ClassificationBanner";
-import { DefaultModeChangedBanner } from "./components/common/DefaultModeChangedBanner";
 import { ChatPanel } from "./components/chat/ChatPanel";
 import { CatalogDrawer } from "./components/catalog/CatalogDrawer";
 import { RecoveryPanel } from "./components/recovery/RecoveryPanel";
@@ -206,8 +205,9 @@ function App() {
   const bootstrapPrefs = usePreferencesStore((s) => s.bootstrap);
   const preferencesLoaded = usePreferencesStore((s) => s.loaded);
   const tutorialCompleted = usePreferencesStore(selectTutorialCompleted);
-  const preferencesWriteError = usePreferencesStore((s) => s.writeError);
-  // I5: when bootstrap failed (writeError is set), tutorialCompleted is at
+  const preferencesError = usePreferencesStore((s) => s.bootstrapError ?? s.writeError);
+  const preferencesBootstrapError = usePreferencesStore((s) => s.bootstrapError);
+  // When bootstrap failed, tutorialCompleted is at
   // its initial-state default of false — but that's "we don't know," not
   // "definitively not completed." Showing the tutorial on the failure
   // branch would re-prompt a returning user who has already completed it
@@ -215,7 +215,7 @@ function App() {
   // unknown state as "don't surface tutorial," consistent with the
   // no-fabrication contract in the store.
   const showTutorial =
-    preferencesLoaded && !tutorialCompleted && preferencesWriteError === null;
+    preferencesLoaded && !tutorialCompleted && preferencesBootstrapError === null;
 
   // Returning-user auto-resume (elspeth-e69642fede): once sessions have
   // loaded, select the most recently active one instead of landing on an
@@ -224,7 +224,7 @@ function App() {
   // preferences to settle before deciding), the shared-inspect route, and
   // hash deep links (checked inside the hook).
   const preferencesSettled =
-    preferencesLoaded || preferencesWriteError !== null;
+    preferencesLoaded || preferencesError !== null;
   useAutoResumeSession(
     isAuthenticated &&
       sharedToken === null &&
@@ -632,13 +632,13 @@ function App() {
         ),
       });
     }
-    if (preferencesWriteError !== null) {
+    if (preferencesError !== null) {
       notices.push({
         kind: "preferences",
         role: "alert",
         content: (
           <>
-            <strong>Preferences:</strong> {preferencesWriteError}
+            <strong>Preferences:</strong> {preferencesError}
           </>
         ),
       });
@@ -728,7 +728,7 @@ function App() {
     healthChecking,
     lastHealthCheckAt,
     openSecrets,
-    preferencesWriteError,
+    preferencesError,
     redirectToast,
     staleBuildDetected,
     systemStatus,
@@ -837,7 +837,6 @@ function App() {
           >
             <ComposerWorkspace
               authoring={<ChatPanel onOpenSecrets={openSecrets} />}
-              authoringStatus={<DefaultModeChangedBanner />}
               collapsedStatus={<CollapsedAuthoringStatus />}
               artifact={
                 // Same availability fact that mounts the REQUEST_RUN_EVENT

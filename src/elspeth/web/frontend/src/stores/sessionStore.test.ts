@@ -60,7 +60,6 @@ vi.mock("@/api/client", () => ({
   // change and assert non-guided behaviour) keep passing.
   fetchUserComposerPreferences: vi.fn().mockResolvedValue({
     default_mode: "freeform",
-    banner_dismissed_at: null,
     tutorial_completed_at: null,
     tutorial_stage: null,
     tutorial_session_id: null,
@@ -253,7 +252,6 @@ describe("sessionStore", () => {
     usePreferencesStore.setState({
       loaded: true,
       defaultMode: "freeform",
-      bannerDismissedAt: null,
       writing: false,
     });
     // Reseed the @/api/client mock that vi.resetAllMocks() cleared so the
@@ -262,7 +260,6 @@ describe("sessionStore", () => {
     const apiMod = await import("@/api/client");
     (apiMod.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue({
       default_mode: "freeform",
-      banner_dismissed_at: null,
       tutorial_completed_at: null,
       tutorial_stage: null,
       tutorial_session_id: null,
@@ -3288,7 +3285,6 @@ describe("sessionStore", () => {
       usePreferencesStore.setState({
         loaded: true,
         defaultMode: mode,
-        bannerDismissedAt: null,
         writing: false,
       });
     }
@@ -3383,7 +3379,6 @@ describe("sessionStore", () => {
       usePreferencesStore.setState({
         loaded: true,
         defaultMode: null,
-        bannerDismissedAt: null,
         writing: false,
       });
 
@@ -3876,7 +3871,6 @@ describe("sessionStore", () => {
       usePreferencesStore.setState({
         loaded: true,
         defaultMode: "freeform",
-        bannerDismissedAt: null,
         writing: false,
       });
       (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -3902,7 +3896,6 @@ describe("sessionStore", () => {
       usePreferencesStore.setState({
         loaded: true,
         defaultMode: "guided",
-        bannerDismissedAt: null,
         writing: false,
       });
       (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -3940,7 +3933,6 @@ describe("sessionStore", () => {
       usePreferencesStore.setState({
         loaded: true,
         defaultMode: "guided",
-        bannerDismissedAt: null,
         writing: false,
       });
       (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -4024,7 +4016,6 @@ describe("sessionStore", () => {
       resetStore(usePreferencesStore);
       (apiClient.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         default_mode: "guided",
-        banner_dismissed_at: null,
         tutorial_completed_at: null,
         tutorial_stage: null,
         tutorial_session_id: null,

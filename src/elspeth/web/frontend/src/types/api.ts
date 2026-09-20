@@ -90,7 +90,6 @@ export type PersistedTutorialStage = "guided" | "run" | "audit" | "graduation";
 
 export interface UserComposerPreferencesPayload {
   default_mode: ComposerMode;
-  banner_dismissed_at: string | null;
   freeform_intro_dismissed_at: string | null;
   tutorial_completed_at: string | null;
   // In-progress tutorial resume state; all four null when no tutorial is
@@ -112,7 +111,6 @@ export interface UserComposerPreferencesPayload {
 
 export interface UpdateUserComposerPreferencesPayload {
   default_mode?: ComposerMode;
-  banner_dismissed_at?: string | null;
   freeform_intro_dismissed_at?: string | null;
   tutorial_completed_at?: string | null;
   // Absent = unchanged; explicit null = clear. Setting (or clearing)
@@ -123,10 +121,9 @@ export interface UpdateUserComposerPreferencesPayload {
   tutorial_run_id?: string | null;
   tutorial_source_data_hash?: string | null;
   show_advanced?: boolean;
-  // Request-only telemetry discriminator: marks a completion write as an
-  // explicit in-tutorial exit (elspeth-61591e64bb). Only valid alongside a
-  // non-null tutorial_completed_at in the same PATCH; never echoed back.
-  tutorial_completed_via?: "exit";
+  // Request-only completion provenance. A non-null completion requires this
+  // discriminator and default_mode="freeform" together; never echoed back.
+  tutorial_completed_via?: "complete" | "skip" | "exit";
 }
 
 // ── First-run tutorial (Phase 4) ───────────────────────────────────────────

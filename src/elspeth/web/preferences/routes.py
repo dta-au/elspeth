@@ -1,7 +1,7 @@
 """FastAPI router for composer-preferences endpoints.
 
 Two endpoints under ``/api/composer-preferences``:
-  - ``GET`` — returns the authenticated user's preferences (guided
+  - ``GET`` — returns the authenticated user's preferences (Freeform
     default for users with no row).
   - ``PATCH`` — partial update; missing fields are preserved. Empty
     payload is a no-op success.
@@ -11,7 +11,7 @@ dependency). Cross-user isolation is via ``user.user_id`` scoping at the
 service layer.
 """
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -28,7 +28,7 @@ from elspeth.web.preferences.models import (
     ComposerPreferences,
     UpdateComposerPreferencesRequest,
 )
-from elspeth.web.preferences.service import PreferencesService
+from elspeth.web.preferences.service import PreferencesService, TutorialProgressConflict
 
 
 def create_preferences_router() -> APIRouter:
@@ -66,7 +66,10 @@ def create_preferences_router() -> APIRouter:
         # promotion of account-level preferences into a Landscape emit;
         # see the "Operational signal only" module-level comment in
         # ``preferences/service.py`` for the future-promotion criterion.
-        transition = await service.update_composer_preferences(user.user_id, body)
+        try:
+            transition = await service.update_composer_preferences(user.user_id, body)
+        except TutorialProgressConflict as exc:
+            raise HTTPException(status_code=409, detail={"code": "tutorial_progress_conflict", "message": str(exc)}) from exc
 
         # Phase 8 Task 2 — account-level mode opt-out / opt-in emit.
         #

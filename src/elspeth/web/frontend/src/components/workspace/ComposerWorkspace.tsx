@@ -36,7 +36,6 @@ export interface ComposerWorkspaceProps {
   artifact: ReactNode;
   inspector: ReactNode;
   actionBar: ReactNode;
-  authoringStatus?: ReactNode;
   collapsedStatus?: ReactNode | {
     text: string;
     tone: "neutral" | "busy" | "error";
@@ -72,7 +71,6 @@ export function ComposerWorkspace({
   artifact,
   inspector,
   actionBar,
-  authoringStatus,
   collapsedStatus = {
     text: "Authoring pane collapsed",
     tone: "neutral",
@@ -353,7 +351,6 @@ export function ComposerWorkspace({
             >
               <ErrorBoundary label="Authoring pane">{authoring}</ErrorBoundary>
             </div>
-            <div className="workspace-authoring-status">{authoringStatus}</div>
           </section>
           {paneState.authoringCollapsed && (
             <div

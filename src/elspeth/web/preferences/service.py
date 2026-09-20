@@ -1,6 +1,6 @@
 """Service layer for the user_preferences table.
 
-Read path: returns the user's row; falls back to 'guided' when no row exists.
+Read path: returns the user's row; falls back to 'freeform' when no row exists.
 Crashes on Tier-1 read of a corrupt mode value (any stored value outside
 {"guided", "freeform"} is a code bug, DB corruption, or tampering — never
 a recoverable situation; the DB-level CHECK constraint on
@@ -120,12 +120,12 @@ _PREFERENCES_PATCH_COUNTER = _meter.create_counter(
     "composer.preferences.patch_total",
     description=(
         "Composer-preferences PATCH operations. Attributes: mode_changed (bool), "
-        "banner_dismissed (bool), tutorial_changed (bool), "
+        "tutorial_changed (bool), "
         "tutorial_progress_changed (bool), wrote_row (bool)."
     ),
 )
 
-_DEFAULT_MODE: ComposerMode = "guided"
+_DEFAULT_MODE: ComposerMode = "freeform"
 _VALID_MODES: frozenset[ComposerMode] = frozenset({"guided", "freeform"})
 # Tier-1 read-guard set for ``tutorial_stage``; lockstep with the
 # ``TutorialStage`` Literal (models.py) and the
@@ -157,7 +157,6 @@ def _select_preferences_for_user(user_id: str) -> Any:
     """
     return select(
         user_preferences_table.c.default_composer_mode,
-        user_preferences_table.c.banner_dismissed_at,
         user_preferences_table.c.freeform_intro_dismissed_at,
         sql_cast(user_preferences_table.c.tutorial_completed_at, String).label("tutorial_completed_at"),
         user_preferences_table.c.tutorial_stage,
@@ -190,6 +189,10 @@ def _decode_tutorial_completed_at(user_id: str, raw_value: object) -> datetime |
     )
 
 
+class TutorialProgressConflict(RuntimeError):
+    """A late resume-state write tried to repopulate a completed tutorial."""
+
+
 class PreferencesService:
     """Reads and writes per-user composer preferences."""
 
@@ -198,10 +201,10 @@ class PreferencesService:
         self._now = now
 
     async def get_composer_preferences(self, user_id: str) -> ComposerPreferences:
-        """Return the user's preferences, falling back to 'guided' if no row exists.
+        """Return the user's preferences, falling back to 'freeform' if no row exists.
 
         Default policy:
-          - No row => 'guided' (new-user default; the existing-user
+          - No row => 'freeform' (new-user default; the existing-user
             session-count heuristic was retired under
             ``project_db_migration_policy`` — see plan 12 Task 5).
           - Row exists => use stored value; crash if stored value is
@@ -214,7 +217,7 @@ class PreferencesService:
                 if row is not None:
                     return self._row_to_prefs(row, user_id)
 
-            # No row: return the new-user guided default. We do not write
+            # No row: return the new-user freeform default. We do not write
             # a row here (lazy — avoid write traffic for users who never
             # touch preferences). Panel U1: updated_at=None because no
             # write event exists to associate a timestamp with;
@@ -222,7 +225,6 @@ class PreferencesService:
             # actually wrote into an audit-visible field.
             return ComposerPreferences(
                 default_mode=_DEFAULT_MODE,
-                banner_dismissed_at=None,
                 freeform_intro_dismissed_at=None,
                 tutorial_completed_at=None,
                 tutorial_stage=None,
@@ -257,7 +259,6 @@ class PreferencesService:
             raise CorruptPreferencesError(user_id, stage, field_name="tutorial_stage")
         return ComposerPreferences(
             default_mode=mode,
-            banner_dismissed_at=row.banner_dismissed_at,
             freeform_intro_dismissed_at=row.freeform_intro_dismissed_at,
             tutorial_completed_at=tutorial_completed_at,
             tutorial_stage=stage,
@@ -303,14 +304,18 @@ class PreferencesService:
         telemetry: increments ``composer.preferences.patch_total`` with attributes naming which
         fields were touched and whether a row was written (the empty-PATCH-no-row guard reports
         ``wrote_row=False``). Operational signal only: no Landscape emit.
+
+        A populated resume-state write conflicts with a completed tutorial.
+        The upsert evaluates this condition against the locked conflict row,
+        so a stale PostgreSQL pre-read cannot resurrect progress after completion.
+        Explicit completion resets and all-null progress clears remain supported.
         """
         now = self._now()
         tutorial_in_payload = "tutorial_completed_at" in payload.model_fields_set
-        banner_in_payload = "banner_dismissed_at" in payload.model_fields_set
         intro_in_payload = "freeform_intro_dismissed_at" in payload.model_fields_set
         advanced_in_payload = "show_advanced" in payload.model_fields_set
         # Tutorial resume fields (elspeth-918f4434b3) — each carries the same
-        # absent-vs-explicit-null discrimination as the banner/tutorial
+        # absent-vs-explicit-null discrimination as the tutorial
         # timestamps. See the completion-clears-progress rule below.
         progress_fields = (
             "tutorial_stage",
@@ -320,9 +325,12 @@ class PreferencesService:
         )
         progress_in_payload = {name: name in payload.model_fields_set for name in progress_fields}
         any_progress_in_payload = any(progress_in_payload.values())
+        populates_progress = any(
+            value is not None
+            for value in (payload.tutorial_stage, payload.tutorial_session_id, payload.tutorial_run_id, payload.tutorial_source_data_hash)
+        )
         payload_is_empty = (
             payload.default_mode is None
-            and not banner_in_payload
             and not intro_in_payload
             and not tutorial_in_payload
             and not any_progress_in_payload
@@ -356,7 +364,6 @@ class PreferencesService:
                     return (
                         ComposerPreferences(
                             default_mode=_DEFAULT_MODE,
-                            banner_dismissed_at=None,
                             freeform_intro_dismissed_at=None,
                             tutorial_completed_at=None,
                             tutorial_stage=None,
@@ -379,17 +386,6 @@ class PreferencesService:
                     insert_mode = prior_prefs.default_mode
                 else:
                     insert_mode = _DEFAULT_MODE
-
-                # banner_dismissed_at uses `model_fields_set` to distinguish
-                # "absent from JSON" (preserve existing) from "explicit null"
-                # (clear the dismissal — re-show the banner on next session).
-                # Symmetric with tutorial_completed_at; see models.py docstring.
-                if banner_in_payload:
-                    resolved_banner: datetime | None = payload.banner_dismissed_at
-                elif prior_prefs is not None:
-                    resolved_banner = prior_prefs.banner_dismissed_at
-                else:
-                    resolved_banner = None
 
                 if intro_in_payload:
                     resolved_intro: datetime | None = payload.freeform_intro_dismissed_at
@@ -437,7 +433,6 @@ class PreferencesService:
                 values: dict[str, object] = {
                     "user_id": user_id,
                     "default_composer_mode": insert_mode,
-                    "banner_dismissed_at": resolved_banner,
                     "freeform_intro_dismissed_at": resolved_intro,
                     "tutorial_completed_at": resolved_tutorial,
                     "show_advanced": resolved_advanced,
@@ -458,8 +453,6 @@ class PreferencesService:
                 update_clause: dict[str, object] = {"updated_at": now}
                 if payload.default_mode is not None:
                     update_clause["default_composer_mode"] = payload.default_mode
-                if banner_in_payload:
-                    update_clause["banner_dismissed_at"] = payload.banner_dismissed_at
                 if intro_in_payload:
                     update_clause["freeform_intro_dismissed_at"] = payload.freeform_intro_dismissed_at
                 if tutorial_in_payload:
@@ -471,11 +464,14 @@ class PreferencesService:
                     # completion-clears-progress rule applies.
                     if progress_in_payload[name] or tutorial_in_payload:
                         update_clause[name] = resolved_progress[name]
-                stmt = stmt.on_conflict_do_update(index_elements=["user_id"], set_=update_clause)
+                # Evaluate the completion gate against the conflict row under
+                # the upsert's row lock. The earlier PostgreSQL snapshot may
+                # predate a concurrently committed completion.
+                progress_allowed = user_preferences_table.c.tutorial_completed_at.is_(None) if populates_progress else None
+                stmt = stmt.on_conflict_do_update(index_elements=["user_id"], set_=update_clause, where=progress_allowed)
                 row = conn.execute(
                     stmt.returning(
                         user_preferences_table.c.default_composer_mode,
-                        user_preferences_table.c.banner_dismissed_at,
                         user_preferences_table.c.freeform_intro_dismissed_at,
                         sql_cast(user_preferences_table.c.tutorial_completed_at, String).label("tutorial_completed_at"),
                         user_preferences_table.c.tutorial_stage,
@@ -485,12 +481,13 @@ class PreferencesService:
                         user_preferences_table.c.show_advanced,
                         user_preferences_table.c.updated_at,
                     )
-                ).one()
+                ).one_or_none()
+                if row is None:
+                    raise TutorialProgressConflict("Tutorial already completed; reload preferences or explicitly reset it before a retake.")
 
             returned = self._row_to_prefs(row, user_id)
             current = ComposerPreferences(
                 default_mode=payload.default_mode if payload.default_mode is not None else returned.default_mode,
-                banner_dismissed_at=payload.banner_dismissed_at if banner_in_payload else returned.banner_dismissed_at,
                 freeform_intro_dismissed_at=(
                     payload.freeform_intro_dismissed_at if intro_in_payload else returned.freeform_intro_dismissed_at
                 ),
@@ -515,7 +512,6 @@ class PreferencesService:
             1,
             attributes={
                 "mode_changed": payload.default_mode is not None,
-                "banner_dismissed": payload.banner_dismissed_at is not None,
                 "freeform_intro_dismissed": payload.freeform_intro_dismissed_at is not None,
                 "tutorial_changed": tutorial_in_payload,
                 "tutorial_progress_changed": any_progress_in_payload,
@@ -524,21 +520,17 @@ class PreferencesService:
         )
         if tutorial_in_payload:
             prior_tutorial = prior_prefs.tutorial_completed_at if prior_prefs is not None else None
-            addressed_mode = "default_mode" in payload.model_fields_set
-            # The explicit discriminator outranks the payload-shape inference
-            # below: an exit-to-freeform opt-out (elspeth-61591e64bb) is a
-            # one-key completion write that shape-reads as "skip" (or, with a
-            # mode change riding along, "first_time").
-            if payload.tutorial_completed_at is not None and payload.tutorial_completed_via == "exit":
-                record_tutorial_completed_path("exit")
-            elif prior_tutorial is None and payload.tutorial_completed_at is not None and addressed_mode:
-                record_tutorial_completed_path("first_time")
-            elif prior_tutorial is None and payload.tutorial_completed_at is not None and not addressed_mode:
-                record_tutorial_completed_path("skip")
-            elif prior_tutorial is not None and payload.tutorial_completed_at is None:
-                record_tutorial_completed_path("retake")
-            elif prior_tutorial is not None and payload.tutorial_completed_at is not None:
+            if payload.tutorial_completed_at is None:
+                if prior_tutorial is not None:
+                    record_tutorial_completed_path("retake")
+            elif prior_tutorial is not None:
                 record_tutorial_completed_path("repeat")
+            elif payload.tutorial_completed_via == "complete":
+                record_tutorial_completed_path("first_time")
+            elif payload.tutorial_completed_via == "skip":
+                record_tutorial_completed_path("skip")
+            elif payload.tutorial_completed_via == "exit":
+                record_tutorial_completed_path("exit")
         # Derived from the engine dialect at call time, outside ``_sync`` so
         # the writer's transaction body stays exactly what the session-DB
         # mutation-authority manifest fingerprints.

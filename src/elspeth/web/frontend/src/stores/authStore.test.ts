@@ -110,10 +110,10 @@ describe("authStore account-scoped store reset", () => {
     usePreferencesStore.setState({
       loaded: true,
       defaultMode: "freeform",
-      bannerDismissedAt: "2026-05-16T00:00:00Z",
       tutorialCompletedAt: "2026-05-19T00:00:00Z",
       tutorialCompleted: true,
-      optedOutAtSessionId: "alice-session",
+      bootstrapError: "old bootstrap error",
+      writeError: "old write error",
     });
     useBlobStore.setState({
       blobs: [
@@ -172,10 +172,9 @@ describe("authStore account-scoped store reset", () => {
     expect(usePreferencesStore.getState()).toMatchObject({
       loaded: false,
       defaultMode: null,
-      bannerDismissedAt: null,
       tutorialCompletedAt: null,
       tutorialCompleted: false,
-      optedOutAtSessionId: null,
+      bootstrapError: null,
       writeError: null,
     });
     expect(useSecretsStore.getState()).toMatchObject({

@@ -11,11 +11,38 @@ from elspeth.web.preferences.models import (
 )
 
 
+@pytest.mark.parametrize("via", ["complete", "skip", "exit"])
+def test_completion_requires_explicit_intent_and_freeform(via: str) -> None:
+    payload = {
+        "tutorial_completed_at": "2026-09-20T00:00:00Z",
+        "tutorial_completed_via": via,
+        "default_mode": "freeform",
+    }
+    assert UpdateComposerPreferencesRequest.model_validate(payload).tutorial_completed_via == via
+    for missing in ("tutorial_completed_via", "default_mode"):
+        with pytest.raises(ValidationError):
+            UpdateComposerPreferencesRequest.model_validate({key: value for key, value in payload.items() if key != missing})
+    with pytest.raises(ValidationError):
+        UpdateComposerPreferencesRequest.model_validate({**payload, "default_mode": "guided"})
+
+
+@pytest.mark.parametrize("completed_at", [None, "2026-09-20T00:00:00Z"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("tutorial_stage", "guided"), ("tutorial_session_id", "session"), ("tutorial_run_id", "run"), ("tutorial_source_data_hash", "hash")],
+)
+def test_completion_and_reset_reject_populated_progress(completed_at: str | None, field: str, value: str) -> None:
+    payload: dict[str, object] = {"tutorial_completed_at": completed_at, field: value}
+    if completed_at is not None:
+        payload.update(default_mode="freeform", tutorial_completed_via="complete")
+    with pytest.raises(ValidationError, match="progress"):
+        UpdateComposerPreferencesRequest.model_validate(payload)
+
+
 def test_composer_preferences_valid() -> None:
     """A well-formed payload constructs cleanly."""
     payload = ComposerPreferences(
         default_mode="guided",
-        banner_dismissed_at=None,
         freeform_intro_dismissed_at=None,
         tutorial_completed_at=None,
         tutorial_stage=None,
@@ -35,7 +62,6 @@ def test_composer_preferences_rejects_invalid_mode() -> None:
     with pytest.raises(ValidationError):
         ComposerPreferences(
             default_mode="kiosk",  # type: ignore[arg-type]
-            banner_dismissed_at=None,
             tutorial_completed_at=None,
             tutorial_stage=None,
             tutorial_session_id=None,
@@ -48,16 +74,16 @@ def test_composer_preferences_rejects_invalid_mode() -> None:
 def test_update_request_accepts_full_payload() -> None:
     payload = UpdateComposerPreferencesRequest(default_mode="freeform")
     assert payload.default_mode == "freeform"
-    assert payload.banner_dismissed_at is None
+    assert payload.freeform_intro_dismissed_at is None
     assert payload.tutorial_completed_at is None
 
 
-def test_update_request_accepts_only_banner_field() -> None:
-    """Partial PATCH: caller sets only banner_dismissed_at."""
+def test_update_request_accepts_only_intro_field() -> None:
+    """Partial PATCH: caller sets only freeform_intro_dismissed_at."""
     stamp = datetime.now(UTC)
-    payload = UpdateComposerPreferencesRequest(banner_dismissed_at=stamp)
+    payload = UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=stamp)
     assert payload.default_mode is None
-    assert payload.banner_dismissed_at == stamp
+    assert payload.freeform_intro_dismissed_at == stamp
 
 
 def test_update_request_accepts_freeform_intro_dismissal() -> None:
@@ -79,7 +105,7 @@ def test_update_request_accepts_empty_payload_as_noop() -> None:
     """An empty PATCH payload is a no-op; the request succeeds without changes."""
     payload = UpdateComposerPreferencesRequest()
     assert payload.default_mode is None
-    assert payload.banner_dismissed_at is None
+    assert payload.freeform_intro_dismissed_at is None
     assert payload.tutorial_completed_at is None
 
 
@@ -87,7 +113,6 @@ def test_composer_preferences_accepts_tutorial_completed_at() -> None:
     stamp = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
     payload = ComposerPreferences(
         default_mode="guided",
-        banner_dismissed_at=None,
         freeform_intro_dismissed_at=None,
         tutorial_completed_at=stamp,
         tutorial_stage=None,
@@ -102,9 +127,9 @@ def test_composer_preferences_accepts_tutorial_completed_at() -> None:
 
 def test_update_request_accepts_tutorial_completed_at() -> None:
     stamp = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
-    payload = UpdateComposerPreferencesRequest(tutorial_completed_at=stamp)
-    assert payload.default_mode is None
-    assert payload.banner_dismissed_at is None
+    payload = UpdateComposerPreferencesRequest(default_mode="freeform", tutorial_completed_at=stamp, tutorial_completed_via="complete")
+    assert payload.default_mode == "freeform"
+    assert payload.freeform_intro_dismissed_at is None
     assert payload.tutorial_completed_at == stamp
     assert "tutorial_completed_at" in payload.model_fields_set
 
@@ -128,7 +153,6 @@ def test_composer_preferences_rejects_unknown_field() -> None:
     with pytest.raises(ValidationError):
         ComposerPreferences(
             default_mode="guided",
-            banner_dismissed_at=None,
             tutorial_completed_at=None,
             tutorial_stage=None,
             tutorial_session_id=None,
@@ -145,7 +169,6 @@ def test_composer_preferences_rejects_invalid_tutorial_stage() -> None:
     with pytest.raises(ValidationError):
         ComposerPreferences(
             default_mode="guided",
-            banner_dismissed_at=None,
             tutorial_completed_at=None,
             tutorial_stage="welcome",  # type: ignore[arg-type]
             tutorial_session_id="sess-1",
@@ -182,6 +205,7 @@ def test_update_request_distinguishes_absent_from_explicit_null_stage() -> None:
 def test_update_request_accepts_tutorial_completed_via_exit() -> None:
     stamp = datetime(2026, 7, 9, 10, 0, tzinfo=UTC)
     payload = UpdateComposerPreferencesRequest(
+        default_mode="freeform",
         tutorial_completed_at=stamp,
         tutorial_completed_via="exit",
     )
@@ -214,7 +238,6 @@ def test_update_request_rejects_unknown_via_value() -> None:
 def test_composer_preferences_carries_show_advanced() -> None:
     prefs = ComposerPreferences(
         default_mode="guided",
-        banner_dismissed_at=None,
         freeform_intro_dismissed_at=None,
         tutorial_completed_at=None,
         tutorial_stage=None,

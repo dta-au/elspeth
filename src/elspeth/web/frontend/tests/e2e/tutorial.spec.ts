@@ -4,15 +4,16 @@
 // describe→showBuilt→graph→mode turns to: welcome bookend →
 // TutorialGuidedShell (the real ChatPanel guided surface, started with the
 // "tutorial" profile) → run → audit → graduation. This spec drives that flow
-// with the whole API surface route-mocked (no live backend), so it owns the
-// guided protocol responses end to end.
+// with tutorial/preferences/session responses route-mocked against the local
+// Playwright deployment; authentication still uses its disposable account.
+// These are browser UI/persistence-contract proofs, not provider acceptance.
 //
 // The happy path mocks:
-//   POST /api/sessions                         → {id} (tutorial then graduation session)
+//   POST /api/sessions                         → {id} (tutorial, then new sessions)
 //   POST /api/sessions/{id}/guided/start       → 200, idempotent (profile seed)
 //   GET  /api/sessions/{id}/guided             → step_1_source turn
-//   POST /api/sessions/{id}/guided/respond     → walks source → sink → step_4_wire,
-//                                                then wire-confirm → completed
+//   POST /api/sessions/{id}/guided/chat        → source → sink → step_4_wire
+//   POST /api/sessions/{id}/guided/respond     → wire-confirm → completed, or exit
 //   POST /api/tutorial/run                     → the canonical run result
 //   GET  .../runs/{id}/audit-story             → the audit story
 //
@@ -108,6 +109,7 @@ interface GuidedFixtureState {
   sessionPostCount: number;
   guidedRespondCount: number;
   requestLog: string[];
+  failDepartureOnce?: boolean;
 }
 
 // The server line that follows the goal on every started or converted session
@@ -347,6 +349,19 @@ async function installTutorialRoutes(
   // of the seeded goal pair. A mock that reset the history each turn would make
   // the locked-prompt predicate trivially false forever.
   const chatHistory: Array<Record<string, unknown>> = seededGoalTurns();
+  let terminal: Record<string, unknown> | null = null;
+  let guidedStarted = false;
+  const preferences: Record<string, unknown> = {
+    default_mode: "freeform",
+    freeform_intro_dismissed_at: null,
+    tutorial_completed_at: null,
+    tutorial_stage: null,
+    tutorial_session_id: null,
+    tutorial_run_id: null,
+    tutorial_source_data_hash: null,
+    show_advanced: false,
+    updated_at: null,
+  };
   await page.route("**/api/**", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -387,57 +402,39 @@ async function installTutorialRoutes(
       return;
     }
 
-    // The account-preferences payload is decoded structurally since
-    // 69c910a56 (preferencesDecoder.ts KEYS): every key must be present or
-    // the store records a preferences error and App.tsx's fail-closed
-    // tutorial gate never shows the welcome turn. Mock the full wire shape.
-    if (path === "/api/composer-preferences" && method === "GET") {
-      await route.fulfill({
-        json: {
-          default_mode: "guided",
-          banner_dismissed_at: null,
-          freeform_intro_dismissed_at: null,
-          tutorial_completed_at: null,
-          tutorial_stage: null,
-          tutorial_session_id: null,
-          tutorial_run_id: null,
-          tutorial_source_data_hash: null,
-          show_advanced: false,
-          updated_at: null,
-        },
-      });
-      return;
-    }
-
-    if (path === "/api/composer-preferences" && method === "PATCH") {
-      const body = request.postDataJSON() as Record<string, unknown>;
-      const echoNullableString = (key: string): string | null =>
-        typeof body[key] === "string" ? (body[key] as string) : null;
-      await route.fulfill({
-        json: {
-          default_mode: body.default_mode ?? "guided",
-          banner_dismissed_at: null,
-          freeform_intro_dismissed_at: null,
-          tutorial_completed_at: echoNullableString("tutorial_completed_at"),
-          tutorial_stage: echoNullableString("tutorial_stage"),
-          tutorial_session_id: echoNullableString("tutorial_session_id"),
-          tutorial_run_id: echoNullableString("tutorial_run_id"),
-          tutorial_source_data_hash: echoNullableString("tutorial_source_data_hash"),
-          show_advanced: typeof body.show_advanced === "boolean" ? body.show_advanced : false,
-          updated_at: "2026-05-19T12:11:00Z",
-        },
-      });
+    if (path === "/api/composer-preferences") {
+      if (method === "PATCH") {
+        const body = request.postDataJSON() as Record<string, unknown>;
+        if (body.tutorial_completed_at != null) {
+          expect(body.default_mode).toBe("freeform");
+          expect(["complete", "skip", "exit"]).toContain(body.tutorial_completed_via);
+          state.requestLog.push(`departure:${String(body.tutorial_completed_via)}`);
+          if (state.failDepartureOnce) {
+            state.failDepartureOnce = false;
+            await route.fulfill({ status: 503, json: { detail: "Preferences temporarily unavailable" } });
+            return;
+          }
+        }
+        for (const key of Object.keys(preferences)) {
+          if (key in body) preferences[key] = body[key];
+        }
+        if (body.tutorial_completed_at != null) {
+          preferences.tutorial_stage = null;
+          preferences.tutorial_session_id = null;
+          preferences.tutorial_run_id = null;
+          preferences.tutorial_source_data_hash = null;
+        }
+        preferences.updated_at = "2026-05-19T12:11:00Z";
+      }
+      await route.fulfill({ json: preferences });
       return;
     }
 
     if (path === "/api/sessions" && method === "GET") {
       await route.fulfill({
-        json: [
-          {
-            ...tutorialSession,
-            title: "First-run tutorial",
-            updated_at: "2026-05-19T12:11:00Z",
-          },
+        json: state.sessionPostCount === 0 ? [] : [
+          { ...tutorialSession, title: "First-run tutorial" },
+          ...(state.sessionPostCount > 1 ? [graduationSession] : []),
         ],
       });
       return;
@@ -470,14 +467,15 @@ async function installTutorialRoutes(
       method === "POST"
     ) {
       state.requestLog.push("guided-start");
+      guidedStarted = true;
       await route.fulfill({
         json: {
           guided_session: guidedSession("step_1_source"),
-          next_turn: singleSelectTurn("Which data source would you like to use?", [
+          next_turn: terminal === null ? singleSelectTurn("Which data source would you like to use?", [
             ["inline_blob", "inline_blob"],
             ["csv", "csv"],
-          ]),
-          terminal: null,
+          ]) : null,
+          terminal,
           composition_state: compositionState,
         },
       });
@@ -504,14 +502,18 @@ async function installTutorialRoutes(
       path === `/api/sessions/${tutorialSession.id}/guided` &&
       method === "GET"
     ) {
+      if (!guidedStarted) {
+        await route.fulfill({ status: 404, json: { detail: "No guided session" } });
+        return;
+      }
       await route.fulfill({
         json: {
-          guided_session: guidedSession("step_1_source", [...chatHistory]),
-          next_turn: singleSelectTurn("Which data source would you like to use?", [
+          guided_session: { ...guidedSession("step_1_source", [...chatHistory]), terminal },
+          next_turn: terminal === null ? singleSelectTurn("Which data source would you like to use?", [
             ["inline_blob", "inline_blob"],
             ["csv", "csv"],
-          ]),
-          terminal: null,
+          ]) : null,
+          terminal,
           composition_state: compositionState,
         },
       });
@@ -568,6 +570,18 @@ async function installTutorialRoutes(
       path === `/api/sessions/${tutorialSession.id}/guided/respond` &&
       method === "POST"
     ) {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      if (body.control_signal === "exit_to_freeform") {
+        terminal = { kind: "exited_to_freeform", reason: "user_pressed_exit", pipeline_yaml: null };
+        state.requestLog.push("guided-exit");
+        await route.fulfill({ json: {
+          guided_session: { ...guidedSession("step_4_wire", [...chatHistory]), terminal },
+          next_turn: null,
+          terminal,
+          composition_state: compositionState,
+        } });
+        return;
+      }
       state.guidedRespondCount += 1;
       const n = state.guidedRespondCount;
       state.requestLog.push(`guided-respond:${n}`);
@@ -593,7 +607,7 @@ async function installTutorialRoutes(
         next = null;
         session = completedSession([...chatHistory]);
       }
-      const terminal =
+      terminal =
         next === null
           ? (session.terminal as Record<string, unknown>)
           : null;
@@ -692,6 +706,7 @@ async function installTutorialRoutes(
       await route.fulfill({
         json: {
           is_valid: true,
+          readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
           summary: "Tutorial pipeline is valid.",
           checks: [],
           errors: [],
@@ -714,6 +729,7 @@ async function installTutorialRoutes(
           rows: [],
           validation_result: {
             is_valid: true,
+            readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
             summary: "Tutorial pipeline is valid.",
             checks: [],
             errors: [],
@@ -783,8 +799,31 @@ async function installTutorialRoutes(
       return;
     }
 
+    if (path.startsWith(`/api/sessions/${graduationSession.id}/`) && method === "GET") {
+      const suffix = path.slice(`/api/sessions/${graduationSession.id}/`.length);
+      if (["messages", "proposals", "runs", "blobs", "state/versions"].includes(suffix)) {
+        await route.fulfill({ json: [] });
+      } else {
+        await route.fulfill({ status: 404, json: { detail: "Not found" } });
+      }
+      return;
+    }
+
     await route.continue();
   });
+}
+
+async function assertFreeformPersists(page: Page): Promise<void> {
+  await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
+  const prefs = await page.evaluate(async () => {
+    const response = await fetch("/api/composer-preferences");
+    return response.json() as Promise<{ default_mode: string; tutorial_completed_at: string | null }>;
+  });
+  expect(prefs.default_mode).toBe("freeform");
+  expect(prefs.tutorial_completed_at).not.toBeNull();
+  await page.reload();
+  await expect(page.getByRole("main", { name: /first-run tutorial/i })).toHaveCount(0);
+  await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
 }
 
 test.describe("first-run tutorial (staged guided flow)", () => {
@@ -946,16 +985,23 @@ test.describe("first-run tutorial (staged guided flow)", () => {
     ).toBeVisible();
     await page.getByRole("button", { name: "Take me to the composer" }).click();
 
-    // Graduation renamed the tutorial session, saved guided default, and
-    // landed on the built pipeline instead of creating a fresh empty session.
+    // Graduation preserves the pipeline and persists Freeform before dismissal.
     await expect.poll(() => state.sessionPostCount).toBe(1);
     await expect(
       page.getByRole("button", { name: /Session switcher: First-run tutorial/i }),
     ).toBeVisible();
+    await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
     expect(state.requestLog).toContain("guided-start");
+    expect(state.requestLog).toContain("guided-exit");
+    expect(state.requestLog).toContain("departure:complete");
+    await assertFreeformPersists(page);
+    await page.getByRole("button", { name: /session switcher/i }).click();
+    await page.getByRole("menuitem", { name: "+ New session" }).click();
+    await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
+    expect(state.sessionPostCount).toBe(2);
   });
 
-  test("skip from welcome lands directly on graduation", async ({ page }) => {
+  test("skip persists immediately, then opens Freeform", async ({ page }) => {
     const state: GuidedFixtureState = {
       sessionPostCount: 0,
       guidedRespondCount: 0,
@@ -968,6 +1014,78 @@ test.describe("first-run tutorial (staged guided flow)", () => {
     await expect(
       page.getByRole("heading", { name: "You're ready to use the composer." }),
     ).toBeVisible();
+    expect(state.requestLog).toContain("departure:skip");
+    await page.getByRole("button", { name: "Take me to the composer" }).click();
+    await assertFreeformPersists(page);
+  });
+
+  test("early exit preserves the tutorial session in Freeform", async ({ page }) => {
+    const state: GuidedFixtureState = { sessionPostCount: 0, guidedRespondCount: 0, requestLog: [] };
+    await installTutorialRoutes(page, state);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Let's go" }).click();
+    await expect(page.getByLabel("Guided composer", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Exit tutorial", exact: true }).click();
+    await assertFreeformPersists(page);
+    expect(state.requestLog).toContain("guided-exit");
+    expect(state.requestLog).toContain("departure:exit");
+    expect(state.sessionPostCount).toBe(1);
+  });
+
+  test("failed departure save keeps the tutorial actionable and retry reuses the exited session", async ({ page }) => {
+    const state: GuidedFixtureState = { sessionPostCount: 0, guidedRespondCount: 0, requestLog: [], failDepartureOnce: true };
+    await installTutorialRoutes(page, state);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Let's go" }).click();
+    await expect(page.getByLabel("Guided composer", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Exit tutorial", exact: true }).click();
+    await expect(page.getByRole("main", { name: /first-run tutorial/i })).toBeVisible();
+    await expect(page.getByRole("main", { name: /first-run tutorial/i }).getByRole("alert").filter({ hasText: "Preferences temporarily unavailable" })).toBeVisible();
+    await page.getByRole("button", { name: "Exit tutorial", exact: true }).click();
+    await assertFreeformPersists(page);
+    expect(state.requestLog.filter((item) => item === "guided-exit")).toHaveLength(1);
+    expect(state.sessionPostCount).toBe(1);
+  });
+
+  test("exit during a pending Guided reply stays actionable until the reply settles", async ({ page }) => {
+    const state: GuidedFixtureState = { sessionPostCount: 0, guidedRespondCount: 0, requestLog: [] };
+    await installTutorialRoutes(page, state);
+    let releaseReply!: () => void;
+    const pendingReply = new Promise<void>((resolve) => { releaseReply = resolve; });
+    await page.route("**/guided/chat", async (route) => {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      if (body.control_signal !== "exit_to_freeform") await pendingReply;
+      await route.fallback();
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "Let's go" }).click();
+    await expect(page.getByLabel("Guided composer", { exact: true })).toBeVisible();
+    const requested = page.waitForRequest((request) => request.url().endsWith("/guided/chat"));
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
+    await requested;
+    try {
+      await page.getByRole("button", { name: "Exit tutorial", exact: true }).click();
+      await expect(page.getByRole("main", { name: /first-run tutorial/i })).toBeVisible();
+      expect(state.requestLog).not.toContain("departure:exit");
+    } finally {
+      releaseReply();
+    }
+    await expect(page.getByText(/Save the pipeline's results/i)).toBeVisible();
+    await page.getByRole("button", { name: "Exit tutorial", exact: true }).click();
+    await assertFreeformPersists(page);
+  });
+
+  test("reload between skip and farewell keeps tutorial dismissed", async ({ page }) => {
+    const state: GuidedFixtureState = { sessionPostCount: 0, guidedRespondCount: 0, requestLog: [] };
+    await installTutorialRoutes(page, state);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Skip the tutorial" }).click();
+    await expect.poll(() => state.requestLog.includes("departure:skip")).toBe(true);
+    await page.reload();
+    await expect(page.getByRole("main", { name: /first-run tutorial/i })).toHaveCount(0);
+    await page.getByRole("button", { name: /session switcher/i }).click();
+    await page.getByRole("menuitem", { name: "+ New session" }).click();
+    await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
   });
 
   test("welcome surfaces the privacy preamble before starting", async ({

@@ -338,7 +338,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 # 59: timestamp-leading quota scan indexes support container-wide daily
 # admission checks alongside the identity-leading indexes.
 # 60: terminal guided operations preserve fork failure diagnostics.
-SESSION_SCHEMA_EPOCH = 60
+# 61: default new preferences to freeform and remove the retired mode banner.
+#     Pre-1.0 delete/recreate boundary; no migration of existing preferences.
+SESSION_SCHEMA_EPOCH = 61
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3188,10 +3190,8 @@ user_preferences_table = Table(
         "default_composer_mode",
         String,
         nullable=False,
-        server_default="guided",
+        server_default="freeform",
     ),
-    # NULL = banner not yet dismissed; non-NULL = dismissed-at timestamp.
-    Column("banner_dismissed_at", DateTime(timezone=True), nullable=True),
     # NULL = freeform introduction visible; non-NULL = dismissed account-wide.
     Column("freeform_intro_dismissed_at", DateTime(timezone=True), nullable=True),
     # NULL = tutorial not completed/reset; non-NULL = completed-at timestamp.

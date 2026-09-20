@@ -22,6 +22,7 @@ import {
   tutorialReducer,
 } from "./tutorialMachine";
 import { HELLO_WORLD_PENDING_SESSION_TITLE } from "./copy";
+import { departTutorialSession } from "./tutorialDeparture";
 
 interface HelloWorldTutorialProps {
   composerAvailable?: boolean;
@@ -61,6 +62,11 @@ export function HelloWorldTutorial({
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const guidedStartupExitRequestedRef = useRef(false);
+  const startAttemptRef = useRef(0);
+  const startingRef = useRef(false);
+  const exitingRef = useRef(false);
+  const [exiting, setExiting] = useState(false);
+  const [exitError, setExitError] = useState<string | null>(null);
 
   // Orphan cleanup runs ONLY on a fresh tutorial entry. On a resume the
   // persisted tutorial session still carries the pending title — sweeping it
@@ -159,10 +165,8 @@ export function HelloWorldTutorial({
   }, [state.step, state.sessionId]);
 
   // Persist the tutorial stage server-side on every stage transition so a
-  // reload resumes instead of restarting. Best-effort: a failed persist
-  // must not interrupt the in-page tutorial (and deliberately does NOT set
-  // the store's writeError — that would unmount the tutorial via App.tsx's
-  // showTutorial gate); the residual cost of a failure is only that a
+  // reload resumes instead of restarting. A failed progress save must not
+  // interrupt the in-page tutorial; the residual cost of a failure is that a
   // reload resumes one stage earlier. The skipped path persists the
   // completion opt-out instead (see onSkip), which clears these fields
   // server-side — so no stage write happens for it.
@@ -225,6 +229,7 @@ export function HelloWorldTutorial({
   // POST /guided/start so the backend orphan-cleanup scan (which matches the
   // exact pending title) catches sessions abandoned mid-tutorial.
   const onStart = async (): Promise<void> => {
+    if (startingRef.current) return;
     if (!composerAvailable || !tutorialReady) {
       setStartError(
         tutorialComposerUnavailableMessage(
@@ -236,6 +241,8 @@ export function HelloWorldTutorial({
       return;
     }
     guidedStartupExitRequestedRef.current = false;
+    startingRef.current = true;
+    const attempt = ++startAttemptRef.current;
     setStarting(true);
     setStartError(null);
     try {
@@ -244,6 +251,7 @@ export function HelloWorldTutorial({
         session.id,
         HELLO_WORLD_PENDING_SESSION_TITLE,
       );
+      if (attempt !== startAttemptRef.current) return;
       useSessionStore.setState((current) => ({
         sessions: [
           renamedSession,
@@ -255,6 +263,7 @@ export function HelloWorldTutorial({
     } catch (err) {
       setStartError(formatError(err));
     } finally {
+      startingRef.current = false;
       setStarting(false);
     }
   };
@@ -266,65 +275,35 @@ export function HelloWorldTutorial({
   // tab between the two must not restart the tutorial. publishLocally=false
   // keeps the graduation card mounted (flipping tutorialCompleted here
   // would unmount the whole tutorial mid-farewell); the graduation card's
-  // finish click re-persists idempotently and then publishes. Best-effort:
+  // finish click reuses the durable completion and then publishes. Best-effort:
   // on failure the finish click is still the second chance to persist.
   const onSkip = (): void => {
+    startAttemptRef.current += 1;
     dispatch({ type: "skipToGraduation" });
     void usePreferencesStore
       .getState()
-      .markTutorialGraduated({ publishLocally: false })
+      .markTutorialGraduated({ via: "skip", publishLocally: false })
       .catch((err) => {
-        console.error("[tutorial] skip opt-out persist failed:", err);
+        setExitError(formatError(err));
       });
   };
 
-  // Exit (unlike skip) leaves the tutorial for a usable freeform composer
-  // NOW: persist the opt-out AND publish it locally, so App's showTutorial
-  // gate unmounts the whole shell and the learner lands in the freeform
-  // composer on the same session (elspeth-61591e64bb). Fired by (a) the
-  // guided wizard's exited_to_freeform terminal — the wire-stage "Exit to
-  // freeform" button is reachable in tutorial mode and on blocked outcomes
-  // is the ONLY affordance — and (b) the persistent "Exit tutorial" chrome
-  // control below. Resilient even on failure: a rejected PATCH sets the
-  // store's writeError, which ALSO flips showTutorial false — the exit can
-  // never strand the learner in the shell.
+  // Keep the tutorial mounted until both the authoritative session exit and
+  // preference save settle. Startup has its own in-flight owner: request its
+  // handoff and let onExited retry here once the terminal is authoritative.
   const onExitTutorial = useCallback((): void => {
-    // Two guided surfaces survive the shell unmount and would keep the learner
-    // OFF freeform, so both must be handed off through exitToFreeform (which
-    // POSTs control_signal=exit_to_freeform, backend-recorded as
-    // user_pressed_exit so guided stays re-enterable):
-    //   * a LIVE (terminal == null) build — ChatPanel's discriminator re-renders
-    //     the guided workspace;
-    //   * a COMPLETED build — the discriminator checks `completed` FIRST and
-    //     re-renders CompletionSummary, whose own "Open freeform editor" button
-    //     just calls exitToFreeform (elspeth-e2c3dba6b5 review P2). Firing it
-    //     here up front lands the learner in freeform NOW instead of on the
-    //     summary with an extra click. The backend exempts kind=COMPLETED from
-    //     the terminal-rejection for exactly this transition (guided.py:1222).
-    // An already-exited_to_freeform terminal (the wizard-path onExited hand-off
-    // reaches this handler with the terminal already set) is left alone: it
-    // already falls through to freeform, and re-firing would be a duplicate
-    // respond POST the backend 409s. Best-effort like the persist below; the
-    // duplicate markTutorialGraduated onExited can trigger (the shell observes
-    // the terminal and hands off) is absorbed by the store's landed-completion
-    // guard.
-    const { guidedSession, exitToFreeform } = useSessionStore.getState();
-    const terminalKind = guidedSession?.terminal?.kind ?? null;
+    if (exitingRef.current) return;
+    const { guidedSession } = useSessionStore.getState();
     const tutorialSessionId = state.sessionId ?? sessionId;
+    setExitError(null);
     if (
       state.step === "guided" &&
       guidedSession === null &&
       tutorialSessionId !== null
     ) {
       guidedStartupExitRequestedRef.current = true;
-    }
-    if (
-      guidedSession !== null &&
-      (terminalKind === null || terminalKind === "completed")
-    ) {
-      void exitToFreeform().catch((err) => {
-        console.error("[tutorial] exit-to-freeform hand-off failed:", err);
-      });
+      setExitError("Finishing tutorial startup before exiting. If startup fails, retry it or reset the tutorial from Composer preferences.");
+      return;
     }
     // Exit during an in-flight run: the run turn's effect cleanup
     // deliberately never aborts (StrictMode), and its Cancel button is the
@@ -338,11 +317,27 @@ export function HelloWorldTutorial({
     if (state.step === "run" && state.runId === null && state.sessionId !== null) {
       abandonTutorialRun(state.sessionId);
     }
-    void usePreferencesStore
-      .getState()
-      .markTutorialGraduated({ via: "exit" })
+    if (tutorialSessionId === null) {
+      setExitError("The tutorial session is unavailable. Reset the tutorial from Composer preferences.");
+      return;
+    }
+    exitingRef.current = true;
+    setExiting(true);
+    void (async () => {
+      if (
+        useSessionStore.getState().activeSessionId !== tutorialSessionId ||
+        useSessionStore.getState().guidedSession === null
+      ) {
+        await useSessionStore.getState().selectSession(tutorialSessionId);
+      }
+      await departTutorialSession(tutorialSessionId, "exit");
+    })()
       .catch((err) => {
-        console.error("[tutorial] exit opt-out persist failed:", err);
+        setExitError(formatError(err));
+      })
+      .finally(() => {
+        exitingRef.current = false;
+        setExiting(false);
       });
   }, [state.step, state.runId, state.sessionId, sessionId]);
   const stepLabels = TUTORIAL_STEP_LABELS;
@@ -433,11 +428,15 @@ export function HelloWorldTutorial({
             variant="bare"
             className="tutorial-link-button tutorial-exit-button"
             onClick={onExitTutorial}
+            disabled={exiting}
           >
             Exit tutorial
           </Button>
         )}
       </nav>
+      {exitError !== null && (
+        <p role="alert" className="tutorial-error">{exitError}</p>
+      )}
       {state.step === "welcome" && (
         <>
           <p role="status" className="sr-only">

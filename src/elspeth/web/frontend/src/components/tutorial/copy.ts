@@ -3,7 +3,7 @@ import { CANONICAL_TUTORIAL_PROMPT } from "./tutorialMachine";
 export { CANONICAL_TUTORIAL_PROMPT };
 
 export const TURN_1_PRIMARY_BUTTON = "Let's go";
-// The mode-choice turn is gone (graduation now saves Guided as the default),
+// The mode-choice turn is gone (graduation saves Freeform as the default),
 // so skip exits the whole tutorial straight to graduation rather than naming a
 // removed step.
 export const TURN_1_SKIP_BUTTON = "Skip the tutorial";
