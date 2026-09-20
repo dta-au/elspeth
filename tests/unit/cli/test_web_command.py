@@ -438,6 +438,35 @@ class TestComposerUsersCommand:
 class TestComposerUsersBootstrapAdmin:
     """``composer users bootstrap-admin``: the operator's lockout recovery (spec D20)."""
 
+    def test_remove_refuses_the_last_active_administrator_and_touches_neither_store(self, tmp_path: Path) -> None:
+        """One mistyped command must not leave a deployment nobody can administer.
+
+        ``bootstrap-admin`` is a way back from zero administrators, but only
+        for an operator with a shell on the container; the web surface has no
+        way back at all. So the CLI refuses exactly as the web route does,
+        before the credential is touched, and says what to do instead.
+        """
+        auth_db = tmp_path / "auth.db"
+        _cli_add(auth_db=auth_db, data_dir=tmp_path)
+        assert self._invoke(tmp_path, provider="local", subject="alice").exit_code == 0
+
+        result = runner.invoke(
+            app,
+            ["--no-dotenv", "composer", "users", "remove", "alice", "--data-dir", str(tmp_path), "--auth-db", str(auth_db), "--yes"],
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "alice is the last active administrator" in result.output
+        assert "Nothing was removed." in result.output
+        assert "Give another person the admin role first" in result.output
+        assert "Traceback" not in result.output
+        assert _auth_user_row(auth_db, "alice") is not None
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        try:
+            assert [(row.subject, row.access_state) for row in _identity_rows(engine)] == [("alice", "active")]
+        finally:
+            engine.dispose()
+
     def _invoke(self, tmp_path: Path, *extra: str, provider: str = "oidc", subject: str = "ada") -> Any:
         return runner.invoke(
             app,

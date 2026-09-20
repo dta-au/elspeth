@@ -293,7 +293,6 @@ def test_a_disable_racing_an_account_deletion_leaves_exactly_one_admin(external_
                     subject="root",
                     reason="local credential deleted",
                     record=_rendezvous(observer, arrived, 1),
-                    protect_last_admin=True,
                     delete_credential=lambda: credential_deletions.append("root"),
                 )
             except LastActiveAdminProtected:

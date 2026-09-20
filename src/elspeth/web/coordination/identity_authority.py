@@ -2083,7 +2083,6 @@ class RepositoryIdentityAuthority:
         subject: str,
         reason: str,
         record: Callable[[IdentityRetired], None],
-        protect_last_admin: bool,
         delete_credential: Callable[[], None],
     ) -> IdentityRecord | None:
         """Delete a credential and retire the identity behind it.
@@ -2113,10 +2112,11 @@ class RepositoryIdentityAuthority:
         username bound to a live identity; re-running the removal finds no
         credential, retires the identity it owed, and is the recovery.
 
-        ``protect_last_admin`` is each surface's own decision, stated rather
-        than defaulted: the web surface has no way back from zero
-        administrators, while an operator at the CLI holds
-        ``bootstrap_admin``'s recovery mode.
+        The refusal holds on EVERY surface, the operator's CLI included.
+        ``bootstrap_admin``'s recovery mode is a way back from zero
+        administrators, not a reason to let one command get there: a
+        container whose only administrator was removed by accident serves
+        nobody until an operator with shell access repairs it.
 
         ``record`` runs INSIDE the transaction like every other mutation's
         callback: a retirement the audit trail cannot hold does not commit.
@@ -2124,14 +2124,12 @@ class RepositoryIdentityAuthority:
         _require_provider(provider)
         _require_nonblank(subject, "subject")
         _require_nonblank(reason, "reason")
-        if type(protect_last_admin) is not bool:
-            raise TypeError("protect_last_admin must be a bool")
         with self._engine.begin() as conn:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
             # R5's population, locked before anything else (see the constant).
             admin_holders = conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
             existing = conn.execute(_IDENTITY_BY_NATURAL_KEY_FOR_UPDATE, {"provider": provider, "subject": subject}).one_or_none()
-            if protect_last_admin and existing is not None and existing.kind == "human" and existing.access_state == "active":
+            if existing is not None and existing.kind == "human" and existing.access_state == "active":
                 target_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": existing.identity_id}).all(), now)
                 if _holds_deployment_admin(target_grants) and _active_human_admin_count(admin_holders, now) <= 1:
                     raise LastActiveAdminProtected()
@@ -3194,8 +3192,6 @@ class RepositoryIdentityAuthority:
 def local_identity_retirer(
     authority: RepositoryIdentityAuthority,
     record: Callable[[IdentityRetired], None],
-    *,
-    protect_last_admin: bool,
 ) -> Callable[[str, Callable[[], None]], bool]:
     """The ONE retirement collaborator for a deleted local credential.
 
@@ -3205,8 +3201,8 @@ def local_identity_retirer(
     reason are decided in exactly one place (elspeth-9c171c00fa).  ``record``
     is the surface's audit sink for the retirement, invoked inside the
     authority's transaction; a surface that audits nothing passes an explicit
-    no-op and owns that decision.  ``protect_last_admin`` is owned the same
-    way: see ``retire_identity``.
+    no-op and owns that decision.  No surface chooses whether the last active
+    human administrator is protected: see ``retire_identity``.
 
     The returned callable takes the username and the caller's credential
     deletion, and answers whether an identity was retired.
@@ -3220,7 +3216,6 @@ def local_identity_retirer(
             subject=username,
             reason="local credential deleted",
             record=record,
-            protect_last_admin=protect_last_admin,
             delete_credential=delete_credential,
         )
         return retired is not None

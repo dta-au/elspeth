@@ -1143,7 +1143,7 @@ def _build_local_auth_provider(
         # in exactly one place.
         # The web surface cannot recover from zero administrators, so a
         # deletion here may not retire the last one (R5).
-        retire_identity=local_identity_retirer(identity_authority, _record_retirement, protect_last_admin=True),
+        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
     )
 
 

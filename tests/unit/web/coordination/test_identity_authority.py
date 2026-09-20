@@ -1265,18 +1265,12 @@ def test_retire_disables_and_retires_the_binding(engine, authority) -> None:
         subject="ada",
         reason="local credential deleted",
         record=_noop,
-        protect_last_admin=False,
         delete_credential=lambda: None,
     )
     assert retired is not None and retired.access_state == "disabled"
     assert retired.subject == f"ada#retired-{pending.identity_id}"
     assert authority.read_identity_by_natural_key(provider="local", subject="ada") is None
-    assert (
-        authority.retire_identity(
-            provider="local", subject="ada", reason="again", record=_noop, protect_last_admin=False, delete_credential=lambda: None
-        )
-        is None
-    )
+    assert authority.retire_identity(provider="local", subject="ada", reason="again", record=_noop, delete_credential=lambda: None) is None
     fresh = _pending(authority, "ada")
     assert fresh.identity_id != pending.identity_id
 
@@ -1290,7 +1284,6 @@ def test_retire_records_one_typed_outcome_and_nothing_for_an_unknown_key(engine,
         subject="ada",
         reason="local credential deleted",
         record=recorder,
-        protect_last_admin=False,
         delete_credential=lambda: None,
     )
     assert retired is not None
@@ -1306,10 +1299,7 @@ def test_retire_records_one_typed_outcome_and_nothing_for_an_unknown_key(engine,
     assert outcome.retired_at == _identity_row(engine, pending.identity_id).disabled_at.replace(tzinfo=UTC)
     # No row, no write, no event: an absent identity is not a retirement.
     assert (
-        authority.retire_identity(
-            provider="local", subject="nobody", reason="x", record=recorder, protect_last_admin=False, delete_credential=lambda: None
-        )
-        is None
+        authority.retire_identity(provider="local", subject="nobody", reason="x", record=recorder, delete_credential=lambda: None) is None
     )
     assert len(recorder.outcomes) == 1
 
@@ -1322,7 +1312,6 @@ def test_a_failed_retirement_audit_rolls_the_retirement_back(engine, authority) 
             subject="ada",
             reason="local credential deleted",
             record=_refuse_audit,
-            protect_last_admin=False,
             delete_credential=lambda: None,
         )
     row = _identity_row(engine, pending.identity_id)
@@ -1336,7 +1325,7 @@ def test_a_failed_retirement_audit_rolls_the_retirement_back(engine, authority) 
 def test_local_identity_retirer_binds_the_local_provider_reason_and_recorder(engine, authority) -> None:
     pending = _pending(authority, "ada")
     recorder = _Recorder()
-    retire = local_identity_retirer(authority, recorder, protect_last_admin=True)
+    retire = local_identity_retirer(authority, recorder)
     deletions: list[str] = []
     assert retire("ada", lambda: deletions.append("ada")) is True
     assert deletions == ["ada"]
@@ -1351,7 +1340,7 @@ def test_local_identity_retirer_binds_the_local_provider_reason_and_recorder(eng
     assert deletions == ["ada", "nobody"]
     impostor: Any = object()
     with pytest.raises(TypeError):
-        local_identity_retirer(impostor, recorder, protect_last_admin=True)
+        local_identity_retirer(impostor, recorder)
 
 
 def test_retirement_refuses_the_last_active_human_admin_before_the_credential_goes(engine, authority) -> None:
@@ -1373,7 +1362,6 @@ def test_retirement_refuses_the_last_active_human_admin_before_the_credential_go
             subject="root",
             reason="local credential deleted",
             record=recorder,
-            protect_last_admin=True,
             delete_credential=lambda: deletions.append("root"),
         )
 
@@ -1384,9 +1372,10 @@ def test_retirement_refuses_the_last_active_human_admin_before_the_credential_go
     assert authority.count_active_human_admins() == 1
 
 
-def test_retirement_of_the_last_admin_is_the_surface_s_decision(engine, authority) -> None:
-    """The operator CLI holds bootstrap recovery, so it may decline the protection."""
+def test_retirement_of_an_admin_proceeds_once_another_active_human_admin_exists(engine, authority) -> None:
+    """The refusal is about the LAST administrator, not about administrators."""
     root = _bootstrap(authority)
+    _active_sso_admin(authority, _actor(root.record.identity_id), "second")
     deletions: list[str] = []
 
     retired = authority.retire_identity(
@@ -1394,13 +1383,12 @@ def test_retirement_of_the_last_admin_is_the_surface_s_decision(engine, authorit
         subject="root",
         reason="local credential deleted",
         record=_noop,
-        protect_last_admin=False,
         delete_credential=lambda: deletions.append("root"),
     )
 
     assert retired is not None and retired.identity_id == root.record.identity_id
     assert deletions == ["root"]
-    assert authority.count_active_human_admins() == 0
+    assert authority.count_active_human_admins() == 1
 
 
 def test_retirement_deletes_the_credential_before_it_writes_the_identity(engine, authority) -> None:
@@ -1413,7 +1401,6 @@ def test_retirement_deletes_the_credential_before_it_writes_the_identity(engine,
         subject="ada",
         reason="local credential deleted",
         record=lambda _outcome: order.append("identity retired"),
-        protect_last_admin=True,
         delete_credential=lambda: order.append("credential deleted"),
     )
 
@@ -1433,20 +1420,11 @@ def test_a_failed_credential_deletion_retires_nothing(engine, authority) -> None
             subject="ada",
             reason="local credential deleted",
             record=_noop,
-            protect_last_admin=True,
             delete_credential=delete_credential,
         )
 
     row = _identity_row(engine, pending.identity_id)
     assert (row.access_state, row.subject) == ("pending", "ada")
-
-
-def test_retirement_demands_an_explicit_protection_decision(authority) -> None:
-    decision: Any = "yes"
-    with pytest.raises(TypeError, match="protect_last_admin"):
-        authority.retire_identity(
-            provider="local", subject="ada", reason="x", record=_noop, protect_last_admin=decision, delete_credential=lambda: None
-        )
 
 
 # --------------------------------------------------------------------------

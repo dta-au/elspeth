@@ -111,7 +111,6 @@ def _retire(authority: RepositoryIdentityAuthority, subject: str = "ada", *, rea
         subject=subject,
         reason=reason,
         record=_record_no_retirement,
-        protect_last_admin=False,
         delete_credential=lambda: None,
     )
 

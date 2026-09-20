@@ -2046,12 +2046,6 @@ def _composer_session_engine(session_db_url: str) -> Engine:
     return create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
 
 
-# An operator at this CLI holds ``bootstrap-admin``'s recovery mode, which is
-# exactly the way back from zero administrators that the web surface lacks, so
-# removing the last administrator's credential stays the operator's call here.
-_CLI_PROTECTS_LAST_ADMIN = False
-
-
 def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> RetireIdentity:
     """A retirer that opens the stores only if it is ever asked to retire.
 
@@ -2073,7 +2067,6 @@ def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> Retir
                 return local_identity_retirer(
                     RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
                     _composer_retirement_recorder(recorder),
-                    protect_last_admin=_CLI_PROTECTS_LAST_ADMIN,
                 )(username, delete_credential)
         finally:
             engine.dispose()
@@ -2186,7 +2179,11 @@ def composer_users_remove(
 ) -> None:
     """Remove a local Composer web user and retire the identity it was bound to."""
     from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
-    from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
+    from elspeth.web.coordination.identity_authority import (
+        LastActiveAdminProtected,
+        RepositoryIdentityAuthority,
+        local_identity_retirer,
+    )
     from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 
     db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
@@ -2220,10 +2217,22 @@ def composer_users_remove(
                 retire_identity=local_identity_retirer(
                     RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
                     _composer_retirement_recorder(recorder),
-                    protect_last_admin=_CLI_PROTECTS_LAST_ADMIN,
                 ),
             )
-            if not provider.delete_user(username).removed_anything:
+            try:
+                deletion = provider.delete_user(username)
+            except LastActiveAdminProtected as exc:
+                # Refused before the credential was touched. ``bootstrap-admin``
+                # only answers when NO active administrator exists, so it is
+                # not the way to make the second one.
+                typer.echo(
+                    f"Error: {username} is the last active administrator, and removing this account would leave "
+                    "the deployment with nobody able to administer it. Nothing was removed.\n"
+                    "Give another person the admin role first (People & access, Roles), then run this command again.",
+                    err=True,
+                )
+                raise typer.Exit(1) from exc
+            if not deletion.removed_anything:
                 typer.echo(f"Error: composer user not found: {username}", err=True)
                 raise typer.Exit(1)
     finally:

@@ -162,7 +162,6 @@ def test_local_correlation_is_exact_and_skips_a_retired_key(authority) -> None:
         subject="pat",
         reason="local credential deleted",
         record=_noop,
-        protect_last_admin=True,
         delete_credential=lambda: None,
     )
     new_id = _login(authority, "pat", activate=True)
