@@ -135,15 +135,16 @@ export function MessageBubble({
   // legibility). An sr-only label, read first, supplies it. (elspeth-f700d8d8a5)
   const authorLabel = isUser ? "You said:" : isSystem ? "System note:" : "ELSPETH said:";
 
-  // System messages: centre-aligned full-width banner, muted colour,
-  // italic text. Used for audit markers like "Pipeline reverted to version N."
+  // Short audit markers remain centred and italic. The current validation
+  // message can contain long error explanations, so it reads as a left-aligned
+  // notice instead.
   if (isSystem) {
     return (
       <div
         className="message-bubble message-bubble--system message-row message-row--system"
       >
         <div
-          className="bubble bubble-system"
+          className={`bubble bubble-system${message.id === "system-validation-current" ? " bubble-system--validation" : ""}`}
           role="status"
         >
           <span className="sr-only">{authorLabel}</span>

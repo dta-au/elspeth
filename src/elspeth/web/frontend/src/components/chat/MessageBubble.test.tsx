@@ -651,3 +651,20 @@ describe("author attribution for assistive tech (C1, elspeth-f700d8d8a5)", () =>
     expect(screen.getByText("System note:")).toBeInTheDocument();
   });
 });
+
+describe("current validation notice", () => {
+  it("uses a readable notice treatment without changing ordinary system markers", () => {
+    const { rerender } = render(
+      <MessageBubble message={makeMessage({
+        id: "system-validation-current",
+        role: "system",
+        content: "**Validation failed** — fix the following errors before running:\n- Check the model settings",
+      })} />,
+    );
+    expect(screen.getByRole("status")).toHaveClass("bubble-system--validation");
+    expect(screen.getByText("Check the model settings")).toBeInTheDocument();
+
+    rerender(<MessageBubble message={makeMessage({ role: "system", content: "Pipeline reverted." })} />);
+    expect(screen.getByRole("status")).not.toHaveClass("bubble-system--validation");
+  });
+});

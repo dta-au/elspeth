@@ -49,7 +49,7 @@ export function GraphFailurePolicies({ state }: { state: CompositionState }): JS
       <div className="graph-detail-table-scroll">
         <table>
           <thead>
-            <tr><th scope="col">Component</th><th scope="col">When</th><th scope="col">Action</th></tr>
+            <tr><th scope="col">Node</th><th scope="col">When</th><th scope="col">Action</th></tr>
           </thead>
           <tbody>
             {rows.map((row) => (

@@ -346,6 +346,7 @@ describe("GraphView", () => {
     const policies = screen.getByText("Failure handling").closest("details");
     expect(policies).toHaveAttribute("open");
     const table = within(policies as HTMLElement).getByRole("table");
+    expect(within(table).getByRole("columnheader", { name: "Node" })).toBeInTheDocument();
     expect(within(table).getByRole("row", { name: /Source: source/ })).toHaveTextContent(
       "Row fails validationDiscard row (audit recorded)",
     );

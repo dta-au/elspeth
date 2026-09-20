@@ -119,6 +119,12 @@
   font-size: var(--font-size-sm);
 }
 
+.bubble-system--validation {
+  text-align: left;
+  color: var(--color-text);
+  font-style: normal;
+}
+
 .trusted-system-notice {
   margin-top: var(--space-md);
   padding: var(--space-sm) var(--space-md);
