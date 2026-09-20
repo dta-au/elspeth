@@ -1163,8 +1163,11 @@ class TestPreflightRepairContinue:
             user_id: str | None = None,
             session_id: str | None = None,
             plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+            *,
+            session_operation_context: SessionOperationContext | None = None,
+            allow_pending_interpretation_placeholders: bool = False,
         ) -> ValidationResult:
-            del user_id, session_id, plugin_snapshot
+            del user_id, session_id, plugin_snapshot, session_operation_context, allow_pending_interpretation_placeholders
             sink_path = state.outputs[0].options.get("path") if state.outputs else None
             if sink_path == _BROKEN_SINK_PATH:
                 return _preflight_invalid_for_placeholder_sink()
