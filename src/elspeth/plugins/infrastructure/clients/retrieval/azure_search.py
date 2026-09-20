@@ -383,7 +383,12 @@ class AzureSearchProvider:
                     f"Malformed JSON response from Azure AI Search: {error}",
                     retryable=False,
                 )
-            return cast(dict[str, Any], parsed)
+            if not isinstance(parsed, dict):
+                raise RetrievalError(
+                    f"Azure AI Search response must be a JSON object, got {type(parsed).__name__}",
+                    retryable=False,
+                )
+            return parsed
         except RetrievalError:
             raise
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:

@@ -774,6 +774,29 @@ class TestExecuteSearchHTTP:
         assert exc_info.value.retryable
         assert exc_info.value.__cause__ is transport_error
 
+    @pytest.mark.parametrize(
+        "response_body",
+        ["null", "42", "1.5", "true", "false", '""', '"value"', "[]", '["value"]'],
+        ids=["null", "integer", "float", "true", "false", "empty-string", "value-string", "empty-array", "value-array"],
+    )
+    def test_200_non_object_json_raises_non_retryable(self, response_body: str) -> None:
+        provider = self._make_provider()
+        try:
+            with respx.mock:
+                route = respx.post(self.PINNED_SEARCH_URL).respond(
+                    status_code=200,
+                    text=response_body,
+                    headers={"Content-Type": "application/json"},
+                )
+
+                with pytest.raises(RetrievalError, match="response must be a JSON object") as exc_info:
+                    provider.search("test query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
+
+                assert exc_info.value.retryable is False
+                assert route.call_count == 1
+        finally:
+            provider.close()
+
     def test_200_malformed_json_raises_non_retryable(self) -> None:
         """HTTP 200 with unparseable body maps to RetrievalError(retryable=False)."""
 
