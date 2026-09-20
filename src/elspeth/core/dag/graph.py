@@ -1199,7 +1199,8 @@ class ExecutionGraph:
                 result[branch_name] = first_node
 
         # row_union branches use the same identity-vs-chain shapes with the
-        # union node as the barrier endpoint.
+        # union node as the barrier endpoint. The builder rejects nested forks
+        # inside these branches, including forks closed by an inner coalesce.
         for branch_name, row_union_name in self._branch_to_row_union.items():
             union_nid = self._row_union_id_map[row_union_name]
             is_identity = any(
@@ -1245,10 +1246,10 @@ class ExecutionGraph:
         rejected at build. E1 review round 2 F5 (elspeth-0bd2cde19a,
         2026-08-23) proved both authorable variants build-reject; a
         row_union disjunct here would be dead code claiming coverage it
-        cannot exercise. The SYMMETRIC case — a row_union BRANCH fed by a
-        coalesce — is a live latent gap, tracked separately at
-        elspeth-a01889580f (``get_branch_first_nodes``'s row_union loop,
-        not this predicate).
+        cannot exercise. The symmetric case — a row_union BRANCH fed by a
+        coalesce — is also build-rejected by the nested-fork guard before
+        runtime branch dispatch. The coalesce-feeds-row_union integration
+        regression pins this boundary (elspeth-a01889580f).
         """
         return CoalesceName(input_connection) in self._coalesce_id_map
 

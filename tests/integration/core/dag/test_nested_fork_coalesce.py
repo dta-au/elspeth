@@ -30,6 +30,7 @@ import pytest
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
 from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
@@ -204,6 +205,70 @@ def test_nested_fork_in_fork_builds_and_runs_to_completion(tmp_path: Path) -> No
     assert result_data["rows_failed"] == 0
     assert result_data["rows_coalesce_failed"] == 0
     assert output_rows == list(_EXPECTED_ROWS)
+
+
+_COALESCE_FEEDS_ROW_UNION_SETTINGS_YAML_TEMPLATE = """
+sources:
+  primary:
+    plugin: csv
+    on_success: outer_fork_input
+    options:
+      path: {input_path}
+      on_validation_failure: discard
+      schema: {{mode: fixed, fields: ["id: int", "value: int"]}}
+gates:
+  - name: outer_fork
+    input: outer_fork_input
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [outer_a, outer_b]
+  - name: inner_fork
+    input: outer_a
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [inner_a1, inner_a2]
+coalesce:
+  - name: merge_inner
+    branches: {{inner_a1: inner_a1, inner_a2: inner_a2}}
+    policy: require_all
+    merge: nested
+row_unions:
+  - name: union_outer
+    branches: {{outer_a: merge_inner, outer_b: outer_b}}
+    on_success: union_out
+transforms:
+  - name: after_union
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema: {{mode: observed}}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema: {{mode: observed}}
+"""
+
+
+def test_coalesce_feeding_row_union_is_rejected_before_runtime(tmp_path: Path) -> None:
+    """The nested-fork build guard pre-empts branch tracing (elspeth-a01889580f).
+
+    Unlike coalesce-feeds-coalesce above, this topology is unsupported even
+    when the inner fork has a merging closer. Keep the real settings/build
+    path here so a future admission change must revisit row-union dispatch.
+    """
+    with pytest.raises(GraphValidationError, match="are nested inside a branch that feeds row_union") as exc_info:
+        _build_and_run(_COALESCE_FEEDS_ROW_UNION_SETTINGS_YAML_TEMPLATE, tmp_path)
+
+    assert "inner_fork" in str(exc_info.value)
+    assert "union_outer" in str(exc_info.value)
+    assert not (tmp_path / "audit.db").exists()
+    assert not (tmp_path / "output.jsonl").exists()
 
 
 # ===== F1: loss-triggered nested merge (THIRD merge-release path) =====
