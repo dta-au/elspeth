@@ -62,7 +62,7 @@ release-evidence controller.
 8. deploy `workload.bicep` in the production shape and prove the rollout;
 9. verify public behaviour and record the operator-local notes; and
 10. optionally, grant the web identity read access to an Azure AI Search index
-    for `rag_retrieval`.
+    and declare it as an operator profile for the `azure_ai_search` transform.
 
 Every step has a stop condition. Do not skip forward after a failed identity,
 image, doctor or readiness check.
@@ -385,8 +385,7 @@ digest in operator-local notes under
 
 ## 10. Optional: grant Azure AI Search access for RAG retrieval
 
-The `rag_retrieval` transform's `azure_search` provider queries an existing
-Azure AI Search index; the default image already carries it
+The `azure_ai_search` transform queries an existing Azure AI Search index; the default image already carries it
 (`INSTALL_EXTRAS=all` includes `azure-identity`). The bundle does not create a
 search service or an index. Keeping to "no static credential in any
 container", the supported credential on this target is the web app's
@@ -411,43 +410,43 @@ az role assignment create --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
 printf 'client_id: %s\n' "$IDENTITY_CLIENT_ID"
 ```
 
-A pipeline then names the identity explicitly. `client_id` is
-required here: the identity is user-assigned, and the provider uses
-`ManagedIdentityCredential`, which does not read `AZURE_CLIENT_ID` on Container
-Apps.
+Declare the service to the web app as an operator profile. It is not a secret,
+so it travels in `extraEnvironment` in the operator-local workload parameter
+file; `indexes` is mandatory, and `"any"` is the written decision to open every
+index on the service to web authors. `client_id` is required here: the identity
+is user-assigned, and the transform uses `ManagedIdentityCredential`, which does
+not read `AZURE_CLIENT_ID` on Container Apps.
 
-```yaml
-provider: azure_search
-provider_config:
-  endpoint: https://<service>.search.windows.net
-  index: <index>
-  use_managed_identity: true
-  client_id: <identityClientId>
-  search_mode: hybrid
+```json
+{"name": "ELSPETH_WEB__AZURE_SEARCH_PROFILES",
+ "value": "[{\"alias\":\"policies\",\"endpoint\":\"https://<service>.search.windows.net\",\"auth\":\"managed_identity\",\"client_id\":\"<identityClientId>\",\"indexes\":[\"<index>\"]}]"}
 ```
+
+Add `transform:azure_ai_search` to `ELSPETH_WEB__PLUGIN_ALLOWLIST`, which is
+another `extraEnvironment` entry on this target. A web author then selects
+`profile: policies` and an index the profile lists; the endpoint and identity
+never appear in an authored pipeline, and `endpoint`, `api_key`,
+`use_managed_identity`, `client_id` and `api_version` are refused there.
+Several services are several entries in the array. A managed-identity profile
+needs no `ELSPETH_WEB__SECRET_WIRING_ALLOWLIST` rule; neither does an `api_key`
+profile, whose server secret the profile injects rather than the author wiring
+it, but this target has no slot for that secret.
 
 Index field mapping, search modes and score ranges are in
 [`examples/azure_search_rag`](../../examples/azure_search_rag/README.md).
 
 Limits on this target:
 
-- **Web-authored pipelines cannot use it yet.** The Web Composer refuses
-  `use_managed_identity` when a pipeline is authored, validated and executed
-  (`web/provider_config_policy.py`), because a server identity's token would
-  otherwise follow any endpoint a user types. The operator-controlled endpoint
-  allowlist that refusal names is not implemented, and this bundle deploys no
-  other run surface, so the grant above is a prerequisite, not a working path,
-  until that allowlist lands.
-- **No private endpoint for the search service.** The provider resolves the
-  endpoint and refuses private addresses before every request and at start-up,
-  so a `privatelink.search.windows.net` answer is blocked as SSRF. Leave the
-  service on its public endpoint and restrict it with the Search IP firewall.
-  The environment's outbound address is not static without a NAT gateway,
-  which the bundle does not create.
-- A run that stops at start-up with `RetrievalNotReadyError` and
-  `unreachable: HTTPStatusError` naming 403 means the role assignment has not
-  propagated or role-based access is off; a missing index reports `not found`,
-  an empty one `is empty`.
+- **No private endpoint for the search service.** The transform resolves the
+  endpoint and refuses private addresses before every request and before the
+  first row, so a `privatelink.search.windows.net` answer is blocked as SSRF.
+  Leave the service on its public endpoint and restrict it with the Search IP
+  firewall. The environment's outbound address is not static without a NAT
+  gateway, which the bundle does not create.
+- A run that stops before the first row with `pre_flight_failed`
+  (`RuntimePreflightFailedError`) and `Authentication failed ... HTTP 403`
+  means the role assignment has not propagated or role-based access is off; a
+  missing index reports `not found`, an empty one `is empty`.
 
 ## Troubleshooting
 
