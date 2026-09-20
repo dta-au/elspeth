@@ -182,6 +182,7 @@ class _WebSettingsStub:
         # Secret wiring is deny-by-default (elspeth-f3c1aafd25); tests that
         # exercise wired secrets construct their own authorizing policy.
         self.secret_wiring_allowlist: tuple[Any, ...] = ()
+        self.execution_rate_limit = RateLimitSettings()
 
     def get_session_db_url(self) -> str:
         return f"sqlite:///{Path(self.data_dir) / 'sessions.db'}"
@@ -4280,7 +4281,12 @@ class TestB3Construction:
         service: ExecutionServiceImpl,
         mock_settings: _WebSettingsStub,
     ) -> None:
-        """Rate-limit persistence must be confined to the web app state root."""
+        """Rate limits are the operator's block, persisted under the web app state root.
+
+        A composition cannot carry ``rate_limit``, so the loaded pipeline's value
+        is only ever the engine default; building the limiter from it pinned
+        every web run to 60 calls/minute with no operator override.
+        """
         _configure_runtime_success(
             mock_load=mock_load,
             mock_instantiate=mock_instantiate,
@@ -4288,6 +4294,8 @@ class TestB3Construction:
             mock_orch_cls=mock_orch_cls,
         )
         mock_settings.data_dir = Path("/tmp/custom-web-state")
+        operator_rate_limit = RateLimitSettings(default_requests_per_minute=6000)
+        mock_settings.execution_rate_limit = operator_rate_limit
 
         with (
             patch(
@@ -4301,7 +4309,8 @@ class TestB3Construction:
         ):
             service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
-        mock_from_settings.assert_called_once_with(mock_load.return_value.rate_limit, state_dir=Path("/tmp/custom-web-state"))
+        mock_from_settings.assert_called_once_with(operator_rate_limit, state_dir=Path("/tmp/custom-web-state"))
+        assert mock_from_settings.call_args.args[0] is not mock_load.return_value.rate_limit
 
 
 @pytest.mark.usefixtures("mock_pipeline_config_assembly")

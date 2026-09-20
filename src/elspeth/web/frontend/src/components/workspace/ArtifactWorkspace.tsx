@@ -28,6 +28,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { RunStatus } from "@/types/index";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
+import { ApprovalsView } from "./ApprovalsView";
 import { ChecksView } from "./ChecksView";
 import { PipelineSpecView } from "./PipelineSpecView";
 import {
@@ -39,7 +40,10 @@ import {
 import { ARTIFACT_TABS, type ArtifactTab } from "./workspaceTypes";
 
 const TAB_LABELS: Record<ArtifactTab, string> = {
-  graph: "Graph",
+  /* The tab id stays "graph" (deep links, the command palette and stored pane
+     state all key on it); only the visible name is "Workflow". */
+  graph: "Workflow",
+  approvals: "Approvals",
   spec: "Spec",
   yaml: "YAML",
   checks: "Checks",
@@ -126,10 +130,16 @@ function activeArtifact(
   tab: ArtifactTab,
   runAvailable: boolean,
   checksValidationContent: React.ReactNode,
+  openFullscreen: () => void,
 ): JSX.Element {
   switch (tab) {
     case "graph":
-      return <GraphView />;
+      // Fullscreen is the graph's fourth canvas control (under fit view).
+      // Only this mount passes the handler: GraphModal renders the same
+      // GraphView and must not offer to open itself.
+      return <GraphView onFullscreen={openFullscreen} />;
+    case "approvals":
+      return <ApprovalsView />;
     case "spec":
       return <PipelineSpecView />;
     case "yaml":
@@ -222,6 +232,7 @@ export function ArtifactWorkspaceSurface({
   const { activeArtifactTab, availableArtifactTabs } = state;
   const tabRefs = useRef<Record<ArtifactTab, HTMLButtonElement | null>>({
     graph: null,
+    approvals: null,
     spec: null,
     yaml: null,
     checks: null,
@@ -346,7 +357,7 @@ export function ArtifactWorkspaceSurface({
   const announceFallback = useCallback((requested: ArtifactTab): void => {
     setAnnouncement((current) => ({
       id: current.id + 1,
-      message: `${TAB_LABELS[requested]} is unavailable. Showing Graph.`,
+      message: `${TAB_LABELS[requested]} is unavailable. Showing ${TAB_LABELS.graph}.`,
     }));
   }, []);
 
@@ -554,16 +565,8 @@ export function ArtifactWorkspaceSurface({
             );
           })}
         </div>
-        {/* Right cluster (2026-08-15 UX review): Plugin catalog precedes
-            Focus graph in DOM order — visual order IS tab order (WCAG 2.4.3;
-            no CSS `order` on interactive controls), and Focus graph keeps
-            its long-standing terminal-edge position whether or not the
-            catalog renders. Focus graph itself must NEVER be removed in
-            favour of a canvas gesture: it is the only keyboard-operable
-            trigger for GraphModal (palette "Show graph" and Ctrl+Shift+G
-            deliberately pass focusMode:false), and the canvas's click
-            gestures are already bound (empty-click deselects, double-click
-            zooms). */}
+        {/* Right cluster: session-wide tools only. The graph's Fullscreen
+            control is one of the Workflow canvas's own controls (GraphView). */}
         <div className="artifact-toolbar-actions">
           {/* Sole opener of the History drawer since the action-bar chips
               retired with the Checks tab: gated on the same completed-history
@@ -583,9 +586,6 @@ export function ArtifactWorkspaceSurface({
             </Button>
           )}
           {catalogAvailable && <CatalogButton />}
-          <Button compact onClick={focusGraph}>
-            Focus graph
-          </Button>
         </div>
       </div>
       <p
@@ -629,7 +629,7 @@ export function ArtifactWorkspaceSurface({
                 key={`${activeSessionId ?? "no-session"}:${tab}`}
                 label={`${activeLabel} artifact`}
               >
-                {activeArtifact(tab, runAvailable, checksValidationContent)}
+                {activeArtifact(tab, runAvailable, checksValidationContent, focusGraph)}
               </ErrorBoundary>
             )}
           </div>

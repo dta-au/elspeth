@@ -3643,7 +3643,9 @@ class ExecutionServiceImpl:
             from elspeth.core.rate_limit import RateLimitRegistry
             from elspeth.telemetry import create_telemetry_manager
 
-            rate_limit_config = RuntimeRateLimitConfig.from_settings(settings.rate_limit, state_dir=self._settings.data_dir)
+            # Operator-owned: a composition cannot carry ``rate_limit``, so
+            # ``settings.rate_limit`` here is only ever the engine default.
+            rate_limit_config = RuntimeRateLimitConfig.from_settings(self._settings.execution_rate_limit, state_dir=self._settings.data_dir)
             concurrency_config = RuntimeConcurrencyConfig.from_settings(settings.concurrency)
             checkpoint_config = RuntimeCheckpointConfig.from_settings(settings.checkpoint)
             telemetry_config = RuntimeTelemetryConfig.from_settings(settings.telemetry)

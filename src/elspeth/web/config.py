@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, Valid
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-from elspeth.core.config import PayloadStoreSettings
+from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
@@ -484,6 +484,15 @@ class WebSettings(BaseModel):
     aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = ()
     orphan_run_max_age_seconds: int = Field(default=3600, ge=60)
     orphan_run_check_interval_seconds: int = Field(default=300, ge=30)
+    # External-call rate limits for web-executed runs: the same block a CLI
+    # pipeline sets as ``rate_limit:`` in settings.yaml. A composition cannot
+    # carry run-execution settings, so without this every web run was pinned to
+    # the engine default (60 calls/minute per service) with no operator
+    # override. Operator-owned, never author-settable. Limiters are keyed by
+    # provider type (``openrouter``, ``azure_openai``, ``bedrock``,
+    # ``gateway``), so one ``services`` entry covers every LLM profile that
+    # shares that provider.
+    execution_rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
 
     # Execution infrastructure — defaults derive from data_dir when not explicitly set
     landscape_url: str | None = None
@@ -1396,7 +1405,7 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
     }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
-    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles"}
+    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles", "execution_rate_limit"}
 )
 
 

@@ -31,6 +31,7 @@ import {
   type ReactFlowInstance,
   type FitViewOptions,
   Background,
+  ControlButton,
   Controls,
   MiniMap,
 } from "@xyflow/react";
@@ -55,7 +56,7 @@ import {
 } from "@/lib/graphTopology";
 import { plural } from "@/utils/plural";
 import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
-import { Button, TypeBadge } from "@/components/ui";
+import { Button, Icon, TypeBadge } from "@/components/ui";
 import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import type { CompositionState } from "@/types/index";
 
@@ -832,7 +833,13 @@ function layoutGraph(
 
 // ── GraphView component ──────────────────────────────────────────────────────
 
-export function GraphView() {
+export interface GraphViewProps {
+  /** Opens the full-screen graph. Passed by the Workflow tab only; GraphModal
+   *  renders this same component and must not offer to open itself. */
+  onFullscreen?: () => void;
+}
+
+export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   const compositionState = useSessionStore((s) => s.compositionState);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const resolvedInterpretationsBySession = useInterpretationEventsStore((s) => s.resolvedBySession);
@@ -2213,7 +2220,16 @@ export function GraphView() {
           <Controls
             showInteractive={false}
             fitViewOptions={GRAPH_FIT_VIEW_OPTIONS}
-          />
+          >
+            {/* Fourth control, under fit view: the keyboard-operable trigger
+                for GraphModal (palette "Show graph" and Ctrl+Shift+G only
+                switch to this tab; the canvas's click gestures are bound). */}
+            {onFullscreen && (
+              <ControlButton onClick={onFullscreen} title="Fullscreen" aria-label="Fullscreen">
+                <Icon name="maximise" />
+              </ControlButton>
+            )}
+          </Controls>
           {nodes.length > MINIMAP_NODE_COUNT_THRESHOLD && (
             <MiniMap
               bgColor="var(--color-surface)"
