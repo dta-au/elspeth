@@ -1324,6 +1324,15 @@ export function GraphView() {
     }
     const nodeIds = new Set(rfNodes.map(n => n.id));
     const outputIds = new Set(compositionState.outputs.map((output) => output.name));
+    function hasErrorRoute(sourceId: string, targetId: string): boolean {
+      // An explicit on_error hint may carry a useful route name. Its label
+      // differs from the inferred "error" label, but both draw the same route.
+      return rfEdges.some((edge) =>
+        edge.source === sourceId
+        && edge.target === targetId
+        && edge.data.flowType === "error",
+      );
+    }
     function addDirectOutputErrorEdge(
       kind: string,
       sourceId: string,
@@ -1342,7 +1351,7 @@ export function GraphView() {
         "error",
         "error",
       );
-      if (existingConnections.has(semanticKey)) return;
+      if (hasErrorRoute(sourceId, targetId)) return;
 
       rfEdges.push({
         id: inferredSemanticEdgeId(
@@ -1572,7 +1581,10 @@ export function GraphView() {
           producer.label,
           producer.edgeType,
         );
-        if (existingConnections.has(semanticKey)) continue;
+        if (
+          existingConnections.has(semanticKey)
+          || (producer.origin === "error" && hasErrorRoute(producer.nodeId, queueId))
+        ) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: inferredSemanticEdgeId(
@@ -1654,7 +1666,10 @@ export function GraphView() {
           producer.label,
           producer.edgeType,
         );
-        if (existingConnections.has(semanticKey)) continue;
+        if (
+          existingConnections.has(semanticKey)
+          || (producer.origin === "error" && hasErrorRoute(producer.nodeId, node.id))
+        ) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: rowUnionIds.has(producer.nodeId)
@@ -1797,12 +1812,7 @@ export function GraphView() {
         node.node_type !== "collector" &&
         node.on_error &&
         nodeIds.has(node.on_error) &&
-        !existingConnections.has(edgeSemanticIdentity(
-          node.id,
-          node.on_error,
-          "error",
-          "error",
-        ))
+        !hasErrorRoute(node.id, node.on_error)
       ) {
         rfEdges.push({
           id: inferredSemanticEdgeId(

@@ -1481,6 +1481,56 @@ describe("GraphView", () => {
       ]);
     });
 
+    it("keeps named error edges without adding generic error lines to the same sinks", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          nodes: [
+            makeNode({ id: "lookup_category", on_error: "join_failures" }),
+            makeNode({ id: "generate_text", on_error: "llm_failures" }),
+          ],
+          edges: [
+            makeEdge({ from_node: "lookup_category", to_node: "join_failures", edge_type: "on_error", label: "category lookup failures" }),
+            makeEdge({ from_node: "generate_text", to_node: "llm_failures", edge_type: "on_error", label: "chaos LLM failures" }),
+          ],
+          outputs: [
+            { name: "join_failures", plugin: "json", options: {} },
+            { name: "llm_failures", plugin: "json", options: {} },
+          ],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+      expect(edgeElements(container, "lookup_category", "join_failures").map((edge) => edge.textContent)).toEqual(["category lookup failures"]);
+      expect(edgeElements(container, "generate_text", "llm_failures").map((edge) => edge.textContent)).toEqual(["chaos LLM failures"]);
+      expect(connectionTexts("lookup_category to join_failures:")).toEqual([
+        "lookup_category to join_failures: category lookup failures (error)",
+      ]);
+      expect(connectionTexts("generate_text to llm_failures:")).toEqual([
+        "generate_text to llm_failures: chaos LLM failures (error)",
+      ]);
+    });
+
+    it("keeps a named error edge to a transform without adding a generic line", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          nodes: [
+            makeNode({ id: "generate_text", on_error: "recovery_in" }),
+            makeNode({ id: "recover", input: "recovery_in" }),
+          ],
+          edges: [makeEdge({
+            from_node: "generate_text", to_node: "recover",
+            edge_type: "on_error", label: "chaos LLM failures",
+          })],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+      expect(edgeElements(container, "generate_text", "recover").map((edge) => edge.textContent)).toEqual(["chaos LLM failures"]);
+      expect(connectionTexts("generate_text to recover:")).toEqual([
+        "generate_text to recover: chaos LLM failures (error)",
+      ]);
+    });
+
     it("keeps discard failure settings inspectable without inventing a node or edge", async () => {
       const user = userEvent.setup();
       useSessionStore.setState({
