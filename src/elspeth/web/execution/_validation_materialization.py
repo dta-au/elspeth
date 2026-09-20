@@ -339,6 +339,25 @@ def materialize_validation_yaml(
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
+        if not refs:
+            # The YAML substring check also matches literal prompt/table text.
+            # Only discovered markers require authorized blob readers.
+            return PhaseReport(
+                artifact=MaterializedYaml(
+                    authored=interpretation.authored,
+                    materialized_state=interpretation.materialized_state,
+                    pipeline_yaml=pipeline_yaml,
+                ),
+                checks=(
+                    ValidationCheck(
+                        name=CHECK_BLOB_INLINE_REFS,
+                        passed=True,
+                        detail="No inline-content blob references found",
+                        affected_nodes=(),
+                        outcome_code=None,
+                    ),
+                ),
+            )
         if blob_get_metadata is None:
             unavailable = [
                 BlobInlineValidationViolation(

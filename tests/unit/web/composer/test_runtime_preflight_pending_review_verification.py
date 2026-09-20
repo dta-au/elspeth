@@ -25,6 +25,7 @@ carve-out to a terminal that names only the review cards.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -32,6 +33,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer import no_tool_policy
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.no_tool_policy import (
@@ -43,7 +45,7 @@ from elspeth.web.composer.no_tool_policy import (
     TrustedSystemNoticeSegment,
     visible_message_segments,
 )
-from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.protocol import ComposerResult, ComposerRuntimePreflightError
 from elspeth.web.composer.service import (
     ComposerServiceImpl,
     _announce_staged_review_handoff,
@@ -583,6 +585,88 @@ class TestAttemptPreflightRepairHandoffVerification:
 
 
 class TestPendingHandoffOutstandingFindings:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("same_operation", [False, True])
+    @pytest.mark.parametrize("has_blob", [False, True])
+    @pytest.mark.parametrize("abandon", ["cancel", "timeout"])
+    async def test_cancelled_preflight_coalesces_only_compatible_blob_operation(
+        self, service, monkeypatch, same_operation: bool, has_blob: bool, abandon: str
+    ) -> None:
+        state = _nonempty_state(version=1)
+        if has_blob:
+            state = replace(
+                state,
+                sources={
+                    "source": replace(
+                        state.sources["source"],
+                        options={"path": {"blob_ref": "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b", "mode": "inline_content"}},
+                    )
+                },
+            )
+        first_context = SessionOperationContext(
+            fence=SessionOperationFence("session:test", "operation-1", "lease-1", 1),
+            operation_kind=SessionOperationKind.COMPOSE,
+        )
+        second_context = (
+            first_context
+            if same_operation
+            else replace(first_context, fence=SessionOperationFence("session:test", "operation-2", "lease-2", 2))
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+        contexts: list[SessionOperationContext | None] = []
+
+        def preflight(*_args: Any, session_operation_context: SessionOperationContext | None = None) -> ValidationResult:
+            contexts.append(session_operation_context)
+            return _structural_failure_result() if session_operation_context == second_context and not same_operation else _valid_result()
+
+        async def controlled_worker(func, *args):
+            result = func(*args)
+            started.set()
+            await release.wait()
+            return result
+
+        monkeypatch.setattr(service, "_runtime_preflight", preflight)
+        monkeypatch.setattr(service_module, "run_sync_in_worker", controlled_worker)
+
+        async def check(context: SessionOperationContext, *, deadline: float | None = None) -> ValidationResult:
+            return await service._cached_runtime_preflight(
+                state,
+                user_id="user-1",
+                session_id="session:test",
+                cache=service._new_runtime_preflight_cache(),
+                initial_version=1,
+                session_scope="session:test",
+                session_operation_context=context,
+                deadline=deadline,
+            )
+
+        deadline = asyncio.get_running_loop().time() + 0.1 if abandon == "timeout" else None
+        first = asyncio.create_task(check(first_context, deadline=deadline))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        if abandon == "cancel":
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        else:
+            with pytest.raises(ComposerRuntimePreflightError):
+                await first
+        second = asyncio.create_task(check(second_context))
+        try:
+            # Let the second caller join/start its worker before releasing the
+            # first worker, whose lifetime survives its cancelled caller.
+            await asyncio.sleep(0)
+            release.set()
+            result = await asyncio.wait_for(second, timeout=5)
+        finally:
+            release.set()
+        if has_blob and not same_operation:
+            assert not result.is_valid
+            assert contexts == [first_context, second_context]
+        else:
+            assert result.is_valid
+            assert contexts == [first_context if has_blob else None]
+
     async def _findings(self, service: ComposerServiceImpl, fake: _RecordingValidatePipeline, monkeypatch) -> ValidationResult | None:
         monkeypatch.setattr(service_module, "validate_pipeline", fake)
         return await service._pending_handoff_outstanding_findings(

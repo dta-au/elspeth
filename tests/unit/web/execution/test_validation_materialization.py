@@ -301,6 +301,89 @@ def test_materialization_validates_blob_metadata_and_substitutes_exact_yaml() ->
     assert requested == [_BLOB_ID]
 
 
+@pytest.mark.parametrize("metadata_available", [False, True])
+@pytest.mark.parametrize("content_available", [False, True])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"prompt_template": "Explain blob_ref and inline_content in {{ row.text }}"},
+        {"reference": "blob_ref,inline_content\ncolumn name,literal data\n"},
+    ],
+    ids=["literal-prompt", "reference-table"],
+)
+def test_materialization_without_discovered_refs_needs_no_blob_readers(
+    options: dict[str, object], metadata_available: bool, content_available: bool
+) -> None:
+    config = {"transforms": [{"name": "node", "options": options}]}
+    pipeline_yaml = yaml.safe_dump(config)
+
+    def unexpected_metadata_read(blob_id: UUID) -> BlobRecord:
+        pytest.fail(f"No reference should request metadata for {blob_id}")
+
+    def unexpected_content_read(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+        pytest.fail(f"No reference should request content for {blob_id}")
+
+    result = materialize_validation_yaml(
+        _interpretation(_state(), contracts=(_contract(),)),
+        yaml_generator=_YamlGenerator(pipeline_yaml),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+        blob_get_metadata=unexpected_metadata_read if metadata_available else None,
+        blob_get_content=unexpected_content_read if content_available else None,
+        load_yaml=yaml.safe_load,
+    )
+
+    assert isinstance(result, PhaseReport)
+    assert result.artifact.pipeline_yaml == pipeline_yaml
+    assert result.artifact.authored.semantic_contracts == (_contract(),)
+    assert [(check.name, check.passed, check.detail) for check in result.checks] == [
+        ("blob_inline_refs", True, "No inline-content blob references found")
+    ]
+
+
+@pytest.mark.parametrize("metadata_available", [False, True])
+def test_materialization_discovered_ref_still_requires_blob_readers(metadata_available: bool) -> None:
+    result = materialize_validation_yaml(
+        _interpretation(_state()),
+        yaml_generator=_YamlGenerator(yaml.safe_dump(_blob_config())),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+        blob_get_metadata=(lambda _blob_id: _ready_blob()) if metadata_available else None,
+        load_yaml=yaml.safe_load,
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.detail == "node:node.options.prompt_template: not_ready"
+    assert len(result.errors) == 1
+    assert result.errors[0].error_code == "not_ready_inline_blob_content"
+    reader = "content" if metadata_available else "metadata"
+    assert f"authorized blob {reader} read is unavailable" in result.errors[0].message
+
+
+def test_materialization_malformed_marker_is_not_treated_as_no_references() -> None:
+    config = {
+        "transforms": [
+            {
+                "name": "node",
+                "options": {"prompt_template": {"blob_ref": "invalid-uuid", "mode": "inline_content", "sha256": _BLOB_HASH}},
+            }
+        ]
+    }
+    result = materialize_validation_yaml(
+        _interpretation(_state()),
+        yaml_generator=_YamlGenerator(yaml.safe_dump(config)),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+        blob_get_metadata=None,
+        load_yaml=yaml.safe_load,
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.detail == "node:node.options.prompt_template: malformed"
+    assert len(result.errors) == 1
+    assert result.errors[0].error_code == "malformed_inline_blob_content"
+
+
 def test_materialization_blob_failure_preserves_diagnostics_and_semantic_evidence() -> None:
     result = materialize_validation_yaml(
         _interpretation(_state(), contracts=(_contract(),)),
