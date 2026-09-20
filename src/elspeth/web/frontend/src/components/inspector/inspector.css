@@ -393,7 +393,8 @@
 }
 
 .graph-output-detail {
-  display: block;
+  display: inline;
+  margin-inline: var(--space-xs);
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
   font-weight: normal;
