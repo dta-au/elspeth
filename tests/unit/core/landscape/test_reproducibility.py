@@ -37,6 +37,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -216,7 +217,7 @@ def _create_nondeterministic_call(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="src_hash",
+                source_data_hash=fake_sha256("src_hash"),
                 created_at=datetime.now(UTC),
             )
         )
@@ -237,8 +238,8 @@ def _create_nondeterministic_call(
                 step_index=0,
                 attempt=0,
                 status=NodeStateStatus.COMPLETED,
-                input_hash="in_hash",
-                output_hash="out_hash",
+                input_hash=fake_sha256("in_hash"),
+                output_hash=fake_sha256("out_hash"),
                 started_at=datetime.now(UTC),
             )
         )
@@ -250,7 +251,7 @@ def _create_nondeterministic_call(
                 call_index=0,
                 call_type=CallType.HTTP,
                 status=CallStatus.SUCCESS,
-                request_hash="req_hash",
+                request_hash=fake_sha256("req_hash"),
                 response_hash=response_hash,
                 response_ref=response_ref,
                 created_at=datetime.now(UTC),
@@ -307,7 +308,7 @@ def _create_nondeterministic_operation_call(
                 call_index=0,
                 call_type=CallType.HTTP,
                 status=CallStatus.SUCCESS,
-                request_hash="req_hash",
+                request_hash=fake_sha256("req_hash"),
                 response_hash=response_hash,
                 response_ref=response_ref,
                 created_at=datetime.now(UTC),
@@ -342,7 +343,7 @@ def _create_source_row(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="src_hash",
+                source_data_hash=fake_sha256("src_hash"),
                 source_data_ref=source_data_ref,
                 created_at=datetime.now(UTC),
             )
@@ -355,7 +356,7 @@ class TestUpdateGradeAfterPurge:
     @pytest.mark.parametrize("deposed", [False, True])
     def test_purge_grade_requires_current_export_authority(self, deposed: bool) -> None:
         db, factory = _setup()
-        _create_nondeterministic_call(db, factory, response_ref=None, response_hash="resp_hash")
+        _create_nondeterministic_call(db, factory, response_ref=None, response_hash=fake_sha256("resp_hash"))
         leader = leader_coordination_token(factory, "run-1")
         factory.run_lifecycle.finalize_run(
             status=RunStatus.COMPLETED,
@@ -387,7 +388,7 @@ class TestUpdateGradeAfterPurge:
         db, factory = _setup()
         # Create a nondeterministic node with a purged response
         # (response_hash set but response_ref is None = purged)
-        _create_nondeterministic_call(db, factory, response_ref=None, response_hash="resp_hash")
+        _create_nondeterministic_call(db, factory, response_ref=None, response_hash=fake_sha256("resp_hash"))
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
         update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
@@ -397,7 +398,9 @@ class TestUpdateGradeAfterPurge:
     def test_replay_degrades_when_nondeterministic_operation_response_ref_deleted(self) -> None:
         """Downgrade when a source/sink operation call response payload was purged."""
         db, factory = _setup()
-        _create_nondeterministic_operation_call(db, factory, response_ref="ref://operation-response", response_hash="resp_hash")
+        _create_nondeterministic_operation_call(
+            db, factory, response_ref="ref://operation-response", response_hash=fake_sha256("resp_hash")
+        )
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
         update_grade_after_purge(
             db, coordination_token=leader_coordination_token(factory, "run-1"), deleted_refs=["ref://operation-response"]
@@ -424,7 +427,7 @@ class TestUpdateGradeAfterPurge:
             factory,
             determinism=Determinism.IO_WRITE,
             output_data_ref="ref://operation-output",
-            output_data_hash="output_hash",
+            output_data_hash=fake_sha256("output_hash"),
             response_hash=None,
         )
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
@@ -444,7 +447,7 @@ class TestUpdateGradeAfterPurge:
             factory,
             determinism=Determinism.DETERMINISTIC,
             response_ref=None,
-            response_hash="resp_hash",
+            response_hash=fake_sha256("resp_hash"),
         )
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
         update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
@@ -456,7 +459,7 @@ class TestUpdateGradeAfterPurge:
         """Do NOT downgrade when nondeterministic responses are still present."""
         db, factory = _setup()
         # Create a nondeterministic node with response still present
-        _create_nondeterministic_call(db, factory, response_ref="ref://still-there", response_hash="resp_hash")
+        _create_nondeterministic_call(db, factory, response_ref="ref://still-there", response_hash=fake_sha256("resp_hash"))
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
         update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
@@ -509,7 +512,7 @@ class TestUpdateGradeAfterPurge:
             db,
             factory,
             response_ref=None,
-            response_hash="resp_hash",
+            response_hash=fake_sha256("resp_hash"),
             node_id="corrupt-node",
         )
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
@@ -532,7 +535,7 @@ class TestUpdateGradeAfterPurge:
             db,
             factory,
             response_ref=None,
-            response_hash="resp_hash",
+            response_hash=fake_sha256("resp_hash"),
             node_id="corrupt-node",
         )
         _set_grade(db, "run-1", ReproducibilityGrade.FULL_REPRODUCIBLE)

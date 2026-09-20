@@ -21,6 +21,7 @@ from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import batch_members_table, batches_table, rows_table, tokens_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -1194,7 +1195,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/result.csv",
-            content_hash="sha256:abc123",
+            content_hash=fake_sha256("sha256:abc123"),
             size_bytes=1024,
         )
 
@@ -1220,7 +1221,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/result.csv",
-            content_hash="sha256:abc123",
+            content_hash=fake_sha256("sha256:abc123"),
             size_bytes=1024,
             artifact_id="art-42",
         )
@@ -1245,7 +1246,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="json",
             path="/output/data.json",
-            content_hash="sha256:def456",
+            content_hash=fake_sha256("sha256:def456"),
             size_bytes=2048,
         )
 
@@ -1254,7 +1255,7 @@ class TestRegisterArtifact:
         assert artifact.sink_node_id == "sink-0"
         assert artifact.artifact_type == "json"
         assert artifact.path_or_uri == "/output/data.json"
-        assert artifact.content_hash == "sha256:def456"
+        assert artifact.content_hash == fake_sha256("sha256:def456")
         assert artifact.size_bytes == 2048
 
     def test_created_at_is_set(self):
@@ -1275,7 +1276,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/result.csv",
-            content_hash="sha256:abc",
+            content_hash=fake_sha256("sha256:abc"),
             size_bytes=512,
         )
 
@@ -1299,7 +1300,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/result.csv",
-            content_hash="sha256:abc",
+            content_hash=fake_sha256("sha256:abc"),
             size_bytes=512,
         )
 
@@ -1323,7 +1324,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/result.csv",
-            content_hash="sha256:abc",
+            content_hash=fake_sha256("sha256:abc"),
             size_bytes=512,
             idempotency_key="idem-key-1",
         )
@@ -1346,7 +1347,7 @@ class TestRegisterArtifact:
             "sink_node_id": "sink-0",
             "artifact_type": "csv",
             "path": "/output/result.csv",
-            "content_hash": "sha256:abc",
+            "content_hash": fake_sha256("sha256:abc"),
             "size_bytes": 512,
             "idempotency_key": "run-1:row-1:csv_sink",
         }
@@ -1365,7 +1366,7 @@ class TestRegisterArtifact:
             ("sink_node_id", "sink-1"),
             ("artifact_type", "json"),
             ("path", "/output/different.csv"),
-            ("content_hash", "sha256:different"),
+            ("content_hash", fake_sha256("sha256:different")),
             ("size_bytes", 513),
         ],
     )
@@ -1402,7 +1403,7 @@ class TestRegisterArtifact:
             "sink_node_id": "sink-0",
             "artifact_type": "csv",
             "path": "/output/result.csv",
-            "content_hash": "sha256:abc",
+            "content_hash": fake_sha256("sha256:abc"),
             "size_bytes": 512,
             "idempotency_key": "run-1:row-1:csv_sink",
         }
@@ -1450,7 +1451,7 @@ class TestRegisterArtifact:
             "sink_node_id": "sink-0",
             "artifact_type": "csv",
             "path": "/output/result.csv",
-            "content_hash": "sha256:abc",
+            "content_hash": fake_sha256("sha256:abc"),
             "size_bytes": 512,
         }
 
@@ -1466,7 +1467,7 @@ class TestRegisterArtifact:
             "sink_node_id": "sink-0",
             "artifact_type": "csv",
             "path": "/output/result.csv",
-            "content_hash": "sha256:abc",
+            "content_hash": fake_sha256("sha256:abc"),
             "size_bytes": 512,
             "idempotency_key": "opaque-logical-effect",
         }
@@ -1494,7 +1495,7 @@ class TestRegisterArtifact:
             "sink_node_id": "sink-0",
             "artifact_type": "csv",
             "path": "/output/result.csv",
-            "content_hash": "sha256:abc",
+            "content_hash": fake_sha256("sha256:abc"),
             "size_bytes": 512,
             "idempotency_key": "run-1:row-1:csv_sink",
         }
@@ -1525,7 +1526,7 @@ class TestRegisterArtifact:
             "sink_node_id": "sink-0",
             "artifact_type": "csv",
             "path": "/output/result.csv",
-            "content_hash": "sha256:abc",
+            "content_hash": fake_sha256("sha256:abc"),
             "size_bytes": 512,
             "idempotency_key": "run-1:row-1:csv_sink",
         }
@@ -1561,7 +1562,7 @@ class TestRegisterArtifact:
                 sink_node_id="sink-0",
                 artifact_type="csv",
                 path="/output/foreign-state.csv",
-                content_hash="sha256:foreign",
+                content_hash=fake_sha256("sha256:foreign"),
                 size_bytes=1,
                 artifact_id="artifact-foreign-state",
             )
@@ -1592,7 +1593,7 @@ class TestGetArtifacts:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/a.csv",
-            content_hash="sha256:a",
+            content_hash=fake_sha256("sha256:a"),
             size_bytes=100,
             artifact_id="art-1",
         )
@@ -1603,7 +1604,7 @@ class TestGetArtifacts:
             sink_node_id="sink-0",
             artifact_type="json",
             path="/output/b.json",
-            content_hash="sha256:b",
+            content_hash=fake_sha256("sha256:b"),
             size_bytes=200,
             artifact_id="art-2",
         )
@@ -1647,7 +1648,7 @@ class TestGetArtifacts:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/a.csv",
-            content_hash="sha256:a",
+            content_hash=fake_sha256("sha256:a"),
             size_bytes=100,
             artifact_id="art-csv",
         )
@@ -1658,7 +1659,7 @@ class TestGetArtifacts:
             sink_node_id="sink-1",
             artifact_type="json",
             path="/output/b.json",
-            content_hash="sha256:b",
+            content_hash=fake_sha256("sha256:b"),
             size_bytes=200,
             artifact_id="art-json",
         )
@@ -1715,7 +1716,7 @@ class TestGetArtifacts:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/r1.csv",
-            content_hash="sha256:r1",
+            content_hash=fake_sha256("sha256:r1"),
             size_bytes=100,
             artifact_id="art-r1",
         )
@@ -1760,7 +1761,7 @@ class TestGetArtifacts:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/r2.csv",
-            content_hash="sha256:r2",
+            content_hash=fake_sha256("sha256:r2"),
             size_bytes=200,
             artifact_id="art-r2",
         )
@@ -1792,7 +1793,7 @@ class TestGetArtifacts:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/c.csv",
-            content_hash="sha256:c",
+            content_hash=fake_sha256("sha256:c"),
             size_bytes=300,
             artifact_id="art-c",
         )
@@ -1803,7 +1804,7 @@ class TestGetArtifacts:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/a.csv",
-            content_hash="sha256:a",
+            content_hash=fake_sha256("sha256:a"),
             size_bytes=100,
             artifact_id="art-a",
         )
@@ -1814,7 +1815,7 @@ class TestGetArtifacts:
             sink_node_id="sink-0",
             artifact_type="json",
             path="/output/b.json",
-            content_hash="sha256:b",
+            content_hash=fake_sha256("sha256:b"),
             size_bytes=200,
             artifact_id="art-b",
         )

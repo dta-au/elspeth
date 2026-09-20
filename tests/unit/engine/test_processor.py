@@ -99,6 +99,7 @@ from elspeth.engine.work_items import WorkItem
 from elspeth.plugins.infrastructure.clients.llm import LLMClientError
 from elspeth.plugins.transforms.batch_replicate import BatchReplicateConfig
 from elspeth.testing import make_contract, make_pipeline_row, make_row, make_source_row, make_token_info
+from tests.fixtures.audit_hashing import fake_error_hash, fake_sha256
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import (
     age_barrier_hold,
@@ -4748,7 +4749,7 @@ class TestDurableSchedulerResumeDrain:
             member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="crashed-worker"),
         )
         assert claimed is not None
-        persisted_error_hash = error_hash if error_hash is not None else "valid-before-corruption"
+        persisted_error_hash = error_hash if error_hash is not None else fake_error_hash("valid-before-corruption")
         factory.scheduler.mark_pending_sink(
             work_item_id=claimed.work_item_id,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
@@ -9564,7 +9565,7 @@ class TestCommittedAggregationRoutingAuthority:
             aggregation_state_id="state-1",
             output_mode=output_mode,
             output_shape="single",
-            output_hash="deadbeef",
+            output_hash=fake_sha256("deadbeef"),
             output_refs=(),
             member_token_ids=(),
             members=(),

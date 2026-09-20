@@ -90,6 +90,7 @@ from elspeth.web.sessions.protocol import GuidedOperationFence
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
@@ -1348,15 +1349,15 @@ class TestComposerSingleToolCall:
             composer_model_identifier=" openai/gpt-5-mini ",
             composer_model_version=" gpt-5-mini-2026-05-01 ",
             composer_provider=" openai ",
-            composer_skill_hash=" sha256:composer-skill ",
-            tool_arguments_hash=" sha256:tool-arguments ",
+            composer_skill_hash=f" {fake_sha256('composer-skill')} ",
+            tool_arguments_hash=f" {fake_sha256('tool-arguments')} ",
         )
 
         assert proposal.composer_model_identifier == "openai/gpt-5-mini"
         assert proposal.composer_model_version == "gpt-5-mini-2026-05-01"
         assert proposal.composer_provider == "openai"
-        assert proposal.composer_skill_hash == "sha256:composer-skill"
-        assert proposal.tool_arguments_hash == "sha256:tool-arguments"
+        assert proposal.composer_skill_hash == fake_sha256("composer-skill")
+        assert proposal.tool_arguments_hash == fake_sha256("tool-arguments")
 
     @pytest.mark.asyncio
     async def test_create_composition_proposal_rejects_blank_composer_provenance(
@@ -1386,8 +1387,8 @@ class TestComposerSingleToolCall:
                 composer_model_identifier="openai/gpt-5-mini",
                 composer_model_version="gpt-5-mini-2026-05-01",
                 composer_provider="\t ",
-                composer_skill_hash="sha256:composer-skill",
-                tool_arguments_hash="sha256:tool-arguments",
+                composer_skill_hash=fake_sha256("composer-skill"),
+                tool_arguments_hash=fake_sha256("tool-arguments"),
             )
 
         assert await sessions_service.list_composition_proposals(session_uuid) == []

@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.tree_gate import iter_gate_files
 
@@ -7949,7 +7950,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
                 insert(runs_table).values(
                     run_id=run_id,
                     started_at=setup_now,
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="running",

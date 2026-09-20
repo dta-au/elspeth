@@ -50,6 +50,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 
 RUN_ID = "run-fence-order"
@@ -76,7 +77,7 @@ def _seed(engine: Tier1Engine, *, worker_heartbeat_offset: timedelta) -> Coordin
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -93,7 +94,7 @@ def _seed(engine: Tier1Engine, *, worker_heartbeat_offset: timedelta) -> Coordin
                     node_type=node_type,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=NOW,
                 )
@@ -141,7 +142,7 @@ def _enqueue_ready_item(engine: Tier1Engine, *, token_id: str = "tok-1") -> str:
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash=f"hash-{token_id}",
+                source_data_hash=fake_sha256(f"hash-{token_id}"),
                 created_at=NOW,
             )
         )

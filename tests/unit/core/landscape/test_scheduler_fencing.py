@@ -25,6 +25,7 @@ from elspeth.core.landscape.scheduler import BarrierJournalRepository, fencing
 from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import run_coordination_table, run_workers_table, runs_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 from tests.helpers.tree_gate import iter_gate_sources
@@ -182,7 +183,7 @@ def _seed_leader() -> tuple[LandscapeDB, CoordinationToken]:
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=NOW,
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=RunStatus.RUNNING.value,

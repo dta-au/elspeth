@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import insert, update
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import landscape_database_now, leader_coordination_token, leader_token_for, member_token_for
 from tests.helpers.state_engine import (
     EXCLUDED_STATE_ENGINE_TABLES,
@@ -82,7 +83,7 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         source_node_id=source.node_id,
         source_name="primary",
         plugin_name="test_source",
-        config_hash="source-config",
+        config_hash=fake_sha256("source-config"),
         lifecycle_state="loaded",
         coordination_token=leader_coordination_token(factory, run.run_id),
     )

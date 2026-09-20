@@ -39,6 +39,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import expire_lease, landscape_database_now, member_token_for
 
 RUN_ID = "run-order"
@@ -65,7 +66,7 @@ def _insert_run_and_nodes(engine: Tier1Engine, *, now: datetime) -> Coordination
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -86,13 +87,15 @@ def _insert_run_and_nodes(engine: Tier1Engine, *, now: datetime) -> Coordination
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
             )
         authority = coordination.register_run_leader_on(conn, run_id=RUN_ID, worker_id=LEADER_WORKER_ID, window_seconds=3600)
-    RunCoordinationRepository(engine).admit_follower(run_id=RUN_ID, worker_id="worker-b", config_hash="config", window_seconds=3600)
+    RunCoordinationRepository(engine).admit_follower(
+        run_id=RUN_ID, worker_id="worker-b", config_hash=fake_sha256("config"), window_seconds=3600
+    )
     return authority
 
 
@@ -115,7 +118,7 @@ def _insert_row_with_tokens(
                 row_index=ingest_sequence,
                 source_row_index=source_row_index,
                 ingest_sequence=ingest_sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=now,
             )
         )

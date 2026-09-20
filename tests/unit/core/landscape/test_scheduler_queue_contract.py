@@ -27,6 +27,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 from tests.helpers.state_engine import capture_state_engine_image
 
@@ -49,7 +50,7 @@ def _make_repository() -> _QueueHarness:
                 insert(runs_table).values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="running",
@@ -65,7 +66,7 @@ def _make_repository() -> _QueueHarness:
                     node_type=NodeType.SOURCE.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -83,7 +84,7 @@ def _make_repository() -> _QueueHarness:
                     node_type=NodeType.TRANSFORM.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -96,7 +97,7 @@ def _make_repository() -> _QueueHarness:
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash=f"hash-{row_id}",
+                    source_data_hash=fake_sha256(f"hash-{row_id}"),
                     created_at=now,
                 )
             )

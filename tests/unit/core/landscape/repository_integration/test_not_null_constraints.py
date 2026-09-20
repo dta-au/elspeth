@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import insert, select
 from sqlalchemy.exc import IntegrityError
+from tests.fixtures.audit_hashing import fake_sha256
 
 from elspeth.contracts import Determinism, NodeType, RunStatus
 from elspeth.core.landscape.database import LandscapeDB
@@ -86,7 +87,7 @@ class TestSchemaNotNullConstraints:
                 insert(runs_table).values(
                     run_id="test_run",
                     started_at=now,
-                    config_hash="test_hash",
+                    config_hash=fake_sha256("test_hash"),
                     settings_json="{}",
                     canonical_version="v1",
                     status=RunStatus.RUNNING,
@@ -104,7 +105,7 @@ class TestSchemaNotNullConstraints:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test_hash",
+                    config_hash=fake_sha256("test_hash"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -119,7 +120,7 @@ class TestSchemaNotNullConstraints:
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="test_hash",
+                    source_data_hash=fake_sha256("test_hash"),
                     created_at=now,
                 )
             )
@@ -140,7 +141,7 @@ class TestSchemaNotNullConstraints:
                     checkpoint_id="test_checkpoint_3",
                     run_id="test_run",
                     sequence_number=3,
-                    upstream_topology_hash="abc123def456",  # Valid hash
+                    upstream_topology_hash=fake_sha256("abc123def456"),  # Valid hash
                     created_at=now,
                 )
             )
@@ -150,4 +151,4 @@ class TestSchemaNotNullConstraints:
             result = conn.execute(select(checkpoints_table).where(checkpoints_table.c.checkpoint_id == "test_checkpoint_3")).fetchone()
 
         assert result is not None
-        assert result.upstream_topology_hash == "abc123def456"
+        assert result.upstream_topology_hash == fake_sha256("abc123def456")

@@ -172,7 +172,7 @@ def _build_linear_pipeline(
             outcome=outcome,
             path=path,
             sink_name=None if fail_transform else "csv_sink",
-            error_hash="e" * 64 if fail_transform else None,
+            error_hash="e" * 16 if fail_transform else None,
             coordination_token=leader_coordination_token(factory, run_id),
         )
 
@@ -483,7 +483,7 @@ class TestExplainTokenLineage:
             ref=TokenRef(token_id=token.token_id, run_id=run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="b" * 64,
+            error_hash="b" * 16,
             coordination_token=leader_coordination_token(factory, run_id),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
@@ -642,7 +642,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token.token_id, run_id="terr-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="c" * 64,
+            error_hash="c" * 16,
             coordination_token=leader_coordination_token(factory, "terr-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "terr-run"))
@@ -752,7 +752,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token.token_id, run_id="retry-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="d" * 64,
+            error_hash="d" * 16,
             coordination_token=leader_coordination_token(factory, "retry-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "retry-run"))
@@ -818,7 +818,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token.token_id, run_id="first-retry-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="e" * 64,
+            error_hash="e" * 16,
             coordination_token=leader_coordination_token(factory, "first-retry-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "first-retry-run"))
@@ -876,7 +876,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token_x.token_id, run_id="run-X"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="e" * 64,
+            error_hash="e" * 16,
             coordination_token=leader_coordination_token(factory, "run-X"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-X"))
@@ -913,7 +913,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token_y.token_id, run_id="run-Y"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="f" * 64,
+            error_hash="f" * 16,
             coordination_token=leader_coordination_token(factory, "run-Y"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-Y"))
@@ -969,7 +969,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token_p.token_id, run_id="run-P"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
             coordination_token=leader_coordination_token(factory, "run-P"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-P"))
@@ -1005,7 +1005,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token_q.token_id, run_id="run-Q"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="b" * 64,
+            error_hash="b" * 16,
             coordination_token=leader_coordination_token(factory, "run-Q"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-Q"))
@@ -1053,7 +1053,7 @@ class TestGetFailureContext:
                 ref=TokenRef(token_id=token.token_id, run_id="limit-run"),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
-                error_hash="a" * 64,
+                error_hash="a" * 16,
                 coordination_token=leader_coordination_token(factory, "limit-run"),
             )
 
@@ -1100,7 +1100,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token0.token_id, run_id="pattern-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
             coordination_token=leader_coordination_token(factory, "pattern-run"),
         )
 
@@ -1131,7 +1131,7 @@ class TestGetFailureContext:
             ref=TokenRef(token_id=token1.token_id, run_id="pattern-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="b" * 64,
+            error_hash="b" * 16,
             coordination_token=leader_coordination_token(factory, "pattern-run"),
         )
 
@@ -1276,7 +1276,7 @@ class TestGetRunSummary:
             ref=TokenRef(token_id=token.token_id, run_id="err-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
             coordination_token=leader_coordination_token(factory, "err-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "err-run"))
@@ -1374,7 +1374,7 @@ class TestGetRunSummary:
             ref=TokenRef(token_id=token1.token_id, run_id="dist-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="b" * 64,
+            error_hash="b" * 16,
             coordination_token=leader_coordination_token(factory, "dist-run"),
         )
 
@@ -1411,7 +1411,7 @@ class TestGetRunSummary:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.ON_ERROR_ROUTED,
             sink_name="csv_sink",
-            error_hash="c" * 64,
+            error_hash="c" * 16,
             coordination_token=leader_coordination_token(factory, "dist-run"),
         )
 
@@ -1559,7 +1559,7 @@ class TestFailureContextCorruptionGuards:
             ref=TokenRef(token_id=token.token_id, run_id="corrupt-te"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
             coordination_token=leader_coordination_token(factory, "corrupt-te"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "corrupt-te"))
@@ -1639,7 +1639,7 @@ class TestErrorAnalysisCorruptionGuard:
             ref=TokenRef(token_id=token.token_id, run_id="corrupt-ea"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
             coordination_token=leader_coordination_token(factory, "corrupt-ea"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "corrupt-ea"))
@@ -1683,7 +1683,7 @@ class TestErrorAnalysisCorruptionGuard:
             ref=TokenRef(token_id=token.token_id, run_id="clean-ea"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
             coordination_token=leader_coordination_token(factory, "clean-ea"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "clean-ea"))

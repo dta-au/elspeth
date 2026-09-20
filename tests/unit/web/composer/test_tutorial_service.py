@@ -33,6 +33,7 @@ from elspeth.web.composer.tutorial_service import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import RunRecord
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.helpers.session_fences import RecordingSessionOperationAuthority, make_execute_context
 
@@ -737,8 +738,8 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
                     call_index=0 if call_type is CallType.LLM else 1,
                     call_type=call_type.value,
                     status=CallStatus.SUCCESS.value,
-                    request_hash=f"{call_id}-request",
-                    response_hash=f"{call_id}-response",
+                    request_hash=fake_sha256(f"{call_id}-request"),
+                    response_hash=fake_sha256(f"{call_id}-response"),
                     created_at=datetime.now(UTC),
                 )
             )

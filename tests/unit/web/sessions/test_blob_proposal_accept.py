@@ -41,6 +41,7 @@ from elspeth.web.sessions.routes.composer import proposals as proposals_routes
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -251,7 +252,7 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
             composer_model_identifier="openai/gpt-5-mini",
             composer_model_version="gpt-5-mini-2026-05-01",
             composer_provider="openai",
-            composer_skill_hash="sha256:composer-skill",
+            composer_skill_hash=fake_sha256("composer-skill"),
             tool_arguments_hash=stable_hash(arguments),
         )
     )
@@ -321,7 +322,7 @@ def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference
             composer_model_identifier="openai/gpt-5-mini",
             composer_model_version="gpt-5-mini-2026-05-01",
             composer_provider="openai",
-            composer_skill_hash="sha256:composer-skill",
+            composer_skill_hash=fake_sha256("composer-skill"),
             tool_arguments_hash=stable_hash(arguments),
         )
 
@@ -385,7 +386,7 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
             composer_model_identifier="openai/gpt-5-mini",
             composer_model_version="gpt-5-mini-2026-05-01",
             composer_provider="openai",
-            composer_skill_hash="sha256:composer-skill",
+            composer_skill_hash=fake_sha256("composer-skill"),
         )
     )
 
@@ -474,7 +475,7 @@ def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
             composer_model_identifier="openai/gpt-5-mini",
             composer_model_version="gpt-5-mini-2026-05-01",
             composer_provider="openai",
-            composer_skill_hash="sha256:composer-skill",
+            composer_skill_hash=fake_sha256("composer-skill"),
             tool_arguments_hash=stable_hash(arguments),
         )
     )
@@ -629,7 +630,7 @@ async def test_accept_update_blob_proposal_serializes_against_reject(
         composer_model_identifier="openai/gpt-5-mini",
         composer_model_version="gpt-5-mini-2026-05-01",
         composer_provider="openai",
-        composer_skill_hash="sha256:composer-skill",
+        composer_skill_hash=fake_sha256("composer-skill"),
         tool_arguments_hash=stable_hash(arguments),
     )
     entered_tool = threading.Event()
@@ -734,7 +735,7 @@ async def test_cancelled_accept_update_blob_proposal_still_terminalizes_before_r
         composer_model_identifier="openai/gpt-5-mini",
         composer_model_version="gpt-5-mini-2026-05-01",
         composer_provider="openai",
-        composer_skill_hash="sha256:composer-skill",
+        composer_skill_hash=fake_sha256("composer-skill"),
         tool_arguments_hash=stable_hash(arguments),
     )
     entered_tool = threading.Event()

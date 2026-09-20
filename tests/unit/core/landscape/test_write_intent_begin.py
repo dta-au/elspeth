@@ -53,6 +53,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.helpers.run_coordination import register_run_leader
 
 BASE = datetime(2026, 6, 11, 12, 0, 0, tzinfo=UTC)
@@ -105,7 +106,7 @@ def _run_values(run_id: str = RUN_ID) -> dict[str, Any]:
     return {
         "run_id": run_id,
         "started_at": BASE,
-        "config_hash": "config",
+        "config_hash": fake_sha256("config"),
         "settings_json": "{}",
         "canonical_version": "v1",
         "status": "running",
@@ -216,7 +217,7 @@ class TestBeginMode:
                         node_type=NodeType.TRANSFORM.value,
                         plugin_version="1.0",
                         determinism="deterministic",
-                        config_hash="config",
+                        config_hash=fake_sha256("config"),
                         config_json="{}",
                         registered_at=BASE,
                     )
@@ -229,7 +230,7 @@ class TestBeginMode:
                         row_index=0,
                         source_row_index=0,
                         ingest_sequence=0,
-                        source_data_hash="hash-row-0",
+                        source_data_hash=fake_sha256("hash-row-0"),
                         created_at=BASE,
                     )
                 )

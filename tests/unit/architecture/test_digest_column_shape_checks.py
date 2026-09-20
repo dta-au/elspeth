@@ -32,6 +32,7 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import CheckConstraint, MetaData, Table
 from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.schema import CreateTable
 
 from elspeth.core.landscape import schema as landscape_schema
@@ -173,8 +174,8 @@ _INVENTORY: dict[tuple[str, str], dict[str, str]] = {
 }
 
 
-def _sqlite_checks(table: Table) -> list[tuple[str, str]]:
-    dialect = sqlite.dialect()
+def dialect_checks(table: Table, dialect: Dialect) -> list[tuple[str, str]]:
+    """The table's CHECKs that are created for ``dialect``, as (name, compiled SQL)."""
     compiler = CreateTable(table).compile(dialect=dialect)
     return [
         (str(constraint.name), str(constraint.sqltext.compile(dialect=dialect, compile_kwargs={"literal_binds": True})))
@@ -184,19 +185,18 @@ def _sqlite_checks(table: Table) -> list[tuple[str, str]]:
 
 
 def _postgres_check_names(table: Table) -> set[str]:
-    compiler = CreateTable(table).compile(dialect=postgresql.dialect())
-    return {
-        str(constraint.name)
-        for constraint in table.constraints
-        if isinstance(constraint, CheckConstraint) and constraint._should_create_for_compiler(compiler)
-    }
+    return {name for name, _text in dialect_checks(table, postgresql.dialect())}
+
+
+def shape_checks(table: Table, column: str, dialect: Dialect) -> list[tuple[str, str]]:
+    """CHECKs that constrain the column's VALUE, not merely whether it is NULL."""
+    mention = rf"\b{re.escape(column)}\b"
+    nullness = rf"\b{re.escape(column)}(::\w+)?\s+IS\s+(NOT\s+)?NULL\b"
+    return [(name, text) for name, text in dialect_checks(table, dialect) if re.search(mention, re.sub(nullness, "", text))]
 
 
 def _shape_checks(table: Table, column: str) -> list[tuple[str, str]]:
-    """CHECKs that constrain the column's VALUE, not merely whether it is NULL."""
-    mention = rf"\b{re.escape(column)}\b"
-    nullness = rf"\b{re.escape(column)}\s+IS\s+(NOT\s+)?NULL\b"
-    return [(name, text) for name, text in _sqlite_checks(table) if re.search(mention, re.sub(nullness, "", text))]
+    return shape_checks(table, column, sqlite.dialect())
 
 
 def _evaluate(conn: sqlite3.Connection, table: Table, text: str, row: dict[str, object]) -> object:

@@ -20,6 +20,7 @@ from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import nodes_table, run_sources_table, runs_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import insert_crashed_leader_seat, leader_token_for, make_landscape_db
 from tests.helpers.checkpoint import checkpoint_draft
 
@@ -34,7 +35,7 @@ def _insert_interrupted_run(conn: Connection, run_id: str, *, lifecycle_state: s
         runs_table.insert().values(
             run_id=run_id,
             started_at=datetime.now(UTC),
-            config_hash="cfg",
+            config_hash=fake_sha256("cfg"),
             settings_json="{}",
             canonical_version="sha256-rfc8785-v1",
             status=RunStatus.INTERRUPTED,
@@ -54,7 +55,7 @@ def _insert_interrupted_run(conn: Connection, run_id: str, *, lifecycle_state: s
                 node_type=node_type,
                 plugin_version="1.0.0",
                 determinism=Determinism.DETERMINISTIC,
-                config_hash="node_cfg",
+                config_hash=fake_sha256("node_cfg"),
                 config_json="{}",
                 registered_at=datetime.now(UTC),
             )
@@ -66,7 +67,7 @@ def _insert_interrupted_run(conn: Connection, run_id: str, *, lifecycle_state: s
             source_name="primary",
             plugin_name="test_source",
             lifecycle_state=lifecycle_state,
-            config_hash="src_cfg",
+            config_hash=fake_sha256("src_cfg"),
             schema_json="{}",
             schema_contract_json=None,
             schema_contract_hash=None,

@@ -62,11 +62,12 @@ from elspeth.core.landscape.schema import (
     token_parents_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
-_ERROR_HASH = "a" * 64
+_ERROR_HASH = "a" * 16
 
 # Minimal contract for tests that only care about token lifecycle, not contract content.
 _MINIMAL_CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
@@ -358,7 +359,7 @@ class TestCreateRow:
                     run_id="run-1",
                     source_node_id="source-0",
                     row_index=5,
-                    source_data_hash="hash",
+                    source_data_hash=fake_sha256("hash"),
                     created_at=now,
                 )
             )
@@ -374,7 +375,7 @@ class TestCreateRow:
                     row_id="row-no-position",
                     run_id="run-1",
                     source_node_id="source-0",
-                    source_data_hash="hash",
+                    source_data_hash=fake_sha256("hash"),
                     created_at=now,
                 )
             )

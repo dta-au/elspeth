@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
+from tests.fixtures.audit_hashing import fake_error_hash
 
 from elspeth.contracts.audit import _TERMINAL_PAIR_FIELD_CONSTRAINTS
 from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, _NON_TERMINAL_PATHS
@@ -155,6 +156,11 @@ def test_final_fate_sweep_reports_only_tokens_without_exactly_one_final_fate() -
     }
 
 
+def _placeholder(field: str, label: str) -> str:
+    """``error_hash`` is shape-CHECKed (16 lowercase hex); the other discriminator fields are free text."""
+    return fake_error_hash(label) if field == "error_hash" else label
+
+
 def test_audit_sweep_discriminator_query_matches_live_field_constraints() -> None:
     sweep = _SWEEP_PATH.read_text()
     discriminator_sql = _sql_under_heading(sweep, "## 5. Discriminator Constraint Violations")
@@ -171,7 +177,7 @@ def test_audit_sweep_discriminator_query_matches_live_field_constraints() -> Non
                 "error_hash": None,
             }
             for field in constraints.required:
-                base_fields[field] = f"{field}-value"
+                base_fields[field] = _placeholder(field, f"{field}-value")
             base_fields.update({field: str(value) for field, value in constraints.exact.items()})
 
             valid_id = f"valid-{pair_index}"
@@ -200,7 +206,7 @@ def test_audit_sweep_discriminator_query_matches_live_field_constraints() -> Non
                 violations.append(values)
             for field in constraints.forbidden:
                 values = dict(base_fields)
-                values[field] = f"unexpected-{field}"
+                values[field] = _placeholder(field, f"unexpected-{field}")
                 violations.append(values)
 
             for violation_index, fields in enumerate(violations):

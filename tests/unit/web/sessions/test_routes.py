@@ -111,6 +111,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -924,14 +925,14 @@ def _install_restricted_plugin_policy(app: FastAPI, *hidden: PluginId) -> Plugin
     catalog = create_catalog_service()
     unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     snapshot = PluginAvailabilitySnapshot.create(
-        policy_hash="session-route-policy",
+        policy_hash=fake_sha256("session-route-policy"),
         principal_scope="local:alice",
         available=unrestricted.available - set(hidden),
         unavailable=(),
         selected=unrestricted.selected,
         usable_profile_aliases=(),
         selected_profile_aliases=(),
-        binding_generation_fingerprint="session-route-policy-generation",
+        binding_generation_fingerprint=fake_sha256("session-route-policy-generation"),
     )
     app.state.catalog_service = catalog
     profile_registry = MagicMock(spec=OperatorProfileRegistry)
@@ -2790,7 +2791,7 @@ def _insert_discard_audit_records(settings: WebSettings, run_id: str) -> None:
                 run_id=run_id,
                 started_at=now,
                 completed_at=now,
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="test",
                 status="completed",
@@ -2808,7 +2809,7 @@ def _insert_discard_audit_records(settings: WebSettings, run_id: str) -> None:
                     "node_type": "source",
                     "plugin_version": "test",
                     "determinism": "deterministic",
-                    "config_hash": "source-cfg",
+                    "config_hash": fake_sha256("source-cfg"),
                     "config_json": "{}",
                     "registered_at": now,
                 },
@@ -2819,7 +2820,7 @@ def _insert_discard_audit_records(settings: WebSettings, run_id: str) -> None:
                     "node_type": "transform",
                     "plugin_version": "test",
                     "determinism": "deterministic",
-                    "config_hash": "transform-cfg",
+                    "config_hash": fake_sha256("transform-cfg"),
                     "config_json": "{}",
                     "registered_at": now,
                 },
@@ -2835,7 +2836,7 @@ def _insert_discard_audit_records(settings: WebSettings, run_id: str) -> None:
                     "row_index": 0,
                     "source_row_index": 0,
                     "ingest_sequence": 0,
-                    "source_data_hash": "hash-transform",
+                    "source_data_hash": fake_sha256("hash-transform"),
                     "created_at": now,
                 },
                 {
@@ -2845,7 +2846,7 @@ def _insert_discard_audit_records(settings: WebSettings, run_id: str) -> None:
                     "row_index": 1,
                     "source_row_index": 1,
                     "ingest_sequence": 1,
-                    "source_data_hash": "hash-sink",
+                    "source_data_hash": fake_sha256("hash-sink"),
                     "created_at": now,
                 },
             ],
@@ -2872,7 +2873,7 @@ def _insert_discard_audit_records(settings: WebSettings, run_id: str) -> None:
                 error_id="verr_discard",
                 run_id=run_id,
                 node_id="source",
-                row_hash="hash-validation",
+                row_hash=fake_sha256("hash-validation"),
                 row_data_json="{}",
                 error="invalid row",
                 schema_mode="fixed",
@@ -2886,7 +2887,7 @@ def _insert_discard_audit_records(settings: WebSettings, run_id: str) -> None:
                 run_id=run_id,
                 token_id="token-transform",
                 transform_id="transform",
-                row_hash="hash-transform",
+                row_hash=fake_sha256("hash-transform"),
                 row_data_json="{}",
                 error_details_json='{"reason":"validation_failed"}',
                 destination="discard",

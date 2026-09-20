@@ -798,7 +798,7 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
                 sink_name="failsink",
-                error_hash="f" * 64,
+                error_hash="f" * 16,
             ),
         ),
         attempt_id=attempt.attempt_id,

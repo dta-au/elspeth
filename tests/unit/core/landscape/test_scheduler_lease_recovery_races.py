@@ -101,6 +101,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, on_fresh_database_second
 
 RUN_ID = "run-rc6-lease-races"
@@ -144,7 +145,7 @@ def _seed_run_rows_tokens(engine: Tier1Engine, token_ids: tuple[str, ...], *, le
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=BASE,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -164,7 +165,7 @@ def _seed_run_rows_tokens(engine: Tier1Engine, token_ids: tuple[str, ...], *, le
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=BASE,
                 )
@@ -213,7 +214,7 @@ def _seed_run_rows_tokens(engine: Tier1Engine, token_ids: tuple[str, ...], *, le
                     row_index=ingest_sequence,
                     source_row_index=ingest_sequence,
                     ingest_sequence=ingest_sequence,
-                    source_data_hash=f"hash-{row_id}",
+                    source_data_hash=fake_sha256(f"hash-{row_id}"),
                     created_at=BASE,
                 )
             )
@@ -554,7 +555,7 @@ def test_ts04_and_ts06_sink_redrive_claim_and_recovery_preserve_complete_bundle(
         sink_name="sink-a",
         outcome=TerminalOutcome.FAILURE.value,
         path=TerminalPath.ON_ERROR_ROUTED.value,
-        error_hash="a" * 64,
+        error_hash="a" * 16,
         error_message="sink retry evidence",
         expected_lease_owner="producer",
     )

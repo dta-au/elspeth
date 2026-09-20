@@ -33,6 +33,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_error_hash, fake_sha256
 from tests.fixtures.landscape import (
     claim_test_work_item,
     leader_coordination_token,
@@ -863,7 +864,7 @@ class TestExpandToken:
                 parent_ref=TokenRef(token_id=second_parent.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
-                error_hash="quarantined-test-hash",
+                error_hash=fake_error_hash("quarantined-test-hash"),
             ),
         )
         original_record = factory.data_flow.outcomes.record_parent_outcomes_on
@@ -1520,7 +1521,7 @@ class TestValidateOutcomeFields:
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="abc123",
+            error_hash=fake_error_hash("abc123"),
             member_token=leader_coordination_token(factory, "run-1").membership,
             work_item=claim_test_work_item(
                 factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
@@ -1549,7 +1550,7 @@ class TestValidateOutcomeFields:
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="abc123",
+            error_hash=fake_error_hash("abc123"),
             member_token=leader_coordination_token(factory, "run-1").membership,
             work_item=claim_test_work_item(
                 factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
@@ -1564,7 +1565,7 @@ class TestValidateOutcomeFields:
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="abc123",
+            error_hash=fake_error_hash("abc123"),
             sink_name="quarantine",
             member_token=leader_coordination_token(factory, "run-1").membership,
             work_item=claim_test_work_item(
@@ -1660,7 +1661,7 @@ class TestValidateOutcomeFields:
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
-                error_hash="abc123",
+                error_hash=fake_error_hash("abc123"),
                 member_token=leader_coordination_token(factory, "run-1").membership,
                 work_item=claim_test_work_item(
                     factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
@@ -1698,7 +1699,7 @@ class TestValidateOutcomeFields:
             sink_name="failsink",
             sink_node_id="sink-0",
             artifact_id=artifact_id,
-            error_hash="abc123",
+            error_hash=fake_error_hash("abc123"),
             member_token=leader_coordination_token(factory, "run-1").membership,
             work_item=claim_test_work_item(
                 factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
@@ -1800,7 +1801,7 @@ class TestRecordTokenOutcome:
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="err-hash-abc",
+            error_hash=fake_error_hash("err-hash-abc"),
             member_token=leader_coordination_token(factory, "run-1").membership,
             work_item=claim_test_work_item(
                 factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
@@ -1810,7 +1811,7 @@ class TestRecordTokenOutcome:
         assert fetched is not None
         assert fetched.outcome == TerminalOutcome.FAILURE
         assert fetched.path == TerminalPath.UNROUTED
-        assert fetched.error_hash == "err-hash-abc"
+        assert fetched.error_hash == fake_error_hash("err-hash-abc")
         assert fetched.completed is True
 
     def test_records_quarantined_outcome(self):
@@ -1820,7 +1821,7 @@ class TestRecordTokenOutcome:
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="quarantine-hash",
+            error_hash=fake_error_hash("quarantine-hash"),
             member_token=leader_coordination_token(factory, "run-1").membership,
             work_item=claim_test_work_item(
                 factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
@@ -2391,7 +2392,7 @@ class TestGetTokenOutcomesForRow:
             ref=TokenRef(token_id=token_b.token_id, run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="err-hash",
+            error_hash=fake_error_hash("err-hash"),
             member_token=leader_coordination_token(factory, "run-1").membership,
             work_item=claim_test_work_item(
                 factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token_b.token_id, node_id=None
@@ -3048,7 +3049,7 @@ class TestTokenRunIdConsistency:
                     step_index=0,
                     attempt=1,
                     status="open",
-                    input_hash="fake-hash",
+                    input_hash=fake_sha256("fake-hash"),
                     started_at=now(),
                 )
             )

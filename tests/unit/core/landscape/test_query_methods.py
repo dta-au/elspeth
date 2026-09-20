@@ -43,6 +43,7 @@ from elspeth.core.landscape.model_loaders import (
 )
 from elspeth.core.landscape.row_data import RowDataResult, RowDataState
 from elspeth.core.landscape.run_status_projection import AuditRunStatusProjection
+from tests.fixtures.audit_hashing import fake_error_hash
 from tests.fixtures.landscape import (
     claim_test_work_item,
     leader_coordination_token,
@@ -2637,7 +2638,7 @@ class TestGetAllTokenOutcomesForRun:
             ref=TokenRef(token_id="tok-2", run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="abc123",
+            error_hash=fake_error_hash("abc123"),
             coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
@@ -2707,7 +2708,7 @@ class TestGetAllTokenOutcomesForRun:
             ref=TokenRef(token_id="tok-b1", run_id="run-b"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="err-hash-1",
+            error_hash=fake_error_hash("err-hash-1"),
             coordination_token=leader_coordination_token(factory, "run-b"),
         )
 
@@ -3289,7 +3290,7 @@ class TestGetTokenOutcomesForTokens:
             TokenRef(token_id="tok-2", run_id="run-1"),
             TerminalOutcome.FAILURE,
             TerminalPath.UNROUTED,
-            error_hash="0" * 64,
+            error_hash="0" * 16,
             coordination_token=leader_coordination_token(factory, "run-1"),
         )
         return factory

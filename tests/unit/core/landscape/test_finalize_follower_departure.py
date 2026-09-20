@@ -39,6 +39,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_token_for, make_landscape_db
 
 # ---------------------------------------------------------------------------
@@ -63,7 +64,7 @@ def _seed_running_run(db: LandscapeDB, *, run_id: str = RUN_ID) -> str:
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=NOW,
-                config_hash="cfg-hash",
+                config_hash=fake_sha256("cfg-hash"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=RunStatus.RUNNING.value,
@@ -145,7 +146,7 @@ def _seed_transform_node(db: LandscapeDB, *, run_id: str = RUN_ID) -> None:
                 node_type=NodeType.TRANSFORM.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="cfg-hash",
+                config_hash=fake_sha256("cfg-hash"),
                 config_json="{}",
                 registered_at=NOW,
             )
@@ -170,7 +171,7 @@ def _seed_row_and_token(
                 row_index=ingest_sequence,
                 source_row_index=ingest_sequence,
                 ingest_sequence=ingest_sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )
@@ -194,7 +195,7 @@ def _seed_source_node(db: LandscapeDB, *, run_id: str = RUN_ID) -> None:
                 node_type=NodeType.SOURCE.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="cfg-hash",
+                config_hash=fake_sha256("cfg-hash"),
                 config_json="{}",
                 registered_at=NOW,
             )

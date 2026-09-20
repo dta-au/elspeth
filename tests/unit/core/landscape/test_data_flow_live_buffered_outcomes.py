@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from elspeth.contracts import Batch, NodeType, Token
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from tests.fixtures.audit_hashing import fake_error_hash
 from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
 
 NOW = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
@@ -178,7 +179,7 @@ def test_failed_unrouted_reconcile_read_scopes_to_failure_unrouted() -> None:
         TokenRef(token_id=failed_token.token_id, run_id=run_id),
         TerminalOutcome.FAILURE,
         TerminalPath.UNROUTED,
-        error_hash="deadbeef",
+        error_hash=fake_error_hash("deadbeef"),
         coordination_token=leader_coordination_token(setup.factory, run_id),
     )
 

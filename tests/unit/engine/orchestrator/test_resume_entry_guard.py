@@ -46,6 +46,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import runs_table
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.spans import SpanFactory
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.run_coordination import register_run_leader
@@ -62,7 +63,7 @@ def _insert_run(db: LandscapeDB, run_id: str, *, status: RunStatus | str) -> Non
             runs_table.insert().values(
                 run_id=run_id,
                 started_at=datetime.now(UTC),
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="sha256-rfc8785-v1",
                 status=status,

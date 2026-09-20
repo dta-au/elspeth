@@ -63,7 +63,7 @@ def _create_completed_run_with_quarantine(
         ref=TokenRef(token_id=token.token_id, run_id=run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.QUARANTINED_AT_SOURCE,
-        error_hash="deadbeef" * 8,
+        error_hash="deadbeef" * 2,
     )
     factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run_id))
     if started_at is not None:

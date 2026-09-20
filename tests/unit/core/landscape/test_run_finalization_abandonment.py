@@ -190,7 +190,7 @@ class TestAbandonmentSweepFires:
             ref=TokenRef(token_id=token_ids[0], run_id=setup.run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="e" * 64,
+            error_hash="e" * 16,
             coordination_token=_leader_token(setup),
         )
 
@@ -225,7 +225,7 @@ class TestAbandonmentSweepFires:
             ref=TokenRef(token_id=token_ids[0], run_id=setup.run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="e" * 64,
+            error_hash="e" * 16,
             coordination_token=_leader_token(setup),
         )
         operation_id = _reserve_effect_operation(setup, token_id=token_ids[0], suffix="open")
@@ -316,7 +316,7 @@ class TestAbandonmentSweepFires:
                 ref=TokenRef(token_id=token_ids[0], run_id=setup.run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
-                error_hash="e" * 64,
+                error_hash="e" * 16,
                 coordination_token=_leader_token(setup),
             )
 

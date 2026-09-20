@@ -7,6 +7,7 @@ from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape.schema import transform_errors_table, validation_errors_table
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
 
 
@@ -32,7 +33,7 @@ def test_discard_summary_counts_discard_path_with_no_sink_state_unattributed() -
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
         sink_name=DISCARD_SINK_NAME,
-        error_hash="a" * 64,
+        error_hash="a" * 16,
     )
 
     summaries = load_discard_summaries_from_db(setup.db, [setup.run_id])
@@ -90,7 +91,7 @@ def test_discard_summary_names_the_sink_node_that_discarded() -> None:
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
         sink_name=DISCARD_SINK_NAME,
-        error_hash="c" * 64,
+        error_hash="c" * 16,
     )
 
     summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
@@ -147,7 +148,7 @@ def test_discard_summary_does_not_double_count_a_token_failed_at_two_sinks() -> 
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
         sink_name=DISCARD_SINK_NAME,
-        error_hash="d" * 64,
+        error_hash="d" * 16,
     )
 
     summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
@@ -198,7 +199,7 @@ def test_discard_summary_counts_gate_evaluation_error_discard_by_gate_node() -> 
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.GATE_ERROR_DISCARDED,
-        error_hash="b" * 64,
+        error_hash="b" * 16,
     )
 
     summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
@@ -242,7 +243,7 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
                     "run_id": setup.run_id,
                     "node_id": setup.source_node_id,
                     "row_id": row.row_id,
-                    "row_hash": "hash-validation-1",
+                    "row_hash": fake_sha256("hash-validation-1"),
                     "row_data_json": "{}",
                     "error": "url field required",
                     "schema_mode": "fixed",
@@ -254,7 +255,7 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
                     "run_id": setup.run_id,
                     "node_id": setup.source_node_id,
                     "row_id": row.row_id,
-                    "row_hash": "hash-validation-2",
+                    "row_hash": fake_sha256("hash-validation-2"),
                     "row_data_json": "{}",
                     "error": "url field required",
                     "schema_mode": "fixed",
@@ -269,7 +270,7 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
                 run_id=setup.run_id,
                 token_id=token.token_id,
                 transform_id=transform_id,
-                row_hash="hash-transform",
+                row_hash=fake_sha256("hash-transform"),
                 row_data_json="{}",
                 error_details_json='{"reason":"validation_failed"}',
                 destination="discard",

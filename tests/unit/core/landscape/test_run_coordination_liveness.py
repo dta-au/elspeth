@@ -61,6 +61,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, landscape_database_now, member_token_for
 from tests.helpers.run_coordination import register_run_leader
 
@@ -92,7 +93,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str = RUN_ID, status: str = "runni
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=status,
@@ -296,7 +297,7 @@ class TestBusyToleranceNeverEvicts:
         repo = RunCoordinationRepository(engine)
         _seed_run(engine)
         leader = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
-        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash=fake_sha256("config"), window_seconds=WINDOW)
         repo.depart_worker(member_token=member)
         refusal_written = False
         attempted_reads: list[str] = []
@@ -342,7 +343,7 @@ class TestBusyToleranceNeverEvicts:
         repo = RunCoordinationRepository(engine)
         _seed_run(engine)
         register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
-        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash=fake_sha256("config"), window_seconds=WINDOW)
         repo.depart_worker(member_token=member)
 
         result = repo.worker_heartbeat(member_token=member, window_seconds=WINDOW)

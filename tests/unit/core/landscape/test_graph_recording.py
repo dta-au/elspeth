@@ -15,6 +15,7 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import nodes_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -354,10 +355,10 @@ class TestRegisterNode:
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
-            schema_hash="abc123hash",
+            schema_hash=fake_sha256("abc123hash"),
             schema_config=_DYNAMIC_SCHEMA,
         )
-        assert node.schema_hash == "abc123hash"
+        assert node.schema_hash == fake_sha256("abc123hash")
 
     def test_schema_hash_none_by_default(self) -> None:
         _db, factory = _setup()

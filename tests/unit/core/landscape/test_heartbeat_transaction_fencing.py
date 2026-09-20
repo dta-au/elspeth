@@ -18,6 +18,7 @@ from elspeth.contracts.errors import AuditIntegrityError, RunMembershipLostError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository, fenced_heartbeat_transaction
 from elspeth.core.landscape.schema import run_coordination_table, run_workers_table, runs_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.helpers.run_coordination import register_run_leader
 from tests.unit.core.landscape.test_run_coordination_repository import RUN_ID, WINDOW, _coordination_image, _seed_run
 
@@ -38,7 +39,7 @@ def test_helper_locks_seat_before_membership_and_payload(heartbeat_db: Landscape
     """Observe actual statements and the PostgreSQL lock intent on their ClauseElements."""
     if worker_id == "follower":
         member = RunCoordinationRepository(heartbeat_db.engine).admit_follower(
-            run_id=RUN_ID, worker_id=worker_id, config_hash="config", window_seconds=WINDOW
+            run_id=RUN_ID, worker_id=worker_id, config_hash=fake_sha256("config"), window_seconds=WINDOW
         )
     else:
         member = WorkerMembershipToken(run_id=RUN_ID, worker_id=worker_id)

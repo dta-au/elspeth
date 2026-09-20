@@ -32,6 +32,7 @@ from elspeth.core.landscape.schema import (
     token_lineage_frames_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_token_for, make_landscape_db
 
 RUN_ID = "run-group-lineage-1"
@@ -62,7 +63,7 @@ def seed_run(db: LandscapeDB, *, status: RunStatus = RunStatus.FAILED) -> None:
             .where(runs_table.c.run_id == RUN_ID)
             .values(
                 started_at=NOW,
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=status.value,
@@ -83,7 +84,7 @@ def seed_run(db: LandscapeDB, *, status: RunStatus = RunStatus.FAILED) -> None:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     config_json="{}",
                     registered_at=NOW,
                 )
@@ -96,7 +97,7 @@ def seed_run(db: LandscapeDB, *, status: RunStatus = RunStatus.FAILED) -> None:
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="hash-row-1",
+                source_data_hash=fake_sha256("hash-row-1"),
                 created_at=NOW,
             )
         )

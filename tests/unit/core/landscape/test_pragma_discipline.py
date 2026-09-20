@@ -54,6 +54,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import landscape_database_now
 
 RUN_ID = "run-pragma"
@@ -78,7 +79,7 @@ def _insert_run_node_row_token(db: LandscapeDB, *, now: datetime) -> None:
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -98,7 +99,7 @@ def _insert_run_node_row_token(db: LandscapeDB, *, now: datetime) -> None:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -111,7 +112,7 @@ def _insert_run_node_row_token(db: LandscapeDB, *, now: datetime) -> None:
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="hash-row-1",
+                source_data_hash=fake_sha256("hash-row-1"),
                 created_at=now,
             )
         )

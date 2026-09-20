@@ -32,22 +32,30 @@ def test_complete_residual_schema_is_admitted(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("table_name", "column_name", "check_name"),
+    ("table_name", "column_name", "check_names"),
     [
-        ("calls", "prompt_tokens", "calls_prompt_tokens_nonnegative"),
-        ("calls", "completion_tokens", "calls_completion_tokens_nonnegative"),
-        ("calls", "cached_prompt_tokens", "calls_cached_prompt_tokens_nonnegative"),
-        ("calls", "reasoning_tokens", "calls_reasoning_tokens_nonnegative"),
-        ("run_web_plugin_policy", "admission_decision_json", "ck_run_web_plugin_policy_admission_pair"),
-        ("run_web_plugin_policy", "admission_decision_hash", "ck_run_web_plugin_policy_admission_pair"),
+        ("calls", "prompt_tokens", ("calls_prompt_tokens_nonnegative",)),
+        ("calls", "completion_tokens", ("calls_completion_tokens_nonnegative",)),
+        ("calls", "cached_prompt_tokens", ("calls_cached_prompt_tokens_nonnegative",)),
+        ("calls", "reasoning_tokens", ("calls_reasoning_tokens_nonnegative",)),
+        ("run_web_plugin_policy", "admission_decision_json", ("ck_run_web_plugin_policy_admission_pair",)),
+        (
+            "run_web_plugin_policy",
+            "admission_decision_hash",
+            # Every CHECK naming the dropped column must go with it, or CREATE TABLE fails.
+            ("ck_run_web_plugin_policy_admission_pair", "ck_run_web_plugin_policy_admission_decision_hash_hex"),
+        ),
     ],
 )
-def test_current_epoch_missing_residual_column_is_refused(tmp_path: Path, table_name: str, column_name: str, check_name: str) -> None:
+def test_current_epoch_missing_residual_column_is_refused(
+    tmp_path: Path, table_name: str, column_name: str, check_names: tuple[str, ...]
+) -> None:
     copied = copy_metadata_for_mutation(metadata)
     table = copied.tables[table_name]
     table._columns.remove(table.c[column_name])
-    constraint = next(constraint for constraint in table.constraints if constraint.name == check_name)
-    table.constraints.remove(constraint)
+    for check_name in check_names:
+        constraint = next(constraint for constraint in table.constraints if constraint.name == check_name)
+        table.constraints.remove(constraint)
     url = _create_stamped_database(tmp_path / "missing-column.db", copied)
 
     with pytest.raises(SchemaCompatibilityError, match=rf"{table_name}\.{column_name}"):

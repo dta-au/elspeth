@@ -44,6 +44,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.core import Orchestrator
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import expire_leader_seat, make_landscape_db
 from tests.helpers.state_engine import capture_state_engine_image
 
@@ -57,7 +58,7 @@ WINDOW = 80.0
 
 # Sentinel config_hash used for all tests that need a matching hash.
 # Raw insert bypasses begin_run so the seat image is fully controlled.
-_SENTINEL_HASH = "sentinel-config-hash-abc123"
+_SENTINEL_HASH = fake_sha256("sentinel-config-hash-abc123")
 
 # Patches for resolve_config+stable_hash so joiner_config_hash == _SENTINEL_HASH.
 _PATCH_RESOLVE = patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={})
@@ -273,7 +274,7 @@ class TestJoinAdmissionRefusals:
     def test_config_hash_mismatch_refused(self) -> None:
         """A joiner with a different settings hash is refused."""
         db = make_landscape_db()
-        _begin_run_with_leader(db, config_hash="stored-hash-abc")
+        _begin_run_with_leader(db, config_hash=fake_sha256("stored-hash-abc"))
 
         fake_settings = types.SimpleNamespace()
         with (
@@ -412,7 +413,7 @@ class TestJoinAdmissionAtomicity:
     def test_no_follower_row_on_config_hash_mismatch(self) -> None:
         """Config-hash refusal: the DB has only the leader row, no ghost follower."""
         db = make_landscape_db()
-        _begin_run_with_leader(db, config_hash="canonical-hash")
+        _begin_run_with_leader(db, config_hash=fake_sha256("canonical-hash"))
 
         events_before = _coord_events(db)
 

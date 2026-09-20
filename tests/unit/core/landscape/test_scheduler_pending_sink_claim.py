@@ -26,6 +26,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 
 RUN_ID = "run-pending-sink-admission"
@@ -87,14 +88,14 @@ def pending_sink() -> Iterator[tuple[Tier1Engine, TokenSchedulerRepository, str,
             {
                 "pending_outcome": TerminalOutcome.FAILURE.value,
                 "pending_path": TerminalPath.ON_ERROR_ROUTED.value,
-                "pending_error_hash": "a" * 64,
+                "pending_error_hash": "a" * 16,
                 "pending_error_message": None,
             },
             id="on-error-missing-error-message",
         ),
         pytest.param(
             {
-                "pending_error_hash": "a" * 64,
+                "pending_error_hash": "a" * 16,
                 "pending_error_message": "stale error",
             },
             id="success-with-error-evidence",
@@ -152,7 +153,7 @@ def test_claim_pending_sink_rejects_incomplete_bundle_without_mutation(
             {
                 "pending_outcome": TerminalOutcome.FAILURE.value,
                 "pending_path": TerminalPath.ON_ERROR_ROUTED.value,
-                "pending_error_hash": "a" * 64,
+                "pending_error_hash": "a" * 16,
                 "pending_error_message": "boom",
             },
             id="on-error-routed",
@@ -239,7 +240,7 @@ def _seed_prerequisites(engine: Tier1Engine) -> str:
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -259,7 +260,7 @@ def _seed_prerequisites(engine: Tier1Engine) -> str:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=NOW,
                 )
@@ -272,7 +273,7 @@ def _seed_prerequisites(engine: Tier1Engine) -> str:
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="row-hash",
+                source_data_hash=fake_sha256("row-hash"),
                 created_at=NOW,
             )
         )

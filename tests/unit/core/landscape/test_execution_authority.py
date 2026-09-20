@@ -21,6 +21,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler.payload_codec import serialize_row_payload
 from elspeth.core.landscape.schema import calls_table, node_states_table, operations_table, rows_table, token_work_items_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
 from tests.fixtures.stores import MockPayloadStore
 
@@ -473,7 +474,9 @@ def test_source_reconciliation_batches_exact_witnesses_atomically(corrupt_second
     )
     if corrupt_second_source:
         with setup.recorder.db.write_connection() as conn:
-            conn.execute(rows_table.update().where(rows_table.c.row_id == row.row_id).values(source_data_hash="wrong-source-hash"))
+            conn.execute(
+                rows_table.update().where(rows_table.c.row_id == row.row_id).values(source_data_hash=fake_sha256("wrong-source-hash"))
+            )
         with pytest.raises(AuditIntegrityError, match="scheduler payload hash"):
             setup.recorder.execution.reconcile_source_completions_from_scheduler(coordination_token=setup.recorder.coordination_token)
         with setup.recorder.db.read_only_connection() as conn:

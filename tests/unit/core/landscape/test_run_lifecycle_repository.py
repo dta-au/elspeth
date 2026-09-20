@@ -51,6 +51,7 @@ from elspeth.core.landscape.run_lifecycle_repository import (
     is_valid_sha256_hex,
 )
 from elspeth.core.landscape.schema import run_attributions_table, run_web_plugin_policy_table, runs_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
 
@@ -400,12 +401,17 @@ class TestBeginRunDirect:
             run_id="corrupt-policy-run",
             web_plugin_policy_evidence=_web_policy_evidence(),
         )
+        # ``ck_run_web_plugin_policy_policy_hash_hex`` rejects a malformed digest
+        # in a normal write; the read-side guard is defence-in-depth for
+        # out-of-band tampering, so the corruption is planted with CHECKs off.
         with db.write_connection() as conn:
+            conn.exec_driver_sql("PRAGMA ignore_check_constraints = ON")
             conn.execute(
                 update(run_web_plugin_policy_table)
                 .where(run_web_plugin_policy_table.c.run_id == "corrupt-policy-run")
                 .values(**corrupt_values)
             )
+            conn.exec_driver_sql("PRAGMA ignore_check_constraints = OFF")
 
         with pytest.raises(AuditIntegrityError, match=message):
             repo.get_web_plugin_policy_evidence("corrupt-policy-run")
@@ -791,7 +797,7 @@ class TestGetSourceFieldResolution:
                 source_node_id=source_node_id,
                 source_name=source_name,
                 plugin_name="csv",
-                config_hash=source_name,
+                config_hash=fake_sha256(source_name),
                 lifecycle_state="loaded",
                 field_resolution_mapping=shared_mapping,
                 normalization_version="v1",
@@ -819,7 +825,7 @@ class TestGetSourceFieldResolution:
             source_node_id="source_orders",
             source_name="orders",
             plugin_name="csv",
-            config_hash="orders",
+            config_hash=fake_sha256("orders"),
             lifecycle_state="loaded",
             field_resolution_mapping={"Order ID": "order_id", "Amount": "amount"},
             normalization_version="v1",
@@ -829,7 +835,7 @@ class TestGetSourceFieldResolution:
             source_node_id="source_refunds",
             source_name="refunds",
             plugin_name="csv",
-            config_hash="refunds",
+            config_hash=fake_sha256("refunds"),
             lifecycle_state="loaded",
             field_resolution_mapping={"Refund ID": "refund_id", "Amount": "amount"},
             normalization_version="v1",
@@ -853,7 +859,7 @@ class TestGetSourceFieldResolution:
             source_node_id="source_orders",
             source_name="orders",
             plugin_name="csv",
-            config_hash="orders",
+            config_hash=fake_sha256("orders"),
             lifecycle_state="loaded",
             field_resolution_mapping={"Order ID": "order_id"},
             normalization_version="v1",
@@ -863,7 +869,7 @@ class TestGetSourceFieldResolution:
             source_node_id="source_refunds",
             source_name="refunds",
             plugin_name="csv",
-            config_hash="refunds",
+            config_hash=fake_sha256("refunds"),
             lifecycle_state="loaded",
             coordination_token=setup.coordination_token,
         )

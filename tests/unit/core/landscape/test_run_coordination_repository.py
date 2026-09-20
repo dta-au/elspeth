@@ -68,6 +68,7 @@ from elspeth.core.landscape.schema import (
     run_workers_table,
     runs_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     assert_deadline_within,
     assert_stamped_between,
@@ -128,7 +129,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str = RUN_ID, status: str = "runni
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=status,
@@ -172,7 +173,7 @@ def test_worker_heartbeat_missing_seat_refuses_without_liveness_write(
     worker_id = leader_id
     if role == "follower":
         worker_id = mint_worker_id(RUN_ID)
-        repo.admit_follower(run_id=RUN_ID, worker_id=worker_id, config_hash="config", window_seconds=WINDOW)
+        repo.admit_follower(run_id=RUN_ID, worker_id=worker_id, config_hash=fake_sha256("config"), window_seconds=WINDOW)
     with engine.begin() as conn:
         conn.execute(delete(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID))
         conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=NOW))
@@ -1024,7 +1025,7 @@ class TestRegistryVerbs:
         register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
 
         follower = mint_worker_id(RUN_ID)
-        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash=fake_sha256("config"), window_seconds=WINDOW)
         assert member == WorkerMembershipToken(run_id=RUN_ID, worker_id=follower)
         worker = _worker_row(engine, follower)
         assert worker["role"] == "follower"
@@ -1032,21 +1033,21 @@ class TestRegistryVerbs:
         assert worker["entry_point"] == "join"
 
         with pytest.raises(JoinRefusedError, match="does not match"):
-            repo.admit_follower(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), config_hash="other", window_seconds=WINDOW)
+            repo.admit_follower(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), config_hash=fake_sha256("other"), window_seconds=WINDOW)
         _expire_seat(engine)  # seat liveness is judged against the database clock
         with pytest.raises(JoinRefusedError, match="no live leader"):
-            repo.admit_follower(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), config_hash="config", window_seconds=WINDOW)
+            repo.admit_follower(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), config_hash=fake_sha256("config"), window_seconds=WINDOW)
         _seed_run(engine, run_id="run-terminal", status="completed")
         with pytest.raises(JoinRefusedError, match="terminal"):
             repo.admit_follower(
-                run_id="run-terminal", worker_id=mint_worker_id("run-terminal"), config_hash="config", window_seconds=WINDOW
+                run_id="run-terminal", worker_id=mint_worker_id("run-terminal"), config_hash=fake_sha256("config"), window_seconds=WINDOW
             )
 
     def test_depart_worker_idempotent_cas(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="running")
         register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
         follower = mint_worker_id(RUN_ID)
-        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash=fake_sha256("config"), window_seconds=WINDOW)
 
         repo.depart_worker(member_token=member)
         assert _worker_row(engine, follower)["status"] == "departed"
@@ -1200,7 +1201,7 @@ class TestRunCoordinationTruthTables:
         follower = repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
-            config_hash="config",
+            config_hash=fake_sha256("config"),
             window_seconds=WINDOW,
         )
         # Age the follower's deadline so the beat's database-time refresh is observable.
@@ -1239,7 +1240,7 @@ class TestRunCoordinationTruthTables:
         follower = repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
-            config_hash="config",
+            config_hash=fake_sha256("config"),
             window_seconds=WINDOW,
         )
         departed_from = landscape_database_now(engine)
@@ -1304,7 +1305,7 @@ class TestRunCoordinationTruthTables:
         repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
-            config_hash="config",
+            config_hash=fake_sha256("config"),
             window_seconds=WINDOW,
         )
         after = landscape_database_now(engine)
@@ -1330,7 +1331,7 @@ class TestRunCoordinationTruthTables:
             repo.admit_follower(
                 run_id=RUN_ID,
                 worker_id="rejected",
-                config_hash="wrong",
+                config_hash=fake_sha256("wrong"),
                 window_seconds=WINDOW,
             )
 

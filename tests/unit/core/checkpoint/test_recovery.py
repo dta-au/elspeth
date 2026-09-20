@@ -47,6 +47,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.factories import make_pipeline_row
 from tests.fixtures.landscape import insert_crashed_leader_seat, make_landscape_db
 from tests.helpers.checkpoint import create_checkpoint
@@ -140,13 +141,13 @@ def _insert_run(
     if contract_json_override is not None:
         schema_contract_json = contract_json_override
         # Intentionally mismatched when override is used for corruption tests.
-        schema_contract_hash = "deadbeefdeadbeef"
+        schema_contract_hash = "deadbeef" * 4
 
     conn.execute(
         runs_table.insert().values(
             run_id=run_id,
             started_at=datetime.now(UTC),
-            config_hash="cfg",
+            config_hash=fake_sha256("cfg"),
             settings_json="{}",
             canonical_version="sha256-rfc8785-v1",
             status=status,
@@ -175,7 +176,7 @@ def _insert_run(
                 source_name="primary",
                 plugin_name="test_source",
                 lifecycle_state="loaded",
-                config_hash="src_cfg",
+                config_hash=fake_sha256("src_cfg"),
                 schema_json="{}",
                 schema_contract_json=schema_contract_json,
                 schema_contract_hash=schema_contract_hash,
@@ -194,7 +195,7 @@ def _insert_node(conn: Connection, run_id: str, node_id: str, *, node_type: Node
             node_type=node_type,
             plugin_version="1.0.0",
             determinism=Determinism.DETERMINISTIC,
-            config_hash="node_cfg",
+            config_hash=fake_sha256("node_cfg"),
             config_json="{}",
             registered_at=datetime.now(UTC),
         )
@@ -210,7 +211,7 @@ def _insert_row(conn: Connection, run_id: str, row_id: str, *, row_index: int, s
             row_index=row_index,
             source_row_index=row_index,
             ingest_sequence=row_index,
-            source_data_hash=f"hash-{row_id}",
+            source_data_hash=fake_sha256(f"hash-{row_id}"),
             source_data_ref=source_data_ref,
             created_at=datetime.now(UTC),
         )
@@ -1630,7 +1631,7 @@ def test_get_resume_point_revalidates_checkpoint_loaded_after_can_resume(
                 sequence_number=99,
                 barrier_scalars_json=None,
                 created_at=datetime.now(UTC),
-                upstream_topology_hash="x" * 64,
+                upstream_topology_hash=fake_sha256("later-incompatible-topology"),
                 format_version=Checkpoint.CURRENT_FORMAT_VERSION,
             )
         )

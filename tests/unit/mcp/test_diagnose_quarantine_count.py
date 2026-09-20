@@ -3,6 +3,7 @@
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.mcp.analyzers.diagnostics import diagnose
+from tests.fixtures.audit_hashing import fake_error_hash
 from tests.fixtures.landscape import make_recorder_with_run
 
 
@@ -23,7 +24,7 @@ def test_diagnose_counts_quarantined_under_new_path() -> None:
             ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash=f"{row_index:064x}",
+            error_hash=fake_error_hash(f"{row_index:064x}"),
         )
 
     setup.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=setup.coordination_token)

@@ -34,6 +34,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_error_hash, fake_sha256
 from tests.fixtures.landscape import (
     assert_stamped_between,
     expire_lease,
@@ -836,7 +837,7 @@ def test_transform_disposition_truth_table_commits_exact_row_event_and_branch_lo
         assert work_item["pending_sink_name"] == "replacement-sink"
         assert work_item["pending_outcome"] == TerminalOutcome.FAILURE.value
         assert work_item["pending_path"] == TerminalPath.ON_ERROR_ROUTED.value
-        assert work_item["pending_error_hash"] == "replacement-error-hash"
+        assert work_item["pending_error_hash"] == fake_error_hash("replacement-error-hash")
         assert work_item["pending_error_message"] == "replacement error"
         assert work_item["lease_owner"] == "worker-b"
 
@@ -1055,7 +1056,7 @@ def test_mark_blocked_refuses_missing_release_key_without_mutation() -> None:
             {
                 "outcome": "success",
                 "path": "default_flow",
-                "error_hash": "unexpected-error-hash",
+                "error_hash": fake_error_hash("unexpected-error-hash"),
                 "error_message": None,
             },
             "error evidence",
@@ -1354,7 +1355,7 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
                 row_index=1,
                 source_row_index=1,
                 ingest_sequence=1,
-                source_data_hash="hash-row-2",
+                source_data_hash=fake_sha256("hash-row-2"),
                 created_at=now,
             )
         )
@@ -2150,7 +2151,7 @@ def _invoke_normal_disposition(
             sink_name="replacement-sink",
             outcome=TerminalOutcome.FAILURE.value,
             path=TerminalPath.ON_ERROR_ROUTED.value,
-            error_hash="replacement-error-hash",
+            error_hash=fake_error_hash("replacement-error-hash"),
             error_message="replacement error",
             expected_lease_owner=expected_lease_owner,
             group_losses=group_losses,
@@ -2278,7 +2279,7 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime, leade
             insert(runs_table).values(
                 run_id="run-1",
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -2294,7 +2295,7 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime, leade
                 node_type=NodeType.SOURCE.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -2307,7 +2308,7 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime, leade
                 node_type=NodeType.TRANSFORM.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -2320,7 +2321,7 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime, leade
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="hash-row-1",
+                source_data_hash=fake_sha256("hash-row-1"),
                 created_at=now,
             )
         )
@@ -2368,7 +2369,7 @@ def _insert_foreign_scheduler_prerequisites(engine: Tier1Engine, *, now: datetim
             insert(runs_table).values(
                 run_id="run-foreign",
                 started_at=now,
-                config_hash="config-foreign",
+                config_hash=fake_sha256("config-foreign"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -2388,7 +2389,7 @@ def _insert_foreign_scheduler_prerequisites(engine: Tier1Engine, *, now: datetim
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config-foreign",
+                    config_hash=fake_sha256("config-foreign"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -2401,7 +2402,7 @@ def _insert_foreign_scheduler_prerequisites(engine: Tier1Engine, *, now: datetim
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="hash-row-foreign",
+                source_data_hash=fake_sha256("hash-row-foreign"),
                 created_at=now,
             )
         )
@@ -2445,7 +2446,7 @@ def _insert_second_scheduler_token(engine: Tier1Engine, *, now: datetime) -> Non
                 row_index=1,
                 source_row_index=1,
                 ingest_sequence=1,
-                source_data_hash="hash-row-2",
+                source_data_hash=fake_sha256("hash-row-2"),
                 created_at=now,
             )
         )

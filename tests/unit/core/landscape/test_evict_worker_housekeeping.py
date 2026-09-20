@@ -52,6 +52,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import landscape_database_now
 
 RUN_ID = "run-evict-housekeeping"
@@ -74,7 +75,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str = RUN_ID) -> None:
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -94,7 +95,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str = RUN_ID) -> None:
                     node_type=node_type,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=NOW,
                 )
@@ -211,7 +212,7 @@ def _seed_leased_item(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash=f"hash-{token_id}",
+                source_data_hash=fake_sha256(f"hash-{token_id}"),
                 created_at=now,
             )
         )

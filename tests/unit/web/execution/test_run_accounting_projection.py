@@ -24,6 +24,7 @@ from elspeth.web.execution.accounting import (
     load_run_accounting_from_db,
     load_run_accounting_map_from_db,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -241,7 +242,7 @@ def test_source_accounting_projects_named_sources_and_aggregate_total() -> None:
                         source_name=source_name,
                         plugin_name="csv",
                         lifecycle_state="loaded",
-                        config_hash=f"hash-{source_name}",
+                        config_hash=fake_sha256(f"hash-{source_name}"),
                         schema_json=None,
                         schema_contract_json=None,
                         schema_contract_hash=None,
@@ -362,7 +363,7 @@ def test_transform_discards_do_not_feed_source_rows_rejected() -> None:
                     run_id="run-te",
                     token_id="token-1",
                     transform_id="transform",
-                    row_hash="hash-1",
+                    row_hash=fake_sha256("hash-1"),
                     row_data_json=None,
                     error_details_json=None,
                     destination="discard",
@@ -402,7 +403,7 @@ def test_all_rows_rejected_source_still_appears_in_per_source_accounting() -> No
                     source_name="tickets",
                     plugin_name="csv",
                     lifecycle_state="loaded",
-                    config_hash="hash-tickets",
+                    config_hash=fake_sha256("hash-tickets"),
                     schema_json=None,
                     schema_contract_json=None,
                     schema_contract_hash=None,

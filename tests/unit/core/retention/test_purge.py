@@ -39,6 +39,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from elspeth.core.retention.purge import PurgeManager
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 
@@ -62,7 +63,7 @@ def _create_run(
             run_id=run_id,
             started_at=datetime.now(UTC),
             completed_at=completed_at,
-            config_hash="cfg",
+            config_hash=fake_sha256("cfg"),
             settings_json="{}",
             canonical_version="sha256-rfc8785-v1",
             status=status,
@@ -97,7 +98,7 @@ def _create_node(
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             determinism=determinism,
-            config_hash="node_cfg",
+            config_hash=fake_sha256("node_cfg"),
             config_json="{}",
             registered_at=datetime.now(UTC),
         )
@@ -121,7 +122,7 @@ def _create_row(
             row_index=row_index,
             source_row_index=row_index,
             ingest_sequence=row_index,
-            source_data_hash=f"hash-{row_id}",
+            source_data_hash=fake_sha256(f"hash-{row_id}"),
             source_data_ref=source_data_ref,
             created_at=datetime.now(UTC),
         )
@@ -164,8 +165,8 @@ def _create_node_state(
             step_index=0,
             attempt=0,
             status=NodeStateStatus.COMPLETED,
-            input_hash="in_hash",
-            output_hash="out_hash",
+            input_hash=fake_sha256("in_hash"),
+            output_hash=fake_sha256("out_hash"),
             started_at=datetime.now(UTC),
         )
     )
@@ -210,9 +211,9 @@ def _create_call_for_state(
             call_index=0,
             call_type=CallType.HTTP,
             status=CallStatus.SUCCESS,
-            request_hash="req_hash",
+            request_hash=fake_sha256("req_hash"),
             request_ref=request_ref,
-            response_hash="res_hash",
+            response_hash=fake_sha256("res_hash"),
             response_ref=response_ref,
             created_at=datetime.now(UTC),
         )
@@ -235,9 +236,9 @@ def _create_call_for_operation(
             call_index=0,
             call_type=CallType.HTTP,
             status=CallStatus.SUCCESS,
-            request_hash="req_hash",
+            request_hash=fake_sha256("req_hash"),
             request_ref=request_ref,
-            response_hash="res_hash",
+            response_hash=fake_sha256("res_hash"),
             response_ref=response_ref,
             created_at=datetime.now(UTC),
         )
@@ -276,7 +277,7 @@ def _create_routing_event(
             routing_group_id=f"rg-{uuid4().hex[:12]}",
             ordinal=0,
             mode=RoutingMode.MOVE,
-            reason_hash="reason_hash",
+            reason_hash=fake_sha256("reason_hash"),
             reason_ref=reason_ref,
             created_at=datetime.now(UTC),
         )

@@ -12,6 +12,7 @@ from elspeth.core.landscape.schema import calls_table
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.execution import service as execution_service
 from elspeth.web.execution.service import _run_token_usage_entries
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 
 T0 = datetime(2026, 9, 13, 23, 59, 58, tzinfo=UTC)
@@ -97,7 +98,7 @@ def test_run_entries_are_the_llm_calls_in_creation_order_with_their_node_model()
                     call_index=offset,
                     call_type=call_type.value,
                     status=status.value,
-                    request_hash=f"{call_id}-request",
+                    request_hash=fake_sha256(f"{call_id}-request"),
                     created_at=T0 + timedelta(seconds=offset),
                     prompt_tokens=prompt,
                     completion_tokens=completion,

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 from elspeth.contracts.audit import TokenRef
@@ -62,7 +63,7 @@ class TestRecorderFactoryArtifacts:
                 sink_node_id=sink.node_id,
                 artifact_type="csv",
                 path="/output/result.csv",
-                content_hash="abc123",
+                content_hash=fake_sha256("abc123"),
                 size_bytes=1024,
             )
 
@@ -113,7 +114,7 @@ class TestRecorderFactoryArtifacts:
                 sink_node_id=sink.node_id,
                 artifact_type="csv",
                 path="/output/a.csv",
-                content_hash="hash1",
+                content_hash=fake_sha256("hash1"),
                 size_bytes=100,
             )
         with fenced_leader_transaction(
@@ -129,7 +130,7 @@ class TestRecorderFactoryArtifacts:
                 sink_node_id=sink.node_id,
                 artifact_type="csv",
                 path="/output/b.csv",
-                content_hash="hash2",
+                content_hash=fake_sha256("hash2"),
                 size_bytes=200,
             )
 
@@ -192,7 +193,7 @@ class TestRecorderFactoryArtifacts:
                 sink_node_id=sink.node_id,
                 artifact_type="csv",
                 path="/output/result.csv",
-                content_hash="abc123",
+                content_hash=fake_sha256("abc123"),
                 size_bytes=1024,
                 idempotency_key=idem_key,
             )
@@ -261,7 +262,7 @@ class TestRecorderFactoryArtifacts:
                 sink_node_id=sink.node_id,
                 artifact_type="csv",
                 path="/output/result.csv",
-                content_hash="abc123",
+                content_hash=fake_sha256("abc123"),
                 size_bytes=1024,
             )
 

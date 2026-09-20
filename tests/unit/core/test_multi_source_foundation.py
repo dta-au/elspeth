@@ -33,6 +33,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     assert_stamped_between,
     expire_lease,
@@ -466,7 +467,7 @@ def test_run_sources_and_source_scoped_rows_are_schema_enforced() -> None:
             insert(runs_table).values(
                 run_id="run-1",
                 started_at=now,
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="test",
                 status="running",
@@ -483,7 +484,7 @@ def test_run_sources_and_source_scoped_rows_are_schema_enforced() -> None:
                     node_type="source",
                     plugin_version="test",
                     determinism="deterministic",
-                    config_hash=source_node_id,
+                    config_hash=fake_sha256(source_node_id),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -494,7 +495,7 @@ def test_run_sources_and_source_scoped_rows_are_schema_enforced() -> None:
                     source_node_id=source_node_id,
                     source_name=source_node_id,
                     plugin_name="csv",
-                    config_hash=source_node_id,
+                    config_hash=fake_sha256(source_node_id),
                     lifecycle_state="ready",
                     recorded_at=now,
                 )
@@ -507,7 +508,7 @@ def test_run_sources_and_source_scoped_rows_are_schema_enforced() -> None:
                 source_node_id="source_a",
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="hash-a",
+                source_data_hash=fake_sha256("hash-a"),
                 created_at=now,
             )
         )
@@ -518,7 +519,7 @@ def test_run_sources_and_source_scoped_rows_are_schema_enforced() -> None:
                 source_node_id="source_b",
                 source_row_index=0,
                 ingest_sequence=1,
-                source_data_hash="hash-b",
+                source_data_hash=fake_sha256("hash-b"),
                 created_at=now,
             )
         )
@@ -540,7 +541,7 @@ def test_record_run_source_rejects_missing_source_node() -> None:
             source_node_id="missing-source",
             source_name="missing",
             plugin_name="csv",
-            config_hash="cfg",
+            config_hash=fake_sha256("cfg"),
             lifecycle_state="ready",
             coordination_token=leader_coordination_token(factory, run.run_id),
         )
@@ -570,7 +571,7 @@ def test_record_run_source_rejects_non_source_node() -> None:
             source_node_id="transform-node",
             source_name="not_a_source",
             plugin_name="csv",
-            config_hash="cfg",
+            config_hash=fake_sha256("cfg"),
             lifecycle_state="ready",
             coordination_token=leader_coordination_token(factory, run.run_id),
         )
@@ -598,7 +599,7 @@ def test_record_run_source_rejects_unknown_lifecycle_state() -> None:
             source_node_id="source-node",
             source_name="orders",
             plugin_name="csv",
-            config_hash="cfg",
+            config_hash=fake_sha256("cfg"),
             lifecycle_state="done",
             coordination_token=leader_coordination_token(factory, run.run_id),
         )
@@ -617,7 +618,7 @@ def test_run_sources_foreign_key_rejects_node_from_different_run() -> None:
                 insert(runs_table).values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     settings_json="{}",
                     canonical_version="test",
                     status="running",
@@ -633,7 +634,7 @@ def test_run_sources_foreign_key_rejects_node_from_different_run() -> None:
                 node_type="source",
                 plugin_version="test",
                 determinism="deterministic",
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -646,7 +647,7 @@ def test_run_sources_foreign_key_rejects_node_from_different_run() -> None:
                     source_node_id="shared-source-id",
                     source_name="source",
                     plugin_name="csv",
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     lifecycle_state="ready",
                     recorded_at=now,
                 )
@@ -672,7 +673,7 @@ def test_run_lifecycle_records_per_source_contract_and_resolution() -> None:
                     node_type="source",
                     plugin_version="test",
                     determinism="deterministic",
-                    config_hash=source_node_id,
+                    config_hash=fake_sha256(source_node_id),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -697,7 +698,7 @@ def test_run_lifecycle_records_per_source_contract_and_resolution() -> None:
         source_node_id="source_orders",
         source_name="orders",
         plugin_name="csv",
-        config_hash="orders-hash",
+        config_hash=fake_sha256("orders-hash"),
         source_schema_json='{"title":"Orders"}',
         schema_contract=contract,
         field_resolution_mapping={"Order ID": "id"},
@@ -709,7 +710,7 @@ def test_run_lifecycle_records_per_source_contract_and_resolution() -> None:
         source_node_id="source_refunds",
         source_name="refunds",
         plugin_name="csv",
-        config_hash="refunds-hash",
+        config_hash=fake_sha256("refunds-hash"),
         source_schema_json='{"title":"Refunds"}',
         field_resolution_mapping={"Refund ID": "id"},
         normalization_version="v1",
@@ -752,7 +753,7 @@ def test_data_flow_create_row_with_token_accepts_source_row_index_and_ingest_seq
                     node_type="source",
                     plugin_version="test",
                     determinism="deterministic",
-                    config_hash=source_node_id,
+                    config_hash=fake_sha256(source_node_id),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -2128,7 +2129,7 @@ def _insert_scheduler_owner_records(
                 insert(runs_table).values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="running",
@@ -2149,7 +2150,7 @@ def _insert_scheduler_owner_records(
                     node_type=NodeType.SOURCE.value if node_id == source_node_id else NodeType.TRANSFORM.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -2164,7 +2165,7 @@ def _insert_scheduler_owner_records(
                         row_index=ingest_sequence,
                         source_row_index=ingest_sequence,
                         ingest_sequence=ingest_sequence,
-                        source_data_hash=f"hash-{row_id}",
+                        source_data_hash=fake_sha256(f"hash-{row_id}"),
                         created_at=now,
                     )
                 )
@@ -2205,7 +2206,7 @@ def _scheduler_member(engine: Tier1Engine, worker_id: str, run_id: str = "run-1"
     return RunCoordinationRepository(engine).admit_follower(
         run_id=run_id,
         worker_id=worker_id,
-        config_hash="config",
+        config_hash=fake_sha256("config"),
         window_seconds=3600,
     )
 

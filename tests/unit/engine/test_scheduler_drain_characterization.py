@@ -75,6 +75,7 @@ from elspeth.engine.processor import SCHEDULER_MAINTENANCE_INTERVAL, DAGTraversa
 from elspeth.engine.scheduler_drain import ProcessorMode
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     RecorderSetup,
     expire_leader_seat,
@@ -1225,7 +1226,7 @@ def test_production_maintenance_evicts_only_stale_same_run_follower() -> None:
             insert(runs_table).values(
                 run_id=foreign_run_id,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",

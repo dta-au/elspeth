@@ -43,6 +43,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 
 
 def test_complete_barrier_rolls_back_terminal_outcomes_with_journal(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,7 +146,7 @@ def _seed_run_grouped(
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -161,7 +162,7 @@ def _seed_run_grouped(
                 node_type=NodeType.SOURCE.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -174,7 +175,7 @@ def _seed_run_grouped(
                 node_type=NodeType.TRANSFORM.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -188,7 +189,7 @@ def _seed_run_grouped(
                     row_index=index,
                     source_row_index=index,
                     ingest_sequence=ingest_sequence,
-                    source_data_hash=f"hash-{row_id}",
+                    source_data_hash=fake_sha256(f"hash-{row_id}"),
                     created_at=now,
                 )
             )

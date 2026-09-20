@@ -29,6 +29,7 @@ import pytest
 # reloading that module replays every production contract registration in one
 # place.
 import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
+from tests.fixtures.audit_hashing import fake_sha256
 
 
 @pytest.fixture()
@@ -480,7 +481,7 @@ def test_resume_calls_prepare_for_run() -> None:
                 runs_table.insert().values(
                     run_id="run-resume-bootstrap",
                     started_at=datetime.now(UTC),
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     settings_json="{}",
                     canonical_version="sha256-rfc8785-v1",
                     status=RunStatus.FAILED,

@@ -47,6 +47,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import landscape_database_now, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
@@ -76,7 +77,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=NOW,
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=RunStatus.RUNNING.value,
@@ -93,7 +94,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     config_json="{}",
                     registered_at=NOW,
                 )
@@ -149,7 +150,7 @@ def _seed_blocked_barrier_hold(db: LandscapeDB, *, sequence: int, barrier_key: s
                 row_index=sequence,
                 source_row_index=sequence,
                 ingest_sequence=sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )
@@ -205,7 +206,7 @@ def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_na
                 row_index=sequence,
                 source_row_index=sequence,
                 ingest_sequence=sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )
@@ -257,7 +258,7 @@ def test_facade_enqueue_ready_forwards_collector_name(db: LandscapeDB, token: Co
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )

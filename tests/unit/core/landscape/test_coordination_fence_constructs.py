@@ -51,6 +51,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     assert_deadline_within,
     assert_stamped_between,
@@ -81,7 +82,7 @@ def _insert_run(db: LandscapeDB, run_id: str) -> None:
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=NOW,
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=RunStatus.RUNNING.value,
@@ -98,7 +99,7 @@ def _insert_run(db: LandscapeDB, run_id: str) -> None:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     config_json="{}",
                     registered_at=NOW,
                 )
@@ -133,7 +134,7 @@ def _seed_ready_item(db: LandscapeDB, run_id: str, *, sequence: int = 0) -> str:
                 row_index=sequence,
                 source_row_index=sequence,
                 ingest_sequence=sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )
@@ -201,7 +202,7 @@ def _seed_unscheduled_item(db: LandscapeDB, run_id: str, *, sequence: int) -> di
                 row_index=sequence,
                 source_row_index=sequence,
                 ingest_sequence=sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )

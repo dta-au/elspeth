@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import CallStatus, CallType, Determinism, NodeStateStatus, NodeType, RunStatus
@@ -78,8 +79,8 @@ def _insert_purged_call(
                 step_index=0,
                 attempt=0,
                 status=NodeStateStatus.COMPLETED.value,
-                input_hash="in_hash",
-                output_hash="out_hash",
+                input_hash=fake_sha256("in_hash"),
+                output_hash=fake_sha256("out_hash"),
                 started_at=now,
             )
         )
@@ -91,8 +92,8 @@ def _insert_purged_call(
                 call_index=0,
                 call_type=CallType.HTTP.value,
                 status=CallStatus.SUCCESS.value,
-                request_hash="req_hash",
-                response_hash="resp_hash",  # Proof the payload once existed
+                request_hash=fake_sha256("req_hash"),
+                response_hash=fake_sha256("resp_hash"),  # Proof the payload once existed
                 response_ref=None,  # NULL = payload has been purged
                 created_at=now,
             )

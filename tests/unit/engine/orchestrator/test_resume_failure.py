@@ -53,6 +53,7 @@ from elspeth.engine.orchestrator.types import ExecutionCounters
 from elspeth.engine.processor import RowProcessor
 from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.testing import make_row_result, make_source_row
+from tests.fixtures.audit_hashing import fake_error_hash, fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_landscape_db, make_recorder_with_run
 from tests.fixtures.stores import MockPayloadStore
 
@@ -114,7 +115,7 @@ def _insert_failed_run(db: LandscapeDB, run_id: str) -> None:
             runs_table.insert().values(
                 run_id=run_id,
                 started_at=datetime.now(UTC),
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="sha256-rfc8785-v1",
                 status=RunStatus.FAILED,
@@ -152,7 +153,7 @@ def _insert_run_source(
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
                 determinism=Determinism.DETERMINISTIC,
-                config_hash="src_cfg",
+                config_hash=fake_sha256("src_cfg"),
                 config_json="{}",
                 registered_at=datetime.now(UTC),
             )
@@ -164,7 +165,7 @@ def _insert_run_source(
                 source_name=source_name,
                 plugin_name="test_source",
                 lifecycle_state=lifecycle_state,
-                config_hash="src_cfg",
+                config_hash=fake_sha256("src_cfg"),
                 schema_json="{}",
                 schema_contract_json=None,
                 schema_contract_hash=None,
@@ -2355,7 +2356,7 @@ class TestResumeFinalizesAsFailed:
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.SINK_DISCARDED,
                 sink_name=DISCARD_SINK_NAME,
-                error_hash="sinkdiscard0001",
+                error_hash=fake_error_hash("sinkdiscard0001"),
             ),
         ]
 

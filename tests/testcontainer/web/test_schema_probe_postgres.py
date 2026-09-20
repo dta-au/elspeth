@@ -16,12 +16,14 @@ from pathlib import Path
 import pytest
 import structlog
 from sqlalchemy import Connection, Engine, create_engine, event, func, insert, inspect, select, text, update
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
+from tests.unit.architecture import test_digest_column_shape_checks as digest_gate
 from tests.unit.core.test_schema_shape import _static_check_issues
 
 from elspeth.contracts import Artifact
@@ -186,6 +188,50 @@ def test_postgres_blob_evidence_hash_checks_require_lowercase_sha256(postgres_en
             conn.execute(insert(table).values(**build(bad_hash)))
         with pytest.raises(IntegrityError, match="violates foreign key constraint"), postgres_engine.begin() as conn:
             conn.execute(insert(table).values(**build("e" * 64)))
+
+
+def test_postgres_digest_checks_enforce_every_inventoried_shape(postgres_engine: Engine) -> None:
+    # The SQLite gate evaluates every digest column's CHECK behaviourally, but
+    # each rule has a second, PostgreSQL-only arm (POSIX regex, ``::text``
+    # casts, a quantifier instead of ``length()``) that SQLite never executes.
+    # Evaluate the compiled PostgreSQL expression for every inventoried column
+    # on a real server, against the same probe values. No tables are needed:
+    # the expression runs over a one-row projection typed like the table.
+    dialect = postgresql.dialect()
+    failures: list[str] = []
+    with postgres_engine.connect() as conn:
+        for store, table_name, column, shape in digest_gate._entries():
+            table = digest_gate._STORES[store].tables[table_name]
+            context = digest_gate._CONTEXT.get((store, table_name, column), {})
+            checks = digest_gate.shape_checks(table, column, dialect)
+            if not checks:
+                failures.append(f"{table_name}.{column}: no PostgreSQL CHECK constrains its value")
+                continue
+            names = [c.name for c in table.columns]
+            # The probed column is projected as unbounded TEXT: an explicit
+            # CAST to VARCHAR(64) silently TRUNCATES in PostgreSQL (only an
+            # assignment raises "value too long"), which would hand the CHECK a
+            # well-formed 64 characters in place of the over-long probe.
+            projection = ", ".join(
+                f'CAST(%s AS {"TEXT" if c.name == column else c.type.compile(dialect=dialect)}) AS "{c.name}"' for c in table.columns
+            )
+
+            def verdict(text: str, value: object, projection: str = projection, names: list[str] = names, context=context, column=column):
+                row = {**context, column: value}
+                sql = f"SELECT ({text.replace('%', '%%')}) FROM (SELECT {projection}) AS probe"
+                return conn.exec_driver_sql(sql, tuple(row.get(name) for name in names)).scalar_one()
+
+            good, bad = digest_gate._PROFILES[shape]
+            known = {column, *context}
+            decidable = [(n, t) for n, t in checks if digest_gate._referenced_columns(table, t) <= known]
+            for value in good:
+                failures.extend(
+                    f"{table_name}.{column}: {n} rejects well-formed {value!r}" for n, t in decidable if verdict(t, value) is False
+                )
+            for value in bad:
+                if not any(verdict(t, value) is False for _n, t in checks):
+                    failures.append(f"{table_name}.{column}: admits malformed {value!r}")
+    assert failures == []
 
 
 def test_preferences_omitted_mode_uses_freeform_database_default(postgres_engine: Engine) -> None:

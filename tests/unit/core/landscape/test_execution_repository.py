@@ -75,6 +75,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, leader_token_for, make_factory, make_landscape_db, make_recorder_with_run
 from tests.fixtures.stores import MockPayloadStore
 
@@ -392,8 +393,8 @@ class TestCompleteNodeStateCrashPaths:
         _complete_many(
             repo,
             (
-                (states[0].state_id, {"row": {"name": "test"}, "artifact_path": "out.csv", "content_hash": "hash"}, 2.5),
-                (states[1].state_id, {"row": {"name": "second"}, "artifact_path": "out.csv", "content_hash": "hash"}, 2.5),
+                (states[0].state_id, {"row": {"name": "test"}, "artifact_path": "out.csv", "content_hash": fake_sha256("hash")}, 2.5),
+                (states[1].state_id, {"row": {"name": "second"}, "artifact_path": "out.csv", "content_hash": fake_sha256("hash")}, 2.5),
             ),
         )
 
@@ -407,8 +408,8 @@ class TestCompleteNodeStateCrashPaths:
         assert {row["token_id"] for row in rows} == {tok, "tok-2"}
         assert {row["status"] for row in rows} == {NodeStateStatus.COMPLETED.value}
         assert {row["output_hash"] for row in rows} == {
-            stable_hash({"row": {"name": "test"}, "artifact_path": "out.csv", "content_hash": "hash"}),
-            stable_hash({"row": {"name": "second"}, "artifact_path": "out.csv", "content_hash": "hash"}),
+            stable_hash({"row": {"name": "test"}, "artifact_path": "out.csv", "content_hash": fake_sha256("hash")}),
+            stable_hash({"row": {"name": "second"}, "artifact_path": "out.csv", "content_hash": fake_sha256("hash")}),
         }
 
     def test_batch_complete_chunks_validation_and_readback_state_id_selects(self) -> None:
@@ -2221,12 +2222,12 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/output/results.csv",
-            content_hash="abc123def456",
+            content_hash=fake_sha256("abc123def456"),
             size_bytes=1024,
         )
         assert artifact.artifact_type == "csv"
         assert artifact.path_or_uri == "/output/results.csv"
-        assert artifact.content_hash == "abc123def456"
+        assert artifact.content_hash == fake_sha256("abc123def456")
         assert artifact.size_bytes == 1024
 
         # Retrieve via get_artifacts
@@ -2246,7 +2247,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="json",
             path="/output/data.json",
-            content_hash="hash123",
+            content_hash=fake_sha256("hash123"),
             size_bytes=512,
             idempotency_key="sink-0:row-1:attempt-0",
         )
@@ -2279,7 +2280,7 @@ class TestRegisterArtifact:
                 sink_node_id="sink-0",
                 artifact_type="webhook",
                 path=path_or_uri,
-                content_hash="abc123def456",
+                content_hash=fake_sha256("abc123def456"),
                 size_bytes=1024,
             )
 
@@ -2311,7 +2312,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-0",
             artifact_type="csv",
             path="/out/a.csv",
-            content_hash="h1",
+            content_hash=fake_sha256("h1"),
             size_bytes=100,
         )
         _register_artifact(
@@ -2321,7 +2322,7 @@ class TestRegisterArtifact:
             sink_node_id="sink-1",
             artifact_type="json",
             path="/out/b.json",
-            content_hash="h2",
+            content_hash=fake_sha256("h2"),
             size_bytes=200,
         )
 
