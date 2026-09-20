@@ -326,7 +326,7 @@ describe("GraphView", () => {
     expect(screen.getByText("llm_transform")).toBeInTheDocument();
   });
 
-  it("shows saved failure handling and LLM selection in the Graph tab", () => {
+  it("counts nodes and shows success and failure outputs with LLM selection in the Graph tab", () => {
     useSessionStore.setState({
       compositionState: makeState({
         sources: {
@@ -343,22 +343,24 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const policies = screen.getByText("Failure handling").closest("details");
+    const policies = screen.getByText("Outputs (3)").closest("details");
     expect(policies).toHaveAttribute("open");
     const table = within(policies as HTMLElement).getByRole("table");
     expect(within(table).getByRole("columnheader", { name: "Node" })).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "Success output" })).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "Failure output" })).toBeInTheDocument();
     expect(within(table).getByRole("row", { name: /Source: source/ })).toHaveTextContent(
-      "Row fails validationDiscard row (audit recorded)",
+      "Send to classifyRow fails validationDiscard row (audit recorded)",
     );
     expect(within(table).getByRole("row", { name: /Transform: classify/ })).toHaveTextContent(
-      "profile sonnetRow processing failsSend to quarantine",
+      "profile sonnetSend to resultsRow processing failsSend to quarantine",
     );
     expect(within(table).getByRole("row", { name: /Output: results/ })).toHaveTextContent(
-      "Row write failsDiscard row (audit recorded)",
+      "Row savedRow write failsDiscard row (audit recorded)",
     );
   });
 
-  it("shows all interpretation approvals above failure handling with independent disclosures", async () => {
+  it("shows all interpretation approvals above outputs with independent disclosures", async () => {
     const user = userEvent.setup();
     const approved: InterpretationEvent = {
       id: "approval-1", session_id: "session-1", composition_state_id: "state-1",
@@ -395,7 +397,7 @@ describe("GraphView", () => {
 
     render(<GraphView />);
     const approvals = screen.getByText("Approvals (3)").closest("details") as HTMLDetailsElement;
-    const failures = screen.getByText("Failure handling").closest("details") as HTMLDetailsElement;
+    const failures = screen.getByText("Outputs (1)").closest("details") as HTMLDetailsElement;
     expect(approvals.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(approvals.open).toBe(false);
     expect(failures.open).toBe(true);
@@ -411,7 +413,7 @@ describe("GraphView", () => {
     expect(within(table).getAllByRole("time")).toHaveLength(3);
     expect(within(table).getAllByRole("time")[0]).toHaveAttribute("datetime", approved.resolved_at);
     expect(within(table).getAllByRole("row")).toHaveLength(4);
-    await user.click(screen.getByText("Failure handling"));
+    await user.click(screen.getByText("Outputs (1)"));
     expect(approvals.open).toBe(true);
     expect(failures.open).toBe(false);
   });

@@ -61,7 +61,7 @@ import type { CompositionState } from "@/types/index";
 
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
-import { GraphFailurePolicies } from "./GraphFailurePolicies";
+import { GraphOutputs } from "./GraphOutputs";
 import { GraphApprovals } from "./GraphApprovals";
 
 const NODE_WIDTH = 260;
@@ -2235,7 +2235,7 @@ export function GraphView() {
         {compositionState && (
           <>
             <GraphApprovals events={approvedInterpretations} />
-            <GraphFailurePolicies state={compositionState} />
+            <GraphOutputs state={compositionState} />
           </>
         )}
         {selectedConfig && (
