@@ -20,7 +20,7 @@ from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
 )
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
-from tests.fixtures.mock_audit import mock_item_audit_authority
+from tests.fixtures.mock_audit import mock_audit_authority, mock_item_audit_authority
 
 
 @dataclass
@@ -1251,3 +1251,83 @@ class TestManagedIdentityCredentialClass:
                 api_key="k",
                 client_id="abc",
             )
+
+
+_PUBLIC_ADDRINFO = ((2, 1, 6, "", ("93.184.216.34", 0)),)
+
+
+class TestRuntimePreflightProbe:
+    """The $count readiness probe as an audited call under an operation parent."""
+
+    _PUBLIC = _PUBLIC_ADDRINFO
+
+    def _probe(self, provider: AzureSearchProvider) -> Any:
+        return provider.runtime_preflight(operation_id="op-1", coordination_token=mock_audit_authority()["coordination_token"])
+
+    def test_probe_is_recorded_as_an_operation_call(self) -> None:
+        recorder = _FakeExecutionRecorder()
+        provider = AzureSearchProvider(
+            config=AzureSearchProviderConfig(endpoint="https://test.search.windows.net", index="test-index", api_key="test-key"),
+            execution=recorder,
+            run_id="run-1",
+            telemetry_emit=_TelemetrySink(),
+        )
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC), respx.mock:
+            route = respx.get(host="93.184.216.34").respond(status_code=200, text="42")
+            result = self._probe(provider)
+        assert (result.reachable, result.count) == (True, 42)
+        assert recorder.operation_call_indices == {"op-1": 1}
+        assert len(recorder.recorded_calls) == 1
+        sent = route.calls.last.request
+        assert sent.url.path.endswith("/indexes/test-index/docs/$count")
+        assert sent.headers["api-key"] == "test-key"
+
+    @pytest.mark.parametrize(("status", "retryable"), [(401, False), (403, False), (429, True), (503, True), (400, False)])
+    def test_probe_error_statuses(self, status: int, retryable: bool) -> None:
+        provider = _provider()
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC), respx.mock:
+            respx.get(host="93.184.216.34").respond(status_code=status)
+            with pytest.raises(RetrievalError) as exc_info:
+                self._probe(provider)
+        assert exc_info.value.retryable is retryable
+        assert exc_info.value.status_code == status
+
+    def test_probe_missing_index_is_reachable_with_unknown_count(self) -> None:
+        provider = _provider()
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC), respx.mock:
+            respx.get(host="93.184.216.34").respond(status_code=404)
+            result = self._probe(provider)
+        assert (result.reachable, result.count) == (True, None)
+        assert "not found" in result.message
+
+    def test_probe_non_integer_count_is_unknown_not_zero(self) -> None:
+        provider = _provider()
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC), respx.mock:
+            respx.get(host="93.184.216.34").respond(status_code=200, text="<html>secret page</html>")
+            result = self._probe(provider)
+        assert (result.reachable, result.count) == (True, None)
+        assert "secret page" not in result.message
+
+    def test_probe_empty_index_reports_zero(self) -> None:
+        provider = _provider()
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC), respx.mock:
+            respx.get(host="93.184.216.34").respond(status_code=200, text="0")
+            result = self._probe(provider)
+        assert (result.reachable, result.count) == (True, 0)
+
+    def test_probe_refuses_a_private_address_before_any_request(self) -> None:
+        provider = _provider()
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.1", 0))]), respx.mock:
+            route = respx.get(host="10.0.0.1")
+            with pytest.raises(RetrievalError, match="SSRF") as exc_info:
+                self._probe(provider)
+        assert exc_info.value.retryable is False
+        assert not route.called
+
+    def test_probe_transport_failure_is_retryable(self) -> None:
+        provider = _provider()
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC), respx.mock:
+            respx.get(host="93.184.216.34").mock(side_effect=httpx.ConnectError("refused"))
+            with pytest.raises(RetrievalError) as exc_info:
+                self._probe(provider)
+        assert exc_info.value.retryable is True

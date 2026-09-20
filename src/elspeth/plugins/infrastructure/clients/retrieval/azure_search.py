@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 import httpx
 from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
 
-from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -538,6 +538,73 @@ class AzureSearchProvider:
             return 0.0
         normalized = (raw_score - min_val) / (max_val - min_val)
         return max(0.0, min(1.0, normalized))
+
+    def runtime_preflight(self, *, operation_id: str, coordination_token: CoordinationToken) -> CollectionReadinessResult:
+        """Count the index's documents as an audited call under an operation parent.
+
+        Returns a result for 200 and 404 (the caller decides whether a missing
+        or empty index is fatal); raises RetrievalError for everything else,
+        retryable only for transport failures, 429 and 5xx.
+        """
+        from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+
+        index_name = self._config.index
+        count_url = f"{self._config.endpoint.rstrip('/')}/indexes/{index_name}/docs/$count?api-version={self._config.api_version}"
+        try:
+            safe_request = validate_url_for_ssrf(count_url)
+        except SSRFBlockedError as exc:
+            raise RetrievalError(f"Azure AI Search endpoint blocked by SSRF validation: {exc}", retryable=False) from exc
+        except NetworkError as exc:
+            raise RetrievalError(f"Azure AI Search endpoint DNS validation failed: {exc}", retryable=True) from exc
+
+        client = AuditedHTTPClient(
+            execution=self._execution,
+            state_id=None,
+            run_id=self._run_id,
+            telemetry_emit=self._telemetry_emit,
+            timeout=10.0,
+            limiter=self._limiter,
+            operation_id=operation_id,
+            coordination_token=coordination_token,
+        )
+        try:
+            response, _final_url, _call = client.get_ssrf_safe(safe_request, headers=self._auth_headers())
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            raise RetrievalError(f"Readiness probe failed: {exc}", retryable=True) from exc
+        except httpx.HTTPError as exc:
+            raise RetrievalError(f"HTTP error during readiness probe: {exc}", retryable=True) from exc
+        finally:
+            client.close()
+
+        status_code = response.status_code
+        if status_code == 404:
+            return CollectionReadinessResult(collection=index_name, reachable=True, count=None, message=f"Index '{index_name}' not found")
+        if status_code in (401, 403):
+            raise RetrievalError(
+                f"Authentication failed for {self._config.endpoint} index {index_name!r}: HTTP {status_code}",
+                retryable=False,
+                status_code=status_code,
+            )
+        if status_code == 429 or status_code >= 500:
+            raise RetrievalError(f"Azure AI Search readiness probe: HTTP {status_code}", retryable=True, status_code=status_code)
+        if status_code >= 400:
+            raise RetrievalError(f"Azure AI Search readiness probe: HTTP {status_code}", retryable=False, status_code=status_code)
+        try:
+            count = int(response.text.strip())
+        except ValueError:
+            # The body is not echoed: an HTML error page does not belong in an audit message.
+            return CollectionReadinessResult(
+                collection=index_name,
+                reachable=True,
+                count=None,
+                message=f"Index '{index_name}' returned a non-integer $count body",
+            )
+        return CollectionReadinessResult(
+            collection=index_name,
+            reachable=True,
+            count=count,
+            message=(f"Index '{index_name}' has {count} documents" if count > 0 else f"Index '{index_name}' is empty"),
+        )
 
     @staticmethod
     def _readiness_get(
