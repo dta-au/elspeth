@@ -292,7 +292,7 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 61 defaults preferences to freeform and retires the mode banner.
-    assert SESSION_SCHEMA_EPOCH == 61
+    assert SESSION_SCHEMA_EPOCH == 62
     expected_tables = frozenset(
         {
             "web_instances",
@@ -462,6 +462,35 @@ def test_previous_epoch_rejection_does_not_rewrite_store() -> None:
         assert conn.execute(text("SELECT * FROM elspeth_schema_identity")).all() == before
         assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
         assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == previous
+
+
+def test_epoch_61_is_rejected_before_reading_old_advisor_gate_grammar() -> None:
+    from elspeth.web.execution.completion_gates import parse_completion_gates
+
+    # The preceding epoch allowed blocked facts without an actionable suggestion.
+    # The current parser deliberately has no historical default for owned data.
+    with pytest.raises(ValueError, match="suggestion is required"):
+        parse_completion_gates(
+            {
+                "completion_gates": {
+                    "advisor_signoff": {
+                        "status": "blocked",
+                        "detail": "Review pending.",
+                        "for_graph": "reviewed-graph",
+                    }
+                }
+            }
+        )
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    with eng.begin() as conn:
+        conn.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 61 WHERE store_kind = 'session'"))
+        conn.exec_driver_sql("PRAGMA user_version = 61")
+    with pytest.raises(SessionSchemaError, match="schema version 61"):
+        initialize_session_schema(eng)
+    with eng.connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 61
+        assert conn.execute(text("SELECT schema_epoch FROM elspeth_schema_identity")).scalar_one() == 61
 
 
 def test_epoch_36_database_is_rejected_by_epoch_44_runtime() -> None:

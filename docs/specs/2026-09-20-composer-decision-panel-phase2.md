@@ -1,7 +1,9 @@
 # Composer decision panel Phase 2
 
-Target: `release/0.8.1`; issue `elspeth-b0ef01ea25`. Initial base:
-`ebc4720e0d4f18810353c646a093269a4ba7bc81`.
+Target: `release/0.8.1`; issue `elspeth-b0ef01ea25`. Reconciled release base:
+`627b72cf1a0bcadfa260bfbbd9a111df79eb7b98`. The initial remote snapshot was
+`ebc4720e0d4f18810353c646a093269a4ba7bc81`; the reconciled base preserves
+the local release commits ahead of that published snapshot.
 
 ## Decisions and interaction ownership
 
@@ -70,10 +72,11 @@ navigation to the visible, focused Checks tab.
    Test redaction and malformed wire values as well as successful display.
 
 The advisor suggestion is required and nullable in the current wire and durable
-envelope. Following the repository's no-compatibility policy, old blocked
-envelopes without this field fail validation rather than being silently
-defaulted. No migration or shared database reset is part of this task. This
-format change must be called out in deployment evidence.
+envelope. Session schema epoch 62 rejects earlier stores at startup, before an
+old blocked envelope can fail during reload. This semantic JSON grammar cut
+follows the epoch 24/25 precedent and the repository's no-compatibility policy.
+Deployment requires operator-authorized session store recreation; no migration
+or shared database reset is performed by this task. Landscape remains epoch 42.
 
 Implementation inspection must establish the exact durable owner before
 editing either wire. Any required persistence change uses the existing typed
