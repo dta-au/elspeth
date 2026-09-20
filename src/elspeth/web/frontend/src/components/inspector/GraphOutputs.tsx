@@ -96,7 +96,7 @@ function policyRows(state: CompositionState): PolicyRow[] {
     name: output.name,
     plugin: output.plugin,
     binding: pluginBindingLabel(output.plugin, output.options),
-    success: ["Row sunk"],
+    success: ["Row written"],
     condition: "Row write fails",
     action: failureAction(output.on_write_failure, destinationName, output.name),
   }));
@@ -107,11 +107,13 @@ export function GraphOutputs({ state }: { state: CompositionState }): JSX.Elemen
   const rows = policyRows(state);
   return (
     <details className="graph-detail-table" open>
-      <summary>Outputs ({rows.length})</summary>
-      <div className="graph-detail-table-scroll">
+      {/* Routing vocabulary throughout: "Output" is a row KIND here (a sink),
+          so it cannot also name the section and its columns. */}
+      <summary>Routing ({rows.length})</summary>
+      <div className="graph-detail-table-scroll" tabIndex={0} role="group" aria-label="Routing table">
         <table>
           <thead>
-            <tr><th scope="col">Node</th><th scope="col">Success output</th><th scope="col">Failure output</th></tr>
+            <tr><th scope="col">Component</th><th scope="col">On success</th><th scope="col">On failure</th></tr>
           </thead>
           <tbody>
             {rows.map((row) => (

@@ -10,9 +10,8 @@ import { Button } from "@/components/ui";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ToolCallCard } from "./ToolCallCard";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
+import { PENDING_REVIEW_NOTICE } from "./pendingReviewNotice";
 
-const PENDING_REVIEW_NOTICE =
-  "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue.";
 
 interface MessageBubbleProps {
   message: ChatMessage;

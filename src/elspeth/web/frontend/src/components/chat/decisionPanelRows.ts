@@ -56,6 +56,8 @@ export type DecisionRow =
       kind: "blocker";
       id: string;
       code: string;
+      /** The step the blocker names, or null for a session-scoped blocker. */
+      componentId: string | null;
       detail: string;
       suggestion: string | null;
     }
@@ -149,6 +151,7 @@ export function projectDecisionRows(input: DecisionRowsInput): DecisionRows {
         kind: "blocker",
         id: decisionId("blocker", [blocker.code, blocker.component_id, blocker.detail, blocker.suggestion]),
         code: blocker.code,
+        componentId: blocker.component_id,
         detail: blocker.detail,
         suggestion: blocker.suggestion,
       });

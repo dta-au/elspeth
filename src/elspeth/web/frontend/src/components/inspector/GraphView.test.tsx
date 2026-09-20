@@ -343,12 +343,12 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const policies = screen.getByText("Outputs (3)").closest("details");
+    const policies = screen.getByText("Routing (3)").closest("details");
     expect(policies).toHaveAttribute("open");
     const table = within(policies as HTMLElement).getByRole("table");
-    expect(within(table).getByRole("columnheader", { name: "Node" })).toBeInTheDocument();
-    expect(within(table).getByRole("columnheader", { name: "Success output" })).toBeInTheDocument();
-    expect(within(table).getByRole("columnheader", { name: "Failure output" })).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "Component" })).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "On success" })).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "On failure" })).toBeInTheDocument();
     expect(within(table).getByText("llm")).toHaveClass("graph-output-detail");
     expect(within(table).getByText("profile sonnet")).toHaveClass("graph-output-detail");
     expect(within(table).getByRole("row", { name: /Source: source/ })).toHaveTextContent(
@@ -358,7 +358,7 @@ describe("GraphView", () => {
       "profile sonnetSend to resultsRow processing failsSend to quarantine (not connected)",
     );
     expect(within(table).getByRole("row", { name: /Output: results/ })).toHaveTextContent(
-      "Row sunkRow write failsDiscard row (audit recorded)",
+      "Row writtenRow write failsDiscard row (audit recorded)",
     );
   });
 
@@ -399,7 +399,7 @@ describe("GraphView", () => {
 
     render(<GraphView />);
     const approvals = screen.getByText("Approvals (3)").closest("details") as HTMLDetailsElement;
-    const failures = screen.getByText("Outputs (1)").closest("details") as HTMLDetailsElement;
+    const failures = screen.getByText("Routing (1)").closest("details") as HTMLDetailsElement;
     expect(approvals.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(approvals.open).toBe(false);
     expect(failures.open).toBe(true);
@@ -415,9 +415,30 @@ describe("GraphView", () => {
     expect(within(table).getAllByRole("time")).toHaveLength(3);
     expect(within(table).getAllByRole("time")[0]).toHaveAttribute("datetime", approved.resolved_at);
     expect(within(table).getAllByRole("row")).toHaveLength(4);
-    await user.click(screen.getByText("Outputs (1)"));
+    await user.click(screen.getByText("Routing (1)"));
     expect(approvals.open).toBe(true);
     expect(failures.open).toBe(false);
+  });
+
+  it("keeps the graph and the routing table when an approval is malformed (L9)", () => {
+    const malformed = {
+      id: "approval-bad", session_id: "session-1", composition_state_id: "state-1",
+      affected_node_id: "classify", tool_call_id: "tool-1", user_term: "category",
+      kind: "vague_term", llm_draft: "initial definitions",
+      accepted_value: null, choice: "amended",
+      created_at: "2026-09-20T07:23:00Z", resolved_at: "2026-09-20T07:24:00Z",
+    } as unknown as InterpretationEvent;
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode()] }) });
+    useInterpretationEventsStore.setState({ resolvedBySession: { "session-1": [malformed] } });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      render(<GraphView />);
+    } finally {
+      consoleError.mockRestore();
+    }
+    // Fail closed, in the table that owns the failure — not the whole tab.
+    expect(screen.getByRole("alert")).toHaveTextContent("Approvals table encountered an error");
+    expect(screen.getByText("Routing (1)")).toBeInTheDocument();
   });
 
   it("renders a pending proposal pill when proposal affects graph", () => {

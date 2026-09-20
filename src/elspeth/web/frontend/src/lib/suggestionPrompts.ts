@@ -23,6 +23,21 @@
 
 import type { ValidationEntryDTO } from "@/types/index";
 
+/**
+ * The DRAFT a blocker row's "Ask the composer about this" places in the chat
+ * input (ruling D4, 2026-09-20). It is never sent by the click: the user
+ * reads it, edits it and sends it, so the planner answers an ordinary user
+ * turn. It asks; it does not say "fix" — a blocker carries no server-vetted
+ * remedy, and some (an operator-held endpoint policy) cannot be cleared by
+ * any pipeline edit. The blocker text is a block quotation because it can
+ * carry user-authored step names.
+ */
+export function askAboutBlockerDraft(detail: string, stepPhrase: string | null): string {
+  const subject = stepPhrase === null ? "this" : `this on ${stepPhrase}`;
+  const quoted = detail.split("\n").map((line) => `> ${line}`).join("\n");
+  return `I'm blocked by ${subject}:\n\n${quoted}\n\nWhat does it mean, and what are my options?`;
+}
+
 /** The canonical "apply this validator suggestion" chat prompt. */
 export function applySuggestionPrompt(suggestion: ValidationEntryDTO): string {
   return `Please apply this suggestion to the pipeline:\n\n**${suggestion.component}:** ${suggestion.message}`;

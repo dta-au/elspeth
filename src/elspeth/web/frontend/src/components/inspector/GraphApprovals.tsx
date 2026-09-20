@@ -62,7 +62,9 @@ export function GraphApprovals({
   return (
     <details className="graph-detail-table">
       <summary>Approvals ({events.length})</summary>
-      <div className="graph-detail-table-scroll">
+      {/* Scrolls, and need not contain a focusable control: keyboard-focusable
+          by the same WCAG 2.1.1 ruling as the chat dock (chat.css). */}
+      <div className="graph-detail-table-scroll" tabIndex={0} role="group" aria-label="Approvals table">
         <table>
           <thead>
             <tr>
@@ -99,9 +101,12 @@ export function GraphApprovals({
                     {name}
                     {nodeName && <> for <code>{nodeName}</code></>}
                     {component?.plugin && <span className="graph-output-detail">{component.plugin}</span>}
+                    {/* The binding is the step's configuration NOW; the value
+                        beside it was approved THEN. Said in words, not in a
+                        hover title (hover-only disclosure ruled out 2026-09-13). */}
                     {binding && (
-                      <span className="graph-output-detail" title="Current node configuration">
-                        {binding}
+                      <span className="graph-output-detail">
+                        {`Now: ${binding}`}
                       </span>
                     )}
                   </th>

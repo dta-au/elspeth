@@ -10576,10 +10576,30 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     const log = screen.getByRole("log", { name: "Conversation" });
     expect(log.contains(panel)).toBe(false);
 
-    fireEvent.click(within(panel).getByRole("button", { name: /^Apply suggestion/ }));
+    fireEvent.click(within(panel).getByRole("button", { name: /^Apply optional suggestion/ }));
     expect(useComposer().sendMessage).toHaveBeenCalledExactlyOnceWith(
       "Please apply this suggestion to the pipeline:\n\n**pipeline:** Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
     );
+  });
+
+  it("Ask the composer about a blocker drafts a question into the input and sends nothing (D4)", async () => {
+    useExecutionStore.setState({ validationResult: withheldValidation() });
+    render(<ChatPanel />);
+    const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
+    const ask = within(panel).getByRole("button", { name: /^Ask the composer about this: Completion advisory review/ });
+
+    fireEvent.click(ask);
+
+    // ChatInput is mocked here; it mirrors the controlled value it is given.
+    const draft = (): string => screen.getByTestId("chat-input").getAttribute("data-value") ?? "";
+    await waitFor(() => expect(draft()).toContain(
+      "> Completion advisory review did not clear after the available attempts.",
+    ));
+    expect(draft()).toMatch(/What does it mean, and what are my options\?$/);
+    expect(useComposer().sendMessage).not.toHaveBeenCalled();
+    // The draft is now text the click would replace: Ask closes, visibly.
+    expect(ask).toBeDisabled();
+    expect(within(panel).getByText("Send or clear your draft before asking about a blocker.")).toBeInTheDocument();
   });
 
   it("Open checks requests the Checks artifact tab for the active session", () => {
@@ -10603,7 +10623,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     useSessionStore.setState({ composeTimeoutReady: false });
     render(<ChatPanel />);
     const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
-    expect(within(panel).getByRole("button", { name: /^Apply suggestion/ })).toBeDisabled();
+    expect(within(panel).getByRole("button", { name: /^Apply optional suggestion/ })).toBeDisabled();
     expect(within(panel).getByRole("status")).toHaveTextContent(COMPOSE_CONNECTING_MESSAGE);
   });
 
@@ -10623,7 +10643,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     render(<ChatPanel />);
     const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
     expect(within(panel).getByText("Save for review is blocked. Run pipeline is still available.")).toBeInTheDocument();
-    const apply = within(panel).getByRole("button", { name: /^Apply suggestion/ });
+    const apply = within(panel).getByRole("button", { name: /^Apply optional suggestion/ });
     expect(apply).toBeDisabled();
     expect(within(panel).getByRole("status")).toHaveTextContent(
       "Pipeline suggestions can be applied in the freeform editor.",
@@ -10643,7 +10663,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
       reviewed_components: { sources: [], outputs: [] }, profile: null,
     }});
     render(<ChatPanel />);
-    const apply = within(screen.getByTestId("decision-panel")).getByRole("button", { name: /^Apply suggestion/ });
+    const apply = within(screen.getByTestId("decision-panel")).getByRole("button", { name: /^Apply optional suggestion/ });
     expect(apply).toBeEnabled();
     fireEvent.click(apply);
     expect(useComposer().sendMessage).toHaveBeenCalledOnce();
@@ -10660,7 +10680,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     });
     render(<ChatPanel />);
     const panel = screen.getByTestId("decision-panel");
-    const apply = within(panel).getByRole("button", { name: /^Apply suggestion/ });
+    const apply = within(panel).getByRole("button", { name: /^Apply optional suggestion/ });
     expect(apply).toBeDisabled();
     fireEvent.click(apply);
     expect(useComposer().sendMessage).not.toHaveBeenCalled();

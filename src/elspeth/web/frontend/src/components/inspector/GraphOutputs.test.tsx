@@ -28,7 +28,7 @@ describe("GraphOutputs", () => {
 
     render(<GraphOutputs state={state} />);
 
-    expect(screen.getByText("Outputs (3)")).toBeInTheDocument();
+    expect(screen.getByText("Routing (3)")).toBeInTheDocument();
     const gate = screen.getByRole("row", { name: /Gate: filter/ });
     expect(gate).toHaveTextContent("accepted: Fork to combined, combined");
     expect(gate).toHaveTextContent("rejected: Discard row (audit recorded)");
@@ -81,7 +81,7 @@ describe("GraphOutputs", () => {
     const summarize = screen.getByRole("row", { name: /Transform: summarize/ });
     expect(summarize).toHaveTextContent("Send to unbound (not connected)");
     const output = screen.getByRole("row", { name: /Output: results/ });
-    expect(within(output).getByText("Row sunk")).toBeInTheDocument();
+    expect(within(output).getByText("Row written")).toBeInTheDocument();
     expect(output).toHaveTextContent("Send to invalid");
   });
 });

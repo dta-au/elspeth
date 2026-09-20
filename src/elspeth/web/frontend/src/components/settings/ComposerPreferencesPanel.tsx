@@ -115,6 +115,11 @@ export function ComposerPreferencesForm({
           />
           <span>Guided</span>
         </label>
+        {/* The only way into guided mode (ruling D1): say how it takes effect,
+            or a user in a Freeform session picks Guided and sees no change. */}
+        <p className="composer-preferences-hint">
+          Applies to sessions you start from now on. To use a different mode, start a new session.
+        </p>
       </fieldset>
       <fieldset className="composer-preferences-fieldset">
         <legend className="composer-preferences-legend">Theme</legend>

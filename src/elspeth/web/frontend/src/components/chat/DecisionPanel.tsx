@@ -21,7 +21,14 @@
 //
 // Contract (test-pinned, InlineSourceFallbackPrompt style):
 //   * root is `<section role="region" aria-label="Awaiting your decision (N)">`;
-//   * Apply buttons are named `Apply suggestion: <humanised text>`;
+//   * Apply buttons are named `Apply optional suggestion: <humanised text>`
+//     and the row says "Optional" in visible text. Observed live (session
+//     46224626): with Run blocked by a policy no edit could clear, Apply was
+//     the only button in the box and read as the fix. A suggestion never
+//     clears a block by itself, and the row must say so;
+//   * a blocker row offers `Ask the composer about this: <detail>`, which
+//     DRAFTS a question into the chat input and sends nothing (ruling D4).
+//     It is not a fix button: a blocker has no server-vetted remedy text;
 //   * `Open checks` always renders. The workspace handles the view intent by
 //     revealing Pipeline on narrow screens, then selecting and focusing Checks.
 //   * no tool or API vocabulary in visible copy (F-3).
@@ -53,7 +60,8 @@ export interface DecisionPanelProps {
   proposals: CompositionProposal[];
   staleProposalIds: string[];
   proposalActionPendingIds: string[];
-  /** A compose is in flight: Apply reads "Applying..." like the side rail. */
+  /** A compose is in flight. Only the row whose Apply started it reads
+   *  "Applying..."; the rest stay "Apply", disabled. */
   isComposing: boolean;
   /** Apply is held closed (composing, or the compose wall-clock has not
    *  landed at boot — the bootstrap race the side rail's SuggestionList
@@ -64,6 +72,12 @@ export interface DecisionPanelProps {
   phraseFor: (componentId: string | null) => string;
   stepLabelFor: (componentId: string) => string | null;
   onApplySuggestion: (suggestion: ValidationEntryDTO) => void;
+  /** Draft a question about a blocker into the chat input. Undefined where
+   *  there is no freeform input to draft into: the button is not rendered. */
+  onAskAboutBlocker?: (detail: string, componentId: string | null) => void;
+  /** Visible reason Ask is held closed (the input already holds a draft the
+   *  click would replace), or null while it is open. */
+  askDisabledReason?: string | null;
   onOpenChecks: () => void;
   interpretationContent?: ReactNode;
   renderSourceFallback?: (candidateText: string) => ReactNode;
@@ -141,6 +155,8 @@ export function DecisionPanel({
   phraseFor,
   stepLabelFor,
   onApplySuggestion,
+  onAskAboutBlocker,
+  askDisabledReason = null,
   onOpenChecks,
   interpretationContent,
   renderSourceFallback,
@@ -149,6 +165,12 @@ export function DecisionPanel({
   onRejectProposal,
 }: DecisionPanelProps): JSX.Element | null {
   const [rejectConfirmId, setRejectConfirmId] = useState<string | null>(null);
+  // The row whose Apply started the compose in flight; a typed turn leaves it
+  // null, so no row claims a compose it did not start.
+  const [applyingRowId, setApplyingRowId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isComposing) setApplyingRowId(null);
+  }, [isComposing]);
   const panelRef = useRef<HTMLElement>(null);
   const focusedElement = useRef<HTMLElement | null>(null);
   useLayoutEffect(() => {
@@ -174,6 +196,7 @@ export function DecisionPanel({
   const listRows = rows.filter((row) => row.kind !== "pending_interpretation");
   const gateReason = !isComposing && applyDisabled ? applyDisabledReason : null;
   const title = `Awaiting your decision (${count})`;
+  const suggestionCount = listRows.filter((row) => row.kind === "suggestion").length;
 
   return (
     <section
@@ -202,17 +225,34 @@ export function DecisionPanel({
           {listRows.map((row) => (
             <li key={row.id} className={`decision-panel-item decision-panel-item--${row.kind}`}>
               {row.kind === "blocker" && (
-                <span className="decision-panel-item-text">{row.detail}{row.suggestion !== null && <> {row.suggestion}</>}</span>
+                <>
+                  <span className="decision-panel-item-text">{row.detail}{row.suggestion !== null && <> {row.suggestion}</>}</span>
+                  {onAskAboutBlocker !== undefined && (
+                    <Button
+                      compact
+                      className="decision-panel-ask-btn"
+                      disabled={askDisabledReason !== null}
+                      aria-label={`Ask the composer about this: ${row.detail}`}
+                      onClick={() => onAskAboutBlocker(row.detail, row.componentId)}
+                    >
+                      Ask the composer about this
+                    </Button>
+                  )}
+                </>
               )}
               {row.kind === "suggestion" && (
                 <SuggestionItem
                   suggestion={row.suggestion}
                   phraseFor={phraseFor}
                   stepLabelFor={stepLabelFor}
-                  isComposing={isComposing}
+                  applying={isComposing && applyingRowId === row.id}
+                  prominent={suggestionCount === 1}
                   applyDisabled={applyDisabled}
                   gateReason={gateReason}
-                  onApply={onApplySuggestion}
+                  onApply={(suggestion) => {
+                    setApplyingRowId(row.id);
+                    onApplySuggestion(suggestion);
+                  }}
                 />
               )}
               {row.kind === "pending_proposal" && actionable.filter((proposal) => proposal.id === row.proposalId).map((proposal) => (
@@ -228,6 +268,11 @@ export function DecisionPanel({
             </li>
           ))}
         </ul>
+      )}
+      {askDisabledReason !== null && onAskAboutBlocker !== undefined && listRows.some((row) => row.kind === "blocker") && (
+        <div role="status" className="decision-panel-gate">
+          {askDisabledReason}
+        </div>
       )}
       {interpretationContent}
       {rejectTarget && (
@@ -277,7 +322,12 @@ interface SuggestionItemProps {
   suggestion: ValidationEntryDTO;
   phraseFor: (componentId: string | null) => string;
   stepLabelFor: (componentId: string) => string | null;
-  isComposing: boolean;
+  /** This row's Apply started the compose in flight. */
+  applying: boolean;
+  /** The only suggestion listed: primary. Several: secondary, so the panel
+   *  is not a column of primaries. Never bare — the 2026-09-13 ruling is
+   *  that the fix affordance must not be the quietest thing in the box. */
+  prominent: boolean;
   applyDisabled: boolean;
   gateReason: string | null;
   onApply: (suggestion: ValidationEntryDTO) => void;
@@ -287,7 +337,8 @@ function SuggestionItem({
   suggestion,
   phraseFor,
   stepLabelFor,
-  isComposing,
+  applying,
+  prominent,
   applyDisabled,
   gateReason,
   onApply,
@@ -297,20 +348,22 @@ function SuggestionItem({
   return (
     <>
       <span className="decision-panel-item-text">
+        <span className="decision-panel-optional">Optional</span>{" "}
         <strong>{phrase}:</strong> {finding.headline}
       </span>
       <Button
-        variant="bare"
+        compact
+        variant={prominent ? "primary" : "secondary"}
         className="decision-panel-apply-btn"
         disabled={applyDisabled}
         title={gateReason ?? undefined}
-        aria-label={`Apply suggestion: ${phrase}: ${finding.headline}`}
+        aria-label={`Apply optional suggestion: ${phrase}: ${finding.headline}`}
         onClick={() => {
           if (applyDisabled) return;
           onApply(suggestion);
         }}
       >
-        {isComposing ? "Applying..." : "Apply"}
+        {applying ? "Applying..." : "Apply"}
       </Button>
     </>
   );

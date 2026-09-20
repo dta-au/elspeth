@@ -89,7 +89,7 @@ import {
 import { DecisionPanel, DecisionPanelLiveRegion } from "./DecisionPanel";
 import { projectDecisionRows } from "./decisionPanelRows";
 import { useExecutionStore } from "@/stores/executionStore";
-import { applySuggestionPrompt } from "@/lib/suggestionPrompts";
+import { applySuggestionPrompt, askAboutBlockerDraft } from "@/lib/suggestionPrompts";
 import { dispatchArtifactViewIntent } from "@/lib/composer-events";
 import {
   COMPOSE_CONNECTING_MESSAGE,
@@ -2094,6 +2094,22 @@ export function ChatPanel({
     },
     [sendMessage],
   );
+  // Ruling D4: a blocker row DRAFTS a question; the user sends it. ChatPanel
+  // owns the freeform draft, so it sets it directly (the catalog's prefill
+  // event exists for surfaces that do not). The draft REPLACES the input, so
+  // the button is held closed while the input holds text the user typed.
+  // Freeform only: guided chat is step-scoped and its input can be a locked
+  // tutorial prompt.
+  const handleAskAboutBlocker = useCallback(
+    (detail: string, componentId: string | null) => {
+      const stepPhrase = componentId === null ? null : decisionPhraseFor(componentId);
+      setInputText(askAboutBlockerDraft(detail, stepPhrase));
+      queueMicrotask(() => inputRef.current?.focus());
+    },
+    [decisionPhraseFor, setInputText],
+  );
+  const decisionAskDisabledReason =
+    inputText.trim() === "" ? null : "Send or clear your draft before asking about a blocker.";
   const handleOpenChecks = useCallback(() => {
     dispatchArtifactViewIntent({
       tab: "checks",
@@ -2338,6 +2354,8 @@ export function ChatPanel({
         phraseFor={decisionPhraseFor}
         stepLabelFor={decisionStepLabelFor}
         onApplySuggestion={handleApplySuggestion}
+        onAskAboutBlocker={guidedDecisionMode ? undefined : handleAskAboutBlocker}
+        askDisabledReason={decisionAskDisabledReason}
         onOpenChecks={handleOpenChecks}
         onAcceptProposal={acceptProposal}
         onRejectProposal={rejectProposal}

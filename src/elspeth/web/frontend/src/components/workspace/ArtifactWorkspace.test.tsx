@@ -551,6 +551,7 @@ describe("ArtifactWorkspace", () => {
               kind: "blocker",
               id: "blocked",
               code: "advisor",
+              componentId: null,
               detail: "Review is required.",
               suggestion: null,
             }]}
