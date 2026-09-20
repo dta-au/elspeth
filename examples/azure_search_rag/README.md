@@ -67,7 +67,7 @@ provider_config:
   endpoint: https://<service>.search.windows.net
   index: <index>
   use_managed_identity: true
-  managed_identity_client_id: <client id>   # user-assigned identity; omit for system-assigned
+  client_id: <client id>   # user-assigned identity; omit for system-assigned
 ```
 
 The identity needs the `Search Index Data Reader` role on the search service,

@@ -1226,7 +1226,7 @@ class TestManagedIdentityCredentialClass:
         provider = _provider(
             api_key=None,
             use_managed_identity=True,
-            managed_identity_client_id="11111111-2222-3333-4444-555555555555",
+            client_id="11111111-2222-3333-4444-555555555555",
         )
         credential = _FakeAzureCredential()
         with (
@@ -1244,10 +1244,10 @@ class TestManagedIdentityCredentialClass:
         mi_cls.assert_called_once_with()
 
     def test_client_id_requires_managed_identity(self):
-        with pytest.raises(ValueError, match="managed_identity_client_id"):
+        with pytest.raises(ValueError, match="client_id requires use_managed_identity"):
             AzureSearchProviderConfig(
                 endpoint="https://test.search.windows.net",
                 index="i",
                 api_key="k",
-                managed_identity_client_id="abc",
+                client_id="abc",
             )

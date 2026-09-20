@@ -408,10 +408,10 @@ az search service update --name "$SEARCH_SERVICE_NAME" --resource-group "$SEARCH
 az role assignment create --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
   --assignee-principal-type ServicePrincipal \
   --role 'Search Index Data Reader' --scope "$SEARCH_RESOURCE_ID" --output none
-printf 'managed_identity_client_id: %s\n' "$IDENTITY_CLIENT_ID"
+printf 'client_id: %s\n' "$IDENTITY_CLIENT_ID"
 ```
 
-A pipeline then names the identity explicitly. `managed_identity_client_id` is
+A pipeline then names the identity explicitly. `client_id` is
 required here: the identity is user-assigned, and the provider uses
 `ManagedIdentityCredential`, which does not read `AZURE_CLIENT_ID` on Container
 Apps.
@@ -422,7 +422,7 @@ provider_config:
   endpoint: https://<service>.search.windows.net
   index: <index>
   use_managed_identity: true
-  managed_identity_client_id: <identityClientId>
+  client_id: <identityClientId>
   search_mode: hybrid
 ```
 

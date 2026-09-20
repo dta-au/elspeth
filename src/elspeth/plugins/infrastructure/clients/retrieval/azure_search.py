@@ -83,7 +83,7 @@ class AzureSearchProviderConfig(BaseModel):
 
     # Client id of a user-assigned managed identity; unset selects the
     # system-assigned identity.
-    managed_identity_client_id: str | None = None
+    client_id: str | None = None
 
     @field_validator("content_field", "id_field", "title_field", "url_field", "vector_field")
     @classmethod
@@ -174,8 +174,8 @@ class AzureSearchProviderConfig(BaseModel):
         inferred_mode: AzureSearchAuthMode = "managed_identity" if self.use_managed_identity else "api_key"
         if self.auth_mode is not None and self.auth_mode != inferred_mode:
             raise ValueError(f"auth_mode {self.auth_mode!r} does not match configured authentication method {inferred_mode!r}")
-        if self.managed_identity_client_id is not None and not self.use_managed_identity:
-            raise ValueError("managed_identity_client_id requires use_managed_identity=true")
+        if self.client_id is not None and not self.use_managed_identity:
+            raise ValueError("client_id requires use_managed_identity=true")
         object.__setattr__(self, "auth_mode", inferred_mode)
         return self
 
@@ -299,7 +299,7 @@ class AzureSearchProvider:
                     "Install elspeth with the 'azure' extra or use api_key authentication.",
                     retryable=False,
                 ) from exc
-            client_id = self._config.managed_identity_client_id
+            client_id = self._config.client_id
             credential = ManagedIdentityCredential(client_id=client_id) if client_id is not None else ManagedIdentityCredential()
             self._managed_identity_credential = cast(_ManagedIdentityCredential, credential)
         return self._managed_identity_credential
