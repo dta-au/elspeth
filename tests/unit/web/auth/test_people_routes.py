@@ -298,6 +298,38 @@ async def test_setting_access_up_moves_a_person_to_their_identity_key(tmp_path) 
         assert after["local_account"]["username"] == "jane"
 
 
+async def test_a_label_borrows_the_linked_account_name_only_where_nothing_is_withheld(tmp_path) -> None:
+    harness = _build(tmp_path)
+    _make_both(harness)
+    async with _client(harness.app) as client:
+        headers = await _bearer(client, "devadmin")
+        prepared = await client.post(
+            "/api/auth/admin/identities",
+            headers=headers,
+            json={"provider": "local", "subject": "jane", "username": "jane", "role": "user", "note": "set up access"},
+        )
+        jane_id = prepared.json()["identity"]["identity_id"]
+        # ``nobody`` has an account named "No Body" and a NEVER-ADMITTED pending identity.
+        pending_id = _admit(harness.authority, _claims("nobody"), activate=False)
+
+        labels = {
+            label["identity_id"]: label
+            for label in (
+                await client.get(f"/api/auth/admin/people/labels?identity_id={jane_id}&identity_id={pending_id}", headers=headers)
+            ).json()["labels"]
+        }
+        # Prepared ahead of first sign-in: no profile yet, so the account names her.
+        assert labels[jane_id]["label"] == "Jane Doe"
+        # Withheld on purpose: the account must not put the name back.
+        assert labels[pending_id]["label"] == "nobody"
+        assert "No Body" not in str(labels[pending_id])
+
+        # An identity-only caller is never shown an account-sourced name.
+        root_headers = await _bearer(client, "root")
+        root_view = (await client.get(f"/api/auth/admin/people/labels?identity_id={jane_id}", headers=root_headers)).json()["labels"][0]
+        assert root_view["label"] == "jane"
+
+
 async def test_a_recycled_username_keeps_its_retired_history_separate(tmp_path) -> None:
     harness = _build(tmp_path)
     _make_both(harness)

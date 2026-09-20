@@ -228,10 +228,19 @@ def _local_person(account: LocalUserAccount, *, identities_visible: bool, user: 
     )
 
 
-def _person_label(summary: IdentitySummary) -> PersonLabel:
-    """Named from the SAME projection the directory shows, so a label cannot reveal what a row withholds."""
+def _person_label(summary: IdentitySummary, *, account: LocalUserAccount | None) -> PersonLabel:
+    """Named from the SAME projection the directory shows, so a label cannot reveal what a row withholds.
+
+    An identity prepared ahead of its first sign-in has no profile yet, so the
+    linked local account's name fills that gap -- for a caller who may read
+    accounts, and NEVER for a never-admitted pending row. That row's profile
+    is withheld on purpose (the projection blanks its ``username``), and a
+    separately authorized source must not put back what it left out.
+    """
     view = _identity_view(summary)
     shown_name = view.display_name.strip() if view.display_name is not None else ""
+    if not shown_name and account is not None and view.username is not None:
+        shown_name = account.display_name.strip()
     label = shown_name or view.username or view.subject
     secondary = view.username if (view.username is not None and view.username != label) else view.subject
     return PersonLabel(
@@ -370,8 +379,13 @@ def create_people_router() -> APIRouter:
             summaries = await run_sync_in_worker(_authority(request).read_identity_summaries, identity_ids=wanted)
         except SQLAlchemyError as exc:
             raise _source_unavailable("identities") from exc
+        by_username = (
+            {account.user_id: account for account in await _all_local_accounts(request)}
+            if capabilities.local_accounts and any(summary.provider == "local" for summary in summaries)
+            else {}
+        )
         _uncacheable(response)
-        return PersonLabelsResponse(labels=[_person_label(summary) for summary in summaries])
+        return PersonLabelsResponse(labels=[_person_label(summary, account=_linked_account(by_username, summary)) for summary in summaries])
 
     @router.get("/identity/{identity_id}", response_model=PersonResponse)
     async def read_identity_person(request: Request, response: Response, identity_id: str) -> PersonResponse:
