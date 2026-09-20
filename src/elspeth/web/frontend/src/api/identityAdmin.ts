@@ -56,6 +56,8 @@ export function listIdentities(accessState: IdentityAccessState, offset = 0, lim
 export function preProvisionIdentity(body: {
   provider: HumanProvisionProvider;
   subject: string;
+  /** Set when the username is known ahead of the first login (a local account). */
+  username?: string;
   organisation_id?: string;
   role: ActivationRole;
   note: string;

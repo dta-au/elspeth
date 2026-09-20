@@ -1,68 +1,129 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import * as admin from "@/api/identityAdmin";
+import { isAbort } from "@/api/people";
 import { Button, Input } from "@/components/ui";
 import type { IdentityRole, RoleView } from "@/types/identityAdmin";
+import { MutationNoticeView } from "./MutationNoticeView";
+import { ROLE_LABEL, ROLE_PURPOSE, formatInstant, localInputToUtcIso, roleConflictAdvice, viewerTimeZone } from "./peopleFormat";
+import { useCancelToTrigger, usePersonMutation, useSubview } from "./peoplePanel";
 
-const ROLES: IdentityRole[] = ["admin", "approver", "reviewer", "user", "curator", "auditor", "oversight"];
+const ROLES: IdentityRole[] = ["user", "approver", "reviewer", "curator", "auditor", "oversight", "admin"];
 
-export function RolesEditor(): JSX.Element {
-  const [filterDraft, setFilterDraft] = useState("");
-  const [filter, setFilter] = useState<string | null>(null);
-  const [offset, setOffset] = useState(0);
-  const [rows, setRows] = useState<RoleView[] | null>(null);
-  const [identityId, setIdentityId] = useState("");
-  const [role, setRole] = useState<IdentityRole>("user");
+type Form = { type: "grant" } | { type: "revoke"; grant: RoleView } | null;
+
+interface Props {
+  identityId: string;
+  personName: string;
+  kind: "human" | "service";
+}
+
+/**
+ * One person's role grants. The identity is bound by the panel: nobody types
+ * an identity ID here. Roles are a SET of grants, each revoked on its own;
+ * there is deliberately no "change role" control, because a swap is two
+ * writes with two outcomes and one dropdown would hide the second.
+ */
+export function RolesEditor({ identityId, personName, kind }: Props): JSX.Element {
+  const [grants, setGrants] = useState<RoleView[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [form, setForm] = useState<Form>(null);
+  const [role, setRole] = useState<IdentityRole>(kind === "service" ? "oversight" : "user");
   const [expiry, setExpiry] = useState("");
   const [note, setNote] = useState("");
-  const [confirmRevoke, setConfirmRevoke] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const expiryHintId = useId();
+  const adviceId = useId();
 
   const reload = useCallback(async () => {
-    const result = await admin.listRoles(filter, offset);
-    setRows(result.roles);
-  }, [filter, offset]);
+    const result = await admin.listRoles(identityId);
+    setGrants(result.roles);
+    setLoadError(null);
+  }, [identityId]);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     let active = true;
-    void admin.listRoles(filter, offset).then(
-      (result) => { if (active) { setRows(result.roles); setError(null); } },
-      (err: unknown) => { if (active) setError(admin.adminErrorMessage(err, "Could not load roles")); },
+    setGrants(null);
+    setLoadError(null);
+    void admin.listRoles(identityId).then(
+      (result) => { if (active) setGrants(result.roles); },
+      (error: unknown) => { if (active && !isAbort(error)) setLoadError(admin.adminErrorMessage(error, "Could not load roles")); },
     );
     return () => { active = false; };
-  }, [filter, offset]);
+  }, [identityId]);
+  useEffect(() => load(), [load]);
 
-  async function run(action: () => Promise<unknown>): Promise<void> {
-    setBusy(true);
-    setError(null);
-    try { await action(); setConfirmRevoke(null); await reload(); }
-    catch (err) { setError(admin.adminErrorMessage(err, "Role change failed")); }
-    finally { setBusy(false); }
-  }
+  const mutation = usePersonMutation(reload);
+  const closeForm = useCallback(() => { setForm(null); setExpiry(""); setNote(""); }, []);
+  const { triggerRef, cancel } = useCancelToTrigger<HTMLButtonElement>(closeForm);
+  useSubview(`roles:${identityId}`, form !== null, form?.type === "grant" && (expiry !== "" || note.trim() !== ""), cancel);
 
-  return <section aria-label="Roles" className="identity-admin-section">
-    {error !== null && <p role="alert" className="composer-preferences-error">{error}</p>}
-    <form className="identity-admin-toolbar" onSubmit={(event) => { event.preventDefault(); setFilter(filterDraft.trim() || null); setOffset(0); setRows(null); }}>
-      <Input label="Filter by identity ID" value={filterDraft} disabled={busy} onChange={(event) => setFilterDraft(event.target.value)} />
-      <Button type="submit" compact disabled={busy}>Apply filter</Button>
-      <span>Page {Math.floor(offset / admin.ADMIN_PAGE_SIZE) + 1}</span>
-      <Button compact disabled={busy || offset === 0} onClick={() => setOffset(Math.max(0, offset - admin.ADMIN_PAGE_SIZE))}>Previous</Button>
-      <Button compact disabled={busy || rows === null || rows.length < admin.ADMIN_PAGE_SIZE} onClick={() => setOffset(offset + admin.ADMIN_PAGE_SIZE)}>Next</Button>
-    </form>
-    {rows === null ? <p>Loading roles…</p> : rows.length === 0 ? <p>No active roles on this page.</p> : <div className="identity-admin-table-scroll"><table className="identity-admin-table"><thead><tr><th scope="col">Identity ID</th><th scope="col">Role</th><th scope="col">Scope</th><th scope="col">Expiry</th><th scope="col">Action</th></tr></thead><tbody>{rows.map((row) => <tr key={row.role_id}><td><code>{row.identity_id}</code></td><td>{row.role}</td><td>{row.scope ?? "Deployment"}</td><td>{row.expires_at ?? "—"}</td><td>{confirmRevoke === row.role_id ? <Button compact variant="danger" disabled={busy} onClick={() => void run(() => admin.revokeRole(row.role_id))}>Confirm revoke</Button> : <Button compact disabled={busy} onClick={() => setConfirmRevoke(row.role_id)}>Revoke</Button>}</td></tr>)}</tbody></table></div>}
-    <form className="identity-admin-form" onSubmit={(event) => {
-      event.preventDefault();
-      void run(async () => {
-        await admin.grantRole({ identity_id: identityId.trim(), role, ...(expiry ? { expires_at: new Date(expiry).toISOString() } : {}), ...(note.trim() ? { note: note.trim() } : {}) });
-        setIdentityId(""); setExpiry(""); setNote("");
-      });
-    }}>
-      <h3>Grant deployment-wide role</h3><div className="identity-admin-fields">
-        <Input label="Identity ID" value={identityId} maxLength={64} required onChange={(event) => setIdentityId(event.target.value)} />
-        <label className="identity-admin-field">Role<select className="input" value={role} onChange={(event) => setRole(event.target.value as IdentityRole)}>{ROLES.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
-        <Input label="Expires at (optional)" type="datetime-local" value={expiry} onChange={(event) => setExpiry(event.target.value)} />
-        <Input label="Note (optional)" value={note} maxLength={512} onChange={(event) => setNote(event.target.value)} />
-      </div><Button type="submit" variant="primary" disabled={busy || identityId.trim() === ""}>Grant role</Button>
-    </form>
-  </section>;
+  const held = (grants ?? []).filter((grant) => grant.scope === null).map((grant) => grant.role);
+  const advice = roleConflictAdvice(role, held, kind);
+  const expiryIso = expiry === "" ? null : localInputToUtcIso(expiry);
+  const expiryInPast = expiryIso !== null && new Date(expiryIso).getTime() <= Date.now();
+  const blocked = mutation.busy || mutation.mustReconcile;
+
+  return (
+    <section aria-label={`Roles for ${personName}`} className="people-section">
+      <MutationNoticeView mutation={mutation} />
+      {loadError !== null ? (
+        <div role="alert" className="people-notice people-notice-rejected"><span>{loadError}</span><Button compact onClick={() => load()}>Retry</Button></div>
+      ) : grants === null ? <p>Loading roles…</p> : grants.length === 0 ? (
+        <p>{personName} holds no roles.</p>
+      ) : (
+        <ul className="people-grants">
+          {grants.map((grant) => (
+            <li key={grant.role_id} className="people-grant">
+              <div>
+                <strong>{ROLE_LABEL[grant.role]}</strong>
+                <span className="people-grant-meta"> · {grant.scope === null ? "Deployment-wide" : `Scope: ${grant.scope}`} · {grant.expires_at === null ? "No expiry" : `Expires ${formatInstant(grant.expires_at)}`}</span>
+                <p className="people-grant-purpose">{ROLE_PURPOSE[grant.role]}</p>
+              </div>
+              <Button compact disabled={blocked || form !== null} aria-label={`Revoke ${ROLE_LABEL[grant.role]} from ${personName}`} onClick={() => { mutation.clear(); setForm({ type: "revoke", grant }); }}>Revoke</Button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {form === null && grants !== null && <div><Button ref={triggerRef} disabled={blocked} onClick={() => { mutation.clear(); setForm({ type: "grant" }); }}>Add role</Button></div>}
+
+      {form?.type === "revoke" && (
+        <form className="identity-admin-form" onSubmit={(event) => {
+          event.preventDefault();
+          const target = form.grant;
+          void mutation.run(() => admin.revokeRole(target.role_id, note.trim() || undefined), `Revoked ${ROLE_LABEL[target.role]} from ${personName}.`, "Role was not revoked").then((ok) => { if (ok) closeForm(); });
+        }}>
+          <h4>Revoke {ROLE_LABEL[form.grant.role]} from {personName}?</h4>
+          <p>This removes one grant. {personName}'s other roles are not changed.</p>
+          <Input label="Note (optional)" value={note} maxLength={512} onChange={(event) => setNote(event.target.value)} />
+          <div className="identity-admin-actions"><Button type="submit" variant="danger" disabled={blocked}>Revoke role</Button><Button disabled={mutation.busy} onClick={cancel}>Cancel</Button></div>
+        </form>
+      )}
+
+      {form?.type === "grant" && (
+        <form className="identity-admin-form" onSubmit={(event) => {
+          event.preventDefault();
+          if (expiryInPast || (expiry !== "" && expiryIso === null)) return;
+          void mutation.run(
+            () => admin.grantRole({ identity_id: identityId, role, ...(expiryIso !== null ? { expires_at: expiryIso } : {}), ...(note.trim() ? { note: note.trim() } : {}) }),
+            `Granted ${ROLE_LABEL[role]} to ${personName}.`,
+            "Role was not granted",
+          ).then((ok) => { if (ok) closeForm(); });
+        }}>
+          <h4>Add a deployment-wide role for {personName}</h4>
+          <div className="identity-admin-fields">
+            <label className="identity-admin-field">Role
+              <select className="input" value={role} aria-describedby={adviceId} onChange={(event) => setRole(event.target.value as IdentityRole)}>
+                {ROLES.map((value) => <option key={value} value={value}>{ROLE_LABEL[value]}</option>)}
+              </select>
+            </label>
+            <Input label="Expires (optional)" type="datetime-local" value={expiry} aria-describedby={expiryHintId} aria-invalid={expiryInPast} onChange={(event) => setExpiry(event.target.value)} />
+            <Input label="Note (optional)" value={note} maxLength={512} onChange={(event) => setNote(event.target.value)} />
+          </div>
+          <p id={adviceId} className="people-grant-purpose">{ROLE_PURPOSE[role]}{advice !== null && <strong> {advice}</strong>}</p>
+          <p id={expiryHintId} className="people-grant-purpose">{expiryInPast ? "The expiry must be in the future. " : ""}Expiry is entered in your time zone ({viewerTimeZone()}). Leave it empty for a grant that does not expire.</p>
+          <div className="identity-admin-actions"><Button type="submit" variant="primary" disabled={blocked || expiryInPast}>Grant role</Button><Button disabled={mutation.busy} onClick={cancel}>Cancel</Button></div>
+        </form>
+      )}
+    </section>
+  );
 }

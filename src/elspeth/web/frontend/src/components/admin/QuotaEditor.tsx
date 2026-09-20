@@ -14,13 +14,14 @@ function parseCap(value: string): number | null {
 }
 
 /** Edit one quota dimension; the server preserves the other inside its audit transaction. */
-export function QuotaEditor({ identityId, onSaved }: { identityId: string; onSaved?: (quota: IdentityQuota) => void }): JSX.Element {
+export function QuotaEditor({ identityId, personName, onSaved }: { identityId: string; personName: string; onSaved?: (quota: IdentityQuota) => void }): JSX.Element {
   const [quota, setQuota] = useState<IdentityQuota | null>(null);
   const [dimension, setDimension] = useState<QuotaDimension>("tokens");
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let live = true;
@@ -32,7 +33,7 @@ export function QuotaEditor({ identityId, onSaved }: { identityId: string; onSav
       (failure: unknown) => { if (live) setError(workflowErrorMessage(failure)); },
     );
     return () => { live = false; };
-  }, [identityId]);
+  }, [identityId, attempt]);
 
   const cap = parseCap(value);
 
@@ -54,14 +55,16 @@ export function QuotaEditor({ identityId, onSaved }: { identityId: string; onSav
     }
   }
 
-  return <section className="identity-admin-form" aria-label="Quota">
-    <h3>Quota for {identityId}</h3>
+  return <section className="identity-admin-form" aria-label={`Usage and limits for ${personName}`}>
+    <h4>Usage and limits for {personName}</h4>
+    <p className="people-grant-purpose">A personal cap applies to {personName} alone. A container ceiling is shared by everyone in this deployment and applies even when a personal cap is higher or absent.</p>
     {quota === null && error === null && <p>Loading quota…</p>}
     {quota !== null && <>
       <p>Tokens per day: {quota.tokens_per_day ?? "no cap"} ({quota.tokens_used_today ?? "unknown"} used today; {quota.container_tokens_per_day === null ? "no container ceiling" : `container ceiling ${quota.container_tokens_per_day}`})</p>
       <p>Storage: {quota.storage_bytes === null ? "no cap" : formatBytes(quota.storage_bytes)} ({formatBytes(quota.storage_bytes_used)} used; {quota.container_storage_bytes === null ? "no container ceiling" : `container ceiling ${formatBytes(quota.container_storage_bytes)}`})</p>
     </>}
     {error !== null && <p role="alert" className="composer-preferences-error">{error}</p>}
+    {quota === null && error !== null && <div><Button compact onClick={() => setAttempt((value) => value + 1)}>Retry</Button></div>}
     {saved && <p role="status">Quota updated.</p>}
     <form className="identity-admin-fields" onSubmit={(event) => { event.preventDefault(); void save(); }}>
       <label className="identity-admin-field">Dimension

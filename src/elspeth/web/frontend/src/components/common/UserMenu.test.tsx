@@ -72,7 +72,7 @@ describe("UserMenu", () => {
         <UserMenu
           onOpenSettings={vi.fn()}
           onSignOut={vi.fn()}
-          onOpenUserManagement={vi.fn()}
+          onOpenPeopleAccess={vi.fn()}
         />,
       );
       await userEvent.click(screen.getByRole("button", { name: /account/i }));
@@ -271,45 +271,45 @@ describe("UserMenu dev-admin entry", () => {
     useAuthStore.setState({ user: null });
   });
 
-  it("hides User management when onOpenUserManagement is absent", async () => {
+  it("hides People & access when onOpenPeopleAccess is absent", async () => {
     render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />);
     await userEvent.click(screen.getByRole("button", { name: /account/i }));
     expect(
-      screen.queryByRole("button", { name: /user management/i }),
+      screen.queryByRole("button", { name: /people & access/i }),
     ).not.toBeInTheDocument();
   });
 
-  it("shows User management and invokes the callback, then closes", async () => {
-    const openUserManagement = vi.fn();
+  it("shows People & access and invokes the callback, then closes", async () => {
+    const openPeopleAccess = vi.fn();
     render(
       <UserMenu
         onOpenSettings={vi.fn()}
         onSignOut={vi.fn()}
-        onOpenUserManagement={openUserManagement}
+        onOpenPeopleAccess={openPeopleAccess}
       />,
     );
     await userEvent.click(screen.getByRole("button", { name: /account/i }));
     await userEvent.click(
-      screen.getByRole("button", { name: /user management/i }),
+      screen.getByRole("button", { name: /people & access/i }),
     );
-    expect(openUserManagement).toHaveBeenCalled();
+    expect(openPeopleAccess).toHaveBeenCalled();
     expect(
-      screen.queryByRole("button", { name: /user management/i }),
+      screen.queryByRole("button", { name: /people & access/i }),
     ).not.toBeInTheDocument();
   });
 
-  it("returns focus to the Account trigger when User management is chosen", async () => {
+  it("returns focus to the Account trigger when People & access is chosen", async () => {
     render(
       <UserMenu
         onOpenSettings={vi.fn()}
         onSignOut={vi.fn()}
-        onOpenUserManagement={vi.fn()}
+        onOpenPeopleAccess={vi.fn()}
       />,
     );
     const trigger = screen.getByRole("button", { name: /account/i });
     await userEvent.click(trigger);
     await userEvent.click(
-      screen.getByRole("button", { name: /user management/i }),
+      screen.getByRole("button", { name: /people & access/i }),
     );
     expect(document.activeElement).toBe(trigger);
   });

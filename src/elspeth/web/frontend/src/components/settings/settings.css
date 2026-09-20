@@ -1,8 +1,9 @@
-/* settings.css — Settings panels (secrets management, dev-admin users,
-   composer preferences).
+/* settings.css — Settings panels (secrets management, local account
+   credentials, composer preferences).
    Owners: .secrets-*, .user-admin-*, .composer-preferences-*.
 
-   .composer-preferences-error is also rendered by UserAdminDialog, so
+   .composer-preferences-error is also rendered by the quota editor in
+   People & access, so
    the rule below is the error affordance both share; it is defined
    here, with the rest of the settings surface, rather than being duplicated
    per call site (elspeth-b9871d3648). */
@@ -63,8 +64,8 @@
 }
 
 /* THE settings error affordance — one rule for the secret
-   entry form, ComposerPreferencesForm and
-   UserAdminDialog (elspeth-b9871d3648). Every one of them renders it on a
+   entry form, ComposerPreferencesForm and the
+   People & access quota editor (elspeth-b9871d3648). Every one of them renders it on a
    role="alert"/aria-describedby element whose whole purpose is to be
    noticed. Before this, .composer-preferences-error had three call sites and
    no rule at all — two shipped as ordinary body text, the third carried a
@@ -202,90 +203,15 @@
 }
 
 /* ---------------------------------------------------------------------------
-   User Admin Dialog (dev-only user management)
+   Local account credentials, as rendered inside People & access
+   (components/admin). The account table and create form that lived here went
+   with the User management dialog; what remains is the intro line and the
+   one-time password result.
    --------------------------------------------------------------------------- */
 .user-admin-intro {
   margin-top: 0;
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
-}
-
-.user-admin-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--font-size-sm);
-}
-
-.user-admin-table th {
-  text-align: left;
-  padding: var(--space-xs) var(--space-sm);
-  font-size: var(--font-size-xs);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: var(--letter-spacing-wide);
-  color: var(--color-text-secondary);
-  border-bottom: 1px solid var(--color-border);
-}
-
-.user-admin-table td {
-  padding: var(--space-xs) var(--space-sm);
-  border-bottom: 1px solid var(--color-border);
-  vertical-align: middle;
-}
-
-.user-admin-username {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  word-break: break-all;
-}
-
-.user-admin-unverified {
-  margin-left: var(--space-xs);
-  font-size: var(--font-size-xs);
-  color: var(--color-warning);
-}
-
-.user-admin-row-actions {
-  white-space: nowrap;
-  text-align: right;
-}
-
-/* The two row actions used to be held apart by a literal `{" "}` text space
-   (~3.4px), less than half the --space-sm the password row above uses
-   (elspeth-a0700fefff). */
-.user-admin-row-action-group {
-  display: flex;
-  gap: var(--space-sm);
-  align-items: center;
-  justify-content: flex-end;
-}
-
-/* Reserve the widest label's width for the delete control. The cell is
-   right-aligned and nowrap, so "Delete" growing into "Confirm delete" used to
-   drag BOTH buttons left, out from under the pointer at the exact moment the
-   user is being asked to confirm a destructive action. Stacking a hidden
-   sizer carrying the longest label in the same grid cell fixes the column at
-   that width, so the confirm step changes the label without moving anything.
-   The sizer carries the button's own .btn/.btn-compact classes rather than a
-   copy of its metrics, so padding/font/border can never drift apart. */
-.user-admin-delete-slot {
-  display: grid;
-  justify-items: end;
-}
-
-.user-admin-delete-slot > * {
-  grid-area: 1 / 1;
-}
-
-.user-admin-delete-sizer {
-  visibility: hidden;
-  pointer-events: none;
-}
-
-.user-admin-empty {
-  padding: var(--space-md) 0;
-  color: var(--color-text-muted);
-  text-align: center;
 }
 
 /* Card radius, not badge radius — see .secrets-list-item (elspeth-38ffb9aff3). */
@@ -316,35 +242,6 @@
   font-size: var(--font-size-xs);
 }
 
-/* Card radius, not badge radius — see .secrets-list-item (elspeth-38ffb9aff3). */
-.user-admin-create-form {
-  margin-top: var(--space-lg);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-sm) var(--space-md) var(--space-md);
-}
-
-.user-admin-create-form legend {
-  font-size: var(--font-size-xs);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: var(--letter-spacing-caps);
-  color: var(--color-text-secondary);
-  padding: 0 var(--space-2xs);
-}
-
-.user-admin-create-fields {
-  display: flex;
-  gap: var(--space-sm);
-  flex-wrap: wrap;
-  align-items: flex-end;
-}
-
-.user-admin-field {
-  flex: 1 1 140px;
-  min-width: 0;
-}
-
 /* ---------------------------------------------------------------------------
    Composer preferences panel
 
@@ -355,7 +252,7 @@
    two fieldset idioms already shipped in this tree: .guided-chip-fieldset
    (guided.css) strips the UA chrome, .tutorial-mode-fieldset (tutorial.css)
    lays the options out on a token grid. The legend matches
-   .user-admin-create-form legend above so the two forms in this dialog family
+   .people-direction legend (admin.css) so the fieldsets in this dialog family
    label their groups the same way.
    --------------------------------------------------------------------------- */
 .composer-preferences-fieldset {

@@ -1,18 +1,3 @@
-.identity-admin-dialog {
-  max-height: min(90vh, 900px);
-  overflow-y: auto;
-}
-
-.identity-admin-section,
-.identity-admin-form {
-  display: grid;
-  gap: var(--space-md);
-}
-
-.identity-admin-section {
-  padding-top: var(--space-md);
-}
-
 .identity-admin-advisory {
   border: 1px solid var(--color-warning);
   border-radius: var(--radius-lg);
@@ -52,37 +37,290 @@
 }
 
 .identity-admin-form {
+  display: grid;
+  gap: var(--space-md);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   padding: var(--space-md);
 }
 
-.identity-admin-form h3 {
+.identity-admin-form h4 {
   margin: 0;
 }
 
-.identity-admin-table-scroll {
-  overflow-x: auto;
+/* ── People & access ──────────────────────────────────────────────────────
+   Per-dialog closure over .app-dialog, like .settings-dialog-wide: only the
+   width and the two-pane layout are this panel's own decisions. */
+.people-dialog {
+  width: 1040px;
 }
 
-.identity-admin-table {
+.people-body {
+  display: grid;
+  gap: var(--space-md);
+  overflow-y: auto;
+}
+
+.people-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.people-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) minmax(0, 3fr);
+  gap: var(--space-lg);
+  align-items: start;
+}
+
+.people-pane {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-md);
+}
+
+.people-pane-detail {
+  border-left: 1px solid var(--color-border);
+  padding-left: var(--space-lg);
+}
+
+/* Beside the list there is nothing to go back to. */
+.people-back {
+  display: none;
+  justify-self: start;
+}
+
+.people-directory,
+.people-detail,
+.people-section {
+  display: grid;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.people-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space-sm);
+}
+
+.people-list,
+.people-grants,
+.people-picker-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.people-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0 var(--space-sm);
   width: 100%;
-  border-collapse: collapse;
-}
-
-.identity-admin-table th,
-.identity-admin-table td {
   padding: var(--space-sm);
-  border-bottom: 1px solid var(--color-border);
   text-align: left;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
 }
 
-.identity-admin-table code {
+.people-row[aria-current="true"] {
+  border-color: var(--color-accent);
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+.people-row-name {
+  font-weight: 600;
   overflow-wrap: anywhere;
 }
 
-.identity-admin-row-actions {
+.people-row .people-grant-meta {
+  grid-column: 1;
+}
+
+.people-row .people-state {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+}
+
+.people-wrap,
+.people-detail-name {
+  overflow-wrap: anywhere;
+}
+
+.people-detail-name,
+.people-detail h4,
+.people-add h3 {
+  margin: 0;
+}
+
+.people-grant-meta,
+.people-grant-purpose,
+.people-password-note {
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+.people-grant {
   display: flex;
   flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: start;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.people-grant > div {
+  min-width: 0;
+  flex: 1 1 220px;
+}
+
+/* State is always WORDS; the border only groups it. Never colour alone. */
+.people-state {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 0 var(--space-sm);
+  white-space: nowrap;
+}
+
+.people-state-pending,
+.people-state-not_set_up {
+  border-color: var(--color-warning);
+}
+
+.people-access-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.people-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: 0;
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.people-notice-rejected,
+.people-notice-uncertain,
+.people-notice-saved_stale {
+  border-color: var(--color-warning);
+}
+
+.people-notice-saved {
+  border-color: var(--color-accent);
+}
+
+.people-detail-header {
+  display: grid;
   gap: var(--space-xs);
+}
+
+.people-empty-detail {
+  margin: 0;
+  color: var(--color-text-secondary);
+}
+
+.people-advanced {
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-sm);
+}
+
+.people-direction {
+  display: grid;
+  gap: var(--space-xs);
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+
+/* The same group label as .composer-preferences-legend (settings.css): the
+   fieldsets in this dialog family label their groups one way, and
+   settingsSurface.test.ts holds the two together. */
+.people-direction legend {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--letter-spacing-caps);
+  color: var(--color-text-secondary);
+  padding: 0 var(--space-2xs);
+}
+
+.people-confirm-sentence {
+  margin: 0;
+  font-weight: 600;
+}
+
+.people-picker {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.people-picker-chosen {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.people-picker-result {
+  width: 100%;
+  padding: var(--space-sm);
+  text-align: left;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow-wrap: anywhere;
+}
+
+.people-password-heading {
+  margin: 0;
+}
+
+.people-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--space-xs) var(--space-md);
+  margin: var(--space-sm) 0 0;
+}
+
+.people-facts dd {
+  margin: 0;
+  min-width: 0;
+}
+
+/* Narrow screens and high zoom: the list OR the person fills the panel, with
+   an explicit way back. 200% zoom on a 1280px display lands here. */
+@media (max-width: 760px) {
+  .people-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .people-layout[data-view="detail"] .people-pane-list,
+  .people-layout[data-view="list"] .people-pane-detail {
+    display: none;
+  }
+
+  .people-pane-detail {
+    border-left: 0;
+    padding-left: 0;
+  }
+
+  .people-back {
+    display: inline-flex;
+  }
+
+  .people-facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

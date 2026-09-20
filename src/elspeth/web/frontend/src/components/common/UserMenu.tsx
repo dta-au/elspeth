@@ -8,17 +8,16 @@ import {
 import { Button } from "@/components/ui";
 import { useTheme } from "@/hooks/useTheme";
 import { useAuthStore } from "@/stores/authStore";
-import { useMailboxStore } from "@/stores/mailboxStore";
 import type { UserProfile } from "@/types/index";
 
 interface UserMenuProps {
   onOpenSettings: () => void;
   onSignOut: () => void;
-  /** Present only when the signed-in user is the env-flagged dev admin
-   *  (/api/auth/me dev_admin); absent, the item is not rendered. */
-  onOpenUserManagement?: () => void;
+  /** Present only when the server reports that the signed-in user holds at
+   *  least one people-administration capability; absent, no entry renders.
+   *  The App owns that decision so this menu never infers it from a role. */
+  onOpenPeopleAccess?: () => void;
   onOpenMailbox?: () => void;
-  onOpenIdentityAdmin?: () => void;
   onOpenLibrary?: () => void;
 }
 
@@ -71,9 +70,8 @@ function showsSecondaryUsername(user: UserProfile): boolean {
 export function UserMenu({
   onOpenSettings,
   onSignOut,
-  onOpenUserManagement,
+  onOpenPeopleAccess,
   onOpenMailbox,
-  onOpenIdentityAdmin,
   onOpenLibrary,
 }: UserMenuProps): JSX.Element {
   const [open, setOpen] = useState(false);
@@ -85,7 +83,6 @@ export function UserMenu({
   // via GET /api/auth/me — so no props flow through AppHeader and no new
   // fetch consumer is added (elspeth-312238838a).
   const user = useAuthStore((s) => s.user);
-  const isIdentityAdmin = useMailboxStore((state) => state.summary?.roles.includes("admin") ?? false);
   const themeLabel =
     resolvedTheme === "dark" ? "Switch to light theme" : "Switch to dark theme";
 
@@ -130,25 +127,19 @@ export function UserMenu({
     onOpenSettings();
   }, [onOpenSettings]);
 
-  // Same focus-return-before-unmount move as onSettings: the user-management
-  // dialog's focus trap needs a live element to save and restore.
-  const onUserManagement = useCallback(() => {
+  // Same focus-return-before-unmount move as onSettings: the People & access
+  // panel's focus trap needs a live element to save and restore.
+  const onPeopleAccess = useCallback(() => {
     triggerRef.current?.focus();
     setOpen(false);
-    onOpenUserManagement?.();
-  }, [onOpenUserManagement]);
+    onOpenPeopleAccess?.();
+  }, [onOpenPeopleAccess]);
 
   const onMailbox = useCallback(() => {
     triggerRef.current?.focus();
     setOpen(false);
     onOpenMailbox?.();
   }, [onOpenMailbox]);
-
-  const onIdentityAdmin = useCallback(() => {
-    triggerRef.current?.focus();
-    setOpen(false);
-    onOpenIdentityAdmin?.();
-  }, [onOpenIdentityAdmin]);
 
   const onLibrary = useCallback(() => {
     triggerRef.current?.focus();
@@ -266,18 +257,9 @@ export function UserMenu({
           {user !== null && onOpenLibrary !== undefined && <li className="user-menu-item">
             <Button variant="bare" onClick={onLibrary} className="user-menu-action">Shared library</Button>
           </li>}
-          {user !== null && isIdentityAdmin && onOpenIdentityAdmin !== undefined && <li className="user-menu-item">
-            <Button variant="bare" onClick={onIdentityAdmin} className="user-menu-action">Identity administration</Button>
-          </li>}
-          {onOpenUserManagement !== undefined && (
+          {onOpenPeopleAccess !== undefined && (
             <li className="user-menu-item">
-              <Button
-                variant="bare"
-                onClick={onUserManagement}
-                className="user-menu-action"
-              >
-                User management
-              </Button>
+              <Button variant="bare" onClick={onPeopleAccess} className="user-menu-action">People &amp; access</Button>
             </li>
           )}
           <li className="user-menu-item">
