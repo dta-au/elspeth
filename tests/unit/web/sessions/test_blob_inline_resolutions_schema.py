@@ -48,7 +48,7 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_61(engine) -> None:
+def test_blob_inline_resolutions_schema_epoch_is_63(engine) -> None:
     # 51: the multi-replica session-operation substrate landed on top of
     # mainline's 50 (elspeth-4d6c0dd0f5).
     # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
@@ -62,9 +62,10 @@ def test_blob_inline_resolutions_schema_epoch_is_61(engine) -> None:
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
-    assert SESSION_SCHEMA_EPOCH == 62
+    # Epoch 63 gives this table's content_hash the full lowercase SHA-256 CHECK.
+    assert SESSION_SCHEMA_EPOCH == 63
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 62
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 63
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:
@@ -143,6 +144,42 @@ def test_blob_inline_resolutions_encoding_check_rejects_unknown(engine) -> None:
                 byte_length=10,
                 mime_type="text/plain",
                 encoding="ascii",
+                resolved_at=datetime.now(UTC),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "content_hash",
+    [
+        pytest.param("a" * 63, id="too-short"),
+        pytest.param("A" * 64, id="uppercase-hex"),
+        pytest.param("g" * 64, id="non-hex-letter"),
+        pytest.param("a" * 63 + " ", id="trailing-space"),
+    ],
+)
+def test_blob_inline_resolutions_hash_check_rejects_non_lowercase_sha256(engine, content_hash: str) -> None:
+    # The CHECK must carry the whole ``^[a-f0-9]{64}$`` shape the writer-side
+    # ``ResolvedBlobContent`` enforces, not the length alone: a 64-character
+    # value that is not lowercase hex can never equal a real digest, so a row
+    # holding one asserts a resolution nobody can verify (elspeth-f99b16fc2f).
+    run_id = str(uuid4())
+    blob_id = str(uuid4())
+    with (
+        pytest.raises(IntegrityError, match="ck_blob_inline_resolutions_hash_format"),
+        engine.begin() as conn,
+    ):
+        _seed_run_and_blob(conn, run_id=run_id, blob_id=blob_id)
+        conn.execute(
+            insert(blob_inline_resolutions_table).values(
+                run_id=run_id,
+                attempt=1,
+                field_path="source.options.system_prompt",
+                blob_id=blob_id,
+                content_hash=content_hash,
+                byte_length=10,
+                mime_type="text/plain",
+                encoding="utf-8",
                 resolved_at=datetime.now(UTC),
             )
         )

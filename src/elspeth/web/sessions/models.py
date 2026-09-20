@@ -343,7 +343,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 # 62: durable advisor completion gates require a nullable backend suggestion.
 #     Semantic-only JSON grammar cut: reject earlier stores at startup before
 #     an old blocked envelope can fail during session reload. No migration.
-SESSION_SCHEMA_EPOCH = 62
+# 63: blob_inline_resolutions.content_hash carries the full lowercase SHA-256
+#     shape, not the length alone (elspeth-f99b16fc2f). Pre-1.0 delete/recreate.
+SESSION_SCHEMA_EPOCH = 63
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3095,10 +3097,7 @@ blob_inline_resolutions_table = Table(
         "attempt",
         name="pk_blob_inline_resolutions",
     ),
-    CheckConstraint(
-        "length(content_hash) = 64",
-        name="ck_blob_inline_resolutions_hash_format",
-    ),
+    *_lower_sha256_constraints("content_hash", name="ck_blob_inline_resolutions_hash_format"),
     CheckConstraint(
         "encoding IN ('utf-8', 'utf-8-sig', 'utf-16', 'latin-1')",
         name="ck_blob_inline_resolutions_encoding",

@@ -292,7 +292,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 61 defaults preferences to freeform and retires the mode banner.
-    assert SESSION_SCHEMA_EPOCH == 62
+    # Epoch 63 tightens the inline blob resolution hash CHECK to lowercase hex.
+    assert SESSION_SCHEMA_EPOCH == 63
     expected_tables = frozenset(
         {
             "web_instances",
