@@ -7,12 +7,13 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
-to 60 for durable Composer progress, request lifecycle leases, identity owner
+to 61 for durable Composer progress, request lifecycle leases, identity owner
 foreign keys, approval revocation provenance, run admission decisions, sparse
 proposal arguments, structured validation errors, approved prompt artifact provenance,
 64-bit quota policy limits, nullable token-ledger prompt/completion measures
 (unknown usage is NULL, never zero), and timestamp-leading indexes for
-container-wide quota scans, plus durable guided fork failure diagnostics.
+container-wide quota scans, durable guided fork failure diagnostics, and the
+freeform default preference with removal of the retired mode banner field.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 42 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
@@ -27,7 +28,7 @@ separate deployment requirement.
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 60 and Landscape databases below epoch 42 must be recreated together.
+epoch 61 and Landscape databases below epoch 42 must be recreated together.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service

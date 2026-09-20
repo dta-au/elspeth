@@ -26,7 +26,8 @@ hammer
     "heartbeat" every ``--beat-interval-ms``: the §A.3 beat shape — a
     single-row CAS UPDATE on the runs row in its own write-intent
     transaction — which is the direct latency proxy for the slice-4
-    heartbeat thread.
+    heartbeat thread. The configured claim and peer-recovery floors must
+    also complete before the worker exits.
 
 reader
     Dashboard-style read batches on a ``from_url(read_only=True)`` handle
@@ -118,6 +119,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     # hammer's last sweep, and a lock-starved peer's first claim can land after
     # any fixed window. The parent's join timeout bounds the wait.
     parser.add_argument("--min-recovered", type=int, default=1)
+    parser.add_argument("--min-claims", type=int, default=0)
     parser.add_argument("--peer-recovered-file", action="append", default=[])
     return parser.parse_args(argv)
 
@@ -237,6 +239,7 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
         iteration = 0
         while (
             time.monotonic() < deadline
+            or claims < args.min_claims
             or recovered_total < args.min_recovered
             or not all(Path(path).exists() for path in args.peer_recovered_file)
         ):

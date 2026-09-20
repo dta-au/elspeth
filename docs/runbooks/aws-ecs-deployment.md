@@ -1618,7 +1618,7 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
   "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 60, "landscape_epoch": 42, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 61, "landscape_epoch": 42, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
     "structural_changes": "session_epoch_35_to_61_landscape_epoch_29_to_42_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema",
     "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",

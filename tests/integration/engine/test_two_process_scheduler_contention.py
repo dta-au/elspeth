@@ -245,6 +245,8 @@ def _spawn_children(
                             str(metrics),
                             "--min-recovered",
                             str(MIN_RECOVERED_PER_HAMMER),
+                            "--min-claims",
+                            str(MIN_CLAIMS_PER_HAMMER),
                             "--expire-claims",
                             *[
                                 argument
@@ -461,6 +463,47 @@ def test_two_process_claim_hammer_with_dashboard_reads(tmp_path: Path) -> None:
         duration_seconds=3.0,
         hammer_owners=("contender-a", "contender-b"),
     )
+
+
+@pytest.mark.timeout(120)
+def test_short_window_hammer_completes_claim_progress_floor_before_exit(tmp_path: Path) -> None:
+    """A short measurement window cannot bypass the worker's A9 claim floor."""
+    db_path = tmp_path / "audit.db"
+    _seed_database(db_path, now=datetime.now(UTC))
+    go_file = tmp_path / "go"
+    go_file.touch()
+    metrics = tmp_path / "metrics.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WORKER_PATH),
+            "--db-url",
+            f"sqlite:///{db_path}",
+            "--role",
+            worker.ROLE_HAMMER,
+            "--owner",
+            "late-contender",
+            "--run-id",
+            RUN_ID,
+            "--ready-file",
+            str(tmp_path / "ready"),
+            "--go-file",
+            str(go_file),
+            "--duration-seconds",
+            "0.001",
+            "--metrics-out",
+            str(metrics),
+            "--min-recovered",
+            "0",
+            "--min-claims",
+            str(MIN_CLAIMS_PER_HAMMER),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(metrics.read_text())["claims"] >= MIN_CLAIMS_PER_HAMMER
 
 
 @pytest.mark.timeout(120)

@@ -502,7 +502,7 @@ parity test feeds one corpus through both).
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 60, "landscape_epoch": 42, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 61, "landscape_epoch": 42, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
