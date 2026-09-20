@@ -204,6 +204,11 @@ class _BoundSecretInventory:
         return self._server_store.has_secret(name)
 
     def has_user_ref(self, principal: str, name: str) -> bool:
+        # Server-only mode: this inventory reads the user store directly, so
+        # it must apply the same lockdown the service does — otherwise a
+        # user-scoped profile would report available and then fail to resolve.
+        if not self._service.user_secrets_enabled:
+            return False
         return self._user_store.has_secret(name, user_id=self._user_id, auth_provider_type=self._auth_provider)
 
     def has_ref(self, principal: str, name: str) -> bool:
@@ -220,6 +225,8 @@ class _BoundSecretInventory:
 
     def user_generation(self, principal: str, name: str) -> str | None:
         del principal
+        if not self._service.user_secrets_enabled:
+            return None
         if not self._user_store.has_secret(name, user_id=self._user_id, auth_provider_type=self._auth_provider):
             return None
         try:

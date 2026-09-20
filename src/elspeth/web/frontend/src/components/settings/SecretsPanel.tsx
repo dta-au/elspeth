@@ -8,6 +8,14 @@ import type { SecretInventoryItem } from "@/types/api";
 
 interface SecretsPanelProps {
   onClose: () => void;
+  /**
+   * False when the deployment runs in locked-down server-only mode
+   * (WebSettings.user_secrets_enabled, published on /api/system/status): the
+   * add/update form is not rendered and the inventory is read-only. The
+   * server enforces the same rule with a 403, so this only keeps the UI
+   * from offering an action that cannot succeed.
+   */
+  userSecretsEnabled?: boolean;
 }
 
 const SECRET_FORM_ERROR_ID = "secret-form-error";
@@ -122,7 +130,10 @@ function secretFormErrorTargets(error: string | null): SecretFormErrorTargets {
  * - The store never retains the value after the API call completes.
  * - No "show password" toggle is provided.
  */
-export function SecretsPanel({ onClose }: SecretsPanelProps) {
+export function SecretsPanel({
+  onClose,
+  userSecretsEnabled = true,
+}: SecretsPanelProps) {
   const { secrets, isLoading, error, loadSecrets, createSecret, deleteSecret } =
     useSecretsStore();
   const [name, setName] = useState("");
@@ -133,7 +144,13 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
   const modalRef = useRef<HTMLDivElement>(null);
   const formErrorTargets = secretFormErrorTargets(error);
   const hasFormErrorTarget = formErrorTargets.name || formErrorTargets.value;
-  useFocusTrap(modalRef, true, "#secret-name");
+  // Server-only mode renders no name field, so initial focus lands on the
+  // close control instead of a selector that matches nothing.
+  useFocusTrap(
+    modalRef,
+    true,
+    userSecretsEnabled ? "#secret-name" : ".dialog-close",
+  );
 
   useEffect(() => {
     loadSecrets();
@@ -227,7 +244,14 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
 
         {/* Scrollable body */}
         <div className="secrets-panel-body">
-          {/* Entry form */}
+          {/* Entry form — not rendered in server-only mode. */}
+          {!userSecretsEnabled && (
+            <p className="secrets-footnote" data-testid="secrets-server-only">
+              This deployment is in server-only mode: secrets are configured by
+              an administrator, and personal keys cannot be added here.
+            </p>
+          )}
+          {userSecretsEnabled && (
           <section
             aria-labelledby="secrets-add-heading"
             className="secrets-panel-section"
@@ -288,6 +312,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
               </div>
             </form>
           </section>
+          )}
 
           {/* Error banner */}
           {error && (
@@ -322,7 +347,9 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
               </div>
             ) : secrets.length === 0 ? (
               <div className="secrets-empty">
-                No secrets configured. Add one above.
+                {userSecretsEnabled
+                  ? "No secrets configured. Add one above."
+                  : "No secrets configured."}
               </div>
             ) : (
               <ul role="list" className="secrets-list">
@@ -357,7 +384,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
                           the scope badge run a control-width further right and
                           the badge column zig-zagged down the list. */}
                       <span className="secrets-list-action">
-                        {secret.scope === "user" && (
+                        {secret.scope === "user" && userSecretsEnabled && (
                           <Button
                             variant="bare"
                             onClick={() => setPendingDelete(secret.name)}

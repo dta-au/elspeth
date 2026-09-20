@@ -162,6 +162,66 @@ def test_llm_profiles_reject_provider_options_runtime_cannot_honor(profile: dict
         _settings(llm_profiles={"invalid": profile}, default_llm_profile="invalid")
 
 
+_BEDROCK_PROFILE_MODEL = "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
+
+
+def test_bedrock_profile_may_name_an_api_key_credential_which_lowers_to_api_key() -> None:
+    from elspeth.core.llm_profiles import lower_llm_profile_options
+
+    settings = _settings(
+        llm_profiles={
+            "keyed": {
+                "provider": "bedrock",
+                "model": _BEDROCK_PROFILE_MODEL,
+                "credential_scope": "server",
+                "credential_ref": "AWS_BEARER_TOKEN_BEDROCK",
+            }
+        },
+        default_llm_profile="keyed",
+    )
+    profile = RuntimeWebPluginConfig.from_settings(settings).llm_profiles[0][1]
+
+    executable, audit_safe = lower_llm_profile_options("keyed", profile, {"prompt_template": "hi"})
+
+    # A reference marker, never a value; and nothing credential-shaped in the audit-safe view.
+    assert executable["api_key"] == {"secret_ref": "AWS_BEARER_TOKEN_BEDROCK", "secret_scope": "server"}
+    assert "api_key" not in audit_safe
+    assert "AWS_BEARER_TOKEN_BEDROCK" not in repr(profile)
+
+
+@pytest.mark.parametrize(
+    ("credential", "message"),
+    [
+        ({"credential_scope": "server"}, "both scope and reference"),
+        ({"credential_ref": "AWS_BEARER_TOKEN_BEDROCK"}, "both scope and reference"),
+        ({"credential_scope": "server", "credential_ref": "not a ref"}, "invalid syntax"),
+    ],
+)
+def test_bedrock_profile_rejects_a_partial_or_malformed_credential(credential: dict[str, str], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        _settings(
+            llm_profiles={"keyed": {"provider": "bedrock", "model": _BEDROCK_PROFILE_MODEL, **credential}},
+            default_llm_profile="keyed",
+        )
+
+
+@pytest.mark.parametrize("field_name", ["api_key", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"])
+def test_profiled_nodes_may_not_author_bedrock_credentials(field_name: str) -> None:
+    from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, lower_llm_profile_options
+
+    settings = _settings(
+        llm_profiles={"keyless": {"provider": "bedrock", "model": _BEDROCK_PROFILE_MODEL}},
+        default_llm_profile="keyless",
+    )
+    profile = RuntimeWebPluginConfig.from_settings(settings).llm_profiles[0][1]
+
+    assert field_name in LLM_PROFILE_PRIVATE_FIELDS
+    with pytest.raises(ValueError, match="private_profile_option"):
+        lower_llm_profile_options("keyless", profile, {field_name: "authored"})
+    # Positive control: the same lowering accepts an ordinary safe option.
+    assert lower_llm_profile_options("keyless", profile, {"prompt_template": "hi"})[0]["provider"] == "bedrock"
+
+
 def test_bedrock_profile_is_keyless_and_uses_canonical_provider_registry() -> None:
     settings = _settings(
         llm_profiles={

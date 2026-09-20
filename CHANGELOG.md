@@ -51,6 +51,22 @@ drained and repair this release forward.
   refuses `/api/ready` when governance is requested with open local
   registration or without a compartment marking. The switch prepares the
   configuration boundary for later approval, review, and library authorities.
+- **Bedrock credentials in API keys & secrets.** The `llm` transform and LLM
+  source accept an optional Amazon Bedrock API key (`api_key`, sent as a
+  bearer token) or static IAM credentials (`aws_access_key_id`,
+  `aws_secret_access_key`, optional `aws_session_token`); the two are mutually
+  exclusive and the AWS default credential chain remains the default, so
+  task-role deployments are unchanged. Bedrock LLM profiles may name an API
+  key through `credential_scope`/`credential_ref`. The default
+  `server_secret_allowlist` gains `AWS_BEARER_TOKEN_BEDROCK`,
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`.
+  Credentials are injected below the audited client and never enter a
+  recorded call, and profiled nodes may not author them.
+- **Server-only secret mode.** `ELSPETH_WEB__USER_SECRETS_ENABLED=false`
+  disables user-scoped secrets end to end: the secrets API refuses create and
+  delete with 403, stored user secrets are neither listed nor resolved nor
+  allowed to shadow a server secret, and the panel renders read-only. See the
+  [environment reference](docs/reference/environment-variables.md).
 
 - **Coordination deadlines are decided from fresh post-lock database time.**
   Lease deadlines are now issued after locked admission rather than from a

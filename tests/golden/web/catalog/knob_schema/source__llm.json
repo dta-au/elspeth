@@ -745,6 +745,62 @@
       },
       {
         "default": null,
+        "description": "Optional resolved Amazon Bedrock API key (bearer token); mutually exclusive with the static AWS credential pair.",
+        "kind": "text",
+        "label": "API Key",
+        "name": "api_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS access-key identifier; required together with aws_secret_access_key.",
+        "kind": "text",
+        "label": "Aws Access Key ID",
+        "name": "aws_access_key_id",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS secret access key; required together with aws_access_key_id.",
+        "kind": "text",
+        "label": "Aws Secret Access Key",
+        "name": "aws_secret_access_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS session token for temporary static credentials.",
+        "kind": "text",
+        "label": "Aws Session Token",
+        "name": "aws_session_token",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
         "description": "Tier 2 tracing configuration",
         "kind": "json-object",
         "label": "Tracing",

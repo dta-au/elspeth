@@ -45,7 +45,7 @@ from elspeth.plugins.transforms.llm import populate_llm_operational_fields
 from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer, create_langfuse_tracer
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMProvider, LLMQueryResult, classify_finish_reason_failure
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, _configure_azure_monitor
-from elspeth.plugins.transforms.llm.providers.bedrock import BedrockLLMProvider
+from elspeth.plugins.transforms.llm.providers.bedrock import BedrockCredentials, BedrockLLMProvider
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
@@ -122,7 +122,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:66f332f1ced031e2"
+    source_file_hash: str | None = "sha256:33bc2fe06a380a8f"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -536,7 +536,16 @@ class LLMSource(BaseSource):
                 **common,
             )
         if isinstance(self._config, BedrockLLMSourceConfig):
-            return BedrockLLMProvider(region_name=self._config.region_name, **common)
+            return BedrockLLMProvider(
+                region_name=self._config.region_name,
+                credentials=BedrockCredentials(
+                    api_key=self._config.api_key,
+                    aws_access_key_id=self._config.aws_access_key_id,
+                    aws_secret_access_key=self._config.aws_secret_access_key,
+                    aws_session_token=self._config.aws_session_token,
+                ),
+                **common,
+            )
         if isinstance(self._config, GatewayLLMSourceConfig):
             return GatewayLLMProvider(
                 endpoint=self._config.endpoint,

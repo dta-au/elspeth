@@ -1177,6 +1177,34 @@ class TestServerSecretAllowlistValidation:
 
         assert "AZURE_CONTENT_SAFETY_KEY" not in settings.server_secret_allowlist
 
+    def test_bedrock_credentials_are_allowlisted_by_default(self) -> None:
+        settings = WebSettings(
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+
+        assert {
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        } <= set(settings.server_secret_allowlist)
+
+    def test_user_secrets_are_enabled_unless_the_operator_locks_down(self) -> None:
+        required = {
+            "composer_max_composition_turns": 15,
+            "composer_max_discovery_turns": 10,
+            "composer_timeout_seconds": 85.0,
+            "composer_rate_limit_per_minute": 10,
+            "shareable_link_signing_key": b"\x00" * 32,
+        }
+
+        assert WebSettings(**required).user_secrets_enabled is True
+        assert WebSettings(**required, user_secrets_enabled=False).user_secrets_enabled is False
+
     def test_reserved_elspeth_server_secret_names_rejected(self) -> None:
         with pytest.raises(ValidationError, match="ELSPETH_"):
             WebSettings(

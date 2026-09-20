@@ -385,7 +385,10 @@ class TestGetSchema:
         for variant in ("AzureOpenAIConfig", "OpenRouterConfig", "BedrockConfig", "GatewayConfig"):
             assert "prompt_template" not in defs[variant]["required"]
         assert "region_name" in defs["BedrockConfig"]["properties"]
-        assert "api_key" not in defs["BedrockConfig"]["properties"]
+        # Bedrock credentials are optional alternatives to the default chain.
+        bedrock_credentials = {"api_key", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"}
+        assert bedrock_credentials <= set(defs["BedrockConfig"]["properties"])
+        assert bedrock_credentials.isdisjoint(defs["BedrockConfig"]["required"])
 
     def test_llm_source_emits_source_discriminated_schema(self, llm_source_catalog: CatalogServiceImpl) -> None:
         info = llm_source_catalog.get_schema("source", "llm")

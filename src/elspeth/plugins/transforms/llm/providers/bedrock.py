@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from threading import Lock
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_governance import LLMCallGovernance
@@ -24,12 +25,18 @@ from elspeth.plugins.infrastructure.clients.llm import (
     ServerError,
 )
 from elspeth.plugins.llm.config_validation import (
+    BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
+    BEDROCK_API_KEY_MAX_LENGTH,
+    BEDROCK_CREDENTIAL_MIN_LENGTH,
     BEDROCK_MODEL_MAX_LENGTH,
     BEDROCK_MODEL_MIN_LENGTH,
     BEDROCK_REGION_MAX_LENGTH,
     BEDROCK_REGION_MIN_LENGTH,
     BEDROCK_REGION_PATTERN,
+    BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH,
+    BEDROCK_SESSION_TOKEN_MAX_LENGTH,
     BEDROCK_VALUE_SOURCES,
+    validate_bedrock_credential_fields,
     validate_bedrock_model,
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
@@ -44,13 +51,48 @@ from elspeth.plugins.transforms.llm.provider import (
 if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
-__all__ = ["BedrockConfig", "BedrockLLMProvider"]
+__all__ = ["BedrockConfig", "BedrockCredentials", "BedrockLLMProvider"]
 
 _STATIC_BEDROCK_ERROR = "Bedrock LLM request failed"
 
 
+@dataclass(frozen=True, slots=True)
+class BedrockCredentials:
+    """Resolved explicit Bedrock credentials; absent fields defer to the AWS default chain.
+
+    Holds secret VALUES, so every field is excluded from ``repr``. Instances
+    are handed to :class:`_LiteLLMSDKAdapter` only — below the audited
+    client — so a credential never enters the recorded request.
+    """
+
+    api_key: str | None = field(default=None, repr=False)
+    aws_access_key_id: str | None = field(default=None, repr=False)
+    aws_secret_access_key: str | None = field(default=None, repr=False)
+    aws_session_token: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        validate_bedrock_credential_fields(
+            api_key=self.api_key,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
+
+    def litellm_kwargs(self) -> dict[str, str]:
+        """Return the LiteLLM completion kwargs carrying these credentials."""
+        candidates = (
+            # LiteLLM sends a Bedrock ``api_key`` as ``Authorization: Bearer``
+            # (the Amazon Bedrock API key) instead of SigV4-signing the call.
+            ("api_key", self.api_key),
+            ("aws_access_key_id", self.aws_access_key_id),
+            ("aws_secret_access_key", self.aws_secret_access_key),
+            ("aws_session_token", self.aws_session_token),
+        )
+        return {name: value for name, value in candidates if value is not None}
+
+
 class BedrockConfig(LLMConfig):
-    """Keyless LiteLLM Bedrock configuration using the AWS default chain."""
+    """LiteLLM Bedrock configuration; the AWS default chain unless a credential is wired."""
 
     # Bedrock model availability is account/region scoped and resolved by AWS;
     # unlike OpenRouter there is no authoritative local catalog to validate.
@@ -72,6 +114,34 @@ class BedrockConfig(LLMConfig):
         pattern=BEDROCK_REGION_PATTERN,
         description="AWS region override; default AWS region resolution otherwise",
     )
+    api_key: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_API_KEY_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved Amazon Bedrock API key (bearer token); mutually exclusive with the static AWS credential pair.",
+    )
+    aws_access_key_id: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS access-key identifier; required together with aws_secret_access_key.",
+    )
+    aws_secret_access_key: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS secret access key; required together with aws_access_key_id.",
+    )
+    aws_session_token: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_SESSION_TOKEN_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS session token for temporary static credentials.",
+    )
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing (langfuse only)")
 
     @field_validator("model")
@@ -79,12 +149,32 @@ class BedrockConfig(LLMConfig):
     def _require_bedrock_prefix(cls, value: str) -> str:
         return validate_bedrock_model(value)
 
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> Self:
+        validate_bedrock_credential_fields(
+            api_key=self.api_key,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
+        return self
+
+    def credentials(self) -> BedrockCredentials:
+        """Return the explicit credentials this config carries (possibly none)."""
+        return BedrockCredentials(
+            api_key=self.api_key,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
+
 
 class _LiteLLMSDKAdapter:
     """Expose ``litellm.completion`` through the SDK-shaped audited client API."""
 
-    def __init__(self, *, region_name: str | None) -> None:
+    def __init__(self, *, region_name: str | None, credentials: BedrockCredentials) -> None:
         self._region_name = region_name
+        self._credentials = credentials
         self.chat = SimpleNamespace(completions=self)
 
     def create(self, **kwargs: Any) -> Any:
@@ -94,6 +184,10 @@ class _LiteLLMSDKAdapter:
             # Precedence is explicit: a caller's own aws_region_name wins, and
             # the configured region fills in only when the call names none.
             kwargs["aws_region_name"] = self._region_name
+        # Configured credentials are authoritative: they are injected here,
+        # below the audited client, so they never enter the recorded request,
+        # and no caller-supplied kwarg may substitute a different identity.
+        kwargs.update(self._credentials.litellm_kwargs())
         # The engine owns retries, so each attempt crosses admission and audit.
         kwargs["num_retries"] = 0
         return litellm.completion(**kwargs)
@@ -124,6 +218,7 @@ class BedrockLLMProvider:
         self,
         *,
         region_name: str | None,
+        credentials: BedrockCredentials,
         recorder: PluginAuditWriter,
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
@@ -132,6 +227,7 @@ class BedrockLLMProvider:
         llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         self._region_name = region_name
+        self._credentials = credentials
         self._recorder = recorder
         self._run_id = run_id
         self._telemetry_emit = telemetry_emit
@@ -227,7 +323,7 @@ class BedrockLLMProvider:
     def _get_underlying_client(self) -> _LiteLLMSDKAdapter:
         with self._underlying_client_lock:
             if self._underlying_client is None:
-                self._underlying_client = _LiteLLMSDKAdapter(region_name=self._region_name)
+                self._underlying_client = _LiteLLMSDKAdapter(region_name=self._region_name, credentials=self._credentials)
             return self._underlying_client
 
     def _get_llm_client(self, audit_parent: LLMAuditParent) -> AuditedLLMClient:

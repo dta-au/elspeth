@@ -494,3 +494,45 @@ def test_gateway_source_structured_accepted_with_capability(provider_configs: di
         plugin_name="llm",
     )
     assert cfg.required_capabilities == ("json_schema",)
+
+
+class TestBedrockSourceCredentials:
+    """The source variant carries the same optional credential contract as the transform."""
+
+    def test_no_credential_is_the_default_chain(self, provider_configs: dict[str, dict[str, Any]]) -> None:
+        config = BedrockLLMSourceConfig.from_dict(provider_configs["bedrock"], plugin_name="llm")
+
+        assert (config.api_key, config.aws_access_key_id, config.aws_secret_access_key, config.aws_session_token) == (None,) * 4
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"api_key": "bedrock-api-key"},
+            {"aws_access_key_id": "access-id", "aws_secret_access_key": "secret-access"},
+            {"aws_access_key_id": "access-id", "aws_secret_access_key": "secret-access", "aws_session_token": "session"},
+        ],
+        ids=["api-key", "static-pair", "static-pair-with-session"],
+    )
+    def test_each_credential_shape_is_accepted(self, overrides: dict[str, str], provider_configs: dict[str, dict[str, Any]]) -> None:
+        config = BedrockLLMSourceConfig.from_dict({**provider_configs["bedrock"], **overrides}, plugin_name="llm")
+
+        assert {name: value for name, value in config.model_dump().items() if name in overrides} == overrides
+        for value in overrides.values():
+            assert value not in repr(config)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"api_key": "k", "aws_access_key_id": "a", "aws_secret_access_key": "s"}, "mutually exclusive"),
+            ({"aws_access_key_id": "a"}, "required together"),
+            ({"aws_session_token": "t"}, "aws_session_token requires"),
+        ],
+    )
+    def test_inconsistent_credentials_are_rejected(
+        self,
+        overrides: dict[str, str],
+        message: str,
+        provider_configs: dict[str, dict[str, Any]],
+    ) -> None:
+        with pytest.raises(PluginConfigError, match=message):
+            BedrockLLMSourceConfig.from_dict({**provider_configs["bedrock"], **overrides}, plugin_name="llm")

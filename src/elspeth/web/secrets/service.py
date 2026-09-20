@@ -123,6 +123,14 @@ def _log_secret_decryption_rate_limited() -> None:
     )
 
 
+class UserSecretsDisabledError(Exception):
+    """A user-scoped secret write was attempted in server-only mode.
+
+    Raised when ``WebSettings.user_secrets_enabled`` is False. The REST
+    layer maps it to 403; carries no secret name or value.
+    """
+
+
 class WebSecretService:
     """Chained secret resolution: user -> server.
 
@@ -133,17 +141,38 @@ class WebSecretService:
 
     Also exposes ``set_user_secret`` / ``delete_user_secret`` for the
     REST API layer.
+
+    Server-only mode (``user_secrets_enabled=False``) removes the user scope
+    from every method, not just the write path: stored user rows are neither
+    listed nor resolved and never shadow a server secret, so a row saved
+    before lockdown cannot keep supplying a credential after it.
     """
 
-    def __init__(self, user_store: UserSecretStore, server_store: ServerSecretStore) -> None:
+    def __init__(self, user_store: UserSecretStore, server_store: ServerSecretStore, *, user_secrets_enabled: bool = True) -> None:
         self._user_store = user_store
         self._server_store = server_store
+        self._user_secrets_enabled = user_secrets_enabled
+
+    @property
+    def user_secrets_enabled(self) -> bool:
+        """False when the deployment runs in locked-down server-only mode."""
+        return self._user_secrets_enabled
+
+    def _has_user_record(self, user_id: str, name: str, *, auth_provider_type: AuthProviderType) -> bool:
+        """User-scope shadowing probe; always False in server-only mode."""
+        if not self._user_secrets_enabled:
+            return False
+        return self._user_store.has_secret_record(name, user_id=user_id, auth_provider_type=auth_provider_type)
 
     # -- Resolution methods ------------------------------------------------
 
     def list_refs(self, user_id: str, *, auth_provider_type: AuthProviderType) -> list[SecretInventoryItem]:
         """Merge user and server inventories; user scope wins on name clash."""
-        user_items = {item.name: item for item in self._user_store.list_secrets(user_id=user_id, auth_provider_type=auth_provider_type)}
+        user_items = (
+            {item.name: item for item in self._user_store.list_secrets(user_id=user_id, auth_provider_type=auth_provider_type)}
+            if self._user_secrets_enabled
+            else {}
+        )
         server_items = {item.name: item for item in self._server_store.list_secrets()}
         merged = {**server_items, **user_items}  # user scope wins
         return sorted(merged.values(), key=lambda x: x.name)
@@ -156,7 +185,7 @@ class WebSecretService:
         currently undecryptable.  This keeps validation aligned with
         list_refs(), where user scope also wins on name clash.
         """
-        if self._user_store.has_secret_record(name, user_id=user_id, auth_provider_type=auth_provider_type):
+        if self._has_user_record(user_id, name, auth_provider_type=auth_provider_type):
             return self._user_store.has_secret(name, user_id=user_id, auth_provider_type=auth_provider_type)
         return self._server_store.has_secret(name)
 
@@ -192,7 +221,7 @@ class WebSecretService:
             # NOT call has_secret as a pre-check here because it eats
             # decryption failures as False; the shadowing invariant
             # requires a failing user row to NOT fall through to server.
-            if self._user_store.has_secret_record(name, user_id=user_id, auth_provider_type=auth_provider_type):
+            if self._has_user_record(user_id, name, auth_provider_type=auth_provider_type):
                 value, ref = self._user_store.get_secret(name, user_id=user_id, auth_provider_type=auth_provider_type)
                 return ResolvedSecret(name=name, value=value, scope="user", fingerprint=ref.fingerprint)
             # Server fallback — get_secret raises typed errors for each
@@ -243,6 +272,10 @@ class WebSecretService:
         """
         try:
             if scope == "user":
+                if not self._user_secrets_enabled:
+                    # Server-only mode: the user scope has no backing store,
+                    # exactly like ``org`` — absent by construction.
+                    return None
                 value, ref = self._user_store.get_secret(name, user_id=user_id, auth_provider_type=auth_provider_type)
                 return ResolvedSecret(name=name, value=value, scope="user", fingerprint=ref.fingerprint)
             if scope == "server":
@@ -287,7 +320,7 @@ class WebSecretService:
         while this method surfaces per-condition typed signals the HTTP
         layer needs to give an API consumer something to act on.
         """
-        if self._user_store.has_secret_record(name, user_id=user_id, auth_provider_type=auth_provider_type):
+        if self._has_user_record(user_id, name, auth_provider_type=auth_provider_type):
             # Exercises the full get_secret path so both
             # FingerprintKeyMissingError and SecretDecryptionError can
             # surface.  The plaintext is immediately discarded — this
@@ -323,7 +356,11 @@ class WebSecretService:
         FingerprintKeyMissingError
             Propagated from the store when ``ELSPETH_FINGERPRINT_KEY`` is
             unset.  No row is written.  HTTP handlers map to 503.
+        UserSecretsDisabledError
+            The deployment runs in server-only mode.  No row is written.
         """
+        if not self._user_secrets_enabled:
+            raise UserSecretsDisabledError("user-scoped secrets are disabled on this deployment")
         fingerprint = self._user_store.set_secret(name, value=value, user_id=user_id, auth_provider_type=auth_provider_type)
         return CreateSecretResult(
             name=name,
@@ -332,7 +369,13 @@ class WebSecretService:
         )
 
     def delete_user_secret(self, user_id: str, name: str, *, auth_provider_type: AuthProviderType) -> bool:
-        """Delete a user-scoped secret. Returns True if deleted."""
+        """Delete a user-scoped secret. Returns True if deleted.
+
+        Raises ``UserSecretsDisabledError`` in server-only mode: the user
+        scope is not served at all, so there is nothing a caller can address.
+        """
+        if not self._user_secrets_enabled:
+            raise UserSecretsDisabledError("user-scoped secrets are disabled on this deployment")
         return self._user_store.delete_secret(name, user_id=user_id, auth_provider_type=auth_provider_type)
 
 

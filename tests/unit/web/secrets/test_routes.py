@@ -54,6 +54,8 @@ class _MockSettings:
 def _make_app(
     user_id: str = "alice",
     server_allowlist: tuple[str, ...] = (),
+    *,
+    user_secrets_enabled: bool = True,
 ) -> FastAPI:
     """Create a test app with secret routes and an in-memory DB."""
     engine = create_session_engine(
@@ -67,9 +69,11 @@ def _make_app(
 
     user_store = UserSecretStore(engine, _TEST_MASTER_KEY)
     server_store = ServerSecretStore(server_allowlist)
-    secret_service = WebSecretService(user_store, server_store)
+    secret_service = WebSecretService(user_store, server_store, user_secrets_enabled=user_secrets_enabled)
 
     app = FastAPI()
+    # Mirrors production app.state so a test can seed a pre-lockdown row.
+    app.state.user_secret_store = user_store
 
     identity = UserIdentity(user_id=user_id, username=user_id)
 
@@ -550,3 +554,50 @@ class TestSecretValidationRedaction:
             assert "loc" in error
             assert "msg" in error
             assert set(error.keys()) <= self._SAFE_KEYS
+
+
+# ---------------------------------------------------------------------------
+# Locked-down server-only mode
+# ---------------------------------------------------------------------------
+
+
+class TestServerOnlyMode:
+    """``user_secrets_enabled=False``: no user-scope writes, read-only inventory."""
+
+    def test_create_is_refused_with_a_typed_403_and_writes_nothing(self) -> None:
+        app = _make_app(user_secrets_enabled=False)
+        client = TestClient(app)
+
+        resp = client.post("/api/secrets", json={"name": "MY_KEY", "value": "super-secret-value"})
+
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error_type"] == "user_secrets_disabled"
+        assert "super-secret-value" not in resp.text
+        assert app.state.user_secret_store.has_secret_record("MY_KEY", user_id="alice", auth_provider_type="local") is False
+
+    def test_create_succeeds_when_enabled(self) -> None:
+        """Positive control for the refusal above: same request, flag on."""
+        client = TestClient(_make_app())
+
+        assert client.post("/api/secrets", json={"name": "MY_KEY", "value": "v"}).status_code == 201
+
+    def test_delete_is_refused_and_the_row_survives(self) -> None:
+        app = _make_app(user_secrets_enabled=False)
+        app.state.user_secret_store.set_secret("OLD_KEY", value="v", user_id="alice", auth_provider_type="local")
+
+        resp = TestClient(app).delete("/api/secrets/OLD_KEY")
+
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error_type"] == "user_secrets_disabled"
+        assert app.state.user_secret_store.has_secret_record("OLD_KEY", user_id="alice", auth_provider_type="local") is True
+
+    def test_inventory_lists_server_secrets_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "server-value")
+        app = _make_app(server_allowlist=("AWS_BEARER_TOKEN_BEDROCK",), user_secrets_enabled=False)
+        app.state.user_secret_store.set_secret("OLD_KEY", value="v", user_id="alice", auth_provider_type="local")
+        client = TestClient(app)
+
+        listed = client.get("/api/secrets").json()
+
+        assert [(item["name"], item["scope"], item["available"]) for item in listed] == [("AWS_BEARER_TOKEN_BEDROCK", "server", True)]
+        assert client.post("/api/secrets/OLD_KEY/validate").json() == {"name": "OLD_KEY", "available": False}

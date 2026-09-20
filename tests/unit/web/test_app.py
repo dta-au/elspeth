@@ -750,6 +750,15 @@ class TestSystemStatusEndpoint:
         assert response.status_code == 200
         assert response.json()["composer_timeout_seconds"] == 300.0
 
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_reports_server_only_secret_mode_and_enforces_it(self, tmp_path, enabled: bool) -> None:
+        """The SPA hides the add-a-key form from this flag; the API enforces it."""
+        app = create_app(_settings(tmp_path, user_secrets_enabled=enabled))
+        client = TestClient(app)
+
+        assert client.get("/api/system/status").json()["user_secrets_enabled"] is enabled
+        assert app.state.secret_service.user_secrets_enabled is enabled
+
     def test_classification_banner_defaults_to_null(self, tmp_path) -> None:
         """An undeclared deployment renders no protective-marking banner."""
         app = create_app(_settings(tmp_path))
@@ -2297,6 +2306,13 @@ class TestSettingsFromEnv:
         settings = settings_from_env()
         assert settings.port == 9090
         assert isinstance(settings.port, int)
+
+    @pytest.mark.parametrize(("raw", "expected"), [("false", False), ("true", True)])
+    def test_user_secrets_enabled_from_env(self, monkeypatch, raw: str, expected: bool) -> None:
+        """The operator's lockdown switch is ELSPETH_WEB__USER_SECRETS_ENABLED=false."""
+        monkeypatch.setenv("ELSPETH_WEB__USER_SECRETS_ENABLED", raw)
+
+        assert settings_from_env().user_secrets_enabled is expected
 
     def test_server_secret_allowlist_from_json(self, monkeypatch) -> None:
         monkeypatch.setenv("ELSPETH_WEB__SERVER_SECRET_ALLOWLIST", '["MY_KEY"]')

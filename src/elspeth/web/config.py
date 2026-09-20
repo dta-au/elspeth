@@ -445,7 +445,20 @@ class WebSettings(BaseModel):
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "AZURE_API_KEY",
+        # Bedrock: the Amazon Bedrock API key (bearer token), then the static
+        # IAM credential triple. All optional — the AWS default credential
+        # chain (task role) needs none of them.
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
     )
+    # Locked-down server-only mode: when False, user-scoped secrets are
+    # disabled end to end — the API refuses create/delete, stored user rows
+    # are neither listed nor resolved, and only ``server_secret_allowlist``
+    # names can be wired. Fail-closed for deployments where every credential
+    # must be operator-provisioned.
+    user_secrets_enabled: bool = True
     # Server-authored secret→destination allowlist (elspeth-f3c1aafd25).
     # Secret WIRING is deny-by-default: with no rules, wire_secret_ref and
     # every other marker entry path is refused at validation. Each rule

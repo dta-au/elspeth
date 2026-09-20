@@ -15,7 +15,7 @@ from elspeth.contracts.secrets import (
 )
 from elspeth.core.security.secret_loader import SecretNotFoundError
 from elspeth.web.secrets.server_store import ServerSecretStore
-from elspeth.web.secrets.service import WebSecretService
+from elspeth.web.secrets.service import UserSecretsDisabledError, WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -984,3 +984,71 @@ class TestResolveScoped:
         assert result is not None
         assert result.value == "secret-val"
         assert local_resolver.resolve_scoped("u1", "KEY", "user") is None
+
+
+class TestServerOnlyMode:
+    """``user_secrets_enabled=False`` removes the user scope from every method.
+
+    Each case stores a real user row first and proves an ENABLED service over
+    the same stores sees it (positive control), so a locked-down negative
+    cannot pass merely because the row was never written.
+    """
+
+    @pytest.fixture()
+    def locked(self, user_store: UserSecretStore, server_store: ServerSecretStore) -> WebSecretService:
+        return WebSecretService(user_store=user_store, server_store=server_store, user_secrets_enabled=False)
+
+    def test_flag_is_published_and_defaults_to_enabled(self, service: WebSecretService, locked: WebSecretService) -> None:
+        assert service.user_secrets_enabled is True
+        assert locked.user_secrets_enabled is False
+
+    def test_stored_user_row_is_not_listed(self, service: WebSecretService, locked: WebSecretService, user_store: UserSecretStore) -> None:
+        user_store.set_secret("USER_ONLY", value="val", user_id="user-1", auth_provider_type="local")
+
+        assert "USER_ONLY" in {item.name for item in service.list_refs("user-1", auth_provider_type="local")}
+        locked_items = locked.list_refs("user-1", auth_provider_type="local")
+        assert [(item.name, item.scope) for item in locked_items] == [("TEST_KEY", "server")]
+
+    def test_stored_user_row_does_not_resolve_or_shadow_the_server_secret(
+        self,
+        service: WebSecretService,
+        locked: WebSecretService,
+        user_store: UserSecretStore,
+    ) -> None:
+        user_store.set_secret("TEST_KEY", value="user-value", user_id="user-1", auth_provider_type="local")
+        user_store.set_secret("USER_ONLY", value="val", user_id="user-1", auth_provider_type="local")
+
+        enabled = service.resolve("user-1", "TEST_KEY", auth_provider_type="local")
+        assert enabled is not None and enabled.scope == "user"
+
+        resolved = locked.resolve("user-1", "TEST_KEY", auth_provider_type="local")
+        assert resolved is not None
+        assert (resolved.scope, resolved.value) == ("server", "env-value")
+        assert locked.resolve("user-1", "USER_ONLY", auth_provider_type="local") is None
+        assert locked.has_ref("user-1", "USER_ONLY", auth_provider_type="local") is False
+        assert locked.has_ref("user-1", "TEST_KEY", auth_provider_type="local") is True
+        assert locked.check_user_ref_resolvable("user-1", "USER_ONLY", auth_provider_type="local") is False
+        assert locked.check_user_ref_resolvable("user-1", "TEST_KEY", auth_provider_type="local") is True
+
+    def test_explicit_user_scope_resolution_is_absent(
+        self,
+        service: WebSecretService,
+        locked: WebSecretService,
+        user_store: UserSecretStore,
+    ) -> None:
+        user_store.set_secret("USER_ONLY", value="val", user_id="user-1", auth_provider_type="local")
+
+        assert service.resolve_scoped("user-1", "USER_ONLY", "user", auth_provider_type="local") is not None
+        assert locked.resolve_scoped("user-1", "USER_ONLY", "user", auth_provider_type="local") is None
+        assert locked.resolve_scoped("user-1", "TEST_KEY", "server", auth_provider_type="local") is not None
+
+    def test_writes_are_refused_without_touching_the_store(self, locked: WebSecretService, user_store: UserSecretStore) -> None:
+        user_store.set_secret("EXISTING", value="val", user_id="user-1", auth_provider_type="local")
+
+        with pytest.raises(UserSecretsDisabledError, match="disabled"):
+            locked.set_user_secret("user-1", "NEW_KEY", "value", auth_provider_type="local")
+        with pytest.raises(UserSecretsDisabledError, match="disabled"):
+            locked.delete_user_secret("user-1", "EXISTING", auth_provider_type="local")
+
+        assert user_store.has_secret_record("NEW_KEY", user_id="user-1", auth_provider_type="local") is False
+        assert user_store.has_secret_record("EXISTING", user_id="user-1", auth_provider_type="local") is True

@@ -44,6 +44,40 @@ BEDROCK_REGION_MIN_LENGTH = 1
 BEDROCK_REGION_MAX_LENGTH = 64
 BEDROCK_REGION_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 BEDROCK_VALUE_SOURCES: tuple[ValueSource, ...] = ()
+BEDROCK_CREDENTIAL_MIN_LENGTH = 1
+BEDROCK_API_KEY_MAX_LENGTH = 16384
+BEDROCK_ACCESS_KEY_ID_MAX_LENGTH = 256
+BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH = 4096
+BEDROCK_SESSION_TOKEN_MAX_LENGTH = 16384
+
+
+def validate_bedrock_credential_fields(
+    *,
+    api_key: str | None,
+    aws_access_key_id: str | None,
+    aws_secret_access_key: str | None,
+    aws_session_token: str | None,
+) -> None:
+    """Enforce the cross-field Bedrock credential contract shared by both LLM surfaces.
+
+    Every credential is optional: with none configured the provider uses
+    boto3's default AWS credential chain (task role, environment, profile),
+    which stays the deployment default. An explicit credential is exactly one
+    of a Bedrock API key (``api_key``, sent as a bearer token) or a static
+    IAM pair (``aws_access_key_id`` + ``aws_secret_access_key``, with
+    ``aws_session_token`` admitted only alongside the pair). Raises
+    ``ValueError`` with a field-precise message that never echoes a value.
+    """
+    access_present = aws_access_key_id is not None
+    secret_present = aws_secret_access_key is not None
+    session_present = aws_session_token is not None
+    if api_key is not None and (access_present or secret_present or session_present):
+        raise ValueError("api_key and static AWS credentials are mutually exclusive; configure exactly one Bedrock credential")
+    if access_present != secret_present:
+        raise ValueError("aws_access_key_id and aws_secret_access_key are required together as a credential pair")
+    if session_present and not access_present:
+        raise ValueError("aws_session_token requires the access and secret credential pair")
+
 
 #: The capability a ``response_format="structured"`` query consumes. Standard
 #: mode asks only for ``json_object``; structured mode sends an API-native
@@ -259,11 +293,16 @@ def validate_gateway_single_prompt_structured_output_capability(
 
 __all__ = [
     "AZURE_MODEL_VALUE_SOURCES",
+    "BEDROCK_ACCESS_KEY_ID_MAX_LENGTH",
+    "BEDROCK_API_KEY_MAX_LENGTH",
+    "BEDROCK_CREDENTIAL_MIN_LENGTH",
     "BEDROCK_MODEL_MAX_LENGTH",
     "BEDROCK_MODEL_MIN_LENGTH",
     "BEDROCK_REGION_MAX_LENGTH",
     "BEDROCK_REGION_MIN_LENGTH",
     "BEDROCK_REGION_PATTERN",
+    "BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH",
+    "BEDROCK_SESSION_TOKEN_MAX_LENGTH",
     "BEDROCK_VALUE_SOURCES",
     "GATEWAY_LOOPBACK_HOST",
     "GATEWAY_MAX_TOKENS_LIMIT",
@@ -283,6 +322,7 @@ __all__ = [
     "derive_azure_model",
     "normalize_openrouter_base_url",
     "validate_azure_endpoint",
+    "validate_bedrock_credential_fields",
     "validate_bedrock_model",
     "validate_gateway_capabilities",
     "validate_gateway_contract_major",

@@ -300,7 +300,7 @@ class TestBedrockProviderTelemetryWiring:
     def test_telemetry_emitted_on_bedrock_llm_call(self) -> None:
         from litellm.types.utils import ModelResponse, Usage
 
-        from elspeth.plugins.transforms.llm.providers.bedrock import BedrockLLMProvider
+        from elspeth.plugins.transforms.llm.providers.bedrock import BedrockCredentials, BedrockLLMProvider
 
         response = ModelResponse(
             choices=[
@@ -316,6 +316,7 @@ class TestBedrockProviderTelemetryWiring:
         events: list[Any] = []
         provider = BedrockLLMProvider(
             region_name=None,
+            credentials=BedrockCredentials(),
             recorder=cast(PluginAuditWriter, _ExecutionRepositoryDouble()),
             run_id="test-run",
             telemetry_emit=events.append,

@@ -42,6 +42,11 @@ LLM_PROFILE_PRIVATE_FIELDS = frozenset(
         "model",
         "api_key",
         "api_key_secret",
+        # Bedrock's static IAM credentials: provider-binding credentials like
+        # ``api_key``, so a profiled node may never author them.
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
         "base_url",
         "endpoint",
         "deployment_name",
@@ -132,8 +137,15 @@ class LLMProfileSettings(BaseModel):
         if self.provider == "azure" and self.region_name is not None:
             raise ValueError("azure profile does not support region_name")
         if self.provider == "bedrock":
-            if self.credential_scope is not None or self.credential_ref is not None:
-                raise ValueError("Bedrock profiles use the keyless AWS credential chain")
+            # Bedrock credentials are optional: a scope-less profile uses the
+            # AWS default credential chain, and a credentialed one names an
+            # Amazon Bedrock API key that lowering wires as ``api_key``. A
+            # profile carries one reference, so the static IAM credential
+            # pair is reachable only through explicit node options.
+            if (self.credential_scope is None) != (self.credential_ref is None):
+                raise ValueError("Bedrock profile credential requires both scope and reference, or neither")
+            if self.credential_ref is not None and SECRET_REF_PATTERN.fullmatch(self.credential_ref) is None:
+                raise ValueError("credential reference has invalid syntax")
             if any(value is not None for value in (self.base_url, self.endpoint, self.deployment_name, self.api_version)):
                 raise ValueError("Bedrock profile contains fields owned by another provider")
             validate_bedrock_model(self.model)

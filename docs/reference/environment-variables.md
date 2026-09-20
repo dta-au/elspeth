@@ -327,19 +327,39 @@ with `-` or `_`).
 
 Credential rules:
 
-- **Bedrock profiles are keyless.** They authenticate through the AWS default
-  credential chain of the web process (the ECS task role on AWS). Setting
-  `credential_scope` or `credential_ref` on a Bedrock profile is a startup
-  error.
+- **Bedrock profiles are keyless by default.** With no credential they
+  authenticate through the AWS default credential chain of the web process
+  (the ECS task role on AWS). A Bedrock profile may instead name an Amazon
+  Bedrock API key: set `credential_scope` and `credential_ref` together
+  (conventionally `AWS_BEARER_TOKEN_BEDROCK`) and the key is sent as a bearer
+  token. Setting only one of the two is a startup error. A profile carries a
+  single reference, so the static IAM credentials (`aws_access_key_id`,
+  `aws_secret_access_key`, optional `aws_session_token`) are available only
+  as explicit `llm` node options, each wired through
+  `ELSPETH_WEB__SECRET_WIRING_ALLOWLIST`; the API key and the IAM pair are
+  mutually exclusive. Note that LiteLLM prefers a process-level
+  `AWS_BEARER_TOKEN_BEDROCK` environment variable over SigV4 signing, so do
+  not set it on a deployment that should authenticate with IAM credentials
+  or a task role.
 - **OpenRouter and Azure profiles are credentialed.** With
   `credential_scope: server`, the `credential_ref` name resolves as an
   environment variable of the web process; the name must appear in
   `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST` (JSON array; default
   `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `AZURE_API_KEY`), the variable must be set and non-empty, and
-  `ELSPETH_FINGERPRINT_KEY` must be set because secret use is fingerprinted
-  into the audit trail. With `credential_scope: user`, the reference resolves
-  through the signed-in user's own uploaded secret store instead.
+  `AZURE_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`), the variable must be set and
+  non-empty, and `ELSPETH_FINGERPRINT_KEY` must be set because secret use is
+  fingerprinted into the audit trail. With `credential_scope: user`, the
+  reference resolves through the signed-in user's own uploaded secret store
+  instead.
+- **Server-only mode.** `ELSPETH_WEB__USER_SECRETS_ENABLED=false` (default
+  `true`) disables user-scoped secrets end to end: `POST` and `DELETE
+  /api/secrets` return 403 (`user_secrets_disabled`), previously stored user
+  secrets are neither listed nor resolved and no longer shadow a server
+  secret of the same name, the "API keys & secrets" panel renders read-only,
+  and any profile with `credential_scope: user` becomes unusable. Only names
+  in `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST` remain available. Stored rows are
+  left in place, so re-enabling restores them.
 
 A profile whose credential cannot be resolved for a given user is unusable
 for that user. When a user has no usable profile at all, the `llm` transform

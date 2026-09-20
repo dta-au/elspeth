@@ -1640,7 +1640,11 @@ def _create_app(
     server_secret_store = ServerSecretStore(settings.server_secret_allowlist)
     app.state.user_secret_store = user_secret_store
     app.state.server_secret_store = server_secret_store
-    app.state.secret_service = WebSecretService(user_secret_store, server_secret_store)
+    app.state.secret_service = WebSecretService(
+        user_secret_store,
+        server_secret_store,
+        user_secrets_enabled=settings.user_secrets_enabled,
+    )
     app.state.scoped_secret_resolver = ScopedSecretResolver(app.state.secret_service, settings.auth_provider)
     from elspeth.web.plugin_policy.availability import RequestPluginSnapshotFactory
 
@@ -2193,6 +2197,10 @@ def _create_app(
             # wall clock (there is no fixed maximum — only transport-ceiling
             # headroom), not just the checked-in deployment default.
             "composer_timeout_seconds": settings.composer_timeout_seconds,
+            # Locked-down server-only mode: False tells the SPA not to offer
+            # the add-a-key form. Advisory only — POST/DELETE /api/secrets
+            # refuse with 403 regardless of what a client believes.
+            "user_secrets_enabled": settings.user_secrets_enabled,
             # The served SPA bundle's identity (deploy-cache coherence
             # beacon); null when no built dist is present.
             "frontend_build": app.state.frontend_build,

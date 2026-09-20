@@ -44,6 +44,21 @@ def create_secrets_router() -> APIRouter:
         settings: WebSettings = request.app.state.settings
         return settings
 
+    def _require_user_secrets_enabled(service: WebSecretService) -> None:
+        """Refuse user-scope writes in locked-down server-only mode.
+
+        Checked before the worker hop so the refusal never touches the store;
+        the service enforces the same rule for every non-HTTP caller.
+        """
+        if not service.user_secrets_enabled:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error_type": "user_secrets_disabled",
+                    "detail": "User-scoped secrets are disabled on this deployment; secrets are configured by an administrator.",
+                },
+            )
+
     def _validated_path_secret_name(name: str) -> str:
         try:
             return validate_secret_name(name)
@@ -98,6 +113,7 @@ def create_secrets_router() -> APIRouter:
         """
         service = _get_service(request)
         settings = _get_settings(request)
+        _require_user_secrets_enabled(service)
         result = await run_sync_in_worker(
             service.set_user_secret,
             user.user_id,
@@ -123,6 +139,7 @@ def create_secrets_router() -> APIRouter:
         name = _validated_path_secret_name(name)
         service = _get_service(request)
         settings = _get_settings(request)
+        _require_user_secrets_enabled(service)
         deleted = await run_sync_in_worker(
             service.delete_user_secret,
             user.user_id,

@@ -1271,6 +1271,13 @@ export interface SystemStatus {
    */
   composer_timeout_seconds?: number;
   /**
+   * False when the deployment runs in locked-down server-only mode
+   * (ELSPETH_WEB__USER_SECRETS_ENABLED=false): users cannot add their own
+   * keys and SecretsPanel renders read-only. Absent is treated as enabled
+   * for fixture tolerance; the server always sends it.
+   */
+  user_secrets_enabled?: boolean;
+  /**
    * Operator-declared protective marking for the deployment
    * (ELSPETH_WEB__CLASSIFICATION_BANNER), rendered by ClassificationBanner
    * in the reserved overlay band. Null/absent renders no banner. Mirrors

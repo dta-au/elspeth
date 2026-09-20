@@ -858,7 +858,12 @@ function App() {
           </div>
         )}
 
-        {showSecrets && <SecretsPanel onClose={closeSecrets} />}
+        {showSecrets && (
+          <SecretsPanel
+            onClose={closeSecrets}
+            userSecretsEnabled={systemStatus?.user_secrets_enabled !== false}
+          />
+        )}
         <GraphModal />
         <ImportYamlModalHost />
         {/* Phase 6B Task 4: mount the SaveForReviewDialog at app-root level so

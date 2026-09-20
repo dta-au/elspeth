@@ -35,9 +35,15 @@ from elspeth.plugins.infrastructure.clients.llm import (
 )
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMProvider
-from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
+from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockCredentials, BedrockLLMProvider
 
 MODEL = "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
+DEFAULT_CHAIN = BedrockCredentials()
+# Distinctive sentinels: the audit-leak proofs search recorded calls for them.
+API_KEY = "bedrock-api-key-sentinel"  # secret-scan: allow-this-line
+ACCESS_KEY_ID = "access-key-id-sentinel"  # secret-scan: allow-this-line
+SECRET_ACCESS_KEY = "secret-access-key-sentinel"  # secret-scan: allow-this-line
+SESSION_TOKEN = "session-token-sentinel"  # secret-scan: allow-this-line
 DYNAMIC_SCHEMA = {"mode": "observed"}
 
 
@@ -95,6 +101,7 @@ def test_governance_guards_bedrock_and_settles_once(preflight: bool, refused: bo
 
     provider = BedrockLLMProvider(
         region_name=None,
+        credentials=DEFAULT_CHAIN,
         recorder=recorder,
         run_id="run-1",
         telemetry_emit=FakeTelemetryEmit(),
@@ -138,11 +145,13 @@ def _config(**overrides: object) -> dict[str, object]:
 def _provider(
     *,
     region_name: str | None = None,
+    credentials: BedrockCredentials = DEFAULT_CHAIN,
     recorder: FakeAuditRecorder | None = None,
     telemetry: FakeTelemetryEmit | None = None,
 ) -> BedrockLLMProvider:
     return BedrockLLMProvider(
         region_name=region_name,
+        credentials=credentials,
         recorder=recorder if recorder is not None else FakeAuditRecorder(),
         run_id="run-1",
         telemetry_emit=telemetry if telemetry is not None else FakeTelemetryEmit(),
@@ -195,9 +204,53 @@ class TestBedrockConfig:
         assert config.provider == "bedrock"
         assert config.model == MODEL
         assert config.region_name is None
-        assert "api_key" not in BedrockConfig.model_fields
-        assert "aws_access_key_id" not in BedrockConfig.model_fields
-        assert "aws_secret_access_key" not in BedrockConfig.model_fields
+        # Credentials are optional: none configured means the default chain.
+        assert config.credentials() == DEFAULT_CHAIN
+        assert config.credentials().litellm_kwargs() == {}
+
+    def test_api_key_is_accepted_as_the_only_credential(self) -> None:
+        config = BedrockConfig.from_dict(_config(api_key=API_KEY))
+
+        assert config.credentials().litellm_kwargs() == {"api_key": API_KEY}
+
+    @pytest.mark.parametrize("session_token", [None, SESSION_TOKEN])
+    def test_static_credential_pair_is_accepted_with_optional_session_token(self, session_token: str | None) -> None:
+        overrides: dict[str, object] = {"aws_access_key_id": ACCESS_KEY_ID, "aws_secret_access_key": SECRET_ACCESS_KEY}
+        expected = {"aws_access_key_id": ACCESS_KEY_ID, "aws_secret_access_key": SECRET_ACCESS_KEY}
+        if session_token is not None:
+            overrides["aws_session_token"] = session_token
+            expected["aws_session_token"] = session_token
+
+        assert BedrockConfig.from_dict(_config(**overrides)).credentials().litellm_kwargs() == expected
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"api_key": API_KEY, "aws_access_key_id": ACCESS_KEY_ID, "aws_secret_access_key": SECRET_ACCESS_KEY}, "mutually exclusive"),
+            ({"aws_access_key_id": ACCESS_KEY_ID}, "required together"),
+            ({"aws_secret_access_key": SECRET_ACCESS_KEY}, "required together"),
+            ({"aws_session_token": SESSION_TOKEN}, "aws_session_token requires"),
+            ({"api_key": ""}, "api_key"),
+        ],
+    )
+    def test_inconsistent_credentials_are_rejected(self, overrides: dict[str, object], message: str) -> None:
+        with pytest.raises(PluginConfigError, match=message):
+            BedrockConfig.from_dict(_config(**overrides))
+
+    def test_credential_values_never_appear_in_reprs_or_validation_errors(self) -> None:
+        config = BedrockConfig.from_dict(
+            _config(aws_access_key_id=ACCESS_KEY_ID, aws_secret_access_key=SECRET_ACCESS_KEY, aws_session_token=SESSION_TOKEN)
+        )
+        rendered = repr(config) + repr(config.credentials()) + repr(BedrockCredentials(api_key=API_KEY))
+        # Positive control: the repr is a real rendering, not an empty string.
+        assert MODEL in rendered
+        for sentinel in (API_KEY, ACCESS_KEY_ID, SECRET_ACCESS_KEY, SESSION_TOKEN):
+            assert sentinel not in rendered
+
+        with pytest.raises(PluginConfigError) as excinfo:
+            BedrockConfig.from_dict(_config(api_key=API_KEY, aws_access_key_id=ACCESS_KEY_ID, aws_secret_access_key=SECRET_ACCESS_KEY))
+        for sentinel in (API_KEY, ACCESS_KEY_ID, SECRET_ACCESS_KEY):
+            assert sentinel not in str(excinfo.value)
 
     def test_explicit_region_is_accepted(self) -> None:
         assert BedrockConfig.from_dict(_config(region_name="us-gov-west-1")).region_name == "us-gov-west-1"
@@ -236,10 +289,6 @@ class TestBedrockConfig:
     @pytest.mark.parametrize(
         "field_name",
         [
-            "api_key",
-            "aws_access_key_id",
-            "aws_secret_access_key",
-            "aws_session_token",
             "profile",
             "profile_name",
             "role",
@@ -248,7 +297,7 @@ class TestBedrockConfig:
             "endpoint_url",
         ],
     )
-    def test_credential_and_endpoint_fields_are_rejected(self, field_name: str) -> None:
+    def test_ambient_identity_and_endpoint_fields_are_rejected(self, field_name: str) -> None:
         with pytest.raises(PluginConfigError, match=field_name):
             BedrockConfig.from_dict(_config(**{field_name: "forbidden"}))
 
@@ -300,11 +349,51 @@ class TestBedrockAdapter:
     def test_region_does_not_override_an_explicit_call_kwarg(self) -> None:
         from elspeth.plugins.transforms.llm.providers.bedrock import _LiteLLMSDKAdapter
 
-        adapter = _LiteLLMSDKAdapter(region_name="ap-southeast-2")
+        adapter = _LiteLLMSDKAdapter(region_name="ap-southeast-2", credentials=DEFAULT_CHAIN)
         with patch("litellm.completion", return_value=_response()) as completion:
             adapter.create(model=MODEL, messages=[], aws_region_name="us-east-1")
 
         assert completion.call_args.kwargs["aws_region_name"] == "us-east-1"
+
+    @pytest.mark.parametrize(
+        "credentials",
+        [
+            BedrockCredentials(api_key=API_KEY),
+            BedrockCredentials(aws_access_key_id=ACCESS_KEY_ID, aws_secret_access_key=SECRET_ACCESS_KEY),
+            BedrockCredentials(aws_access_key_id=ACCESS_KEY_ID, aws_secret_access_key=SECRET_ACCESS_KEY, aws_session_token=SESSION_TOKEN),
+        ],
+        ids=["api-key", "static-pair", "static-pair-with-session"],
+    )
+    def test_configured_credentials_reach_litellm_but_never_the_audit_record(self, credentials: BedrockCredentials) -> None:
+        recorder = FakeAuditRecorder()
+        provider = _provider(credentials=credentials, recorder=recorder)
+
+        with patch("litellm.completion", return_value=_response()) as completion:
+            _execute(provider)
+
+        kwargs = completion.call_args.kwargs
+        expected = credentials.litellm_kwargs()
+        assert expected  # positive control: this case really carries a credential
+        assert {name: kwargs[name] for name in expected} == expected
+        for name in ("api_key", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"):
+            assert (name in kwargs) == (name in expected)
+
+        # The credential is injected below the audited client, so the recorded
+        # call must not carry it. Positive control: the model IS recorded.
+        assert len(recorder.calls) == 1
+        recorded = repr(recorder.calls)
+        assert MODEL in recorded
+        for secret_value in expected.values():
+            assert secret_value not in recorded
+
+    def test_configured_credentials_override_a_caller_supplied_identity(self) -> None:
+        from elspeth.plugins.transforms.llm.providers.bedrock import _LiteLLMSDKAdapter
+
+        adapter = _LiteLLMSDKAdapter(region_name=None, credentials=BedrockCredentials(api_key=API_KEY))
+        with patch("litellm.completion", return_value=_response()) as completion:
+            adapter.create(model=MODEL, messages=[], api_key="caller-supplied")
+
+        assert completion.call_args.kwargs["api_key"] == API_KEY
 
 
 class TestBedrockProvider:
@@ -312,6 +401,7 @@ class TestBedrockProvider:
         recorder = FakeAuditRecorder()
         provider = BedrockLLMProvider(
             region_name=None,
+            credentials=DEFAULT_CHAIN,
             recorder=recorder,
             run_id="run-1",
             telemetry_emit=FakeTelemetryEmit(),

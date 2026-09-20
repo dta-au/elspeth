@@ -13,11 +13,16 @@ from elspeth.plugins.infrastructure.config_base import DataPluginConfig
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment
 from elspeth.plugins.llm.config_validation import (
     AZURE_MODEL_VALUE_SOURCES,
+    BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
+    BEDROCK_API_KEY_MAX_LENGTH,
+    BEDROCK_CREDENTIAL_MIN_LENGTH,
     BEDROCK_MODEL_MAX_LENGTH,
     BEDROCK_MODEL_MIN_LENGTH,
     BEDROCK_REGION_MAX_LENGTH,
     BEDROCK_REGION_MIN_LENGTH,
     BEDROCK_REGION_PATTERN,
+    BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH,
+    BEDROCK_SESSION_TOKEN_MAX_LENGTH,
     BEDROCK_VALUE_SOURCES,
     GATEWAY_MAX_TOKENS_LIMIT,
     GATEWAY_MAX_TOKENS_MIN_EXCLUSIVE,
@@ -30,6 +35,7 @@ from elspeth.plugins.llm.config_validation import (
     OPENROUTER_MODEL_VALUE_SOURCES,
     derive_azure_model,
     validate_azure_endpoint,
+    validate_bedrock_credential_fields,
     validate_bedrock_model,
     validate_gateway_capabilities,
     validate_gateway_contract_major,
@@ -201,7 +207,7 @@ class OpenRouterLLMSourceConfig(LLMSourceConfig):
 
 
 class BedrockLLMSourceConfig(LLMSourceConfig):
-    """Keyless LiteLLM Bedrock settings for one source request."""
+    """LiteLLM Bedrock settings for one source request; the AWS default chain unless a credential is wired."""
 
     provider: Literal["bedrock"] = Field(default="bedrock", description="LLM provider")
     model: str = Field(
@@ -217,12 +223,50 @@ class BedrockLLMSourceConfig(LLMSourceConfig):
         pattern=BEDROCK_REGION_PATTERN,
         description="AWS region override; default AWS region resolution otherwise",
     )
+    api_key: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_API_KEY_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved Amazon Bedrock API key (bearer token); mutually exclusive with the static AWS credential pair.",
+    )
+    aws_access_key_id: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS access-key identifier; required together with aws_secret_access_key.",
+    )
+    aws_secret_access_key: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS secret access key; required together with aws_access_key_id.",
+    )
+    aws_session_token: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_SESSION_TOKEN_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS session token for temporary static credentials.",
+    )
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
 
     @field_validator("model")
     @classmethod
     def _require_bedrock_prefix(cls, value: str) -> str:
         return validate_bedrock_model(value)
+
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> BedrockLLMSourceConfig:
+        validate_bedrock_credential_fields(
+            api_key=self.api_key,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
+        return self
 
     VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = BEDROCK_VALUE_SOURCES
 
