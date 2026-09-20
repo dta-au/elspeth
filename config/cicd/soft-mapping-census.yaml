@@ -962,8 +962,8 @@ files:
     Mapping[str, object]: 3
   src/elspeth/web/plugin_policy/profiles.py:
     Mapping[str, object]: 2
-    dict[str, Any]: 17
-    dict[str, object]: 8
+    dict[str, Any]: 21
+    dict[str, object]: 10
   src/elspeth/web/plugin_policy/validation.py:
     Mapping[str, object]: 1
     dict[str, object]: 2
@@ -1046,6 +1046,6 @@ totals:
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1139
-  dict[str, object]: 406
-  soft: 2740
+  dict[str, Any]: 1143
+  dict[str, object]: 408
+  soft: 2746

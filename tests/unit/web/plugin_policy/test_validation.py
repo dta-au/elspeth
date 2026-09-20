@@ -1,3 +1,6 @@
+import pytest
+
+
 def test_profile_unavailable_finding_enumerates_available_aliases() -> None:
     """When operator profiles EXIST and the options simply failed to select
     one, the finding must say so and name the aliases — telling the model
@@ -650,3 +653,188 @@ def test_scope_mismatch_suggestion_repairs_the_control_scope_not_the_wiring() ->
     assert "untrusted_prompt" in finding.suggestion
     assert "benign_label" in finding.suggestion
     assert "'recommend'" in finding.suggestion
+
+
+def _search_policy_context(*, secret_wiring_allowlist: tuple[str, ...] = ()) -> tuple[object, object, object]:
+    """Real registry + the snapshot the PRODUCTION builder makes + catalog, for two search profiles."""
+    from elspeth.web.config import WebSettings
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    class _Inventory:
+        def has_server_ref(self, name: str) -> bool:
+            return name == "SEARCH_B_KEY"
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return self.has_server_ref(name)
+
+        def server_generation(self, name: str) -> str | None:
+            return "present" if self.has_server_ref(name) else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    settings = WebSettings.model_validate(
+        {
+            "composer_max_composition_turns": 4,
+            "composer_max_discovery_turns": 4,
+            "composer_timeout_seconds": 60,
+            "composer_rate_limit_per_minute": 20,
+            "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+            "plugin_allowlist": ["transform:azure_ai_search"],
+            "server_secret_allowlist": ["SEARCH_B_KEY"],
+            "secret_wiring_allowlist": list(secret_wiring_allowlist),
+            "azure_search_profiles": [
+                {
+                    "alias": "policies",
+                    "endpoint": "https://operator-private-marker.search.windows.net",
+                    "auth": "managed_identity",
+                    "indexes": ["approved-documents"],
+                },
+                {
+                    "alias": "contracts",
+                    "endpoint": "https://operator-private-marker-b.search.windows.net",
+                    "auth": "api_key",
+                    "credential_ref": "SEARCH_B_KEY",
+                    "indexes": "any",
+                },
+            ],
+        }
+    )
+    runtime_config = RuntimeWebPluginConfig.from_settings(settings)
+    catalog = create_catalog_service()
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config)
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime_config)
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=catalog,
+        profiles=registry,
+        principal_scope="local:alice",
+        secret_inventory=_Inventory(),
+        generation_key=b"deterministic-test-generation-key",
+    )
+    return registry, snapshot, catalog
+
+
+def _search_node_state(**options: object) -> object:
+    from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
+
+    node = NodeSpec(
+        id="rag_1",
+        node_type="transform",
+        plugin="azure_ai_search",
+        input="transform_in",
+        on_success="results",
+        on_error="discard",
+        options={"query_field": "question", "output_prefix": "policy", "schema": {"mode": "observed"}, **options},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    return CompositionState(source=None, nodes=(node,), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+
+def _validate_search(state: object, context: tuple[object, object, object] | None = None):
+    from typing import cast
+
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+    from elspeth.web.plugin_policy.validation import validate_plugin_policy
+
+    registry, snapshot, catalog = context or _search_policy_context()
+    return validate_plugin_policy(
+        cast(CompositionState, state),
+        snapshot=cast(PluginAvailabilitySnapshot, snapshot),
+        profile_registry=cast(OperatorProfileRegistry, registry),
+        catalog=cast(CatalogService, catalog),
+    )
+
+
+def test_validate_plugin_policy_lowers_a_profiled_azure_ai_search_node() -> None:
+    from typing import cast
+
+    from elspeth.web.composer.state import CompositionState
+
+    state = _search_node_state(profile="policies", index="approved-documents")
+
+    result = _validate_search(state)
+
+    assert result.findings == ()
+    executable = dict(result.executable_state.nodes[0].options)
+    assert executable["endpoint"] == "https://operator-private-marker.search.windows.net"
+    assert executable["use_managed_identity"] is True
+    assert "profile" not in executable
+    authored = dict(cast(CompositionState, state).nodes[0].options)
+    assert "endpoint" not in authored
+    assert authored["profile"] == "policies"
+
+
+def test_validate_plugin_policy_refuses_a_raw_azure_ai_search_node() -> None:
+    """The guarantee that replaces the managed-identity refusal: no profile, no lowering."""
+    state = _search_node_state(endpoint="https://tenant-b.search.windows.net", index="payroll", use_managed_identity=True)
+
+    result = _validate_search(state)
+
+    assert [finding.error_code for finding in result.findings] == ["profile_unavailable"]
+    assert result.executable_state is state
+    # The finding names the aliases the author may choose, never the binding.
+    assert "policies" in result.findings[0].message
+    assert "operator-private-marker" not in result.findings[0].message
+
+
+@pytest.mark.parametrize(
+    "private",
+    [
+        {"endpoint": "https://tenant-b.search.windows.net"},
+        {"use_managed_identity": True},
+        {"client_id": "11111111-2222-3333-4444-555555555555"},
+        {"api_key": "stolen"},
+        {"api_key": {"secret_ref": "SOMEONE_ELSES_KEY"}},
+        {"api_version": "2020-06-30"},
+    ],
+    ids=["endpoint", "use_managed_identity", "client_id", "api_key-literal", "api_key-ref", "api_version"],
+)
+def test_validate_plugin_policy_refuses_a_private_option_beside_a_profile(private: dict[str, object]) -> None:
+    state = _search_node_state(profile="policies", index="approved-documents", **private)
+
+    result = _validate_search(state)
+
+    assert len(result.findings) == 1
+    assert "not authorable on a profile-bound node" in result.findings[0].message
+    assert next(iter(private)) in result.findings[0].message
+    assert result.executable_state is state
+    assert "tenant-b" not in result.findings[0].message
+    assert "stolen" not in result.findings[0].message
+
+
+def test_validate_plugin_policy_refuses_an_index_the_profile_does_not_admit() -> None:
+    state = _search_node_state(profile="policies", index="hr-records")
+
+    result = _validate_search(state)
+
+    assert len(result.findings) == 1
+    assert "Index is not admitted by the selected Azure AI Search profile" in result.findings[0].message
+    assert "hr-records" not in result.findings[0].message
+    assert "approved-documents" not in result.findings[0].message
+    assert result.executable_state is state
+
+
+def test_validate_plugin_policy_admits_any_index_under_an_any_profile() -> None:
+    result = _validate_search(_search_node_state(profile="contracts", index="hr-records"))
+
+    assert result.findings == ()
+    executable = dict(result.executable_state.nodes[0].options)
+    assert executable["api_key"] == {"secret_ref": "SEARCH_B_KEY", "secret_scope": "server"}
+    assert executable["index"] == "hr-records"

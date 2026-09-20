@@ -28,6 +28,7 @@ from elspeth.contracts.aws_textract import (
     TextractProfiledAuditIdentity,
     textract_profiled_binding_fingerprint,
 )
+from elspeth.contracts.azure_ai_search import AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
@@ -1156,6 +1157,221 @@ class _TextractProfileResolver:
         return usable_aliases[0] if len(usable_aliases) == 1 else None
 
 
+_AZURE_SEARCH_PROFILE_DESCRIPTION = "Operator-approved Azure AI Search profile alias"
+
+
+class _AzureSearchProfileResolver:
+    """Web-authoring contract for azure_ai_search: the operator owns the service binding.
+
+    A profile supplies the endpoint and how to authenticate to it; the author
+    supplies everything else, including which index to query, which the
+    profile's pin must admit.
+    """
+
+    def __init__(self, profiles: tuple[AzureSearchProfileSettings, ...]) -> None:
+        if not profiles:
+            raise ValueError("profile_unavailable")
+        self._profiles = {profile.alias: profile for profile in profiles}
+
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for the azure_ai_search transform plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
+        source_param="full_schema",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a "
+            "mapping, if any author-visible property schema is not a mapping, or if an author-visible property "
+            "has no canonical knob projection; never publishes a name in "
+            "AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES. An ABSENT key is not a softer path: 'properties' absent "
+            "publishes only 'profile', which the plugin's own required 'index' then makes unsatisfiable rather "
+            "than wider; an absent 'required' carries JSON Schema's own 'nothing is required'; an absent '$defs' "
+            "is reachable only for a schema carrying no $ref"
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_search_public_schema_rejects_non_mapping_properties",
+        test_fingerprint="9ad026ea44928c0b871a34ab25a6a7bc05933c1a5507fe267679dcb27c40f5c9",
+    )
+    def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
+        from elspeth.web.catalog.schemas import PluginSchemaInfo
+
+        raw_properties = full_schema.json_schema.get("properties", {})
+        if not isinstance(raw_properties, dict):
+            raise ValueError("malformed_profile_schema")
+        # Computed, not listed: a new author option on the plugin is web-visible
+        # without touching this file, and a new binding option must join the
+        # private set to be hidden.
+        author_names = tuple(name for name in raw_properties if name not in AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES)
+        available = tuple(self._profiles[alias] for alias in available_aliases)
+        profile_description = f"{_AZURE_SEARCH_PROFILE_DESCRIPTION}. Indexes each profile admits: " + "; ".join(
+            f"{profile.alias}: {'any index' if isinstance(profile.indexes, str) else ', '.join(profile.indexes)}" for profile in available
+        )
+        safe_properties: dict[str, Any] = {
+            "profile": {
+                "type": "string",
+                "enum": list(available_aliases),
+                "description": profile_description,
+            }
+        }
+        for name in author_names:
+            raw_schema = raw_properties[name]
+            if not isinstance(raw_schema, dict):
+                raise ValueError("malformed_profile_schema")
+            safe_properties[name] = deepcopy(raw_schema)
+        # One profile with a closed pin is the only case where the admitted
+        # indexes are a single list the author can choose from.
+        index_choices: list[str] | None = None
+        if len(available) == 1 and not isinstance(available[0].indexes, str) and "index" in safe_properties:
+            index_choices = list(available[0].indexes)
+            safe_properties["index"]["enum"] = index_choices
+        raw_required = full_schema.json_schema.get("required", ())
+        required = ["profile", *(name for name in raw_required if isinstance(name, str) and name in author_names)]
+        public_json_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": safe_properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+        definitions = full_schema.json_schema.get("$defs", {})
+        referenced_definitions: dict[str, Any] = {}
+        pending = _schema_refs(public_json_schema)
+        while pending:
+            definition_name = pending.pop()
+            if definition_name in referenced_definitions:
+                continue
+            definition = definitions.get(definition_name) if isinstance(definitions, dict) else None
+            if isinstance(definition, dict):
+                referenced_definitions[definition_name] = deepcopy(definition)
+                pending.update(_schema_refs(definition))
+        if referenced_definitions:
+            public_json_schema["$defs"] = referenced_definitions
+
+        raw_fields = full_schema.knob_schema.get("fields", ())
+        canonical_fields = {
+            raw_field["name"]: raw_field
+            for raw_field in raw_fields
+            if isinstance(raw_field, dict) and isinstance(raw_field.get("name"), str)
+        }
+        fields: list[dict[str, Any]] = [
+            {
+                "name": "profile",
+                "type": "string",
+                "tier": _DEFAULT_COMPOSER_TIER,
+                "required": True,
+                "description": profile_description,
+                "choices": list(available_aliases),
+            }
+        ]
+        for name in author_names:
+            try:
+                field_projection = deepcopy(canonical_fields[name])
+            except KeyError as exc:
+                raise ValueError("malformed_profile_schema") from exc
+            field_projection["required"] = name in required
+            if "tier" not in field_projection:
+                field_projection["tier"] = _DEFAULT_COMPOSER_TIER
+            if name == "index" and index_choices is not None:
+                field_projection["choices"] = list(index_choices)
+            fields.append(field_projection)
+        return PluginSchemaInfo(
+            name=full_schema.name,
+            plugin_type=full_schema.plugin_type,
+            description=full_schema.description,
+            json_schema=public_json_schema,
+            knob_schema={"fields": fields},
+            composer_hints=(
+                "This is the Azure RAG plugin: select an operator-approved Azure AI Search profile; the server supplies the private service binding.",
+                "Name an index the chosen profile admits.",
+                "Pair it with an llm transform that reads {output_prefix}__rag_context.",
+            ),
+            secret_requirements=(),
+            web_config_authority=full_schema.web_config_authority,
+            policy_capabilities=full_schema.policy_capabilities,
+        )
+
+    def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
+        try:
+            profile = self._profiles[alias]
+        except KeyError:
+            raise ValueError("profile_unavailable") from None
+        if set(safe_options) & AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES:
+            raise ValueError("private_profile_option")
+        index = safe_options["index"] if "index" in safe_options else None
+        if type(index) is not str or not profile.admits_index(index):
+            raise ValueError("profile_index_not_admitted")
+        executable: dict[str, object] = {**safe_options, "endpoint": profile.endpoint}
+        if profile.api_version is not None:
+            executable["api_version"] = profile.api_version
+        if profile.auth == "managed_identity":
+            executable["use_managed_identity"] = True
+            if profile.client_id is not None:
+                executable["client_id"] = profile.client_id
+        else:
+            executable["api_key"] = {"secret_ref": profile.credential_ref, "secret_scope": "server"}
+        return LoweredPluginConfig(
+            executable_options=MappingProxyType(executable),
+            audit_safe_options=MappingProxyType({"profile": alias, **safe_options}),
+        )
+
+    def profile_availability(
+        self,
+        principal: str,
+        inventory: ProfileCredentialInventory,
+    ) -> tuple[ProfileAvailability, ...]:
+        del principal
+        result: list[ProfileAvailability] = []
+        for alias, profile in self._profiles.items():
+            if profile.credential_ref is None:
+                result.append(
+                    ProfileAvailability(
+                        alias=alias,
+                        credential_scope=None,
+                        usable=True,
+                        generation=self._binding_generation(profile, credential_generation=None),
+                    )
+                )
+                continue
+            credential_generation = inventory.server_generation(profile.credential_ref)
+            usable = credential_generation is not None
+            result.append(
+                ProfileAvailability(
+                    alias=alias,
+                    credential_scope="server",
+                    usable=usable,
+                    reason=None if usable else ProfileUnavailableReason.CREDENTIAL_MISSING,
+                    generation=self._binding_generation(profile, credential_generation=credential_generation) if usable else None,
+                )
+            )
+        return tuple(result)
+
+    @staticmethod
+    def _binding_generation(profile: AzureSearchProfileSettings, *, credential_generation: str | None) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "endpoint": profile.endpoint,
+                    "auth": profile.auth,
+                    "client_id": profile.client_id,
+                    "credential_ref": profile.credential_ref,
+                    "indexes": profile.indexes if isinstance(profile.indexes, str) else list(profile.indexes),
+                    "api_version": profile.api_version,
+                    "credential_generation": credential_generation,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+    def check_local_requirements(self, alias: str) -> LocalRequirementResult:
+        if alias not in self._profiles:
+            return LocalRequirementResult(available=False)
+        if self._profiles[alias].auth == "managed_identity" and importlib.util.find_spec("azure.identity") is None:
+            return LocalRequirementResult(available=False, reason=ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING)
+        return LocalRequirementResult(available=True)
+
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        # Several search services are several corpora; none of them is "the" default.
+        return usable_aliases[0] if len(usable_aliases) == 1 else None
+
+
 # Every field the catalog lowers carries a composer tier
 # (``web/catalog/knob_schema._attach_tier``: "Every wire field carries a tier
 # so the form never has to guess"), and its own default when a plugin declares
@@ -1271,6 +1487,8 @@ class OperatorProfileRegistry:
                 settings.aws_textract_profiles,
                 region=settings.deployment_aws_region,
             )
+        if settings.azure_search_profiles:
+            self._resolvers[PluginId("transform", "azure_ai_search")] = _AzureSearchProfileResolver(settings.azure_search_profiles)
 
     def public_schema(
         self,
@@ -1320,7 +1538,7 @@ class OperatorProfileRegistry:
             "composer_hints": public_schema.composer_hints,
             "secret_requirements": public_schema.secret_requirements,
         }
-        # Exact-type dispatch over the three module-private resolver classes:
+        # Exact-type dispatch over the module-private resolver classes:
         # each arm publishes the guidance for ONE operator-profile contract, so a
         # future subclass must declare its own arm rather than silently inherit.
         if type(resolver) is _S3SourceProfileResolver:
@@ -1357,6 +1575,26 @@ class OperatorProfileRegistry:
                 "    text_field: textract_text\n"
                 "    schema: {mode: observed}"
             )
+        elif type(resolver) is _AzureSearchProfileResolver:
+            example_alias = available_aliases[0] if available_aliases else "operator-approved-profile"
+            updates["usage_when_to_use"] = (
+                "Use in Web Composer for Azure RAG: retrieving ranked, cited chunks from an Azure AI Search index "
+                "through an operator-approved profile, to ground a downstream llm transform."
+            )
+            updates["usage_when_not_to_use"] = (
+                "Do not use when no operator-approved profile admits the index you need, for indexing documents, "
+                "or for generating answers; use rag_retrieval for Chroma collections."
+            )
+            updates["example_use"] = (
+                "transform:\n"
+                "  plugin: azure_ai_search\n"
+                "  options:\n"
+                f"    profile: {example_alias}\n"
+                "    index: approved-documents\n"
+                "    query_field: question\n"
+                "    output_prefix: policy\n"
+                "    schema: {mode: observed}"
+            )
         return full_summary.model_copy(update=updates)
 
     def public_assistance(
@@ -1386,6 +1624,17 @@ class OperatorProfileRegistry:
                     "Select an available profile; the server supplies the private document storage binding.",
                     "Rows carry relative object keys in key_field; choose feature_types and map at least one output field.",
                     "The bound document location is verified against the deployment before analysis starts.",
+                ),
+            )
+        if type(resolver) is _AzureSearchProfileResolver:
+            return PluginAssistance(
+                plugin_name=full_assistance.plugin_name,
+                issue_code=full_assistance.issue_code,
+                summary="Azure RAG: retrieve ranked, cited chunks from an Azure AI Search index through an operator-approved profile.",
+                composer_hints=(
+                    "Select an available profile; the server supplies the private search service binding.",
+                    "Name an index the chosen profile admits; the profile description lists them.",
+                    "field_content and field_id name INDEX fields; pair the output with an llm transform that reads {output_prefix}__rag_context.",
                 ),
             )
         return full_assistance
