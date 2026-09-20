@@ -554,9 +554,8 @@ when offering the tutorial. Public health probes alone do not prove this flow.
 The `azure_ai_search` transform queries an existing Azure AI Search index; the default image already carries it
 (`INSTALL_EXTRAS=all` includes `azure-identity`). The bundle does not create a
 search service or an index. Keeping to "no static credential in any
-container", the supported credential on this target is the web app's
-user-assigned identity, not a Search API key: the bundle has no Key Vault slot
-for a plugin key, and `extraEnvironment` entries are plain values.
+container", the recommended credential on this target is the web app's
+user-assigned identity, not a Search API key.
 
 Enable role-based access on the search service and grant the identity read
 access to index data:
@@ -577,8 +576,8 @@ printf 'client_id: %s\n' "$IDENTITY_CLIENT_ID"
 ```
 
 Declare the service to the web app as an operator profile. It is not a secret,
-so it travels in `extraEnvironment` in the operator-local workload parameter
-file; `indexes` is mandatory, and `"any"` is the written decision to open every
+so it travels as a plain `extraEnvironment` entry in the operator-local
+application parameter file (`$APPLICATION_PARAMETERS`); `indexes` is mandatory, and `"any"` is the written decision to open every
 index on the service to web authors. `client_id` is required here: the identity
 is user-assigned, and the transform uses `ManagedIdentityCredential`, which does
 not read `AZURE_CLIENT_ID` on Container Apps.
@@ -596,7 +595,11 @@ never appear in an authored pipeline, and `endpoint`, `api_key`,
 Several services are several entries in the array. A managed-identity profile
 needs no `ELSPETH_WEB__SECRET_WIRING_ALLOWLIST` rule; neither does an `api_key`
 profile, whose server secret the profile injects rather than the author wiring
-it, but this target has no slot for that secret.
+it. If a query key is unavoidable, hold it in Key Vault as an `extraSecrets`
+entry, expose it through `extraEnvironment` with `secretRef`, name that
+variable as the profile's `credential_ref`, and list it in
+`ELSPETH_WEB__SERVER_SECRET_ALLOWLIST`; a profile whose secret does not resolve
+reads as unavailable instead of failing start-up.
 
 Index field mapping, search modes and score ranges are in
 [`examples/azure_search_rag`](../../examples/azure_search_rag/README.md).
