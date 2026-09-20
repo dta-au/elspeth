@@ -47,10 +47,7 @@ import { BlobManager } from "@/components/blobs/BlobManager";
 import { CompletionSummary } from "./guided/CompletionSummary";
 import { ModeSwitchButton } from "./guided/ModeSwitchButton";
 import { ComposerOptions } from "./ComposerOptions";
-import {
-  PendingProposalsLiveRegion,
-  actionableProposals,
-} from "./PendingProposalsBanner";
+import { actionableProposals } from "./actionableProposals";
 import { GuidedChatHistory } from "./guided/GuidedChatHistory";
 import { GuidedDecisionSheet } from "./guided/GuidedDecisionSheet";
 import {
@@ -79,13 +76,12 @@ import { isGuidedBuildActive } from "./guided/guidedBuildActive";
 import { latestAssistantRationale } from "./guided/guidedRationale";
 import { clientWireBlockerMessages, humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
 import {
-  AcknowledgementLiveRegion,
   AcknowledgementStack,
   isPendingAcknowledgement,
   useHasPendingGuidedInterpretations,
   usePendingAcknowledgements,
 } from "./AcknowledgementStack";
-import { acknowledgementCardDomId, acknowledgementCardTitle } from "./AcknowledgementCard";
+import { acknowledgementCardTitle } from "./AcknowledgementCard";
 import {
   humaniseStepLabel,
   humaniseStepTitle,
@@ -1672,7 +1668,7 @@ export function ChatPanel({
   // ── Interpretation review surfacing ───────────────────────────────────────
   //
   // Both guided and freeform render pending interpretation events through the
-  // single AcknowledgementStack (pinned at the top of the chat column), driven
+  // single AcknowledgementStack inside the decision panel, driven
   // by the same `pendingBySession[sessionId]` projection.  The stack owns the
   // ordering, the count announce, the cards, and the foot-of-stack opt-out;
   // ChatPanel only supplies the post-resolve callbacks per mode.
@@ -1920,9 +1916,7 @@ export function ChatPanel({
   const revealActionableProposals = useCallback(
     (revealAlreadySeen: boolean) => {
       const dock = dockRef.current;
-      // No dock on the guided surfaces: leave the seen-set unconsumed so the
-      // arrival still counts as new once the freeform body (and its dock)
-      // is mounted.
+      // A loading surface may not yet have attached its decision dock.
       if (dock === null) return;
       const seen = seenActionableBannerIdsRef.current;
       seenActionableBannerIdsRef.current = new Set(actionableBannerProposalIds);
@@ -1930,7 +1924,7 @@ export function ChatPanel({
         ? actionableBannerProposalIds.length > 0
         : actionableBannerProposalIds.some((id) => !seen.has(id));
       if (!shouldReveal) return;
-      const banner = dock.querySelector<HTMLElement>(".pending-proposals-banner");
+      const banner = dock.querySelector<HTMLElement>(".decision-panel-item--pending_proposal");
       if (banner === null) return;
       const bannerTop =
         banner.getBoundingClientRect().top -
@@ -2026,14 +2020,24 @@ export function ChatPanel({
   const sessionDismissed =
     activeSessionId !== null && fallbackDismissedAt.has(activeSessionId);
 
+  const guidedDecisionMode = isGuidedBuildActive(guidedSession, guidedNextTurn) ||
+    guidedSession?.terminal?.kind === "completed";
+
+  const shouldRenderFallback =
+    fallbackCandidate !== null &&
+    !isComposing &&
+    !hasInflightSourceCall &&
+    !compositionHasSource &&
+    !sessionDismissed;
+
   // ── Decision panel (elspeth-cb0d4b8dba) ──────────────────────────────────
   // The one "Awaiting your decision" surface above the input. Every input is
   // an existing store fact: the durable readiness gate the server re-emits on
   // each validate, the composition's validator suggestions, the pending
   // review cards, and the proposals the banner already showed here. The
   // projection is pure (decisionPanelRows.ts); the panel is a dumb render;
-  // the handlers below send canned chat prompts so each click that changes
-  // the pipeline is a planner call.
+  // suggestion/fallback handlers send provider chat; proposal and
+  // interpretation decisions use their existing approval APIs.
   const validationResult = useExecutionStore((s) => s.validationResult);
   const decisionRows = useMemo(
     () =>
@@ -2043,6 +2047,7 @@ export function ChatPanel({
         pendingInterpretations: pendingAcknowledgementEvents,
         proposals: compositionProposals,
         staleProposalIds,
+        inlineSourceCandidate: !guidedDecisionMode && shouldRenderFallback ? fallbackCandidate : null,
       }),
     [
       validationResult,
@@ -2050,6 +2055,9 @@ export function ChatPanel({
       pendingAcknowledgementEvents,
       compositionProposals,
       staleProposalIds,
+      guidedDecisionMode,
+      shouldRenderFallback,
+      fallbackCandidate,
     ],
   );
   const decisionPhraseFor = useMemo(
@@ -2066,11 +2074,10 @@ export function ChatPanel({
   // backend's 422 (bootstrap race), so Apply stays closed until
   // composeTimeoutReady, and reads as connecting (or the stuck unavailable
   // state) rather than as a dead click.
-  const guidedCompleted = guidedSession?.terminal?.kind === "completed";
-  // Completed guided chat is advisory. Show the same readiness information,
-  // but keep mutation on the existing freeform editing surface.
-  const decisionApplyDisabled = guidedCompleted || isComposing || !composeTimeoutReady;
-  const decisionApplyDisabledReason = guidedCompleted
+  // Guided suggestions are informational: applying them uses the existing
+  // freeform editing workflow rather than bypassing guided stage admission.
+  const decisionApplyDisabled = guidedDecisionMode || isComposing || !composeTimeoutReady;
+  const decisionApplyDisabledReason = guidedDecisionMode
     ? "Pipeline suggestions can be applied in the freeform editor."
     : composerTimeoutUnavailable
       ? COMPOSE_UNAVAILABLE_MESSAGE
@@ -2088,21 +2095,6 @@ export function ChatPanel({
       sessionId: activeSessionId,
     });
   }, [activeSessionId]);
-  const handleShowInterpretation = useCallback((eventId: string) => {
-    const card = document.getElementById(acknowledgementCardDomId(eventId));
-    if (card === null) return;
-    card.scrollIntoView({ block: "center", behavior: preferredScrollBehavior() });
-    const focusable = card.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
-    (focusable ?? card).focus({ preventScroll: true });
-  }, []);
-
-  const shouldRenderFallback =
-    fallbackCandidate !== null &&
-    !isComposing &&
-    !hasInflightSourceCall &&
-    !compositionHasSource &&
-    !sessionDismissed;
-
   // F-3 — no API jargon in the user-visible chat message. The dispatched
   // chat turn reads as natural language; the composer prompt (Task 8)
   // teaches the LLM to recognise this framing and call set_pipeline
@@ -2318,19 +2310,15 @@ export function ChatPanel({
     );
   }
 
-  // Proposal and interpretation arrivals retain their existing announcers.
-  // This live region announces only facts those surfaces do not already own.
+  // One persistent announcer owns every pending decision across modes.
+  const decisionLiveRegion = (
+    <DecisionPanelLiveRegion
+      count={decisionRows.count}
+      decisionIds={decisionRows.rows.map((row) => row.id)}
+    />
+  );
   const decisionPanel = (
     <>
-      <PendingProposalsLiveRegion
-        proposals={compositionProposals}
-        staleProposalIds={staleProposalIds}
-      />
-      <DecisionPanelLiveRegion
-        count={decisionRows.rows.filter(
-          (row) => row.kind === "blocker" || row.kind === "suggestion",
-        ).length}
-      />
       <DecisionPanel
         rows={decisionRows.rows}
         blockedVerbs={decisionRows.blockedVerbs}
@@ -2345,9 +2333,31 @@ export function ChatPanel({
         stepLabelFor={decisionStepLabelFor}
         onApplySuggestion={handleApplySuggestion}
         onOpenChecks={handleOpenChecks}
-        onShowInterpretation={handleShowInterpretation}
         onAcceptProposal={acceptProposal}
         onRejectProposal={rejectProposal}
+        onEmptyFocus={() => inputRef.current?.focus()}
+        interpretationContent={
+          <AcknowledgementStack
+            sessionId={activeSessionId}
+            isTutorial={isTutorial}
+            onFocusFallback={() => inputRef.current?.focus()}
+            onResolved={(newState) => {
+              if (guidedDecisionMode) {
+                if (newState !== null) useSessionStore.setState({ compositionState: newState });
+              } else {
+                applyResolvedInterpretation(newState);
+              }
+            }}
+          />
+        }
+        renderSourceFallback={(candidateText) => (
+          <InlineSourceFallbackPrompt
+            shouldRender
+            candidateText={candidateText}
+            onAccept={handleFallbackAccept}
+            onDismiss={handleFallbackDismiss}
+          />
+        )}
       />
     </>
   );
@@ -2611,6 +2621,7 @@ export function ChatPanel({
         role="region"
         aria-label="Pipeline summary"
       >
+        {decisionLiveRegion}
         <GuidedWorkflowStepper
           activeStep="ready"
           readyStepLabel={COMPLETED_READY_STEP_LABELS[guidedCompletionOutcome]}
@@ -2631,15 +2642,6 @@ export function ChatPanel({
             log. Directly after the tick that opened it, so keyboard focus moves
             forward into the panel rather than jumping past the conversation. */}
         {buildGuidedDecisionSheet(guidedSession)}
-        {/* The guided wire-confirm commit surfaces interpretation events
-            AFTER the terminal lands (the writer boundary needs the committed
-            nodes), so the completion surface is the FIRST place the Accept
-            cards can render. Without the stack here the events are orphaned —
-            no surface offers resolution and the run gate (tutorial auto-run,
-            freeform-style execute) fails closed forever (session e1332b5a).
-            Same persistent-mount contract as the guided surface: the stack
-            returns null when empty; the live region is unconditional. */}
-        <AcknowledgementLiveRegion sessionId={activeSessionId ?? ""} />
         {/* The conversation SURVIVES the commit (elspeth-986801d218). The
             build is over — there is no wizard turn, no decision card and no
             forward affordance — but the chat channel stays open so the user
@@ -2650,19 +2652,6 @@ export function ChatPanel({
             false, so the freeform SideRail (Run / Export) keeps its place. */}
         {buildGuidedWorkspaceScroller(
           <>
-            {/* These cards share the scroll budget with the transcript, as
-                they do during guided authoring. Fixed above the scroller,
-                they squeezed the new decision dock and input off a narrow
-                screen. The announcer stays outside this scrolling content. */}
-            <AcknowledgementStack
-              sessionId={activeSessionId ?? ""}
-              isTutorial={isTutorial}
-              onResolved={(newState) => {
-                if (newState !== null) {
-                  useSessionStore.setState({ compositionState: newState });
-                }
-              }}
-            />
             <CompletionSummary terminal={guidedSession.terminal} isTutorial={isTutorial} />
             <GuidedChatHistory
               chatHistory={guidedSession.chat_history}
@@ -3179,6 +3168,7 @@ export function ChatPanel({
         role="region"
         aria-label="Guided composer"
       >
+        {decisionLiveRegion}
         {/* Header — mirrors the freeform body header so the mode-switch control
             ("Exit to freeform") remains directly available in the header. The tutorial suppresses the exit
             affordance, so it has no header. Session title and model identity
@@ -3242,31 +3232,11 @@ export function ChatPanel({
               afterConfirmationToken={afterConfirmationChatToken(guidedSession)}
             />
           );
-          // Persistent-mount contract (AcknowledgementStack.tsx): the stack
-          // returns null when empty, so the count announcer must live outside
-          // it, unconditionally rendered — and in the tutorial OUTSIDE the
-          // scroll wrapper, whose subtree is where content churns.
-          const ackLiveRegion = (
-            <AcknowledgementLiveRegion sessionId={activeSessionId ?? ""} />
-          );
-          const ackStack = (
-            <AcknowledgementStack
-              sessionId={activeSessionId ?? ""}
-              isTutorial={isTutorial}
-              onResolved={(newState) => {
-                if (newState !== null) {
-                  useSessionStore.setState({ compositionState: newState });
-                }
-              }}
-            />
-          );
           return (
             <>
-              {ackLiveRegion}
               {buildGuidedWorkspaceScroller(
                 <>
                   {transcript}
-                  {ackStack}
                   {decisionSection}
                   {/* Direct child of the scroll region: OUTSIDE both role=log
                       containers, so its role=status is announced once. */}
@@ -3286,6 +3256,15 @@ export function ChatPanel({
                   ) : null}
                 </>,
               )}
+              <div
+                ref={attachDock}
+                className="chat-panel-dock"
+                role="region"
+                aria-label="Decision controls"
+                tabIndex={0}
+              >
+                {decisionPanel}
+              </div>
               {stepComposer}
             </>
           );
@@ -3363,6 +3342,7 @@ export function ChatPanel({
       // components/chat/chat.css [data-composing="true"] rules.
       data-composing={isComposing ? "true" : undefined}
     >
+      {decisionLiveRegion}
       {/* Authority stays visible; Guided is a deliberate Composer options action. */}
       <div className="chat-panel-header">
         {/* Layout lives in chat.css, NOT in a style prop (elspeth-0b70269ccc).
@@ -3409,38 +3389,6 @@ export function ChatPanel({
             {"\u00D7"}
           </Button>
         </div>
-      )}
-
-      {/*
-        Acknowledgement stack — pinned at the top of the chat column.  Both
-        guided and freeform unify on this surface; in freeform it sits above
-        the scrolling message list so pending decisions stay visible.  The
-        resolved event is surfaced so the "Got it…" confirmation bubble below
-        can read user_term; applyResolvedInterpretation re-syncs + re-validates
-        so the run gate opens once the last decision is acknowledged.  Opt-out
-        passes a null event so no per-term confirmation fires.
-      */}
-      {activeSessionId !== null && (
-        <>
-          {/*
-            Persistent count announcer (see the guided branch / the component
-            doc): pre-exists its content so the 0→1 appearance announces.
-          */}
-          <AcknowledgementLiveRegion sessionId={activeSessionId} />
-          <AcknowledgementStack
-            sessionId={activeSessionId}
-            onResolved={(newState) => {
-              // The confirmation bubble is NOT pushed from here any more
-              // (elspeth-51ed4fd8d5). useInterpretationResolver already lands
-              // the resolved row in interpretationEventsStore.resolvedBySession,
-              // and the transcript derives every confirmation from that slice —
-              // so the same code path serves a live resolve and a page reload,
-              // and the row's tool_call_id anchors the echo to the turn that
-              // raised the term instead of appending it to the tail.
-              applyResolvedInterpretation(newState);
-            }}
-          />
-        </>
       )}
 
       {/* Messages region (elspeth-4ad68a3769): the positioning containing
@@ -3554,9 +3502,6 @@ export function ChatPanel({
                       proposalsByToolCallId={proposalsByToolCallId}
                       compositionState={compositionState}
                       staleProposalIds={staleProposalIds}
-                      proposalActionPendingIds={proposalActionPendingIds}
-                      onAcceptProposal={acceptProposal}
-                      onRejectProposal={rejectProposal}
                       sourcesCreated={sourcesForThisTurn}
                       onEditInlineSource={handleEditInlineSource}
                     />
@@ -3685,23 +3630,6 @@ export function ChatPanel({
         {showBlobManager && <BlobManager onUseAsInput={handleUseAsInput} />}
 
         {decisionPanel}
-
-        {/*
-          Inline-source fallback prompt (Phase 5a Task 5).
-
-          LLM-skip safety net. Anchored ABOVE the chat input — the user
-          reads the affordance immediately before the surface they would
-          otherwise re-type into. The widget renders nothing when
-          `shouldRenderFallback` is false; mounting unconditionally with
-          the boolean gate keeps the DOM stable across predicate flips
-          (no remount churn for the focus/scroll containers around it).
-        */}
-        <InlineSourceFallbackPrompt
-          shouldRender={shouldRenderFallback}
-          candidateText={fallbackCandidate ?? ""}
-          onAccept={handleFallbackAccept}
-          onDismiss={handleFallbackDismiss}
-        />
       </div>
 
       {/* Input */}

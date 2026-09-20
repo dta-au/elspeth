@@ -1011,7 +1011,7 @@ describe("ChatPanel", () => {
     }
   });
 
-  it("reveals a pending proposal when the freeform surface returns from guided mode", () => {
+  it("reveals a pending proposal in guided mode and after returning to freeform", async () => {
     // A proposal already pending while the GUIDED surface is up: the dock is
     // not mounted there, so the arrival was never surfaced. Returning to
     // freeform mounts the dock — a fresh scroll container with no operator
@@ -1050,7 +1050,8 @@ describe("ChatPanel", () => {
       },
     });
     const { container } = render(<ChatPanel />);
-    expect(container.querySelector(".chat-panel-dock")).toBeNull();
+    expect(container.querySelector(".chat-panel-dock")).not.toBeNull();
+    const mountedAnnouncement = screen.getByTestId("decision-panel-live-region");
 
     // The dock element does not exist until the switch commit, so the scroll
     // must be observed at the prototype and attributed by receiver.
@@ -1063,20 +1064,21 @@ describe("ChatPanel", () => {
       const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
       expect(dock).not.toBeNull();
       expect(protoScrollSpy.mock.contexts).toContain(dock);
-      expect(
-        screen.getByTestId("pending-proposals-live-region"),
-      ).toHaveTextContent("1 pending change needs your approval");
+      expect(screen.getByTestId("decision-panel-live-region")).toBe(mountedAnnouncement);
+      await waitFor(() => expect(
+        screen.getByTestId("decision-panel-live-region"),
+      ).toHaveTextContent("1 item needs your decision"));
     } finally {
       protoScrollSpy.mockRestore();
     }
   });
 
-  it("announces a proposal arrival through the persistent live region", () => {
+  it("announces a proposal arrival through the persistent live region", async () => {
     renderIdleFreeformPanel();
 
     // The region pre-exists its content — that is the property that makes the
     // 0→1 announcement reliable.
-    const region = screen.getByTestId("pending-proposals-live-region");
+    const region = screen.getByTestId("decision-panel-live-region");
     expect(region).toHaveAttribute("role", "status");
     expect(region).toHaveTextContent("");
 
@@ -1086,7 +1088,7 @@ describe("ChatPanel", () => {
       });
     });
 
-    expect(region).toHaveTextContent("1 pending change needs your approval");
+    await waitFor(() => expect(region).toHaveTextContent("1 item needs your decision"));
   });
 });
 
@@ -3872,7 +3874,7 @@ describe("ChatPanel mode discriminator", () => {
     expect(scroll!.contains(composer)).toBe(false);
 
     const transcript = scroll!.querySelector(".guided-chat-bubbles");
-    const acks = scroll!.querySelector('[data-testid="acknowledgement-stack"]');
+    const acks = screen.getByTestId("decision-panel").querySelector('[data-testid="acknowledgement-stack"]');
     const decision = scroll!.querySelector(".guided-current-decision");
     const pending = scroll!.querySelector(".guided-pending-strip");
     expect(transcript).not.toBeNull();
@@ -3882,7 +3884,8 @@ describe("ChatPanel mode discriminator", () => {
     const follows = (earlier: Element, later: Element) =>
       earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING;
     expect(follows(transcript!, acks!)).toBeTruthy();
-    expect(follows(acks!, decision!)).toBeTruthy();
+    expect(follows(pending!, acks!)).toBeTruthy();
+    expect(scroll!.contains(acks)).toBe(false);
     expect(follows(decision!, pending!)).toBeTruthy();
     expect(follows(pending!, composer!)).toBeTruthy();
   });
@@ -8365,7 +8368,7 @@ describe("ChatPanel generic inline-source proposal review", () => {
     expect(proposal.arguments_redacted_json).not.toHaveProperty("metadata");
     render(<ChatPanel />);
 
-    const banners = screen.getAllByRole("region", { name: "Pending changes (1)" });
+    const banners = screen.getAllByRole("region", { name: "Awaiting your decision (1)" });
     expect(banners).toHaveLength(1);
     expect(within(banners[0]).getAllByRole("listitem")).toHaveLength(1);
     expect(within(banners[0]).getByText(proposal.summary)).toBeInTheDocument();
@@ -8381,7 +8384,7 @@ describe("ChatPanel generic inline-source proposal review", () => {
       const { proposal } = seedReview();
       useSessionStore.setState({ compositionProposals: [{ ...proposal, summary }] });
       render(<ChatPanel />);
-      expect(screen.getByRole("region", { name: "Pending changes (1)" })).toBeInTheDocument();
+      expect(screen.getByRole("region", { name: "Awaiting your decision (1)" })).toBeInTheDocument();
       expect(screen.queryByRole("region", { name: /row count/i })).not.toBeInTheDocument();
     },
   );
@@ -8394,7 +8397,7 @@ describe("ChatPanel generic inline-source proposal review", () => {
       const rejectProposal = vi.fn().mockResolvedValue(undefined);
       useSessionStore.setState({ acceptProposal, rejectProposal });
       render(<ChatPanel />);
-      const banner = screen.getByRole("region", { name: "Pending changes (1)" });
+      const banner = screen.getByRole("region", { name: "Awaiting your decision (1)" });
       if (action === "accept") {
         fireEvent.click(within(banner).getByRole("button", { name: `Accept proposal: ${proposal.summary}` }));
         expect(acceptProposal).toHaveBeenCalledExactlyOnceWith(proposal.id);
@@ -8431,7 +8434,7 @@ describe("ChatPanel generic inline-source proposal review", () => {
     const { proposal } = seedReview();
     useSessionStore.setState({ proposalActionPendingIds: [proposal.id] });
     render(<ChatPanel />);
-    const banner = screen.getByRole("region", { name: "Pending changes (1)" });
+    const banner = screen.getByRole("region", { name: "Awaiting your decision (1)" });
     expect(within(banner).getByRole("button", { name: /accept proposal/i })).toBeDisabled();
     expect(within(banner).getByRole("button", { name: /reject proposal/i })).toBeDisabled();
   });
@@ -8451,7 +8454,7 @@ describe("ChatPanel generic inline-source proposal review", () => {
       compositionState: makeComposition(1),
     });
     render(<ChatPanel />);
-    expect(screen.getByRole("region", { name: "Pending changes (1)" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Awaiting your decision (1)" })).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: /row count/i })).not.toBeInTheDocument();
     expect(useSessionStore.getState().compositionProposals).toEqual([replacementProposal]);
   });
@@ -8574,6 +8577,21 @@ describe("ChatPanel inline-source fallback prompt", () => {
       compositionState: null,
       error: null,
     });
+  });
+
+  it("retains source fallback after exiting a guided session to freeform", () => {
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id, sessions: [sessionFixture],
+      messages: [makeUserMessage("https://example.com")],
+      guidedSession: {
+        step: "step_1_source", history: [],
+        terminal: { kind: "exited_to_freeform", reason: "user_pressed_exit", pipeline_yaml: null },
+        chat_history: [], chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] }, profile: null,
+      },
+    });
+    render(<ChatPanel />);
+    expect(within(screen.getByTestId("decision-panel")).getByRole("button", { name: "Create source" })).toBeInTheDocument();
   });
 
   it("renders the fallback prompt when a recent user message looks like a URL and no source is bound", () => {
@@ -9034,6 +9052,29 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
   // Spec lines 768-774: "Got it — using your interpretation of *<user_term>*."
   // — pure UI nudge, NOT persisted to the audit trail (which already
   // recorded the resolved interpretation_event row).
+  it("refreshes freeform readiness when resolving after exiting guided", async () => {
+    const event = makeInterpretationEvent({ user_term: "cool" });
+    const next = makeComposition(2);
+    vi.spyOn(apiClient, "resolveInterpretation").mockResolvedValue({
+      event: { ...event, choice: "accepted_as_drafted" }, new_state: next,
+    });
+    const applyResolvedInterpretation = vi.fn();
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id, sessions: [sessionFixture], messages: [],
+      applyResolvedInterpretation,
+      guidedSession: {
+        step: "step_1_source", history: [],
+        terminal: { kind: "exited_to_freeform", reason: "user_pressed_exit", pipeline_yaml: null },
+        chat_history: [], chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] }, profile: null,
+      },
+    });
+    useInterpretationEventsStore.getState().addPendingEvent(sessionFixture.id, event);
+    render(<ChatPanel />);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /Acknowledge the LLM's interpretation/i })));
+    expect(applyResolvedInterpretation).toHaveBeenCalledWith(next);
+  });
+
   it("renders a resolve-success confirmation line after the user resolves an interpretation (Phase 5b.18b.8)", async () => {
     const event = makeInterpretationEvent({ user_term: "cool" });
     // Stub the resolve API so the store's resolveEvent action completes.
@@ -10508,6 +10549,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
           {
             code: "advisor_signoff_blocked",
             component_id: "pipeline",
+            suggestion: null,
             component_type: "pipeline",
             detail:
               "Completion advisory review did not clear after the available attempts.",
@@ -10622,7 +10664,39 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     expect(useComposer().sendMessage).not.toHaveBeenCalled();
   });
 
-  it("announces pending interpretation arrivals once and Show focuses the existing card", () => {
+  it("keeps Apply available after exiting guided into freeform", () => {
+    useExecutionStore.setState({ validationResult: withheldValidation() });
+    useSessionStore.setState({ guidedSession: {
+      step: "step_3_transforms", history: [],
+      terminal: { kind: "exited_to_freeform", reason: "user_pressed_exit", pipeline_yaml: null },
+      chat_history: [], chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] }, profile: null,
+    }});
+    render(<ChatPanel />);
+    const apply = within(screen.getByTestId("decision-panel")).getByRole("button", { name: /^Apply suggestion/ });
+    expect(apply).toBeEnabled();
+    fireEvent.click(apply);
+    expect(useComposer().sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps Apply closed during active guided authoring", () => {
+    useExecutionStore.setState({ validationResult: withheldValidation() });
+    useSessionStore.setState({
+      guidedSession: {
+        step: "step_3_transforms", history: [], terminal: null,
+        chat_history: [], chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] }, profile: null,
+      },
+    });
+    render(<ChatPanel />);
+    const panel = screen.getByTestId("decision-panel");
+    const apply = within(panel).getByRole("button", { name: /^Apply suggestion/ });
+    expect(apply).toBeDisabled();
+    fireEvent.click(apply);
+    expect(useComposer().sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("owns pending interpretation actions and announces arrivals once", async () => {
     render(<ChatPanel />);
     const event: InterpretationEvent = {
       id: "decision-review",
@@ -10650,13 +10724,14 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
       approved_prompt_artifact_hash: null,
     };
     act(() => useInterpretationEventsStore.getState().addPendingEvent("session-1", event));
-    expect(screen.getByTestId("acknowledgement-live-region")).toHaveTextContent("1 decision to acknowledge");
-    expect(screen.getByTestId("decision-panel-live-region")).toBeEmptyDOMElement();
-    fireEvent.click(screen.getByRole("button", { name: "Show interpretation review: cool" }));
-    expect(screen.getByTestId("acknowledgement-stack").contains(document.activeElement)).toBe(true);
+    expect(screen.queryByTestId("acknowledgement-live-region")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("decision-panel-live-region")).toHaveTextContent("1 item needs your decision"));
+    const panel = screen.getByTestId("decision-panel");
+    expect(within(panel).getByTestId("acknowledgement-stack")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show interpretation review: cool" })).not.toBeInTheDocument();
   });
 
-  it("keeps the proposals banner reachable under its pinned name inside the panel", () => {
+  it("renders proposals as native rows without a nested Pending changes region", () => {
     useExecutionStore.setState({ validationResult: withheldValidation() });
     useSessionStore.setState({
       compositionProposals: [
@@ -10680,7 +10755,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     });
     render(<ChatPanel />);
     const panel = screen.getByRole("region", { name: "Awaiting your decision (3)" });
-    expect(within(panel).getByRole("region", { name: "Pending changes (1)" })).toBeInTheDocument();
-    expect(screen.getAllByRole("region", { name: "Pending changes (1)" })).toHaveLength(1);
+    expect(within(panel).getByRole("button", { name: "Accept proposal: Change one option on colour_questions." })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Pending changes (1)" })).not.toBeInTheDocument();
   });
 });

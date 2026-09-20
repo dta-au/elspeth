@@ -37,6 +37,7 @@ GuidedDecisionSheet is settled history: preserve replay without pending action
 controls. Guided stage choices remain stage choices unless they duplicate a
 proposal or interpretation already owned by the panel. Active guided,
 completed guided and freeform share interpretation and proposal ownership.
+Active guided currently has no panel mount; add the shared bounded dock there.
 Preserve completed-guided restrictions on pipeline-changing suggestions.
 
 ## Accessibility and layout
@@ -67,6 +68,12 @@ navigation to the visible, focused Checks tab.
    frontend decoder. Render it on the matching blocker without inventing
    frontend advice. Omit or clear it when its owning blocker/state is absent.
    Test redaction and malformed wire values as well as successful display.
+
+The advisor suggestion is required and nullable in the current wire and durable
+envelope. Following the repository's no-compatibility policy, old blocked
+envelopes without this field fail validation rather than being silently
+defaulted. No migration or shared database reset is part of this task. This
+format change must be called out in deployment evidence.
 
 Implementation inspection must establish the exact durable owner before
 editing either wire. Any required persistence change uses the existing typed

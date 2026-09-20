@@ -149,7 +149,7 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
     // elspeth-49b467d91a it is retained in component state and restored
     // when the send verifiably fails to deliver.
     expect(screen.getByLabelText("Message input")).toHaveValue("");
-    expect(screen.getByRole("status")).toHaveTextContent("Guided setup running");
+    expect(screen.getByText("Guided setup running").closest('[role="status"]')).toBeInTheDocument();
     expect(window.sessionStorage.getItem("elspeth_guided_operation_retries_v2")).not.toContain(
       "Original prompt that is not persisted",
     );
@@ -206,7 +206,7 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
     render(<ChatPanel />);
     await user.type(screen.getByLabelText("Message input"), "Prompt");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    expect(screen.getByRole("status")).toHaveTextContent("Guided setup running");
+    expect(screen.getByText("Guided setup running").closest('[role="status"]')).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Stop" }));
     await screen.findByLabelText("Message input");

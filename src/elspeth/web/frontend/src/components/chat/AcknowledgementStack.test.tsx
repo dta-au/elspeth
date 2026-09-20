@@ -8,10 +8,10 @@
 // ============================================================================
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe, toHaveNoViolations } from "jest-axe";
-import { AcknowledgementLiveRegion, AcknowledgementStack } from "./AcknowledgementStack";
+import { AcknowledgementStack } from "./AcknowledgementStack";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
@@ -106,6 +106,17 @@ beforeEach(() => {
 });
 
 describe("AcknowledgementStack — projection", () => {
+  it("renders pending decisions as native rows in the labelled approvals section", () => {
+    seedPending([makeEvent("e1"), makeEvent("e2")]);
+    render(<AcknowledgementStack sessionId={SID} />);
+    const approvals = screen.getByRole("region", { name: "Interpretation approvals" });
+    const list = within(approvals).getByRole("list");
+    expect(list.tagName).toBe("UL");
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.tagName === "LI")).toBe(true);
+  });
+
   it("renders one card per pending user_approved event with a count header", () => {
     seedPending([makeEvent("e1"), makeEvent("e2")]);
     render(<AcknowledgementStack sessionId={SID} />);
@@ -169,11 +180,11 @@ describe("AcknowledgementStack — ordering", () => {
 });
 
 describe("AcknowledgementStack — accessibility", () => {
-  it("does not host its own role='status' announce (the persistent AcknowledgementLiveRegion owns it)", () => {
+  it("does not host its own role='status' announce (the decision panel owns it)", () => {
     // The stack returns null when empty, so a live region mounted INSIDE it
     // would be inserted with its content already present on the 0->1
     // transition — the documented-unreliable polite-announce pattern. The
-    // count announce is therefore the persistent AcknowledgementLiveRegion's
+    // count announce is therefore the decision panel's
     // job (covered below). This guards against regressing to an in-stack status.
     seedPending([makeEvent("e1"), makeEvent("e2")]);
     render(<AcknowledgementStack sessionId={SID} />);
@@ -190,53 +201,6 @@ describe("AcknowledgementStack — accessibility", () => {
     seedPending([makeEvent("e1")]);
     const { container } = render(<AcknowledgementStack sessionId={SID} />);
     expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("AcknowledgementLiveRegion — count announce", () => {
-  it("carries the pending count in a role='status' region", () => {
-    seedPending([makeEvent("e1"), makeEvent("e2")]);
-    render(<AcknowledgementLiveRegion sessionId={SID} />);
-    expect(screen.getByRole("status").textContent).toMatch(
-      /2 decisions to acknowledge/i,
-    );
-  });
-
-  it("uses the singular form for a single decision", () => {
-    seedPending([makeEvent("e1")]);
-    render(<AcknowledgementLiveRegion sessionId={SID} />);
-    expect(screen.getByRole("status").textContent).toMatch(
-      /1 decision to acknowledge/i,
-    );
-  });
-
-  it("stays mounted with empty text when nothing is pending (so 0->1 announces)", () => {
-    useInterpretationEventsStore.setState({ pendingBySession: { [SID]: {} } });
-    render(<AcknowledgementLiveRegion sessionId={SID} />);
-    const status = screen.getByRole("status");
-    expect(status).toBeTruthy();
-    expect((status.textContent ?? "").trim()).toBe("");
-  });
-
-  // The whole reason this region is mounted separately from the stack is that
-  // the announcement must be a content MUTATION inside a node that already
-  // existed — a region inserted carrying its own text is the form with the
-  // documented AT failures. Every assertion above re-resolves the region by
-  // role AFTER rendering, which cannot tell a mutation from a replacement, so
-  // none of them guards that reason. Hold the element across the 0->1
-  // transition instead (elspeth-b46cd07678).
-  it("MUTATES the same region node across the 0->1 transition", () => {
-    useInterpretationEventsStore.setState({ pendingBySession: { [SID]: {} } });
-    render(<AcknowledgementLiveRegion sessionId={SID} />);
-    const before = screen.getByRole("status");
-    expect((before.textContent ?? "").trim()).toBe("");
-
-    act(() => {
-      seedPending([makeEvent("e1")]);
-    });
-
-    expect(screen.getByRole("status")).toBe(before);
-    expect(before.textContent).toMatch(/1 decision to acknowledge/i);
   });
 });
 
@@ -400,6 +364,35 @@ describe("AcknowledgementStack — removed node label (elspeth-93f5621f18)", () 
 });
 
 describe("AcknowledgementStack — focus restoration", () => {
+  it("wraps focus to the first remaining row when the last row resolves", async () => {
+    const user = userEvent.setup();
+    const first = makeEvent("e1", { user_term: "first" });
+    const last = makeEvent("e2", { user_term: "last" });
+    seedPending([first, last]);
+    vi.mocked(api.resolveInterpretation).mockResolvedValue({
+      event: { ...last, choice: "accepted_as_drafted", accepted_value: last.llm_draft },
+      new_state: makeCompositionState([]),
+    });
+    render(<AcknowledgementStack sessionId={SID} />);
+    await user.click(screen.getByRole("button", { name: /acknowledge the llm's interpretation of last/i }));
+    await waitFor(() => expect(screen.getAllByTestId("acknowledgement-card")).toHaveLength(1));
+    expect(screen.getByRole("button", { name: /acknowledge the llm's interpretation of first/i })).toHaveFocus();
+  });
+
+  it("returns focus to the parent fallback after the final approval", async () => {
+    const user = userEvent.setup();
+    const last = makeEvent("e1");
+    seedPending([last]);
+    vi.mocked(api.resolveInterpretation).mockResolvedValue({
+      event: { ...last, choice: "accepted_as_drafted", accepted_value: last.llm_draft },
+      new_state: makeCompositionState([]),
+    });
+    const onFocusFallback = vi.fn();
+    render(<AcknowledgementStack sessionId={SID} onFocusFallback={onFocusFallback} />);
+    await user.click(screen.getByRole("button", { name: /acknowledge the llm's interpretation of cool/i }));
+    await waitFor(() => expect(onFocusFallback).toHaveBeenCalledTimes(1));
+  });
+
   // Pins the comment-documented fallback (stack effect: disabled button →
   // section): after a sibling resolves, a still-gated prompt card's Approve
   // is disabled, so focus lands on the card's labelled <section>.

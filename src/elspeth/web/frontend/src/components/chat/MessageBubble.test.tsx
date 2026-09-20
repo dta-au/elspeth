@@ -286,10 +286,7 @@ describe("MessageBubble", () => {
       expect(writeText).toHaveBeenCalledWith("I'll set that up.");
     });
 
-    it("renders proposal cards for matching tool calls", async () => {
-      const user = userEvent.setup();
-      const onAcceptProposal = vi.fn();
-      const onRejectProposal = vi.fn();
+    it("renders read-only proposal history for matching tool calls", () => {
       const proposal = makeProposal();
       const message = makeMessage({
         role: "assistant",
@@ -307,8 +304,6 @@ describe("MessageBubble", () => {
         <MessageBubble
           message={message}
           proposalsByToolCallId={new Map([["tc-1", proposal]])}
-          onAcceptProposal={onAcceptProposal}
-          onRejectProposal={onRejectProposal}
         />,
       );
 
@@ -317,14 +312,7 @@ describe("MessageBubble", () => {
           "Proposed: Replaces the entire pipeline configuration in a single operation.",
         ),
       ).toBeInTheDocument();
-      await user.click(
-        screen.getByRole("button", {
-          name: `Accept proposal: ${proposal.summary}`,
-        }),
-      );
-
-      expect(onAcceptProposal).toHaveBeenCalledWith("proposal-1");
-      expect(onRejectProposal).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: /Accept proposal|Reject proposal/ })).toBeNull();
     });
   });
 

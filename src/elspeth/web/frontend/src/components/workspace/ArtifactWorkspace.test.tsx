@@ -552,6 +552,7 @@ describe("ArtifactWorkspace", () => {
               id: "blocked",
               code: "advisor",
               detail: "Review is required.",
+              suggestion: null,
             }]}
             blockedVerbs={["save_for_review"]}
             count={1}
@@ -569,7 +570,6 @@ describe("ArtifactWorkspace", () => {
               focusMode: false,
               sessionId: "session-1",
             })}
-            onShowInterpretation={vi.fn()}
             onAcceptProposal={vi.fn()}
             onRejectProposal={vi.fn()}
           />

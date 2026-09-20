@@ -13,10 +13,8 @@
 //   * executionStore.validationResult.readiness — the durable completion
 //     gate the server re-emits on every POST /validate (blockers + axes);
 //   * sessionStore.compositionState.validation_suggestions — the validator's
-//     optional-improvement nudges (transient: only the compose response and
-//     a live validate carry them; GET /state returns null, so after a reload
-//     the panel can show a blocker with no suggestion rows — a known phase-1
-//     gap, backfill is a wire change);
+//     optional-improvement nudges (restored by the backend from current validation
+//     on reload as well as live compose/validate responses);
 //   * interpretationEventsStore.pendingBySession — pending review cards;
 //   * sessionStore.compositionProposals / staleProposalIds — pending
 //     proposals, filtered by the SAME predicate the banner renders from.
@@ -34,7 +32,7 @@
 //     must not vanish for want of a pointer).
 // ============================================================================
 
-import { actionableProposals } from "./PendingProposalsBanner";
+import { actionableProposals } from "./actionableProposals";
 import type {
   CompositionProposal,
   CompositionState,
@@ -53,11 +51,13 @@ export const INTERPRETATION_REVIEW_PENDING_CODE = "interpretation_review_pending
 export type BlockedVerb = "run" | "save_for_review";
 
 export type DecisionRow =
+  | { kind: "inline_source_fallback"; id: string; candidateText: string }
   | {
       kind: "blocker";
       id: string;
       code: string;
       detail: string;
+      suggestion: string | null;
     }
   | {
       kind: "suggestion";
@@ -78,6 +78,7 @@ export type DecisionRow =
     };
 
 export interface DecisionRowsInput {
+  inlineSourceCandidate?: string | null;
   validationResult: ValidationResult | null;
   compositionState: CompositionState | null;
   pendingInterpretations: readonly InterpretationEvent[];
@@ -126,6 +127,15 @@ export function projectDecisionRows(input: DecisionRowsInput): DecisionRows {
     affectedNodeId: event.affected_node_id,
   }));
 
+  // A duplicate occurrence gets its own identity without tying distinct
+  // decisions to array positions (reordering must not announce new work).
+  const occurrences = new Map<string, number>();
+  const decisionId = (kind: string, values: readonly unknown[]): string => {
+    const key = `${kind}:${JSON.stringify(values)}`;
+    const occurrence = occurrences.get(key) ?? 0;
+    occurrences.set(key, occurrence + 1);
+    return `${key}:${occurrence}`;
+  };
   const blockerRows: DecisionRow[] = [];
   if (validationResult !== null && isBlocked) {
     for (const blocker of validationResult.readiness.blockers) {
@@ -137,19 +147,20 @@ export function projectDecisionRows(input: DecisionRowsInput): DecisionRows {
       }
       blockerRows.push({
         kind: "blocker",
-        id: `blocker:${blocker.code}:${blocker.component_id ?? "pipeline"}`,
+        id: decisionId("blocker", [blocker.code, blocker.component_id, blocker.detail, blocker.suggestion]),
         code: blocker.code,
         detail: blocker.detail,
+        suggestion: blocker.suggestion,
       });
     }
   }
 
   const suggestionRows: DecisionRow[] = [];
   if (isBlocked && compositionState !== null) {
-    (compositionState.validation_suggestions ?? []).forEach((suggestion, i) => {
+    (compositionState.validation_suggestions ?? []).forEach((suggestion) => {
       suggestionRows.push({
         kind: "suggestion",
-        id: `suggestion:${i}`,
+        id: decisionId("suggestion", [suggestion.component, suggestion.message, suggestion.severity]),
         suggestion,
       });
     });
@@ -164,6 +175,11 @@ export function projectDecisionRows(input: DecisionRowsInput): DecisionRows {
     proposalId: proposal.id,
   }));
 
-  const rows = [...blockerRows, ...suggestionRows, ...pointerRows, ...proposalRows];
+  const fallbackRows: DecisionRow[] = input.inlineSourceCandidate == null ? [] : [{
+    kind: "inline_source_fallback",
+    id: `inline-source:${input.inlineSourceCandidate}`,
+    candidateText: input.inlineSourceCandidate,
+  }];
+  const rows = [...blockerRows, ...suggestionRows, ...pointerRows, ...proposalRows, ...fallbackRows];
   return { rows, blockedVerbs, count: rows.length };
 }

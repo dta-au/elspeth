@@ -112,6 +112,7 @@ describe("projectDecisionRows", () => {
           {
             code: "advisor_signoff_blocked",
             component_id: "pipeline",
+            suggestion: null,
             component_type: "pipeline",
             detail: "Completion advisory review did not clear after the available attempts.",
           },
@@ -127,13 +128,14 @@ describe("projectDecisionRows", () => {
     expect(projected.rows).toEqual([
       {
         kind: "blocker",
-        id: "blocker:advisor_signoff_blocked:pipeline",
+        suggestion: null,
+        id: expect.stringContaining("blocker:"),
         code: "advisor_signoff_blocked",
         detail: "Completion advisory review did not clear after the available attempts.",
       },
       {
         kind: "suggestion",
-        id: "suggestion:0",
+        id: expect.stringContaining("suggestion:"),
         suggestion: S1,
       },
     ]);
@@ -162,6 +164,7 @@ describe("projectDecisionRows", () => {
           {
             code: "interpretation_review_pending",
             component_id: "colour_questions",
+            suggestion: null,
             component_type: "transform",
             detail: "1 interpretation awaits review.",
           },
@@ -197,6 +200,7 @@ describe("projectDecisionRows", () => {
           {
             code: "interpretation_review_pending",
             component_id: "colour_questions",
+            suggestion: null,
             component_type: "transform",
             detail: "1 interpretation awaits review.",
           },
@@ -234,6 +238,7 @@ describe("projectDecisionRows", () => {
           {
             code: "advisor_signoff_blocked",
             component_id: "pipeline",
+            suggestion: null,
             component_type: "pipeline",
             detail: "withheld",
           },
@@ -255,4 +260,25 @@ describe("projectDecisionRows", () => {
     ]);
     expect(projected.count).toBe(4);
   });
+});
+
+// Source fallback is a pending decision even before validation exists.
+it("projects the eligible inline source candidate into the decision count", () => {
+  const result = projectDecisionRows({ ...empty, validationResult: null, inlineSourceCandidate: "red, blue" });
+  expect(result.rows).toEqual([{ kind: "inline_source_fallback", id: "inline-source:red, blue", candidateText: "red, blue" }]);
+  expect(result.count).toBe(1);
+});
+
+it("tracks changed remedies and preserves identities under reorder", () => {
+  const validationResult = makeValidationResult({readiness: {
+    authoring_valid: true, execution_ready: true, completion_ready: false, blockers: [],
+  }});
+  const a = { component: "out", message: "First remedy", severity: "low" as const };
+  const b = { component: "out", message: "Second remedy", severity: "low" as const };
+  const project = (suggestions: ValidationEntryDTO[]) => projectDecisionRows({ ...empty, validationResult,
+    compositionState: makeComposition(1, { validation_suggestions: suggestions }),
+  }).rows.map((row) => row.id);
+  expect(project([a])).not.toEqual(project([b]));
+  expect(project([a, b])).toEqual(project([b, a]).reverse());
+  expect(new Set(project([a, a])).size).toBe(2);
 });

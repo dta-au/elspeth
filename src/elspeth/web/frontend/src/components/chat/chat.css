@@ -4,7 +4,7 @@
    .message-bubble-content*, .bubble-action-overlay*, .message-edit-*,
    .message-failed-*, .message-retry-btn, .message-pending, .message-tools*,
    .message-sources-created*, .inline-source-created-turn*,
-   .message-group-separator, .tool-call-*, .pending-proposals-banner*,
+   .message-group-separator, .tool-call-*,
    .inline-source-fallback-prompt*, .pending-overlay-pill, .spec-pending-proposal,
    .yaml-pending-summary, .runs-pending-proposal, .composing-*,
    .freeform-introduction, .proposal-diff*.
@@ -2260,81 +2260,6 @@
 /* Pending-proposal banner. Co-locates Accept/Reject controls with the
    chat input so the operator does not have to scroll up to find the
    action on the originating tool-call message. */
-.pending-proposals-banner {
-  margin: 0 var(--space-md) var(--space-sm);
-  padding: var(--space-sm) var(--space-md);
-  border: 1px solid var(--color-border-strong);
-  /* Settled transcript accent width — see .tool-call-card. */
-  border-left: 3px solid var(--color-warning);
-  border-radius: var(--radius-md);
-  background: var(--color-surface-elevated);
-  color: var(--color-text);
-}
-
-.pending-proposals-banner-header {
-  display: flex;
-  gap: var(--space-sm);
-  align-items: baseline;
-  flex-wrap: wrap;
-  margin-bottom: var(--space-xs);
-}
-
-.pending-proposals-banner-help {
-  color: var(--color-text-muted);
-  font-size: var(--font-size-sm);
-}
-
-.pending-proposals-banner-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-sm);
-}
-
-.pending-proposals-banner-item {
-  display: flex;
-  gap: var(--space-md);
-  align-items: center;
-  justify-content: space-between;
-  padding: var(--space-sm) 0;
-}
-
-.pending-proposals-banner-item + .pending-proposals-banner-item {
-  border-top: 1px solid var(--color-border);
-}
-
-.pending-proposals-banner-item-body {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.pending-proposals-banner-summary {
-  margin: 0;
-  font-weight: 600;
-}
-
-.pending-proposals-banner-affects {
-  margin: var(--space-xs) 0 0;
-  color: var(--color-text-muted);
-  font-size: var(--font-size-sm);
-}
-
-.pending-proposals-banner-actions {
-  display: flex;
-  gap: var(--space-sm);
-  flex-shrink: 0;
-}
-
-.pending-proposals-banner-actions .btn {
-  min-height: var(--size-control-compact);
-}
-
-/* Decision panel (elspeth-cb0d4b8dba): the one "Awaiting your decision"
-   surface above the chat input. Same input-aligned margins and warning
-   accent as the proposals banner it hosts; the hosted banner drops its
-   outer margin and border so it reads as a section of the panel. */
 .decision-panel {
   margin: 0 var(--space-md) var(--space-sm);
   padding: var(--space-sm) var(--space-md);
@@ -2402,15 +2327,6 @@
 .decision-panel-apply-btn,
 .decision-panel-show-btn {
   flex-shrink: 0;
-}
-
-.decision-panel .pending-proposals-banner {
-  margin: var(--space-xs) 0 0;
-  padding: var(--space-xs) 0 0;
-  border: 0;
-  border-top: 1px solid var(--color-border);
-  border-radius: 0;
-  background: transparent;
 }
 
 .decision-panel-actions {
@@ -3256,4 +3172,19 @@
 .ack-card .code-block-wrapper:hover .code-block-copy,
 .ack-card .code-block-copy:focus-visible {
   opacity: 1;
+}
+
+.ack-stack-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.decision-panel-proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
 }
