@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ToolCallCard } from "./ToolCallCard";
 import type { CompositionProposal, CompositionState, ToolCall } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
@@ -61,8 +60,6 @@ describe("ToolCallCard", () => {
       <ToolCallCard
         toolCall={makeToolCall(name)}
         proposal={null}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expect(screen.getByText(description, { selector: ".tool-call-ribbon-text" })).toBeInTheDocument();
@@ -79,8 +76,6 @@ describe("ToolCallCard", () => {
       <ToolCallCard
         toolCall={makeToolCall(name)}
         proposal={{ ...proposal, tool_name: name, summary, arguments_redacted_json: { target: "safe-label" } }}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expect(screen.getByText(`Proposed: ${heading}`)).toBeInTheDocument();
@@ -102,8 +97,6 @@ describe("ToolCallCard", () => {
           affects: ["interpretation"],
           arguments_redacted_json: { kind },
         }}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expect(screen.getByText("Proposed: Asks you to review an assumption the planner made before it is built into the pipeline.")).toBeInTheDocument();
@@ -116,21 +109,17 @@ describe("ToolCallCard", () => {
       <ToolCallCard
         toolCall={makeToolCall("update_blob")}
         proposal={{ ...proposal, tool_name: "update_blob", affects: ["blob_store", "future-domain"] }}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expect(screen.getByText("Session files, future-domain")).toBeInTheDocument();
     expect(screen.queryByText(/blob_store/)).not.toBeInTheDocument();
   });
 
-  it("renders pending write proposals with balanced accept and reject actions", () => {
+  it("renders pending write proposals as read-only history", () => {
     render(
       <ToolCallCard
         toolCall={toolCall}
         proposal={proposal}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
 
@@ -141,15 +130,15 @@ describe("ToolCallCard", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(proposal.summary)).toBeInTheDocument();
     expect(
-      screen.getByRole("button", {
+      screen.queryByRole("button", {
         name: `Accept proposal: ${proposal.summary}`,
       }),
-    ).toBeInTheDocument();
+    ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", {
+      screen.queryByRole("button", {
         name: `Reject proposal: ${proposal.summary}`,
       }),
-    ).toBeInTheDocument();
+    ).not.toBeInTheDocument();
   });
 
   it("renders read-only tools as ribbons", () => {
@@ -161,8 +150,6 @@ describe("ToolCallCard", () => {
           function: { name: "get_pipeline_state", arguments: "{}" },
         }}
         proposal={null}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
 
@@ -191,8 +178,6 @@ describe("ToolCallCard", () => {
         <ToolCallCard
           toolCall={call("applied", 3)}
           proposal={null}
-          onAccept={vi.fn()}
-          onReject={vi.fn()}
         />,
       );
       expect(screen.getByText("Applied: Adds a new transform or gate node, or replaces an existing one with the same id.")).toBeInTheDocument();
@@ -205,8 +190,6 @@ describe("ToolCallCard", () => {
         <ToolCallCard
           toolCall={call("applied", null)}
           proposal={null}
-          onAccept={vi.fn()}
-          onReject={vi.fn()}
         />,
       );
       expect(screen.getByText("Applied: Adds a new transform or gate node, or replaces an existing one with the same id.")).toBeInTheDocument();
@@ -218,8 +201,6 @@ describe("ToolCallCard", () => {
         <ToolCallCard
           toolCall={call("rejected")}
           proposal={null}
-          onAccept={vi.fn()}
-          onReject={vi.fn()}
         />,
       );
       expect(
@@ -235,8 +216,6 @@ describe("ToolCallCard", () => {
         <ToolCallCard
           toolCall={call("failed")}
           proposal={null}
-          onAccept={vi.fn()}
-          onReject={vi.fn()}
         />,
       );
       expect(
@@ -251,8 +230,6 @@ describe("ToolCallCard", () => {
         <ToolCallCard
           toolCall={call("cancelled")}
           proposal={null}
-          onAccept={vi.fn()}
-          onReject={vi.fn()}
         />,
       );
       expect(
@@ -272,8 +249,6 @@ describe("ToolCallCard", () => {
         <ToolCallCard
           toolCall={call()}
           proposal={null}
-          onAccept={vi.fn()}
-          onReject={vi.fn()}
         />,
       );
       expect(
@@ -297,8 +272,6 @@ describe("ToolCallCard", () => {
             outcome: "completed",
           }}
           proposal={null}
-          onAccept={vi.fn()}
-          onReject={vi.fn()}
         />,
       );
       expect(
@@ -319,8 +292,6 @@ describe("ToolCallCard", () => {
             outcome: "completed",
           }}
           proposal={null}
-          onAccept={vi.fn()}
-          onReject={vi.fn()}
         />,
       );
       expect(
@@ -336,39 +307,15 @@ describe("ToolCallCard", () => {
     expect(rule?.groups?.body).toContain("height: 24px");
   });
 
-  it("calls accept and reject handlers", async () => {
-    const user = userEvent.setup();
-    const onAccept = vi.fn();
-    const onReject = vi.fn();
+  it("keeps proposal mutation handlers out of transcript history", () => {
     render(
       <ToolCallCard
         toolCall={toolCall}
         proposal={proposal}
-        onAccept={onAccept}
-        onReject={onReject}
       />,
     );
 
-    await user.click(
-      screen.getByRole("button", {
-        name: `Accept proposal: ${proposal.summary}`,
-      }),
-    );
-    // S3.5 (button-audit): Reject now opens a ConfirmDialog. Click the
-    // dialog's primary action ("Reject proposal", exactly — distinct from
-    // the original card button whose accessible name is "Reject proposal:
-    // {summary}") to actually invoke onReject.
-    await user.click(
-      screen.getByRole("button", {
-        name: `Reject proposal: ${proposal.summary}`,
-      }),
-    );
-    await user.click(
-      screen.getByRole("button", { name: /^reject proposal$/i }),
-    );
-
-    expect(onAccept).toHaveBeenCalledWith("proposal-1");
-    expect(onReject).toHaveBeenCalledWith("proposal-1");
+    expect(screen.queryByRole("button", { name: /Accept proposal|Reject proposal/ })).toBeNull();
   });
 
   it("renders stale proposals without actionable accept or reject buttons", () => {
@@ -377,9 +324,6 @@ describe("ToolCallCard", () => {
         toolCall={toolCall}
         proposal={proposal}
         isStale={true}
-        isBusy={false}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
 
@@ -399,8 +343,6 @@ describe("ToolCallCard humanised primary label (elspeth-af559a0bab)", () => {
       <ToolCallCard
         toolCall={makeToolCall("upsert_node", { outcome: "applied", applied_state_version: 3 })}
         proposal={null}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expect(
@@ -417,8 +359,6 @@ describe("ToolCallCard humanised primary label (elspeth-af559a0bab)", () => {
       <ToolCallCard
         toolCall={makeToolCall("upsert_node", { outcome: "rejected" })}
         proposal={null}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expect(
@@ -433,8 +373,6 @@ describe("ToolCallCard humanised primary label (elspeth-af559a0bab)", () => {
       <ToolCallCard
         toolCall={makeToolCall("mystery_tool")}
         proposal={null}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expect(screen.getByText("Ran: mystery_tool")).toBeInTheDocument();
@@ -445,8 +383,6 @@ describe("ToolCallCard humanised primary label (elspeth-af559a0bab)", () => {
       <ToolCallCard
         toolCall={makeToolCall("set_source_from_blob", { outcome: "applied", applied_state_version: 7 })}
         proposal={null}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expectNoIdentifiersInDefaultDom(container);
@@ -461,8 +397,6 @@ describe("ToolCallCard humanised primary label (elspeth-af559a0bab)", () => {
       <ToolCallCard
         toolCall={makeToolCall("request_interpretation_review", { outcome: "completed" })}
         proposal={null}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
     expect(
@@ -533,8 +467,6 @@ describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {
         toolCall={upsertToolCall}
         proposal={upsertProposal()}
         currentState={currentState}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
 
@@ -552,8 +484,6 @@ describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {
         toolCall={upsertToolCall}
         proposal={upsertProposal()}
         currentState={currentState}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
 
@@ -572,8 +502,6 @@ describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {
         proposal={upsertProposal()}
         currentState={currentState}
         isStale={true}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
 
@@ -587,8 +515,6 @@ describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {
         toolCall={upsertToolCall}
         proposal={upsertProposal({ status: "committed" })}
         currentState={currentState}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
 
@@ -601,8 +527,6 @@ describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {
       <ToolCallCard
         toolCall={upsertToolCall}
         proposal={upsertProposal()}
-        onAccept={vi.fn()}
-        onReject={vi.fn()}
       />,
     );
 

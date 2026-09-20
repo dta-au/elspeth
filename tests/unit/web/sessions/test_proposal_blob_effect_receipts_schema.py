@@ -18,7 +18,7 @@ def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
-    assert SESSION_SCHEMA_EPOCH == 61
+    assert SESSION_SCHEMA_EPOCH == 62
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

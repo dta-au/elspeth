@@ -23,9 +23,6 @@ interface MessageBubbleProps {
    */
   compositionState?: CompositionState | null;
   staleProposalIds?: string[];
-  proposalActionPendingIds?: string[];
-  onAcceptProposal?: (proposalId: string) => void;
-  onRejectProposal?: (proposalId: string) => void;
   /**
    * Inline source summaries attached to this turn — rendered as a second
    * collapsible group below the tool-calls group, separated by a horizontal
@@ -47,9 +44,6 @@ export function MessageBubble({
   proposalsByToolCallId,
   compositionState = null,
   staleProposalIds = [],
-  proposalActionPendingIds = [],
-  onAcceptProposal = () => undefined,
-  onRejectProposal = () => undefined,
   sourcesCreated,
   onEditInlineSource,
 }: MessageBubbleProps) {
@@ -329,15 +323,6 @@ export function MessageBubble({
                           )
                         : false
                     }
-                    isBusy={
-                      tc.id
-                        ? proposalActionPendingIds.includes(
-                            proposalsByToolCallId?.get(tc.id)?.id ?? "",
-                          )
-                        : false
-                    }
-                    onAccept={onAcceptProposal}
-                    onReject={onRejectProposal}
                   />
                 ))}
               </div>

@@ -340,7 +340,10 @@ from elspeth.core.schema_identity import create_schema_identity_table
 # 60: terminal guided operations preserve fork failure diagnostics.
 # 61: default new preferences to freeform and remove the retired mode banner.
 #     Pre-1.0 delete/recreate boundary; no migration of existing preferences.
-SESSION_SCHEMA_EPOCH = 61
+# 62: durable advisor completion gates require a nullable backend suggestion.
+#     Semantic-only JSON grammar cut: reject earlier stores at startup before
+#     an old blocked envelope can fail during session reload. No migration.
+SESSION_SCHEMA_EPOCH = 62
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

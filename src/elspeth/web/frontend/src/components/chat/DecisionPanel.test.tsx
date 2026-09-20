@@ -9,12 +9,15 @@
 // ============================================================================
 
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 
 import type { CompositionProposal, ValidationEntryDTO } from "@/types/index";
 
 import { DecisionPanel, DecisionPanelLiveRegion, decisionAnnounceText } from "./DecisionPanel";
 import type { DecisionRow } from "./decisionPanelRows";
+import { actionableProposals } from "./actionableProposals";
+import { projectDecisionRows } from "./decisionPanelRows";
+import { makeComposition, makeValidationResult } from "@/test/composerFixtures";
 
 const S1: ValidationEntryDTO = {
   component: "pipeline",
@@ -28,6 +31,7 @@ const blockerRow: DecisionRow = {
   id: "blocker:advisor_signoff_blocked:pipeline",
   code: "advisor_signoff_blocked",
   detail: "Completion advisory review did not clear after the available attempts.",
+  suggestion: null,
 };
 
 const suggestionRow: DecisionRow = {
@@ -95,7 +99,6 @@ function makeHandlers() {
   return {
     onApplySuggestion: vi.fn(),
     onOpenChecks: vi.fn(),
-    onShowInterpretation: vi.fn(),
     onAcceptProposal: vi.fn(),
     onRejectProposal: vi.fn(),
   };
@@ -171,21 +174,18 @@ describe("DecisionPanel", () => {
     );
   });
 
-  it("points at a pending interpretation card by its user term", () => {
-    const { handlers } = renderPanel({
+  it("hosts interpretation controls once without a pointer action", () => {
+    renderPanel({
       rows: [pointerRow],
       blockedVerbs: ["run", "save_for_review"],
       count: 1,
+      interpretationContent: <section aria-label="Interpretation approvals"><button>Approve interpretation</button></section>,
     });
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Show interpretation review: llm_prompt_template:colour_questions",
-      }),
-    );
-    expect(handlers.onShowInterpretation).toHaveBeenCalledExactlyOnceWith("event-1");
+    expect(screen.getAllByRole("button", { name: "Approve interpretation" })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /Show interpretation/ })).toBeNull();
   });
 
-  it("hosts the pending-proposals banner inside the panel unchanged", () => {
+  it("renders proposal actions as a native decision row without a nested region", () => {
     const { handlers } = renderPanel({
       rows: [{ kind: "pending_proposal", id: "proposal:proposal-1", proposalId: "proposal-1" }],
       blockedVerbs: [],
@@ -193,7 +193,8 @@ describe("DecisionPanel", () => {
       proposals: [proposal()],
     });
     const panel = screen.getByRole("region", { name: "Awaiting your decision (1)" });
-    const banner = within(panel).getByRole("region", { name: "Pending changes (1)" });
+    expect(within(panel).queryByRole("region")).toBeNull();
+    const banner = within(panel).getByRole("listitem");
     fireEvent.click(
       within(banner).getByRole("button", {
         name: "Accept proposal: Change one option on colour_questions.",
@@ -202,6 +203,69 @@ describe("DecisionPanel", () => {
     expect(handlers.onAcceptProposal).toHaveBeenCalledExactlyOnceWith("proposal-1");
     // Nothing is blocked, so no verb sentence.
     expect(screen.queryByText(/is blocked|are blocked/)).toBeNull();
+  });
+
+  it("confirms rejection and preserves the row when cancelled", () => {
+    const { handlers } = renderPanel({
+      rows: [{ kind: "pending_proposal", id: "proposal:proposal-1", proposalId: "proposal-1" }],
+      count: 1,
+      proposals: [proposal()],
+    });
+    fireEvent.click(screen.getByRole("button", { name: `Reject proposal: ${proposal().summary}` }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep open" }));
+    expect(handlers.onRejectProposal).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: `Reject proposal: ${proposal().summary}` }));
+    fireEvent.click(screen.getByRole("button", { name: "Reject proposal" }));
+    expect(handlers.onRejectProposal).toHaveBeenCalledExactlyOnceWith("proposal-1");
+  });
+
+  it("disables both proposal actions while its request is pending", () => {
+    const { handlers } = renderPanel({
+      rows: [{ kind: "pending_proposal", id: "proposal:proposal-1", proposalId: "proposal-1" }],
+      count: 1,
+      proposals: [proposal()],
+      proposalActionPendingIds: ["proposal-1"],
+    });
+    const accept = screen.getByRole("button", { name: `Accept proposal: ${proposal().summary}` });
+    const reject = screen.getByRole("button", { name: `Reject proposal: ${proposal().summary}` });
+    expect(accept).toBeDisabled();
+    expect(reject).toBeDisabled();
+    fireEvent.click(accept);
+    fireEvent.click(reject);
+    expect(handlers.onAcceptProposal).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("forgets rejection confirmation when its proposal disappears", () => {
+    const props = {
+      rows: [{ kind: "pending_proposal" as const, id: "proposal:proposal-1", proposalId: "proposal-1" }],
+      blockedVerbs: [], count: 1, proposals: [proposal()],
+      staleProposalIds: [], proposalActionPendingIds: [],
+      isComposing: false, applyDisabled: false, applyDisabledReason: null,
+      phraseFor, stepLabelFor, ...makeHandlers(),
+    };
+    const { rerender } = render(<DecisionPanel {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: `Reject proposal: ${proposal().summary}` }));
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    rerender(<DecisionPanel {...props} rows={[]} count={0} proposals={[]} />);
+    rerender(<DecisionPanel {...props} />);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  it("restores focus to Open checks or the input callback after a focused row disappears", () => {
+    const onEmptyFocus = vi.fn();
+    const props = {
+      rows: [suggestionRow, blockerRow], blockedVerbs: [], count: 2,
+      proposals: [], staleProposalIds: [], proposalActionPendingIds: [],
+      isComposing: false, applyDisabled: false, applyDisabledReason: null,
+      phraseFor, stepLabelFor, ...makeHandlers(), onEmptyFocus,
+    };
+    const { rerender } = render(<DecisionPanel {...props} />);
+    screen.getByRole("button", { name: /^Apply suggestion/ }).focus();
+    rerender(<DecisionPanel {...props} rows={[blockerRow]} count={1} />);
+    expect(screen.getByRole("button", { name: "Open checks" })).toHaveFocus();
+    rerender(<DecisionPanel {...props} rows={[]} count={0} />);
+    expect(onEmptyFocus).toHaveBeenCalledOnce();
   });
 
   it("emits no tool or API vocabulary in its visible copy", () => {
@@ -225,6 +289,63 @@ describe("decisionAnnounceText", () => {
 });
 
 describe("DecisionPanelLiveRegion", () => {
+  it("announces changed projected suggestions at equal count but ignores reordering", () => {
+    vi.useFakeTimers();
+    const project = (suggestions: ValidationEntryDTO[]) => projectDecisionRows({
+      validationResult: makeValidationResult({ readiness: {
+        ...makeValidationResult().readiness,
+        completion_ready: false,
+      } }),
+      compositionState: makeComposition(1, { validation_suggestions: suggestions }),
+      pendingInterpretations: [], proposals: [], staleProposalIds: [],
+    });
+    const initial = project([S1, { ...S1, message: "Review the source fields." }]);
+    const replacement = project([S1, { ...S1, message: "Review the output fields." }]);
+    const reordered = project([{ ...S1, message: "Review the output fields." }, S1]);
+    const renderAnnouncement = (projection: ReturnType<typeof project>) => (
+      <DecisionPanelLiveRegion count={projection.count} decisionIds={projection.rows.map((row) => row.id)} />
+    );
+    try {
+      const { rerender } = render(renderAnnouncement(initial));
+      const region = screen.getByRole("status");
+      act(() => vi.runAllTimers());
+      expect(region).toHaveTextContent("2 items need your decision");
+      rerender(renderAnnouncement(replacement));
+      expect(region).toBeEmptyDOMElement();
+      act(() => vi.runAllTimers());
+      expect(region).toHaveTextContent("2 items need your decision");
+      const observer = new MutationObserver(() => {});
+      observer.observe(region, { childList: true, characterData: true, subtree: true });
+      rerender(renderAnnouncement(reordered));
+      act(() => vi.runAllTimers());
+      expect(observer.takeRecords()).toHaveLength(0);
+      observer.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("announces equal-count arrivals once without remounting the live region", () => {
+    vi.useFakeTimers();
+    try {
+      const { rerender } = render(<DecisionPanelLiveRegion count={1} decisionIds={["p1"]} />);
+      const region = screen.getByRole("status");
+      act(() => vi.runAllTimers());
+      expect(region).toHaveTextContent("1 item needs your decision");
+      rerender(<DecisionPanelLiveRegion count={1} decisionIds={["p2"]} />);
+      expect(screen.getByRole("status")).toBe(region);
+      expect(region).toBeEmptyDOMElement();
+      act(() => vi.runAllTimers());
+      expect(region).toHaveTextContent("1 item needs your decision");
+      const observer = new MutationObserver(() => {});
+      observer.observe(region, { childList: true, characterData: true, subtree: true });
+      rerender(<DecisionPanelLiveRegion count={1} decisionIds={["p2"]} />);
+      act(() => vi.runAllTimers());
+      expect(observer.takeRecords()).toHaveLength(0);
+      observer.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it("stays mounted and empty when nothing needs a decision", () => {
     render(<DecisionPanelLiveRegion count={0} />);
     const region = screen.getByTestId("decision-panel-live-region");
@@ -237,5 +358,17 @@ describe("DecisionPanelLiveRegion", () => {
     expect(
       await screen.findByText("2 items need your decision"),
     ).toBeInTheDocument();
+  });
+});
+
+describe("actionableProposals", () => {
+  it("preserves pending non-stale eligibility without mutating input", () => {
+    const pending = proposal();
+    const stale = { ...proposal(), id: "stale" };
+    const rejected = { ...proposal(), id: "rejected", status: "rejected" as const };
+    const committed = { ...proposal(), id: "committed", status: "committed" as const };
+    const input = Object.freeze([pending, stale, rejected, committed]);
+    expect(actionableProposals(input, ["stale"])).toEqual([pending]);
+    expect(input).toHaveLength(4);
   });
 });

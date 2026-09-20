@@ -12,7 +12,7 @@
 // YamlView retains:
 // - the fetch effect (on composition-version change)
 // - the empty/loading/error states
-// - the pending-YAML-proposal panel (with Accept/Reject buttons)
+// - the read-only pending-YAML-proposal summary
 // - the 409 validation-blocked alert
 //
 // SharedInspectView mounts `<YamlDisplay yaml={...} />` directly with
@@ -20,12 +20,10 @@
 // ============================================================================
 
 import { useState, useEffect, useMemo } from "react";
-import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import * as api from "@/api/client";
 import type { ApiError } from "@/types/index";
 import { YamlDisplay } from "./YamlDisplay";
-import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { hasCompositionContent } from "@/utils/compositionState";
 
 interface YamlFetchError {
@@ -68,12 +66,7 @@ export function YamlView() {
       ? storedBlobBinding
       : null;
   const compositionProposals = useSessionStore((s) => s.compositionProposals);
-  const proposalActionPendingIds = useSessionStore(
-    (s) => s.proposalActionPendingIds,
-  );
   const staleProposalIds = useSessionStore((s) => s.staleProposalIds);
-  const acceptProposal = useSessionStore((s) => s.acceptProposal);
-  const rejectProposal = useSessionStore((s) => s.rejectProposal);
   const pendingYamlProposals = useMemo(
     () =>
       compositionProposals.filter(
@@ -85,7 +78,6 @@ export function YamlView() {
   const [yaml, setYaml] = useState<string | null>(null);
   const [yamlError, setYamlError] = useState<YamlFetchError | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [rejectConfirmId, setRejectConfirmId] = useState<string | null>(null);
 
   // Fetch YAML from the backend whenever composition state version changes
   const version = compositionState?.version ?? null;
@@ -146,58 +138,22 @@ export function YamlView() {
   }, [activeSessionId, version, hasPipelineContent, setExportedYamlBlobBinding]);
 
   const pendingYamlProposal = pendingYamlProposals[0] ?? null;
-  const pendingYamlProposalIsBusy =
-    pendingYamlProposal !== null &&
-    proposalActionPendingIds.includes(pendingYamlProposal.id);
   const pendingYamlProposalIsStale =
     pendingYamlProposal !== null && staleProposalIds.includes(pendingYamlProposal.id);
   const pendingYamlProposalPanel =
     pendingYamlProposal === null ? null : (
-      <>
-        <div className="yaml-pending-summary" role="note">
-          <span>Pending YAML change: {pendingYamlProposal.summary}</span>
-          {pendingYamlProposalIsStale ? (
-            <span className="tool-call-stale">
-              Stale proposal. Ask the composer to rebase or revise this proposal.
-            </span>
-          ) : (
-            <span className="tool-call-actions">
-              <Button
-                variant="primary"
-                className="btn-small"
-                disabled={pendingYamlProposalIsBusy}
-                onClick={() => void acceptProposal(pendingYamlProposal.id)}
-                aria-label={`Accept YAML proposal: ${pendingYamlProposal.summary}`}
-              >
-                Accept
-              </Button>
-              <Button
-                variant="danger"
-                className="btn-small"
-                disabled={pendingYamlProposalIsBusy}
-                onClick={() => setRejectConfirmId(pendingYamlProposal.id)}
-                aria-label={`Reject YAML proposal: ${pendingYamlProposal.summary}`}
-              >
-                Reject
-              </Button>
-            </span>
-          )}
-        </div>
-        {rejectConfirmId !== null && (
-          <ConfirmDialog
-            title="Reject YAML proposal"
-            message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
-            confirmLabel="Reject proposal"
-            cancelLabel="Keep open"
-            variant="danger"
-            onConfirm={() => {
-              void rejectProposal(rejectConfirmId);
-              setRejectConfirmId(null);
-            }}
-            onCancel={() => setRejectConfirmId(null)}
-          />
+      <div className="yaml-pending-summary" role="note">
+        <span>Pending YAML change: {pendingYamlProposal.summary}</span>
+        {pendingYamlProposalIsStale ? (
+          <span className="tool-call-stale">
+            Stale proposal. Ask the composer to rebase or revise this proposal.
+          </span>
+        ) : (
+          <span>
+            Review this proposal in the Awaiting your decision panel.
+          </span>
         )}
-      </>
+      </div>
     );
 
   // Empty state

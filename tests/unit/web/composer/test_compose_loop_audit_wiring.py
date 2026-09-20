@@ -664,6 +664,7 @@ async def test_preview_tolerant_preflight_failure_records_tool_invocation() -> N
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="llm1",
                     component_type="transform",
@@ -734,6 +735,7 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="llm1",
                     component_type="transform",

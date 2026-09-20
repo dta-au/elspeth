@@ -68,6 +68,7 @@ def _blocked_readiness() -> ValidationReadiness:
         completion_ready=False,
         blockers=[
             ValidationReadinessBlocker(
+                suggestion=None,
                 code="blocked",
                 component_id=None,
                 component_type=None,
@@ -93,6 +94,7 @@ def _pending_readiness() -> ValidationReadiness:
         completion_ready=True,
         blockers=[
             ValidationReadinessBlocker(
+                suggestion=None,
                 code="interpretation_review_pending",
                 component_id="llm_1",
                 component_type="transform",
@@ -503,6 +505,7 @@ def test_finish_success_snapshots_all_mutable_inputs() -> None:
     readiness.completion_ready = False
     readiness.blockers.append(
         ValidationReadinessBlocker(
+            suggestion=None,
             code="mutated",
             component_id=None,
             component_type=None,

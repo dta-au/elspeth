@@ -1027,6 +1027,7 @@ def _proof_repair_exhausted_validation(
             blockers=[
                 ValidationReadinessBlocker(
                     code=_PROOF_REPAIR_EXHAUSTED_CODE,
+                    suggestion=None,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -1112,6 +1113,7 @@ def _orphaned_interpretation_review_validation(
             blockers=[
                 ValidationReadinessBlocker(
                     code=_INTERPRETATION_REVIEW_ORPHANED_CODE,
+                    suggestion=None,
                     component_id=component_id,
                     component_type=_component_type_for_kind(kind),
                     detail=detail,
@@ -1177,12 +1179,12 @@ def _outstanding_findings_suggestion_block(outstanding_findings: ValidationResul
     than the one shown would misdirect the repair. Failed CHECKS have no
     suggestion field at all, so a check-only result yields ``""``.
 
-    This exists because the suffix is the operator's ONLY sight of the
-    suggestion on the staged-review branch's cross-turn red arm: the shape
-    replaces the preflight-failure suffix that would otherwise have carried it,
-    and ``_composer_persisted_validation`` projects preflight errors to
-    ``[error.message]``, so ``ValidationError.suggestion`` reaches no
-    structured surface either. Mirrors the ``suggestion_block`` construction in
+    Preserve the runtime suggestion when the staged-review branch's cross-turn
+    red arm replaces the preflight-failure suffix. Reload recomputes Stage-1
+    ``ValidationSummary.suggestions`` for the decision panel; those are separate
+    from runtime ``ValidationError.suggestion``, which
+    ``_composer_persisted_validation`` omits from persisted error records.
+    Mirrors the ``suggestion_block`` construction in
     ``compose_preflight_failure_message`` byte for byte.
     """
     if outstanding_findings is None or not outstanding_findings.errors:
@@ -1288,11 +1290,11 @@ def _announce_staged_review_handoff(result: ComposerResult, raw_content: str | N
     qualified handoff shape's untrusted ``Cause:`` region — the same leading
     objection ``compose_preflight_failure_message`` would have named, since
     both read ``first_validation_objection`` — and its ``Suggested fix:`` tail
-    rides along too. Carrying the suggestion is NOT optional politeness: the
-    tail's suffix is replaced rather than extended, and
-    ``_composer_persisted_validation`` projects preflight errors to
-    ``[error.message]``, so nothing else publishes
-    ``ValidationError.suggestion`` to the operator.
+    rides along too. The tail's suffix is replaced rather than extended, so
+    dropping that suggestion would remove it from the handoff notice.
+    ``_composer_persisted_validation`` omits runtime error suggestions; the
+    decision panel's reload backfill recomputes separate Stage-1 suggestions
+    and does not restore this runtime suggestion.
 
     KNOWN REMAINING OVERLAP, deliberately not fixed here: the tail's
     state-claim GROUNDING correction can also co-occur with this announcement
@@ -10574,6 +10576,7 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) 
             blockers=[
                 ValidationReadinessBlocker(
                     code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
+                    suggestion=suggestion,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -10877,7 +10880,7 @@ def _advisor_signoff_pending_validation(
     Applies to every advisor reason. This release's authority decision is
     completion-only: an advisor FLAG does not make execution unsafe.
     """
-    detail, _suggestion = _advisor_signoff_blocked_wording(
+    detail, suggestion = _advisor_signoff_blocked_wording(
         reason=reason,
         findings=findings,
         findings_backend_authored=findings_backend_authored,
@@ -10902,6 +10905,7 @@ def _advisor_signoff_pending_validation(
                     *base.readiness.blockers,
                     ValidationReadinessBlocker(
                         code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
+                        suggestion=suggestion,
                         component_id="pipeline",
                         component_type="pipeline",
                         detail=detail,

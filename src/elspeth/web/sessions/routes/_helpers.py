@@ -816,6 +816,13 @@ def composition_validation_error_responses(
     return [CompositionValidationErrorResponse(**record) for record in records]
 
 
+def _validation_entry_responses(entries: Sequence[ValidationEntry]) -> list[ValidationEntryResponse]:
+    """Project owned Stage-1 warnings and suggestions into their HTTP shape."""
+    return [
+        ValidationEntryResponse(component=e.component, message=e.message, severity=e.severity, error_code=e.error_code) for e in entries
+    ]
+
+
 def _state_response(
     state: CompositionStateRecord,
     live_validation: ValidationSummary | None = None,
@@ -872,18 +879,8 @@ def _state_response(
         metadata=deep_thaw(state.metadata_),
         is_valid=state.is_valid,
         validation_errors=composition_validation_error_responses(state.validation_errors),
-        validation_warnings=[
-            ValidationEntryResponse(component=e.component, message=e.message, severity=e.severity, error_code=e.error_code)
-            for e in live_validation.warnings
-        ]
-        if live_validation is not None
-        else None,
-        validation_suggestions=[
-            ValidationEntryResponse(component=e.component, message=e.message, severity=e.severity, error_code=e.error_code)
-            for e in live_validation.suggestions
-        ]
-        if live_validation is not None
-        else None,
+        validation_warnings=_validation_entry_responses(live_validation.warnings) if live_validation is not None else None,
+        validation_suggestions=_validation_entry_responses(live_validation.suggestions) if live_validation is not None else None,
         derived_from_state_id=str(state.derived_from_state_id) if state.derived_from_state_id is not None else None,
         created_at=state.created_at,
         composer_meta=composer_meta_data,

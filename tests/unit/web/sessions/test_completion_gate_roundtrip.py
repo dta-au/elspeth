@@ -117,6 +117,7 @@ async def _save_with_gate(service: SessionServiceImpl, state: CompositionState, 
             "repair_turns_used": 1,
             COMPLETION_GATES_META_KEY: {
                 "advisor_signoff": {
+                    "suggestion": None,
                     "status": "blocked",
                     "detail": _BLOCKED_DETAIL,
                     "for_graph": for_graph,
@@ -154,7 +155,7 @@ async def test_blocked_gate_survives_db_roundtrip_and_blocks_recompute(service) 
 
     facts = parse_completion_gates(record.composer_meta)
     assert facts == CompletionGateFacts(
-        advisor_signoff=AdvisorSignoffGateFact(detail=_BLOCKED_DETAIL, for_graph=completion_gate_fingerprint(state))
+        advisor_signoff=AdvisorSignoffGateFact(detail=_BLOCKED_DETAIL, for_graph=completion_gate_fingerprint(state), suggestion=None)
     )
 
     # Fingerprint stability across reconstruction: the state rebuilt from the
@@ -213,6 +214,7 @@ async def test_durable_completion_gates_returns_prior_envelope_verbatim(service)
     carried = await _durable_completion_gates(service, record.session_id)
     assert carried == {
         "advisor_signoff": {
+            "suggestion": None,
             "status": "blocked",
             "detail": _BLOCKED_DETAIL,
             "for_graph": fingerprint,

@@ -13844,6 +13844,7 @@ def _handoff_strict_preflight() -> _SyncCallRecorder:
                 completion_ready=True,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
                         code="interpretation_review_pending",
                         component_id="summarize",
                         component_type="transform",

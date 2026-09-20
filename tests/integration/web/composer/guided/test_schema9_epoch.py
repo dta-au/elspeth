@@ -54,7 +54,7 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
-    assert SESSION_SCHEMA_EPOCH == 61
+    assert SESSION_SCHEMA_EPOCH == 62
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
     assert SQLITE_SCHEMA_EPOCH == 42

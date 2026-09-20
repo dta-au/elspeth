@@ -58,6 +58,7 @@ class AdvisorSignoffGateDict(TypedDict):
 
     status: str
     detail: str
+    suggestion: str | None
     for_graph: str
 
 
@@ -76,6 +77,7 @@ class AdvisorSignoffGateFact:
     """One persisted advisor sign-off outcome, bound to the reviewed graph."""
 
     detail: str
+    suggestion: str | None
     for_graph: str
 
 
@@ -130,6 +132,7 @@ def _reconcile_advisor_blocker(
     blockers: Sequence[ValidationReadinessBlocker],
     *,
     detail: str,
+    suggestion: str | None,
 ) -> list[ValidationReadinessBlocker]:
     """Replace duplicate advisor blockers while retaining the first slot."""
     replacement = ValidationReadinessBlocker(
@@ -137,6 +140,7 @@ def _reconcile_advisor_blocker(
         component_id="pipeline",
         component_type="pipeline",
         detail=detail,
+        suggestion=suggestion,
     )
     reconciled: list[ValidationReadinessBlocker] = []
     replaced = False
@@ -191,6 +195,7 @@ def completion_gates_meta_value(
         "advisor_signoff": AdvisorSignoffGateDict(
             status=_GATE_STATUS_BLOCKED,
             detail=blocked[0].detail,
+            suggestion=blocked[0].suggestion,
             for_graph=completion_gate_fingerprint(state),
         )
     }
@@ -215,6 +220,7 @@ def completion_gates_meta_from_facts(facts: CompletionGateFacts | None) -> Compl
         "advisor_signoff": AdvisorSignoffGateDict(
             status=_GATE_STATUS_BLOCKED,
             detail=facts.advisor_signoff.detail,
+            suggestion=facts.advisor_signoff.suggestion,
             for_graph=facts.advisor_signoff.for_graph,
         )
     }
@@ -266,7 +272,12 @@ def parse_completion_gates(
     for_graph = raw_signoff["for_graph"] if "for_graph" in raw_signoff else None
     if type(for_graph) is not str or not for_graph:
         raise ValueError("Tier 1: completion_gates.advisor_signoff.for_graph must be a non-empty string")
-    return CompletionGateFacts(advisor_signoff=AdvisorSignoffGateFact(detail=detail, for_graph=for_graph))
+    if "suggestion" not in raw_signoff:
+        raise ValueError("Tier 1: completion_gates.advisor_signoff.suggestion is required")
+    suggestion = raw_signoff["suggestion"]
+    if suggestion is not None and type(suggestion) is not str:
+        raise ValueError("Tier 1: completion_gates.advisor_signoff.suggestion must be a string or null")
+    return CompletionGateFacts(advisor_signoff=AdvisorSignoffGateFact(detail=detail, suggestion=suggestion, for_graph=for_graph))
 
 
 def merge_completion_gates(
@@ -295,7 +306,9 @@ def merge_completion_gates(
                 authoring_valid=result.readiness.authoring_valid,
                 execution_ready=result.readiness.execution_ready,
                 completion_ready=False,
-                blockers=_reconcile_advisor_blocker(result.readiness.blockers, detail=detail),
+                blockers=_reconcile_advisor_blocker(
+                    result.readiness.blockers, detail=detail, suggestion=fact.suggestion if current else None
+                ),
             ),
         }
     )

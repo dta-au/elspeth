@@ -391,6 +391,7 @@ def _merge_authoritative_proof_diagnostics(
         blockers.append(
             ValidationReadinessBlocker(
                 code=code,
+                suggestion=None,
                 component_id=node_id,
                 component_type=component_type,
                 detail=f"Bounded source proof blocked execution: {code}.",
@@ -416,6 +417,7 @@ def _merge_authoritative_proof_diagnostics(
         blockers.append(
             ValidationReadinessBlocker(
                 code="proof_diagnostics",
+                suggestion=None,
                 component_id=None,
                 component_type="pipeline",
                 detail=(
@@ -484,6 +486,7 @@ def _merge_unavailable_authoritative_proof(result: ValidationResult) -> Validati
                     *result.readiness.blockers,
                     ValidationReadinessBlocker(
                         code="source_inspection_failed",
+                        suggestion=None,
                         component_id=None,
                         component_type="source",
                         detail="Bounded source proof was unavailable; execution fails closed.",
@@ -2020,6 +2023,7 @@ class ExecutionServiceImpl:
                         blockers=[
                             ValidationReadinessBlocker(
                                 code="managed_identity_policy",
+                                suggestion=None,
                                 component_id=node.id,
                                 component_type="transform",
                                 detail=f"{node.node_type} {node.id} enables managed identity from web-authored provider_config",
@@ -2051,6 +2055,7 @@ class ExecutionServiceImpl:
                         blockers=[
                             ValidationReadinessBlocker(
                                 code="llm_retry_budget_policy",
+                                suggestion=None,
                                 component_id=node.id,
                                 component_type="transform",
                                 detail=f"transform {node.id} uses an unsafe sequential multi-query LLM retry budget",
@@ -2792,6 +2797,7 @@ class ExecutionServiceImpl:
                     blockers=[
                         ValidationReadinessBlocker(
                             code="state_exists",
+                            suggestion=None,
                             component_id=None,
                             component_type=None,
                             detail="No composition state exists for this session.",

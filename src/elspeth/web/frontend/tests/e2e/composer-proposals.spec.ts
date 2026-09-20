@@ -1,16 +1,27 @@
 import { expect, type Page, test } from "@playwright/test";
+import type { CompositionState } from "../../src/types";
 import { ComposerPage } from "./page-objects/composer-page";
 
 const sessionId = "proposal-session-1";
 
 const baseState = {
   id: "state-1",
+  session_id: sessionId,
   version: 1,
+  is_valid: true,
+  validation_errors: null,
+  validation_warnings: null,
+  validation_suggestions: null,
+  derived_from_state_id: null,
+  created_at: "2026-05-14T00:00:00Z",
+  composer_meta: null,
+  plugin_policy_findings: [],
   sources: {
     source: {
       plugin: "csv",
       options: { path: "input.csv" },
       on_success: "classify_in",
+      on_validation_failure: "discard",
     },
   },
   nodes: [
@@ -30,10 +41,11 @@ const baseState = {
       name: "json_out",
       plugin: "json",
       options: { path: "output.jsonl" },
+      on_write_failure: "discard",
     },
   ],
   metadata: { name: "Proposal workflow", description: null },
-};
+} satisfies CompositionState;
 
 const committedState = {
   ...baseState,
@@ -207,14 +219,7 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
 
     if (path === `/api/sessions/${sessionId}/state/versions` && method === "GET") {
       await route.fulfill({
-        json: [
-          {
-            id: accepted ? "state-2" : "state-1",
-            version: accepted ? 2 : 1,
-            created_at: "2026-05-14T00:00:00Z",
-            node_count: 1,
-          },
-        ],
+        json: [accepted ? committedState : baseState],
       });
       return;
     }
@@ -269,15 +274,16 @@ test("explicit approve tool call is visible before commit", async ({ page }) => 
   await composer.sendMessage("Build a simple csv to json pipeline");
 
   await expectToolCard(page, "Proposed", "set_pipeline");
-  const pendingChanges = page.getByRole("region", { name: /Pending changes/ });
+  const decisionPanel = page.getByRole("region", { name: /Awaiting your decision/ });
+  await expect(page.getByRole("region", { name: /Pending changes/ })).toHaveCount(0);
   await expect(
-    pendingChanges.getByRole("button", { name: /Accept proposal:/ }),
+    decisionPanel.getByRole("button", { name: /Accept proposal:/ }),
   ).toBeVisible();
   await expect(
-    pendingChanges.getByRole("button", { name: /Reject proposal:/ }),
+    decisionPanel.getByRole("button", { name: /Reject proposal:/ }),
   ).toBeVisible();
 
-  await pendingChanges.getByRole("button", { name: /Accept proposal:/ }).click();
+  await decisionPanel.getByRole("button", { name: /Accept proposal:/ }).click();
 
   await expectToolCard(page, "Applied", "set_pipeline");
   await expect(

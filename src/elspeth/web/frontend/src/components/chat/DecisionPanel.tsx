@@ -13,20 +13,15 @@
 //
 // This panel is a DUMB RENDER of decisionPanelRows.projectDecisionRows plus
 // callbacks. It owns no store and builds no prompt: ChatPanel computes the
-// rows and the compose gate, and sends the canned prompts through
-// useComposer.sendMessage, so every click that changes the pipeline is a
-// planner call (AGENTS.md § Composer invariants).
+// rows and the compose gate. Suggestion and source actions use provider-backed
+// composition; proposal and interpretation approvals use their existing APIs.
 //
-// Phase 1 scope: the pending-proposals banner is HOSTED inside this region
-// unchanged (its accessible names are pinned by ChatPanel.test.tsx and the
-// proposals E2E spec) and pending interpretation cards get pointer rows that
-// scroll to the existing card. Phase 2 migrates both in full; the row kinds
-// are already in place for it.
+// Pending proposals, interpretation reviews and source fallback actions
+// have one interactive home here; anchored transcript cards remain history.
 //
 // Contract (test-pinned, InlineSourceFallbackPrompt style):
 //   * root is `<section role="region" aria-label="Awaiting your decision (N)">`;
 //   * Apply buttons are named `Apply suggestion: <humanised text>`;
-//   * pointer buttons are named `Show interpretation review: <user term>`;
 //   * `Open checks` always renders. The workspace handles the view intent by
 //     revealing Pipeline on narrow screens, then selecting and focusing Checks.
 //   * no tool or API vocabulary in visible copy (F-3).
@@ -40,13 +35,15 @@
 // accepting a proposal, or the user's next real change.
 // ============================================================================
 
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui";
 import { humaniseValidationSuggestion } from "@/lib/validationHumaniser";
 import type { CompositionProposal, ValidationEntryDTO } from "@/types/index";
 
-import { PendingProposalsBanner } from "./PendingProposalsBanner";
+import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { actionableProposals } from "./actionableProposals";
+import { proposalEffectLabel } from "./proposalEffectLabel";
 import type { BlockedVerb, DecisionRow } from "./decisionPanelRows";
 
 export interface DecisionPanelProps {
@@ -68,7 +65,9 @@ export interface DecisionPanelProps {
   stepLabelFor: (componentId: string) => string | null;
   onApplySuggestion: (suggestion: ValidationEntryDTO) => void;
   onOpenChecks: () => void;
-  onShowInterpretation: (eventId: string) => void;
+  interpretationContent?: ReactNode;
+  renderSourceFallback?: (candidateText: string) => ReactNode;
+  onEmptyFocus?: () => void;
   onAcceptProposal: (proposalId: string) => void;
   onRejectProposal: (proposalId: string) => void;
 }
@@ -93,18 +92,31 @@ export function decisionAnnounceText(count: number): string {
 
 /**
  * Persistent, ALWAYS-mounted `role="status"` live region for the panel —
- * the PendingProposalsLiveRegion idiom: the panel returns null when empty,
+ * the panel returns null when empty,
  * so a live role on its own section would enter the DOM with its content
  * already present (the WAI-ARIA unreliable pattern). Mount silent, land the
  * text one commit later so every announcement is a content mutation inside
  * an already-inserted node.
  */
-export function DecisionPanelLiveRegion({ count }: { count: number }): JSX.Element {
+export function DecisionPanelLiveRegion({ count, decisionIds }: {
+  count: number;
+  decisionIds?: readonly string[];
+}): JSX.Element {
   const announceText = decisionAnnounceText(count);
   const [renderedText, setRenderedText] = useState("");
+  const previousIds = useRef<readonly string[]>([]);
+  const identity = JSON.stringify(decisionIds ?? []);
   useEffect(() => {
+    const ids: string[] = JSON.parse(identity);
+    const arrived = ids.some((id) => !previousIds.current.includes(id));
+    previousIds.current = ids;
+    if (arrived) {
+      setRenderedText("");
+      const timer = window.setTimeout(() => setRenderedText(announceText), 0);
+      return () => window.clearTimeout(timer);
+    }
     setRenderedText(announceText);
-  }, [announceText]);
+  }, [announceText, identity]);
   return (
     <div
       role="status"
@@ -130,20 +142,43 @@ export function DecisionPanel({
   stepLabelFor,
   onApplySuggestion,
   onOpenChecks,
-  onShowInterpretation,
+  interpretationContent,
+  renderSourceFallback,
+  onEmptyFocus,
   onAcceptProposal,
   onRejectProposal,
 }: DecisionPanelProps): JSX.Element | null {
+  const [rejectConfirmId, setRejectConfirmId] = useState<string | null>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  const focusedElement = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (focusedElement.current !== null && !focusedElement.current.isConnected) {
+      focusedElement.current = null;
+      if (document.activeElement === document.body) {
+        const fallback = panelRef.current?.querySelector<HTMLButtonElement>(".decision-panel-checks-btn");
+        if (fallback) fallback.focus();
+        else onEmptyFocus?.();
+      }
+    }
+  });
+  const actionable = actionableProposals(proposals, staleProposalIds);
+  const rejectTarget = actionable.find((proposal) => proposal.id === rejectConfirmId);
+  useEffect(() => {
+    if (rejectConfirmId !== null && rejectTarget === undefined) {
+      setRejectConfirmId(null);
+    }
+  }, [rejectConfirmId, rejectTarget]);
   if (count === 0) return null;
 
   const verbSentence = blockedVerbsSentence(blockedVerbs);
-  const listRows = rows.filter((row) => row.kind !== "pending_proposal");
-  const hasProposals = rows.some((row) => row.kind === "pending_proposal");
+  const listRows = rows.filter((row) => row.kind !== "pending_interpretation");
   const gateReason = !isComposing && applyDisabled ? applyDisabledReason : null;
   const title = `Awaiting your decision (${count})`;
 
   return (
     <section
+      ref={panelRef}
+      onFocusCapture={(event) => { focusedElement.current = event.target; }}
       role="region"
       aria-label={title}
       data-testid="decision-panel"
@@ -167,7 +202,7 @@ export function DecisionPanel({
           {listRows.map((row) => (
             <li key={row.id} className={`decision-panel-item decision-panel-item--${row.kind}`}>
               {row.kind === "blocker" && (
-                <span className="decision-panel-item-text">{row.detail}</span>
+                <span className="decision-panel-item-text">{row.detail}{row.suggestion !== null && <> {row.suggestion}</>}</span>
               )}
               {row.kind === "suggestion" && (
                 <SuggestionItem
@@ -180,39 +215,33 @@ export function DecisionPanel({
                   onApply={onApplySuggestion}
                 />
               )}
-              {row.kind === "pending_interpretation" && (
-                <>
-                  <span className="decision-panel-item-text">
-                    Interpretation review pending
-                    {row.userTerm !== null && (
-                      <>
-                        {" "}
-                        for <em>{row.userTerm}</em>
-                      </>
-                    )}
-                    .
-                  </span>
-                  <Button
-                    compact
-                    className="decision-panel-show-btn"
-                    aria-label={`Show interpretation review: ${row.userTerm ?? row.eventId}`}
-                    onClick={() => onShowInterpretation(row.eventId)}
-                  >
-                    Show
-                  </Button>
-                </>
-              )}
+              {row.kind === "pending_proposal" && actionable.filter((proposal) => proposal.id === row.proposalId).map((proposal) => (
+                <ProposalItem
+                  key={proposal.id}
+                  proposal={proposal}
+                  isBusy={proposalActionPendingIds.includes(proposal.id)}
+                  onAccept={onAcceptProposal}
+                  onReject={setRejectConfirmId}
+                />
+              ))}
+              {row.kind === "inline_source_fallback" && renderSourceFallback?.(row.candidateText)}
             </li>
           ))}
         </ul>
       )}
-      {hasProposals && (
-        <PendingProposalsBanner
-          proposals={proposals}
-          staleProposalIds={staleProposalIds}
-          proposalActionPendingIds={proposalActionPendingIds}
-          onAccept={onAcceptProposal}
-          onReject={onRejectProposal}
+      {interpretationContent}
+      {rejectTarget && (
+        <ConfirmDialog
+          title="Reject proposal"
+          message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
+          confirmLabel="Reject proposal"
+          cancelLabel="Keep open"
+          variant="danger"
+          onConfirm={() => {
+            onRejectProposal(rejectTarget.id);
+            setRejectConfirmId(null);
+          }}
+          onCancel={() => setRejectConfirmId(null)}
         />
       )}
       <div className="decision-panel-actions">
@@ -221,6 +250,26 @@ export function DecisionPanel({
         </Button>
       </div>
     </section>
+  );
+}
+
+function ProposalItem({ proposal, isBusy, onAccept, onReject }: {
+  proposal: CompositionProposal;
+  isBusy: boolean;
+  onAccept: (id: string) => void;
+  onReject: (id: string) => void;
+}): JSX.Element {
+  return (
+    <>
+      <div className="decision-panel-item-text">
+        <p>{proposal.summary}</p>
+        {proposal.affects.length > 0 && <p>Affects: {proposal.affects.map(proposalEffectLabel).join(", ")}</p>}
+      </div>
+      <div className="decision-panel-proposal-actions">
+        <Button variant="primary" disabled={isBusy} aria-label={`Accept proposal: ${proposal.summary}`} onClick={() => onAccept(proposal.id)}>Accept</Button>
+        <Button variant="danger" disabled={isBusy} aria-label={`Reject proposal: ${proposal.summary}`} onClick={() => onReject(proposal.id)}>Reject</Button>
+      </div>
+    </>
   );
 }
 

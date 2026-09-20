@@ -104,6 +104,7 @@ def _red_result() -> ValidationResult:
             completion_ready=False,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
                     code="graph_structure",
                     component_id="map_node",
                     component_type="transform",
@@ -131,6 +132,7 @@ def _pending_review_result() -> ValidationResult:
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="map_node",
                     component_type="transform",

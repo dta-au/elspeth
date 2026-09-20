@@ -231,7 +231,7 @@ def test_current_session_schema_epoch_is_61() -> None:
     # 58: 64-bit quota limits and nullable token-ledger usage measures.
     # 59: timestamp-leading indexes for container quota scans.
     # 60: durable guided fork failure diagnostics.
-    assert SESSION_SCHEMA_EPOCH == 61
+    assert SESSION_SCHEMA_EPOCH == 62
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

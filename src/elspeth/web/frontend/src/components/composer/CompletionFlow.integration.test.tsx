@@ -49,6 +49,7 @@ const BLOCKED_READINESS = {
       component_id: "n",
       component_type: "transform",
       detail: "The transform did not pass validation.",
+      suggestion: null,
     },
   ],
 } satisfies ValidationReadiness;
@@ -63,6 +64,7 @@ const COMPLETION_BLOCKED_READINESS = {
       component_id: null,
       component_type: null,
       detail: "Advisor sign-off is required before sharing for review.",
+      suggestion: null,
     },
   ],
 } satisfies ValidationReadiness;

@@ -62,9 +62,9 @@ def test_blob_inline_resolutions_schema_epoch_is_61(engine) -> None:
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
-    assert SESSION_SCHEMA_EPOCH == 61
+    assert SESSION_SCHEMA_EPOCH == 62
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 61
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 62
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

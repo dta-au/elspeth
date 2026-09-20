@@ -195,6 +195,7 @@ class TestValidationResult:
                 completion_ready=True,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
                         code="interpretation_review_pending",
                         component_id="rate_coolness",
                         component_type="transform",
@@ -292,6 +293,7 @@ class TestValidationResult:
                 completion_ready=False,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
                         code="graph_structure",
                         component_id="gate_1",
                         component_type="gate",
@@ -364,6 +366,7 @@ class TestValidationResult:
                 completion_ready=False,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
                         code="settings_load",
                         component_id=None,
                         component_type=None,

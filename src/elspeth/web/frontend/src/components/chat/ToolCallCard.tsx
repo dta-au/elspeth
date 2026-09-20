@@ -1,8 +1,7 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import type { CompositionProposal, CompositionState, ToolCall } from "@/types/api";
 import { Button } from "@/components/ui";
-import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { ArgumentFields, buildProposalDiff, ProposalChanges } from "./ProposalDiff";
 import { proposalEffectLabel } from "./proposalEffectLabel";
 import {
@@ -58,9 +57,6 @@ interface ToolCallCardProps {
    */
   currentState?: CompositionState | null;
   isStale?: boolean;
-  isBusy?: boolean;
-  onAccept: (proposalId: string) => void;
-  onReject: (proposalId: string) => void;
 }
 
 export function ToolCallCard({
@@ -68,11 +64,7 @@ export function ToolCallCard({
   proposal,
   currentState = null,
   isStale = false,
-  isBusy = false,
-  onAccept,
-  onReject,
 }: ToolCallCardProps) {
-  const [rejectConfirmOpen, setRejectConfirmOpen] = useState(false);
   // Fragment-level before/after projection of the proposal against the
   // current pipeline. null = not derivable (unknown tool, malformed args, no
   // state) → structured argument fields render instead. Computed before the
@@ -140,7 +132,6 @@ export function ToolCallCard({
     );
   }
 
-  const isPending = proposal.status === "pending";
   const proposalSentence: string | undefined =
     TOOL_CALL_DESCRIPTIONS[proposal.tool_name];
   const headingPrefix =
@@ -197,42 +188,6 @@ export function ToolCallCard({
         <p className="tool-call-stale">
           Stale proposal. Ask the composer to rebase or revise this proposal.
         </p>
-      )}
-      {isPending && !isStale && (
-        <div className="tool-call-actions">
-          <Button
-            variant="primary"
-            onClick={() => onAccept(proposal.id)}
-            aria-label={`Accept proposal: ${proposal.summary}`}
-            disabled={isBusy}
-            className="btn-small"
-          >
-            Accept
-          </Button>
-          <Button
-            variant="danger"
-            onClick={() => setRejectConfirmOpen(true)}
-            aria-label={`Reject proposal: ${proposal.summary}`}
-            disabled={isBusy}
-            className="btn-small"
-          >
-            Reject
-          </Button>
-        </div>
-      )}
-      {rejectConfirmOpen && proposal && (
-        <ConfirmDialog
-          title="Reject proposal"
-          message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
-          confirmLabel="Reject proposal"
-          cancelLabel="Keep open"
-          variant="danger"
-          onConfirm={() => {
-            onReject(proposal.id);
-            setRejectConfirmOpen(false);
-          }}
-          onCancel={() => setRejectConfirmOpen(false)}
-        />
       )}
     </article>
   );

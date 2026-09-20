@@ -19,6 +19,7 @@ import type {
 } from "../types/api";
 import { VALIDATION_CHECK_OUTCOME_CODE_VALUES } from "../types/index";
 import { authHeaders, parseResponse } from "./client";
+import { isValidationReadiness } from "./validationReadiness";
 
 type AuditReadinessBaseEnvelope = {
   session_id: string;
@@ -116,27 +117,6 @@ function isSemanticEdgeContract(contract: unknown): boolean {
       contract.outcome === "unknown"
     ) &&
     typeof contract.requirement_code === "string"
-  );
-}
-
-function isValidationReadinessBlocker(blocker: unknown): boolean {
-  return (
-    isRecord(blocker) &&
-    typeof blocker.code === "string" &&
-    (typeof blocker.component_id === "string" || blocker.component_id === null) &&
-    (typeof blocker.component_type === "string" || blocker.component_type === null) &&
-    typeof blocker.detail === "string"
-  );
-}
-
-function isValidationReadiness(readiness: unknown): boolean {
-  return (
-    isRecord(readiness) &&
-    typeof readiness.authoring_valid === "boolean" &&
-    typeof readiness.execution_ready === "boolean" &&
-    typeof readiness.completion_ready === "boolean" &&
-    Array.isArray(readiness.blockers) &&
-    readiness.blockers.every(isValidationReadinessBlocker)
   );
 }
 

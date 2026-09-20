@@ -3196,7 +3196,7 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
-    assert SESSION_SCHEMA_EPOCH == 61
+    assert SESSION_SCHEMA_EPOCH == 62
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

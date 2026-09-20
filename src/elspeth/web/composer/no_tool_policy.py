@@ -360,12 +360,11 @@ _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER: Final = (
 _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
     _INTERPRETATION_REVIEW_HANDOFF_NOTICE,
     _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER,
-    # Same slot pair as the preflight wrapper, and for the same reason: when
-    # this shape carries a red RUNTIME PREFLIGHT (the staged-review branch's
-    # cross-turn arm) the prose is the operator's ONLY sight of the repair
-    # suggestion. ``_composer_persisted_validation`` projects preflight errors
-    # to ``[error.message]`` alone, so ``ValidationError.suggestion`` reaches
-    # no structured surface — dropping it here would discard it outright.
+    # Keep the preflight wrapper's detail/suggestion pair when the staged-review
+    # branch replaces that wrapper on its cross-turn red arm. Persisted runtime
+    # errors omit ValidationError.suggestion. Reload backfills the decision
+    # panel's separate Stage-1 suggestions; it does not restore this runtime
+    # suggestion, so the handoff notice must retain it.
     diagnostic_slots="{detail}{suggestion_block}",
 )
 
@@ -1438,6 +1437,7 @@ def no_mutation_empty_state_validation(blocker: str) -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     code="state_exists",
+                    suggestion=None,
                     component_id=None,
                     component_type=None,
                     detail=detail,

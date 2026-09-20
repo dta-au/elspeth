@@ -1363,6 +1363,7 @@ class TestExecutionFlow:
                 completion_ready=False,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
                         code="graph_structure",
                         component_id="rate",
                         component_type="transform",
@@ -1391,6 +1392,7 @@ class TestExecutionFlow:
     ) -> None:
         """Execution admission follows readiness even when validation is green."""
         blocker = ValidationReadinessBlocker(
+            suggestion=None,
             code="runtime_admission",
             component_id="pipeline",
             component_type="pipeline",
@@ -1590,12 +1592,14 @@ class TestExecutionFlow:
         session_id = selected_record.session_id
         authored_state = state_from_record(selected_record)
         fact = AdvisorSignoffGateFact(
+            suggestion=None,
             detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
             for_graph=completion_gate_fingerprint(authored_state),
         )
         selected_record.composer_meta = {
             "completion_gates": {
                 "advisor_signoff": {
+                    "suggestion": None,
                     "status": "blocked",
                     "detail": fact.detail,
                     "for_graph": fact.for_graph,
@@ -1788,6 +1792,7 @@ class TestExecutionFlow:
         state = state_from_record(mock_session_service.get_current_state.return_value)
         facts = CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph=completion_gate_fingerprint(state),
             )
@@ -1827,6 +1832,7 @@ class TestExecutionFlow:
         mock_session_service.get_current_state.return_value.composer_meta = {
             "completion_gates": {
                 "advisor_signoff": {
+                    "suggestion": None,
                     "status": "blocked",
                     "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                     "for_graph": "0" * 64,
@@ -1852,6 +1858,7 @@ class TestExecutionFlow:
         validate_state.assert_awaited_once()
         assert validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
             )

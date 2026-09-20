@@ -5532,6 +5532,7 @@ class TestStep2IntraStep:
                         completion_ready=False,
                         blockers=[
                             ValidationReadinessBlocker(
+                                suggestion=None,
                                 code="gate_expression_type_mismatch_against_source_schema",
                                 component_id="amount_gate",
                                 component_type="gate",
