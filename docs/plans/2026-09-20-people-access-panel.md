@@ -1,6 +1,6 @@
 # People & access: unified Composer administration
 
-Status: implemented on `design/people-access-panel` (2026-09-20), not merged. What was
+Status: implemented (2026-09-20) on `design/people-access-panel` for `release/0.8.1`. What was
 checked and what was not is recorded under *Scope and validation status* at the end.
 
 Target: release/0.8.1, confirmed by the maintainer on 2026-09-20. Inspected base:
@@ -402,41 +402,71 @@ timings only after observing both versions.
 
 ## Scope and validation status
 
-Implemented on `design/people-access-panel`, based on `5ae03b8ac`. Nothing has been
-merged, pushed or deployed, and no live account or deployed service was touched.
+Implemented on `design/people-access-panel`, rebased onto `release/0.8.1` at
+`f6df9d0d5`. No live account or deployed service was touched.
 
 Checked, with the process exit code read from a log each time:
 
 - The deletion prerequisite was confirmed as a defect before it was repaired: the
   dev admin could delete the last active human administrator's account and the
   route answered 204. `retire_identity` now refuses under the administrator-row
-  lock, before the credential is deleted.
+  lock, before the credential is deleted, on EVERY surface. The refusal was first
+  a per-surface switch that `composer users remove` turned off; the switch is
+  removed, and the CLI answers exit 1 with what to do instead.
 - Focused backend suites (auth, coordination, identity repository, CLI), the
   Sessions mutation-authority manifest, contracts and soft-mapping census,
   masquerade, mock-discipline and attribute-contract gates, ruff and mypy.
-- The full serial PostgreSQL testcontainer selection, including the two files
-  named above and two new proofs. Mutation controls were run on the search
-  redaction guard, the capability gate on the credential source, the label
-  redaction rule, the retirement lock and the cancel-focus behaviour; each
-  mutant went red.
-- The full default Python suite through `scripts/full-suite-gate.sh` at
-  `c3f529404`, once the host was free of other suites: ruff, mypy, contracts and
-  pytest all exit 0, tree frozen before and after.
+- Mutation controls on the search redaction guard, the capability gate on the
+  credential source, the label redaction rule, the retirement lock, the
+  cancel-focus behaviour, the last-administrator refusal as seen from the CLI,
+  and each acceptance repair below; each mutant went red.
 - The whole frontend suite, typecheck, ESLint, stylelint and build.
-- A real browser against a disposable backend and throwaway accounts: the
-  account-menu entry, set up access, grant a role, assign an approver by name
-  including a server refusal, and reflow at 1280 and 320 CSS pixels.
-- The trust-tier lint corpus is unchanged in size and carries no finding on a
-  line this work changed. Signed allowlist bindings on touched files were not
-  re-signed; that is the operator's step.
+- A real browser against a disposable backend and throwaway accounts, at 1280,
+  640 (200% zoom) and 320 CSS pixels, in light, dark and forced-colors rendering,
+  with axe-core (WCAG 2.0-2.2 A/AA and best-practice) run over thirteen panel
+  states. Axe found one issue (a second banner landmark); forced-colors lost the
+  selected person and the selected tab. All three are repaired.
+- The trust-tier lint corpus is identical to the release tip's. Signed allowlist
+  bindings on touched files were not re-signed; that is the operator's step.
+- The full gate through `scripts/full-suite-gate.sh` at `9a8016c4d`, tree frozen
+  before and after: ruff, mypy and contracts exit 0; the serial PostgreSQL
+  selection exit 0 (537 passed); the default Python suite 54433 passed and ONE
+  failed, `test_run_start_checkpoint.py::test_resume_does_not_rewrite_sequence_zero`,
+  whose mock clock advanced 298.3 s against a 300 s floor. It is in the
+  orchestrator resume family AGENTS.md names as flaky under parallelism, this
+  branch changes no file under `src/elspeth/engine`, `src/elspeth/core` or
+  `tests/unit/engine`, and it passed three of three serial reruns on this tree.
+  The suite was not rerun to turn it green.
 
-Not done, and still required before merge:
+Task-based acceptance, by proxy. A fresh agent that had never seen the panel or
+the source was given a URL, a throwaway login and the seven tasks. It is a stand-in
+for a person, not a substitute. It completed six of seven unaided, never needed an
+identity ID, and called a backwards approver assignment "very unlikely". What it
+hit, and what was done:
 
-- Forced-colors and dark-theme visual checks, an axe run, a manual screen-reader
-  pass and 200% zoom. Keyboard flow and focus were exercised; conformance is not
-  claimed.
-- The task-based acceptance with an administrator who has not seen the layout.
-  The design remains a hypothesis until that is observed.
+- Task 6 could not be completed: a first personal cap is stored with both values,
+  the other comes from the deployment's default limits, and the throwaway server
+  had none. The panel now says so before the form and the refusal is written in
+  plain words; with defaults configured the task completes. The maintainer then
+  ruled that enabling the quota system requires the defaults: configuring any
+  `quota_*` setting without both per-identity defaults now refuses to start, and
+  with quotas off the panel shows usage and offers no cap form.
+- A second generated password replaced the first on screen. Undismissed passwords
+  now stack, one per account.
+- After an approval the roles list still said "holds no roles". It is re-read.
+- The approver refusal spoke of "the overseeing identity". Both the server message
+  and the form's hint now name the person and the fix.
+- The "one active human administrator" warning outlived the grant that made a
+  second one. Role writes now refresh it.
+- A typed cap survived a change of dimension. It is cleared.
+
+Not done:
+
+- A manual screen-reader pass with a human listener. The accessibility tree was
+  inspected and axe run; conformance is not claimed.
+- Acceptance with a human administrator. Left from the proxy run and not changed:
+  disabling a person ends their approver links without naming who is affected;
+  storage caps are entered in raw bytes; expiry has no presets.
 
 The proposal does not introduce invitation email delivery, IdP account editing,
 bulk permission operations, identity merging, a new role model, or audit-history
