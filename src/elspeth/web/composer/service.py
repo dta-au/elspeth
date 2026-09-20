@@ -3142,6 +3142,8 @@ class ComposerServiceImpl:
         # A completed ready verdict for a marker must be paid again before a
         # later decision; the coordinator still coalesces concurrent workers.
         contains_blob_ref = _state_contains_blob_ref(state)
+        blob_operation_context = session_operation_context if contains_blob_ref else None
+        coordinator_key = replace(key, session_operation_context=blob_operation_context)
         # A cache miss is the normal, expected state on the first preflight for
         # this key — absence is not a missing-key bug, so membership-test then
         # subscript instead of relying on .get's implicit-None default.
@@ -3158,7 +3160,6 @@ class ComposerServiceImpl:
 
         async def worker() -> ValidationResult:
             preflight: Callable[..., ValidationResult]
-            blob_operation_context = session_operation_context if contains_blob_ref else None
             if interpretation_tolerant and blob_operation_context is not None:
                 preflight = functools.partial(
                     self._runtime_preflight,
@@ -3186,7 +3187,7 @@ class ComposerServiceImpl:
         timeout = self._runtime_preflight_timeout_seconds
         if deadline is not None:
             timeout = max(0.0, min(timeout, deadline - asyncio.get_running_loop().time()))
-        entry = await self._runtime_preflight_coordinator.run(key, worker, timeout=timeout)
+        entry = await self._runtime_preflight_coordinator.run(coordinator_key, worker, timeout=timeout)
         if not contains_blob_ref:
             cache[key] = entry
         if isinstance(entry, RuntimePreflightFailure):

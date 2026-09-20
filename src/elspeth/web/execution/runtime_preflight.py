@@ -12,6 +12,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.execution.schemas import ValidationResult
 
 
@@ -25,6 +26,9 @@ class RuntimePreflightKey:
     # interpretation-review handoff (elspeth-5a372d3267). Keyed separately so
     # a tolerant entry never satisfies a strict lookup or vice versa.
     interpretation_tolerant: bool = False
+    # Blob evidence is authorized under this operation. A worker can outlive
+    # its caller, but its verdict must never satisfy a different operation.
+    session_operation_context: SessionOperationContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
