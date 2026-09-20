@@ -419,6 +419,9 @@ Checked, with the process exit code read from a log each time:
   redaction guard, the capability gate on the credential source, the label
   redaction rule, the retirement lock and the cancel-focus behaviour; each
   mutant went red.
+- The full default Python suite through `scripts/full-suite-gate.sh` at
+  `c3f529404`, once the host was free of other suites: ruff, mypy, contracts and
+  pytest all exit 0, tree frozen before and after.
 - The whole frontend suite, typecheck, ESLint, stylelint and build.
 - A real browser against a disposable backend and throwaway accounts: the
   account-menu entry, set up access, grant a role, assign an approver by name
@@ -429,9 +432,6 @@ Checked, with the process exit code read from a log each time:
 
 Not done, and still required before merge:
 
-- The full default Python suite. Another full suite was running on the host and
-  the rule is one broad suite at a time. Shared authority code changed, so this
-  is owed.
 - Forced-colors and dark-theme visual checks, an axe run, a manual screen-reader
   pass and 200% zoom. Keyboard flow and focus were exercised; conformance is not
   claimed.
