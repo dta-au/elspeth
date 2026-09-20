@@ -1,6 +1,6 @@
 # Composer Freeform default implementation
 
-Implemented on `feature/composer-freeform-default`, based on `release/0.8.1` at `9dae0d50d7b7c9bb8085998f4cc1f725a8e8464d`. Worktree: `.claude/worktrees/composer-freeform-default`. This is local implementation evidence, not release integration or deployment acceptance.
+Implemented in `fc0bd33146326fca31f4d928f1674af1dce5fe4e`, based on `release/0.8.1` at `9dae0d50d7b7c9bb8085998f4cc1f725a8e8464d`. Merged locally into `release/0.8.1` at `9da7ffe340342b3d572f26abf1964c9c2f5b489e`. This is implementation and local integration evidence, not deployment acceptance.
 
 ## Behaviour delivered
 
@@ -49,4 +49,6 @@ The broad gate was stopped at the operator's request before pytest. No full Pyth
 
 Session schema epoch is **61**, replacing 60; Landscape schema is unchanged. Deploy the matching frontend/backend together. Existing pre-release session databases require operator-approved recreation; there is no migration or automatic reset. Actual accounts, preferences and session data affected by a shared-store reset must be identified before requesting approval. No shared database was reset and no live provider-backed acceptance was performed for this task.
 
-The implementation remains on its isolated branch. Merge, signing where required, shared-store recreation and deployment are separate subsequent actions.
+The operator authorized local release integration and retirement of the feature branch and worktree after scoped validation. The same selections passed on merge commit `9da7ffe340342b3d572f26abf1964c9c2f5b489e`: Python `499 passed in 57.83s`, PostgreSQL `8 passed, 71 deselected in 17.33s`, and frontend `228 passed (228)` across `10 passed (10)` files. All three processes exited 0; logs are `release-python.log`, `release-postgres.log`, and `release-frontend.log` in the lane directory above. The release HEAD stayed unchanged during these runs.
+
+Signing where required, shared-store recreation, publication and deployment remain separate subsequent actions.

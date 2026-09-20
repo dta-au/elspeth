@@ -6,7 +6,7 @@
 
 **Tech stack:** React, TypeScript, Zustand, Vitest, Playwright; Python, Pydantic, SQLAlchemy, SQLite and PostgreSQL.
 
-**Status:** Implemented locally in `feature/composer-freeform-default`. See the adjacent implementation note for validation and release boundaries. No merge, shared database reset, or deployment performed.
+**Status:** Implemented and merged locally into `release/0.8.1` at `9da7ffe340342b3d572f26abf1964c9c2f5b489e`. See the adjacent implementation note for validation and release boundaries. No shared database reset or deployment performed.
 
 **Validation scope amendment (operator, 2026-09-20):** Run only the relevant unit and integration tests. This supersedes the broad-suite instructions below. The broad Python gate was stopped before pytest; focused preferences, tutorial, schema, and PostgreSQL race checks are the completion evidence.
 
