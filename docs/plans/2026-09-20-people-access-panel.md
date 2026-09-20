@@ -1,6 +1,7 @@
 # People & access: unified Composer administration
 
-Status: proposed design and implementation plan; application changes have not been made.
+Status: implemented on `design/people-access-panel` (2026-09-20), not merged. What was
+checked and what was not is recorded under *Scope and validation status* at the end.
 
 Target: release/0.8.1, confirmed by the maintainer on 2026-09-20. Inspected base:
 `5ae03b8ac09561feb47f6dfa0fd1947154d0d669`. Planning branch:
@@ -401,10 +402,41 @@ timings only after observing both versions.
 
 ## Scope and validation status
 
-This work creates the planning worktree and this document. No application code,
-authentication settings, live users or deployed service has changed. No automated
-application tests or browser/usability checks have been run for this documentation
-change. The implementation checks above are required future work, not results.
+Implemented on `design/people-access-panel`, based on `5ae03b8ac`. Nothing has been
+merged, pushed or deployed, and no live account or deployed service was touched.
+
+Checked, with the process exit code read from a log each time:
+
+- The deletion prerequisite was confirmed as a defect before it was repaired: the
+  dev admin could delete the last active human administrator's account and the
+  route answered 204. `retire_identity` now refuses under the administrator-row
+  lock, before the credential is deleted.
+- Focused backend suites (auth, coordination, identity repository, CLI), the
+  Sessions mutation-authority manifest, contracts and soft-mapping census,
+  masquerade, mock-discipline and attribute-contract gates, ruff and mypy.
+- The full serial PostgreSQL testcontainer selection, including the two files
+  named above and two new proofs. Mutation controls were run on the search
+  redaction guard, the capability gate on the credential source, the label
+  redaction rule, the retirement lock and the cancel-focus behaviour; each
+  mutant went red.
+- The whole frontend suite, typecheck, ESLint, stylelint and build.
+- A real browser against a disposable backend and throwaway accounts: the
+  account-menu entry, set up access, grant a role, assign an approver by name
+  including a server refusal, and reflow at 1280 and 320 CSS pixels.
+- The trust-tier lint corpus is unchanged in size and carries no finding on a
+  line this work changed. Signed allowlist bindings on touched files were not
+  re-signed; that is the operator's step.
+
+Not done, and still required before merge:
+
+- The full default Python suite. Another full suite was running on the host and
+  the rule is one broad suite at a time. Shared authority code changed, so this
+  is owed.
+- Forced-colors and dark-theme visual checks, an axe run, a manual screen-reader
+  pass and 200% zoom. Keyboard flow and focus were exercised; conformance is not
+  claimed.
+- The task-based acceptance with an administrator who has not seen the layout.
+  The design remains a hypothesis until that is observed.
 
 The proposal does not introduce invitation email delivery, IdP account editing,
 bulk permission operations, identity merging, a new role model, or audit-history
