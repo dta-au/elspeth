@@ -2941,6 +2941,15 @@
   border-radius: var(--radius-md);
 }
 
+.ack-card-prompt-role {
+  margin: var(--space-sm) 0 var(--space-xs);
+  font-weight: var(--font-weight-semibold);
+}
+
+.ack-card-prompt-role:first-child {
+  margin-top: 0;
+}
+
 .ack-card-prompt-pre {
   margin: 0;
   white-space: pre-wrap;

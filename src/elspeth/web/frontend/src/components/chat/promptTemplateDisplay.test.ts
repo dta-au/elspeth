@@ -142,6 +142,20 @@ describe("resolvePromptDisplaySegments — structured parts", () => {
 });
 
 describe("resolvePromptDisplaySegments — fallback chain", () => {
+  it("exposes the system prompt beside the user template for a single-prompt node", () => {
+    const state = makeState([
+      makeNode({
+        system_prompt: "You are a careful reviewer.",
+        prompt_template: "Summarise {{ row.text }}.",
+      }),
+    ]);
+    const result = resolvePromptDisplaySegments(state, makeEvent());
+    expect(result.systemPrompt).toBe("You are a careful reviewer.");
+    expect(result.segments).toEqual([
+      { kind: "text", text: "Summarise {{ row.text }}." },
+    ]);
+  });
+
   it("falls back to the node's prompt_template on malformed parts", () => {
     const state = makeState([
       makeNode({

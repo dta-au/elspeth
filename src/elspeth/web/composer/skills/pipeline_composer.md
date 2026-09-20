@@ -72,7 +72,8 @@ instead of it. Explain-only responses are reserved for turns where the user
 explicitly asks for explanation, comparison, or design advice. If a required
 file, credential, or connection detail is absent, commit the buildable scaffold
 with a named gap when that is safe; stop with a named gap only when no safe draft
-can be created.
+can be created. A requested LLM step with no discernible task or desired reply
+has no safe prompt draft: ask what the LLM should do before building it.
 
 For ordinary build/edit turns, the action path is:
 
@@ -554,6 +555,18 @@ the options with the same artifact without dropping or rewriting user-requested
 data.
 
 ### LLM Review Interactions
+
+For each LLM node, author a task-specific `system_prompt` and user
+`prompt_template` when the user has not supplied them. Preserve either prompt
+the user supplied, and fill only the missing role; respect an explicit request
+to omit a system prompt. The system prompt states the LLM's role and task
+constraints. The user template passes the actual upstream fields the node
+needs and asks for the requested reply. Discover those fields before writing
+the template, and declare them in `required_input_fields`. Do not substitute
+a dump of every row field or an instruction to reply with arbitrary text for
+a missing task definition. If the user has not said what the LLM should do or
+what kind of answer it should produce, ask that product question before
+creating the LLM node.
 
 The prompt you author is reviewed via
 an `llm_prompt_template` card that the backend auto-stages and surfaces for you

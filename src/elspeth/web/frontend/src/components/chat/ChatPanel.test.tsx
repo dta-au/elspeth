@@ -9186,6 +9186,29 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
     );
   });
 
+  it("does not repeat approved interpretations in chat when the graph approval table is available", () => {
+    useInterpretationEventsStore.setState({
+      resolvedBySession: {
+        [sessionFixture.id]: [makeInterpretationEvent({
+          id: "approved-prompt", session_id: sessionFixture.id,
+          tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}prompt`,
+          kind: "llm_prompt_template", user_term: "llm_prompt_template:generate_text",
+          affected_node_id: "generate_text", choice: "accepted_as_drafted",
+          resolved_at: "2026-05-18T10:06:00Z",
+        })],
+      },
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      compositionState: makeComposition(1),
+      messages: [],
+    });
+    render(<ChatPanel />);
+    expect(screen.queryByTestId("interpretation-approvals-section")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("interpretation-review-confirmation")).not.toBeInTheDocument();
+  });
+
   // ── elspeth-51ed4fd8d5: anchoring and survival ────────────────────────────
   //
   // The confirmation used to be ChatPanel-local state appended to a list and

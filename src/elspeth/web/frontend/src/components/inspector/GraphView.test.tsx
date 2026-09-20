@@ -379,7 +379,13 @@ describe("GraphView", () => {
           approved,
           {
             ...approved, id: "prompt-approval", kind: "llm_prompt_template",
-            user_term: "llm_prompt_template:classify", accepted_value: "Classify each complaint",
+            user_term: "llm_prompt_template:classify",
+            accepted_value: "System prompt:\nClassify carefully.\n\nPrompt template:\nClassify each complaint",
+          },
+          {
+            ...approved, id: "legacy-prompt-approval", kind: "llm_prompt_template",
+            user_term: "llm_prompt_template:summarize", affected_node_id: "summarize",
+            accepted_value: "Summarize each complaint",
           },
           { ...approved, id: "opted-out", choice: "opted_out" },
         ],
@@ -388,22 +394,23 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const approvals = screen.getByText("Approvals (2)").closest("details") as HTMLDetailsElement;
+    const approvals = screen.getByText("Approvals (3)").closest("details") as HTMLDetailsElement;
     const failures = screen.getByText("Failure handling").closest("details") as HTMLDetailsElement;
     expect(approvals.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(approvals.open).toBe(false);
     expect(failures.open).toBe(true);
-    await user.click(screen.getByText("Approvals (2)"));
+    await user.click(screen.getByText("Approvals (3)"));
     expect(approvals.open).toBe(true);
     expect(failures.open).toBe(true);
     const table = within(approvals).getByRole("table");
     expect(within(table).getByRole("columnheader", { name: "Approved value" })).toBeInTheDocument();
     expect(within(table).getByRole("row", { name: /category/ })).toHaveTextContent("billing, outage, or other");
-    expect(within(table).getByRole("row", { name: /Prompt for classify/ })).toHaveTextContent("Classify each complaint");
+    expect(within(table).getByRole("row", { name: /System and user prompts for classify/ })).toHaveTextContent("Classify each complaint");
+    expect(within(table).getByRole("row", { name: /User prompt for summarize/ })).toHaveTextContent("Summarize each complaint");
     expect(within(table).getByRole("columnheader", { name: "Approved at" })).toBeInTheDocument();
-    expect(within(table).getAllByRole("time")).toHaveLength(2);
+    expect(within(table).getAllByRole("time")).toHaveLength(3);
     expect(within(table).getAllByRole("time")[0]).toHaveAttribute("datetime", approved.resolved_at);
-    expect(within(table).getAllByRole("row")).toHaveLength(3);
+    expect(within(table).getAllByRole("row")).toHaveLength(4);
     await user.click(screen.getByText("Failure handling"));
     expect(approvals.open).toBe(true);
     expect(failures.open).toBe(false);

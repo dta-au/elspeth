@@ -139,7 +139,8 @@ const NO_RESOLVED_INTERPRETATIONS: readonly InterpretationEvent[] = [];
  *
  * The canonical record is the interpretation_event row in the audit trail;
  * this is the nudge that tells the operator, in the conversation, which
- * assumption they just signed off. One component because it now renders from
+ * assumption they just signed off when no graph approval table is available.
+ * One component because it now renders from
  * TWO places — anchored beside the turn that raised the term, and after the
  * stream for rows that carry no usable anchor — and the two must stay the
  * same bubble.
@@ -3513,7 +3514,10 @@ export function ChatPanel({
                       onEditInlineSource={handleEditInlineSource}
                       pendingReviewCreatedAt={pendingReviewCreatedAt}
                     />
-                    {confirmedApprovals.map((conf) => (
+                    {/* The graph's Approvals table owns resolved history once
+                        a composition exists; keep the chat echo only while no
+                        graph table can render it. */}
+                    {compositionState === null && confirmedApprovals.map((conf) => (
                       <InterpretationConfirmation
                         key={conf.id}
                         userTerm={conf.userTerm}
@@ -3543,9 +3547,9 @@ export function ChatPanel({
 
             The anchored ones render beside the turn that raised them, up in
             the turn map. These are the residue: rows carrying no tool_call_id,
-            or whose call is not on screen. Rendering them here — after the
-            stream, which is where every confirmation used to go — keeps an
-            approval visible rather than dropping it for want of an anchor.
+            or whose call is not on screen. When no composition is available,
+            rendering them here keeps the approval visible despite the
+            missing graph table and turn anchor.
 
             role="status" inside the role="log" region so an arriving bubble is
             announced (aria-live="polite" on the parent).
@@ -3556,14 +3560,12 @@ export function ChatPanel({
             sentinel tool_call_id matches no provider call by construction,
             (B) guided-raised events whose turns persist no assistant chat
             rows, (C) revert/import/seed events bound to states no chat row
-            references — so for any session with LLM nodes this block is the
-            NORMAL destination for server-obligation approvals, not an edge
-            case. Unsectioned, the rows read as assistant replies to the
+            references. Unsectioned, those rows read as assistant replies to the
             newest message and grow without bound (one per resolution,
             rehydrated on every load). The header carries the count — the
             per-row node clause stays (elspeth-52be5924d7), so no collapse.
           */}
-          {tailConfirmations.length > 0 && (
+          {compositionState === null && tailConfirmations.length > 0 && (
             <section
               className="interpretation-approvals-section"
               data-testid="interpretation-approvals-section"

@@ -46,6 +46,8 @@ export interface PromptDisplaySegment {
 
 export interface PromptDisplayResult {
   segments: PromptDisplaySegment[];
+  /** Single-prompt nodes expose the separate system message; undefined for multi-query or missing state. */
+  systemPrompt?: string | null;
   /**
    * True when the structured parts could not be rendered: the result is a
    * single flat text segment from the fallback chain (node prompt_template,
@@ -307,19 +309,21 @@ export function resolvePromptDisplaySegments(
     if (surface !== null) return segmentsFromSurface(surface, options);
   }
   if (options !== null) {
+    const systemPrompt = typeof options.system_prompt === "string" ? options.system_prompt : null;
     const requirements = parseRequirements(options.interpretation_requirements);
     if (requirements !== null) {
       const segments = segmentsFromParts(
         options.prompt_template_parts,
         requirements,
       );
-      if (segments !== null) return { segments, usedFallback: false };
+      if (segments !== null) return { segments, usedFallback: false, systemPrompt };
     }
     const template = options.prompt_template;
     if (typeof template === "string" && template !== "") {
       return {
         segments: [{ kind: "text", text: template }],
         usedFallback: true,
+        systemPrompt,
       };
     }
   }

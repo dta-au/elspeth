@@ -5,6 +5,18 @@ const APPROVAL_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
   timeStyle: "short",
 });
 
+function promptApprovalName(value: string, nodeId: string): string {
+  if (value.startsWith("System prompt:\n") && value.includes("\n\nPrompt template:\n")) {
+    return `System and user prompts for ${nodeId}`;
+  }
+  if (value.startsWith("Multi-query LLM node:")) {
+    return value.includes("System prompt (sent with every query):\n(none)")
+      ? `User query prompts for ${nodeId}`
+      : `System and query prompts for ${nodeId}`;
+  }
+  return `User prompt for ${nodeId}`;
+}
+
 export function GraphApprovals({
   events,
 }: {
@@ -37,7 +49,7 @@ export function GraphApprovals({
                 <tr key={event.id}>
                   <th scope="row">
                     {event.kind === "llm_prompt_template" && event.affected_node_id !== null
-                      ? `Prompt for ${event.affected_node_id}`
+                      ? promptApprovalName(event.accepted_value, event.affected_node_id)
                       : event.user_term}
                   </th>
                   <td className="graph-approvals-value">{event.accepted_value}</td>
