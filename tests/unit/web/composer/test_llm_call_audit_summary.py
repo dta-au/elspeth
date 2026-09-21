@@ -374,6 +374,7 @@ class TestAllThreeDrainSitesShareOneProjection:
             llm_calls=(planner_call,),
             planner_attempts=(_attempt(planner_call_ordinal=1),),
             invocations=(),
+            withheld_replies=(),
             session_operation_context=_compose_context(planner_session_id),
         )
 
@@ -435,6 +436,7 @@ async def test_freeform_planner_persistence_atomically_interleaves_physical_call
         llm_calls=(failed_call, response_call),
         planner_attempts=(_attempt(planner_call_ordinal=2),),
         invocations=(),
+        withheld_replies=(),
         session_operation_context=_compose_context(planner_session_id),
     )
 

@@ -18,8 +18,18 @@ finding is a code-path reading, and frequency in production is **not measured**
 | 3 | **Recoverable.** Published behaviour unchanged; the turn's own prose is kept as an audit row before the status line replaces it. |
 | 4 | **Fixed.** The block withholds prose only when `advisor_repair_context_introduced` is true. Otherwise the reply is published with a `_PUBLISHED_` twin of the notice. When it does withhold, the words are kept as an audit row. |
 | 5 | **Recoverable.** Published behaviour unchanged; the terminal prose is kept as an audit row before the replacer runs. |
-| 2, 6, 7, 8 | **Not changed.** See "Left for decision". |
-| Deadline sibling of 1 | **Not changed.** `ComposerConvergenceError` would need a prose field. |
+| 2 | **Recoverable (freeform).** Published behaviour unchanged. Prose the planner refuses as `PROSE_REPLY` is staged on the recorder and settles inside the planner audit cohort (`planner_prose_unadmitted`), on the success, decline and failure exits alike. A published `DECLINE:` body is not recorded. Guided planning requests stage but never persist: that lane's audit is hash-only. The `QUESTION:` marker is undecided. |
+| Deadline sibling of 1 | **Fixed.** The finished reply is kept (`compose_deadline_expired`) before the raise at both END-gate sites. The timeout `detail`, which is the HTTP body the user reads, no longer claims the model "kept making tool calls without producing a final response". |
+| 6, 8 | **Not changed.** See "Left for decision". |
+| 7 | **Not changed, by decision at implementation.** The guided audit cohort is hash-only and CAS-bound (`ComposerChatTurn.assistant_message_hash`, `prepare_guided_audit_rows`). A scaffold-leak reply is text carrying leaked tool-call payloads, so storing it raw there reverses that lane's custody design. It needs a ruling, not a record. |
+
+Maintainer note, 2026-09-22: freeform is the only mode in use and guided is
+to be removed, so cases 7 and 8 and the guided half of case 2 need no work.
+
+Both independent reviews of the open rulings are beside this file
+(`2026-09-22-reply-withholding-rulings-llm.md`, `-systems.md`). Counts per
+`origin` from the `composer_withheld_reply` rows are what price the remaining
+rulings on cases 2 and 6.
 
 The audit row uses its own envelope kind, not `composer_control_message`:
 control rows are replayed into provider context by

@@ -240,6 +240,7 @@ async def _stage(
             planner_llm_calls=(),
             planner_attempts=(),
             planner_invocations=(),
+            planner_withheld_replies=(),
             plugin_snapshot=None,
         )
     return result, sessions

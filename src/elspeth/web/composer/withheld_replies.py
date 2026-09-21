@@ -18,6 +18,7 @@ recoverable without rendering or replaying it.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Final, Literal
 
 COMPOSER_WITHHELD_REPLY_KIND: Final = "composer_withheld_reply"
@@ -28,7 +29,30 @@ WithheldReplyOrigin = Literal[
     "advisor_repair_tool_turn",
     "advisor_repair_terminal",
     "advisor_terminal_block",
+    "compose_deadline_expired",
+    "planner_prose_unadmitted",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class WithheldReply:
+    """One unpublished reply staged by a producer that holds no session.
+
+    The pipeline planner runs without a session write context, so it stages
+    the words on the request's ``BufferingRecorder`` and the caller that does
+    hold one persists them inside the planner audit cohort.
+
+    The guided lane does not use this: its audit cohort is hash-only by design
+    (``ComposerChatTurn.assistant_message_hash``), so a guided planning
+    request's staged replies are never persisted.
+    """
+
+    origin: WithheldReplyOrigin
+    content: str
+
+    def __post_init__(self) -> None:
+        if type(self.content) is not str or not self.content.strip():
+            raise ValueError(f"{self.origin} withheld reply content must be a non-blank string")
 
 
 def withheld_reply_envelope(origin: WithheldReplyOrigin, content: str) -> dict[str, str]:

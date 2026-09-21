@@ -219,7 +219,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools._registry import resolve_tool_effects
 from elspeth.web.composer.tools.declarations import EffectDomain
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, interpretation_rate_cap_hit
-from elspeth.web.composer.withheld_replies import WithheldReplyOrigin, withheld_reply_envelope
+from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin, withheld_reply_envelope
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
@@ -4777,6 +4777,11 @@ class ComposerServiceImpl:
         llm_calls: tuple[ComposerLLMCall, ...],
         planner_attempts: tuple[ComposerPlannerAttempt, ...],
         invocations: tuple[ComposerToolInvocation, ...],
+        # REQUIRED (no default): the prose replies this planning request
+        # refused to publish. They settle inside this cohort, never as a
+        # separate write, so a caller that forgets them must fail loudly rather
+        # than silently drop the model's words.
+        withheld_replies: tuple[WithheldReply, ...],
         session_operation_context: SessionOperationContext | None,
     ) -> None:
         """Make planner LLM/discovery evidence durable before proposal authority.
@@ -4821,6 +4826,14 @@ class ComposerServiceImpl:
                     role="audit",
                     content=content,
                     tool_calls=(envelope,),
+                )
+            )
+        for withheld in withheld_replies:
+            drafts.append(
+                AuditMessageDraft(
+                    role="audit",
+                    content=withheld.content,
+                    tool_calls=(withheld_reply_envelope(withheld.origin, withheld.content),),
                 )
             )
         # Fenced session write (P4-D6 family A2b): the planner evidence carries
@@ -4945,6 +4958,8 @@ class ComposerServiceImpl:
         planner_llm_calls: tuple[ComposerLLMCall, ...],
         planner_attempts: tuple[ComposerPlannerAttempt, ...],
         planner_invocations: tuple[ComposerToolInvocation, ...],
+        # REQUIRED (no default): see ``_persist_pipeline_planner_audit``.
+        planner_withheld_replies: tuple[WithheldReply, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
         """Persist planner evidence, then create one reviewable proposal row.
@@ -4973,6 +4988,7 @@ class ComposerServiceImpl:
             llm_calls=planner_llm_calls,
             planner_attempts=planner_attempts,
             invocations=planner_invocations,
+            withheld_replies=planner_withheld_replies,
             session_operation_context=session_operation_context,
         )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
@@ -5172,6 +5188,7 @@ class ComposerServiceImpl:
         planner_llm_start = len(recorder.llm_calls)
         planner_attempt_start = len(recorder.planner_attempts)
         planner_invocation_start = len(recorder.invocations)
+        planner_withheld_start = len(recorder.withheld_replies)
         try:
             plan = await plan_pipeline(
                 intent=message,
@@ -5249,6 +5266,7 @@ class ComposerServiceImpl:
                 llm_calls=recorder.llm_calls[planner_llm_start:],
                 planner_attempts=recorder.planner_attempts[planner_attempt_start:],
                 invocations=recorder.invocations[planner_invocation_start:],
+                withheld_replies=recorder.withheld_replies[planner_withheld_start:],
                 session_operation_context=session_operation_context,
             )
             decline_message = declined.decline_text.strip() or (
@@ -5274,6 +5292,7 @@ class ComposerServiceImpl:
                     llm_calls=attached_calls,
                     planner_attempts=attached_attempts,
                     invocations=recorder.invocations[planner_invocation_start:],
+                    withheld_replies=recorder.withheld_replies[planner_withheld_start:],
                     session_operation_context=session_operation_context,
                 ),
                 deferred=exc if type(exc) is asyncio.CancelledError else None,
@@ -5297,6 +5316,7 @@ class ComposerServiceImpl:
             planner_llm_calls=recorder.llm_calls[planner_llm_start:],
             planner_attempts=recorder.planner_attempts[planner_attempt_start:],
             planner_invocations=recorder.invocations[planner_invocation_start:],
+            planner_withheld_replies=recorder.withheld_replies[planner_withheld_start:],
             plugin_snapshot=plugin_snapshot,
         )
 
@@ -5929,6 +5949,14 @@ class ComposerServiceImpl:
                             deadline=deadline,
                         )
                     except _AdvisorCheckpointComposeDeadlineExpired:
+                        # The model had already replied; the timeout envelope
+                        # carries no prose, so keep the finished reply.
+                        await self._persist_withheld_reply(
+                            "compose_deadline_expired",
+                            assistant_message.content or "",
+                            session_id=session_id,
+                            session_operation_context=session_operation_context,
+                        )
                         raise ComposerConvergenceError.capture(
                             max_turns=new_composition_turns_used + discovery_turns_used,
                             budget_exhausted="timeout",
@@ -6244,6 +6272,14 @@ class ComposerServiceImpl:
                 deadline=deadline,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
+            # The model had already replied; the timeout envelope carries no
+            # prose, so keep the finished reply.
+            await self._persist_withheld_reply(
+                "compose_deadline_expired",
+                assistant_message.content or "",
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
             raise ComposerConvergenceError.capture(
                 max_turns=composition_turns_used + discovery_turns_used,
                 budget_exhausted="timeout",

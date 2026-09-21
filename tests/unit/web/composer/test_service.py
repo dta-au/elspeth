@@ -11,7 +11,7 @@ import tracemalloc
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 from uuid import UUID, uuid4
 
@@ -6892,6 +6892,25 @@ class TestComposerErrorConstructionInvariants:
     initial_version" invariant mechanically rather than relying on each
     raise site to apply the rule by hand.
     """
+
+    @pytest.mark.parametrize("budget", ["composition", "discovery"])
+    def test_turn_budget_convergence_detail_names_the_tool_call_loop(self, budget: Literal["composition", "discovery"]) -> None:
+        detail = str(ComposerConvergenceError(6, budget_exhausted=budget))
+
+        assert detail.startswith(f"Composer did not converge within 6 turns (budget exhausted: {budget}).")
+        assert "kept making tool calls without producing a final response" in detail
+
+    def test_timeout_convergence_detail_does_not_claim_the_model_never_replied(self) -> None:
+        """The detail is the HTTP body the user reads. A compose deadline can
+        expire AFTER the model's final reply (the END gate's re-validation ran
+        out of time), so "kept making tool calls without producing a final
+        response" is false there. The timeout wording claims only what every
+        timeout has in common."""
+        detail = str(ComposerConvergenceError(6, budget_exhausted="timeout"))
+
+        assert detail.startswith("Composer did not converge within 6 turns (budget exhausted: timeout).")
+        assert "kept making tool calls" not in detail
+        assert "ran out of time before the turn could be completed" in detail
 
     def test_plugin_crash_error_attributes_are_frozen_after_construction(self) -> None:
         exc = ComposerPluginCrashError(ValueError("boom"), partial_state=None)

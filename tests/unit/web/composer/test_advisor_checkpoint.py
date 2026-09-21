@@ -2158,6 +2158,31 @@ async def test_end_gate_starts_no_advisor_attempt_after_compose_deadline(
 
 
 @pytest.mark.asyncio
+async def test_end_gate_compose_deadline_keeps_the_completed_reply_recoverable(make_service, simple_state, monkeypatch):
+    """The model HAD replied when the deadline expired inside the END gate. The
+    user gets the timeout envelope, which carries no prose, so the finished
+    reply is kept as a withheld-reply audit row before the raise."""
+    service = make_service()
+    service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN", {}))
+    monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", AsyncMock(spec=persist_advisor_checkpoint_pass))
+
+    with pytest.raises(ComposerConvergenceError):
+        await drive_try_terminate(
+            service,
+            simple_state,
+            advisor_checkpoint_passes_used=0,
+            deadline=asyncio.get_running_loop().time() - 1.0,
+            initial_version=0,
+        )
+
+    (row,) = service._sessions_service.add_message.calls
+    assert row.args[1:3] == ("audit", _AssistantMessage.content)
+    (envelope,) = row.kwargs["tool_calls"]
+    assert envelope["_kind"] == "composer_withheld_reply"
+    assert envelope["origin"] == "compose_deadline_expired"
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_deadline_preserves_malformed_attempt_before_retry_expiry(make_service, simple_state):
     service = make_service()
     loop = asyncio.get_running_loop()
