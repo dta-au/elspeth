@@ -1011,6 +1011,116 @@ def service(
 # ── Basic Lifecycle ────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("terminal_status", [RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.FAILED, RunStatus.EMPTY])
+@pytest.mark.parametrize(
+    "finalization", ["none", "success", "failure", "partial", "stale_owner", "settlement_error", "accounting_error", "event_error"]
+)
+@pytest.mark.usefixtures("mock_pipeline_config_assembly")
+def test_worker_settles_terminal_saga_only_after_output_finalization(
+    service: ExecutionServiceImpl,
+    mock_session_service: MagicMock,
+    real_loop: asyncio.AbstractEventLoop,
+    terminal_status: RunStatus,
+    finalization: str,
+) -> None:
+    run_id = str(uuid4())
+    result = _orchestrator_result_stub(
+        run_id=run_id,
+        status=terminal_status,
+        rows_processed=0 if terminal_status is RunStatus.EMPTY else 10,
+        rows_succeeded=10 if terminal_status is RunStatus.COMPLETED else (9 if terminal_status is RunStatus.COMPLETED_WITH_FAILURES else 0),
+        rows_failed=10 if terminal_status is RunStatus.FAILED else (1 if terminal_status is RunStatus.COMPLETED_WITH_FAILURES else 0),
+    )
+    terminal = _run_record_stub(id=UUID(run_id), status=terminal_status.value)
+    mock_session_service.get_run.return_value = terminal
+    transaction = MagicMock()
+    mock_session_service.session_operation_authority.mutate.side_effect = lambda context, mutation: mutation(transaction)
+    settlement_error: Exception | None = None
+    if finalization == "stale_owner":
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        settlement_error = SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+    elif finalization == "settlement_error":
+        settlement_error = OSError("terminal settlement unavailable")
+    if settlement_error is not None:
+        mock_session_service.session_operation_authority.mutate.side_effect = settlement_error
+    post_status_error: Exception | None = None
+    if finalization == "event_error":
+        post_status_error = OSError("terminal event persistence unavailable")
+        mock_session_service.append_run_event.side_effect = post_status_error
+    elif finalization == "accounting_error" and terminal_status is not RunStatus.FAILED:
+        post_status_error = OSError("accounting projection unavailable")
+    # Do not use the standard fixture's RuntimeError-swallowing bridge.
+    cast(Any, service)._call_async = real_loop.run_until_complete
+    if finalization != "none":
+        blob_service = _blob_service_stub()
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        if finalization == "failure":
+            blob_service.finalize_run_output_blobs.side_effect = OSError("output storage unavailable")
+        elif finalization == "partial":
+            from elspeth.contracts.blobs import BlobFinalizationError
+
+            blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(
+                finalized=(), errors=(BlobFinalizationError(blob_id=uuid4(), exc_type="OSError", detail="storage unavailable"),)
+            )
+        service._blob_service = blob_service
+    with (
+        patch("elspeth.web.execution.service.Orchestrator") as orchestrator,
+        patch("elspeth.web.execution.service.load_settings_from_yaml_string") as load,
+        patch("elspeth.web.execution.preflight.instantiate_plugins_from_config") as instantiate,
+        patch("elspeth.web.execution.preflight.ExecutionGraph") as graph,
+        patch("elspeth.web.execution.service.open_landscape_db"),
+        patch("elspeth.web.execution.service.FilesystemPayloadStore"),
+        patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(terminal_status),
+            side_effect=post_status_error if finalization == "accounting_error" else None,
+        ),
+    ):
+        _configure_runtime_success(
+            mock_load=load,
+            mock_instantiate=instantiate,
+            mock_graph_cls=graph,
+            mock_orch_cls=orchestrator,
+            result=result,
+        )
+        expected_error = settlement_error or post_status_error
+        if expected_error is not None:
+            with pytest.raises(type(expected_error)) as raised:
+                service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
+            assert raised.value is expected_error
+        else:
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
+    assert mock_session_service.update_run_status.call_args.kwargs["status"] == terminal_status.value
+    if finalization in {"failure", "partial", "stale_owner", "settlement_error"} or post_status_error is not None:
+        transaction.runs.mark_recovery_outputs_finalized.assert_not_called()
+    else:
+        transaction.runs.mark_recovery_outputs_finalized.assert_called_once_with(run_id=UUID(run_id))
+
+
+@pytest.mark.parametrize("finalization_succeeds", [True, False])
+def test_cancelled_worker_settles_saga_after_terminal_status(
+    service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, finalization_succeeds: bool
+) -> None:
+    run_id = str(uuid4())
+    mock_session_service.get_run.return_value = _run_record_stub(id=UUID(run_id), status="cancelled")
+    transaction = MagicMock()
+    mock_session_service.session_operation_authority.mutate.side_effect = lambda context, mutation: mutation(transaction)
+    cast(Any, service)._call_async = real_loop.run_until_complete
+    shutdown = threading.Event()
+    shutdown.set()
+    if not finalization_succeeds:
+        blob_service = _blob_service_stub()
+        blob_service.finalize_run_output_blobs.side_effect = OSError("output storage unavailable")
+        service._blob_service = blob_service
+    service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown, session_operation_lease=_execute_lease())
+    assert mock_session_service.update_run_status.call_args.kwargs["status"] == "cancelled"
+    if finalization_succeeds:
+        transaction.runs.mark_recovery_outputs_finalized.assert_called_once_with(run_id=UUID(run_id))
+    else:
+        transaction.runs.mark_recovery_outputs_finalized.assert_not_called()
+
+
 class TestExecutionFlow:
     @pytest.mark.parametrize("authored_compartment", [None, "forged"])
     @pytest.mark.parametrize("signing_mode", ["unsigned", "hmac_sha256"])

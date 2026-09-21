@@ -2903,6 +2903,8 @@ class ExecutionServiceImpl:
         run_start_permit: RunStartPermitBinding | None = None
         admission_decision: ChargeableAdmissionDecision | None = None
         admission_refusal_pending = False
+        outputs_finalized = False
+        terminal_event_persisted = False
         try:
             session_operation_lease.guard_external_effect()
             approval_inputs: ApprovalGateInputs | None = None
@@ -3000,7 +3002,7 @@ class ExecutionServiceImpl:
             # Early shutdown check: if cancel()/shutdown() fired before we
             # start setup, skip the expensive LandscapeDB/plugin/graph work.
             if shutdown_event.is_set() and not resume_existing:
-                self._finalize_output_blobs(
+                outputs_finalized = self._finalize_output_blobs(
                     run_id,
                     success=False,
                     session_operation_lease=session_operation_lease,
@@ -3030,6 +3032,7 @@ class ExecutionServiceImpl:
                     ),
                     session_operation_lease=session_operation_lease,
                 )
+                terminal_event_persisted = True
                 return None
 
             profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
@@ -3483,7 +3486,7 @@ class ExecutionServiceImpl:
                 session_operation_lease.guard_external_effect()
                 current = self._call_async(self._session_service.get_run(run_uuid))
                 if current.status == "cancelled":
-                    self._finalize_output_blobs(
+                    outputs_finalized = self._finalize_output_blobs(
                         run_id,
                         success=False,
                         session_operation_lease=session_operation_lease,
@@ -3505,6 +3508,7 @@ class ExecutionServiceImpl:
                         ),
                         session_operation_lease=session_operation_lease,
                     )
+                    terminal_event_persisted = True
                     return None
                 raise
 
@@ -3830,7 +3834,7 @@ class ExecutionServiceImpl:
                         rows_processed=result.rows_processed,
                         rows_failed=result.rows_failed,
                     )
-                    self._finalize_output_blobs(
+                    outputs_finalized = self._finalize_output_blobs(
                         run_id,
                         success=False,
                         session_operation_lease=session_operation_lease,
@@ -3852,6 +3856,7 @@ class ExecutionServiceImpl:
                         ),
                         session_operation_lease=session_operation_lease,
                     )
+                    terminal_event_persisted = True
                     return None
                 raise
 
@@ -3868,7 +3873,7 @@ class ExecutionServiceImpl:
             # evidence (e.g. quarantine sink contents), so finalize as
             # success=False to keep the failure-track outputs distinct
             # from clean-completion outputs in the blob lifecycle.
-            self._finalize_output_blobs(
+            outputs_finalized = self._finalize_output_blobs(
                 run_id,
                 success=(result.status != RunStatus.FAILED),
                 session_operation_lease=session_operation_lease,
@@ -3960,6 +3965,8 @@ class ExecutionServiceImpl:
                     session_operation_lease=session_operation_lease,
                 )
 
+            terminal_event_persisted = True
+
         except SessionOperationFenceLost:
             # A successor now owns the session.  Do not translate authority
             # loss into user cancellation or failure: either would finalize
@@ -3992,7 +3999,7 @@ class ExecutionServiceImpl:
         except GracefulShutdownError as gse:
             # Orchestrator detected shutdown during processing and raised
             # after flushing in-progress work. Finalize → status → broadcast.
-            self._finalize_output_blobs(
+            outputs_finalized = self._finalize_output_blobs(
                 run_id,
                 success=False,
                 session_operation_lease=session_operation_lease,
@@ -4030,6 +4037,7 @@ class ExecutionServiceImpl:
                 ),
                 session_operation_lease=session_operation_lease,
             )
+            terminal_event_persisted = True
             return _RUN_PIPELINE_GRACEFUL_SHUTDOWN_HANDLED
 
         except BaseException as exc:
@@ -4059,7 +4067,7 @@ class ExecutionServiceImpl:
             # Without this, the Run record stays in 'running' forever.
 
             # Finalize blobs first — before any terminal event surfaces.
-            self._finalize_output_blobs(
+            outputs_finalized = self._finalize_output_blobs(
                 run_id,
                 success=False,
                 session_operation_lease=session_operation_lease,
@@ -4300,6 +4308,7 @@ class ExecutionServiceImpl:
                     ),
                     session_operation_lease=session_operation_lease,
                 )
+                terminal_event_persisted = True
             raise
         finally:
             # Always clean up, regardless of success or failure
@@ -4323,6 +4332,22 @@ class ExecutionServiceImpl:
 
                     record_operator_pipeline_queue_drops(telemetry_manager.health_metrics["queue_drops"])
             self._broadcaster.cleanup_run(run_id)
+            if outputs_finalized and terminal_event_persisted:
+                # Failure/cancellation can finalize outputs before recording
+                # terminal status; normal completion does so afterward. Settle
+                # only after both and the terminal event have succeeded, under
+                # the owner's live fence. Missing events or unfinished outputs
+                # remain discoverable by peer recovery.
+                session_operation_lease.guard_external_effect()
+                # The mutation rechecks terminal status inside its fenced
+                # transaction; a separate status read would add a race.
+                self._call_async(
+                    run_sync_in_worker(
+                        self._session_service.session_operation_authority.mutate,
+                        session_operation_context,
+                        lambda tx: tx.runs.mark_recovery_outputs_finalized(run_id=run_uuid),
+                    )
+                )
         return None
 
     def _admit_run_llm_call(self, run_uuid: UUID, session_operation_lease: SessionOperationLease) -> str:
@@ -4622,16 +4647,20 @@ class ExecutionServiceImpl:
         *,
         success: bool,
         session_operation_lease: SessionOperationLease,
-    ) -> None:
+    ) -> bool:
         """Finalize pending output blobs after a run completes/fails/cancels.
 
         Uses _call_async to bridge from the background thread to the async
         blob service. Failure here must not mask the original run outcome —
         errors are logged, not raised. Programmer bugs (TypeError,
         AttributeError) are deliberately not caught.
+
+        Return whether every output is settled, including the no-blob case.
+        The worker uses this outcome to close its saga only after terminal
+        status is durable; unsuccessful settlement must remain recoverable.
         """
         if self._blob_service is None:
-            return
+            return True
         outcome = self._finalize_output_blobs_outcome(
             run_id,
             success=success,
@@ -4644,7 +4673,7 @@ class ExecutionServiceImpl:
                 success=success,
                 exc_type=outcome.failure_exc_type,
             )
-            return
+            return False
         if outcome.errors:
             slog.error(
                 "blob_finalization_partial_failure",
@@ -4654,6 +4683,8 @@ class ExecutionServiceImpl:
                 error_count=len(outcome.errors),
                 errors=list(outcome.errors),
             )
+            return False
+        return True
 
     def _on_pipeline_done(
         self,

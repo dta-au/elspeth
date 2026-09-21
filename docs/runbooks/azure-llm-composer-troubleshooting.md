@@ -61,6 +61,14 @@ prevents an unconfigured pricing-catalog request to GitHub. A standalone
 standalone calculation therefore does not prove that the web worker has the
 same model entry or prices.
 
+The release dependency now requires LiteLLM 1.102.0 or newer, with 1.102.0
+locked for reproducible installation. Its bundled catalog contains the exact
+`gpt-5.6-terra` and `azure/gpt-5.6-terra` entries, so this deployment model no
+longer requires a remote pricing fetch. Build from the updated lockfile and
+remove the deployment's explicit remote-fetch override to use the offline
+default. A running container built with the old dependency does not acquire
+the new catalog merely by receiving the Python source patch.
+
 Compare the installed LiteLLM version, catalog source, and requested-model
 entry in the actual worker and the diagnostic process. Run offline diagnostic
 processes with `LITELLM_LOCAL_MODEL_COST_MAP=True` explicitly set to reproduce
@@ -98,6 +106,13 @@ explicit `0.0`. Standard models can still use an explicit value, such as
 `temperature: 0.7`. The same behavior applies to single-query and multi-query
 transforms, including nodes bound through an LLM profile. Explicit values
 are preserved; ELSPETH does not infer capabilities from deployment names.
+
+For profile-bound nodes, temperature belongs to the operator's profile, not
+the authored pipeline options. An absent profile setting retains the provider
+default; explicit `null` omits the wire parameter, and an explicit number is
+forwarded. A pipeline cannot override this binding. Keep old operator profile
+aliases configured while retained sessions still reference them; changing the
+default alias affects new authoring and does not rewrite historical states.
 
 If every row fails, the tutorial run endpoint reports the durable zero-output
 outcome with HTTP 409 and the run's row counts. It does not attempt to preview

@@ -205,6 +205,12 @@ def _sqlstate(exc: OperationalError) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def database_sqlstate(exc: OperationalError) -> str | None:
+    """Restrict admitted driver codes to SQLSTATE's alphabet before logging."""
+    value = _sqlstate(exc)
+    return value if value is not None and re.fullmatch(r"[A-Z0-9]{5}", value) is not None else None
+
+
 def _invalidate_uncertain(conn: Connection, *, original: BaseException) -> None:
     """Invalidate without allowing secondary cleanup errors to replace the original."""
     try:

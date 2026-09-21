@@ -187,6 +187,14 @@ the server store; a user-scoped profile resolves only through that principal's
 store. Web-authored pipeline state stores the opaque profile alias, not the
 provider, model, endpoint, or credential binding.
 
+For profiled LLM sources and transforms, `temperature` belongs to the
+operator's LLM profile. An omitted profile setting adds no temperature option;
+an explicit number from `0.0` to `2.0` is forwarded, and explicit `null` omits
+the parameter from the provider request. Authored profiled nodes cannot set or
+override it, including with `null`. Unprofiled YAML nodes can still configure
+temperature directly. Use explicit sampling only for a deployment that
+supports it; deployment aliases do not identify model capabilities.
+
 `ELSPETH_WEB__DEFAULT_LLM_PROFILE` must name a configured profile or the
 service refuses to start — so renaming or removing a profile this still points
 at will break a previously healthy deployment on its next restart; change both

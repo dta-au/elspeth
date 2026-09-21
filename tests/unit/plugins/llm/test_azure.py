@@ -78,8 +78,6 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
     monkeypatch.setattr(litellm, "cost_per_token", forbidden)
     monkeypatch.setattr(litellm, "completion_cost", forbidden)
     config = _make_azure_config(deployment_name="private-production-deployment", prompt_template="{{ row.text }}")
-    if temperature != "omitted":
-        config["temperature"] = temperature
     if multi_query:
         config["queries"] = {
             name: {"input_fields": {"text": "text"}, "output_fields": [{"suffix": "score", "type": "integer"}]}
@@ -94,6 +92,7 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
             endpoint="https://probe.openai.azure.com",
             credential_scope="server",
             credential_ref="AZURE_PROBE_KEY",
+            **({"temperature": temperature} if temperature != "omitted" else {}),
         ),
     )
     config, _ = lower_llm_profile_options(

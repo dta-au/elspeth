@@ -327,6 +327,59 @@ volume holds payload persistence and local data. Back up and restore them as
 separate stores. Do not scale `web` beyond one replica or run more than one
 web process.
 
+### TLS proxy and WebSocket acceptance
+
+The Compose backend listens on port 8451. For host nginx, use the tracked
+[`deploy/compose/nginx.conf`](../../deploy/compose/nginx.conf) as an include
+inside nginx's `http` context, such as `/etc/nginx/conf.d/elspeth.conf`.
+Provision a certificate valid for the public hostname and its private key at
+`/etc/nginx/tls/elspeth/fullchain.pem` and `privkey.pem` first. Restrict direct
+access to port 8451 with the host firewall or change the Compose port binding
+to `127.0.0.1:8451:8451`. Set the public hostname in `server_name` and configure
+the application's allowed origins for that HTTPS origin.
+
+For an existing deployment, review the installed configuration against this
+template and carry the changes into its owning Ansible or deployment source.
+This repository does not ship an Ansible role. Validate with `nginx -t` after
+provisioning certificates; service reload remains an operator deployment step.
+Do not install another proxy or overwrite an existing TLS configuration blindly.
+
+The HTTP-scope map and upstream `Upgrade`/`Connection` headers preserve
+WebSocket negotiation through `/ws/runs/...`; ordinary authenticated requests
+continue through the same proxy. A healthy `/api/ready` does not prove upgrade
+works. Both nginx proxy timeouts are 240 seconds, matching the bundle's declared
+transport ceiling. Composer has 180 seconds with 30 seconds of required
+headroom. Any additional CDN or load balancer must allow at least 240 seconds;
+otherwise lower the declared ceiling to the smallest actual hop and lower the
+Composer timeout to preserve headroom. The 15/10 turn settings are upper bounds,
+not a promise that all 25 provider turns fit inside 180 seconds.
+
+The nginx access log uses `$uri` without query strings and records status and
+timings. Stock nginx error logs can include the full request with a one-use
+WebSocket ticket; this template disables that server's error log because it
+cannot redact those credentials. Diagnose failures using safe access status and
+timing fields plus application telemetry. Do not enable raw request/error logging
+on this endpoint to investigate a ticket failure.
+
+After an operator deploys the configuration, use a small canary run owned by the
+authenticated user. Store that user's existing session bearer token in a private
+file (mode 0600); never put it in command-line arguments or a shared log. The
+probe uses normal ticket authorization and does not create or cancel runs:
+
+```bash
+python -m scripts.probe_websocket_ingress \
+  --origin https://elspeth.example.org \
+  --run-id "$CANARY_RUN_ID" \
+  --bearer-file "$PRIVATE_BEARER_FILE" \
+  --timeout 240
+```
+
+It requires a first event through public WSS, rejection of ticket reuse, a fresh
+ticket, replay from sequence zero through the terminal event, and clean closure.
+Only status, event sequences and an exception class on failure are printed.
+Keep the returned JSON and exit code as ingress acceptance evidence. Unit tests
+of the backend alone do not establish that the deployed proxy passes this probe.
+
 ---
 
 ## Health Checks

@@ -1904,7 +1904,6 @@ def test_public_llm_source_schema_is_component_specific() -> None:
         "schema",
         "prompt_template",
         "system_prompt",
-        "temperature",
         "response_field",
         "on_validation_failure",
         "lookup",

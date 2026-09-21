@@ -18845,7 +18845,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "6577c8508024422b",
             1,
             None,
-            line=241,
+            line=247,
             connection_escape=True,
         ),
         # The session-lock wrapper: an honest escape until every caller proves

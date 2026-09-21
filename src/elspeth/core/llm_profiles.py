@@ -59,6 +59,7 @@ LLM_PROFILE_PRIVATE_FIELDS = frozenset(
         "tracing",
         "timeout_seconds",
         "max_tokens",
+        "temperature",
         "pool_size",
         "min_dispatch_delay_ms",
         "max_dispatch_delay_ms",
@@ -125,6 +126,7 @@ class LLMProfileSettings(BaseModel):
     required_capabilities: tuple[str, ...] | None = Field(default=None, repr=False)
     timeout_seconds: float = Field(default=60.0, gt=0, le=300, repr=False)
     max_tokens: int | None = Field(default=None, gt=0, le=131072, repr=False)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, strict=True, allow_inf_nan=False, repr=False)
 
     @model_validator(mode="after")
     def _validate_provider_binding(self) -> LLMProfileSettings:
@@ -215,9 +217,13 @@ class RuntimeLLMProfile:
                 ("timeout_seconds", settings.timeout_seconds),
             ),
         }
-        options = tuple(
+        options: tuple[tuple[str, object], ...] = tuple(
             (name, value) for name, value in (*provider_fields[settings.provider], ("max_tokens", settings.max_tokens)) if value is not None
         )
+        # Omission leaves the provider config default intact. Explicit null
+        # is an operator instruction to omit temperature from the wire.
+        if "temperature" in settings.model_fields_set:
+            options += (("temperature", settings.temperature),)
         return cls(
             alias=alias,
             provider=settings.provider,

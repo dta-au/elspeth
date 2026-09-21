@@ -203,11 +203,14 @@ def _recover_full_web_dispatch(session_url, landscape_url, data_dir, run_id, con
             run = await sessions.get_run(UUID(run_id))
             assert run.status not in ("failed", "cancelled"), (run.status, run.error)
             assert run.saga_state != "recovery_required", run.recovery_required_reason
-            if run.status == "completed" and not execution.get_live_run_ids():
+            if run.status == "completed" and run.saga_state == "terminal" and not execution.get_live_run_ids():
                 break
             await asyncio.sleep(0.05)
         else:
             raise AssertionError(f"recovered pipeline did not finish: {run.status}, {run.saga_state}")
+        # The owner must settle its saga before another coordinator pass can
+        # repair it; otherwise this check would mask owner-completion drift.
+        assert run.saga_state == "terminal"
         # A second coordinator pass must not create another UUID or repeat the
         # successful CSV write / terminal audit outcome.
         await coordinator.recover()

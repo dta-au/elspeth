@@ -31,6 +31,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import SecretStr
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.pool import QueuePool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
@@ -146,7 +147,7 @@ from elspeth.web.readiness import (
     overall_timeout_report,
     readiness_report,
 )
-from elspeth.web.schema_probe import postgres_engine_kwargs
+from elspeth.web.schema_probe import database_sqlstate, postgres_engine_kwargs
 from elspeth.web.secrets.routes import create_secrets_router
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
@@ -2012,12 +2013,20 @@ def _create_app(
         exc: OperationalError,
     ) -> JSONResponse:
         request_id = _request_id(request)
+        session_pool = request.app.state.session_engine.pool
+        driver_error_class = type(exc.orig).__name__
         _handler_slog.error(
             "http_database_unavailable",
             path=request.url.path,
             method=request.method,
             request_id=request_id,
             exc_class=type(exc).__name__,
+            db_sqlstate=database_sqlstate(exc),
+            db_driver_error_class=(driver_error_class if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", driver_error_class) else None),
+            db_connection_invalidated=exc.connection_invalidated,
+            session_pool_size=session_pool.size() if isinstance(session_pool, QueuePool) else None,
+            session_pool_checked_out=session_pool.checkedout() if isinstance(session_pool, QueuePool) else None,
+            session_pool_overflow=session_pool.overflow() if isinstance(session_pool, QueuePool) else None,
         )
         return JSONResponse(
             status_code=503,

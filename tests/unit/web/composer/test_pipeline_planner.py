@@ -6383,6 +6383,58 @@ async def test_route_lifecycle_rate_rejection_happens_before_provider_attempt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_seconds", [85.0, 180.0], ids=["previous-deadline", "deployed-deadline"])
+async def test_multiturn_authoring_settles_with_deployed_deadline(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    timeout_seconds: float,
+) -> None:
+    """Three real planner turns consume 120 simulated seconds, without sleeping."""
+    loop = asyncio.get_running_loop()
+    clock_origin = loop.time()
+    elapsed = 0.0
+
+    class TimedCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
+            nonlocal elapsed
+            elapsed += 40.0
+            return await super().__call__(**kwargs)
+
+    completion = TimedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(("get_plugin_schema", {"plugin_type": "sink", "name": "json"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    events: list[str] = []
+    with patch.object(loop, "time", lambda: clock_origin + elapsed):
+        operation = _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"timeout_seconds": timeout_seconds},
+            lifecycle=_lifecycle(events),
+        )
+        if timeout_seconds == 85.0:
+            with pytest.raises(PipelinePlannerError, match="wall-clock") as error:
+                await operation
+            assert error.value.code == "TIMEOUT"
+            assert events[-1] == "settled:failed"
+        else:
+            result = await operation
+            assert deep_thaw(result.proposal.pipeline) == _pipeline(tmp_path)
+            assert events[-1] == "settled:complete"
+
+    assert elapsed == 120.0
+    assert len(completion.requests) == 3
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2, 3]
+    assert [invocation.tool_name for invocation in recorder.invocations] == ["get_plugin_schema", "get_plugin_schema"]
+    assert any(message["role"] == "tool" for message in completion.requests[1]["messages"])
+    assert sum(message["role"] == "tool" for message in completion.requests[2]["messages"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_absolute_deadline_audits_slow_provider_timeout_and_settles(
     tmp_path: Path,
     tool_context: ToolContext,

@@ -134,7 +134,7 @@ llm = [
     "jinja2>=3.1,<4",  # Template engine for prompts
     "httpx>=0.28,<1",  # HTTP client (inherited from main deps)
     "openai>=2.36,<3",  # OpenAI SDK
-    "litellm>=1.83.10,<2",  # Multi-provider LLM interface
+    "litellm>=1.102.0,<2",  # Bundled pricing includes the production GPT-5.6 Terra model
 ]
 
 azure = [
@@ -174,7 +174,7 @@ webui = [
     "websockets>=14.2,<15",
     "httpx>=0.28,<1",
     "bcrypt>=4.3,<5",
-    "litellm>=1.83.10,<2",
+    "litellm>=1.102.0,<2",
     # Prometheus metrics exposition endpoint (B1-r3 MeterProvider precondition)
     "opentelemetry-exporter-prometheus>=0.61b0,<0.62",
     "prometheus_client>=0.21,<1",
@@ -223,7 +223,7 @@ all = [
     # llm dependencies
     "jinja2>=3.1,<4",
     "openai>=2.36,<3",
-    "litellm>=1.83.10,<2",
+    "litellm>=1.102.0,<2",
     # azure dependencies
     "azure-storage-blob>=12.28,<13",
     "azure-identity>=1.25,<2",

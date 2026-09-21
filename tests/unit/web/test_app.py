@@ -3405,6 +3405,71 @@ class TestSecretsExceptionHandlers:
         assert resp.status_code == 500
         assert "database_unavailable" not in resp.text
 
+    @pytest.mark.parametrize("sqlstate", ["53300", "40P01", "08006", "SECRET_SQLSTATE", "40p01", 53300, None])
+    def test_database_failure_logs_only_safe_driver_and_pool_diagnostics(self, tmp_path, monkeypatch, sqlstate) -> None:
+        from sqlalchemy.pool import QueuePool
+
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "fp-k")
+        client = self._authed_client(tmp_path)
+
+        class DriverFailure(Exception):
+            def __init__(self, code: object) -> None:
+                super().__init__("SECRET_DRIVER_MESSAGE")
+                self.sqlstate = code
+
+        failure = DriverFailure(sqlstate)
+
+        def fail(*args, **kwargs):
+            raise OperationalError("SECRET_SQL", {"value": "SECRET_PARAM"}, failure, connection_invalidated=True)
+
+        monkeypatch.setattr(client.app.state.secret_service, "list_refs", fail)
+        pool = client.app.state.session_engine.pool
+        assert isinstance(pool, QueuePool)
+        with client.app.state.session_engine.connect(), capture_logs() as logs:
+            expected_checked_out = pool.checkedout()
+            response = client.get("/api/secrets")
+        assert response.status_code == 503
+        event = next(item for item in logs if item["event"] == "http_database_unavailable")
+        assert event["db_sqlstate"] == (sqlstate if sqlstate in ("53300", "40P01", "08006") else None)
+        assert event["db_driver_error_class"] == "DriverFailure"
+        assert event["db_connection_invalidated"] is True
+        assert event["session_pool_size"] == pool.size()
+        assert event["session_pool_checked_out"] == expected_checked_out
+        assert event["session_pool_overflow"] == pool.overflow()
+        assert "SECRET_" not in str(event)
+        assert "SECRET_" not in response.text
+
+    def test_database_diagnostics_reject_driver_class_text_and_support_nonqueue_pool(self, tmp_path, monkeypatch) -> None:
+        from sqlalchemy.pool import NullPool
+
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "fp-k")
+        client = self._authed_client(tmp_path)
+
+        class DriverFailure(Exception):
+            pgcode = "53300"
+
+        DriverFailure.__name__ = "SECRET_CLASS\nforged event"
+
+        def fail(*args, **kwargs):
+            raise OperationalError("SECRET_SQL", {}, DriverFailure("SECRET_MESSAGE"))
+
+        def unexpected_checkout():
+            pytest.fail("diagnostics must never open a database connection")
+
+        monkeypatch.setattr(client.app.state.secret_service, "list_refs", fail)
+        monkeypatch.setattr(client.app.state.session_engine, "pool", NullPool(unexpected_checkout))
+        with capture_logs() as logs:
+            response = client.get("/api/secrets")
+        assert response.status_code == 503
+        event = next(item for item in logs if item["event"] == "http_database_unavailable")
+        assert event["db_sqlstate"] == "53300"
+        assert event["db_driver_error_class"] is None
+        assert event["db_connection_invalidated"] is False
+        assert event["session_pool_size"] is None
+        assert event["session_pool_checked_out"] is None
+        assert event["session_pool_overflow"] is None
+        assert "SECRET_" not in str(event)
+
     # -- OSError → 503 --------------------------------------------------------
 
     def test_oserror_on_list_returns_503(self, tmp_path, monkeypatch) -> None:

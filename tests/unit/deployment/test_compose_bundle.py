@@ -292,7 +292,9 @@ def test_web_overlay_sets_production_composer_defaults() -> None:
     assert environment["ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED"] == ("${ELSPETH_WEB_COMPOSER_BOOT_PROBE_ENABLED:-true}")
     assert environment["ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS"] == "15"
     assert environment["ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS"] == "10"
-    assert environment["ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS"] == "85"
+    assert environment["ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS"] == "180"
+    assert environment["ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS"] == "240"
+    assert environment["ELSPETH_WEB__COMPOSER_TRANSPORT_HEADROOM_SECONDS"] == "30"
     assert environment["ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE"] == "10"
 
 
