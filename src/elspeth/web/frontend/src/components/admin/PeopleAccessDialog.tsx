@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type JSX, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { adminErrorMessage } from "@/api/identityAdmin";
 import { PEOPLE_PAGE_SIZE, fetchPeopleCapabilities, isAbort, listPeople } from "@/api/people";
 import { Button } from "@/components/ui";

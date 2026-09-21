@@ -68,7 +68,7 @@
  * plan's wording for cross-document grep continuity.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { type JSX, useEffect, useMemo, useState } from "react";
 
 import {
   downloadRunOutputContent,

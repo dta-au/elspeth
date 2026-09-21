@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 import { Button } from "@/components/ui";
 import { OPEN_CATALOG_EVENT } from "@/lib/composer-events";
 

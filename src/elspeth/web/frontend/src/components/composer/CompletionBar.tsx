@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 /**
  * CompletionBar — three-button completion gesture surface (Phase 6B Task 3).
  *

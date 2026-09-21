@@ -6,7 +6,7 @@
 // runs after the inspector Runs tab is removed.
 // ============================================================================
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type JSX, useEffect, useMemo, useRef, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useShowAdvanced } from "@/stores/preferencesStore";

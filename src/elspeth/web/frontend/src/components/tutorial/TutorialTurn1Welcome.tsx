@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 import { AlertBanner, Button } from "../ui";
 import {
   TURN_1_PRIMARY_BUTTON,

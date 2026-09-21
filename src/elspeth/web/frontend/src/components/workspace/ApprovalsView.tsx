@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { type JSX, useMemo } from "react";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { approvalRows } from "@/components/inspector/approvalRows";
 import { ApprovalsTable } from "@/components/inspector/GraphApprovals";

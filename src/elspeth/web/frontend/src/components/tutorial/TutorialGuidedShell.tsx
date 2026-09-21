@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type MutableRefObject } from "react";
+import { type JSX, useEffect, useRef, useState, type MutableRefObject } from "react";
 import {
   getGuided,
   getTutorialSample,

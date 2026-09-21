@@ -1,6 +1,6 @@
 // src/components/chat/guided/GuidedPendingStrip.tsx
 
-import { useEffect, useState } from "react";
+import { type JSX, useEffect, useState } from "react";
 
 import { Button } from "@/components/ui";
 import type { ComposerProgressSnapshot } from "@/types/api";

@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { type JSX, useCallback, useState } from "react";
 import * as api from "@/api/client";
 import * as admin from "@/api/identityAdmin";
 import { PROVIDER_LABEL, errorStatus, isUncertainOutcome, localKey } from "@/api/people";

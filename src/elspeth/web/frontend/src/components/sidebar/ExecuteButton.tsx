@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { type JSX, useCallback, useEffect, useId, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";

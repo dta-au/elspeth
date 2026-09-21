@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 // ============================================================================
 // PipelineGloss — one-line plain-language description of the pipeline (Slice C)
 //

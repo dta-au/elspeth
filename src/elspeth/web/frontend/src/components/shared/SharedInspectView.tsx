@@ -59,7 +59,7 @@
  * * Other / network → "Couldn't load the shared pipeline" with retry.
  */
 
-import { useEffect, useState, type CSSProperties } from "react";
+import { type JSX, useEffect, useState, type CSSProperties } from "react";
 
 import { fetchSharedInspect } from "@/api/shareableReviews";
 import { ReadOnlyProvider } from "@/contexts/ReadOnlyContext";

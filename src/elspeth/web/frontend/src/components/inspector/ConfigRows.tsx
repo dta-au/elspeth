@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 // ============================================================================
 // ConfigRows — the shared key/value renderer for node-inspector panels
 // (extracted from GraphView.tsx so OptionRows.tsx can reuse it without

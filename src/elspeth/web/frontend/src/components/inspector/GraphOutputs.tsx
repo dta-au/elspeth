@@ -1,4 +1,4 @@
-import { Fragment, type ReactNode } from "react";
+import { type JSX, Fragment, type ReactNode } from "react";
 import type { CompositionState, NodeSpec, NodeType } from "@/types";
 import { FORK_CONNECTION, publishedSuccessConnection } from "@/lib/graphTopology";
 import { pluginBindingLabel } from "@/lib/pluginBindingLabel";

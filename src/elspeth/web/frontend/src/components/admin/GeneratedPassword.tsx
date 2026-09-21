@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { type JSX, useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui";
 import { useCopiedReset } from "./peoplePanel";
 

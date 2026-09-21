@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 import type { ApprovalRow } from "./approvalRows";
 
 /** The dedicated Approvals tab's table: Name, Approved value, Approved at. */

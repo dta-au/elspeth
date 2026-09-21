@@ -5,7 +5,7 @@
 // run's progress and outputs. Historical access lives in RunsHistoryDrawer.
 // ============================================================================
 
-import { useEffect, useState } from "react";
+import { type JSX, useEffect, useState } from "react";
 import { Button, Icon } from "@/components/ui";
 import {
   type RunHistoryLoadOutcome,

@@ -12,7 +12,7 @@
 // Empty state when no nodes.
 // ============================================================================
 
-import { useMemo, useCallback, useEffect, useRef, type ReactNode } from "react";
+import { useMemo, useCallback, useEffect, useRef, type JSX, type ReactNode } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -2094,7 +2094,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     guidedProjection !== null &&
     (guidedProjection.stage !== "reviewed" || nodes.length === 0)
   ) {
-    return <GuidedGraphPane projection={guidedProjection} />;
+    return <GuidedGraphPane projection={guidedProjection} onFullscreen={onFullscreen} />;
   }
   if (nodes.length === 0) {
     return (

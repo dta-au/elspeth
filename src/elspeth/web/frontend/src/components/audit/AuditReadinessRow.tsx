@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 /**
  * AuditReadinessRow — single row of the audit-readiness panel.
  *

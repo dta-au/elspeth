@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 import { Button } from "@/components/ui";
 import type { ApprovalView, MailboxSent } from "@/types/workflow";
 

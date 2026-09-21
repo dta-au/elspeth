@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { type JSX, useCallback, useEffect, useId, useRef, useState } from "react";
 import * as admin from "@/api/identityAdmin";
 import { errorStatus, fetchPerson, isAbort, isUncertainOutcome, personDisambiguator, personName } from "@/api/people";
 import { Button, Input } from "@/components/ui";

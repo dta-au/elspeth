@@ -42,7 +42,7 @@
 // accepting a proposal, or the user's next real change.
 // ============================================================================
 
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { type JSX, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui";
 import { humaniseValidationSuggestion } from "@/lib/validationHumaniser";

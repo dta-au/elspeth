@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { type JSX, useId } from "react";
 import { PROVIDER_LABEL, personDisambiguator, personName } from "@/api/people";
 import { Button, Input } from "@/components/ui";
 import type { IdentityProvider } from "@/types/identityAdmin";

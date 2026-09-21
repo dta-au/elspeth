@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 export interface WireReviewItem {
   id: string;
   from: string;

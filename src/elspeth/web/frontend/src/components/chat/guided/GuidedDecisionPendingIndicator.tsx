@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 // src/components/chat/guided/GuidedDecisionPendingIndicator.tsx
 
 import type { ComposerProgressSnapshot } from "@/types/api";

@@ -25,7 +25,7 @@
 // detail, column = signal).
 // ============================================================================
 
-import { useMemo } from "react";
+import { type JSX, useMemo } from "react";
 
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";

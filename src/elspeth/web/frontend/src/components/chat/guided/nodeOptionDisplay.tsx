@@ -15,7 +15,7 @@
 // no local prompt editor here, by design.
 // ============================================================================
 
-import { useState } from "react";
+import { type JSX, useState } from "react";
 
 import { Button } from "@/components/ui";
 import type { NodeOptionSummary } from "@/types/guided";

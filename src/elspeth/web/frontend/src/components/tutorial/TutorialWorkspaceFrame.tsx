@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { JSX, ReactNode } from "react";
 import { PipelineValidationSummary } from "@/components/chat/guided/PipelineValidationSummary";
 import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
 import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";

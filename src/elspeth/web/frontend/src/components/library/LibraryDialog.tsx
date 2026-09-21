@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { type JSX, useEffect, useRef, useState } from "react";
 import { Button, Input } from "@/components/ui";
 import * as library from "@/api/library";
 import { useFocusTrap } from "@/hooks/useFocusTrap";

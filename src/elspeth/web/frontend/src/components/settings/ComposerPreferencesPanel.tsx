@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { type JSX, useCallback, useEffect, useRef } from "react";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useTheme, type Theme } from "@/hooks/useTheme";

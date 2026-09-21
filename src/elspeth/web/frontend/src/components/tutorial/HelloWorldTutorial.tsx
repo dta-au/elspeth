@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { type JSX, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
   createSession,
   deleteTutorialOrphans,

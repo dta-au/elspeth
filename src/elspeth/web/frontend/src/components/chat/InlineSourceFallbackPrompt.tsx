@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 // ============================================================================
 // InlineSourceFallbackPrompt.tsx — Phase 5a Task 5
 //

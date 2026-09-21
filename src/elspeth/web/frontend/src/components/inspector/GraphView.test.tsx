@@ -4021,6 +4021,60 @@ describe("GraphView", () => {
       status: "reviewed" as const,
     };
 
+    const wiringTurn: TurnPayload = {
+      type: "confirm_wiring",
+      step_index: 3,
+      turn_token: "e".repeat(64),
+      payload: {
+        proposal_id: proposalTurn.payload.proposal_id,
+        draft_hash: proposalTurn.payload.draft_hash,
+        sources: [{
+          stable_id: SOURCE_ID,
+          label: "source-1",
+          plugin: "csv",
+          on_validation_failure: "discard",
+          guaranteed_fields: [],
+          row_cardinality: { input: "none", output: "zero_or_many", expected_output_count: null },
+        }],
+        nodes: [],
+        outputs: [{
+          stable_id: OUTPUT_ID,
+          label: "output-1",
+          plugin: "json",
+          on_write_failure: "discard",
+          required_fields: [],
+          business_schema: { mode: "observed", fields: [], guaranteed_fields: [], required_fields: [] },
+        }],
+        connections: proposalTurn.payload.graph.edges.map((edge) => ({ ...edge, schema_contract: null })),
+        semantic_contracts: [],
+        warnings: [],
+        blockers: [],
+        can_confirm: true,
+      },
+    };
+
+    it.each([
+      ["proposal", proposalTurn],
+      ["wiring", wiringTurn],
+      ["reviewed", null],
+    ] as const)("preserves Fullscreen access for the %s projection", async (_stage, turn) => {
+      useSessionStore.setState({
+        guidedNextTurn: turn,
+        guidedReviewedComponents: { sources: [reviewedSource], outputs: [] },
+      });
+      const onFullscreen = vi.fn();
+      const { unmount } = render(<GraphView onFullscreen={onFullscreen} />);
+      expect(screen.getByRole("img")).toBeInTheDocument();
+      const control = screen.getByRole("button", { name: "Fullscreen" });
+      await userEvent.click(control);
+      expect(onFullscreen).toHaveBeenCalledTimes(1);
+
+      unmount();
+      render(<GraphView />);
+      expect(screen.getByRole("img")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
+    });
+
     it("draws the pending proposal from its payload while the composition is empty", () => {
       useSessionStore.setState({ guidedNextTurn: proposalTurn });
       const { container } = render(<GraphView />);

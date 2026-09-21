@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback } from "react";
+import { type JSX, type ReactNode, useCallback } from "react";
 
 import { AuditReadinessPanel } from "@/components/audit/AuditReadinessPanel";
 import { SideRailValidationBanner } from "@/components/sidebar/SideRailValidationBanner";

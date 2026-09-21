@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { type JSX, useEffect, useState } from "react";
 import { Button } from "@/components/ui";
 import { approvalForState, useMailboxStore } from "@/stores/mailboxStore";
 import { WorkflowRequestDialog } from "./WorkflowRequestDialog";

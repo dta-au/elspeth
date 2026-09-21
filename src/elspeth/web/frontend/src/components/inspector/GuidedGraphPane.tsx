@@ -8,17 +8,26 @@
 // deciding on in the wide pane rather than in a 300px card. Presentation
 // only: the projection is the single authority for what is drawn.
 
+import type { JSX } from "react";
 import type { GuidedGraphProjection } from "@/components/chat/guided/guidedGraphProjection";
 import { ReadOnlyPipelineGraph } from "@/components/chat/guided/ReadOnlyPipelineGraph";
+import { Button } from "@/components/ui/Button";
 
 export function GuidedGraphPane({
   projection,
+  onFullscreen,
 }: {
   projection: GuidedGraphProjection;
+  onFullscreen?: () => void;
 }): JSX.Element {
   return (
     <div className="graph-view-guided" data-guided-stage={projection.stage}>
       <p className="graph-view-guided__caption">{projection.caption}</p>
+      {onFullscreen && (
+        <div>
+          <Button compact onClick={onFullscreen} title="Fullscreen">Fullscreen</Button>
+        </div>
+      )}
       <ReadOnlyPipelineGraph
         nodes={projection.nodes}
         edges={projection.edges}

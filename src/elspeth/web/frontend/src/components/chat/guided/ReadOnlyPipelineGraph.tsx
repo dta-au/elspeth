@@ -1,4 +1,4 @@
-import { useId, useMemo } from "react";
+import { type JSX, useId, useMemo } from "react";
 import dagre from "@dagrejs/dagre";
 
 export interface ReadOnlyPipelineGraphNode {

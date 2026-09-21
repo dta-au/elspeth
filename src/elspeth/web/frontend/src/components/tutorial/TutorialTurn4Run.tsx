@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { type JSX, useEffect, useRef, useState } from "react";
 import { cancelTutorialRun, fetchPluginPolicy, runTutorialPipeline } from "@/api/client";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
 import { AlertBanner, Button } from "@/components/ui";

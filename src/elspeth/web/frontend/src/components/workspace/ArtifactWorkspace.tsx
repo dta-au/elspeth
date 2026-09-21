@@ -1,4 +1,5 @@
 import {
+  type JSX,
   type KeyboardEvent,
   useCallback,
   useEffect,

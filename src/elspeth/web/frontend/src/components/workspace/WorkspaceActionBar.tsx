@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 import { CompletionBar } from "@/components/composer/CompletionBar";
 
 export interface WorkspaceActionCapabilities {

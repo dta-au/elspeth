@@ -1,4 +1,4 @@
-import type { ElementType, HTMLAttributes } from "react";
+import type { JSX, ElementType, HTMLAttributes } from "react";
 
 export interface WordMarkProps extends HTMLAttributes<HTMLElement> {
   /** Font size in px (number) or any CSS length (string). @default 13 */

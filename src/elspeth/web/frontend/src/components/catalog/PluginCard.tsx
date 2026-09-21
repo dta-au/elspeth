@@ -23,7 +23,7 @@
 // for its prefill action, and ChatInput.tsx remains the receiver.
 // ============================================================================
 
-import { useEffect, useState, type MouseEvent } from "react";
+import { type JSX, useEffect, useState, type MouseEvent } from "react";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
 import { Button } from "@/components/ui";
 import { useShowAdvanced } from "@/stores/preferencesStore";

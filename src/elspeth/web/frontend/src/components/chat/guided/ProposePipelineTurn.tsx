@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { type JSX, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui";
 import { stepLabelForPlugin } from "@/components/chat/interpretationStepLabel";

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { type JSX, useEffect, useRef } from "react";
 import { Button } from "@/components/ui";
 import type { PersonMutation } from "./peoplePanel";
 

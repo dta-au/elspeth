@@ -1384,7 +1384,10 @@ class _AzureSearchProfileResolver:
     def check_local_requirements(self, alias: str) -> LocalRequirementResult:
         if alias not in self._profiles:
             return LocalRequirementResult(available=False)
-        if self._profiles[alias].auth == "managed_identity" and importlib.util.find_spec("azure.identity") is None:
+        # Dotted lookups raise ModuleNotFoundError when the parent is absent.
+        if self._profiles[alias].auth == "managed_identity" and (
+            importlib.util.find_spec("azure") is None or importlib.util.find_spec("azure.identity") is None
+        ):
             return LocalRequirementResult(available=False, reason=ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING)
         return LocalRequirementResult(available=True)
 

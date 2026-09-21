@@ -767,6 +767,46 @@ def test_azure_ai_search_managed_identity_profile_needs_azure_identity_installed
     assert dict(without_package.usable_profile_aliases)[_SEARCH_PLUGIN] == ()
 
 
+@pytest.mark.parametrize("api_key", [False, True], ids=["managed-identity", "api-key"])
+def test_azure_search_availability_without_azure_namespace(monkeypatch: pytest.MonkeyPatch, api_key: bool) -> None:
+    import importlib.util
+    import sys
+    from importlib.machinery import ModuleSpec
+    from types import ModuleType
+
+    profile = _SEARCH_KEY_PROFILE if api_key else _SEARCH_MI_PROFILE
+    settings = _settings(
+        plugin_allowlist=(str(_SEARCH_PLUGIN),),
+        azure_search_profiles=(profile,),
+        server_secret_allowlist=("SEARCH_B_KEY",),
+    )
+    inventory = _Inventory(server=frozenset({"SEARCH_B_KEY"}))
+    with monkeypatch.context() as installed:
+        for name in ("azure", "azure.identity"):
+            module = ModuleType(name)
+            module.__spec__ = ModuleSpec(name, loader=None, is_package=True)
+            installed.setitem(sys.modules, name, module)
+        assert _SEARCH_PLUGIN in _build(settings, inventory=inventory).available
+
+    # Exercise the real import machinery: a missing parent raises for a dotted
+    # lookup, unlike the existing missing-child test's stub returning None.
+    monkeypatch.setitem(sys.modules, "azure", None)
+    monkeypatch.delitem(sys.modules, "azure.identity", raising=False)
+    with pytest.raises(ModuleNotFoundError):
+        importlib.util.find_spec("azure.identity")
+
+    snapshot = _build(settings, inventory=inventory)
+
+    if api_key:
+        assert _SEARCH_PLUGIN in snapshot.available
+        assert dict(snapshot.usable_profile_aliases)[_SEARCH_PLUGIN] == ("contracts",)
+    else:
+        assert _SEARCH_PLUGIN not in snapshot.available
+        assert dict(snapshot.usable_profile_aliases)[_SEARCH_PLUGIN] == ()
+        assert PluginAvailability(_SEARCH_PLUGIN, PluginUnavailableReason.PROFILE_UNAVAILABLE) in snapshot.unavailable
+    assert PluginId("source", "csv") in snapshot.available
+
+
 def test_several_azure_search_profiles_are_all_usable_with_no_house_default() -> None:
     snapshot = _build(
         _settings(

@@ -36,7 +36,7 @@
 // beyond the two switch actions and the resume/fresh discriminator read below.
 // ============================================================================
 
-import { useEffect, useId, useState } from "react";
+import { type JSX, useEffect, useId, useState } from "react";
 
 import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";

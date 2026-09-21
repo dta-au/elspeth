@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { type JSX, useMemo, useState } from "react";
 import { ValidationResultBanner } from "@/components/execution/ValidationResult";
 import { Button } from "@/components/ui";
 import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";

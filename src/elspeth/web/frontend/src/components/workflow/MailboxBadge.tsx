@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 import { Button } from "@/components/ui";
 import { badgeCount, useMailboxStore } from "@/stores/mailboxStore";
 import "./workflow.css";

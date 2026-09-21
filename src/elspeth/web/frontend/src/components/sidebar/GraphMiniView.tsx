@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";

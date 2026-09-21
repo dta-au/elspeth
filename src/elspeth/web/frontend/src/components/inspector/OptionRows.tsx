@@ -19,7 +19,7 @@
 //      "Raw options (JSON)" block, which itself renders only with show_advanced.
 // ============================================================================
 
-import { useEffect } from "react";
+import { type JSX, useEffect } from "react";
 
 import { CodeBlock } from "@/components/chat/CodeBlock";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";

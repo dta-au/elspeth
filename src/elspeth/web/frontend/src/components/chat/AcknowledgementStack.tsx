@@ -17,7 +17,7 @@
 // via `useInterpretationResolver` inside each AcknowledgementCard.
 // ============================================================================
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type JSX, useEffect, useMemo, useRef, useState } from "react";
 import type { CompositionState } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { Button } from "@/components/ui";

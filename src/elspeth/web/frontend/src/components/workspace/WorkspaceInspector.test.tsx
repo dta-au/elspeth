@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState } from "react";
+import { type JSX, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { makeComposition } from "@/test/composerFixtures";

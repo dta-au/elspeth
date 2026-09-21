@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { type JSX, useCallback, useState } from "react";
 import * as api from "@/api/client";
 import { PROVIDER_LABEL, errorStatus } from "@/api/people";
 import { Button, Input } from "@/components/ui";

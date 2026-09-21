@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useId, useMemo, useRef, useState } from "react";
+import { type JSX, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from "react";
 import { parseDocument } from "yaml";
 import * as api from "@/api/client";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
