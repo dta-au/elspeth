@@ -338,7 +338,6 @@ def _record_undeclared_producer(
     errors: list[ValidationEntry],
     warnings: list[ValidationEntry],
     contracts: list[SemanticEdgeContract],
-    seen_edges: set[tuple[str, str, str, str]],
 ) -> None:
     """Emit the UNKNOWN finding for a consumer with no resolvable producer.
 
@@ -346,10 +345,6 @@ def _record_undeclared_producer(
     The schema-contract layer owns missing-field cases; the semantic layer
     treats this as unknown and lets the requirement's own policy grade it.
     """
-    edge_key = ("?source", consumer.contract_id, requirement.field_name, requirement.field_name)
-    if edge_key in seen_edges:
-        return
-    seen_edges.add(edge_key)
     contracts.append(
         SemanticEdgeContract(
             from_id="?",
@@ -391,7 +386,6 @@ def _record_producer_edge(
     errors: list[ValidationEntry],
     warnings: list[ValidationEntry],
     contracts: list[SemanticEdgeContract],
-    seen_edges: set[tuple[str, str, str, str]],
 ) -> None:
     """Compare one producer's facts to one requirement and record the outcome.
 
@@ -402,11 +396,6 @@ def _record_producer_edge(
     """
     facts = _find_producer_facts(producer_decl, requirement.field_name) if producer_decl is not None else None
     outcome = compare_semantic(facts, requirement)
-
-    edge_key = (producer.producer_id, consumer.contract_id, requirement.field_name, requirement.field_name)
-    if edge_key in seen_edges:
-        return
-    seen_edges.add(edge_key)
 
     contracts.append(
         SemanticEdgeContract(
@@ -543,6 +532,10 @@ def validate_semantic_contracts(
     ``CompositionState.validate()`` passes the cache it shares with the
     schema-contract stage, and a standalone call owns one for this walk.
 
+    Evaluate every declared requirement, including those sharing a field or
+    requirement code. Only upstream producer routes are deduplicated, by
+    ``_sink_upstream_producers`` before requirements are evaluated.
+
     Returns (errors, warnings, contracts):
     - errors: ValidationEntry records suitable for ValidationSummary.errors
     - warnings: advisory records for ValidationSummary.warnings, raised on
@@ -556,7 +549,6 @@ def validate_semantic_contracts(
     errors: list[ValidationEntry] = []
     warnings: list[ValidationEntry] = []
     contracts: list[SemanticEdgeContract] = []
-    seen_edges: set[tuple[str, str, str, str]] = set()
 
     sink_names = frozenset(output.name for output in state.outputs)
     resolver = ProducerResolver.build(
@@ -597,7 +589,6 @@ def validate_semantic_contracts(
                     errors=errors,
                     warnings=warnings,
                     contracts=contracts,
-                    seen_edges=seen_edges,
                 )
             continue
 
@@ -611,7 +602,6 @@ def validate_semantic_contracts(
                 errors=errors,
                 warnings=warnings,
                 contracts=contracts,
-                seen_edges=seen_edges,
             )
 
     # Sinks are consumers too, and they are NOT in state.nodes — NodeType has
@@ -644,7 +634,6 @@ def validate_semantic_contracts(
                     errors=errors,
                     warnings=warnings,
                     contracts=contracts,
-                    seen_edges=seen_edges,
                 )
             continue
 
@@ -662,7 +651,6 @@ def validate_semantic_contracts(
                     errors=errors,
                     warnings=warnings,
                     contracts=contracts,
-                    seen_edges=seen_edges,
                 )
 
     return tuple(errors), tuple(warnings), tuple(contracts)

@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from elspeth.contracts.plugin_semantics import (
     ContentKind,
+    FieldSemanticRequirement,
+    InputSemanticRequirements,
     SemanticOutcome,
+    SemanticValueType,
     TextFraming,
+    UnknownSemanticPolicy,
 )
 from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import (
@@ -112,6 +118,80 @@ def _wardline_state(*, text_separator: str = " ", scrape_format: str = "text"):
     )
 
 
+@pytest.mark.parametrize("consumer_kind", ["transform", "sink"])
+@pytest.mark.parametrize("upstream", ["declared", "no_facts", "unresolved"])
+@pytest.mark.parametrize("same_code", [False, True], ids=["distinct-codes", "same-code"])
+@pytest.mark.parametrize("strict_first", [False, True], ids=["strict-last", "strict-first"])
+def test_every_same_field_requirement_is_evaluated(
+    monkeypatch: pytest.MonkeyPatch,
+    consumer_kind: str,
+    upstream: str,
+    same_code: bool,
+    strict_first: bool,
+) -> None:
+    from elspeth.plugins.sinks.text_sink import TextSink
+    from elspeth.plugins.transforms.line_explode import LineExplode
+
+    permissive = FieldSemanticRequirement(
+        field_name="content",
+        accepted_content_kinds=frozenset({ContentKind.PLAIN_TEXT}),
+        accepted_text_framings=frozenset(),
+        requirement_code="content.text",
+        unknown_policy=UnknownSemanticPolicy.ALLOW,
+    )
+    strict = replace(
+        permissive,
+        requirement_code=permissive.requirement_code if same_code else "content.list",
+        accepted_value_types=frozenset({SemanticValueType.LIST}),
+        unknown_policy=UnknownSemanticPolicy.FAIL,
+    )
+    requirements = (strict, permissive) if strict_first else (permissive, strict)
+
+    def input_requirements(self: LineExplode | TextSink) -> InputSemanticRequirements:
+        return InputSemanticRequirements(fields=requirements)
+
+    if consumer_kind == "transform":
+        monkeypatch.setattr(LineExplode, "input_semantic_requirements", input_requirements)
+        state = _wardline_state(text_separator="\n")
+        consumer_id, component = "explode", "node:explode"
+    else:
+        monkeypatch.setattr(TextSink, "input_semantic_requirements", input_requirements)
+        state = _sink_state(
+            producer=_web_scrape_node(scrape_format="text", text_separator="\n"),
+            sink_plugin="text",
+            sink_field="content",
+        )
+        consumer_id = component = "output:sink"
+
+    producer = state.nodes[0]
+    if upstream == "no_facts":
+        producer = replace(
+            producer,
+            plugin="field_mapper",
+            options={"schema": {"mode": "observed"}, "mapping": {"url": "url"}},
+        )
+    elif upstream == "unresolved":
+        producer = replace(producer, on_success="unused")
+    state = replace(state, nodes=(producer, *state.nodes[1:]))
+
+    errors, warnings, contracts = validate_semantic_contracts(state)
+
+    assert len(errors) == 1
+    assert errors[0].component == component
+    assert errors[0].error_code == "semantic_contract_violation"
+    assert strict.requirement_code in errors[0].message
+    assert warnings == ()
+    assert tuple(edge.requirement for edge in contracts) == requirements
+    expected_outcomes = (
+        {permissive: SemanticOutcome.SATISFIED, strict: SemanticOutcome.CONFLICT}
+        if upstream == "declared"
+        else {permissive: SemanticOutcome.UNKNOWN, strict: SemanticOutcome.UNKNOWN}
+    )
+    assert tuple(edge.outcome for edge in contracts) == tuple(expected_outcomes[req] for req in requirements)
+    expected_producer = "?" if upstream == "unresolved" else producer.id
+    assert [(edge.from_id, edge.to_id) for edge in contracts] == [(expected_producer, consumer_id)] * 2
+
+
 class TestValidateSemanticContracts:
     def test_validation_closes_consumer_and_producer_probes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -177,8 +257,6 @@ class TestValidateSemanticContracts:
         assert [probe.close_count for probe in sink_probes] == [1, 1]
 
     def test_consumer_probe_closes_when_semantic_inspection_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from elspeth.contracts.plugin_semantics import InputSemanticRequirements
-
         class _RaisingProbe:
             close_count = 0
 
@@ -1742,6 +1820,33 @@ class TestSinkSemanticAcceptanceCriteria:
 
 class TestSinkFanIn:
     """A sink takes MANY producers. The rule is conservative: ANY conflict blocks."""
+
+    def test_repeated_routes_to_one_producer_do_not_duplicate_requirements(self) -> None:
+        state = _sink_state(
+            producer=_web_scrape_node(scrape_format="markdown", text_separator="\n", on_success="gate_in"),
+            sink_plugin="text",
+            sink_field="content",
+        )
+        gate = _transform_node(
+            id="route_content",
+            node_type="gate",
+            input="gate_in",
+            on_success=None,
+            on_error=None,
+            condition="row['content']",
+            routes={"yes": "sink", "no": "sink"},
+        )
+        state = replace(state, nodes=(*state.nodes, gate))
+
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert len(contracts) == 1
+        assert contracts[0].from_id == "produce"
+        assert contracts[0].to_id == "output:sink"
+        assert contracts[0].outcome is SemanticOutcome.CONFLICT
+        assert len(errors) == 1
+        assert errors[0].component == "output:sink"
+        assert warnings == ()
 
     def _fan_in_state(self, *, second_scrape_format: str) -> CompositionState:
         return CompositionState(

@@ -39,6 +39,7 @@ from elspeth.web.execution._semantic_helpers import (
     semantic_component_attribution,
     serialize_semantic_contracts,
 )
+from elspeth.web.execution._validation_materialization import _source_policy_component_id
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
     InterpretationValidatedState,
@@ -278,7 +279,7 @@ def validate_path_policy(
 
     for source_name, source in state.sources.items():
         source_options = dict(source.options)
-        source_component = "source" if source_name == "source" else f"source:{source_name}"
+        source_component = _source_policy_component_id(source_name)
         for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
             value = source_options.get(key)
             if value is None:
@@ -734,7 +735,7 @@ def validate_secret_evidence(
     if secret_service is not None and user_id is not None:
         env_ref_names = {item.name for item in secret_service.list_refs(user_id)}
         for source_name, source in state.sources.items():
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            source_component = _source_policy_component_id(source_name)
             all_refs.extend(_collect_secret_refs(source.options, env_ref_names))
             fabricated = collect_credential_field_violations(source.options, env_ref_names)
             if fabricated:
@@ -776,7 +777,7 @@ def validate_secret_evidence(
         # profile-lowered credential markers are server-authored and exempt.
         authored = policy.authored_state
         for source_name, source in authored.sources.items():
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            source_component = _source_policy_component_id(source_name)
             _collect_unauthorized(source_component, "source", source.plugin, source.options)
         for node in authored.nodes:
             _collect_unauthorized(node.id, "transform", node.plugin or "<unset>", node.options)

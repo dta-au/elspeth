@@ -235,6 +235,40 @@ def test_path_phase_returns_typed_failure_for_malformed_authored_paths(bad_path:
     assert result.errors[0].component_id == "source"
 
 
+@pytest.mark.parametrize(
+    ("source_name", "component_id"),
+    [("source", "source"), ("orders", "source:orders"), ("7", "source:7"), (7, "source:<invalid>"), (None, "source:<invalid>")],
+)
+@pytest.mark.parametrize("policy_case", ["path", "fabricated_secret", "unauthorized_secret_ref"])
+def test_authoring_policy_source_component_ids(source_name: object, component_id: str, policy_case: str) -> None:
+    options: dict[str, object]
+    if policy_case == "path":
+        options = {"path": 123}
+    elif policy_case == "fabricated_secret":
+        options = {"api_key": "literal-credential"}
+    else:
+        options = {"api_key": {"secret_ref": "API_KEY"}}
+    # The constructor admits malformed mapping keys; exercise the same state
+    # boundary as rehydrated authoring data, without mutating a frozen object.
+    state = CompositionState(
+        sources={cast(str, source_name): _source(options)},
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    if policy_case == "path":
+        result = validate_path_policy(_policy(state), data_dir=Path("/tmp/test_data"), session_id="test-session")
+    else:
+        result = validate_secret_evidence(_policy(state), secret_service=_SecretService(frozenset({"API_KEY"})), user_id="alice")
+
+    assert isinstance(result, PhaseFailure)
+    assert [(error.component_id, error.component_type, error.error_code) for error in result.errors] == [
+        (component_id, "source", None if policy_case == "path" else policy_case)
+    ]
+
+
 def test_policy_lowering_returns_typed_state_and_four_canonical_checks() -> None:
     state = _state(outputs=(_output(),))
 
