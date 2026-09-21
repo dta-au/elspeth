@@ -55,7 +55,6 @@ const empty = {
   compositionState: null,
   pendingInterpretations: [] as InterpretationEvent[],
   proposals: [] as CompositionProposal[],
-  staleProposalIds: [] as string[],
 };
 
 describe("blockedVerbsFromReadiness", () => {
@@ -212,7 +211,7 @@ describe("projectDecisionRows", () => {
     expect(projected.rows.map((r) => r.kind)).toEqual(["blocker"]);
   });
 
-  it("counts actionable proposals but never stale or resolved ones", () => {
+  it("counts all pending proposals, including obsolete proposals that can be rejected", () => {
     const projected = projectDecisionRows({
       ...empty,
       validationResult: makeValidationResult(),
@@ -221,12 +220,12 @@ describe("projectDecisionRows", () => {
         proposal({ id: "proposal-2" }),
         proposal({ id: "proposal-3", status: "committed" }),
       ],
-      staleProposalIds: ["proposal-2"],
     });
     expect(projected.rows).toEqual([
       { kind: "pending_proposal", id: "proposal:proposal-1", proposalId: "proposal-1" },
+      { kind: "pending_proposal", id: "proposal:proposal-2", proposalId: "proposal-2" },
     ]);
-    expect(projected.count).toBe(1);
+    expect(projected.count).toBe(2);
   });
 
   it("orders blockers first, then suggestions, then pointers, then proposals", () => {
@@ -251,7 +250,6 @@ describe("projectDecisionRows", () => {
       compositionState: makeComposition(7, { validation_suggestions: [S1] }),
       pendingInterpretations: [pendingEvent()],
       proposals: [proposal()],
-      staleProposalIds: [],
     });
     expect(projected.rows.map((r) => r.kind)).toEqual([
       "blocker",

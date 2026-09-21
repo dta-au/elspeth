@@ -1049,6 +1049,9 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("renders inline-content-hashed provenance row when the source is inline_blob-backed (Phase 5a.7)", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1, {
+      sources: { source: { plugin: "csv_file", options: { blob_ref: "blob-uuid" } } },
+    }) });
     // Seed an inline-source summary so the panel's projection branch fires.
     useInlineSourceStore.getState().setSummary(SESSION_ID, {
       blobId: "blob-uuid",
@@ -1082,7 +1085,12 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("renders the default backend-supplied provenance summary when no inline source is bound (Phase 5a.7)", async () => {
-    // No inline source seeded — store returns null for getSummary(SESSION_ID).
+    // A cached previous blob must not describe the current pipeline.
+    useInlineSourceStore.getState().setSummary(SESSION_ID, {
+      blobId: "removed-blob", filename: "old.csv", mimeType: "text/csv",
+      contentPreview: "old", rowCount: 1, contentHash: "abc123def456789",
+      provenance: "verbatim",
+    });
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) =>
         makeAbortablePromise(snapshotWithProvenanceWarning(1), { signal }),

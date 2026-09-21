@@ -46,6 +46,12 @@ function response(body: unknown, status: number): Response {
 beforeEach(() => {
   resetStore(useInterpretationEventsStore);
   resetStore(useSessionStore);
+  useSessionStore.setState({ compositionState: {
+    id: "state-1", ...compositionStateAuthorityFields, version: 1,
+    sources: {}, edges: [], outputs: [], metadata: { name: null, description: null },
+    nodes: [{ id: "variant_a", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+      options: { system_prompt: "Summarise precisely.", prompt_template: "Summarise {{ row.text }}." } }],
+  } });
   useInterpretationEventsStore.getState().addPendingEvent("session-1", event);
 });
 

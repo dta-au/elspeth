@@ -45,6 +45,8 @@ export interface PromptDisplaySegment {
 }
 
 export interface PromptDisplayResult {
+  /** False when only the bounded event preview is available. */
+  reviewAvailable: boolean;
   segments: PromptDisplaySegment[];
   /** Single-prompt nodes expose the separate system message; undefined for multi-query or missing state. */
   systemPrompt?: string | null;
@@ -278,7 +280,7 @@ function segmentsFromSurface(
       { kind: "text" as const, text: surface.nodePromptTemplate },
     ]),
   ];
-  return { segments, usedFallback: templateSegments === null };
+  return { segments, usedFallback: templateSegments === null, reviewAvailable: true };
 }
 
 /**
@@ -316,19 +318,21 @@ export function resolvePromptDisplaySegments(
         options.prompt_template_parts,
         requirements,
       );
-      if (segments !== null) return { segments, usedFallback: false, systemPrompt };
+      if (segments !== null) return { segments, usedFallback: false, systemPrompt, reviewAvailable: true };
     }
     const template = options.prompt_template;
-    if (typeof template === "string" && template !== "") {
+    if (typeof template === "string") {
       return {
         segments: [{ kind: "text", text: template }],
         usedFallback: true,
         systemPrompt,
+        reviewAvailable: true,
       };
     }
   }
   return {
     segments: [{ kind: "text", text: event.llm_draft ?? "" }],
     usedFallback: true,
+    reviewAvailable: false,
   };
 }

@@ -373,7 +373,10 @@ async def accept_composition_proposal(
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail="The session state changed after this proposal was created. Ask ELSPETH to rebase the proposal.",
+                    detail={
+                        "error_type": "proposal_base_state_changed",
+                        "detail": "The session state changed after this proposal was created. Ask ELSPETH to rebase the proposal.",
+                    },
                 )
             current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state()
             arguments = cast(dict[str, Any], deep_thaw(proposal.arguments_json))

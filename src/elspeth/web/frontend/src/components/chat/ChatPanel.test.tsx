@@ -884,7 +884,7 @@ describe("ChatPanel", () => {
 
     render(<ChatPanel />);
 
-    expect(screen.getByText("Replace the pipeline.")).toBeInTheDocument();
+    expect(screen.getAllByText("Replace the pipeline.")).toHaveLength(2);
     expect(screen.getByText("Stale proposal")).toBeInTheDocument();
   });
 
@@ -970,7 +970,7 @@ describe("ChatPanel", () => {
     expect(scrollSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("does not scroll the dock when the arriving proposal is stale", () => {
+  it("reveals the rejection action when an obsolete proposal arrives", () => {
     const dock = renderIdleFreeformPanel();
     const scrollSpy = vi.spyOn(dock, "scrollTo");
 
@@ -981,7 +981,7 @@ describe("ChatPanel", () => {
       });
     });
 
-    expect(scrollSpy).not.toHaveBeenCalled();
+    expect(scrollSpy).toHaveBeenCalledTimes(1);
   });
 
   it("downgrades the arrival scroll to behavior:'auto' under prefers-reduced-motion (elspeth-5b42a9ae1e)", async () => {
@@ -7851,7 +7851,7 @@ describe("ChatPanel inline-source projection", () => {
     render(<ChatPanel />);
 
     await waitFor(() => {
-      expect(useInlineSourceStore.getState().getSummary("session-inline")).toBeNull();
+      expect(useInlineSourceStore.getState().getSummaries("session-inline")[0]).toBeUndefined();
     });
     expect(apiClient.previewBlobContent).not.toHaveBeenCalled();
   });
@@ -7973,8 +7973,8 @@ describe("ChatPanel inline-source projection", () => {
       screen.queryByRole("region", { name: /source created/i }),
     ).toBeNull();
     expect(
-      useInlineSourceStore.getState().getSummary("session-inline"),
-    ).toBeNull();
+      useInlineSourceStore.getState().getSummaries("session-inline")[0],
+    ).toBeUndefined();
 
     errorSpy.mockRestore();
   });
@@ -8021,8 +8021,8 @@ describe("ChatPanel inline-source projection", () => {
       screen.queryByRole("region", { name: /source created/i }),
     ).toBeNull();
     expect(
-      useInlineSourceStore.getState().getSummary("session-inline"),
-    ).toBeNull();
+      useInlineSourceStore.getState().getSummaries("session-inline")[0],
+    ).toBeUndefined();
 
     errorSpy.mockRestore();
   });
@@ -8318,7 +8318,7 @@ describe("ChatPanel generic inline-source proposal review", () => {
     },
   );
 
-  it("keeps stale proposals out of actionable review and retains the stale tool association", () => {
+  it("retains rejection and the tool association for obsolete proposals", () => {
     const { proposal } = seedReview();
     useSessionStore.setState({
       compositionProposals: [{ ...proposal, base_state_id: "previous-state" }],
@@ -8327,7 +8327,8 @@ describe("ChatPanel generic inline-source proposal review", () => {
     render(<ChatPanel />);
     expect(screen.queryByRole("region", { name: /pending changes|row count/i })).not.toBeInTheDocument();
     expect(screen.getByText("Stale proposal")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /accept proposal/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /accept proposal/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /reject proposal/i })).toBeEnabled();
   });
 
   it("keeps in-flight proposal actions disabled", () => {

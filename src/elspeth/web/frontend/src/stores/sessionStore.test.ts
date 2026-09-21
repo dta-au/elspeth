@@ -2761,6 +2761,111 @@ describe("sessionStore", () => {
   });
 
   describe("composer proposals", () => {
+    it.each([409, 500])("retains confirmed staleness when rejection fails (%s)", async (status) => {
+      const api = await import("@/api/client");
+      const pending = makeCompositionProposal();
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending], staleProposalIds: [pending.id] });
+      vi.mocked(api.rejectCompositionProposal).mockRejectedValue({ status, detail: "Rejection failed" });
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([pending]);
+      await useSessionStore.getState().rejectProposal(pending.id);
+      expect(useSessionStore.getState().staleProposalIds).toContain(pending.id);
+    });
+
+    it("does not let an older conflict refresh retire a proposal found by a newer read", async () => {
+      const api = await import("@/api/client");
+      const pending = makeCompositionProposal();
+      let finishOld!: (proposals: CompositionProposal[]) => void;
+      vi.mocked(api.acceptCompositionProposal).mockRejectedValue({ status: 409, detail: "Busy" });
+      vi.mocked(api.fetchCompositionProposals)
+        .mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve; }))
+        .mockResolvedValueOnce([pending]);
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending] });
+      const accepting = useSessionStore.getState().acceptProposal(pending.id);
+      await vi.waitFor(() => expect(finishOld).toBeTypeOf("function"));
+      await useSessionStore.getState().loadCompositionProposals();
+      finishOld([]);
+      await accepting;
+      expect(useSessionStore.getState().compositionProposals).toEqual([pending]);
+      expect(useSessionStore.getState().staleProposalIds).not.toContain(pending.id);
+    });
+
+    it("retains newer composition and pending arrivals after delayed accept hydration", async () => {
+      const api = await import("@/api/client");
+      const pending = makeCompositionProposal();
+      const accepted = makeCompositionProposal({ status: "committed" });
+      const fresh = makeCompositionProposal({ id: "fresh", tool_call_id: "fresh-call", base_state_id: "state-3" });
+      let finishState!: (state: CompositionState) => void;
+      let finishList!: (proposals: CompositionProposal[]) => void;
+      vi.mocked(api.acceptCompositionProposal).mockResolvedValue(accepted);
+      vi.mocked(api.fetchCompositionState).mockImplementationOnce(() => new Promise((resolve) => { finishState = resolve; }));
+      vi.mocked(api.fetchCompositionProposals).mockImplementationOnce(() => new Promise((resolve) => { finishList = resolve; }));
+      vi.mocked(api.sendMessage).mockResolvedValue({
+        message: { id: "asst-new", session_id: "session-1", role: "assistant", content: "Updated", tool_calls: null, created_at: "2026-09-22T00:00:00Z" },
+        state: makeCompositionState(3), proposals: [fresh],
+      });
+      useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1), compositionProposals: [pending], messages: [] });
+      const acceptance = useSessionStore.getState().acceptProposal(pending.id);
+      await vi.waitFor(() => expect(finishState).toBeTypeOf("function"));
+      await useSessionStore.getState().sendMessage("Revise");
+      expect(useSessionStore.getState().compositionState?.id).toBe("state-3");
+      finishState(makeCompositionState(2));
+      finishList([accepted]);
+      await acceptance;
+      expect(useSessionStore.getState().compositionProposals).toContainEqual(fresh);
+      expect(useSessionStore.getState().compositionState?.id).toBe("state-3");
+    });
+
+    it("retires a confirmed stale-base proposal even while its lifecycle is pending", async () => {
+      const api = await import("@/api/client");
+      const proposal = makeCompositionProposal({ base_state_id: "state-1" });
+      vi.mocked(api.acceptCompositionProposal).mockRejectedValue({
+        status: 409, error_type: "proposal_base_state_changed", detail: "Rebase required.",
+      });
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([proposal]);
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [proposal], compositionState: makeCompositionState(2) });
+      await useSessionStore.getState().acceptProposal(proposal.id);
+      expect(useSessionStore.getState().staleProposalIds).toContain(proposal.id);
+      expect(useSessionStore.getState().error).toBe("Rebase required.");
+    });
+
+    it("keeps the newest proposal snapshot when reads complete in reverse order", async () => {
+      const api = await import("@/api/client");
+      const proposal = makeCompositionProposal();
+      let finishOld!: (proposals: CompositionProposal[]) => void;
+      vi.mocked(api.fetchCompositionProposals)
+        .mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve; }))
+        .mockResolvedValueOnce([proposal]);
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [] });
+      const oldRead = useSessionStore.getState().loadCompositionProposals();
+      await useSessionStore.getState().loadCompositionProposals();
+      finishOld([]);
+      await oldRead;
+      expect(useSessionStore.getState().compositionProposals).toEqual([proposal]);
+    });
+
+    it("keeps a new compose proposal when older rejection hydration finishes", async () => {
+      const api = await import("@/api/client");
+      const original = makeCompositionProposal();
+      const receipt = makeCompositionProposal({ status: "rejected" });
+      const fresh = makeCompositionProposal({ id: "new-proposal", tool_call_id: "new-call" });
+      let finishRead!: (proposals: CompositionProposal[]) => void;
+      vi.mocked(api.rejectCompositionProposal).mockResolvedValue(receipt);
+      vi.mocked(api.fetchCompositionProposals).mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
+      vi.mocked(api.sendMessage).mockResolvedValue({
+        message: { id: "asst-new", session_id: "session-1", role: "assistant", content: "Review replacement", tool_calls: null, created_at: "2026-09-22T00:00:00Z" },
+        state: null, proposals: [fresh],
+      });
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [original], messages: [] });
+      const rejection = useSessionStore.getState().rejectProposal(original.id);
+      await vi.waitFor(() => expect(finishRead).toBeTypeOf("function"));
+      await useSessionStore.getState().sendMessage("Revise the proposal");
+      expect(useSessionStore.getState().compositionProposals).toContainEqual(fresh);
+      finishRead([receipt]);
+      await rejection;
+      expect(useSessionStore.getState().compositionProposals).toContainEqual(fresh);
+      expect(useSessionStore.getState().compositionProposals).toContainEqual(receipt);
+    });
+
     it("keeps a decision receipt when an older list read finishes afterward", async () => {
       const api = await import("@/api/client");
       const pending = makeCompositionProposal();

@@ -40,6 +40,28 @@ interface SchemaFormTurnProps {
 
 type FormValues = Record<string, unknown>;
 
+/** Editor text and parsed values have different authority. A failed parse must
+ * never masquerade as a legitimate JSON scalar string. */
+class JsonDraft {
+  readonly parsed: { ok: true; value: unknown } | { ok: false };
+
+  constructor(readonly text: string) {
+    try {
+      this.parsed = { ok: true, value: JSON.parse(text) };
+    } catch {
+      this.parsed = { ok: false };
+    }
+  }
+}
+
+function isJsonField(field: KnobField): boolean {
+  return field.kind === "json-object" || field.kind === "json-array" || field.kind === "json-value";
+}
+
+function parsedValue(value: unknown): unknown {
+  return value instanceof JsonDraft && value.parsed.ok ? value.parsed.value : value;
+}
+
 export function SchemaFormTurn({
   payload,
   onSubmit,
@@ -80,7 +102,7 @@ export function SchemaFormTurn({
 
   function isVisible(field: KnobField, state: FormValues = values): boolean {
     if (!field.visible_when) return true;
-    return state[field.visible_when.field] === field.visible_when.equals;
+    return parsedValue(state[field.visible_when.field]) === field.visible_when.equals;
   }
 
   function visibleFields(state: FormValues = values): KnobField[] {
@@ -91,7 +113,7 @@ export function SchemaFormTurn({
     setValues((prev) => {
       const next = { ...prev, [name]: value };
       for (const field of payload.knobs.fields) {
-        if (field.visible_when?.field === name && field.visible_when.equals !== value) {
+        if (field.visible_when?.field === name && field.visible_when.equals !== parsedValue(value)) {
           delete next[field.name];
         }
       }
@@ -105,12 +127,12 @@ export function SchemaFormTurn({
   // the Edit view (elspeth-eba8820005).
   function fieldsNeedingAttention(): KnobField[] {
     return visibleFields().filter((field) => {
-      const value = values[field.name];
+      const value = parsedValue(values[field.name]);
       // Any field the form already knows holds an invalid value (broken JSON /
       // non-numeric number) blocks submit, required or not. Previously such a
       // value rode silently through to submit because canSubmit only inspected
       // required fields and never checked validity.
-      if (fieldHasError(field, value)) return true;
+      if (fieldHasError(field, values[field.name])) return true;
       if (!isRequiredNow(field, values)) return false;
       if (field.kind === "checkbox") return false;
       if (value === undefined || value === null || value === "") return true;
@@ -132,9 +154,9 @@ export function SchemaFormTurn({
       // contract rejects null for a non-nullable option (stage_transitions.py:
       // "option 'X' is not nullable"), even though the field is optional and the
       // plugin config supplies its own default (e.g. the JSON sink's `headers` /
-      // `collision_policy` / `indent`). A json-value field can hold the literal
-      // string "null" that submittedValue parses to null, so we test the resolved
-      // value, not the raw input. Required-field validation is unaffected;
+      // `collision_policy` / `indent`). Test the parsed value, not the editor
+      // text: JSON null is omitted here, while the JSON string "null" remains
+      // a string. Required-field validation is unaffected;
       // nullable optional fields still send null (null is meaningful there).
       if (value === null && !isRequiredNow(field, values) && !field.nullable) {
         continue;
@@ -308,6 +330,7 @@ export function SchemaFormTurn({
 // raw string riding in a JSON/number field (broken input) is NOT empty — it
 // renders so the user can see what needs fixing.
 function isEmptyValue(field: KnobField, value: unknown): boolean {
+  value = parsedValue(value);
   if (field.kind === "checkbox") return false;
   if (value === undefined || value === null) return true;
   if (field.kind === "string-list") {
@@ -335,7 +358,7 @@ function summaryValueNode(field: KnobField, value: unknown): ReactNode {
   if (field.kind === "json-object" || field.kind === "json-array" || field.kind === "json-value") {
     return (
       <CodeBlock
-        code={typeof value === "string" ? value : JSON.stringify(value)}
+        code={value instanceof JsonDraft ? value.text : JSON.stringify(value)}
         prettyJson
         showCopy={false}
         ariaLabel={field.label}
@@ -360,6 +383,9 @@ function initialValues(fields: KnobField[], prefilled: Record<string, unknown>):
       values[field.name] = field.default;
     } else {
       values[field.name] = emptyForKind(field.kind);
+    }
+    if (isJsonField(field)) {
+      values[field.name] = new JsonDraft(JSON.stringify(values[field.name]));
     }
   }
   return values;
@@ -390,6 +416,7 @@ function emptyForKind(kind: KnobField["kind"]): unknown {
 }
 
 function submittedValue(field: KnobField, value: unknown): unknown {
+  value = parsedValue(value);
   if (value === undefined) return field.default ?? null;
   if (field.kind === "string-list") {
     if (value === null && field.nullable) return null;
@@ -414,7 +441,7 @@ function submittedValue(field: KnobField, value: unknown): unknown {
 function isRequiredNow(field: KnobField, state: FormValues): boolean {
   if (field.required) return true;
   if (!field.required_when) return false;
-  return state[field.required_when.field] === field.required_when.equals;
+  return parsedValue(state[field.required_when.field]) === field.required_when.equals;
 }
 
 // Whether a field participates in the required-marker / aria-required treatment.
@@ -432,10 +459,17 @@ function isRequiredField(field: KnobField, state: FormValues): boolean {
 // raw text (instead of silently blanking/coercing it) precisely so it can be
 // surfaced here — both to gate Continue and to render the inline error.
 //
-// json-value is excluded by design: its parse is lossy (a bare `x` and a parsed
-// `"x"` both end up as the string "x"), so the form genuinely cannot tell a
-// valid scalar from a broken one and must not guess.
 function fieldHasError(field: KnobField, value: unknown): boolean {
+  if (value instanceof JsonDraft) {
+    if (!value.parsed.ok) return true;
+    const parsed = value.parsed.value;
+    // An unanswered optional knob uses null and is omitted at submission when
+    // non-nullable; a required null remains blocked by requiredness above.
+    if (parsed === null) return false;
+    if (field.kind === "json-object") return typeof parsed !== "object" || Array.isArray(parsed);
+    if (field.kind === "json-array") return !Array.isArray(parsed);
+    return false;
+  }
   switch (field.kind) {
     case "number-int":
     case "number-float":
@@ -508,7 +542,7 @@ function KnobFieldRenderer({
       // Tutorial path-leak mask (audience-sensitive: this is the public
       // Composer-screenshot surface). A blob-backed source/sink commits its
       // `path` knob as the server's ABSOLUTE blob storage_path
-      // (/home/<user>/.../data/blobs/<session>/<blob_id>_name.json — see
+      // (<data-root>/blobs/<session>/<blob_id>_name.json — see
       // web/blobs/service.py _storage_path), leaking the deploy dir + OS
       // username. Show the friendly basename to the passive learner; the real
       // path stays in form state and flows to submit unchanged (handleContinue
@@ -724,13 +758,7 @@ function KnobFieldRenderer({
             aria-required={required || undefined}
             aria-invalid={hasError || undefined}
             aria-describedby={describedBy(descriptionId, errorId)}
-            onChange={(event) => {
-              try {
-                onChange(JSON.parse(event.target.value));
-              } catch {
-                onChange(event.target.value);
-              }
-            }}
+            onChange={(event) => onChange(new JsonDraft(event.target.value))}
             disabled={disabled}
             // Tutorial: the passive learner authors nothing. Show the prefilled
             // raw-JSON value read-only (transparency) instead of an editable,
@@ -744,7 +772,11 @@ function KnobFieldRenderer({
           )}
           {hasError && (
             <p id={errorId} className="guided-schema-error" role="alert">
-              Invalid JSON — check brackets, quotes, and commas.
+              {field.kind === "json-object"
+                ? "Invalid JSON object — enter an object with named properties."
+                : field.kind === "json-array"
+                  ? "Invalid JSON array — enter a list in square brackets."
+                  : "Invalid JSON — check brackets, quotes, and commas."}
             </p>
           )}
         </div>
@@ -779,6 +811,6 @@ function friendlyBlobRef(absPath: string): string {
 }
 
 function jsonText(value: unknown, kind: "json-object" | "json-array" | "json-value"): string {
-  if (typeof value === "string") return value;
+  if (value instanceof JsonDraft) return value.text;
   return JSON.stringify(value ?? emptyForKind(kind), null, 2);
 }

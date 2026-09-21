@@ -124,7 +124,11 @@ function renderCard(
       event={event}
       sessionId="sess-1"
       stepLabel={props.stepLabel ?? "Summarise"}
-      compositionState={props.compositionState}
+      compositionState={props.compositionState === undefined && event.kind === "llm_prompt_template" ? {
+        ...makeCompositionState(),
+        nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+          options: { prompt_template: event.llm_draft ?? "" } }],
+      } : props.compositionState}
       showAmend={props.showAmend ?? event.kind === "vague_term"}
       onResolved={props.onResolved}
     />,
@@ -634,6 +638,59 @@ describe("AcknowledgementCard — error mapping", () => {
 // Approve button that stays disabled until the prompt has been viewed.
 
 describe("AcknowledgementCard — prompt-template View/Approve controls", () => {
+  it("does not approve a bounded draft while full prompt state is unavailable", async () => {
+    const user = userEvent.setup();
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" }), {
+      compositionState: null,
+    });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
+    expect(api.resolveInterpretation).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /approve the llm prompt template/i })).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("requires viewing the full prompt after a collapsed preview loads", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });
+    const { rerender } = renderCard(event, { compositionState: null });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await user.click(screen.getByRole("button", { name: "Hide prompt" }));
+    const state: CompositionState = {
+      ...makeCompositionState(),
+      nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+        options: { prompt_template: "Complete instruction previously omitted" } }],
+    };
+    rerender(<AcknowledgementCard event={event} sessionId="sess-1" stepLabel="Summarise" compositionState={state} />);
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByText("Complete instruction previously omitted")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    expect(screen.getByText("Complete instruction previously omitted")).toBeVisible();
+    expect(approve).not.toHaveAttribute("aria-disabled");
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(makeResolveResponse(event));
+    await user.click(approve);
+    expect(api.resolveInterpretation).toHaveBeenCalledTimes(1);
+  });
+
+  it("unlocks when the full prompt loads into an open disclosure and stays unlocked after collapse", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });
+    const { rerender } = renderCard(event, { compositionState: null });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve).toHaveAttribute("aria-disabled", "true");
+    const state: CompositionState = {
+      ...makeCompositionState(),
+      nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+        options: { prompt_template: "Complete instruction previously omitted" } }],
+    };
+    rerender(<AcknowledgementCard event={event} sessionId="sess-1" stepLabel="Summarise" compositionState={state} />);
+    expect(screen.getByText("Complete instruction previously omitted")).toBeVisible();
+    expect(approve).not.toHaveAttribute("aria-disabled");
+    await user.click(screen.getByRole("button", { name: "Hide prompt" }));
+    expect(approve).not.toHaveAttribute("aria-disabled");
+  });
+
   it("shows both prompt roles before approval of a single-prompt LLM node", async () => {
     const user = userEvent.setup();
     const state: CompositionState = {

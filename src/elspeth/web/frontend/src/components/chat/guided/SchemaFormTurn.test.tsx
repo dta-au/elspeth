@@ -700,7 +700,7 @@ describe("SchemaFormTurn", () => {
       render(
         <SchemaFormTurn
           payload={pluginPayload([field({ name: "path", label: "Path", kind: "text" })], {
-            path: "/home/u/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
+            path: "/var/lib/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
           })}
           onSubmit={vi.fn()}
         />,
@@ -1145,4 +1145,66 @@ describe("SchemaFormTurn advanced tier", () => {
     expect(within(details).getByRole("spinbutton", { name: "Temperature" })).toBeInTheDocument();
     expect(screen.getByRole("spinbutton", { name: "Temperature" }).closest("details")).toBe(details);
   });
+});
+
+describe("JSON draft authority", () => {
+  it.each([
+    ["json-value", '{"mode":'],
+    ["json-object", "[1]"],
+    ["json-array", '{"value":1}'],
+    ["json-object", "42"],
+    ["json-array", "true"],
+  ] satisfies Array<[FieldKind, string]>)("blocks invalid %s draft %s", (kind, draft) => {
+    const onSubmit = vi.fn();
+    render(<SchemaFormTurn payload={pluginPayload([field({ name: "config", kind, required: true })])} onSubmit={onSubmit} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /config/ }), { target: { value: draft } });
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['"original"', "original"],
+    ["42", 42],
+    ["false", false],
+    ["null", null],
+    ['{ "mode": "observed" }', { mode: "observed" }],
+    ["[1, 2]", [1, 2]],
+  ])("retains exact JSON draft %s and submits its parsed value", (draft, parsed) => {
+    const onSubmit = vi.fn();
+    render(<SchemaFormTurn payload={pluginPayload([field({ name: "config", kind: "json-value", nullable: true })])} onSubmit={onSubmit} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const input = screen.getByRole("textbox", { name: "config" });
+    fireEvent.change(input, { target: { value: draft } });
+    expect(input).toHaveValue(draft);
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(onSubmit.mock.calls[0][0].edited_values.options.config).toEqual(parsed);
+  });
+
+  it("renders prefilled JSON scalar strings with their quotes", () => {
+    render(<SchemaFormTurn payload={pluginPayload([field({ name: "headers", kind: "json-value" })], { headers: "original" })} onSubmit={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByRole("textbox", { name: "headers" })).toHaveValue('"original"');
+  });
+});
+
+it("uses parsed JSON scalars for conditional visibility and requiredness", () => {
+  const onSubmit = vi.fn();
+  render(<SchemaFormTurn payload={pluginPayload([
+    field({ name: "mode", kind: "json-value" }),
+    field({ name: "detail", kind: "text", visible_when: { field: "mode", equals: "custom" }, required_when: { field: "mode", equals: "custom" } }),
+  ], { mode: "custom" })} onSubmit={onSubmit} />);
+  fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  expect(screen.getByRole("textbox", { name: /detail/ })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+  fireEvent.change(screen.getByRole("textbox", { name: /detail/ }), { target: { value: "choice" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "mode" }), { target: { value: '"automatic"' } });
+  expect(screen.queryByRole("textbox", { name: /detail/ })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+  expect(onSubmit.mock.calls[0][0].edited_values.options).toEqual({ mode: "automatic" });
+  fireEvent.change(screen.getByRole("textbox", { name: "mode" }), { target: { value: '"custom"' } });
+  expect(screen.getByRole("textbox", { name: /detail/ })).toHaveValue("");
+  expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
 });

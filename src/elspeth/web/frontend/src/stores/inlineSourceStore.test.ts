@@ -86,8 +86,8 @@ describe("deriveInlineSourceRowCount", () => {
 describe("inlineSourceStore", () => {
   beforeEach(() => resetStore(useInlineSourceStore));
 
-  it("returns null when no inline source is bound to the session", () => {
-    expect(useInlineSourceStore.getState().getSummary("session-1")).toBeNull();
+  it("returns an empty collection when no inline source is bound to the session", () => {
+    expect(useInlineSourceStore.getState().getSummaries("session-1")).toEqual([]);
   });
 
   it("stores a verbatim summary and retrieves it by session", () => {
@@ -100,7 +100,7 @@ describe("inlineSourceStore", () => {
       contentHash: "abc123",
       provenance: "verbatim",
     });
-    const summary = useInlineSourceStore.getState().getSummary("session-1");
+    const summary = useInlineSourceStore.getState().getSummaries("session-1")[0];
     expect(summary?.provenance).toBe("verbatim");
     expect(summary?.rowCount).toBe(1);
   });
@@ -116,7 +116,7 @@ describe("inlineSourceStore", () => {
       provenance: "verbatim",
     });
     useInlineSourceStore.getState().clearSummary("session-1");
-    expect(useInlineSourceStore.getState().getSummary("session-1")).toBeNull();
+    expect(useInlineSourceStore.getState().getSummaries("session-1")[0]).toBeUndefined();
   });
 
   it("namespaces summaries per session", () => {
@@ -138,8 +138,8 @@ describe("inlineSourceStore", () => {
       contentHash: "112233aabb",
       provenance: "llm-generated",
     });
-    expect(useInlineSourceStore.getState().getSummary("session-1")?.provenance).toBe("verbatim");
-    expect(useInlineSourceStore.getState().getSummary("session-2")?.provenance).toBe("llm-generated");
+    expect(useInlineSourceStore.getState().getSummaries("session-1")[0]?.provenance).toBe("verbatim");
+    expect(useInlineSourceStore.getState().getSummaries("session-2")[0]?.provenance).toBe("llm-generated");
   });
 
   // --- Fallback-prompt dismiss persistence tests (F-20) ---

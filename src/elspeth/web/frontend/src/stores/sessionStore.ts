@@ -559,6 +559,7 @@ const guidedResponseRetryOwnerGenerations = new Map<string, number>();
 
 function advanceGuidedPublicationGeneration(): number {
   guidedPublicationGeneration += 1;
+  proposalSnapshotSequence += 1;
   return guidedPublicationGeneration;
 }
 
@@ -588,22 +589,30 @@ async function reconcileProposalConflict(
   error: ApiError,
   isCurrent: () => boolean,
 ): Promise<void> {
-  // A 409 can mean operation contention, not proposal retirement. Only a
-  // successful authoritative read may remove actionability.
+  if (!isCurrent()) return;
+  const confirmedStaleBase = error.error_type === "proposal_base_state_changed";
+  if (confirmedStaleBase && isCurrent()) {
+    useSessionStore.setState((state) => ({
+      staleProposalIds: Array.from(new Set([...state.staleProposalIds, proposalId])),
+    }));
+  }
+  // Contention alone cannot retire a proposal. Only a named base refusal or
+  // an authoritative lifecycle read may disable acceptance.
+  const snapshot = beginProposalSnapshot();
   try {
     const proposals = await api.fetchCompositionProposals(sessionId);
-    if (!isCurrent()) return;
+    if (!isCurrent() || !snapshot.isCurrent()) return;
     useSessionStore.setState((state) => ({
-      compositionProposals: reconcileCompositionProposals(state.compositionProposals, proposals),
-      staleProposalIds: proposals.some(
+      compositionProposals: snapshot.reconcile(state.compositionProposals, proposals),
+      staleProposalIds: !confirmedStaleBase && proposals.some(
         (proposal) => proposal.id === proposalId && proposal.status === "pending",
       )
-        ? state.staleProposalIds.filter((id) => id !== proposalId)
+        ? state.staleProposalIds
         : Array.from(new Set([...state.staleProposalIds, proposalId])),
       error: error.detail ?? "The proposal could not be updated. Reload the session and try again.",
     }));
   } catch {
-    if (isCurrent()) {
+    if (isCurrent() && snapshot.isCurrent()) {
       useSessionStore.setState({
         error: error.detail ?? "The proposal could not be updated or refreshed. Reload the session.",
       });
@@ -1074,14 +1083,25 @@ function mergeCompositionProposals(
   return Array.from(byId.values());
 }
 
-function reconcileCompositionProposals(
-  existing: CompositionProposal[],
-  snapshot: CompositionProposal[],
-): CompositionProposal[] {
-  return mergeCompositionProposals(
-    existing.filter((proposal) => proposal.status !== "pending"),
-    snapshot,
-  );
+let proposalSnapshotSequence = 0;
+
+/** A list read may retire only proposals it knew about when dispatched. */
+function beginProposalSnapshot(): {
+  isCurrent: () => boolean;
+  reconcile: (existing: CompositionProposal[], snapshot: CompositionProposal[]) => CompositionProposal[];
+} {
+  const sequence = ++proposalSnapshotSequence;
+  const knownIds = new Set(useSessionStore.getState().compositionProposals.map((proposal) => proposal.id));
+  return {
+    isCurrent: () => sequence === proposalSnapshotSequence,
+    reconcile: (existing, snapshot) => {
+      if (sequence !== proposalSnapshotSequence) return existing;
+      return mergeCompositionProposals(
+        existing.filter((proposal) => proposal.status !== "pending" || !knownIds.has(proposal.id)),
+        snapshot,
+      );
+    },
+  };
 }
 
 // turn_not_emitted self-heal bookkeeping (C-3, composer first-principles
@@ -2376,18 +2396,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   async loadCompositionProposals(sessionId?: string) {
     const targetSessionId = sessionId ?? get().activeSessionId;
-    if (!targetSessionId) return;
+    if (!targetSessionId || targetSessionId !== get().activeSessionId) return;
     const generation = guidedPublicationGeneration;
     const isCurrent = () => get().activeSessionId === targetSessionId && guidedPublicationGeneration === generation;
 
+    const snapshot = beginProposalSnapshot();
     try {
       const proposals = await api.fetchCompositionProposals(targetSessionId);
       if (!isCurrent()) {
         return;
       }
-      set((state) => ({ compositionProposals: reconcileCompositionProposals(state.compositionProposals, proposals ?? []) }));
+      set((state) => ({ compositionProposals: snapshot.reconcile(state.compositionProposals, proposals ?? []) }));
     } catch {
-      if (isCurrent()) set({ error: "Failed to load composition proposals. Please try again." });
+      if (isCurrent() && snapshot.isCurrent()) set({ error: "Failed to load composition proposals. Please try again." });
     }
   },
 
@@ -2406,7 +2427,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       proposalActionPendingIds: Array.from(
         new Set([...state.proposalActionPendingIds, proposalId]),
       ),
-      staleProposalIds: state.staleProposalIds.filter((id) => id !== proposalId),
     }));
 
     try {
@@ -2427,6 +2447,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }));
       let compositionState: CompositionState | null;
       let proposals: CompositionProposal[];
+      const snapshot = beginProposalSnapshot();
       try {
         [compositionState, proposals] = await Promise.all([
           api.fetchCompositionState(activeSessionId),
@@ -2440,10 +2461,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }
       if (!isCurrent()) return;
       set((state) => ({
-        compositionState,
+        compositionState: state.compositionState !== null && (
+          compositionState === null || state.compositionState.version > compositionState.version
+        ) ? state.compositionState : compositionState,
         compositionStateLoaded: true,
         compositionProposals: mergeCompositionProposals(
-          reconcileCompositionProposals(state.compositionProposals, proposals ?? []),
+          snapshot.reconcile(state.compositionProposals, proposals ?? []),
           [proposal],
         ),
       }));
@@ -2510,7 +2533,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       proposalActionPendingIds: Array.from(
         new Set([...state.proposalActionPendingIds, proposalId]),
       ),
-      staleProposalIds: state.staleProposalIds.filter((id) => id !== proposalId),
     }));
 
     try {
@@ -2523,6 +2545,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         compositionProposals: mergeCompositionProposals(state.compositionProposals, [proposal]),
       }));
       let proposals: CompositionProposal[];
+      const snapshot = beginProposalSnapshot();
       try {
         proposals = await api.fetchCompositionProposals(activeSessionId);
       } catch {
@@ -2536,7 +2559,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }
       set((state) => ({
         compositionProposals: mergeCompositionProposals(
-          reconcileCompositionProposals(state.compositionProposals, proposals ?? []),
+          snapshot.reconcile(state.compositionProposals, proposals ?? []),
           [proposal],
         ),
       }));

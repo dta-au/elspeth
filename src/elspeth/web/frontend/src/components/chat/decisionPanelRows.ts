@@ -16,7 +16,7 @@
 //     optional-improvement nudges (restored by the backend from current validation
 //     on reload as well as live compose/validate responses);
 //   * interpretationEventsStore.pendingBySession — pending review cards;
-//   * sessionStore.compositionProposals / staleProposalIds — pending
+//   * sessionStore.compositionProposals — pending
 //     proposals, filtered by the SAME predicate the banner renders from.
 //
 // Rules:
@@ -85,7 +85,6 @@ export interface DecisionRowsInput {
   compositionState: CompositionState | null;
   pendingInterpretations: readonly InterpretationEvent[];
   proposals: readonly CompositionProposal[];
-  staleProposalIds: readonly string[];
 }
 
 export interface DecisionRows {
@@ -112,7 +111,6 @@ export function projectDecisionRows(input: DecisionRowsInput): DecisionRows {
     compositionState,
     pendingInterpretations,
     proposals,
-    staleProposalIds,
   } = input;
 
   const blockedVerbs =
@@ -171,7 +169,6 @@ export function projectDecisionRows(input: DecisionRowsInput): DecisionRows {
 
   const proposalRows: DecisionRow[] = actionableProposals(
     proposals,
-    staleProposalIds,
   ).map((proposal) => ({
     kind: "pending_proposal",
     id: `proposal:${proposal.id}`,

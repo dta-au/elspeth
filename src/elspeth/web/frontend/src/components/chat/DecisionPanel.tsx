@@ -183,7 +183,7 @@ export function DecisionPanel({
       }
     }
   });
-  const actionable = actionableProposals(proposals, staleProposalIds);
+  const actionable = actionableProposals(proposals);
   const rejectTarget = actionable.find((proposal) => proposal.id === rejectConfirmId);
   useEffect(() => {
     if (rejectConfirmId !== null && rejectTarget === undefined) {
@@ -259,6 +259,7 @@ export function DecisionPanel({
                 <ProposalItem
                   key={proposal.id}
                   proposal={proposal}
+                  isStale={staleProposalIds.includes(proposal.id)}
                   isBusy={proposalActionPendingIds.includes(proposal.id)}
                   onAccept={onAcceptProposal}
                   onReject={setRejectConfirmId}
@@ -298,9 +299,10 @@ export function DecisionPanel({
   );
 }
 
-function ProposalItem({ proposal, isBusy, onAccept, onReject }: {
+function ProposalItem({ proposal, isBusy, isStale, onAccept, onReject }: {
   proposal: CompositionProposal;
   isBusy: boolean;
+  isStale: boolean;
   onAccept: (id: string) => void;
   onReject: (id: string) => void;
 }): JSX.Element {
@@ -308,10 +310,11 @@ function ProposalItem({ proposal, isBusy, onAccept, onReject }: {
     <>
       <div className="decision-panel-item-text">
         <p>{proposal.summary}</p>
+        {isStale && <p>Ask the composer to rebase or revise this proposal before accepting it. You can still reject it.</p>}
         {proposal.affects.length > 0 && <p>Affects: {proposal.affects.map(proposalEffectLabel).join(", ")}</p>}
       </div>
       <div className="decision-panel-proposal-actions">
-        <Button variant="primary" disabled={isBusy} aria-label={`Accept proposal: ${proposal.summary}`} onClick={() => onAccept(proposal.id)}>Accept</Button>
+        <Button variant="primary" disabled={isBusy || isStale} aria-label={`Accept proposal: ${proposal.summary}`} onClick={() => onAccept(proposal.id)}>Accept</Button>
         <Button variant="danger" disabled={isBusy} aria-label={`Reject proposal: ${proposal.summary}`} onClick={() => onReject(proposal.id)}>Reject</Button>
       </div>
     </>

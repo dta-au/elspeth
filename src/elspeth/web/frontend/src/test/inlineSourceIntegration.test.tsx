@@ -489,7 +489,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     // (f) The projection store now holds a non-null summary with the
     // hyphenated provenance form (translated from the snake_case wire
     // value via the `toInlineSourceProvenance` adapter).
-    const summary = useInlineSourceStore.getState().getSummary(SESSION_ID);
+    const summary = useInlineSourceStore.getState().getSummaries(SESSION_ID)[0];
     expect(summary).not.toBeNull();
     expect(summary?.provenance).toBe("verbatim");
     expect(summary?.blobId).toBe(BLOB_ID);
@@ -540,7 +540,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
 
     // Store projection carries the hyphenated form translated from the
     // snake_case wire `llm_generated`.
-    const summary = useInlineSourceStore.getState().getSummary(SESSION_ID);
+    const summary = useInlineSourceStore.getState().getSummaries(SESSION_ID)[0];
     expect(summary).not.toBeNull();
     expect(summary?.provenance).toBe("llm-generated");
     expect(summary?.blobId).toBe(BLOB_ID);

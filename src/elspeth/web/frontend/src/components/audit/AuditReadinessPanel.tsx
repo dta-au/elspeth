@@ -19,7 +19,7 @@ import { useExecutionStore } from "../../stores/executionStore";
 import { useInlineSourceStore } from "../../stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "../../stores/interpretationEventsStore";
 import { useShowAdvanced } from "@/stores/preferencesStore";
-import { hasCompositionContent } from "../../utils/compositionState";
+import { hasCompositionContent, sortedSourceEntries } from "../../utils/compositionState";
 import { relativeTime } from "../../utils/time";
 import type {
   CompositionState,
@@ -282,9 +282,15 @@ export function AuditReadinessPanel({
   // (Task 2.5), not a frontend computation — the override here only
   // changes the displayed text. Status/heading/clickability still come
   // from the backend-supplied row.
-  const inlineSummary = useInlineSourceStore((s) =>
-    activeSessionId ? s.getSummary(activeSessionId) : null,
-  );
+  const inlineSummariesBySession = useInlineSourceStore((s) => s.summariesBySession);
+  const currentBlobIds = compositionState === null ? [] : [...new Set(
+    sortedSourceEntries(compositionState).map(([, source]) => source.options["blob_ref"]),
+  )];
+  const inlineSummaries = activeSessionId
+    ? currentBlobIds.flatMap((blobId) =>
+      (inlineSummariesBySession[activeSessionId] ?? []).filter((summary) => summary.blobId === blobId),
+    )
+    : [];
 
   // Phase 5b.18b.7 — interpretation-event counts feed the `llm_interpretations`
   // row's frontend-stylised summary. We subscribe to the per-session
@@ -612,8 +618,8 @@ export function AuditReadinessPanel({
             // stays in the Tier-1 audit trail (Landscape) — this row is
             // a UI affordance, not the legal record.
             const summaryText =
-              row.id === "provenance" && inlineSummary !== null
-                ? `Inline content hashed (SHA-256: ${inlineSummary.contentHash.slice(0, 12)}…)`
+              row.id === "provenance" && inlineSummaries.length > 0
+                ? `Inline content hashed (SHA-256: ${inlineSummaries.map((summary) => `${inlineSummaries.length > 1 ? `${summary.filename}: ` : ""}${summary.contentHash.slice(0, 12)}…`).join(", ")})`
                 : row.summary;
             const presentation: RowPresentation = {
               id: row.id,

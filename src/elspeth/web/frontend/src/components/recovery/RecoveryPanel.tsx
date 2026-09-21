@@ -46,7 +46,14 @@ export function RecoveryPanel({
   const [needsConfirmation, setNeedsConfirmation] = useState(false);
   const [showTranscriptControls, setShowTranscriptControls] = useState(false);
   const showAdvanced = useShowAdvanced();
-  useFocusTrap(dialogRef, recoveryError !== null, ".recovery-panel-apply");
+  const draftWasSaved = recoveryError !== null &&
+    recoveryError.partial_state_save_failed !== true &&
+    recoveryError.partial_state.id.trim() !== "";
+  useFocusTrap(
+    dialogRef,
+    recoveryError !== null,
+    draftWasSaved ? ".recovery-panel-apply" : ".recovery-panel-discard",
+  );
 
   if (recoveryError === null || activeSessionId === null) {
     return null;
@@ -128,7 +135,14 @@ export function RecoveryPanel({
           </span>
         </section>
 
-        {needsConfirmation ? (
+        {!draftWasSaved && (
+          <p role="alert">
+            The partial draft was not saved on the server. Discard recovery and
+            retry the composer step.
+          </p>
+        )}
+
+        {needsConfirmation && draftWasSaved ? (
           <div className="recovery-panel-confirm" role="alert">
             <p>
               The current pipeline changed after this failed turn started.
@@ -195,14 +209,16 @@ export function RecoveryPanel({
           >
             Discard recovery
           </Button>
-          <Button
-            variant="primary"
-            className="recovery-panel-apply"
-            type="button"
-            onClick={requestApply}
-          >
-            Apply partial draft
-          </Button>
+          {draftWasSaved && (
+            <Button
+              variant="primary"
+              className="recovery-panel-apply"
+              type="button"
+              onClick={requestApply}
+            >
+              Apply partial draft
+            </Button>
+          )}
         </footer>
       </div>
     </>

@@ -385,6 +385,10 @@ export function AcknowledgementCard({
   const userTerm = event.user_term ?? "this term";
 
   const requiresPromptView = event.kind === "llm_prompt_template";
+  const promptDisplay = requiresPromptView
+    ? resolvePromptDisplaySegments(compositionState, event)
+    : null;
+  const promptReviewAvailable = promptDisplay?.reviewAvailable === true;
   const valueIsLong =
     llmDraft.length > 140 || llmDraft.split("\n").length > 4;
   // invented_source shows pretty-printed JSON; short values inline, long
@@ -410,7 +414,9 @@ export function AcknowledgementCard({
   const [promptViewed, setPromptViewed] = useState(!requiresPromptView);
 
   const acceptDisabled = primaryButtonsDisabled;
-  const approveGated = requiresPromptView && !promptViewed;
+  // An open disclosure shows the complete prompt as soon as loading finishes.
+  // A closed preview never counts as viewing the subsequently loaded content.
+  const approveGated = requiresPromptView && (!promptReviewAvailable || (!promptViewed && !expanded));
 
   // Focus on amend-mode toggle ONLY (never on mount — see file header).  Skip
   // the first run so mounting the card does not move focus.
@@ -510,9 +516,6 @@ export function AcknowledgementCard({
   // in place of the staging-time "pending interpretation" masks.  The frozen
   // event.llm_draft is demoted to a secondary "View original template"
   // disclosure, shown only when it differs from the resolved render.
-  const promptDisplay = requiresPromptView
-    ? resolvePromptDisplaySegments(compositionState, event)
-    : null;
   const promptDisplayText =
     promptDisplay === null
       ? ""
@@ -563,7 +566,7 @@ export function AcknowledgementCard({
         aria-expanded={expanded}
         aria-controls={valueRegionId}
         onClick={() => {
-          if (!expanded) setPromptViewed(true);
+          if (promptReviewAvailable) setPromptViewed(true);
           setExpanded((prev) => !prev);
         }}
       >
@@ -667,7 +670,7 @@ export function AcknowledgementCard({
                 runs with whatever you accept there.
               </p>
             )}
-            {promptDisplay.usedFallback && (
+            {promptDisplay.usedFallback && promptDisplay.reviewAvailable && (
               <p className="ack-card-prompt-pending-note">
                 {/* Audit honesty (code-review 2026-08-13): the structured
                     parts could not be rendered, so this is the node's stored
@@ -722,9 +725,15 @@ export function AcknowledgementCard({
             pre-2026-07 "dead end" reading — see the promptViewed comment). */}
         {chooseMode && approveGated && (
           <p id={promptGateId} className="ack-card-gate-note">
+            {!promptReviewAvailable ? (
+              <>The complete prompt is not available yet. Reload the session if it does not load; the preview cannot be approved.</>
+            ) : (
+              <>
             <strong>{ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}</strong> shows the
             LLM's instruction; {ACKNOWLEDGEMENT_APPROVE_LABEL} unlocks once
             you have viewed it.
+              </>
+            )}
           </p>
         )}
         {/* The disclosure precedes the gated primary in DOM AND tab order

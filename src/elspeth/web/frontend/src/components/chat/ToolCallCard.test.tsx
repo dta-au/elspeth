@@ -509,6 +509,28 @@ describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {
     expect(screen.getByTestId("proposal-arg-fields")).toBeInTheDocument();
   });
 
+  it("does not diff an ordinary proposal against a different base state", () => {
+    render(<ToolCallCard toolCall={upsertToolCall} proposal={upsertProposal({ base_state_id: "older-state" })} currentState={currentState} />);
+    expect(screen.queryByTestId("proposal-diff")).not.toBeInTheDocument();
+    expect(screen.getByTestId("proposal-arg-fields")).toBeInTheDocument();
+    expect(screen.getByText(/targets an earlier pipeline state/)).toBeInTheDocument();
+  });
+
+  it("does not apply ordinary base checks to canonical pipeline proposals", () => {
+    render(<ToolCallCard toolCall={toolCall} proposal={{
+      ...proposal, tool_name: "set_pipeline",
+      arguments_redacted_json: { sources: {}, nodes: [], edges: [], outputs: [] },
+      base_state_id: "older-state",
+      pipeline_metadata: {
+        surface: "freeform", draft_hash: "d".repeat(64), base: { kind: "absent" },
+        reviewed_anchor_hash: "a".repeat(64), repair_count: 0, skill_hash: "s".repeat(64),
+        audit_payload_hash: "p".repeat(64), custody_result: "not_required",
+      },
+    }} currentState={currentState} />);
+    expect(screen.getByTestId("proposal-diff")).toBeInTheDocument();
+    expect(screen.queryByText(/targets an earlier pipeline state/)).not.toBeInTheDocument();
+  });
+
   it("falls back to structured argument fields for resolved proposals", () => {
     render(
       <ToolCallCard

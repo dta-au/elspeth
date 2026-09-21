@@ -4,6 +4,7 @@ import type { CompositionProposal, CompositionState, ToolCall } from "@/types/ap
 import { Button } from "@/components/ui";
 import { ArgumentFields, buildProposalDiff, ProposalChanges } from "./ProposalDiff";
 import { proposalEffectLabel } from "./proposalEffectLabel";
+import { proposalBaseChanged } from "./actionableProposals";
 import {
   TOOL_CALL_DESCRIPTIONS,
   describeToolCall,
@@ -65,12 +66,13 @@ export function ToolCallCard({
   currentState = null,
   isStale = false,
 }: ToolCallCardProps) {
+  const baseChanged = proposal !== null && proposalBaseChanged(proposal, currentState);
   // Fragment-level before/after projection of the proposal against the
   // current pipeline. null = not derivable (unknown tool, malformed args, no
   // state) → structured argument fields render instead. Computed before the
   // no-proposal early return to keep hooks unconditional.
   const diffEntries = useMemo(() => {
-    if (proposal === null || proposal.status !== "pending" || isStale) {
+    if (proposal === null || proposal.status !== "pending" || isStale || baseChanged) {
       return null;
     }
     return buildProposalDiff(
@@ -78,7 +80,7 @@ export function ToolCallCard({
       proposal.arguments_redacted_json,
       currentState,
     );
-  }, [proposal, isStale, currentState]);
+  }, [proposal, isStale, baseChanged, currentState]);
   if (!proposal) {
     // Proposal-less calls carry a server-derived outcome stamped by
     // GET /messages from the Tier-1 tool rows (elspeth-f5e6723133). In
@@ -184,6 +186,9 @@ export function ToolCallCard({
           aria-label="Tool call arguments (scrollable)"
         >{JSON.stringify(proposal.arguments_redacted_json, null, 2)}</pre>
       </details>
+      {baseChanged && !isStale && (
+        <p>This proposal targets an earlier pipeline state. Its arguments are shown without a current-state comparison; the server will check whether it can still be accepted.</p>
+      )}
       {isStale && (
         <p className="tool-call-stale">
           Stale proposal. Ask the composer to rebase or revise this proposal.

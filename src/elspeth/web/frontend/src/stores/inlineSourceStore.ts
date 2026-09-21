@@ -143,10 +143,11 @@ export async function projectInlineSourceSummary({
 
 interface InlineSourceState {
   // --- Primary projection: per-session inline-source summary ---
-  summariesBySession: Record<string, InlineSourceSummary>;
+  summariesBySession: Record<string, readonly InlineSourceSummary[]>;
   setSummary: (sessionId: string, summary: InlineSourceSummary) => void;
   clearSummary: (sessionId: string) => void;
-  getSummary: (sessionId: string) => InlineSourceSummary | null;
+  retainSummaries: (sessionId: string, blobIds: readonly string[]) => void;
+  getSummaries: (sessionId: string) => readonly InlineSourceSummary[];
 
   // --- Fallback-prompt dismiss persistence (F-20) ---
   // Keyed by sessionId. A dismissed fallback prompt must not re-fire
@@ -156,11 +157,19 @@ interface InlineSourceState {
   isDismissed: (sessionId: string) => boolean;
 }
 
+const EMPTY_SUMMARIES: readonly InlineSourceSummary[] = [];
+
 export const useInlineSourceStore = create<InlineSourceState>((set, get) => ({
   summariesBySession: {},
   setSummary: (sessionId, summary) =>
     set((s) => ({
-      summariesBySession: { ...s.summariesBySession, [sessionId]: summary },
+      summariesBySession: {
+        ...s.summariesBySession,
+        [sessionId]: [
+          ...(s.summariesBySession[sessionId] ?? []).filter((item) => item.blobId !== summary.blobId),
+          summary,
+        ],
+      },
     })),
   clearSummary: (sessionId) =>
     set((s) => {
@@ -168,7 +177,13 @@ export const useInlineSourceStore = create<InlineSourceState>((set, get) => ({
       delete next[sessionId];
       return { summariesBySession: next };
     }),
-  getSummary: (sessionId) => get().summariesBySession[sessionId] ?? null,
+  retainSummaries: (sessionId, blobIds) => set((state) => ({
+    summariesBySession: {
+      ...state.summariesBySession,
+      [sessionId]: (state.summariesBySession[sessionId] ?? []).filter((summary) => blobIds.includes(summary.blobId)),
+    },
+  })),
+  getSummaries: (sessionId) => get().summariesBySession[sessionId] ?? EMPTY_SUMMARIES,
 
   dismissedAt: new Map(),
   markDismissed: (sessionId) =>

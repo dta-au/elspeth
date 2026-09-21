@@ -1044,7 +1044,7 @@ def transition_source_inspection_review(
     turn: AnsweredTurn,
     response: InspectionResponse,
 ) -> GuidedSession:
-    """Resolve one inspection-review source using only edited column names."""
+    """Confirm inspected headers without rewriting facts about source bytes."""
 
     _require_active_turn(
         session,
@@ -1065,6 +1065,8 @@ def transition_source_inspection_review(
     if intent.plugin is None or intent.options is None or intent.inspection_facts is None:
         raise InvariantError("inspection-review source intent is missing server-held resolution facts")
     facts = _validated_inspection_facts(intent.inspection_facts)
+    if columns != tuple(facts.observed_headers or ()):
+        raise ValueError("inspection confirmation must match the observed headers; request column changes as a processing step")
     _require_inspection_plugin_match(intent.plugin, facts)
     _require_inspection_custody_match(
         facts,

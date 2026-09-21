@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import replace
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -567,14 +568,14 @@ def test_source_schema_form_rejects_plugin_hidden_blob_path_and_custody_tamperin
     assert session.pending_source_intents[SOURCE_A].phase == "plugin_options"
 
 
-def test_inspection_review_uses_only_edited_columns_and_held_intent() -> None:
+def test_inspection_review_confirms_observed_columns_and_held_intent() -> None:
     session, turn = _source_review_session()
 
     result = transition_source_inspection_review(
         session,
         target_id=SOURCE_A,
         turn=turn,
-        response=InspectionResponse(columns=("record_id", "display_name")),
+        response=InspectionResponse(columns=("id", "name")),
     )
 
     assert result.step is GuidedStep.STEP_1_SOURCE
@@ -584,7 +585,7 @@ def test_inspection_review_uses_only_edited_columns_and_held_intent() -> None:
     source = result.reviewed_sources[SOURCE_A]
     assert source.plugin == "csv"
     assert dict(source.options)["path"].startswith("blob:")
-    assert source.observed_columns == ("record_id", "display_name")
+    assert source.observed_columns == ("id", "name")
     assert source.sample_rows == ()
 
 
@@ -1508,7 +1509,7 @@ def test_inspection_backed_source_edit_survives_restart_until_final_review() -> 
         restored,
         target_id=SOURCE_A,
         turn=inspection_turn,
-        response=InspectionResponse(columns=("record_id", "display_name")),
+        response=InspectionResponse(columns=("id", "name")),
     )
 
     assert result.step is GuidedStep.STEP_1_SOURCE
@@ -1516,7 +1517,7 @@ def test_inspection_backed_source_edit_survives_restart_until_final_review() -> 
     assert result.reviewed_sources[SOURCE_B] == session.reviewed_sources[SOURCE_B]
     revised = result.reviewed_sources[SOURCE_A]
     assert revised.name == "source"
-    assert revised.observed_columns == ("record_id", "display_name")
+    assert revised.observed_columns == ("id", "name")
     assert revised.on_validation_failure == "quarantine"
     assert result.active_edit_target is None
     assert not result.pending_source_intents
@@ -1782,7 +1783,7 @@ def test_inspection_review_records_content_identity_anchor() -> None:
         session,
         target_id=SOURCE_A,
         turn=turn,
-        response=InspectionResponse(columns=("record_id",)),
+        response=InspectionResponse(columns=("id", "name")),
     )
 
     reviewed = result.reviewed_sources[SOURCE_A]
@@ -1799,7 +1800,7 @@ def test_inspection_review_without_content_anchor_records_none() -> None:
         session,
         target_id=SOURCE_A,
         turn=turn,
-        response=InspectionResponse(columns=("record_id",)),
+        response=InspectionResponse(columns=("id", "name")),
     )
 
     reviewed = result.reviewed_sources[SOURCE_A]
@@ -1828,3 +1829,48 @@ def test_reorder_reviewed_components_rejects_non_sequence_and_non_uuid_stable_id
         reorder_reviewed_components(session, "source", "a-str-is-a-character-sequence-trap")
     with pytest.raises(TypeError, match="exact UUID"):
         reorder_reviewed_components(session, "source", (UUID(SOURCE_A), "not-a-uuid"))
+
+
+@pytest.mark.parametrize("columns", [("record_id", "name"), ("id",), ("name", "id")])
+def test_inspection_confirmation_cannot_rewrite_observed_headers(columns: tuple[str, ...]) -> None:
+    session, turn = _source_review_session()
+    with pytest.raises(ValueError, match="observed headers"):
+        transition_source_inspection_review(
+            session,
+            target_id=SOURCE_A,
+            turn=turn,
+            response=InspectionResponse(columns=columns),
+        )
+    assert session.pending_source_intents[SOURCE_A].inspection_facts is not None
+    assert session.pending_source_intents[SOURCE_A].inspection_facts.observed_headers == ("id", "name")
+
+
+def test_confirmed_inspection_columns_agree_with_runtime_source(tmp_path: Path) -> None:
+    from elspeth.plugins.sources.csv_source import CSVSource
+    from elspeth.web.composer.guided.planning import guided_redacted_planner_context
+    from tests.fixtures.factories import make_context
+
+    session, turn = _source_review_session()
+    result = transition_source_inspection_review(
+        session,
+        target_id=SOURCE_A,
+        turn=turn,
+        response=InspectionResponse(columns=("id", "name")),
+    )
+    reviewed = result.reviewed_sources[SOURCE_A]
+    source_file = tmp_path / "input.csv"
+    source_file.write_text("id,name\n1,Alice\n")
+    # Resolve blob custody to the same inspected bytes, without changing any
+    # data-shaping options. The source's runtime headers remain authoritative.
+    source = CSVSource(
+        {
+            **dict(reviewed.options),
+            "path": str(source_file),
+            "schema": {"mode": "observed"},
+            "on_validation_failure": reviewed.on_validation_failure,
+        }
+    )
+    rows = list(source.load(make_context()))
+    assert rows[0].row == {"id": "1", "name": "Alice"}
+    assert tuple(rows[0].row) == reviewed.observed_columns
+    assert guided_redacted_planner_context(result)["sources"][0]["observed_columns"] == list(rows[0].row)

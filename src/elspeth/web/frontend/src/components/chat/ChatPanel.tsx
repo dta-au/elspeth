@@ -402,13 +402,12 @@ function readSourceBlobRef(source: { options: Record<string, unknown> } | null):
   return typeof raw === "string" && raw !== "" ? raw : null;
 }
 
-function readBlobRef(state: CompositionState | null): string | null {
-  if (state === null) return null;
-  for (const [, source] of sortedSourceEntries(state)) {
+function readBlobRefs(state: CompositionState | null): string[] {
+  if (state === null) return [];
+  return [...new Set(sortedSourceEntries(state).flatMap(([, source]) => {
     const ref = readSourceBlobRef(source);
-    if (ref !== null) return ref;
-  }
-  return null;
+    return ref === null ? [] : [ref];
+  }))];
 }
 
 function isInlineSourceBlob(metadata: BlobMetadata): boolean {
@@ -1646,8 +1645,8 @@ export function ChatPanel({
 
   // ── Inline-source projection (Phase 5a Task 3) ─────────────────────────────
   //
-  // When the active composition's source blob_ref resolves to an assistant-
-  // created blob with chat-message provenance, project that blob's metadata +
+  // When active source blob refs resolve to assistant-created blobs with
+  // chat-message provenance, project each blob's metadata and
   // a bounded content preview into the inlineSourceStore. The summary is rendered
   // inside the agent bubble (MessageBubble's "Sources created" disclosure
   // group) — the store is the projection layer for downstream consumers
@@ -1664,12 +1663,19 @@ export function ChatPanel({
   // plus a non-null `created_from_message_id`; browser uploads and pipeline
   // outputs do not carry that pair. Checking metadata before preview fetch
   // keeps large uploaded sources out of the chat-created-source projection.
-  const blobRef = readBlobRef(compositionState);
+  const blobRefsKey = JSON.stringify(readBlobRefs(compositionState));
+  const blobRefs = useMemo<string[]>(() => JSON.parse(blobRefsKey), [blobRefsKey]);
+  const [sourceProjectionFailure, setSourceProjectionFailure] = useState<{
+    sessionId: string; blobRefsKey: string;
+  } | null>(null);
+  const [sourceProjectionAttempt, setSourceProjectionAttempt] = useState(0);
   const setInlineSourceSummary = useInlineSourceStore((s) => s.setSummary);
-  const clearInlineSourceSummary = useInlineSourceStore((s) => s.clearSummary);
-  const inlineSourceSummary = useInlineSourceStore((s) =>
-    activeSessionId !== null ? s.summariesBySession[activeSessionId] ?? null : null,
-  );
+  const retainInlineSourceSummaries = useInlineSourceStore((s) => s.retainSummaries);
+  const storedInlineSources = useInlineSourceStore((s) => s.summariesBySession);
+  const inlineSourceSummaries = activeSessionId === null ? [] :
+    blobRefs.flatMap((blobId) =>
+      (storedInlineSources[activeSessionId] ?? []).filter((summary) => summary.blobId === blobId),
+    );
 
   // ── Interpretation review surfacing ───────────────────────────────────────
   //
@@ -1841,22 +1847,14 @@ export function ChatPanel({
 
   useEffect(() => {
     if (activeSessionId === null) return;
-    if (blobRef === null) {
-      // No inline source attached — clear any stale projection.
-      clearInlineSourceSummary(activeSessionId);
-      return;
-    }
+    retainInlineSourceSummaries(activeSessionId, blobRefs);
+    setSourceProjectionFailure(null);
     let cancelled = false;
     const sessionId = activeSessionId;
-    const targetBlobId = blobRef;
-    void (async () => {
+    void Promise.all(blobRefs.map(async (targetBlobId) => {
       try {
         const meta = await getBlobMetadata(sessionId, targetBlobId);
-        if (cancelled) return;
-        if (!isInlineSourceBlob(meta)) {
-          clearInlineSourceSummary(sessionId);
-          return;
-        }
+        if (cancelled || !isInlineSourceBlob(meta)) return;
         const text = await previewBlobContent(sessionId, targetBlobId);
         if (cancelled) return;
         const summary = await projectInlineSourceSummary({
@@ -1864,39 +1862,18 @@ export function ChatPanel({
           contentText: text,
           toProvenance: toInlineSourceProvenance,
         });
-        if (cancelled) return;
-        setInlineSourceSummary(sessionId, summary);
+        if (!cancelled) setInlineSourceSummary(sessionId, summary);
       } catch (err) {
-        // Frontend display-projection failure.  Bound `err` (not bare
-        // `catch {}`) so programming errors are debuggable:
-        //   * Transient blob-fetch failures (Tier-3 boundary —
-        //     authenticated endpoint returning 5xx) are the expected
-        //     case; we keep the last-known-good summary in the store.
-        //   * `toInlineSourceProvenance` throws on an unknown wire
-        //     `CreationModality` value (exhaustiveness `never`).  That
-        //     would be a wire-contract drift we MUST see, not silently
-        //     swallow.
-        //   * The Tier-1 hash-invariant throw above lands here.
-        // `console.error` follows the in-codebase frontend convention
-        // (see App.tsx [preferences], CatalogDrawer.tsx, etc.) — it is
-        // NOT the backend `slog` channel (the logging-telemetry-policy skill
-        // §Logging Policy).  The audit trail of the failure itself lives on
-        // the server (blob-fetch attempts are recorded server-side);
-        // this is the operational mirror so a developer opening
-        // devtools sees the projection failure.
         if (!cancelled) {
           console.error("[inline-source] projection failed:", err);
+          setSourceProjectionFailure({ sessionId, blobRefsKey });
         }
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    }));
+    return () => { cancelled = true; };
   }, [
-    activeSessionId,
-    blobRef,
-    setInlineSourceSummary,
-    clearInlineSourceSummary,
+    activeSessionId, blobRefs, blobRefsKey, sourceProjectionAttempt,
+    setInlineSourceSummary, retainInlineSourceSummaries,
   ]);
 
   // A newly-actionable proposal must be SEEN (elspeth-2d1cf8908c). The dock
@@ -1915,8 +1892,8 @@ export function ChatPanel({
   // any waiting decision via attachDock — a fresh mount has no operator
   // scroll state to fight.
   const actionableBannerProposalIds = useMemo(
-    () => actionableProposals(compositionProposals, staleProposalIds).map((p) => p.id),
-    [compositionProposals, staleProposalIds],
+    () => actionableProposals(compositionProposals).map((p) => p.id),
+    [compositionProposals],
   );
   const seenActionableBannerIdsRef = useRef<ReadonlySet<string>>(new Set());
   const revealActionableProposals = useCallback(
@@ -2052,7 +2029,6 @@ export function ChatPanel({
         compositionState,
         pendingInterpretations: pendingAcknowledgementEvents,
         proposals: compositionProposals,
-        staleProposalIds,
         inlineSourceCandidate: !guidedDecisionMode && shouldRenderFallback ? fallbackCandidate : null,
       }),
     [
@@ -2060,7 +2036,6 @@ export function ChatPanel({
       compositionState,
       pendingAcknowledgementEvents,
       compositionProposals,
-      staleProposalIds,
       guidedDecisionMode,
       shouldRenderFallback,
       fallbackCandidate,
@@ -2156,13 +2131,18 @@ export function ChatPanel({
    */
   const handleEditInlineSource = useCallback(
     (summary: InlineSourceSummary) => {
+      const sourceNames = compositionState === null ? [] : sortedSourceEntries(compositionState)
+        .filter(([, source]) => readSourceBlobRef(source) === summary.blobId)
+        .map(([name]) => name);
+      if (sourceNames.length === 0) return;
       const prompt =
         `I'd like to edit the inline source "${summary.filename}". ` +
+        `Pipeline source names: ${sourceNames.join(", ")}. Blob ID: ${summary.blobId}. ` +
         `Current contents:\n\n${summary.contentPreview}\n\n` +
         `Please update it per the changes I describe in my next message.`;
       sendMessage(prompt);
     },
-    [sendMessage],
+    [sendMessage, compositionState],
   );
 
   // Guided workspace auto-scroll: keep the conversation column pinned to the
@@ -3487,17 +3467,15 @@ export function ChatPanel({
             renderedTurns.map((turn: ChatTurn) => {
                 const repr = turnRepresentativeMessage(turn);
                 // Attach the inline-source summary to the most recent complete
-                // agent turn — that's the turn whose audit narrative includes
-                // the source-creation event. The store holds at most one
-                // summary per session today; passing it as a list keeps the
-                // bubble's contract ready for multi-source turns without a
-                // future refactor here. When no agent turn is present (e.g.
+                // agent turn. The summaries follow named-source order,
+                // independent of the order their metadata requests finish.
+                // When no agent turn is present (e.g.
                 // session-restore loaded a composition before any chat), the
                 // summary falls through to the standalone widget rendered
                 // below the message stream.
                 const sourcesForThisTurn =
-                  inlineSourceSummary && turn.id === inlineSourceTargetTurnId
-                    ? [inlineSourceSummary]
+                  inlineSourceSummaries.length > 0 && turn.id === inlineSourceTargetTurnId
+                    ? inlineSourceSummaries
                     : undefined;
                 // Interpretation confirmations raised BY this turn, emitted
                 // straight after its bubble (elspeth-51ed4fd8d5). The anchor
@@ -3544,11 +3522,21 @@ export function ChatPanel({
               chat turn happened). The hybrid keeps the operator's stated UX —
               sources-created appears inside the bubble like tool calls do —
               while not silently dropping the summary in pre-chat states. */}
-          {inlineSourceSummary && inlineSourceTargetTurnId === null && (
+          {inlineSourceTargetTurnId === null && inlineSourceSummaries.map((summary) => (
             <InlineSourceCreatedTurn
-              summary={inlineSourceSummary}
+              key={summary.blobId}
+              summary={summary}
               onEdit={handleEditInlineSource}
             />
+          ))}
+          {sourceProjectionFailure?.sessionId === activeSessionId &&
+            sourceProjectionFailure?.blobRefsKey === blobRefsKey && (
+            <div role="alert">
+              <p>Could not load some source details.</p>
+              <Button onClick={() => setSourceProjectionAttempt((attempt) => attempt + 1)}>
+                Retry source details
+              </Button>
+            </div>
           )}
           {/*
             Unanchorable resolve confirmations (Phase 5b.18b.8).

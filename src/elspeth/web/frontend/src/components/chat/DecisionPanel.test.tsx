@@ -106,6 +106,22 @@ function makeHandlers() {
 }
 
 describe("DecisionPanel", () => {
+  it("disables acceptance after a confirmed stale refusal but still permits rejection", () => {
+    const pending = { ...proposal(), base_state_id: "older-state" };
+    renderPanel({
+      proposals: [pending], staleProposalIds: [pending.id],
+      rows: [{ kind: "pending_proposal", id: "proposal:proposal-1", proposalId: pending.id }], count: 1,
+    });
+    expect(screen.getByRole("button", { name: /^Accept proposal:/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^Reject proposal:/ })).toBeEnabled();
+    expect(screen.getByText(/Ask the composer to rebase/)).toBeInTheDocument();
+  });
+
+  it("does not preempt server admission for pending blob-effect retries", () => {
+    const pending = { ...proposal(), tool_name: "update_blob", base_state_id: "earlier-state" };
+    renderPanel({ proposals: [pending], rows: [{ kind: "pending_proposal", id: "proposal:proposal-1", proposalId: pending.id }], count: 1 });
+    expect(screen.getByRole("button", { name: /^Accept proposal:/ })).toBeEnabled();
+  });
   it("renders nothing when there is nothing to decide", () => {
     const { container } = renderPanel({ rows: [], blockedVerbs: [], count: 0 });
     expect(container.firstChild).toBeNull();
@@ -358,7 +374,7 @@ describe("DecisionPanelLiveRegion", () => {
         completion_ready: false,
       } }),
       compositionState: makeComposition(1, { validation_suggestions: suggestions }),
-      pendingInterpretations: [], proposals: [], staleProposalIds: [],
+      pendingInterpretations: [], proposals: [],
     });
     const initial = project([S1, { ...S1, message: "Review the source fields." }]);
     const replacement = project([S1, { ...S1, message: "Review the output fields." }]);
@@ -423,13 +439,13 @@ describe("DecisionPanelLiveRegion", () => {
 });
 
 describe("actionableProposals", () => {
-  it("preserves pending non-stale eligibility without mutating input", () => {
+  it("preserves pending rejection eligibility without mutating input", () => {
     const pending = proposal();
     const stale = { ...proposal(), id: "stale" };
     const rejected = { ...proposal(), id: "rejected", status: "rejected" as const };
     const committed = { ...proposal(), id: "committed", status: "committed" as const };
     const input = Object.freeze([pending, stale, rejected, committed]);
-    expect(actionableProposals(input, ["stale"])).toEqual([pending]);
+    expect(actionableProposals(input)).toEqual([pending, stale]);
     expect(input).toHaveLength(4);
   });
 });
