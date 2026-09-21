@@ -328,15 +328,17 @@ class _LLMProfileResolver:
         suppresses=("R1", "R5"),
         invariant=(
             "raises ValueError('malformed_profile_schema') when $defs, discriminator, discriminator['mapping'], a "
-            "mapped provider definition, its properties, or its required list deviates from the shape every variant "
+            "selected mapped provider definition, its properties, or its required list deviates from the shape every variant "
             "of THIS union declares (dict / list[str], required non-empty) — the section that decides "
             "public-vs-LLM_PROFILE_PRIVATE_FIELDS exposure never silently narrows there. An absent 'required' counts "
             "as a deviation on that measured ground and not on a general pydantic guarantee (pydantic v2 omits "
             "'required' for an all-defaulted model); what holds is that every LLM provider variant reachable through "
-            "discriminator['mapping'] inherits a non-empty required set from LLMConfig. The downstream $ref-closure walk that assembles public $defs, and "
-            "the source knob-field projection, are unchanged pre-existing best-effort behaviour and are not covered "
-            "by this invariant. An ABSENT key is not a softer path into the exposure decision: a discriminator "
-            "naming a $defs entry the schema does not carry raises, and with neither $defs nor discriminator the "
+            "discriminator['mapping'] inherits a non-empty required set from LLMConfig. Only providers represented by "
+            "available profile aliases are projected; conflicting defaults and descriptions are omitted, and source "
+            "knobs select those providers' variants. The downstream $ref-closure walk that assembles public $defs "
+            "is pre-existing best-effort behaviour and is not covered by this invariant. An ABSENT key is not a "
+            "softer path into the exposure decision: a selected provider discriminator naming a $defs entry the "
+            "schema does not carry raises, and with neither $defs nor discriminator the "
             "projection collapses to the operator-approved 'profile' alias alone — an absent key can only narrow "
             "this public schema, never admit a provider field the union did not declare."
         ),
@@ -357,7 +359,10 @@ class _LLMProfileResolver:
         if not isinstance(mapping, dict):
             raise ValueError("malformed_profile_schema")
         provider_definitions: list[dict[str, Any]] = []
-        for definition_ref in mapping.values():
+        selected_providers = {self._profiles[alias].provider for alias in available_aliases}
+        for provider, definition_ref in mapping.items():
+            if provider not in selected_providers:
+                continue
             if not isinstance(definition_ref, str) or not definition_ref.startswith("#/$defs/"):
                 raise ValueError("malformed_profile_schema")
             definition = definitions.get(definition_ref.removeprefix("#/$defs/"))
@@ -372,10 +377,15 @@ class _LLMProfileResolver:
                     continue
                 if not isinstance(property_schema, dict):
                     raise ValueError("malformed_profile_schema")
-                # First variant wins: the union's variants share these public
-                # property names and the projection publishes one shape for each.
                 if name not in safe_properties:
                     safe_properties[name] = deepcopy(property_schema)
+                else:
+                    # Shared fields may have different provider defaults.
+                    # Publish only metadata true for every selectable provider.
+                    for metadata in ("default", "description"):
+                        existing = safe_properties[name]
+                        if metadata in existing and (metadata not in property_schema or existing[metadata] != property_schema[metadata]):
+                            del existing[metadata]
         required_by_variant: list[set[str]] = []
         for definition in provider_definitions:
             # An absent "required" is a shape deviation HERE, not "nothing is
@@ -443,6 +453,14 @@ class _LLMProfileResolver:
             raw_fields = full_schema.knob_schema.get("fields", ())
             first_raw_field: dict[str, dict[str, Any]] = {}
             for field in raw_fields:
+                if isinstance(field, dict) and "visible_when" in field:
+                    visible_when = field["visible_when"]
+                    if (
+                        isinstance(visible_when, dict)
+                        and visible_when.get("field") == "provider"
+                        and visible_when.get("equals") not in selected_providers
+                    ):
+                        continue
                 if isinstance(field, dict) and isinstance(field.get("name"), str) and field["name"] not in first_raw_field:
                     first_raw_field[field["name"]] = field
             fields: list[dict[str, Any]] = [
@@ -466,6 +484,9 @@ class _LLMProfileResolver:
                     raise ValueError(f"source profile field {name!r} has no canonical knob projection") from exc
                 if "visible_when" in field:
                     del field["visible_when"]
+                for metadata in ("default", "description"):
+                    if metadata not in safe_properties[name] and metadata in field:
+                        del field[metadata]
                 if "tier" not in field:
                     field["tier"] = _projected_tier(name, canonical_tiers)
                 fields.append(field)

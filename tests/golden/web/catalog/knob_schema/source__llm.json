@@ -71,8 +71,8 @@
         }
       },
       {
-        "default": 0.0,
-        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
+        "default": null,
+        "description": "Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",

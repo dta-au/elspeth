@@ -5,7 +5,7 @@ from __future__ import annotations
 PROVIDER_REQUIRED_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "anthropic": ("ANTHROPIC_API_KEY",),
     "azure": ("AZURE_API_KEY",),
-    "azure_ai": ("AZURE_API_KEY",),
+    "azure_ai": ("AZURE_AI_API_KEY",),
     # LiteLLM's Bedrock provider uses boto3's default AWS credential chain
     # (task role, environment, profile, etc.), so Composer REQUIRES no key:
     # a non-empty tuple here would mark Bedrock unavailable on every

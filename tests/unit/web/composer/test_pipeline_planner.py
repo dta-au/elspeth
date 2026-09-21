@@ -23,6 +23,7 @@ from uuid import uuid4
 
 import pytest
 import structlog
+from litellm import ModelResponse, Usage
 from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
@@ -224,11 +225,11 @@ class _Response:
 
 
 class _ScriptedCompletion:
-    def __init__(self, *responses: _Response | BaseException) -> None:
+    def __init__(self, *responses: _Response | ModelResponse | BaseException) -> None:
         self._responses = list(responses)
         self.requests: list[dict[str, Any]] = []
 
-    async def __call__(self, **kwargs: Any) -> _Response:
+    async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
         self.requests.append(deepcopy(kwargs))
         response = self._responses.pop(0)
         if isinstance(response, BaseException):
@@ -4955,6 +4956,33 @@ async def test_exact_request_bytes_and_post_call_cost_caps_fail_closed(
         )
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].provider_cost == 0.11
+
+
+@pytest.mark.asyncio
+async def test_calculated_azure_cost_enforces_planner_continuation_cap(tmp_path: Path, tool_context: ToolContext) -> None:
+    response = ModelResponse(
+        model="private-azure-deployment-2026-07-09",
+        usage=Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+        choices=[{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+    )
+    response._hidden_params = {}
+    completion = _ScriptedCompletion(response)
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError, match="cost continuation cap"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            budget=_budget(max_cumulative_provider_cost=Decimal("0.0004")),
+            model_overrides={"model_identifier": "openai/gpt-4o-2024-08-06", "provider": "openai"},
+        )
+
+    assert len(completion.requests) == 1
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].provider_cost == pytest.approx(0.00045)
+    assert recorder.llm_calls[0].provider_cost_source == "litellm.cost_per_token"
 
 
 @pytest.mark.asyncio

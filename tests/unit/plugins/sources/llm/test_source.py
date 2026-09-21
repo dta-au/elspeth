@@ -43,6 +43,66 @@ def _install_provider(source: LLMSource, provider: FakeProvider) -> None:
     source._provider = provider
 
 
+def test_azure_source_config_hides_key_repr(provider_configs: dict[str, dict[str, Any]]) -> None:
+    from elspeth.plugins.sources.llm.config import AzureOpenAILLMSourceConfig
+
+    config = AzureOpenAILLMSourceConfig.from_dict(provider_configs["azure"])
+    assert config.api_key not in repr(config)
+    assert config.api_key not in str(config)
+    assert config.api_key == provider_configs["azure"]["api_key"]
+
+
+@pytest.mark.parametrize("temperature", ["omitted", None, 0.0, 0.7])
+def test_azure_source_preserves_temperature_wire_contract(
+    temperature: str | float | None,
+    provider_configs: dict[str, dict[str, Any]],
+    source_context: PluginContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    import openai
+
+    requests: list[dict[str, Any]] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "source-response",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-2099-01-01",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+            },
+        )
+
+    sdk = openai.AzureOpenAI(
+        api_key="source-probe",
+        azure_endpoint="https://example.openai.azure.com",
+        api_version="2024-10-21",
+        http_client=httpx.Client(transport=httpx.MockTransport(reply)),
+    )
+    monkeypatch.setattr(openai, "AzureOpenAI", lambda **kwargs: sdk)
+    config = provider_configs["azure"]
+    if temperature != "omitted":
+        config["temperature"] = temperature
+    source = LLMSource(config)
+    try:
+        source.on_start(source_context)
+        rows = list(source.load(source_context))
+        assert len(rows) == 1
+        assert len(requests) == 1
+        assert requests[0]["model"] == config["deployment_name"]
+        if temperature is None or temperature == "omitted":
+            assert "temperature" not in requests[0]
+        else:
+            assert requests[0]["temperature"] == temperature
+    finally:
+        source.close()
+
+
 def _install_runtime_rejecting_schema(source: LLMSource) -> None:
     """Simulate a runtime schema mismatch without authoring an impossible source contract."""
     source._schema_class = create_schema_from_config(

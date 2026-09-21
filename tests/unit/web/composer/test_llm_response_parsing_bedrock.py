@@ -79,7 +79,7 @@ def test_zero_private_response_cost_is_preserved() -> None:
     assert record.provider_cost_source == "_hidden_params.response_cost"
 
 
-@pytest.mark.parametrize("bad_cost", [True, "0.01", -0.01, math.nan, math.inf, -math.inf, None])
+@pytest.mark.parametrize("bad_cost", [True, "0.01", -0.01, math.nan, math.inf, -math.inf, None, 10**400, -(10**400)])
 def test_malformed_private_response_cost_is_unavailable(bad_cost: object) -> None:
     record = _record(_response(response_cost=bad_cost))
 
@@ -87,7 +87,7 @@ def test_malformed_private_response_cost_is_unavailable(bad_cost: object) -> Non
     assert record.provider_cost_source == "not_available"
 
 
-@pytest.mark.parametrize("bad_usage_cost", [True, "0.01", -0.01, math.nan, math.inf, None])
+@pytest.mark.parametrize("bad_usage_cost", [True, "0.01", -0.01, math.nan, math.inf, None, 10**400, -(10**400)])
 def test_present_malformed_usage_cost_does_not_fall_back_to_private_cost(bad_usage_cost: object) -> None:
     response = _response(response_cost=0.01234)
     response.usage.cost = bad_usage_cost

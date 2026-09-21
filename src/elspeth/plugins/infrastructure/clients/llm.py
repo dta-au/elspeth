@@ -167,6 +167,7 @@ _NETWORK_ERROR_PATTERNS = (
 )
 _CONTENT_POLICY_PATTERNS = (
     "content_policy_violation",
+    "content_filter",
     "content policy",
     "safety system",
 )
@@ -205,13 +206,19 @@ def _classify_llm_error(exception: Exception) -> str:
     if any(pattern in error_str for pattern in CONTEXT_LENGTH_PATTERNS):
         return "context_length"
 
-    # Match explicit rate-limit indicators only; do not match arbitrary "rate" substrings.
+    status_code = exception.__dict__.get("status_code")
+    if type(status_code) is int:
+        if status_code == 429:
+            return "rate_limit"
+        if status_code in (500, 502, 503, 504, 529):
+            return "server"
+        if status_code in (400, 401, 403, 404, 422):
+            return "client"
+
+    # Text fallback is for exceptions without a recognized HTTP status. A
+    # request reference in an authentication error must not turn it retryable.
     if re.search(r"\b429\b", error_str) or any(pattern.search(error_str) for pattern in _RATE_LIMIT_PATTERNS):
         return "rate_limit"
-
-    status_code = exception.__dict__.get("status_code")
-    if type(status_code) is int and status_code in (500, 502, 503, 504, 529):
-        return "server"
     if _SERVER_ERROR_CODE_PATTERN.search(error_str):
         return "server"
     if any(pattern in error_str for pattern in _NETWORK_ERROR_PATTERNS):
@@ -609,7 +616,12 @@ class AuditedLLMClient(AuditedClientBase):
 
         try:
             response_model = _validate_provider_response_model(response.model)
-        except ValueError as model_exc:
+            # The SDK constructs responses without strict field validation.
+            # Admit the array before indexing: malformed Azure envelopes must
+            # retain their call record, just like malformed model metadata.
+            if not isinstance(response.choices, list):
+                raise ValueError("LLM response choices must be an array")
+        except (ValueError, AttributeError) as model_exc:
             error_msg = f"{model_exc}. Provider returned malformed data at Tier 3 boundary."
             response_payload = RawCallPayload(raw_response)
             self._record_call(

@@ -198,19 +198,21 @@ def test_runtime_preflight_wire_request_is_accepted_by_reasoning_deployments() -
     assert create_calls[0]["max_completion_tokens"] >= 1024
 
 
-def test_execute_query_sends_max_completion_tokens_and_omits_null_temperature() -> None:
+@pytest.mark.parametrize("deployment_name", ["reasoning-deployment", "production-chat", "gpt-4o", "o3"])
+def test_execute_query_sends_max_completion_tokens_and_omits_null_temperature(deployment_name: str) -> None:
     create_calls: list[dict[str, Any]] = []
     provider = _recording_azure_provider(create_calls)
 
     provider.execute_query(
         [ChatMessage(role="user", content="hello")],
-        model="reasoning-deployment",
+        model=deployment_name,
         temperature=None,
         max_tokens=100,
         audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
     )
 
     assert len(create_calls) == 1
+    assert create_calls[0]["model"] == deployment_name
     assert create_calls[0]["max_completion_tokens"] == 100
     assert "max_tokens" not in create_calls[0]
     assert "temperature" not in create_calls[0]

@@ -178,9 +178,15 @@ class AzureOpenAILLMSourceConfig(LLMSourceConfig):
 
     provider: Literal["azure"] = Field(default="azure", description="LLM provider")
     model: str = Field(default="", description="Model identifier (defaults to deployment_name)")
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
+    )
     deployment_name: str = Field(..., description="Azure deployment name")
     endpoint: str = Field(..., description="Azure OpenAI endpoint URL")
-    api_key: str = Field(..., description="Azure OpenAI API key")
+    api_key: str = Field(..., description="Azure OpenAI API key", repr=False)
     api_version: str = Field(default="2024-10-21", description="Azure API version")
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
 

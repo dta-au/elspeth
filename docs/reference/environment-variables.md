@@ -218,7 +218,8 @@ satisfied:
 | `openrouter` | `OPENROUTER_API_KEY` |
 | `openai` | `OPENAI_API_KEY` |
 | `anthropic` | `ANTHROPIC_API_KEY` |
-| `azure` / `azure_ai` | `AZURE_API_KEY` |
+| `azure` | One of `AZURE_API_KEY`, `AZURE_OPENAI_API_KEY`, or `AZURE_AD_TOKEN` |
+| `azure_ai` | `AZURE_AI_API_KEY` |
 
 A missing or empty required key does not stop the service: the Composer is
 reported unavailable, with the missing variable named, through the sanitized

@@ -23,8 +23,9 @@ Tier 3 boundary discipline (per docs/guides/data-trust-and-error-handling.md
   attribute-style provider response objects.
 - Missing fields surface as ``None`` (absence), not as fabricated zeros.
 
-The module imports only from contracts (L0) and stdlib. It must not import
-from ``service.py`` — that would create a cycle.
+LiteLLM pricing is imported lazily only when an otherwise admissible response
+omits cost metadata. This module must not import from ``service.py`` — that
+would create a cycle.
 """
 
 from __future__ import annotations
@@ -37,7 +38,10 @@ from datetime import UTC, datetime
 from types import MemberDescriptorType
 from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
+import structlog
+
 from elspeth.contracts.composer_llm_audit import (
+    PROVIDER_COST_SOURCE_COST_PER_TOKEN,
     PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
     PROVIDER_COST_SOURCE_NOT_AVAILABLE,
     PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST,
@@ -72,6 +76,7 @@ __all__ = [
 ]
 
 _LLM_ERROR_MESSAGE_MAX_CHARS = 512
+_log = structlog.get_logger()
 _LLM_ERROR_HASH_CHARS = 16
 _LLM_ERROR_REDACTED_DETAIL = "provider error detail redacted"
 _LLM_ERROR_HASH_LABEL = "raw_error_hash"
@@ -300,14 +305,18 @@ def _token_usage_from_usage(usage: Any | None) -> TokenUsage:
     return TokenUsage.from_dict(usage_data)
 
 
-def _provider_cost_from_response(response: Any | None) -> tuple[float | None, ComposerLLMProviderCostSource]:
-    """Extract provider-reported request cost without fabricating a value.
+def _provider_cost_from_response(
+    response: Any | None, *, model_requested: str | None = None
+) -> tuple[float | None, ComposerLLMProviderCostSource]:
+    """Extract request cost, calculating only when both cost fields are absent.
 
     Prefer the public ``response.usage.cost`` field when the provider supplies
     it. LiteLLM stores Bedrock's calculated cost in the Pydantic private-data
     mapping at ``_hidden_params.response_cost``; consult that mapping only when
     ``usage.cost`` is absent. A present but malformed public value is evidence
     of malformed metadata and must not silently fall back to another source.
+    If both fields are absent, the original requested model and reported
+    usage may supply a catalog calculation with explicit provenance.
 
     Both sources are external provider metadata, so booleans, non-numbers,
     negative values, and non-finite values are treated as unavailable. The
@@ -317,7 +326,7 @@ def _provider_cost_from_response(response: Any | None) -> tuple[float | None, Co
     if response is None:
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     usage = _provider_field(response, "usage")
-    return _provider_cost_from_captured_usage(response, usage)
+    return _provider_cost_from_captured_usage(response, usage, model_requested=model_requested)
 
 
 @observation_boundary(
@@ -326,14 +335,16 @@ def _provider_cost_from_response(response: Any | None) -> tuple[float | None, Co
     source_param="response",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns (None, PROVIDER_COST_SOURCE_NOT_AVAILABLE) whenever the private mapping, its "
-        "_hidden_params entry, or the cost value is absent or malformed; the private read goes through "
+        "preserves present public or private cost values, rejects malformed metadata, and permits "
+        "requested-model pricing only when both cost fields are absent; the private read goes through "
         "object.__getattribute__ so no provider-named property is invoked, and it never raises"
     ),
 )
 def _provider_cost_from_captured_usage(
     response: Any,
     usage: Any | None,
+    *,
+    model_requested: str | None = None,
 ) -> tuple[float | None, ComposerLLMProviderCostSource]:
     """Extract cost without resolving the response's usage field again."""
 
@@ -341,21 +352,178 @@ def _provider_cost_from_captured_usage(
     if usage_fields is not None and "cost" in usage_fields:
         return _validated_provider_cost(usage_fields["cost"], PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST)
 
+    service_tier = _provider_field(response, "service_tier")
+
     try:
         private = object.__getattribute__(response, "__pydantic_private__")
     except AttributeError:
-        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+        return _calculate_missing_provider_cost(usage, model_requested=model_requested, service_tier=service_tier)
+    if private is None:
+        return _calculate_missing_provider_cost(usage, model_requested=model_requested, service_tier=service_tier)
     if not isinstance(private, Mapping):
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     if "_hidden_params" not in private:
-        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+        return _calculate_missing_provider_cost(usage, model_requested=model_requested, service_tier=service_tier)
     hidden_params = private["_hidden_params"]
-    if not isinstance(hidden_params, Mapping) or "response_cost" not in hidden_params:
+    if not isinstance(hidden_params, Mapping):
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    if "response_cost" not in hidden_params:
+        return _calculate_missing_provider_cost(usage, model_requested=model_requested, service_tier=service_tier)
     return _validated_provider_cost(
         hidden_params["response_cost"],
         PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
     )
+
+
+@observation_boundary(
+    tier=3,
+    source="optional cache and reasoning counters from an external LiteLLM usage payload",
+    source_param="usage",
+    suppresses=("R1",),
+    invariant=(
+        "rejects present non-null malformed optional counters and detail containers before pricing; "
+        "None stays absent, and only nonnegative exact integer counters are accepted through data-only field reads"
+    ),
+)
+def _pricing_usage_optional_fields_valid(usage: Any | None) -> bool:
+    """Reject malformed pricing counters before token admission erases their shape.
+
+    Explicit None remains absent. Read data fields only, using the same SDK
+    mapping boundary as token admission, without resolving provider properties.
+    """
+    fields = _provider_field_map(usage)
+    if fields is None:
+        return False
+    for name in ("cache_creation_input_tokens", "cache_read_input_tokens", "reasoning_tokens"):
+        value = fields.get(name)
+        if value is not None and (type(value) is not int or value < 0):
+            return False
+    for details_name, counter_name in (
+        ("prompt_tokens_details", "cached_tokens"),
+        ("completion_tokens_details", "reasoning_tokens"),
+        ("output_tokens_details", "reasoning_tokens"),
+    ):
+        details = fields.get(details_name)
+        if details is None:
+            continue
+        detail_fields = _provider_field_map(details)
+        if detail_fields is None:
+            return False
+        value = detail_fields.get(counter_name)
+        if value is not None and (type(value) is not int or value < 0):
+            return False
+        if details_name == "prompt_tokens_details":
+            creation_details = detail_fields.get("cache_creation_token_details")
+            if creation_details is not None:
+                ttl_fields = _provider_field_map(creation_details)
+                if ttl_fields is None:
+                    return False
+                if set(ttl_fields) != {"ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"}:
+                    return False
+                short = ttl_fields.get("ephemeral_5m_input_tokens")
+                long = ttl_fields.get("ephemeral_1h_input_tokens")
+                if type(short) is not int or type(long) is not int or short < 0 or long < 0:
+                    return False
+                creation = fields.get("cache_creation_input_tokens")
+                nested_creation = detail_fields.get("cache_creation_tokens")
+                if type(creation) is not int or short + long != creation:
+                    return False
+                if nested_creation is not None and (type(nested_creation) is not int or nested_creation != creation):
+                    return False
+    return True
+
+
+def _calculate_missing_provider_cost(
+    usage: Any | None, *, model_requested: str | None, service_tier: Any | None = None
+) -> tuple[float | None, ComposerLLMProviderCostSource]:
+    """Price reported usage against the request identity, never a deployment alias.
+
+    LiteLLM can omit cost metadata when Azure returns an unpriceable deployment
+    name. The original requested model can still have a catalog price. Missing
+    counters must not trigger LiteLLM's text-based token estimation; an unknown
+    price or malformed calculation remains unavailable to the planner cap.
+    """
+    if not _pricing_usage_optional_fields_valid(usage):
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    if service_tier is not None and (type(service_tier) is not str or service_tier not in ("default", "standard", "priority", "flex")):
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    reported = _token_usage_from_usage(usage)
+    if model_requested is None or reported.prompt_tokens is None or reported.completion_tokens is None:
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    if reported.cached_prompt_tokens is not None and reported.cached_prompt_tokens > reported.prompt_tokens:
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    if reported.reasoning_tokens is not None and reported.reasoning_tokens > reported.completion_tokens:
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+
+    import litellm
+
+    try:
+        # Reconstruct only admitted counters. Passing the original response
+        # to completion_cost permits LiteLLM to select Azure's returned alias
+        # instead of the supplied request model, recreating COST_UNAVAILABLE.
+        prompt_details: dict[str, int | dict[str, int] | None] = {}
+        if reported.cached_prompt_tokens is not None:
+            prompt_details["cached_tokens"] = reported.cached_prompt_tokens
+        source_details = _provider_field(usage, "prompt_tokens_details")
+        creation_details = _provider_field(source_details, "cache_creation_token_details")
+        if creation_details is not None:
+            prompt_details["cache_creation_tokens"] = reported.cache_creation_input_tokens
+            prompt_details["cache_creation_token_details"] = {
+                "ephemeral_5m_input_tokens": _provider_field(creation_details, "ephemeral_5m_input_tokens"),
+                "ephemeral_1h_input_tokens": _provider_field(creation_details, "ephemeral_1h_input_tokens"),
+            }
+        pricing_usage = litellm.Usage(
+            prompt_tokens=reported.prompt_tokens,
+            completion_tokens=reported.completion_tokens,
+            total_tokens=reported.prompt_tokens + reported.completion_tokens,
+            prompt_tokens_details=prompt_details or None,
+            completion_tokens_details={"reasoning_tokens": reported.reasoning_tokens} if reported.reasoning_tokens is not None else None,
+            cache_creation_input_tokens=reported.cache_creation_input_tokens,
+            cache_read_input_tokens=reported.cache_read_input_tokens,
+        )
+        costs = litellm.cost_per_token(
+            model=model_requested,
+            prompt_tokens=reported.prompt_tokens,
+            completion_tokens=reported.completion_tokens,
+            usage_object=pricing_usage,
+            service_tier=service_tier,
+        )
+    except Exception as exc:
+        # The external SDK raises several exception types for unsupported
+        # models and malformed usage. Preserve unavailable cost, never zero.
+        # DEBUG-only process diagnostics: arbitrary SDK exception prose may
+        # contain request content or credentials and must never reach logs.
+        _log.debug(
+            "planner_cost_recovery",
+            reason="calculator_exception",
+            error_class=type(exc).__name__,
+            model_requested=_safe_llm_error_message(model_requested),
+            prompt_tokens=reported.prompt_tokens,
+            completion_tokens=reported.completion_tokens,
+            cached_prompt_tokens=reported.cached_prompt_tokens,
+            reasoning_tokens=reported.reasoning_tokens,
+            cache_creation_input_tokens=reported.cache_creation_input_tokens,
+            cache_read_input_tokens=reported.cache_read_input_tokens,
+        )
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    return _validated_calculated_cost(costs)
+
+
+@observation_boundary(
+    tier=3,
+    source="the external LiteLLM cost_per_token calculator result",
+    source_param="costs",
+    suppresses=("R5",),
+    invariant="admits only a two-element tuple of finite nonnegative costs with a finite sum; malformed results remain unavailable",
+)
+def _validated_calculated_cost(costs: Any) -> tuple[float | None, ComposerLLMProviderCostSource]:
+    if not isinstance(costs, tuple) or len(costs) != 2:
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    prompt_cost, _ = _validated_provider_cost(costs[0], PROVIDER_COST_SOURCE_COST_PER_TOKEN)
+    completion_cost, _ = _validated_provider_cost(costs[1], PROVIDER_COST_SOURCE_COST_PER_TOKEN)
+    if prompt_cost is None or completion_cost is None:
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    return _validated_provider_cost(prompt_cost + completion_cost, PROVIDER_COST_SOURCE_COST_PER_TOKEN)
 
 
 def _validated_provider_cost(
@@ -364,7 +532,10 @@ def _validated_provider_cost(
 ) -> tuple[float | None, ComposerLLMProviderCostSource]:
     if type(raw_cost) is bool or type(raw_cost) not in (int, float):
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
-    cost = float(cast(int | float, raw_cost))
+    try:
+        cost = float(cast(int | float, raw_cost))
+    except OverflowError:
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     if not math.isfinite(cost) or cost < 0:
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     return cost, source
@@ -862,7 +1033,7 @@ def build_llm_call_record(
 ) -> ComposerLLMCall:
     if response_metadata is None:
         usage = token_usage_from_response(response)
-        provider_cost, provider_cost_source = _provider_cost_from_response(response)
+        provider_cost, provider_cost_source = _provider_cost_from_response(response, model_requested=model_requested)
         reasoning_metadata = _reasoning_metadata_from_response(response)
         model_returned = safe_response_model(response)
         finish_reason = _finish_reason_from_response(response)

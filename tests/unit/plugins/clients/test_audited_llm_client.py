@@ -1228,6 +1228,41 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
     def _create_mock_execution() -> FakeExecutionRepository:
         return FakeExecutionRepository()
 
+    @pytest.mark.parametrize("field_name,value", [("model", None), ("choices", 1), ("choices", {"unexpected": 1}), ("choices", "bad")])
+    def test_malformed_sdk_envelope_is_audited(self, field_name: str, value: object) -> None:
+        from openai.types.chat import ChatCompletion
+
+        payload: dict[str, Any] = {
+            "id": "azure-response",
+            "model": "gpt-4o",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop", "index": 0}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+        }
+        if value is None:
+            del payload[field_name]
+        else:
+            payload[field_name] = value
+        response = ChatCompletion.model_construct(**payload)
+        execution = self._create_mock_execution()
+        events: list[ExternalCallCompleted] = []
+        client = AuditedLLMClient(
+            **mock_audit_authority(),
+            execution=execution,
+            state_id="state_azure_malformed",
+            run_id="run_azure_malformed",
+            telemetry_emit=events.append,
+            underlying_client=FakeOpenAIClient(response=response),
+            provider="azure",
+        )
+        with pytest.raises(LLMClientError) as exc_info:
+            client.chat_completion(model="deployment", messages=[ChatMessage(role="user", content="hello")])
+        assert exc_info.value.retryable is False
+        execution.assert_recorded_once()
+        assert execution.last_record_call_kwargs["status"] == CallStatus.ERROR
+        assert execution.last_record_call_kwargs["token_usage"].total_tokens == 4
+        assert len(events) == 1
+        assert events[0].status == CallStatus.ERROR
+
     def test_content_extraction_failure_records_call_before_raising(self) -> None:
         """Missing .content on success path: call recorded as ERROR, LLMClientError raised.
 

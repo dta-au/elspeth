@@ -1045,7 +1045,7 @@ Options common to all providers:
 | `prompt_template` | string | **Yes** | — | Jinja2 prompt template |
 | `model` | string | provider-dependent | — | Model identifier; required for `openrouter` and `bedrock`, defaulted from `deployment_name` for `azure` |
 | `system_prompt` | string | No | (none) | Optional system message |
-| `temperature` | float or null | No | `0.0` | Sampling temperature, `0.0`–`2.0`; the default is the deterministic setting. Set `null` to omit it from the request so the provider default applies — required for reasoning deployments (for example Azure GPT-5-family), which reject any explicit temperature |
+| `temperature` | float or null | No | Azure: `null`; other providers: `0.0` | Sampling temperature, `0.0`–`2.0`. Azure omits it by default for compatibility with reasoning deployments. Set an explicit value for a model that supports adjustable temperature; `null` omits the parameter and uses the provider default |
 | `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0. The `azure` provider sends it as `max_completion_tokens`, which also counts reasoning tokens |
 | `response_field` | string | No | `llm_response` | Row field for the model response; must be a valid Python identifier |
 | `queries` | list or mapping | No | (none) | Multi-query specs; omit for single-query mode |

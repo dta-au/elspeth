@@ -409,6 +409,17 @@ class TestLLMClientExceptionTypes:
 class TestAzureSpecificCodes:
     """Test Azure-specific error codes."""
 
+    @pytest.mark.parametrize(
+        "status_code,message,expected",
+        [
+            (429, "Capacity unavailable", "rate_limit"),
+            (401, "Credential rejected; reference 503", "client"),
+            (400, "content_filter", "content_policy"),
+        ],
+    )
+    def test_azure_status_and_filter_codes(self, status_code: int, message: str, expected: str) -> None:
+        assert _classify_llm_error(_StatusCodeError(message, status_code)) == expected
+
     def test_azure_529_model_overloaded_is_retryable(self) -> None:
         """Azure 529 (model overloaded) should be retryable."""
         error = Exception("529: The model is currently overloaded")

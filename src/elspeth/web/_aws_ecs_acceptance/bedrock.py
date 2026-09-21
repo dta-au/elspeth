@@ -234,6 +234,7 @@ def _bedrock_receipt_projection(
         "not_available": "unavailable",
         "response_usage.cost": "provider_reported",
         "_hidden_params.response_cost": "litellm_calculated",
+        "litellm.cost_per_token": "litellm_calculated",
     }
     cost_source = cost_sources[record.provider_cost_source]
     return {

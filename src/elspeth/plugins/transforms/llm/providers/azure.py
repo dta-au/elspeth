@@ -81,9 +81,17 @@ class AzureOpenAIConfig(LLMConfig):
     # Override model to make it optional - will default to deployment_name
     model: str = Field(default="", description="Model identifier (defaults to deployment_name)")
 
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
     deployment_name: str = Field(..., description="Azure deployment name")
     endpoint: str = Field(..., description="Azure OpenAI endpoint URL")
-    api_key: str = Field(..., description="Azure OpenAI API key")
+    api_key: str = Field(..., description="Azure OpenAI API key", repr=False)
     api_version: str = Field(default="2024-10-21", description="Azure API version")
 
     # Tier 2: Plugin-internal tracing (optional)

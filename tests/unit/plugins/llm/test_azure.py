@@ -1,9 +1,11 @@
 # tests/plugins/llm/test_azure.py
 """Tests for Azure OpenAI LLM provider via unified LLMTransform."""
 
+import json
 import threading
 from collections.abc import Generator
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -28,6 +30,104 @@ from .conftest import chaosllm_azure_openai_client
 
 # Common schema config for dynamic field handling (accepts any fields)
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+
+@pytest.mark.parametrize("multi_query", [False, True])
+@pytest.mark.parametrize("temperature", ["omitted", None, 0.0, 0.7])
+def test_missing_cost_with_dated_model_does_not_block_transform(
+    multi_query: bool, temperature: str | float | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+    import litellm
+    import openai
+
+    from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, LLMProfileSettings, RuntimeLLMProfile, lower_llm_profile_options
+
+    requests: list[dict[str, Any]] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "azure-response",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-2099-01-01",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": '{"score":1}' if multi_query else "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+            },
+        )
+
+    def forbidden(**kwargs: Any) -> None:
+        pytest.fail("Azure transform must not require a LiteLLM price lookup")
+
+    sdk = openai.AzureOpenAI(
+        api_key="probe-key",
+        azure_endpoint="https://probe.openai.azure.com",
+        api_version="2024-10-21",
+        http_client=httpx.Client(transport=httpx.MockTransport(reply)),
+    )
+    monkeypatch.setattr(openai, "AzureOpenAI", lambda **kwargs: sdk)
+    monkeypatch.setattr(litellm, "cost_per_token", forbidden)
+    monkeypatch.setattr(litellm, "completion_cost", forbidden)
+    config = _make_azure_config(deployment_name="private-production-deployment", prompt_template="{{ row.text }}")
+    if temperature != "omitted":
+        config["temperature"] = temperature
+    if multi_query:
+        config["queries"] = {
+            name: {"input_fields": {"text": "text"}, "output_fields": [{"suffix": "score", "type": "integer"}]}
+            for name in ("first", "second")
+        }
+    profile = RuntimeLLMProfile.from_settings(
+        "production",
+        LLMProfileSettings(
+            provider="azure",
+            model="private-production-deployment",
+            deployment_name="private-production-deployment",
+            endpoint="https://probe.openai.azure.com",
+            credential_scope="server",
+            credential_ref="AZURE_PROBE_KEY",
+        ),
+    )
+    config, _ = lower_llm_profile_options(
+        "production", profile, {key: value for key, value in config.items() if key not in LLM_PROFILE_PRIVATE_FIELDS}
+    )
+    assert config["api_key"] == {"secret_ref": "AZURE_PROBE_KEY", "secret_scope": "server"}
+    config["api_key"] = "probe-key"
+    writer = _FakeAuditWriter()
+    collector = CollectorOutputPort()
+    transform = LLMTransform(config)
+    try:
+        transform.on_start(make_context(**mock_audit_authority("test"), run_id="test", landscape=writer))
+        transform.connect_output(collector, max_pending=10)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=make_token("row-1"), landscape=writer)
+        transform.accept(make_pipeline_row({"text": "hello"}), ctx)
+        transform.flush_batch_processing(timeout=10)
+        assert len(collector.results) == 1
+        result = collector.results[0][1]
+        assert result.status == "success"
+        assert result.row is not None
+        expected_calls = 2 if multi_query else 1
+        assert len(requests) == expected_calls
+        assert writer.record_call.call_count == expected_calls
+        assert all(request["model"] == "private-production-deployment" for request in requests)
+        for request in requests:
+            if temperature is None or temperature == "omitted":
+                assert "temperature" not in request
+            else:
+                assert request["temperature"] == temperature
+        for prefix in ("first_", "second_") if multi_query else ("",):
+            assert result.row[f"{prefix}llm_response_model"] == "gpt-4o-2099-01-01"
+            assert result.row[f"{prefix}llm_response_usage"] == {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+    finally:
+        transform.close()
 
 
 class _RecordCallSpy:
@@ -145,6 +245,14 @@ def _make_azure_config(**overrides: object) -> dict[str, object]:
 
 class TestAzureOpenAIConfig:
     """Tests for AzureOpenAIConfig validation."""
+
+    def test_api_key_is_absent_from_config_representations(self) -> None:
+        credential = "azure-runtime-repr-test-value"
+        config = AzureOpenAIConfig.from_dict(_make_azure_config(api_key=credential))
+        assert credential not in repr(config)
+        assert credential not in str(config)
+        assert config.api_key == credential
+        assert config.model_dump()["api_key"] == credential
 
     def test_config_requires_deployment_name(self) -> None:
         """AzureOpenAIConfig requires deployment_name."""
@@ -307,7 +415,7 @@ class TestAzureOpenAIConfig:
             }
         )
         # Inherited from LLMConfig
-        assert config.temperature == 0.0
+        assert config.temperature is None
         assert config.max_tokens is None
         assert config.system_prompt is None
         assert config.response_field == "llm_response"

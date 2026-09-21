@@ -68,6 +68,11 @@ def _missing_required_env_keys(provider: str, *, endpoint_configured: bool) -> t
     """
     if endpoint_configured:
         return ()
+    # LiteLLM accepts either Azure OpenAI API-key spelling or an Entra
+    # bearer token. These are alternatives, not jointly required secrets.
+    # Azure AI uses its separate AZURE_AI_API_KEY contract below.
+    if provider == "azure" and any(key in os.environ and os.environ[key] for key in ("AZURE_OPENAI_API_KEY", "AZURE_AD_TOKEN")):
+        return ()
     return tuple(key for key in PROVIDER_REQUIRED_ENV_KEYS[provider] if key not in os.environ or not os.environ[key])
 
 
