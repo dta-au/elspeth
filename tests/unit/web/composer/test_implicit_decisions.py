@@ -22,7 +22,7 @@ import json
 import pytest
 
 from elspeth.contracts.freeze import deep_freeze
-from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
+from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report, merge_implicit_decisions_meta
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.source_demand import build_source_data_contract_draft, source_data_contract_artifact_hash
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
@@ -50,6 +50,49 @@ def _state_with_source_options(options: dict[str, object], *, plugin: str = "csv
 def _entries_by_path(state: CompositionState) -> dict[str, dict[str, object]]:
     report = build_implicit_decisions_report(state)
     return {str(entry["path"]): dict(entry) for entry in report["entries"]}
+
+
+def test_report_discloses_state_decisions_without_claiming_normalization_history() -> None:
+    """A state projection cannot claim that no normalization events occurred."""
+    report = build_implicit_decisions_report(_state_with_source_options({"path": "data/input.csv"}))
+
+    assert set(report) == {"schema_version", "entries"}
+    assert report["schema_version"] == 2
+    assert {entry["path"]: entry["value"] for entry in report["entries"]} == {
+        "source.path": "data/input.csv",
+        "source.on_validation_failure": "discard",
+    }
+
+
+def test_report_merge_replaces_prior_disclosure_without_mutating_prior_metadata() -> None:
+    """A new save must replace the old report, including its vestigial fields."""
+    prior_meta = deep_freeze(
+        {
+            "repair_turns_used": 1,
+            "implicit_decisions": {"schema_version": 1, "entries": [], "normalization_events": []},
+        }
+    )
+
+    merged = merge_implicit_decisions_meta(prior_meta, _state_with_source_options({"path": "data/input.csv"}))
+
+    assert merged == {
+        "repair_turns_used": 1,
+        "implicit_decisions": {
+            "schema_version": 2,
+            "entries": [
+                {"path": "source.path", "value": "data/input.csv", "category": "source", "provenance": "composer_selected"},
+                {
+                    "path": "source.on_validation_failure",
+                    "value": "discard",
+                    "category": "error_routing",
+                    "provenance": "default",
+                    "candidate_alternatives": ["discard", "named_sink"],
+                },
+            ],
+        },
+    }
+    assert prior_meta["implicit_decisions"]["schema_version"] == 1
+    assert "normalization_events" in prior_meta["implicit_decisions"]
 
 
 def test_blob_backed_source_path_records_blob_ref_sentinel() -> None:

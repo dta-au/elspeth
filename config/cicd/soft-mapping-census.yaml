@@ -774,7 +774,7 @@ files:
     Mapping[str, object]: 4
   src/elspeth/web/composer/implicit_decisions.py:
     Mapping[str, Any]: 3
-    dict[str, object]: 3
+    dict[str, object]: 2
   src/elspeth/web/composer/inventory_response_contracts.py:
     Mapping[str, object]: 1
   src/elspeth/web/composer/llm_response_parsing.py:
@@ -1047,5 +1047,5 @@ totals:
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1143
-  dict[str, object]: 408
-  soft: 2745
+  dict[str, object]: 407
+  soft: 2744
