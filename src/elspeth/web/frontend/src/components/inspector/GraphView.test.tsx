@@ -331,6 +331,23 @@ describe("GraphView", () => {
     expect(within(screen.getByTestId("node-classify")).getByText("llm_transform")).toBeInTheDocument();
   });
 
+  it.each([
+    { options: { model: "anthropic/claude-sonnet-4" }, label: "model anthropic/claude-sonnet-4" },
+    { options: { profile: "sonnet", resolved_model: "private-deployment" }, label: "profile sonnet" },
+    { options: {}, label: "configured LLM" },
+  ])("shows $label inside the LLM transform box and accessible description", ({ options, label }) => {
+    useSessionStore.setState({
+      compositionState: makeState({
+        nodes: [makeNode({ id: "classify", plugin: "llm", options })],
+      }),
+    });
+    render(<GraphView />);
+    const node = screen.getByTestId("node-classify");
+    expect(within(node).getByText(`llm · ${label}`)).toHaveAttribute("title", `llm · ${label}`);
+    expect(screen.getByRole("button", { name: new RegExp(`transform: classify.*${label}`) })).toBeInTheDocument();
+    expect(node).not.toHaveTextContent("private-deployment");
+  });
+
   it("counts nodes and shows success and failure outputs with LLM selection in the Graph tab", async () => {
     useSessionStore.setState({
       compositionState: makeState({
