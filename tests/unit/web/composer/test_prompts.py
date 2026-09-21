@@ -642,7 +642,7 @@ class TestBuildSystemPrompt:
         assert "Do not treat a missing or mismatched review handoff as a product blocker" in flattened
         assert "Before stopping, enumerate pending `interpretation_requirements` from the source and from every node" in flattened
         assert 'Use `affected_node_id="source"` for requirements stored on `source.options.interpretation_requirements`' in flattened
-        assert "If review handoff fails for a staged requirement" in flattened
+        assert "For persisted review kinds, if review handoff fails for a staged requirement" in flattened
         assert "do not describe the workflow as otherwise complete and ask whether to keep repairing" in flattened
         assert "For source rows or URLs you generated yourself, create a session blob first" in flattened
         assert "never put a guessed future file path such as `data/...` or `inputs/...`" in flattened
@@ -1537,7 +1537,7 @@ class TestMutationEchoOperatingContract:
         assert "Never call `get_pipeline_state` to confirm components named in that echo" in " ".join(section.split())
 
     def test_review_handoff_recovery_uses_mutation_echo_before_state_read(self) -> None:
-        section = SYSTEM_PROMPT.split("If review handoff fails for a staged requirement", 1)[1].split(
+        section = SYSTEM_PROMPT.split("For persisted review kinds, if review handoff fails for a staged requirement", 1)[1].split(
             "`interpretation_requirements` is always a JSON array", 1
         )[0]
         flattened = " ".join(section.split())

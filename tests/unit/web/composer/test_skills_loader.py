@@ -52,6 +52,45 @@ class TestLoadSkill:
         with pytest.raises(FileNotFoundError):
             load_skill("nonexistent_skill_that_does_not_exist")
 
+    def test_comparison_guidance_preserves_literal_prompts_and_control_variables(self) -> None:
+        normalized = " ".join(load_skill("pipeline_composer").split())
+
+        assert "Preserve supplied literal prompts character-for-character" in normalized
+        assert "A/B comparison" in normalized
+        assert "response format, output schema and enum values" in normalized
+        assert "output field names may differ" in normalized
+
+    def test_review_recovery_does_not_reopen_resolved_content(self) -> None:
+        normalized = " ".join(load_skill("pipeline_composer").split())
+
+        assert "If the matching requirement is already resolved" in normalized
+        assert "do not re-stage unchanged content" in normalized
+        assert "retry only if a matching pending requirement exists" in normalized
+
+    def test_warning_diagnosis_requires_evidence_before_mutating(self) -> None:
+        normalized = " ".join(load_skill("pipeline_composer").split())
+
+        assert "A high-severity warning does not establish its root cause" in normalized
+        assert "Do not attribute a schema or presence warning to LLM nondeterminism" in normalized
+        assert "If the same diagnostic survives a targeted repair" in normalized
+
+    def test_computed_source_review_is_exempt_from_persisted_requirement_precondition(self) -> None:
+        normalized = " ".join(load_skill("pipeline_composer").split())
+
+        assert "`source_data_contract` | backend (computed from current graph demand) | YOU" in normalized
+        assert "does not require a persisted `interpretation_requirements` row" in normalized
+        assert "For review kinds backed by persisted requirement rows" in normalized
+        assert "For persisted review kinds, if review handoff fails" in normalized
+        assert "For computed `source_data_contract` recovery, recheck current missing source-field demand" in normalized
+        assert "Do not call the review tool for a requirement that was not successfully staged" not in normalized
+
+    def test_runtime_explanations_distinguish_configuration_delivery_and_compliance(self) -> None:
+        normalized = " ".join(load_skill("pipeline_composer").split())
+
+        assert "Saved configuration does not prove the provider request bytes" in normalized
+        assert "provider receipt does not prove model compliance" in normalized
+        assert "observations, hypotheses, and verified causes" in normalized
+
 
 class TestLoadDeploymentSkill:
     """Deployment skill overlay loading."""

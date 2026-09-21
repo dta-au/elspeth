@@ -414,7 +414,7 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
                 "schema": {"mode": "observed"},
                 # The pre-existing vague_term must be WIRED (an unwired pending
                 # vague_term is rejected by the review contract): the parts ref
-                # survives the prompt_template patch, so the copied-forward row
+                # survives the structured prompt patch, so the copied-forward row
                 # stays resolvable in the patched state.
                 PROMPT_TEMPLATE_PARTS_KEY: [
                     {"kind": "text", "text": "Old "},
@@ -438,12 +438,24 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
         )
 
         result = _execute_patch_node_options(
-            {"node_id": "llm1", "patch": {"prompt_template": "New {{ row.text }}."}},
+            {
+                "node_id": "llm1",
+                "patch": {
+                    "prompt_template": "New pending interpretation {{ row.text }}.",
+                    PROMPT_TEMPLATE_PARTS_KEY: [
+                        {"kind": "text", "text": "New "},
+                        {"kind": "interpretation_ref", "requirement_id": "vague"},
+                        {"kind": "text", "text": " {{ row.text }}."},
+                    ],
+                },
+            },
             state,
             _ctx(),
         )
 
         assert result.success is True, result.data
+        assert result.updated_state.nodes[0].options["prompt_template"].startswith("New ")
+        assert "{{ row.text }}" in result.updated_state.nodes[0].options["prompt_template"]
         requirements = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
         # The composite LLM-review auto-stager attaches every default
         # gate; ``vague_term`` was pre-existing and copied forward, the
@@ -456,7 +468,7 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
             "llm_model_choice",
         ]
         assert requirements[1]["user_term"] == "llm_prompt_template:llm1"
-        assert requirements[1]["draft"] == "New {{ row.text }}."
+        assert requirements[1]["draft"] == result.updated_state.nodes[0].options["prompt_template"]
         assert requirements[2]["user_term"] == "llm_model_choice:llm1"
         assert requirements[2]["draft"] == "anthropic/claude-haiku-4.5"
 

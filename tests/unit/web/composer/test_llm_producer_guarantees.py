@@ -18,10 +18,12 @@ provider-independent output contract the lowered runtime build computes.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.llm.config_validation import GATEWAY_SUPPORTED_CAPABILITIES
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.state import (
@@ -296,6 +298,31 @@ def _fork_coalesce_summary(required: list[str] | None) -> ValidationSummary:
 
 
 class TestLlmProducerGuarantees:
+    def test_approved_profile_keeps_computed_contract(self) -> None:
+        """Server-stamped approval evidence is not an authored provider binding."""
+        node = _llm_node("recommend_pairing", "rows", "pairing_done", "complementary_colour")
+        digest = approved_prompt_artifact_hash(prompt_template=node.options["prompt_template"], system_prompt=node.options["system_prompt"])
+        node = replace(node, options={**node.options, "approved_prompt_artifact_hash": digest})
+        state = (
+            _base_state()
+            .with_node(node)
+            .with_node(_consumer("tidy_output", "pairing_done", ["colour", "complementary_colour"], {"complementary_colour": "pairing"}))
+        )
+
+        summary = _with_output(state).validate()
+
+        assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+        assert _probe_failed_warnings(summary) == []
+
+    def test_approval_digest_is_still_validated_by_profile_probe(self) -> None:
+        node = _llm_node("recommend_pairing", "rows", "pairing_done", "complementary_colour")
+        prepared = prepare_validation_probe_options({**node.options, "approved_prompt_artifact_hash": "a" * 64}, plugin="llm")
+
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        with pytest.raises(ValueError, match="approved_prompt_artifact_hash must match"):
+            get_shared_plugin_manager().create_transform("llm", prepared)
+
     def test_unbound_llm_draft_still_fails_closed(self) -> None:
         """The validation stub is profile lowering, not generic config repair."""
         summary = _linear_summary(["colour", "complementary_colour"], profile=None)

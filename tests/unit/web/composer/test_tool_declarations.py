@@ -528,7 +528,9 @@ class TestStep3DiscoveryTierMigration:
             "for what it does not cover: a component the change did not touch, or "
             "the whole document. A node or output request returns just `node` or "
             '`output`; `component="source"` returns the `sources` map; '
-            "`set_pipeline_arguments` returns the exact round-trip arguments. A "
+            "`set_pipeline_arguments` returns the flat pipeline document. For the web "
+            'set_pipeline tool, put that document inside {"pipeline": <document>}; do not '
+            "send its source/nodes/edges/outputs fields at the top level. A "
             "full-state read (no component, or an alias) returns the whole document "
             "with an `inspection` block: `requested_component` (what you asked for), "
             "`resolved_component` (always `full` here — the request matched a "
@@ -542,8 +544,9 @@ class TestStep3DiscoveryTierMigration:
                         "description": (
                             "Optional: return only one component — 'source', a node ID, or an output name. "
                             "Accepted full-state aliases: omit component, pass 'full', 'all', 'pipeline', "
-                            "or pass the empty string. Use 'set_pipeline_arguments' for the exact public "
-                            "payload accepted by set_pipeline; ordinary inspection output is diagnostic only."
+                            "or pass the empty string. Use 'set_pipeline_arguments' for the flat authoring document; "
+                            'the web set_pipeline call requires {"pipeline": <document>}. '
+                            "Ordinary inspection output is diagnostic only."
                         ),
                     },
                 },

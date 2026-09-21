@@ -448,6 +448,14 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "persona keep the SAME prompt_template and vary system_prompt — which is "
     "itself a reason to fork: system_prompt is shared by every query on a "
     "node, so a per-arm system prompt cannot be expressed as multi_query.",
+    "For a single-variable A/B comparison, vary only the requested experimental variable. "
+    "Keep model/profile, sampling settings, input rows, prompt_template, response_format, "
+    "and output_fields constraints equal unless one is the requested variable. Both arms "
+    "use the same enum values and extraction rules; output field names may differ to keep "
+    "results distinct. Structured output on one arm and free text on the other changes "
+    "the experiment. Compare the saved branch options before claiming only one variable differs.",
+    "Cleanup field_mapper mapping keys are existing INPUT fields; values are the desired OUTPUT names. "
+    "Its schema describes the INPUT row, so declare the arriving names there, not the renamed output names.",
     "Do not author interpretation_requirements rows for llm_prompt_template "
     "or llm_model_choice — required LLM reviews auto-stage on every llm "
     "node. Author rows only for the planner-owned kinds (vague_term wired "
@@ -662,6 +670,13 @@ _WEB_SCRAPE_HTTP_IDENTITY_RULES: Final[tuple[str, ...]] = (
 
 
 _USER_DISCLOSURE_RULES: Final[tuple[str, ...]] = (
+    "Separate observations, hypotheses, and verified causes when explaining a run. "
+    "Saved configuration does not prove the provider request bytes, and provider receipt does not prove model compliance. "
+    "If wire or execution evidence is unavailable, say which claim cannot be checked; do not conclude that one prompt "
+    "role overrode another or that a sampling setting caused an output without evidence that isolates that cause.",
+    "Preserve supplied literal prompts character-for-character, including capitalization, punctuation, and whitespace. "
+    "Do not silently normalize or improve them. If a required adaptation would change the supplied literal, "
+    "explain the needed change and obtain the user's decision before making it.",
     "In your user-facing reply, answer the user's design questions as well as explaining what you authored, "
     "including when the turn stops at review cards. Compare the actual saved prompt text with the user's words "
     "before describing it: say 'verbatim' or 'exactly as written' only for unchanged text. Adding row variables, "
@@ -908,6 +923,16 @@ def _llm_output_contract_rules(*, output_control: str | None) -> list[str]:
 
 
 _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
+    "On a surface advertising request_interpretation_review, use currently pending review sites "
+    "assigned to the planner in the review ownership matrix. For kinds backed by persisted requirements, use current state or the latest "
+    "mutation echo, not historical tool calls. If the matching requirement is already resolved, skip it; "
+    "do not re-stage unchanged content to obtain another approval. After a missing-pending-site rejection, "
+    "reconcile current status before retrying; absence alone does not authorize inventing a review row.",
+    "source_data_contract is a computed review site: current missing source fields establish the demand, "
+    "with no persisted interpretation_requirements row needed before the call. For a source the composer "
+    "cannot preflight, request that review using the source target and user_term='source_data_contract'; "
+    "omit llm_draft so the server computes it. Do not author a row or field list, and do not call it when "
+    "there is no current missing-field demand or the source content is composer-authored.",
     "pipeline_decision user_term values are a CLOSED registry — choose ONLY "
     "from registered_pipeline_decision_user_terms above. A minted term is "
     "unresolvable and poisons its review card.",
