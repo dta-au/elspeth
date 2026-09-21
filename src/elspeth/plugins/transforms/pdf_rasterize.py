@@ -7,6 +7,7 @@ import hashlib
 import re
 import shutil
 import tempfile
+from itertools import chain
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -29,6 +30,7 @@ from elspeth.plugins.infrastructure.rasterize.protocol import (
     DocumentRefusalKind,
     PageRefusalKind,
     RasterizeResponse,
+    RefusedPage,
     RenderedPage,
 )
 from elspeth.plugins.infrastructure.rasterize.renderer import PoolRenderer, RenderLimits, RenderResult, RenderTimedOut
@@ -367,7 +369,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3a016be956cf93db"
+    source_file_hash: str | None = "sha256:9d3d1b4c3b85addd"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -628,9 +630,26 @@ class PDFRasterize(BaseTransform):
         return TransformResult.error(reason, retryable=False)
 
     def _map_rasterize_response(self, response: RasterizeResponse, *, blob_ref: str, row: PipelineRow, output_dir: Path) -> TransformResult:
+        # Assert the worker's complete partition before policy handling or page IO.
+        # A broken worker protocol is a framework bug, not a document refusal.
+        if type(response.page_count) is not int or not 0 <= response.page_count <= self._max_pages:
+            raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: page_count outside configured bounds")
+        seen: set[int] = set()
+        for page_result in chain[RenderedPage | RefusedPage](response.rendered, response.refused):
+            number = page_result.page_number
+            if type(number) is not int or not 1 <= number <= response.page_count:
+                raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: page number outside document bounds")
+            if number in seen:
+                raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: duplicate page number")
+            seen.add(number)
+        # Unique in-range members with this cardinality cover exactly 1..page_count.
+        if len(seen) != response.page_count:
+            raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: missing pages")
+
         field_name = self._blob_ref_field
         refused_entries: list[dict[str, Any]] = [
-            {"page_number": refused.page_number, "kind": refused.kind.value, "detail": refused.detail} for refused in response.refused
+            {"page_number": refused.page_number, "kind": refused.kind.value, "detail": refused.detail}
+            for refused in sorted(response.refused, key=lambda item: item.page_number)
         ]
 
         if not response.rendered:
@@ -676,7 +695,7 @@ class PDFRasterize(BaseTransform):
         base = row.to_dict()
         output_rows: list[dict[str, Any]] = []
         resolved_output_dir = output_dir.resolve()
-        for page in response.rendered:
+        for page in sorted(response.rendered, key=lambda item: item.page_number):
             resolved_png_path = page.png_path.resolve()
             if not resolved_png_path.is_relative_to(resolved_output_dir):
                 # The spawn worker parses hostile PDF bytes; a compromised worker returning

@@ -181,6 +181,70 @@ def test_worker_contract_violation_text_none_with_extract_text_enabled_is_a_fram
         transform.process(make_pipeline_row({"blob_ref": ref}), make_context())
 
 
+@pytest.mark.parametrize("policy", ["fail_document", "emit_rendered"])
+@pytest.mark.parametrize(
+    ("page_count", "rendered", "refused"),
+    [
+        pytest.param(3, (2, 2), (), id="duplicate-rendered"),
+        pytest.param(3, (1, 1, 3), (), id="duplicate-rendered-same-count"),
+        pytest.param(3, (1, 3), (), id="missing"),
+        pytest.param(3, (), (), id="all-missing"),
+        pytest.param(3, (1, 2, 4), (), id="out-of-range"),
+        pytest.param(3, (0, 2, 3), (), id="zero-page-number"),
+        pytest.param(3, (-1, 2, 3), (), id="negative-page-number"),
+        pytest.param(3, (1, 2, 3), (2,), id="overlap"),
+        pytest.param(3, (1, 2), (2,), id="overlap-same-count"),
+        pytest.param(3, (1, 3), (2, 2), id="duplicate-refused"),
+        pytest.param(3, (1,), (2, 2), id="duplicate-refused-same-count"),
+        pytest.param(3, (1, 2), (4,), id="refused-out-of-range"),
+        pytest.param(3, (), (1, 2), id="refused-incomplete"),
+        pytest.param(0, (1,), (), id="nonempty-zero-count"),
+        pytest.param(-1, (1,), (), id="negative-count"),
+        pytest.param(201, (1,), (), id="over-limit-count"),
+        pytest.param(True, (1,), (), id="boolean-count"),
+        pytest.param(1.0, (1,), (), id="float-count"),
+        pytest.param(1, (True,), (), id="boolean-page"),
+        pytest.param(1, (1.0,), (), id="float-page"),
+        pytest.param(1, (), (True,), id="boolean-refused-page"),
+        pytest.param(1, (), (1.0,), id="float-refused-page"),
+    ],
+)
+def test_invalid_worker_page_partition_fails_before_publishing(
+    store: FilesystemPayloadStore, policy: str, page_count: int, rendered: tuple[int, ...], refused: tuple[int, ...]
+) -> None:
+    ref = store.store(minimal_pdf(3))
+    response = RasterizeResponse(
+        page_count=page_count,
+        rendered=tuple(_page(number) for number in rendered),
+        refused=tuple(RefusedPage(number, PageRefusalKind.RENDER_ERROR, "boom") for number in refused),
+    )
+    renderer = _StubRenderer(response, tuple(PNG for _ in rendered))
+    transform = _transform(store, renderer, on_page_failure=policy)
+    with pytest.raises(FrameworkBugError, match="page partition"):
+        transform.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert not store.exists(hashlib.sha256(PNG).hexdigest())
+    assert renderer.discarded and not renderer.discarded[0].exists()
+
+
+def test_worker_page_partition_is_emitted_in_canonical_order(store: FilesystemPayloadStore) -> None:
+    ref = store.store(minimal_pdf(4))
+    response = RasterizeResponse(
+        page_count=4,
+        rendered=(_page(3, "third"), _page(1, "first")),
+        refused=(RefusedPage(4, PageRefusalKind.RENDER_ERROR, "fourth"), RefusedPage(2, PageRefusalKind.RENDER_ERROR, "second")),
+    )
+    renderer = _StubRenderer(response, (PNG + b"third", PNG + b"first"))
+    result = _transform(store, renderer, on_page_failure="emit_rendered").process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert [row["page_number"] for row in result.rows] == [1, 3]
+    assert [row["page_text"] for row in result.rows] == ["first", "third"]
+    assert [store.retrieve(row["page_blob_ref"]) for row in result.rows] == [PNG + b"first", PNG + b"third"]
+    assert result.success_reason["metadata"]["refused_pages"] == [
+        {"page_number": 2, "kind": "render_error", "detail": "second"},
+        {"page_number": 4, "kind": "render_error", "detail": "fourth"},
+    ]
+
+
 def test_page_png_path_outside_output_dir_raises_containment_error(store: FilesystemPayloadStore, tmp_path: Path) -> None:
     """A worker-returned png_path outside its own render output_dir is a containment
 
