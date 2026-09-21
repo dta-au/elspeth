@@ -69,6 +69,20 @@ database incident is fixed.
 
 ## Release boundary
 
+The complete default suite exercised production tree `b08fe591d`: 55,462
+passed, with four test failures. Three assumed a complete live model catalog;
+the fourth assumed a foreign lease always had its full lifetime remaining.
+The subsequent changes affect only those test fixtures: all 425 planner tests,
+23 guided-projection tests and four checkpoint tests passed. A controlled
+aged-lease reproduction and a deliberate wall-clock-wait regression verified
+the checkpoint test's corrected assertions.
+
+The serial PostgreSQL suite passed all 542 selected tests on `f23f4498e`.
+The later production changes affect only cost parsing and planner catalog
+projection; the tested persistence implementation is unchanged. These local
+results do not establish live Azure acceptance. The existing package signing
+gate remains outstanding; the compared lint corpus gained no new violations.
+
 The dedicated Composer `cost_unavailable` failure vocabulary requires Sessions
 schema epoch 64. The existing pre-1.0 recreation policy applies; no production
 store is recreated as part of this code merge. The core cost and temperature

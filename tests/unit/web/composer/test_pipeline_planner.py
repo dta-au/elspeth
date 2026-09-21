@@ -9128,6 +9128,7 @@ async def test_planner_schema_discovery_failure_never_marks_the_session_tracker(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("complete_model_catalog_aid")
 async def test_aid_deferral_arms_keep_the_manifest_discoverable(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -9169,7 +9170,20 @@ async def test_aid_deferral_arms_keep_the_manifest_discoverable(
     assert {"list_models", "get_expression_grammar"} <= names
 
 
+@pytest.fixture
+def complete_model_catalog_aid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise supplied-aid semantics independently of SDK catalog growth."""
+    from elspeth.web.composer import planner_authoring_aids
+
+    monkeypatch.setattr(planner_authoring_aids, "read_litellm_model_list", lambda: ("bedrock/test-model",))
+    monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: frozenset({"openai/gpt-4o"}))
+    catalog = planner_authoring_aids.planner_model_catalog()
+    assert catalog["models_omitted"] == []
+    assert catalog["models_by_provider"] == {"bedrock": ["bedrock/test-model"], "openrouter": ["openai/gpt-4o"]}
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("complete_model_catalog_aid")
 async def test_aid_supplied_no_gain_pair_in_one_turn_never_escalates(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -9201,6 +9215,8 @@ async def test_aid_supplied_no_gain_pair_in_one_turn_never_escalates(
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    initial_payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    assert initial_payload["information_manifest"]["supplied"]["model_catalog"] == "authoring_aids"
     assert len(completion.requests) == 2
     # Not the hatch: the follow-up turn stays on the planner model.
     assert completion.requests[1]["model"] == "anthropic/claude-planner"
@@ -9210,6 +9226,7 @@ async def test_aid_supplied_no_gain_pair_in_one_turn_never_escalates(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("complete_model_catalog_aid")
 async def test_aid_supplied_no_gain_calls_across_turns_never_escalate(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -9235,6 +9252,8 @@ async def test_aid_supplied_no_gain_calls_across_turns_never_escalate(
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    initial_payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    assert initial_payload["information_manifest"]["supplied"]["model_catalog"] == "authoring_aids"
     assert len(completion.requests) == 3
     assert [request["model"] for request in completion.requests] == ["anthropic/claude-planner"] * 3
     for request_index in (1, 2):
@@ -9246,6 +9265,7 @@ async def test_aid_supplied_no_gain_calls_across_turns_never_escalate(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("complete_model_catalog_aid")
 async def test_aid_supplied_tools_stay_in_the_palette_after_a_discovery_turn(
     tmp_path: Path,
     tool_context: ToolContext,

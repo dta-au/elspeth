@@ -1777,7 +1777,9 @@ def test_transform_with_on_error_omitted_projects_the_derived_discard_error_flow
 
 
 @pytest.mark.asyncio
-async def test_guided_planner_request_carries_evidence_and_manifest_without_private_values(tmp_path: Path) -> None:
+async def test_guided_planner_request_carries_evidence_and_manifest_without_private_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The guided planner provider request's Task-10 additions leak nothing.
 
     Pins the request-level context the planner actually sends: the
@@ -1788,6 +1790,15 @@ async def test_guided_planner_request_carries_evidence_and_manifest_without_priv
     addition, evidence content included (no option values, no policy-hidden
     identities).
     """
+    from elspeth.web.composer import planner_authoring_aids
+
+    # This scenario pins supplied-aid semantics, independent of SDK catalog growth.
+    monkeypatch.setattr(planner_authoring_aids, "read_litellm_model_list", lambda: ("bedrock/test-model",))
+    monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: frozenset({"openai/gpt-4o"}))
+    catalog = planner_authoring_aids.planner_model_catalog()
+    assert catalog["models_omitted"] == []
+    assert catalog["models_by_provider"] == {"bedrock": ["bedrock/test-model"], "openrouter": ["openai/gpt-4o"]}
+
     # A deferred intent carrying the private option path/value canaries rides
     # the session, so the DEFERRED_* sweeps below can actually fail: the
     # provider projection must reduce the constraint to closed structural
