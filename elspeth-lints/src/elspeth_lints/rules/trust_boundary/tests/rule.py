@@ -77,6 +77,7 @@ from elspeth_lints.rules.trust_boundary.shared import (
     iter_boundary_decorators,
     load_honesty_gate_allowlist,
     make_decorator_finding,
+    package_name_for_file,
     repository_root,
 )
 from elspeth_lints.rules.trust_boundary.tests.metadata import (
@@ -150,6 +151,7 @@ class TrustBoundaryTestsRule:
             return analyze_tree(
                 tree,
                 display_path(file_path, context.root),
+                package_name=package_name_for_file(file_path),
                 repo_root=repository_root(context.root, context.repo_root),
             )
         return scan_root(
@@ -161,10 +163,10 @@ class TrustBoundaryTestsRule:
         )
 
 
-def analyze_tree(tree: ast.AST, file_path: str, *, repo_root: Path) -> list[Finding]:
+def analyze_tree(tree: ast.AST, file_path: str, *, repo_root: Path, package_name: str | None = None) -> list[Finding]:
     """Return ``trust_boundary.tests`` findings for one parsed syntax tree."""
     findings: list[Finding] = []
-    for match in iter_boundary_decorators(tree):
+    for match in iter_boundary_decorators(tree, package_name=package_name):
         func_node = match.function
         call = match.call
         extraction = extract_keywords(call, implicit_non_raising=match.non_raising)
@@ -421,7 +423,11 @@ def scan_root(
         # rule-id-specific finding.
         if isinstance(item, (PythonSyntaxError, PythonFileReadError)):
             continue
-        findings.extend(analyze_tree(item.tree, display_path(item.path, root), repo_root=resolved_repo_root))
+        findings.extend(
+            analyze_tree(
+                item.tree, display_path(item.path, root), repo_root=resolved_repo_root, package_name=package_name_for_file(item.path)
+            )
+        )
     return filter_allowlisted_findings(
         findings,
         allowlist,

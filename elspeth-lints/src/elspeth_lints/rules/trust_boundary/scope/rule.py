@@ -81,6 +81,7 @@ from elspeth_lints.rules.trust_boundary.shared import (
     iter_trust_boundary_decorators,
     load_honesty_gate_allowlist,
     make_decorator_finding,
+    package_name_for_file,
 )
 
 _ALLOWLIST_RULE_IDS = frozenset({RULE_NOPARAM, RULE_DEAD, RULE_NONLITERAL})
@@ -97,7 +98,7 @@ class TrustBoundaryScopeRule:
     def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> list[Finding]:
         """Analyze one tree directly (for focused tests) or walk the scan root."""
         if isinstance(tree, ast.Module) and tree.body and file_path.suffix == ".py":
-            return analyze_tree(tree, display_path(file_path, context.root))
+            return analyze_tree(tree, display_path(file_path, context.root), package_name=package_name_for_file(file_path))
         return scan_root(
             context.root,
             allowlist_dir_override=context.allowlist_dir_override,
@@ -106,10 +107,10 @@ class TrustBoundaryScopeRule:
         )
 
 
-def analyze_tree(tree: ast.AST, file_path: str) -> list[Finding]:
+def analyze_tree(tree: ast.AST, file_path: str, *, package_name: str | None = None) -> list[Finding]:
     """Return ``trust_boundary.scope`` findings for one parsed syntax tree."""
     findings: list[Finding] = []
-    for func_node, call in iter_trust_boundary_decorators(tree):
+    for func_node, call in iter_trust_boundary_decorators(tree, package_name=package_name):
         extraction = extract_keywords(call)
         if extraction.kwargs is None:
             # Non-literal kwarg (or **-unpacking / positional args). Per the
@@ -193,7 +194,7 @@ def scan_root(
         # in trust_boundary/tests/rule.py::scan_root.
         if isinstance(item, (PythonSyntaxError, PythonFileReadError)):
             continue
-        findings.extend(analyze_tree(item.tree, display_path(item.path, root)))
+        findings.extend(analyze_tree(item.tree, display_path(item.path, root), package_name=package_name_for_file(item.path)))
     return filter_allowlisted_findings(
         findings,
         allowlist,

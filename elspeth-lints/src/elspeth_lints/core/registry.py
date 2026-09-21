@@ -5,9 +5,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from importlib import metadata
 from pathlib import Path
-from typing import Any
 
 from elspeth_lints.core.protocols import Category, Finding, Rule, RuleContext, RuleMetadata, RuleScope, Severity
 
@@ -91,20 +89,6 @@ class RuleRegistry:
         for rule in BUILTIN_RULES:
             if rule.id not in self._rules:
                 self.register(rule)
-
-    def load_entry_points(self, group: str = "elspeth_lints.rules") -> None:
-        """Load rule objects or callables exposed through package entry points."""
-        entry_points = metadata.entry_points()
-        selected = entry_points.select(group=group)
-        for entry_point in selected:
-            loaded: Any = entry_point.load()
-            if isinstance(loaded, Rule):
-                if loaded.id not in self._rules:
-                    self.register(loaded)
-            elif callable(loaded):
-                self.register_callable(entry_point.name, loaded)
-            else:
-                raise TypeError(f"entry point {entry_point.name!r} did not load a rule or callable")
 
 
 DEFAULT_REGISTRY = RuleRegistry()

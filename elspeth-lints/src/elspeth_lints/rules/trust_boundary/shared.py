@@ -13,6 +13,8 @@ Recognised decorator spellings (matching the runtime import surface):
 * ``@elspeth.contracts.trust_boundary(...)`` (fully qualified attribute chain);
 * ``@contracts.trust_boundary(...)`` (shortened attribute chain).
 * ``@tb_mod.trust_boundary(...)`` after importing the decorator module as an alias.
+* Package-resolved relative imports and wildcard imports from the two canonical
+  ELSPETH export modules. Relative imports require the scanned file's package.
 
 Bare-decorator usage (``@trust_boundary`` without a call) is not recognised:
 the runtime decorator is keyword-only and never appears without arguments.
@@ -30,12 +32,14 @@ import hashlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.util import resolve_name
 from pathlib import Path
 
 from elspeth_lints.core.allowlist import Allowlist, AllowlistEntry, FindingKey, load_allowlist, verify_entry_binding_against_finding
 from elspeth_lints.core.allowlist_governance import allowlist_governance_findings
 from elspeth_lints.core.boundary_aliases import (
     BoundaryDecoratorKind,
+    ImportAliasEffect,
     argument_names,
     assignment_target_names,
     evaluate_alias_flow,
@@ -49,6 +53,48 @@ from elspeth_lints.core.boundary_aliases import (
 from elspeth_lints.core.protocols import Finding, RuleMetadata
 
 TRUST_BOUNDARY_ALLOWLIST_DIR = "enforce_trust_boundary_honesty"
+
+
+def _canonical_star_exports(module: str) -> tuple[str, ...]:
+    """Read the owned literal export contract without importing runtime code.
+
+    This workspace-only analyzer reads its own checkout, never a source path
+    supplied by the scanned import. Export drift fails closed instead of
+    silently treating an unknown wildcard as granting marker identity.
+    """
+    relative_path = {
+        "elspeth.contracts": "src/elspeth/contracts/__init__.py",
+        "elspeth.contracts.trust_boundary": "src/elspeth/contracts/trust_boundary.py",
+    }[module]
+    source_path = Path(__file__).resolve().parents[5] / relative_path
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    exports = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+    ]
+    if len(exports) != 1 or not isinstance(exports[0], ast.List):
+        raise ValueError(f"Canonical boundary export contract must define one literal __all__ list: {source_path}")
+    names: list[str] = []
+    for element in exports[0].elts:
+        if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+            raise ValueError(f"Canonical boundary __all__ must contain only literal names: {source_path}")
+        names.append(element.value)
+    return tuple(names)
+
+
+def package_name_for_file(file_path: Path) -> str | None:
+    """Resolve the scanned file's package independently of its display path.
+
+    Follow Python's regular-package layout; never infer ELSPETH identity from
+    a matching directory suffix in an unrelated package.
+    """
+    parts: list[str] = []
+    directory = file_path.resolve().parent
+    while (directory / "__init__.py").is_file():
+        parts.append(directory.name)
+        directory = directory.parent
+    return ".".join(reversed(parts)) if parts else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,8 +125,10 @@ def _boundary_decorator(decorator: ast.expr, *, import_aliases: Mapping[str, str
 class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
     """Find Elspeth trust-boundary decorators with lexical import awareness."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, package_name: str | None = None) -> None:
         self.matches: list[BoundaryDecoratorMatch] = []
+        self._package_name = package_name
+        self._star_exports: dict[str, tuple[str, ...]] = {}
         self._import_alias_stack: list[tuple[str, dict[str, str]]] = [("module", {})]
         self._import_alias_mutation_stack: list[tuple[dict[str, str], set[str]]] = []
 
@@ -121,8 +169,36 @@ class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
         for name in bound_names:
             self._import_aliases.pop(name, None)
 
+    def _resolve_import(self, node: ast.Import | ast.ImportFrom) -> ImportAliasEffect:
+        """Recognise canonical relative/star imports for honesty checks only.
+
+        Unknown stars still invalidate aliases. Known stars rebind exactly
+        their literal export set, preserving unrelated aliases while replacing
+        aliases whose names collide with exported non-marker objects.
+        The suppression walker retains its conservative default resolver.
+        """
+        if isinstance(node, ast.Import):
+            return import_alias_effect(node)
+        module = node.module
+        if node.level:
+            if self._package_name is None:
+                return import_alias_effect(node)
+            try:
+                module = resolve_name("." * node.level + (module or ""), self._package_name)
+            except ImportError:
+                return import_alias_effect(node)
+        if any(alias.name == "*" for alias in node.names):
+            if module not in {"elspeth.contracts.trust_boundary", "elspeth.contracts"}:
+                return import_alias_effect(node)
+            if module not in self._star_exports:
+                self._star_exports[module] = _canonical_star_exports(module)
+            return ImportAliasEffect(proven=tuple((name, f"{module}.{name}") for name in self._star_exports[module]))
+        if module is None:
+            return import_alias_effect(node)
+        return ImportAliasEffect(proven=tuple((alias.asname or alias.name, f"{module}.{alias.name}") for alias in node.names))
+
     def _apply_import(self, node: ast.Import | ast.ImportFrom) -> None:
-        effect = import_alias_effect(node)
+        effect = self._resolve_import(node)
         if effect.clears_all:
             self._record_alias_mutations(self._import_aliases)
             self._import_aliases.clear()
@@ -234,7 +310,7 @@ class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
         if target is not None:
             for name in assignment_target_names(target):
                 flow_entry.pop(name, None)
-        flow_paths = evaluate_alias_flow(body, flow_entry)
+        flow_paths = evaluate_alias_flow(body, flow_entry, resolve_import=self._resolve_import)
 
         self._restore_aliases(entry_aliases)
         if target is not None:
@@ -257,7 +333,7 @@ class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
         normal_exit = identical_alias_join((entry_aliases, *normal_paths))
         self._restore_aliases(normal_exit)
         self._visit_statements(orelse)
-        orelse_paths = evaluate_alias_flow(orelse, normal_exit)
+        orelse_paths = evaluate_alias_flow(orelse, normal_exit, resolve_import=self._resolve_import)
         post_loop_paths = [dict(path.aliases) for path in orelse_paths if path.transfer is None]
         self._join_alias_paths((*post_loop_paths, *break_paths))
 
@@ -347,7 +423,7 @@ class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
 
     def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
         start = dict(self._import_aliases)
-        finally_entry = evaluate_finally_entry_aliases(node, start) if node.finalbody else None
+        finally_entry = evaluate_finally_entry_aliases(node, start, resolve_import=self._resolve_import) if node.finalbody else None
         self._restore_aliases(start)
         body_aliases, body_mutations = self._visit_tracked_statements(node.body)
         if node.orelse:
@@ -387,6 +463,8 @@ class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
 
 def iter_trust_boundary_decorators(
     tree: ast.AST,
+    *,
+    package_name: str | None = None,
 ) -> Iterator[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.Call]]:
     """Yield ``(function_node, decorator_call)`` for every ``@trust_boundary`` in ``tree``.
 
@@ -397,15 +475,15 @@ def iter_trust_boundary_decorators(
     Ordering is deterministic: statements are visited in lexical order while
     preserving import aliases visible at each decorator site.
     """
-    visitor = _TrustBoundaryDecoratorVisitor()
+    visitor = _TrustBoundaryDecoratorVisitor(package_name=package_name)
     visitor.visit(tree)
     for match in visitor.matches:
         yield match.function, match.call
 
 
-def iter_boundary_decorators(tree: ast.AST) -> Iterator[BoundaryDecoratorMatch]:
+def iter_boundary_decorators(tree: ast.AST, *, package_name: str | None = None) -> Iterator[BoundaryDecoratorMatch]:
     """Yield boundary markers with their import-resolved semantic kind."""
-    visitor = _TrustBoundaryDecoratorVisitor()
+    visitor = _TrustBoundaryDecoratorVisitor(package_name=package_name)
     visitor.visit(tree)
     yield from visitor.matches
 

@@ -2188,6 +2188,61 @@ class TestRequiredModeAutoWireAids:
         assert PROMPT_SHIELD_WARNING_DRAFT in rendered
 
 
+class TestSessionRepairGuidance:
+    """Prompt-content contracts; provider adherence needs a separate live evaluation."""
+
+    def test_single_variable_comparison_keeps_output_constraints_equal(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["fork_coalesce"]["rules"])
+
+        assert "A/B comparison" in rules
+        assert "response_format" in rules
+        assert "output_fields" in rules
+        assert "same enum values" in rules
+        assert "model/profile, sampling settings" in rules
+        assert "output field names may differ" in rules
+
+    def test_supplied_prompt_text_cannot_be_silently_normalized(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["user_disclosure"]["rules"])
+
+        assert "Preserve supplied literal prompts character-for-character" in rules
+        assert "capitalization, punctuation, and whitespace" in rules
+
+    def test_review_tool_requires_current_pending_site(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
+
+        assert "currently pending" in rules
+        assert "already resolved" in rules
+        assert "do not re-stage unchanged content" in rules
+
+    def test_fork_cleanup_teaches_mapping_direction(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["fork_coalesce"]["rules"])
+
+        assert "field_mapper mapping keys are existing INPUT fields" in rules
+        assert "values are the desired OUTPUT names" in rules
+
+    def test_computed_source_contract_demand_does_not_require_a_persisted_review_row(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["review_registry"]["rules"]
+        source_rules = [rule for rule in rules if "source_data_contract" in rule]
+
+        assert source_rules, "Computed source review must remain reachable under pending-site guidance"
+        assert any("no persisted interpretation_requirements row" in rule for rule in source_rules)
+        assert any("current missing source fields" in rule for rule in source_rules)
+        assert not any("call it only for a currently pending requirement" in rule for rule in rules)
+
+    def test_saved_configuration_does_not_prove_provider_delivery_or_compliance(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["user_disclosure"]["rules"])
+
+        assert "Saved configuration does not prove the provider request bytes" in rules
+        assert "provider receipt does not prove model compliance" in rules
+        assert "observations, hypotheses, and verified causes" in rules
+
+
 class TestModelCustody:
     """Suite run 1 G2 (8/8): never-invent had no sanctioned alternative."""
 

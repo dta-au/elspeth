@@ -63,6 +63,7 @@ from elspeth_lints.core.allowlist import (
     AllowlistEntry,
     JudgeVerdict,
     iter_allowlist_root_yaml_paths,
+    validate_persisted_judge_verdicts,
 )
 from elspeth_lints.core.allowlist_io import (
     AllowlistIOError,
@@ -289,7 +290,7 @@ def write_override_rate_counter_snapshot(
 
 
 def load_override_rate_counter_snapshot(snapshot_path: Path) -> OverrideRateCounterSnapshot:
-    """Load a counter snapshot from disk with structural validation."""
+    """Load a counter snapshot with structural and persisted-verdict validation."""
     try:
         raw = strict_json_loads(snapshot_path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -577,7 +578,7 @@ def _counter_record_from_json(raw: Any, snapshot_path: Path) -> JudgeVerdictCoun
     verdict = _judge_verdict_from_snapshot(raw.get("judge_verdict"), snapshot_path, "judge_verdict")
     if verdict is None:
         raise OverrideRateError(f"counter snapshot {snapshot_path} record judge_verdict must not be null")
-    return JudgeVerdictCounterRecord(
+    record = JudgeVerdictCounterRecord(
         source_file=_required_snapshot_field(raw, "source_file", str, snapshot_path),
         entry_key=_required_snapshot_field(raw, "entry_key", str, snapshot_path),
         rule_id=_required_snapshot_field(raw, "rule_id", str, snapshot_path),
@@ -590,6 +591,15 @@ def _counter_record_from_json(raw: Any, snapshot_path: Path) -> JudgeVerdictCoun
         ),
         judge_metadata_signature=_required_snapshot_field(raw, "judge_metadata_signature", str, snapshot_path),
     )
+    try:
+        validate_persisted_judge_verdicts(
+            record.judge_verdict,
+            record.judge_model_verdict,
+            context=f"counter snapshot {snapshot_path} record {record.source_file}::{record.entry_key}",
+        )
+    except ValueError as exc:
+        raise OverrideRateError(str(exc)) from exc
+    return record
 
 
 def _required_snapshot_field(raw: dict[str, Any], field: str, expected_type: type, snapshot_path: Path) -> Any:

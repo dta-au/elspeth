@@ -31,6 +31,7 @@ its boundary probe.
 
 from __future__ import annotations
 
+import json
 import textwrap
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,7 @@ from elspeth_lints.core.override_rate import (
     append_judge_decision_event,
     compute_override_rate,
     default_counter_snapshot_path,
+    load_override_rate_counter_snapshot,
     write_override_rate_counter_snapshot,
 )
 
@@ -588,6 +590,88 @@ def test_counter_snapshot_is_consumed_without_yaml_rescan(
     assert detail.report.judged_in_window == 2
     assert detail.report.accepted_in_window == 1
     assert detail.report.overrides_in_window == 1
+
+
+@pytest.mark.parametrize("source", ["yaml", "counter_snapshot"])
+@pytest.mark.parametrize("verdict", list(JudgeVerdict))
+@pytest.mark.parametrize("model_verdict", [None, *JudgeVerdict])
+def test_persisted_verdict_invariants_match_across_counter_sources(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: str,
+    verdict: JudgeVerdict,
+    model_verdict: JudgeVerdict | None,
+) -> None:
+    """Both gate paths accept exactly the three persistable verdict pairs."""
+    from elspeth_lints.core.cli import main
+
+    enforce_root = _make_allowlist_dir(tmp_path)
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    key = "x.py:R1:accepted:fp=aa"
+    _write_entry(
+        enforce_root / "enforce_x",
+        file_name="accepted.yaml",
+        key=key,
+        verdict=JudgeVerdict.ACCEPTED.value if source == "counter_snapshot" else verdict.value,
+        recorded_at=now - timedelta(days=1),
+        model_verdict=model_verdict.value if source == "yaml" and model_verdict is not None else None,
+    )
+    snapshot_path = None
+    if source == "counter_snapshot":
+        snapshot_path = write_override_rate_counter_snapshot(enforce_root).path
+        payload = json.loads(snapshot_path.read_text())
+        payload["records"][0]["judge_verdict"] = verdict.value
+        payload["records"][0]["judge_model_verdict"] = model_verdict.value if model_verdict is not None else None
+        snapshot_path.write_text(json.dumps(payload))
+
+    valid_pair = (verdict, model_verdict) in {
+        (JudgeVerdict.ACCEPTED, None),
+        (JudgeVerdict.OVERRIDDEN_BY_OPERATOR, JudgeVerdict.ACCEPTED),
+        (JudgeVerdict.OVERRIDDEN_BY_OPERATOR, JudgeVerdict.BLOCKED),
+    }
+    if not valid_pair:
+        if snapshot_path is not None:
+            with pytest.raises(OverrideRateError, match=r"judge_.*verdict") as exc:
+                load_override_rate_counter_snapshot(snapshot_path)
+            assert str(snapshot_path) in str(exc.value)
+            assert key in str(exc.value)
+        with pytest.raises(OverrideRateError, match=r"judge_.*verdict"):
+            compute_override_rate(
+                allowlist_root=enforce_root,
+                window_days=30,
+                min_samples=1,
+                max_rate=1.0,
+                reference_time=now,
+                counter_snapshot_path=snapshot_path,
+            )
+        exit_code = main(
+            [
+                "check-override-rate",
+                "--allowlist-root",
+                str(enforce_root),
+                "--reference-time",
+                now.isoformat(),
+            ]
+        )
+        assert exit_code == 2
+        assert "cannot run" in capsys.readouterr().err
+        return
+
+    detail = compute_override_rate(
+        allowlist_root=enforce_root,
+        window_days=30,
+        min_samples=1,
+        max_rate=1.0,
+        reference_time=now,
+        counter_snapshot_path=snapshot_path,
+    )
+    assert detail.counter_source == source
+    assert detail.report.judged_in_window == 1
+    assert detail.report.accepted_in_window == int(verdict is JudgeVerdict.ACCEPTED)
+    assert detail.report.overrides_in_window == int(verdict is JudgeVerdict.OVERRIDDEN_BY_OPERATOR)
+    assert detail.report.model_blocked_in_window == int(model_verdict is JudgeVerdict.BLOCKED)
+    assert detail.report.model_accepted_in_window == int(model_verdict is not JudgeVerdict.BLOCKED)
+    assert detail.report.passes
 
 
 def test_cli_snapshot_hash_read_error_returns_gate_broken_exit_two(

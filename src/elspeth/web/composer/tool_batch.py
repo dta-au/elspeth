@@ -979,19 +979,20 @@ async def run_tool_batch(
                     version_before=state.version,
                     actor=actor,
                 )
-                error_payload = {"error": "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."}
+                envelope_error = "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."
+                error_payload = {"error": envelope_error}
                 recorder.record(
                     finish_arg_error(
                         audit,
                         error_class="TypeError",
-                        error_message="invalid provider argument envelope",
+                        error_message=envelope_error,
                         error_payload=error_payload,
                     )
                 )
                 _append_tool_outcome(
                     response=None,
                     error_class="TypeError",
-                    error_message="invalid provider argument envelope",
+                    error_message=envelope_error,
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
