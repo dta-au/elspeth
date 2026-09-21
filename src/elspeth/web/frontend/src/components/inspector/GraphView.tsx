@@ -39,7 +39,6 @@ import dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
-import { selectApprovedInterpretations, useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { projectGuidedGraph } from "@/components/chat/guided/guidedGraphProjection";
 import { GuidedGraphPane } from "./GuidedGraphPane";
 import { useTheme } from "@/hooks/useTheme";
@@ -64,7 +63,6 @@ import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphOutputs } from "./GraphOutputs";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
-import { GraphApprovals } from "./GraphApprovals";
 
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
@@ -841,12 +839,6 @@ export interface GraphViewProps {
 
 export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   const compositionState = useSessionStore((s) => s.compositionState);
-  const activeSessionId = useSessionStore((s) => s.activeSessionId);
-  const resolvedInterpretationsBySession = useInterpretationEventsStore((s) => s.resolvedBySession);
-  const approvedInterpretations = useMemo(
-    () => selectApprovedInterpretations(activeSessionId === null ? [] : resolvedInterpretationsBySession[activeSessionId] ?? []),
-    [activeSessionId, resolvedInterpretationsBySession],
-  );
   const pendingProposalCount = useSessionStore(
     (s) =>
       s.compositionProposals.filter(
@@ -2250,17 +2242,9 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
           )}
         </div>
         {compositionState && (
-          <>
-            {/* GraphApprovals throws on a malformed approval (fail closed).
-                The boundary keeps that failure in the table that owns it, so
-                the graph above survives it. */}
-            <ErrorBoundary label="Approvals table">
-              <GraphApprovals events={approvedInterpretations} state={compositionState} />
-            </ErrorBoundary>
-            <ErrorBoundary label="Routing table">
-              <GraphOutputs state={compositionState} />
-            </ErrorBoundary>
-          </>
+          <ErrorBoundary label="Routing table">
+            <GraphOutputs state={compositionState} />
+          </ErrorBoundary>
         )}
         {selectedConfig && (
           <NodeConfigPanel

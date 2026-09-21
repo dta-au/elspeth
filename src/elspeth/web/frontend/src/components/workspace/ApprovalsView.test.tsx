@@ -1,7 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { GraphApprovals } from "@/components/inspector/GraphApprovals";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
@@ -45,7 +44,7 @@ describe("ApprovalsView", () => {
     resetStore(useInterpretationEventsStore);
   });
 
-  it("shows the Workflow tab's approvals table: Name, Approved value, Approved at", () => {
+  it("shows the approvals table: Name, Approved value, Approved at", () => {
     seed([event]);
     render(<ApprovalsView />);
 
@@ -60,18 +59,6 @@ describe("ApprovalsView", () => {
     expect(row.querySelector("time")).toHaveAttribute("datetime", "2026-09-20T07:01:00Z");
     // The whole panel is available here, so no 12rem scroller caps the table.
     expect(region.querySelector(".graph-detail-table-scroll")).toBeNull();
-  });
-
-  it("is a copy of the Workflow tab's table: identical cells from the one component", () => {
-    seed([event]);
-    const cells = (): (string | null)[] =>
-      screen.getAllByRole("row").flatMap((r) => Array.from(r.children).map((c) => c.textContent));
-    const { unmount } = render(<GraphApprovals events={[event]} state={state} />);
-    const workflowCells = cells();
-    unmount();
-    render(<ApprovalsView />);
-    expect(workflowCells.length).toBeGreaterThan(3);
-    expect(cells()).toEqual(workflowCells);
   });
 
   it("leaves out rejected interpretations and says so when nothing is approved", () => {

@@ -1,10 +1,10 @@
 import { render, screen, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { CompositionState } from "@/types";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
-import { GraphApprovals } from "./GraphApprovals";
+import { ApprovalsTable } from "./GraphApprovals";
+import { approvalRows } from "./approvalRows";
 import { GraphOutputs } from "./GraphOutputs";
 
 const event: InterpretationEvent = {
@@ -39,49 +39,45 @@ function stateWithTitle(eventId: string): CompositionState {
   };
 }
 
-describe("GraphApprovals", () => {
+describe("ApprovalsTable", () => {
   it.each([
     "aws_bedrock_prompt_shield",
     "aws_bedrock_content_safety",
     "aws_textract_document_analysis",
-  ])("shows %s profile aliases in both tables", async (plugin) => {
+  ])("shows %s profile aliases in both tables", (plugin) => {
     const state = stateWithTitle(event.id);
     state.nodes[0].plugin = plugin;
     state.nodes[0].options.profile = "approved-documents";
-    render(<><GraphApprovals events={[event]} state={state} /><GraphOutputs state={state} /></>);
-    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+    render(<><ApprovalsTable rows={approvalRows([event], state)} /><GraphOutputs state={state} /></>);
     // Routing shows the binding; Approvals says in words that it is the
     // CURRENT one, beside a value approved earlier (L4).
     const labels = [screen.getByText("profile approved-documents"), screen.getByText("Now: profile approved-documents")];
     for (const label of labels) expect(label).toHaveClass("graph-output-detail");
   });
 
-  it("shows an S3 source profile in both tables", async () => {
+  it("shows an S3 source profile in both tables", () => {
     const state = stateWithTitle(event.id);
     state.nodes = [];
     state.sources = { documents: {
       plugin: "aws_s3", options: { profile: "approved-documents" },
       on_success: "results", on_validation_failure: "discard",
     } };
-    render(<><GraphApprovals events={[{ ...event, affected_node_id: "source:documents" }]} state={state} /><GraphOutputs state={state} /></>);
-    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+    render(<><ApprovalsTable rows={approvalRows([{ ...event, affected_node_id: "source:documents" }], state)} /><GraphOutputs state={state} /></>);
     expect(screen.getByText("profile approved-documents")).toBeInTheDocument();
     expect(screen.getByText("Now: profile approved-documents")).toBeInTheDocument();
   });
 
-  it("shows Azure Document Intelligence model selection in both tables", async () => {
+  it("shows Azure Document Intelligence model selection in both tables", () => {
     const state = stateWithTitle(event.id);
     state.nodes[0].plugin = "azure_document_intelligence";
     state.nodes[0].options = { model_id: "prebuilt-layout" };
-    render(<><GraphApprovals events={[event]} state={state} /><GraphOutputs state={state} /></>);
-    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+    render(<><ApprovalsTable rows={approvalRows([event], state)} /><GraphOutputs state={state} /></>);
     const labels = [screen.getByText("model prebuilt-layout"), screen.getByText("Now: model prebuilt-layout")];
     for (const label of labels) expect(label).toHaveClass("graph-output-detail");
   });
 
-  it("shows the saved LLM title with styled node and profile details", async () => {
-    render(<GraphApprovals events={[event]} state={stateWithTitle(event.id)} />);
-    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+  it("shows the saved LLM title with styled node and profile details", () => {
+    render(<ApprovalsTable rows={approvalRows([event], stateWithTitle(event.id))} />);
     const name = screen.getByRole("rowheader");
     expect(name).toHaveTextContent("Protect the summary from page instructions for summarize_page");
     expect(within(name).getByText("summarize_page").tagName).toBe("CODE");
@@ -90,18 +86,16 @@ describe("GraphApprovals", () => {
     expect(binding).toHaveClass("graph-output-detail");
     // Visible words, not a hover title.
     expect(binding).not.toHaveAttribute("title");
-    expect(screen.getByRole("group", { name: "Approvals table" })).toHaveAttribute("tabindex", "0");
     expect(screen.getByText(event.accepted_value!)).toBeInTheDocument();
   });
 
-  it("uses a readable fallback for historical approvals instead of another event's title", async () => {
-    render(<GraphApprovals events={[event]} state={stateWithTitle("newer-approval")} />);
-    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+  it("uses a readable fallback for historical approvals instead of another event's title", () => {
+    render(<ApprovalsTable rows={approvalRows([event], stateWithTitle("newer-approval"))} />);
     expect(screen.getByRole("rowheader")).toHaveTextContent("Prompt injection protection for summarize_page");
     expect(screen.queryByText(/Protect the summary from page instructions/)).not.toBeInTheDocument();
   });
 
-  it("keeps system and user prompt roles explicit when a saved custom title exists", async () => {
+  it("keeps system and user prompt roles explicit when a saved custom title exists", () => {
     const promptEvent: InterpretationEvent = {
       ...event, kind: "llm_prompt_template", user_term: "llm_prompt_template:summarize_page",
       accepted_value: "System prompt:\nSummarize faithfully.\n\nPrompt template:\nSummarize {{ row.text }}.",
@@ -111,8 +105,7 @@ describe("GraphApprovals", () => {
       event_id: event.id, kind: promptEvent.kind, user_term: promptEvent.user_term,
       display_title: "Summarization instructions",
     }];
-    render(<GraphApprovals events={[promptEvent]} state={state} />);
-    await userEvent.setup().click(screen.getByText("Approvals (1)"));
+    render(<ApprovalsTable rows={approvalRows([promptEvent], state)} />);
     expect(screen.getByRole("rowheader")).toHaveTextContent("Summarization instructions (system and user prompts)");
   });
 });

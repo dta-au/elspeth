@@ -7,10 +7,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types";
 import type { InterpretationEvent } from "@/types/interpretation";
 
-/** The Approvals artifact tab: the SAME table the Workflow tab shows under its
- *  Approvals disclosure (ApprovalsTable — one component, same columns and
- *  content), given the whole panel instead of a 12rem scroller, inside the
- *  Checks tab's audit-panel card so the record surfaces read as one family. */
+/** Approval history uses the whole panel inside the shared audit-panel card. */
 function ApprovalsList({
   events,
   state,

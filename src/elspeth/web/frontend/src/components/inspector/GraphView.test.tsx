@@ -367,7 +367,7 @@ describe("GraphView", () => {
     );
   });
 
-  it("shows all interpretation approvals above outputs with independent disclosures", async () => {
+  it("keeps routing in Workflow without duplicating the Approvals tab", async () => {
     const user = userEvent.setup();
     const approved: InterpretationEvent = {
       id: "approval-1", session_id: "session-1", composition_state_id: "state-1",
@@ -403,25 +403,11 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const approvals = screen.getByText("Approvals (3)").closest("details") as HTMLDetailsElement;
     const failures = screen.getByText("Routing (1)").closest("details") as HTMLDetailsElement;
-    expect(approvals.compareDocumentPosition(failures) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(approvals.open).toBe(false);
+    expect(screen.queryByText(/^Approvals/)).not.toBeInTheDocument();
+    expect(screen.queryByText(approved.accepted_value!)).not.toBeInTheDocument();
     expect(failures.open).toBe(true);
-    await user.click(screen.getByText("Approvals (3)"));
-    expect(approvals.open).toBe(true);
-    expect(failures.open).toBe(true);
-    const table = within(approvals).getByRole("table");
-    expect(within(table).getByRole("columnheader", { name: "Approved value" })).toBeInTheDocument();
-    expect(within(table).getByRole("row", { name: /category/ })).toHaveTextContent("billing, outage, or other");
-    expect(within(table).getByRole("row", { name: /System and user prompts for classify/ })).toHaveTextContent("Classify each complaint");
-    expect(within(table).getByRole("row", { name: /User prompt for summarize/ })).toHaveTextContent("Summarize each complaint");
-    expect(within(table).getByRole("columnheader", { name: "Approved at" })).toBeInTheDocument();
-    expect(within(table).getAllByRole("time")).toHaveLength(3);
-    expect(within(table).getAllByRole("time")[0]).toHaveAttribute("datetime", approved.resolved_at);
-    expect(within(table).getAllByRole("row")).toHaveLength(4);
     await user.click(screen.getByText("Routing (1)"));
-    expect(approvals.open).toBe(true);
     expect(failures.open).toBe(false);
   });
 
@@ -435,14 +421,8 @@ describe("GraphView", () => {
     } as unknown as InterpretationEvent;
     useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode()] }) });
     useInterpretationEventsStore.setState({ resolvedBySession: { "session-1": [malformed] } });
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    try {
-      render(<GraphView />);
-    } finally {
-      consoleError.mockRestore();
-    }
-    // Fail closed, in the table that owns the failure — not the whole tab.
-    expect(screen.getByRole("alert")).toHaveTextContent("Approvals table encountered an error");
+    render(<GraphView />);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByText("Routing (1)")).toBeInTheDocument();
   });
 
