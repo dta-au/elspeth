@@ -56,7 +56,7 @@ RecoveryKind = Literal[
 ]
 RecoveryFaultKind = Literal["sink_effect"]
 RecoveryFaultSeam = Literal["before_effect"]
-GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "row_union", "sink", "source", "transform"]
+GraphNodeType = Literal["aggregation", "coalesce", "collector", "gate", "queue", "row_union", "sink", "source", "transform"]
 
 EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
     "config",
