@@ -22,7 +22,7 @@ import pytest
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth import local as auth_local
-from elspeth.web.auth.local import LocalAuthProvider, LocalUserDeletion
+from elspeth.web.auth.local import LocalAuthCredentialChanged, LocalAuthProvider, LocalUserDeletion
 from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityClaims, IdentityDisabled, UserIdentity, UserProfile
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
@@ -375,6 +375,47 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert recovery == LocalUserDeletion(credential_deleted=False, identity_retired=True)
         assert recovery.removed_anything is True
         assert retired == ["alice", "alice"]
+
+    def test_delete_user_recovery_preserves_a_replacement_registration(self, tmp_path) -> None:
+        def retire(username: str, _reason: str, credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
+            assert credential_exists() is False
+            provider.create_user(username, "replacement-password", display_name="Replacement")
+            _insert_crashed_intent(provider, user_id=username, issuance_path="register", created_at=int(time.time()))
+            delete_credential()
+            return True
+
+        provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retire)
+        result = provider.delete_user("alice", reason="finish interrupted removal")
+
+        assert [account.display_name for account in provider.list_users()] == ["Replacement"]
+        assert _audit_intents(provider) == [("alice", "register")]
+        assert result == LocalUserDeletion(credential_deleted=False, identity_retired=True)
+
+    @pytest.mark.parametrize("replacement", [False, True], ids=["password-reset", "replacement-account"])
+    def test_delete_user_refuses_a_changed_credential_generation(self, tmp_path, replacement: bool) -> None:
+        retired: list[str] = []
+
+        def retire(username: str, _reason: str, credential_exists: Callable[[], bool], delete_credential: Callable[[], None]) -> bool:
+            assert credential_exists() is True
+            if replacement:
+                _delete_user(provider, username)
+                provider.create_user(username, "password123", display_name="Replacement")
+            else:
+                provider.set_password(username, "password123")
+            _insert_crashed_intent(provider, user_id=username, issuance_path="register", created_at=int(time.time()))
+            delete_credential()
+            retired.append(username)
+            return True
+
+        provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retire)
+        provider.create_user("alice", "password123", display_name="Alice")
+
+        with pytest.raises(LocalAuthCredentialChanged, match="credential changed during removal"):
+            provider.delete_user("alice", reason="left the team")
+
+        assert retired == []
+        assert [account.user_id for account in provider.list_users()] == ["alice"]
+        assert _audit_intents(provider) == [("alice", "register")]
 
     def test_delete_user_probe_reports_the_credential_row_as_the_store_holds_it(self, tmp_path) -> None:
         """The retirer decides its last-administrator refusal on this answer, so it must be the store's."""

@@ -32,6 +32,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Barrier, Event
 from typing import Any
 
@@ -39,7 +40,9 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine, make_url
 
+from elspeth.web.auth.local import LocalAuthProvider, LocalUserDeletion
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.auth.session_token import LOCAL_AUDIENCE, SessionTokenIssuer
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
@@ -51,8 +54,10 @@ from elspeth.web.coordination.identity_authority import (
     IdentityRetired,
     LastActiveAdminProtected,
     RepositoryIdentityAuthority,
+    local_identity_retirer,
 )
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
@@ -368,6 +373,140 @@ def test_a_last_admin_whose_credential_is_already_gone_is_retired_on_postgres(ex
         assert authority.count_active_human_admins() == 1
     finally:
         engine.dispose()
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        control.dispose()
+
+
+def test_retirement_retry_preserves_a_replacement_registration_on_postgres(external_deployment_postgres_url: str, tmp_path: Path) -> None:
+    """A missing-credential retry must not delete a registration waiting on its identity lock."""
+    admin_url = make_url(external_deployment_postgres_url)
+    database = f"retirement_registration_{uuid.uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+    url = admin_url.set(database=database).render_as_string(hide_password=False)
+    engine = create_session_engine(url)
+    registration_engine = create_session_engine(url)
+    observer = create_session_engine(url)
+    observed_absent = Event()
+    replacement_committed = Event()
+    try:
+        initialize_session_schema(engine)
+        authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        registration_authority = RepositoryIdentityAuthority(
+            registration_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply
+        )
+        original = authority.bootstrap_admin(
+            claims=_claims("root"), note="original admin", quota_tokens_per_day=None, quota_storage_bytes=None, record=_noop
+        ).record
+        # No credential is seeded: this is the documented recovery state after
+        # credential deletion committed but identity retirement rolled back.
+        retire = local_identity_retirer(authority, _noop)
+
+        def retire_after_replacement_commits(
+            username: str,
+            reason: str,
+            credential_exists: Callable[[], bool],
+            delete_credential: Callable[[], None],
+        ) -> bool:
+            def probe_then_wait() -> bool:
+                exists = credential_exists()
+                assert exists is False
+                observed_absent.set()
+                assert replacement_committed.wait(_RENDEZVOUS_DEADLINE_SECONDS), "replacement credential never committed"
+                deadline = time.monotonic() + _RENDEZVOUS_DEADLINE_SECONDS
+                while time.monotonic() < deadline:
+                    with observer.connect() as conn:
+                        blocked = conn.execute(
+                            text(
+                                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                                "AND query ILIKE '%identities%' AND pid <> pg_backend_pid())"
+                            )
+                        ).scalar_one()
+                    if blocked:
+                        return exists
+                    time.sleep(_POLL_SECONDS)
+                pytest.fail("replacement admission never blocked on retirement's identity lock")
+
+            def delete_and_check_replacement() -> None:
+                delete_credential()
+                with provider._connect() as conn:
+                    assert conn.execute("SELECT display_name FROM users WHERE user_id = 'root'").fetchone() == ("Replacement",), (
+                        "retirement retry deleted the replacement credential"
+                    )
+                    assert conn.execute("SELECT issuance_path FROM token_audit_intents WHERE user_id = 'root'").fetchall() == [
+                        ("register",)
+                    ], "retirement retry deleted the replacement's audit intent"
+
+            return retire(username, reason, probe_then_wait, delete_and_check_replacement)
+
+        def admit_replacement(claims: IdentityClaims) -> EnsureIdentityOutcome:
+            # Production invokes admission only after committing the SQLite
+            # credential and audit intent. The PostgreSQL read then waits on
+            # retirement's lock, which the probe observes before it continues.
+            replacement_committed.set()
+            return registration_authority.ensure_identity(
+                claims=claims,
+                activate=True,
+                quota_tokens_per_day=None,
+                quota_storage_bytes=None,
+                identity_dormancy_days=90,
+                record_admission=_noop,
+                record_rebound=_noop,
+                record_dormant=_noop,
+            )
+
+        def principal_is_active(identity_id: str) -> bool:
+            identity = registration_authority.read_identity(identity_id=identity_id)
+            return identity is not None and identity.is_active
+
+        issuer = SessionTokenIssuer(
+            signing_key=b"registration-retirement-test-key-32",
+            provider="local",
+            audience=LOCAL_AUDIENCE,
+            token_expiry_hours=24,
+            max_refresh_chain_hours=168,
+            principal_is_active=principal_is_active,
+        )
+        provider = LocalAuthProvider(
+            tmp_path / "auth.db",
+            token_issuer=issuer,
+            admit_identity=admit_replacement,
+            retire_identity=retire_after_replacement_commits,
+        )
+        audited_tokens: list[str] = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            removal = pool.submit(provider.delete_user, "root", reason="finish failed retirement")
+            assert observed_absent.wait(_RENDEZVOUS_DEADLINE_SECONDS), "retry never observed the absent credential"
+            registration = pool.submit(
+                provider.register_open_user_with_audit,
+                "root",
+                "replacement-password",
+                "Replacement",
+                None,
+                record_token_issued=audited_tokens.append,
+            )
+            assert removal.result(timeout=60) == LocalUserDeletion(credential_deleted=False, identity_retired=True)
+            token = registration.result(timeout=60)
+
+        claims = issuer.authenticate(token)
+        assert claims.identity_id != original.identity_id
+        assert claims.username == "root"
+        assert provider._authenticate_sync(token).user_id == claims.identity_id
+        assert audited_tokens == [token]
+        retired = authority.read_identity(identity_id=original.identity_id)
+        assert retired is not None and retired.access_state == "disabled"
+        assert retired.subject == f"root#retired-{original.identity_id}"
+        assert authority.count_active_human_admins() == 0
+        assert [account.display_name for account in provider.list_users()] == ["Replacement"]
+        with provider._connect() as conn:
+            assert conn.execute("SELECT intent_id FROM token_audit_intents").fetchall() == []
+    finally:
+        engine.dispose()
+        registration_engine.dispose()
+        observer.dispose()
         with control.connect() as conn:
             conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
         control.dispose()

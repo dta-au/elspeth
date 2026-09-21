@@ -88,6 +88,10 @@ class LocalAuthRegistrationConflict(ValueError):
     """A requested local registration conflicts with an existing account."""
 
 
+class LocalAuthCredentialChanged(ValueError):
+    """Removal lost the credential generation it observed; neither store may be changed."""
+
+
 @dataclass(frozen=True)
 class LocalUserAccount:
     """One local-auth account row as listed to the dev-admin surface."""
@@ -672,7 +676,17 @@ class LocalAuthProvider:
         keeps bootstrap recovery inert. Retiring is idempotent (the natural key is rewritten, so a
         second pass finds nothing), and a username that never logged in has
         no identity to retire.
+
+        Snapshot the salted password hash before entering the identity store.
+        It identifies the observed credential: every creation and password
+        reset salts a new hash, even when the password is reused. An absent
+        snapshot authorizes retirement only, never deletion of a later
+        registration. A changed hash refuses removal before identity mutation.
+        The comparison and dependent-row deletion share one SQLite write
+        transaction, without holding that lock while entering the identity store.
         """
+        with self._connect() as conn:
+            observed_credential = conn.execute("SELECT password_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
         credential_deletions: list[bool] = []
 
         def credential_exists() -> bool:
@@ -682,7 +696,16 @@ class LocalAuthProvider:
         def delete_credential() -> None:
             if credential_deletions:
                 raise RuntimeError("retire_identity called the credential deletion more than once")
-            with self._connect() as conn:
+            if observed_credential is None:
+                credential_deletions.append(False)
+                return
+            with self._connect(immediate=True) as conn:
+                current_credential = conn.execute("SELECT password_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
+                if current_credential is None:
+                    credential_deletions.append(False)
+                    return
+                if current_credential != observed_credential:
+                    raise LocalAuthCredentialChanged("Local credential changed during removal; refresh the account and retry.")
                 credential_deletions.append(self._delete_user_rows(conn, user_id))
 
         identity_retired = self._retire_identity(user_id, reason, credential_exists, delete_credential)

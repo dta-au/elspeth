@@ -2157,10 +2157,12 @@ class RepositoryIdentityAuthority:
         NO credential is therefore retired: nobody can sign in as them, and
         retiring the row is what lets an operator bootstrap a working one.
         The probe runs under R5's lock and only when the refusal is otherwise
-        decided.  A registration of the same username landing between the
-        probe and the deletion has its fresh credential deleted with the rest
-        and registers again to a fresh identity: inconvenient, and the
-        opposite of the inheritance this method exists to prevent.
+        decided. The caller fences deletion to the credential generation it
+        observed before retirement. A retry that observed no credential must
+        leave any concurrent replacement registration untouched; after this
+        transaction retires the old binding, that registration can proceed
+        to a fresh identity. A changed observed credential must cause the
+        callback to raise before the identity write.
 
         The refusal holds on EVERY surface, the operator's CLI included.
         ``bootstrap_admin``'s recovery mode is a way back from zero

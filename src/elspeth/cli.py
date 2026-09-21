@@ -2459,6 +2459,7 @@ def composer_users_remove(
     ),
 ) -> None:
     """Remove a local Composer web user and retire the identity it was bound to."""
+    from elspeth.web.auth.local import LocalAuthCredentialChanged
     from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import (
         LOCAL_DELETION_REASON_MAX_LENGTH,
@@ -2510,6 +2511,9 @@ def composer_users_remove(
             )
             try:
                 deletion = provider.delete_user(username, reason=reason)
+            except LocalAuthCredentialChanged as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(1) from exc
             except LastActiveAdminProtected as exc:
                 # Refused before the credential was touched. ``bootstrap-admin``
                 # only answers when NO active administrator exists, so it is

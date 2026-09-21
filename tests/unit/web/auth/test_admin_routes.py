@@ -233,6 +233,27 @@ class TestResetPassword:
 
 @pytest.mark.asyncio
 class TestDeleteUser:
+    async def test_changed_credential_refuses_removal_without_retiring_identity(self, tmp_path, monkeypatch) -> None:
+        provider = _provider_with_admin(tmp_path)
+        provider.create_user("alice", "user-password-1", display_name="Alice")
+        app = _create_test_app(provider, dev_admin_user="john")
+        original_retire = provider._retire_identity
+
+        def retire_after_password_reset(username, reason, credential_exists, delete_credential):
+            provider.set_password(username, "replacement-password")
+            return original_retire(username, reason, credential_exists, delete_credential)
+
+        monkeypatch.setattr(provider, "_retire_identity", retire_after_password_reset)
+        async with _client_for(app) as client:
+            headers = await _bearer(client, "john", "admin-password-1")
+            alice_headers = await _bearer(client, "alice", "user-password-1")
+            response = await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, json={"reason": "left the team"})
+
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["refusal"] == "credential_changed"
+            assert (await client.get("/api/auth/me", headers=alice_headers)).status_code == 200
+            assert (await client.post("/api/auth/login", json={"username": "alice", "password": "replacement-password"})).status_code == 200
+
     async def test_delete_removes_account(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
         provider.create_user("alice", "user-password-1", display_name="Alice")

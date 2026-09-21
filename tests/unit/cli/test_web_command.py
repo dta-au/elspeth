@@ -342,6 +342,28 @@ class TestComposerUsersCommand:
         with pytest.raises(RuntimeError, match="closed"):
             recorders[0].start()
 
+    def test_remove_refuses_a_concurrent_password_reset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth import cli
+
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        provider.create_user("alice", "password123", display_name="Alice")
+        original_retire = provider._retire_identity
+
+        def retire_after_password_reset(username, reason, credential_exists, delete_credential):
+            provider.set_password(username, "replacement-password")
+            return original_retire(username, reason, credential_exists, delete_credential)
+
+        monkeypatch.setattr(provider, "_retire_identity", retire_after_password_reset)
+        monkeypatch.setattr(cli, "_composer_auth_provider", lambda *_args, **_kwargs: provider)
+        result = runner.invoke(
+            app,
+            ["--no-dotenv", "composer", "users", "remove", "alice", "--reason", "left the team", "--data-dir", str(tmp_path), "--yes"],
+        )
+
+        assert result.exit_code == 1
+        assert "credential changed during removal" in result.output
+        assert _auth_user_row(tmp_path / "auth.db", "alice") is not None
+
     def test_remove_missing_auth_db_does_not_create_new_database(self, tmp_path: Path) -> None:
         auth_db = tmp_path / "missing" / "auth.db"
 

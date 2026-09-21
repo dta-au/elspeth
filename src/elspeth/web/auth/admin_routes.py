@@ -20,7 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.local import LocalAuthProvider, LocalAuthRegistrationConflict
+from elspeth.web.auth.local import LocalAuthCredentialChanged, LocalAuthProvider, LocalAuthRegistrationConflict
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.auth.routes import _mark_sensitive_auth_response_uncacheable
@@ -238,6 +238,8 @@ def create_dev_admin_router() -> APIRouter:
         provider: LocalAuthProvider = request.app.state.auth_provider
         try:
             deletion = await run_sync_in_worker(provider.delete_user, user_id, reason=body.reason)
+        except LocalAuthCredentialChanged as exc:
+            raise HTTPException(status_code=409, detail={"refusal": "credential_changed", "detail": str(exc)}) from exc
         except LastActiveAdminProtected as exc:
             # Deleting the account retires its identity, and this one is the
             # container's last active human administrator (R5). Decided
