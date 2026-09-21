@@ -10,6 +10,42 @@ changes were made. Nothing here was reproduced against a live session: every
 finding is a code-path reading, and frequency in production is **not measured**
 (see "Not measured").
 
+## Resolution status (branch `fix/composer-reply-withholding`)
+
+| # | Outcome |
+|---|---------|
+| 1 | **Fixed.** The superseded reply is appended to the provider context before the terminate phase (withdrawn again when the phase returns, so the published path is unchanged), elided together with the advisor message it was answered by, and kept as a `composer_withheld_reply` audit row. |
+| 3 | **Recoverable.** Published behaviour unchanged; the turn's own prose is kept as an audit row before the status line replaces it. |
+| 4 | **Fixed.** The block withholds prose only when `advisor_repair_context_introduced` is true. Otherwise the reply is published with a `_PUBLISHED_` twin of the notice. When it does withhold, the words are kept as an audit row. |
+| 5 | **Recoverable.** Published behaviour unchanged; the terminal prose is kept as an audit row before the replacer runs. |
+| 2, 6, 7, 8 | **Not changed.** See "Left for decision". |
+| Deadline sibling of 1 | **Not changed.** `ComposerConvergenceError` would need a prose field. |
+
+The audit row uses its own envelope kind, not `composer_control_message`:
+control rows are replayed into provider context by
+`replay_composer_control_message`, and a withheld reply must never re-enter
+it. Other `audit` rows are excluded from the chat view and from prompt
+history, so the text is recoverable without being rendered or replayed.
+
+### Left for decision
+
+- **2, planner prose.** Whether a first-build text reply should reach the
+  user is a product decision about the planner surface, and the nudge exists
+  for a measured reason (elspeth-b1e85829e9: the model narrating instead of
+  emitting). The narrow option is to publish the last prose with the
+  empty-state suffix when the nudge budget is spent and no hatch is
+  available, instead of failing `MALFORMED_RESPONSE`.
+- **3 and 5, advisor cohort.** Withholding after an injection is an
+  adjudicated ruling and is kept. Case 5 also withholds after a CLEAN
+  re-review; narrowing that is a ruling change.
+- **6, planner staging.** Needs a measurement first: do real providers return
+  `content` beside the terminal proposal call?
+- **7, scaffold guard.** The substring match could be narrowed to a
+  line-leading tag. Recoverability would need the guided lane's chat-turn
+  audit, which stores a hash only.
+- **8, guided rejections.** Reply and action are coupled on purpose: a
+  rejected action's explanation would describe a change that did not happen.
+
 ## The defended path, for contrast
 
 `no_tool_finalize.finalize_no_tool_response` is augmentation-only. Every exit

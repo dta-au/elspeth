@@ -2296,6 +2296,32 @@ class TestComposerMultiTurnToolCalls:
         assert all(item["content"] != "Looks ready." for item in _composer_chat_history(stored))
 
     @pytest.mark.asyncio
+    async def test_advisor_outage_on_the_first_pass_does_not_delete_the_models_reply(self) -> None:
+        """Whole loop, real driver wiring: the advisor never rendered a verdict,
+        so nothing hidden entered the model's context and the reply is the
+        model's own. The block is reported beside it."""
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        outage = AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="advisor unavailable", failure_class="unavailable")
+
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=[_make_llm_response(content="Looks ready.")]),
+            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(service, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage),
+        ):
+            result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
+
+        assert result.raw_assistant_content == "Looks ready."
+        assert _no_tool_policy_module.visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+            _no_tool_policy_module.AssistantTextSegment("Looks ready."),
+            # No mutation this turn, so no preflight ran: the absent-shape twin.
+            _no_tool_policy_module.TrustedSystemNoticeSegment(
+                _no_tool_policy_module._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE
+            ),
+        )
+        assert result.runtime_preflight is not None
+        assert result.runtime_preflight.readiness.completion_ready is False
+
+    @pytest.mark.asyncio
     async def test_advisor_cohort_keeps_every_replaced_reply_recoverable(self) -> None:
         """The advisor-repair cohort publishes fixed copy in place of the
         model's prose on the repair tool turn and on the terminal. What the
@@ -2544,6 +2570,7 @@ def test_none_preflight_reads_unknown_fail_closed_in_both_advisor_consumers() ->
         persisted_tool_call_turn=False,
         runtime_preflight=None,
         outstanding_findings=None,
+        advisor_repair_context_introduced=True,
     )
     blocked_preflight = blocked.runtime_preflight
     assert blocked_preflight is not None

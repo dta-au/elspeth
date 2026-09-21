@@ -297,6 +297,15 @@ Shared disclosure text (for example the advisor-cohort withheld-prose
 disclosure) lives as one constant in that module and is appended to every
 message that needs it; never fork a per-message copy.
 
+Every END-gate blocked notice exists as a pair: the withheld form, and a
+`_PUBLISHED_` twin without the withheld-prose disclosure for a block that
+publishes the model's reply beside the notice. The withheld form is defined
+as twin plus disclosure, so edit the twin. A new blocked notice needs both
+members, both registered, and its composer takes the required
+`prose_withheld` flag. What decides the member is whether advisor findings
+entered the model's context this turn (`advisor_repair_context_introduced`),
+never the block's `reason`.
+
 ### Gate: declared oracles pin output bytes
 
 **Pins:** content hashes, golden files and byte-exact corpora — the

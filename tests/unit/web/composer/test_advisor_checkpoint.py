@@ -1614,6 +1614,7 @@ def test_advisor_blocked_result_surfaces_backend_prescan_finding(make_service, s
             readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
         ),
         outstanding_findings=None,
+        advisor_repair_context_introduced=True,
     )
 
     runtime_result = result.runtime_preflight
@@ -2320,8 +2321,14 @@ async def drive_try_terminate(
     deadline: float | None = None,
     recorder: BufferingRecorder | None = None,
     initial_version: int = 1,
+    advisor_repair_context_introduced: bool = True,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
+
+    ``advisor_repair_context_introduced`` defaults to the withheld cohort,
+    which is what the blocked-terminal tests in this module were written
+    against; the published-prose arm passes ``False`` explicitly.
+
 
     Stubs the SERVICE-level orphan pre-check to return empty (so the end
     gate runs) and the shared finalize tail to return a canned runnable
@@ -2435,8 +2442,84 @@ async def drive_try_terminate(
         persisted_assistant_content=None,
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+        advisor_repair_context_introduced=advisor_repair_context_introduced,
         **kwargs,
     )
+
+
+def _unavailable_verdict() -> AdvisorCheckpointVerdict:
+    return AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable")
+
+
+def _audit_row_origins(service) -> list[str]:
+    return [
+        envelope["origin"]
+        for call in service._sessions_service.add_message.calls
+        for envelope in call.kwargs["tool_calls"]
+        if "origin" in envelope
+    ]
+
+
+@pytest.mark.asyncio
+async def test_end_gate_block_publishes_the_models_reply_when_no_advisor_context_entered(make_service, clean_runnable_state):
+    """The withholding exists because prose written AFTER hidden advisor
+    findings entered the model's context may quote them. An advisor outage on
+    the first pass injected nothing, so the reply is the model's own and the
+    block is reported beside it, not in place of it."""
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
+        ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE,
+        AssistantTextSegment,
+        TrustedSystemNoticeSegment,
+        visible_message_segments,
+    )
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(return_value=_unavailable_verdict())
+    outcome = await drive_try_terminate(
+        service, clean_runnable_state, advisor_checkpoint_passes_used=0, advisor_repair_context_introduced=False
+    )
+
+    assert outcome.action == "return"
+    result = outcome.result
+    prose = _AssistantMessage.content
+    assert result.raw_assistant_content == prose
+    assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in result.message
+    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        AssistantTextSegment(prose),
+        TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE),
+    )
+    # The block itself is unchanged: completion stays withheld.
+    assert result.runtime_preflight.readiness.completion_ready is False
+    # Nothing was withheld, so neither withholding record is written.
+    assert _audit_row_origins(service) == []
+
+
+@pytest.mark.asyncio
+async def test_end_gate_block_withholds_and_keeps_the_reply_recoverable_once_advisor_context_entered(make_service, clean_runnable_state):
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE,
+        ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE,
+        TrustedSystemNoticeSegment,
+        visible_message_segments,
+    )
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(return_value=_unavailable_verdict())
+    outcome = await drive_try_terminate(
+        service, clean_runnable_state, advisor_checkpoint_passes_used=0, advisor_repair_context_introduced=True
+    )
+
+    result = outcome.result
+    assert result.raw_assistant_content == ""
+    assert _AssistantMessage.content not in result.message
+    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE),
+    )
+    assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE in result.message
+    assert _audit_row_origins(service) == ["advisor_terminal_block", "advisor_signoff_withheld"]
+    withheld_row = service._sessions_service.add_message.calls[0]
+    assert withheld_row.args[1:3] == ("audit", _AssistantMessage.content)
 
 
 @pytest.mark.asyncio
@@ -2632,6 +2715,7 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
+        advisor_repair_context_introduced=True,
     )
 
     assert outcome.action == "return"
@@ -2697,6 +2781,7 @@ def test_advisor_blocked_result_replaces_echoed_assistant_prose_with_fixed_notic
             readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
         ),
         outstanding_findings=None,
+        advisor_repair_context_introduced=True,
     )
 
     assert result.message.endswith(_ADVISOR_SIGNOFF_PENDING_NOTICE)
@@ -2914,7 +2999,7 @@ def test_signoff_pending_note_mints_trusted_chrome() -> None:
     )
 
     raw = "Done — the pipeline is ready."
-    content = compose_advisor_signoff_pending_message(raw)
+    content = compose_advisor_signoff_pending_message(raw, prose_withheld=True)
     segments = visible_message_segments(content=content, raw_content=raw)
 
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE)
@@ -2988,13 +3073,13 @@ def test_signoff_unverified_note_mints_trusted_chrome() -> None:
     )
 
     raw = "Done — the pipeline is ready."
-    content = compose_advisor_signoff_unverified_message(raw)
+    content = compose_advisor_signoff_unverified_message(raw, prose_withheld=True)
     segments = visible_message_segments(content=content, raw_content=raw)
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE)
 
     # The blocked terminal composes over withheld prose (raw_content == "");
     # the recognizer's empty-prefix arm must mint the same chrome.
-    bare = compose_advisor_signoff_unverified_message("")
+    bare = compose_advisor_signoff_unverified_message("", prose_withheld=True)
     segments = visible_message_segments(content=bare, raw_content="")
     assert segments == (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE),)
 
@@ -3334,11 +3419,11 @@ def test_signoff_unrepairable_note_mints_trusted_chrome() -> None:
     )
 
     raw = "Done — the pipeline is ready."
-    content = compose_advisor_signoff_unrepairable_message(raw)
+    content = compose_advisor_signoff_unrepairable_message(raw, prose_withheld=True)
     segments = visible_message_segments(content=content, raw_content=raw)
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE)
 
-    bare = compose_advisor_signoff_unrepairable_message("")
+    bare = compose_advisor_signoff_unrepairable_message("", prose_withheld=True)
     segments = visible_message_segments(content=bare, raw_content="")
     assert segments == (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE),)
 
@@ -3610,7 +3695,7 @@ def test_pending_handoff_note_mints_trusted_chrome() -> None:
     )
 
     raw = "Done — the pipeline is ready."
-    content = compose_advisor_pending_handoff_message(raw)
+    content = compose_advisor_pending_handoff_message(raw, prose_withheld=True)
     segments = visible_message_segments(content=content, raw_content=raw)
 
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE)
@@ -3629,6 +3714,7 @@ def test_pending_handoff_note_with_findings_mints_trusted_chrome() -> None:
     raw = "Done — the pipeline is ready."
     content = compose_advisor_pending_handoff_message(
         raw,
+        prose_withheld=True,
         outstanding_findings_detail="consumer requires 'str', producer emits 'Any'",
     )
     segments = visible_message_segments(content=content, raw_content=raw)
@@ -4454,14 +4540,30 @@ async def test_end_gate_terminal_block_persists_withheld_disclosure_before_retur
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
+        advisor_repair_context_introduced=True,
     )
 
     assert outcome.action == "return"
-    # Two fenced audit rows, in this order: the withheld-turn disclosure, then
-    # the ``terminal_block`` publication record (audit primacy: the row lands
-    # before the publication event mirrors it).
-    assert sessions.add_message.await_count == 2
-    persist, publication_row = sessions.add_message.calls
+    # Three fenced audit rows, in this order: the withheld words themselves,
+    # the withheld-turn disclosure, then the ``terminal_block`` publication
+    # record (audit primacy: the row lands before the publication event
+    # mirrors it).
+    assert sessions.add_message.await_count == 3
+    withheld_reply_row, persist, publication_row = sessions.add_message.calls
+    assert withheld_reply_row.args[1:3] == ("audit", _AssistantMessage.content)
+    (withheld_reply_envelope,) = withheld_reply_row.kwargs["tool_calls"]
+    assert withheld_reply_envelope["_kind"] == "composer_withheld_reply"
+    assert withheld_reply_envelope["origin"] == "advisor_terminal_block"
+    # Kept, never replayed: the control-message decoder does not claim it.
+    assert (
+        replay_composer_control_message(
+            stored_role="audit",
+            writer_principal="compose_loop",
+            content=_AssistantMessage.content,
+            tool_calls=[withheld_reply_envelope],
+        )
+        is None
+    )
     assert publication_row.args[1] == "audit"
     (publication_envelope,) = publication_row.kwargs["tool_calls"]
     assert publication_envelope["_kind"] == "advisor_terminal_publication_audit"
@@ -4524,6 +4626,7 @@ async def test_end_gate_terminal_block_skips_disclosure_without_session(make_ser
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
+        advisor_repair_context_introduced=True,
     )
 
     assert outcome.action == "return"
@@ -4598,6 +4701,7 @@ async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp
             initial_version=1,
             session_scope="s1",
             plugin_snapshot=None,
+            advisor_repair_context_introduced=True,
         )
     assert outcome.action == "return"
     result = outcome.result
@@ -4983,6 +5087,9 @@ async def _drive_gate_with_review_state(service, state, review_state):
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
+        # A prior pass FLAGGED and was granted a repair-continue, so advisor
+        # findings are already in the model's context.
+        advisor_repair_context_introduced=True,
         advisor_review_state=review_state,
     )
 
@@ -5083,6 +5190,9 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
+        # A prior pass FLAGGED and was granted a repair-continue, so advisor
+        # findings are already in the model's context.
+        advisor_repair_context_introduced=True,
         advisor_review_state=review_state,
     )
     assert service._run_advisor_checkpoint.await_count == 1
