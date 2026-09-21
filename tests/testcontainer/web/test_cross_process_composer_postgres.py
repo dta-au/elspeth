@@ -367,7 +367,7 @@ def test_bounded_global_cleanup_skips_busy_identity_and_admission_removes_abando
         ).all()
     assert before - after == 2
     assert len(remaining) >= 3
-    # A production heartbeat/publication transaction owns this identity first.
+    # An identity administration transaction can own this identity independently.
     # Cleanup must skip that lock rather than block the request behind itself.
     with engine.begin() as conn:
         conn.execute(select(identities_table.c.identity_id).where(identities_table.c.identity_id == user_id).with_for_update()).one()

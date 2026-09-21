@@ -1,6 +1,7 @@
 """Database-owned Composer lifecycle counts and latest-generation progress.
 
-Every operation serializes on the current identity and session ownership rows.
+Writes lock the session before the identity, matching token accounting.
+Reads use one committed snapshot for authorization and progress without row locks.
 Request tokens count queued work independently of the latest publisher's custody.
 No database error is converted into process-local progress.
 """
@@ -28,19 +29,22 @@ from elspeth.web.sessions.models import (
 _MAX_SNAPSHOT_BYTES = 16384
 
 
-def _ownership_query(session_id: str, user_id: str, *, allow_archived: bool = False) -> Select[Any]:
+def _ownership_query(session_id: str, user_id: str, *, allow_archived: bool = False, lock: bool = True) -> Select[Any]:
     query = select(sessions_table.c.id).where(sessions_table.c.id == session_id, sessions_table.c.user_id == user_id)
     if not allow_archived:
         query = query.where(sessions_table.c.archived_at.is_(None))
-    return query.with_for_update()
+    if lock:
+        query = query.with_for_update()
+    return query
 
 
-def _identity_query(user_id: str) -> Select[Any]:
-    return (
-        select(identities_table.c.identity_id)
-        .where(identities_table.c.identity_id == user_id, identities_table.c.access_state == "active")
-        .with_for_update()
+def _identity_query(user_id: str, *, lock: bool = True) -> Select[Any]:
+    query = select(identities_table.c.identity_id).where(
+        identities_table.c.identity_id == user_id, identities_table.c.access_state == "active"
     )
+    if lock:
+        query = query.with_for_update()
+    return query
 
 
 def _snapshot(session_id: str, request_id: str | None, event: ComposerProgressEvent, now: datetime) -> ComposerProgressSnapshot:
@@ -128,10 +132,10 @@ class SessionComposerProgressAuthority:
         self.cleanup_expired()
         lease = ComposerRequestLease(request_token=uuid4().hex, session_id=session_id, user_id=user_id)
         with self._engine.begin() as conn:
-            if conn.execute(_identity_query(user_id)).one_or_none() is None:
-                raise PermissionError("Composer progress identity is inactive")
             if conn.execute(_ownership_query(session_id, user_id)).one_or_none() is None:
                 raise PermissionError("Composer progress session is unavailable")
+            if conn.execute(_identity_query(user_id)).one_or_none() is None:
+                raise PermissionError("Composer progress identity is inactive")
             now = _database_clock_value(conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one())
             conn.execute(
                 insert(composer_inflight_requests_table).values(
@@ -149,7 +153,7 @@ class SessionComposerProgressAuthority:
         """Remove bounded abandoned state without waiting on active sessions.
 
         Candidate discovery is only a hint. Each independent transaction locks
-        identity then session, samples database time, and rechecks expiry.
+        session then identity, samples database time, and rechecks expiry.
         Snapshot custody survives while any request in its session is live.
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
@@ -173,19 +177,19 @@ class SessionComposerProgressAuthority:
             if removed == limit:
                 break
             with self._engine.begin() as conn:
-                identity = conn.execute(
-                    select(identities_table.c.identity_id)
-                    .where(identities_table.c.identity_id == candidate.user_id)
-                    .with_for_update(skip_locked=True)
-                ).one_or_none()
-                if identity is None:
-                    continue
                 session = conn.execute(
                     select(sessions_table.c.id)
                     .where(sessions_table.c.id == candidate.id, sessions_table.c.user_id == candidate.user_id)
                     .with_for_update(skip_locked=True)
                 ).one_or_none()
                 if session is None:
+                    continue
+                identity = conn.execute(
+                    select(identities_table.c.identity_id)
+                    .where(identities_table.c.identity_id == candidate.user_id)
+                    .with_for_update(skip_locked=True)
+                ).one_or_none()
+                if identity is None:
                     continue
                 now = _database_clock_value(conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one())
                 tokens = (
@@ -245,10 +249,10 @@ class SessionComposerProgressAuthority:
 
     def heartbeat_request(self, lease: ComposerRequestLease) -> None:
         with self._engine.begin() as conn:
-            if conn.execute(_identity_query(lease.user_id)).one_or_none() is None:
-                raise PermissionError("Composer progress identity is inactive")
             if conn.execute(_ownership_query(lease.session_id, lease.user_id)).one_or_none() is None:
                 raise PermissionError("Composer progress session is unavailable")
+            if conn.execute(_identity_query(lease.user_id)).one_or_none() is None:
+                raise PermissionError("Composer progress identity is inactive")
             now = _database_clock_value(conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one())
             renewed = conn.execute(
                 update(composer_inflight_requests_table)
@@ -281,10 +285,10 @@ class SessionComposerProgressAuthority:
     def bind_request(self, lease: ComposerRequestLease, request_id: str | None) -> str:
         generation = uuid4().hex
         with self._engine.begin() as conn:
-            if conn.execute(_identity_query(lease.user_id)).one_or_none() is None:
-                raise PermissionError("Composer progress identity is inactive")
             if conn.execute(_ownership_query(lease.session_id, lease.user_id)).one_or_none() is None:
                 raise PermissionError("Composer progress session is unavailable")
+            if conn.execute(_identity_query(lease.user_id)).one_or_none() is None:
+                raise PermissionError("Composer progress identity is inactive")
             now = _database_clock_value(conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one())
             active = conn.execute(
                 select(composer_inflight_requests_table.c.request_token).where(
@@ -316,10 +320,10 @@ class SessionComposerProgressAuthority:
 
     def publish(self, lease: ComposerRequestLease, generation: str, request_id: str | None, event: ComposerProgressEvent) -> None:
         with self._engine.begin() as conn:
-            if conn.execute(_identity_query(lease.user_id)).one_or_none() is None:
-                raise PermissionError("Composer progress identity is inactive")
             if conn.execute(_ownership_query(lease.session_id, lease.user_id)).one_or_none() is None:
                 raise PermissionError("Composer progress session is unavailable")
+            if conn.execute(_identity_query(lease.user_id)).one_or_none() is None:
+                raise PermissionError("Composer progress identity is inactive")
             now = _database_clock_value(conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one())
             active = conn.execute(
                 select(composer_inflight_requests_table.c.request_token).where(
@@ -350,10 +354,10 @@ class SessionComposerProgressAuthority:
         if lease is not None and (lease.session_id != session_id or lease.user_id != user_id):
             raise ValueError("Composer replay lease does not match the request")
         with self._engine.begin() as conn:
-            if conn.execute(_identity_query(user_id)).one_or_none() is None:
-                raise PermissionError("Composer progress identity is inactive")
             if conn.execute(_ownership_query(session_id, user_id)).one_or_none() is None:
                 raise PermissionError("Composer progress session is unavailable")
+            if conn.execute(_identity_query(user_id)).one_or_none() is None:
+                raise PermissionError("Composer progress identity is inactive")
             now = _database_clock_value(conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one())
             existing = conn.execute(
                 select(composer_progress_snapshots_table.c.session_id).where(
@@ -393,10 +397,12 @@ class SessionComposerProgressAuthority:
         return snapshot
 
     def get_latest(self, session_id: str, user_id: str) -> ComposerProgressSnapshot:
-        with self._engine.begin() as conn:
-            if conn.execute(_identity_query(user_id)).one_or_none() is None:
+        # Authorization and data must share a snapshot even if access is revoked
+        # during the read. A later poll starts a fresh snapshot and observes it.
+        with self._engine.connect().execution_options(isolation_level="REPEATABLE READ") as conn, conn.begin():
+            if conn.execute(_identity_query(user_id, lock=False)).one_or_none() is None:
                 raise PermissionError("Composer progress identity is inactive")
-            if conn.execute(_ownership_query(session_id, user_id)).one_or_none() is None:
+            if conn.execute(_ownership_query(session_id, user_id, lock=False)).one_or_none() is None:
                 raise PermissionError("Composer progress session is unavailable")
             now = _database_clock_value(conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one())
             row = conn.execute(
@@ -413,15 +419,14 @@ class SessionComposerProgressAuthority:
             return _read_snapshot(row, session_id, user_id, now, count)
 
     def list_active(self, user_id: str) -> tuple[ComposerProgressSnapshot, ...]:
-        with self._engine.begin() as conn:
-            if conn.execute(_identity_query(user_id)).one_or_none() is None:
+        with self._engine.connect().execution_options(isolation_level="REPEATABLE READ") as conn, conn.begin():
+            if conn.execute(_identity_query(user_id, lock=False)).one_or_none() is None:
                 raise PermissionError("Composer progress identity is inactive")
             session_ids = (
                 conn.execute(
                     select(sessions_table.c.id)
                     .where(sessions_table.c.user_id == user_id, sessions_table.c.archived_at.is_(None))
                     .order_by(sessions_table.c.id)
-                    .with_for_update()
                 )
                 .scalars()
                 .all()
@@ -447,11 +452,11 @@ class SessionComposerProgressAuthority:
 
     def clear(self, session_id: str, user_id: str) -> None:
         with self._engine.begin() as conn:
-            if conn.execute(_identity_query(user_id)).one_or_none() is None:
-                raise PermissionError("Composer progress identity is inactive")
             session = conn.execute(
                 select(sessions_table.c.user_id).where(sessions_table.c.id == session_id).with_for_update()
             ).one_or_none()
+            if conn.execute(_identity_query(user_id)).one_or_none() is None:
+                raise PermissionError("Composer progress identity is inactive")
             # Archiving a session without durable history physically deletes it;
             # foreign-key cascades have already removed its progress in that case.
             if session is None:

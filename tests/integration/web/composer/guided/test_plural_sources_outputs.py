@@ -539,12 +539,12 @@ def test_blob_backed_source_edit_reinspects_exact_target_and_preserves_identity(
     assert stable_id in staged.reviewed_sources
     assert staged.pending_source_intents[stable_id].phase == "inspection_review"
 
-    reviewed = _respond(client, session_id, edited_values={"columns": ["record_id", "display_label"]})
+    reviewed = _respond(client, session_id, edited_values={"columns": ["id", "label"]})
     assert _review_items(reviewed)[0]["stable_id"] == stable_id
     hydrated = _hydrate(client, session_id)
     assert hydrated.source_order == (stable_id,)
     assert hydrated.reviewed_sources[stable_id].name == "source"
-    assert hydrated.reviewed_sources[stable_id].observed_columns == ("record_id", "display_label")
+    assert hydrated.reviewed_sources[stable_id].observed_columns == ("id", "label")
     assert hydrated.active_edit_target is None
 
 

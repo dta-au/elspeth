@@ -21,6 +21,7 @@ from elspeth.web.coordination.approval_authority import (
     ApproverRoleRequired,
     RepositoryApprovalAuthority,
 )
+from elspeth.web.coordination.quota_authority import TokenUsageEntry, record_token_usage_on_connection
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     approval_decisions_table,
@@ -29,6 +30,7 @@ from elspeth.web.sessions.models import (
     identities_table,
     identity_roles_table,
     sessions_table,
+    token_usage_ledger_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 
@@ -138,6 +140,61 @@ def test_two_eligible_approvers_race_to_decide_one_open_request(approval_engine:
         assert (
             conn.execute(select(approvals_table.c.decision).where(approvals_table.c.approval_id == approval_id)).scalar_one() == "approved"
         )
+
+
+def test_approval_request_waits_for_session_without_blocking_token_settlement(approval_engine: Engine) -> None:
+    _seed(approval_engine)
+    waiting_on_holder = text(
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND CAST(:blocker AS integer) = ANY(pg_blocking_pids(pid))"
+    )
+    now = datetime.now(UTC)
+    entry = TokenUsageEntry(
+        model="test-model",
+        prompt_tokens=10,
+        completion_tokens=5,
+        cached_prompt_tokens=0,
+        reasoning_tokens=0,
+        recorded_at=now,
+        call_id="approval-concurrency-call",
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool, approval_engine.connect() as holder:
+        with holder.begin():
+            holder.exec_driver_sql("SET LOCAL lock_timeout = '3s'")
+            holder.execute(select(sessions_table.c.id).where(sessions_table.c.id == "session-1").with_for_update()).one()
+            blocker = int(holder.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+            pending = pool.submit(_open_request, approval_engine)
+            # PostgreSQL's wait graph is the barrier: the request must have
+            # reached its session lock before settlement asks for the owner FK.
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                assert not pending.done(), "approval completed while its session was exclusively locked"
+                with approval_engine.connect() as observer:
+                    if observer.execute(waiting_on_holder, {"blocker": blocker}).scalar_one() >= 1:
+                        break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("approval never waited on its session")
+
+            recorded = record_token_usage_on_connection(
+                holder,
+                session_id="session-1",
+                source="composer",
+                run_id=None,
+                entries=(entry,),
+                recorded_at=now,
+            )
+            assert len(recorded) == 1
+            assert not pending.done()
+        approval_id = pending.result(timeout=30)
+
+    with approval_engine.connect() as conn:
+        approval = conn.execute(select(approvals_table).where(approvals_table.c.approval_id == approval_id)).one()
+        usage = conn.execute(select(token_usage_ledger_table)).one()
+    assert approval.session_id == "session-1"
+    assert approval.decision is None
+    assert usage.identity_id == "alice"
+    assert usage.prompt_tokens == 10
+    assert usage.completion_tokens == 5
 
 
 def test_role_expiring_during_identity_lock_wait_refuses_decision(approval_engine: Engine) -> None:

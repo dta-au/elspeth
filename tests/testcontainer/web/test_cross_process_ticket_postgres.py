@@ -18,7 +18,7 @@ from tests.unit.web.execution.test_durable_websocket_ticket import seed_ticket_r
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import identities_table, websocket_tickets_table
+from elspeth.web.sessions.models import identities_table, sessions_table, websocket_tickets_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
@@ -48,7 +48,8 @@ def ticket_postgres(external_deployment_postgres_url: str) -> Iterator[Engine]:
 
 
 def _issue_process(url: str, run_id: str, user: UserIdentity, pipe: Connection) -> None:
-    engine = create_session_engine(url)
+    issuer_url = make_url(url).update_query_dict({"application_name": run_id}).render_as_string(hide_password=False)
+    engine = create_session_engine(issuer_url)
     try:
         issued = RepositorySessionWebsocketTicketAuthority(engine).issue(run_id=run_id, user=user)
         pipe.send(issued.ticket)
@@ -152,6 +153,55 @@ def test_identity_revocation_committed_while_consumer_waits_refuses(ticket_postg
         assert parent.recv() is None
         process.join(30)
         assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(30)
+        parent.close()
+
+
+@pytest.mark.parametrize("operation", ["issue", "consume"])
+def test_session_waiter_does_not_hold_identity_lock(ticket_postgres: Engine, operation: str) -> None:
+    """A session-fenced writer can take its identity FK lock while tickets wait."""
+    session_id, run_id, user = seed_ticket_run(ticket_postgres)
+    authority = RepositorySessionWebsocketTicketAuthority(ticket_postgres)
+    issued = authority.issue(run_id=run_id, user=user)
+    url = ticket_postgres.url.render_as_string(hide_password=False)
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = (
+        ctx.Process(target=_issue_process, args=(url, run_id, user, child))
+        if operation == "issue"
+        else ctx.Process(target=_consume_process, args=(url, run_id, issued.ticket, child))
+    )
+    try:
+        with ticket_postgres.begin() as holder:
+            holder.execute(select(sessions_table).where(sessions_table.c.id == session_id).with_for_update()).one()
+            process.start()
+            child.close()
+            if operation == "consume":
+                assert parent.poll(30)
+                assert parent.recv() == "ready"
+                parent.send("consume")
+            _await_consumer_lock(ticket_postgres, run_id)
+            # PostgreSQL has confirmed that the worker is blocked on our session
+            # lock. NOWAIT is the negative control for the old identity-first
+            # order: it fails immediately if that waiter already owns identity.
+            holder.execute(
+                select(identities_table)
+                .where(identities_table.c.identity_id == user.user_id)
+                .with_for_update(nowait=True, read=True, key_share=True)
+            ).one()
+        assert parent.poll(30)
+        result = parent.recv()
+        process.join(30)
+        assert process.exitcode == 0
+        if operation == "consume":
+            assert result == user.user_id
+            assert authority.consume(ticket=issued.ticket, run_id=run_id) is None
+        else:
+            assert authority.consume(ticket=result, run_id=run_id) == UserIdentity(user.user_id, "current-name")
+            assert authority.consume(ticket=result, run_id=run_id) is None
     finally:
         if process.is_alive():
             process.terminate()

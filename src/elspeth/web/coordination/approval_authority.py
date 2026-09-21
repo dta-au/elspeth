@@ -654,6 +654,10 @@ class ApprovalTransactionAuthority:
 
     def run[T](self, session_id: str, mutation: Callable[[str], T]) -> T:
         with locked_session_transaction(self._engine, session_id) as conn:
+            # Advisory exclusion does not cover progress or WebSocket writers.
+            # Lock the session row before participant identities: approval
+            # insertion also takes a session foreign-key lock.
+            conn.execute(_SESSION.with_for_update(), {"session_id": session_id}).one_or_none()
             token = _register_mutation_connection(conn)
             try:
                 return mutation(token)

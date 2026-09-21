@@ -6,7 +6,8 @@ from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import event, insert, select, update
+from sqlalchemy.dialects import postgresql
 from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
@@ -44,6 +45,35 @@ BINDING = ApprovalBinding(
     binding_generation_fingerprint="generation",
     policy_hash="policy",
 )
+
+
+def test_transaction_locks_session_before_participant_identity() -> None:
+    engine = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="author")
+        conn.execute(insert(sessions_table).values(id="session", user_id="author", title="approval", created_at=NOW, updated_at=NOW))
+    statements: list[str] = []
+
+    def capture(_conn, statement, _multiparams, _params, _execution_options) -> None:
+        statements.append(str(statement.compile(dialect=postgresql.dialect())))
+
+    def mutation(token: str) -> None:
+        conn = _resolve_mutation_connection(token)
+        conn.execute(select(identities_table).where(identities_table.c.identity_id == "author").with_for_update()).one()
+
+    event.listen(engine, "before_execute", capture)
+    try:
+        ApprovalTransactionAuthority(engine).run("session", mutation)
+    finally:
+        event.remove(engine, "before_execute", capture)
+        engine.dispose()
+
+    assert len(statements) == 2
+    assert "FROM sessions" in statements[0]
+    assert "FOR UPDATE" in statements[0]
+    assert "FROM identities" in statements[1]
+    assert "FOR UPDATE" in statements[1]
 
 
 def test_evidence_field_decision_is_closed_and_keeps_generation_but_excludes_snapshot() -> None:
