@@ -331,7 +331,7 @@ describe("GraphView", () => {
     expect(within(screen.getByTestId("node-classify")).getByText("llm_transform")).toBeInTheDocument();
   });
 
-  it("counts nodes and shows success and failure outputs with LLM selection in the Graph tab", () => {
+  it("counts nodes and shows success and failure outputs with LLM selection in the Graph tab", async () => {
     useSessionStore.setState({
       compositionState: makeState({
         sources: {
@@ -348,7 +348,10 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const policies = screen.getByText("Routing (3)").closest("details");
+    const summary = screen.getByText("Wiring (3)");
+    const policies = summary.closest("details");
+    expect(policies).not.toHaveAttribute("open");
+    await userEvent.setup().click(summary);
     expect(policies).toHaveAttribute("open");
     const table = within(policies as HTMLElement).getByRole("table");
     expect(within(table).getByRole("columnheader", { name: "Component" })).toBeInTheDocument();
@@ -367,7 +370,7 @@ describe("GraphView", () => {
     );
   });
 
-  it("keeps routing in Workflow without duplicating the Approvals tab", async () => {
+  it("keeps Wiring collapsed in Workflow without duplicating the Approvals tab", async () => {
     const user = userEvent.setup();
     const approved: InterpretationEvent = {
       id: "approval-1", session_id: "session-1", composition_state_id: "state-1",
@@ -403,15 +406,17 @@ describe("GraphView", () => {
     });
 
     render(<GraphView />);
-    const failures = screen.getByText("Routing (1)").closest("details") as HTMLDetailsElement;
+    const wiring = screen.getByText("Wiring (1)").closest("details") as HTMLDetailsElement;
     expect(screen.queryByText(/^Approvals/)).not.toBeInTheDocument();
     expect(screen.queryByText(approved.accepted_value!)).not.toBeInTheDocument();
-    expect(failures.open).toBe(true);
-    await user.click(screen.getByText("Routing (1)"));
-    expect(failures.open).toBe(false);
+    expect(wiring.open).toBe(false);
+    await user.click(screen.getByText("Wiring (1)"));
+    expect(wiring.open).toBe(true);
+    await user.click(screen.getByText("Wiring (1)"));
+    expect(wiring.open).toBe(false);
   });
 
-  it("keeps the graph and the routing table when an approval is malformed (L9)", () => {
+  it("keeps the graph and the Wiring table when an approval is malformed (L9)", () => {
     const malformed = {
       id: "approval-bad", session_id: "session-1", composition_state_id: "state-1",
       affected_node_id: "classify", tool_call_id: "tool-1", user_term: "category",
@@ -423,7 +428,7 @@ describe("GraphView", () => {
     useInterpretationEventsStore.setState({ resolvedBySession: { "session-1": [malformed] } });
     render(<GraphView />);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(screen.getByText("Routing (1)")).toBeInTheDocument();
+    expect(screen.getByText("Wiring (1)")).toBeInTheDocument();
   });
 
   it("renders a pending proposal pill when proposal affects graph", () => {
