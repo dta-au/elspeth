@@ -61,7 +61,6 @@ class ImplicitDecisionEntry(TypedDict, total=False):
 class ImplicitDecisionsReport(TypedDict):
     schema_version: int
     entries: list[ImplicitDecisionEntry]
-    normalization_events: list[dict[str, object]]
 
 
 _FORMAT_ALTERNATIVES = ["html", "markdown", "text"]
@@ -86,6 +85,8 @@ def build_implicit_decisions_report(state: CompositionState) -> ImplicitDecision
     model prose. That means it is conservative about provenance: when the final
     state alone cannot prove whether a value came from the operator or a
     deployment identity record, the entry says ``explicit_source_required``.
+    Schema version 2 omits the unused normalization-event field: final state
+    cannot establish a history of normalization operations.
     """
 
     entries: list[ImplicitDecisionEntry] = []
@@ -97,9 +98,8 @@ def build_implicit_decisions_report(state: CompositionState) -> ImplicitDecision
         entries.extend(_output_entries(output))
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "entries": entries,
-        "normalization_events": [],
     }
 
 
