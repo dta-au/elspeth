@@ -732,7 +732,7 @@ def validate_aws_s3_endpoint_url_policy(
             policy_error = web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
             if policy_error is None:
                 continue
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            source_component = _source_policy_component_id(source_name)
             return PhaseFailure(
                 passed_checks=(),
                 failed_check=ValidationCheck(
@@ -828,7 +828,7 @@ def validate_aws_s3_source_policy(
             if policy_error is None:
                 profiled_source = profiled_source or source.plugin == "aws_s3"
                 continue
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            source_component = _source_policy_component_id(source_name)
             return PhaseFailure(
                 passed_checks=(),
                 failed_check=ValidationCheck(
