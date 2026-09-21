@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
@@ -324,6 +324,7 @@ class AuditedLLMClient(AuditedClientBase):
         member_token: WorkerMembershipToken | None = None,
         work_item: TokenWorkItem | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
+        max_tokens_param: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
     ) -> None:
         """Initialize audited LLM client.
 
@@ -337,6 +338,10 @@ class AuditedLLMClient(AuditedClientBase):
             limiter: Optional rate limiter for throttling requests
             token_id: Optional token identity for telemetry correlation
             operation_id: Optional operation parent for runtime preflight calls
+            max_tokens_param: Wire name the output budget is sent and recorded
+                under. Reasoning deployments reject ``max_tokens`` and require
+                ``max_completion_tokens``; the choice is the provider's, never
+                inferred from the model name.
         """
         super().__init__(
             execution,
@@ -353,6 +358,7 @@ class AuditedLLMClient(AuditedClientBase):
         )
         self._client = underlying_client
         self._provider = provider
+        self._max_tokens_param = max_tokens_param
 
     def _emit_telemetry_after_audit(
         self,
@@ -419,7 +425,7 @@ class AuditedLLMClient(AuditedClientBase):
         model: str,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = 0.0,
         max_tokens: int | None = None,
         approved_prompt_artifact_hash: str | None = None,
         **kwargs: Any,
@@ -431,8 +437,11 @@ class AuditedLLMClient(AuditedClientBase):
             messages: Ordered chat messages. The SDK sees the wire projection
                 (base64 image data URIs); the audit trail sees the bytes-free
                 projection.
-            temperature: Sampling temperature (default: 0.0 for determinism)
-            max_tokens: Maximum tokens to generate (optional)
+            temperature: Sampling temperature (default: 0.0 for determinism).
+                None omits the parameter so the provider default applies —
+                reasoning deployments reject any explicit value.
+            max_tokens: Maximum tokens to generate (optional), sent under
+                this client's ``max_tokens_param`` wire name
             approved_prompt_artifact_hash: Phase 5b Task 9 cross-DB anchor.
                 When the LLM transform is downstream of a resolved
                 interpretation event, the runtime reads the SHA-256 from
@@ -457,7 +466,7 @@ class AuditedLLMClient(AuditedClientBase):
         call_index = self._next_call_index()
 
         # Build request DTO - frozen dataclass ensures construction-time type safety;
-        # to_dict() conditionally omits max_tokens when None (hash-stable).
+        # to_dict() conditionally omits temperature and max_tokens when None (hash-stable).
         # DTO stays alive for typed telemetry payload; dict form used for Landscape hashing.
         request_dto = LLMCallRequest(
             model=model,
@@ -465,20 +474,22 @@ class AuditedLLMClient(AuditedClientBase):
             temperature=temperature,
             provider=self._provider,
             max_tokens=max_tokens,
+            max_tokens_param=self._max_tokens_param,
             extra_kwargs=kwargs,
         )
         request_data = request_dto.to_dict()
 
-        # Build SDK call kwargs - omit max_tokens when None to avoid
-        # serializing as JSON null (which can trigger provider validation errors)
+        # Build SDK call kwargs - omit temperature and max_tokens when None to
+        # avoid serializing as JSON null (which can trigger provider validation errors)
         sdk_kwargs: dict[str, Any] = {
             "model": model,
             "messages": wire_messages(messages),  # wire form to the SDK only
-            "temperature": temperature,
             **kwargs,
         }
+        if temperature is not None:
+            sdk_kwargs["temperature"] = temperature
         if max_tokens is not None:
-            sdk_kwargs["max_tokens"] = max_tokens
+            sdk_kwargs[self._max_tokens_param] = max_tokens
 
         llm_call_attempt = self._before_llm_call()
         start = time.perf_counter()

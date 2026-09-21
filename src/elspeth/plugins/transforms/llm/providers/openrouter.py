@@ -339,7 +339,7 @@ class OpenRouterLLMProvider:
         messages: Sequence[ChatMessage],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
@@ -386,8 +386,9 @@ class OpenRouterLLMProvider:
             request_body: dict[str, Any] = {
                 "model": model,
                 "messages": wire,
-                "temperature": temperature,
             }
+            if temperature is not None:
+                request_body["temperature"] = temperature
             if max_tokens is not None:
                 request_body["max_tokens"] = max_tokens
             if response_format is not None:
@@ -484,7 +485,7 @@ class OpenRouterLLMProvider:
         *,
         model: str,
         messages: Sequence[ChatMessage],
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         response_format: dict[str, Any] | None,
     ) -> LLMCallRequest:

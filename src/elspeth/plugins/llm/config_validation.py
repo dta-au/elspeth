@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -109,6 +110,30 @@ GATEWAY_VALUE_SOURCES: tuple[ValueSource, ...] = ()
 def validate_azure_endpoint(value: str) -> str:
     """Validate an Azure OpenAI endpoint under the shared bearer URL policy."""
     return validate_credential_safe_https_url(value, field_name="endpoint", allow_http_loopback=True)
+
+
+# First Azure OpenAI API version whose chat-completions contract defines
+# ``max_completion_tokens`` — the only output-budget parameter every Azure
+# call sends (reasoning deployments reject ``max_tokens``).
+AZURE_MIN_DATED_API_VERSION = "2024-09-01-preview"
+_AZURE_DATED_API_VERSION = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def validate_azure_api_version(value: str) -> str:
+    """Reject a dated Azure API version that predates ``max_completion_tokens``.
+
+    An older version answers the parameter with HTTP 400 "Unrecognized request
+    argument", which reaches the operator only as the audit-safe provider
+    error, so the cause is named here instead. Undated versions (the v1
+    ``preview``/``latest`` aliases) pass through unchanged.
+    """
+    dated = _AZURE_DATED_API_VERSION.match(value)
+    if dated is not None and dated.group() < AZURE_MIN_DATED_API_VERSION[:10]:
+        raise ValueError(
+            f"api_version {value!r} predates {AZURE_MIN_DATED_API_VERSION}: the Azure provider sends the output budget as "
+            "max_completion_tokens, which older API versions reject"
+        )
+    return value
 
 
 @trust_boundary(

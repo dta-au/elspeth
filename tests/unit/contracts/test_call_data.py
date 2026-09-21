@@ -127,6 +127,38 @@ class TestLLMCallRequest:
         ).to_dict()
         assert "max_tokens" not in d
 
+    def test_temperature_none_excluded(self) -> None:
+        """An omitted wire temperature is recorded as omitted, never as 0.0."""
+        d = LLMCallRequest(
+            model="gpt-4",
+            messages=[],
+            temperature=None,
+            provider="azure",
+        ).to_dict()
+        assert "temperature" not in d
+
+    def test_max_tokens_param_names_the_wire_key(self) -> None:
+        d = LLMCallRequest(
+            model="gpt-4",
+            messages=[],
+            temperature=0.0,
+            provider="azure",
+            max_tokens=100,
+            max_tokens_param="max_completion_tokens",
+        ).to_dict()
+        assert d["max_completion_tokens"] == 100
+        assert "max_tokens" not in d
+
+    def test_max_completion_tokens_is_a_reserved_extra_kwarg(self) -> None:
+        with pytest.raises(ValueError, match="reserved key"):
+            LLMCallRequest(
+                model="gpt-4",
+                messages=[],
+                temperature=0.0,
+                provider="azure",
+                extra_kwargs={"max_completion_tokens": 100},
+            )
+
     def test_frozen(self) -> None:
         obj = LLMCallRequest(
             model="gpt-4",
@@ -198,6 +230,7 @@ class TestLLMCallRequestConstructionInvariants:
             {"max_tokens": -1},
             {"max_tokens": 1.5},
             {"max_tokens": True},
+            {"max_tokens_param": "max_output_tokens"},
             {"messages": "not-a-message-sequence"},
             {"messages": ["not-a-message-mapping"]},
             {"messages": [{1: "non-string-key"}]},

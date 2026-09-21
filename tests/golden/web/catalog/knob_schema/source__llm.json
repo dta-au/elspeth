@@ -72,11 +72,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "common",
         "visible_when": {
@@ -336,11 +336,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "common",
         "visible_when": {
@@ -588,11 +588,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "common",
         "visible_when": {
@@ -869,11 +869,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "common",
         "visible_when": {

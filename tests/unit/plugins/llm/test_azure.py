@@ -273,10 +273,25 @@ class TestAzureOpenAIConfig:
                 "prompt_template": "{{ row.text }}",
                 "schema": DYNAMIC_SCHEMA,
                 "required_input_fields": [],  # Explicit opt-out for this test
-                "api_version": "2023-12-01-preview",
+                "api_version": "2025-01-01-preview",
             }
         )
-        assert config.api_version == "2023-12-01-preview"
+        assert config.api_version == "2025-01-01-preview"
+
+    @pytest.mark.parametrize("api_version", ["2024-02-01", "2023-12-01-preview", "2024-08-01-preview"])
+    def test_api_version_older_than_max_completion_tokens_is_rejected(self, api_version: str) -> None:
+        """Older API versions answer max_completion_tokens with an HTTP 400 the audit trail scrubs."""
+        with pytest.raises(PluginConfigError, match="max_completion_tokens"):
+            AzureOpenAIConfig.from_dict(_make_azure_config(api_version=api_version))
+
+    @pytest.mark.parametrize("api_version", ["2024-09-01-preview", "2024-10-21", "2025-01-01-preview", "preview"])
+    def test_api_version_at_or_after_the_floor_is_accepted(self, api_version: str) -> None:
+        config = AzureOpenAIConfig.from_dict(_make_azure_config(api_version=api_version))
+        assert config.api_version == api_version
+
+    def test_temperature_null_is_accepted(self) -> None:
+        config = AzureOpenAIConfig.from_dict(_make_azure_config(temperature=None))
+        assert config.temperature is None
 
     def test_config_inherits_llm_config_defaults(self) -> None:
         """Config inherits defaults from LLMConfig."""
@@ -335,13 +350,13 @@ class TestLLMTransformAzureInit:
         transform = LLMTransform(
             _make_azure_config(
                 prompt_template="{{ row.text }}",
-                api_version="2023-12-01-preview",
+                api_version="2025-01-01-preview",
             )
         )
         assert isinstance(transform._config, AzureOpenAIConfig)
         assert transform._config.endpoint == "https://my-resource.openai.azure.com"
         assert transform._config.api_key == "azure-api-key"
-        assert transform._config.api_version == "2023-12-01-preview"
+        assert transform._config.api_version == "2025-01-01-preview"
         assert transform._config.deployment_name == "my-gpt4o-deployment"
 
     def test_model_set_to_deployment_name(self) -> None:
@@ -647,7 +662,7 @@ class TestLLMTransformAzurePipelining:
         collector: CollectorOutputPort,
         chaosllm_server,
     ) -> None:
-        """Temperature and max_tokens are passed to Azure client."""
+        """Temperature and max_tokens reach the Azure client, the budget as max_completion_tokens."""
         transform = LLMTransform(
             _make_azure_config(
                 prompt_template="{{ row.text }}",
@@ -670,7 +685,8 @@ class TestLLMTransformAzurePipelining:
                 call_args = mock_client.chat.completions.create.call_args
                 assert call_args.kwargs["model"] == "my-gpt4o-deployment"
                 assert call_args.kwargs["temperature"] == 0.7
-                assert call_args.kwargs["max_tokens"] == 500
+                assert call_args.kwargs["max_completion_tokens"] == 500
+                assert "max_tokens" not in call_args.kwargs
         finally:
             transform.close()
 

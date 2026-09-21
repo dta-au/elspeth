@@ -72,6 +72,18 @@ def test_source_provider_models_are_rooted_in_data_plugin_config(
     assert model._plugin_component_type == "source"
 
 
+def test_azure_source_rejects_an_api_version_older_than_max_completion_tokens(
+    provider_configs: dict[str, dict[str, Any]],
+) -> None:
+    with pytest.raises(PluginConfigError, match="max_completion_tokens"):
+        AzureOpenAILLMSourceConfig.from_dict({**provider_configs["azure"], "api_version": "2024-02-01"})
+
+
+def test_azure_source_accepts_a_null_temperature(provider_configs: dict[str, dict[str, Any]]) -> None:
+    cfg = AzureOpenAILLMSourceConfig.from_dict({**provider_configs["azure"], "temperature": None})
+    assert cfg.temperature is None
+
+
 def test_source_prompt_rejects_row_access_but_accepts_lookup(openrouter_config: Callable[..., dict[str, Any]]) -> None:
     with pytest.raises(PluginConfigError, match="row"):
         OpenRouterLLMSourceConfig.from_dict(
