@@ -21,8 +21,9 @@ def _usage() -> dict[str, Any]:
 
 
 def test_cache_write_ttl_preserves_price() -> None:
-    cost, source = _provider_cost_from_response({"usage": _usage()}, model_requested="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
-    assert cost == pytest.approx(0.00096)
+    cost, source = _provider_cost_from_response({"usage": _usage()}, model_requested="bedrock/anthropic.claude-sonnet-4-5-20250929-v1:0")
+    # 20 uncached input * $3/M + 80 one-hour writes * $6/M + 20 output * $15/M.
+    assert cost == pytest.approx(0.00084)
     assert source == "litellm.cost_per_token"
 
 
@@ -59,10 +60,106 @@ def test_invalid_ttl_stays_unavailable(detail: object) -> None:
 
 def test_bedrock_standard_tier_and_private_cost_preserved() -> None:
     cost, _ = _provider_cost_from_response(
-        {"usage": _usage(), "service_tier": "standard"}, model_requested="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"
+        {"usage": _usage(), "service_tier": "standard"}, model_requested="bedrock/anthropic.claude-sonnet-4-5-20250929-v1:0"
     )
-    assert cost == pytest.approx(0.00096)
+    assert cost == pytest.approx(0.00084)
     response = ModelResponse(model="gpt-5", usage=Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120))
     response.service_tier = "malformed"
     response._hidden_params["response_cost"] = 0.07
     assert _provider_cost_from_response(response, model_requested="openai/gpt-5") == (0.07, "_hidden_params.response_cost")
+
+
+def test_unpriced_one_hour_writes_stay_unavailable() -> None:
+    # This model's bundled map has five-minute pricing but no one-hour rate.
+    assert _provider_cost_from_response({"usage": _usage()}, model_requested="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0") == (
+        None,
+        "not_available",
+    )
+
+
+@pytest.mark.parametrize("rate", [None, True, -1.0, "0.1", float("nan"), float("inf")])
+@pytest.mark.parametrize("one_hour", [False, True])
+def test_missing_or_invalid_required_cache_rate_prevents_calculator(monkeypatch: pytest.MonkeyPatch, rate: object, one_hour: bool) -> None:
+    import litellm
+
+    field = "cache_creation_input_token_cost_above_1hr" if one_hour else "cache_creation_input_token_cost"
+    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: {field: rate})
+
+    def forbidden(**kwargs: Any) -> tuple[float, float]:
+        pytest.fail("required cache-write price is unavailable")
+
+    monkeypatch.setattr(litellm, "cost_per_token", forbidden)
+    usage = _usage()
+    if not one_hour:
+        usage.pop("prompt_tokens_details")
+    assert _provider_cost_from_response({"usage": usage}, model_requested="bedrock/model") == (None, "not_available")
+
+
+def test_supported_default_cache_write_rate_is_preserved() -> None:
+    usage = _usage()
+    usage.pop("prompt_tokens_details")
+    cost, source = _provider_cost_from_response({"usage": usage}, model_requested="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
+    assert cost == pytest.approx(0.00066)
+    assert source == "litellm.cost_per_token"
+
+
+def test_explicit_zero_cache_write_rate_is_not_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: {"cache_creation_input_token_cost_above_1hr": 0.0})
+    monkeypatch.setattr(litellm, "cost_per_token", lambda **kwargs: (0.0, 0.0))
+    assert _provider_cost_from_response({"usage": _usage()}, model_requested="bedrock/model") == (0.0, "litellm.cost_per_token")
+
+
+def test_explicit_provider_cost_wins_over_unpriced_cache_duration() -> None:
+    usage = _usage()
+    usage["cost"] = 0.02
+    assert _provider_cost_from_response({"usage": usage}, model_requested="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0") == (
+        0.02,
+        "response_usage.cost",
+    )
+
+
+@pytest.mark.parametrize("model", ["vertex_ai/gemini-3.1-pro-preview", "openrouter/google/gemini-3.1-pro-preview"])
+@pytest.mark.parametrize("prompt_tokens", [200000, 200001, 300000])
+def test_threshold_only_cache_write_price(model: str, prompt_tokens: int) -> None:
+    response = {"usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 20, "cache_creation_input_tokens": 80000}}
+    cost, source = _provider_cost_from_response(response, model_requested=model)
+    if prompt_tokens <= 200000:
+        assert (cost, source) == (None, "not_available")
+    else:
+        # The bundled map supplies the write rate only above 200k tokens.
+        assert cost == pytest.approx((prompt_tokens - 80000) * 4e-6 + 80000 * 2.5e-7 + 20 * 18e-6)
+        assert source == "litellm.cost_per_token"
+
+
+@pytest.mark.parametrize("rate", [True, -1.0, "0.1", float("nan"), float("inf")])
+@pytest.mark.parametrize("threshold", [False, True])
+def test_malformed_selected_cache_rate_rejects(monkeypatch: pytest.MonkeyPatch, rate: object, threshold: bool) -> None:
+    import litellm
+
+    key = "cache_creation_input_token_cost" + ("_above_200k_tokens" if threshold else "") + "_priority"
+    info = {"cache_creation_input_token_cost": 0.001, "input_cost_per_token_above_200k_tokens": 0.002, key: rate}
+    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: info)
+
+    def forbidden(**kwargs: Any) -> tuple[float, float]:
+        pytest.fail("selected cache rate is malformed")
+
+    monkeypatch.setattr(litellm, "cost_per_token", forbidden)
+    response = {
+        "usage": {"prompt_tokens": 300000 if threshold else 100, "completion_tokens": 20, "cache_creation_input_tokens": 80},
+        "service_tier": "priority",
+    }
+    assert _provider_cost_from_response(response, model_requested="openai/model") == (None, "not_available")
+    response["usage"]["cost"] = 0.03
+    assert _provider_cost_from_response(response, model_requested="openai/model") == (0.03, "response_usage.cost")
+
+
+def test_zero_selected_threshold_rate_is_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    info = {"input_cost_per_token_above_200k_tokens": 0.002, "cache_creation_input_token_cost_above_200k_tokens_priority": 0.0}
+    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: info)
+    monkeypatch.setattr(litellm, "cost_per_token", lambda **kwargs: (0.0, 0.0))
+    response = {"usage": {"prompt_tokens": 300000, "completion_tokens": 20, "cache_creation_input_tokens": 80}, "service_tier": "priority"}
+    assert _provider_cost_from_response(response, model_requested="openai/model") == (0.0, "litellm.cost_per_token")

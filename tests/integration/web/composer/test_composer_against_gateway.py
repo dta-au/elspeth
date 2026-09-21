@@ -127,6 +127,7 @@ _INBOUND_BEARER = "composer-gw-e2e-inbound-bearer-0123456789abcdef"  # secret-sc
 _OAUTH_CLIENT_ID = "composer-gw-e2e-oauth-client"
 _OAUTH_CLIENT_SECRET = "composer-gw-e2e-oauth-client-secret-0123456789abcdef"  # secret-scan: allow-this-line
 _MODEL_ALIAS = "gpt-5.5"  # matches WebSettings.composer_model's default -- no override needed
+_SAMPLING_MODEL_ALIAS = "gpt-4.1"  # explicit model whose sampling contract admits temperature + seed
 _MODEL_TARGET = "composer-gw-e2e-target"
 _OAUTH_HOST = "oauth.composer-gw-e2e.mock"
 _UPSTREAM_HOST = "upstream.composer-gw-e2e.mock"
@@ -190,7 +191,9 @@ def _build_gateway_app() -> Any:
         "ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS": _MAX_STRING_CHARS,
         "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_BYTES": _MAX_SCHEMA_BYTES,
         "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_DEPTH": _MAX_SCHEMA_DEPTH,
-        "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS": json.dumps({_MODEL_ALIAS: {"target": _MODEL_TARGET}}),
+        "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS": json.dumps(
+            {_MODEL_ALIAS: {"target": _MODEL_TARGET}, _SAMPLING_MODEL_ALIAS: {"target": _MODEL_TARGET}}
+        ),
     }
     config = load_config(env)
     return create_app(config, adapter=ReferenceV1InvokeAdapter(), upstream_client=upstream_client)
@@ -557,11 +560,12 @@ async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(gatewa
     """The probe's other real payload shape: temperature + seed alongside the
     translated token cap. ``seed`` is a gated capability the reference
     adapter declares, so this also proves the alias did not disturb the
-    capability path."""
+    capability path. Use a sampling-capable model explicitly: the default
+    gpt-5.5 rejects nondefault temperature while reasoning is active."""
     from elspeth.web.composer.boot_probe import probe_composer_config
 
     probed = await probe_composer_config(
-        model=_MODEL_ALIAS,
+        model=_SAMPLING_MODEL_ALIAS,
         temperature=0.2,
         seed=7,
         api_base=f"{gateway_base_url}/v1",
@@ -569,6 +573,24 @@ async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(gatewa
     )
 
     assert probed is True
+
+
+@pytest.mark.asyncio
+async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(gateway_base_url: str) -> None:
+    """An endpoint override must not silently drop rejected operator sampling."""
+    from litellm.exceptions import UnsupportedParamsError
+
+    from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
+
+    with pytest.raises(ComposerBootConfigError, match="sampling rejected") as caught:
+        await probe_composer_config(
+            model=_MODEL_ALIAS,
+            temperature=0.2,
+            seed=7,
+            api_base=f"{gateway_base_url}/v1",
+            api_key=_INBOUND_BEARER,
+        )
+    assert isinstance(caught.value.__cause__, UnsupportedParamsError)
 
 
 # ---------------------------------------------------------------------------

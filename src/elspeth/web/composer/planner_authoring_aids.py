@@ -1177,9 +1177,11 @@ _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
 # aid carries identifier lists only for the providers an llm node can actually
 # declare: the whole litellm inventory canonicalizes to ~57 KiB, which costs
 # more across a multi-turn plan than the discovery turns it would save. The
-# ceiling is sized for the live OpenRouter catalog (measured 2026-08-18: 9.6
-# KiB against the bundled slice, 20.5 KiB against a 330-model live snapshot).
-_MODEL_CATALOG_MAX_CANONICAL_BYTES: Final[int] = 32 * 1024
+# initial-scaffold gate leaves 10,516 bytes for this aid on the measured
+# LiteLLM 1.102 request (119,398 total cap minus 108,882 other bytes). Allocate
+# 8 KiB to the catalog itself, leaving room for its guidance/wrapper. Catalog
+# growth must defer complete provider lists, not grow every planner request.
+_MODEL_CATALOG_MAX_CANONICAL_BYTES: Final[int] = 8 * 1024
 _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES: Final[int] = 8 * 1024
 
 
@@ -2031,23 +2033,24 @@ def planner_model_catalog() -> _ModelCatalog:
             "omitted_provider_count": 0,
         },
     }
-    if _model_catalog_size(catalog) > _MODEL_CATALOG_MAX_CANONICAL_BYTES:
-        # Whole lists or none. A sliced identifier list reads as a complete
-        # one, and binding a slug this deployment does not serve is the exact
-        # rejection the carried catalog exists to prevent — so an oversized
-        # catalog falls back to the counts plus a marker per dropped provider
-        # and the listing tool stays the way to reach the identifiers.
-        catalog["models_omitted"] = [
+    # Defer the largest whole lists first so growth in one provider does not
+    # erase smaller providers' usable inventory. Never carry a sliced list:
+    # the exact complete inventory remains reachable through list_models.
+    for provider, identifiers in sorted(
+        models_by_provider.items(), key=lambda item: (-len(canonical_json(item[1]).encode("utf-8")), item[0])
+    ):
+        if _model_catalog_size(catalog) <= _MODEL_CATALOG_MAX_CANONICAL_BYTES:
+            break
+        catalog["models_omitted"].append(
             {
                 "provider": provider,
                 "model_count": len(identifiers),
                 "details_via": _MODEL_CATALOG_DETAILS_VIA,
             }
-            for provider, identifiers in sorted(models_by_provider.items())
-        ]
+        )
+        del catalog["models_by_provider"][provider]
         catalog["budget"]["omitted_provider_count"] = len(catalog["models_omitted"])
-        catalog["models_by_provider"] = {}
-        _model_catalog_size(catalog)
+    catalog["models_omitted"].sort(key=lambda omission: omission["provider"])
     if _model_catalog_size(catalog) > _MODEL_CATALOG_MAX_CANONICAL_BYTES:
         raise RuntimeError("model_catalog_budget_invariant")
     return catalog

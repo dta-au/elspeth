@@ -48,10 +48,12 @@ authoring-form requirements beyond structural argument validation:
   routes it through `plan_pipeline` rather than the ordinary compose loop.
 - **`structured_llm` uses the web operator-profile form.** Its `llm` node is
   authored with `profile: "task-role"` plus public safe options (`queries`,
-  `prompt_template`, `schema`, `required_input_fields`, `temperature`) — the
-  private `provider` / `model` / `api_key` / retry knobs are supplied by the
+  `prompt_template`, `schema`, `required_input_fields`) — the
+  private `provider` / `model` / `api_key` / `temperature` / retry knobs are supplied by the
   operator profile at lowering. The real-path harness and any live run must
-  configure an LLM profile aliased `task-role`; the multi-query retry budget
+  configure an LLM profile aliased `task-role`. The harness sets temperature
+  `0.0` on that operator profile; live profiles should configure sampling only
+  when their deployment supports it. The multi-query retry budget
   is injected by profile lowering (`_LLMProfileResolver.lower_options`). The
   source declares a fixed schema so the field contract to the LLM's declared
   `required_input_fields` is satisfiable at config time.

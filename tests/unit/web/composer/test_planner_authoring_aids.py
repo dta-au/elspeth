@@ -1690,29 +1690,49 @@ class TestModelCatalogAid:
         catalog = planner_model_catalog()
 
         rendered = canonical_json(catalog).encode("utf-8")
-        assert len(rendered) <= 32 * 1024
+        assert len(rendered) <= 8 * 1024
         assert catalog["budget"]["canonical_bytes_used"] == len(rendered)
-        assert catalog["budget"]["max_canonical_bytes"] == 32 * 1024
-        assert catalog["models_omitted"] == []
-        assert catalog["budget"]["omitted_provider_count"] == 0
+        assert catalog["budget"]["max_canonical_bytes"] == 8 * 1024
+        assert catalog["budget"]["omitted_provider_count"] == len(catalog["models_omitted"])
+
+    def test_catalog_growth_defers_large_provider_without_dropping_small_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        bedrock = ["bedrock/test-model-a", "bedrock/test-model-b"]
+        openrouter = frozenset(f"openrouter/provider/model-{index:04d}-with-a-long-deployment-name" for index in range(300))
+        monkeypatch.setattr(planner_authoring_aids, "read_litellm_model_list", lambda: tuple(bedrock))
+        monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: openrouter)
+
+        catalog = planner_model_catalog()
+
+        assert catalog["models_by_provider"] == {"bedrock": bedrock}
+        assert catalog["provider_model_counts"] == {"bedrock": 2, "openrouter": 300}
+        assert catalog["total_models"] == 302
+        assert catalog["models_omitted"] == [{"provider": "openrouter", "model_count": 300, "details_via": "list_models"}]
+        assert len(canonical_json(catalog).encode("utf-8")) <= 8 * 1024
+        assert planner_model_catalog() == catalog
 
     def test_over_budget_defers_whole_lists_and_keeps_the_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Whole lists or none: a sliced list reads as a complete one."""
         from elspeth.core.canonical import canonical_json
 
+        monkeypatch.setattr(planner_authoring_aids, "_MODEL_CATALOG_MAX_CANONICAL_BYTES", 128 * 1024)
         full = planner_model_catalog()
         monkeypatch.setattr(planner_authoring_aids, "_MODEL_CATALOG_MAX_CANONICAL_BYTES", 4 * 1024)
 
         catalog = planner_model_catalog()
 
-        assert catalog["models_by_provider"] == {}
         assert catalog["provider_model_counts"] == full["provider_model_counts"]
         assert catalog["total_models"] == full["total_models"]
+        for provider, identifiers in catalog["models_by_provider"].items():
+            assert identifiers == full["models_by_provider"][provider]
         assert catalog["models_omitted"] == [
             {"provider": provider, "model_count": len(identifiers), "details_via": "list_models"}
             for provider, identifiers in sorted(full["models_by_provider"].items())
+            if provider not in catalog["models_by_provider"]
         ]
-        assert catalog["budget"]["omitted_provider_count"] == len(full["models_by_provider"])
+        assert catalog["models_omitted"]
+        assert catalog["budget"]["omitted_provider_count"] + len(catalog["models_by_provider"]) == len(full["models_by_provider"])
         assert len(canonical_json(catalog).encode("utf-8")) <= 4 * 1024
 
     def test_catalog_fails_closed_when_the_counts_alone_exceed_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1757,7 +1777,9 @@ class TestModelCatalogAid:
         assert "details_via" in guidance
         assert "Never invent a slug" in guidance
 
-    def test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory(self, tmp_path: Path) -> None:
+    def test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The operator's binding stays private; the public catalog stays public.
 
         ``_source_only_profile_view`` binds ``anthropic/claude-sonnet-4.6``
@@ -1769,9 +1791,8 @@ class TestModelCatalogAid:
         is that the carried list is the public reader's whole content, never a
         deployment-selected subset.
         """
-        from elspeth.contracts.value_source import get_catalog_values
-        from elspeth.plugins.transforms.llm.model_catalog import MODEL_CATALOG_OPENROUTER
-
+        public_models = frozenset({"anthropic/claude-sonnet-4.6", "openai/gpt-4o"})
+        monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: public_models)
         view, _snapshot = _source_only_profile_view(tmp_path)
 
         aids = build_planner_authoring_aids(view)
@@ -1781,7 +1802,7 @@ class TestModelCatalogAid:
         # leak that landed under some OTHER provider key could never reach the
         # prompt either, whatever it was.
         assert aids["model_catalog"]["catalog"] == planner_model_catalog()
-        assert carried == sorted(get_catalog_values(MODEL_CATALOG_OPENROUTER))
+        assert carried == sorted(public_models)
         assert "anthropic/claude-sonnet-4.6" in carried
         without_public_inventory = json.loads(json.dumps(aids))
         without_public_inventory["model_catalog"]["catalog"]["models_by_provider"] = {}

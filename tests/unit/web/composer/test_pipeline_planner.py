@@ -1888,10 +1888,18 @@ async def test_discovery_round_uses_real_read_only_tool_then_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("catalog_inventory", ["live", "small"])
 async def test_initial_request_declares_supplied_information_and_omits_redundant_discovery(
     tmp_path: Path,
     tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_inventory: str,
 ) -> None:
+    if catalog_inventory == "small":
+        from elspeth.web.composer import planner_authoring_aids
+
+        monkeypatch.setattr(planner_authoring_aids, "read_litellm_model_list", lambda: ("bedrock/test-model",))
+        monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: frozenset({"openai/gpt-4o"}))
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
 
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
@@ -1901,19 +1909,21 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
     # decline-eligible from turn 1, so the affordance notice follows it.
     payload = json.loads(request["messages"][1]["content"])
     assert 'starting with "DECLINE: "' in str(request["messages"][-1]["content"])
-    # The full catalog carries a policy-visible llm surface and both aids
-    # land complete on this deployment, so model.catalog and
-    # expression.grammar are manifest-SUPPLIED from turn 1 (F3/F5): the
-    # payload names the aid channel and drops the keys from the discoverable
-    # classes, while their palette tools stay advertised below.
-    assert payload["information_manifest"]["supplied"] == {
+    # Complete catalogs are supplied immediately; a grown live catalog must
+    # explicitly retain discovery for the whole provider lists it deferred.
+    supplied = {
         "pipeline_state": "current_projection",
         "plugin_selection": "policy_snapshot",
-        "model_catalog": "authoring_aids",
         "expression_grammar": "authoring_aids",
     }
+    deferred = bool(payload["authoring_aids"]["model_catalog"]["catalog"]["models_omitted"])
+    if catalog_inventory == "small":
+        assert not deferred
+    if not deferred:
+        supplied["model_catalog"] = "authoring_aids"
+    assert payload["information_manifest"]["supplied"] == supplied
     assert "plugin.schema" in payload["information_manifest"]["discoverable_classes"]
-    assert "model.catalog" not in payload["information_manifest"]["discoverable_classes"]
+    assert ("model.catalog" in payload["information_manifest"]["discoverable_classes"]) is deferred
     assert "expression.grammar" not in payload["information_manifest"]["discoverable_classes"]
     assert payload["information_manifest"]["unresolved"] == []
     assert "unresolved_classes" not in payload["information_manifest"]

@@ -433,6 +433,64 @@ def _pricing_usage_optional_fields_valid(usage: Any | None) -> bool:
     return True
 
 
+@observation_boundary(
+    tier=3,
+    source="LiteLLM get_model_info pricing metadata for the requested model",
+    source_param="model_info",
+    suppresses=("R1", "R5"),
+    invariant="requires an explicit finite nonnegative numeric rate for each charged cache-write duration; absent rates are never free",
+)
+def _cache_write_prices_available(
+    model_info: Any, *, short_writes: bool, long_writes: bool, prompt_tokens: int, service_tier: str | None
+) -> bool:
+    """Validate the effective cache rates selected by LiteLLM's flat catalog.
+
+    Match its strict-above input threshold and service-tier/base fallback.
+    Structured tier tables need a separate admission contract; do not infer
+    rates from those tables or substitute zero for a missing duration price.
+    """
+    if not isinstance(model_info, Mapping):
+        return False
+    if model_info.get("tiered_pricing") is not None:
+        return False
+    tier_suffix = f"_{service_tier}" if service_tier in ("priority", "flex") else ""
+    active_threshold = 0.0
+    threshold_suffix = ""
+    for key, value in model_info.items():
+        if type(key) is not str or value is None:
+            continue
+        match = re.fullmatch(r"input_cost_per_token_above_(\d+(?:\.\d+)?)(k?)_tokens", key)
+        if match is None:
+            continue
+        threshold = float(match[1]) * (1000 if match[2] else 1)
+        if active_threshold < threshold < prompt_tokens:
+            active_threshold = threshold
+            threshold_suffix = key.removeprefix("input_cost_per_token")
+
+    for required, key in (
+        (short_writes, "cache_creation_input_token_cost"),
+        (long_writes, "cache_creation_input_token_cost_above_1hr"),
+    ):
+        if required:
+            # The SDK applies service tiers to short-write base rates, and
+            # to both durations' threshold rates; one-hour base is untiered.
+            base_key = key + tier_suffix if key == "cache_creation_input_token_cost" else key
+            selected = model_info.get(base_key)
+            if selected is None:
+                selected = model_info.get(key)
+            if threshold_suffix:
+                threshold_key = key + threshold_suffix
+                threshold_rate = model_info.get(threshold_key + tier_suffix)
+                if threshold_rate is None:
+                    threshold_rate = model_info.get(threshold_key)
+                if threshold_rate is not None:
+                    selected = threshold_rate
+            rate, _ = _validated_provider_cost(selected, PROVIDER_COST_SOURCE_COST_PER_TOKEN)
+            if rate is None:
+                return False
+    return True
+
+
 def _calculate_missing_provider_cost(
     usage: Any | None, *, model_requested: str | None, service_tier: Any | None = None
 ) -> tuple[float | None, ComposerLLMProviderCostSource]:
@@ -466,6 +524,17 @@ def _calculate_missing_provider_cost(
             prompt_details["cached_tokens"] = reported.cached_prompt_tokens
         source_details = _provider_field(usage, "prompt_tokens_details")
         creation_details = _provider_field(source_details, "cache_creation_token_details")
+        if reported.cache_creation_input_tokens:
+            short_writes = creation_details is None or _provider_field(creation_details, "ephemeral_5m_input_tokens") > 0
+            long_writes = creation_details is not None and _provider_field(creation_details, "ephemeral_1h_input_tokens") > 0
+            if not _cache_write_prices_available(
+                litellm.get_model_info(model=model_requested),
+                short_writes=short_writes,
+                long_writes=long_writes,
+                prompt_tokens=reported.prompt_tokens,
+                service_tier=service_tier,
+            ):
+                return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
         if creation_details is not None:
             prompt_details["cache_creation_tokens"] = reported.cache_creation_input_tokens
             prompt_details["cache_creation_token_details"] = {

@@ -608,7 +608,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, create_autospec, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -3734,9 +3734,20 @@ def _execute_lease(loop: asyncio.AbstractEventLoop, session_id: Any) -> Any:
     )
 
 
+def _fake_settlement_authority() -> Mock:
+    from elspeth.web.sessions.protocol import SessionOperationAuthority, SessionOperationMutationTransaction, SessionOperationRunMutations
+
+    authority = create_autospec(SessionOperationAuthority, instance=True, spec_set=True)
+    transaction = create_autospec(SessionOperationMutationTransaction, instance=True, spec_set=True)
+    transaction.runs = create_autospec(SessionOperationRunMutations, instance=True, spec_set=True)
+    authority.mutate.side_effect = lambda context, mutation: mutation(transaction)
+    return authority
+
+
 @dataclass(slots=True)
 class _FakeSessionService:
     run: _RunSnapshot
+    session_operation_authority: Mock = field(default_factory=_fake_settlement_authority)
     update_run_status_calls: list[tuple[UUID, str, dict[str, Any]]] = field(default_factory=list)
     appended_run_events: list[dict[str, Any]] = field(default_factory=list)
     recorded_blob_inline_resolutions: list[dict[str, Any]] = field(default_factory=list)

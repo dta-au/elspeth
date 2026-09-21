@@ -706,7 +706,11 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
     assert structured == {case[0] for case in cases}
 
     for exc_type, exc in cases:
-        response = await app.exception_handlers[exc_type](_audit_request("req-invariant-1"), exc)
+        request = _audit_request("req-invariant-1")
+        # Starlette supplies the serving application in every live HTTP scope;
+        # database diagnostics use its real session pool.
+        request.scope["app"] = app
+        response = await app.exception_handlers[exc_type](request, exc)
         body = json.loads(response.body)
         assert body["request_id"] == "req-invariant-1", exc_type.__name__
 

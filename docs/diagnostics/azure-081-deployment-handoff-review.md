@@ -13,6 +13,10 @@ and service-tier details. Explicit malformed costs and unsupported models remain
 fail-closed. The audit source is `litellm.cost_per_token`, and calculated cost is
 included in the planner's cumulative cap.
 
+Cache-write recovery also requires an explicit valid catalog rate for each
+reported cache duration. A missing one-hour rate must remain unavailable;
+the pricing library's zero-cost default would otherwise understate the cap.
+
 LiteLLM 1.85.0's bundled catalog did not contain the reported model. The updated
 lock selects 1.102.0, whose bundled catalog contains the exact OpenAI and Azure
 Terra entries. This removes the reported model's dependency on a successful
