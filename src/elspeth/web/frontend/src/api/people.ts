@@ -1,3 +1,4 @@
+import { authFetch } from "./authSession";
 /** Requests to the people directory read facade. Reads only: every write goes
  *  through the identity-administration or dev-admin API that owns it. */
 import { authHeaders, parseResponse } from "./client";
@@ -17,7 +18,7 @@ export const PEOPLE_LABEL_LOOKUP_MAX = 50;
 const BASE = "/api/auth/admin/people";
 
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, { headers: authHeaders(), cache: "no-store", signal });
+  const response = await authFetch(`${BASE}${path}`, { headers: authHeaders(), cache: "no-store", signal });
   return parseResponse<T>(response);
 }
 

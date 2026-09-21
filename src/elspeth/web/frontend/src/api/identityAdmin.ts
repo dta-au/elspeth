@@ -1,3 +1,4 @@
+import { authFetch } from "./authSession";
 /** Requests to the live-role-guarded identity administration API. */
 import { authHeaders, parseResponse } from "./client";
 import type {
@@ -19,7 +20,7 @@ export const ADMIN_PAGE_SIZE = 50;
 const BASE = "/api/auth/admin";
 
 async function get<T>(path: string): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, { headers: authHeaders(), cache: "no-store" });
+  const response = await authFetch(`${BASE}${path}`, { headers: authHeaders(), cache: "no-store" });
   return parseResponse<T>(response);
 }
 
@@ -32,7 +33,7 @@ export function adminErrorMessage(error: unknown, fallback: string): string {
 }
 
 async function post<T>(path: string, body: object): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, {
+  const response = await authFetch(`${BASE}${path}`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),

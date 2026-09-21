@@ -11,7 +11,10 @@ import {
   type SetStateAction,
 } from "react";
 import { Button } from "@/components/ui";
-import { useSessionStore } from "@/stores/sessionStore";
+import {
+  createInterpretationResolutionHandler,
+  useSessionStore,
+} from "@/stores/sessionStore";
 import {
   selectApprovedInterpretations,
   useInterpretationEventsStore,
@@ -631,9 +634,6 @@ export function ChatPanel({
   );
   const acceptProposal = useSessionStore((s) => s.acceptProposal);
   const rejectProposal = useSessionStore((s) => s.rejectProposal);
-  const applyResolvedInterpretation = useSessionStore(
-    (s) => s.applyResolvedInterpretation,
-  );
   const composerProgress = useSessionStore((s) => s.composerProgress);
   const clearError = useSessionStore((s) => s.clearError);
   const forkFromMessage = useSessionStore((s) => s.forkFromMessage);
@@ -2365,13 +2365,10 @@ export function ChatPanel({
             sessionId={activeSessionId}
             isTutorial={isTutorial}
             onFocusFallback={() => inputRef.current?.focus()}
-            onResolved={(newState) => {
-              if (guidedDecisionMode) {
-                if (newState !== null) useSessionStore.setState({ compositionState: newState });
-              } else {
-                applyResolvedInterpretation(newState);
-              }
-            }}
+            onResolved={createInterpretationResolutionHandler(
+              activeSessionId,
+              guidedDecisionMode,
+            )}
           />
         }
         renderSourceFallback={(candidateText) => (

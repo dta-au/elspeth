@@ -453,7 +453,20 @@ describe("executionStore.execute", () => {
     expect(state.error).toBe(driftDetail);
   });
 
-  it("keeps the generic 409 copy for a run-already-active conflict without the drift error_type", async () => {
+  it.each([undefined, "future_conflict"])("preserves a non-run conflict detail (%s)", async (errorType) => {
+    const { executePipeline } = await import("@/api/client");
+    vi.mocked(executePipeline).mockRejectedValue({
+      status: 409,
+      detail: "Session operation is already active",
+      error_type: errorType,
+    });
+
+    expect(await useExecutionStore.getState().execute("session-1")).toBeNull();
+    expect(useExecutionStore.getState().error).toBe("Session operation is already active");
+    expect(useExecutionStore.getState().isExecuting).toBe(false);
+  });
+
+  it("shows active-run copy only for the run-already-active discriminator", async () => {
     const { executePipeline } = await import("@/api/client");
     (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValue({
       status: 409,

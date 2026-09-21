@@ -203,11 +203,10 @@ def _accept_runtime_preflight_failure(proposal: CompositionProposalRecord) -> HT
     """Name a settle-time runtime-preflight failure without committing anything.
 
     ``_state_data_from_composer_state(preflight_exception_policy="raise")``
-    has already recorded the exception telemetry. The status is deliberately
-    not 409: the SPA's ``acceptProposal`` treats every 409 as a stale proposal
-    ("the state changed, rebase"), which would misdiagnose this failure. The
-    same exception class is a structured 500 on the compose and message
-    routes. The wrapped exception's text stays server-side.
+    has already recorded the exception telemetry. This is a server failure,
+    not a proposal lifecycle conflict. The same exception class is a
+    structured 500 on the compose and message routes. The wrapped exception's
+    text stays server-side.
     """
     return HTTPException(
         status_code=500,

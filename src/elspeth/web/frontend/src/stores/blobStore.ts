@@ -197,10 +197,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
         isLoading: false,
       }));
     } catch (err) {
-      const detail =
-        (err as { status?: number }).status === 409
-          ? "Cannot delete — file is linked to an active run."
-          : "Failed to delete file.";
+      const detail = (err as ApiError).detail ?? "Failed to delete file.";
       const current = get();
       if (
         ownership.ownsStore &&

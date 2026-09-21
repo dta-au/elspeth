@@ -13,7 +13,7 @@
 // - the fetch effect (on composition-version change)
 // - the empty/loading/error states
 // - the read-only pending-YAML-proposal summary
-// - the 409 validation-blocked alert
+// - the export error alert and explicit retry
 //
 // SharedInspectView mounts `<YamlDisplay yaml={...} />` directly with
 // the wire YAML, bypassing all of the above.
@@ -21,6 +21,7 @@
 
 import { useState, useEffect, useMemo } from "react";
 import { useSessionStore } from "@/stores/sessionStore";
+import { Button } from "@/components/ui";
 import * as api from "@/api/client";
 import type { ApiError } from "@/types/index";
 import { YamlDisplay } from "./YamlDisplay";
@@ -37,13 +38,6 @@ function describeYamlFetchError(error: unknown): YamlFetchError {
     typeof apiError.detail === "string" && apiError.detail.trim().length > 0
       ? apiError.detail
       : "Please try again.";
-
-  if (apiError.status === 409) {
-    return {
-      title: "YAML export is blocked by validation errors.",
-      detail,
-    };
-  }
 
   return {
     title: "Failed to load YAML.",
@@ -78,6 +72,7 @@ export function YamlView() {
   const [yaml, setYaml] = useState<string | null>(null);
   const [yamlError, setYamlError] = useState<YamlFetchError | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [retryAttempt, setRetryAttempt] = useState(0);
 
   // Fetch YAML from the backend whenever composition state version changes
   const version = compositionState?.version ?? null;
@@ -135,7 +130,7 @@ export function YamlView() {
     return () => {
       cancelled = true;
     };
-  }, [activeSessionId, version, hasPipelineContent, setExportedYamlBlobBinding]);
+  }, [activeSessionId, version, hasPipelineContent, setExportedYamlBlobBinding, retryAttempt]);
 
   const pendingYamlProposal = pendingYamlProposals[0] ?? null;
   const pendingYamlProposalIsStale =
@@ -200,6 +195,9 @@ export function YamlView() {
           <div className="validation-banner-content">
             <div className="validation-banner-summary">{yamlError.title}</div>
             <div>{yamlError.detail}</div>
+            <Button onClick={() => setRetryAttempt((attempt) => attempt + 1)}>
+              Retry YAML export
+            </Button>
           </div>
         </div>
       </div>

@@ -562,6 +562,55 @@ function advanceGuidedPublicationGeneration(): number {
   return guidedPublicationGeneration;
 }
 
+/** Bind interpretation publication to the activation that displayed its card. */
+export function createInterpretationResolutionHandler(
+  sessionId: string,
+  guided: boolean,
+): (newState: CompositionState | null) => void {
+  const generation = guidedPublicationGeneration;
+  return (newState: CompositionState | null): void => {
+    const store = useSessionStore.getState();
+    if (
+      store.activeSessionId !== sessionId ||
+      guidedPublicationGeneration !== generation
+    ) return;
+    if (guided) {
+      if (newState !== null) useSessionStore.setState({ compositionState: newState });
+    } else {
+      store.applyResolvedInterpretation(newState);
+    }
+  };
+}
+
+async function reconcileProposalConflict(
+  sessionId: string,
+  proposalId: string,
+  error: ApiError,
+  isCurrent: () => boolean,
+): Promise<void> {
+  // A 409 can mean operation contention, not proposal retirement. Only a
+  // successful authoritative read may remove actionability.
+  try {
+    const proposals = await api.fetchCompositionProposals(sessionId);
+    if (!isCurrent()) return;
+    useSessionStore.setState((state) => ({
+      compositionProposals: reconcileCompositionProposals(state.compositionProposals, proposals),
+      staleProposalIds: proposals.some(
+        (proposal) => proposal.id === proposalId && proposal.status === "pending",
+      )
+        ? state.staleProposalIds.filter((id) => id !== proposalId)
+        : Array.from(new Set([...state.staleProposalIds, proposalId])),
+      error: error.detail ?? "The proposal could not be updated. Reload the session and try again.",
+    }));
+  } catch {
+    if (isCurrent()) {
+      useSessionStore.setState({
+        error: error.detail ?? "The proposal could not be updated or refreshed. Reload the session.",
+      });
+    }
+  }
+}
+
 function guidedPublicationIsCurrent(
   sessionId: string,
   generation: number,
@@ -1018,9 +1067,21 @@ function mergeCompositionProposals(
   }
   const byId = new Map(existing.map((proposal) => [proposal.id, proposal]));
   for (const proposal of incoming) {
+    const previous = byId.get(proposal.id);
+    if (previous && previous.status !== "pending" && proposal.status === "pending") continue;
     byId.set(proposal.id, proposal);
   }
   return Array.from(byId.values());
+}
+
+function reconcileCompositionProposals(
+  existing: CompositionProposal[],
+  snapshot: CompositionProposal[],
+): CompositionProposal[] {
+  return mergeCompositionProposals(
+    existing.filter((proposal) => proposal.status !== "pending"),
+    snapshot,
+  );
 }
 
 // turn_not_emitted self-heal bookkeeping (C-3, composer first-principles
@@ -2316,20 +2377,26 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   async loadCompositionProposals(sessionId?: string) {
     const targetSessionId = sessionId ?? get().activeSessionId;
     if (!targetSessionId) return;
+    const generation = guidedPublicationGeneration;
+    const isCurrent = () => get().activeSessionId === targetSessionId && guidedPublicationGeneration === generation;
 
     try {
       const proposals = await api.fetchCompositionProposals(targetSessionId);
-      if (get().activeSessionId !== targetSessionId) {
+      if (!isCurrent()) {
         return;
       }
-      set({ compositionProposals: proposals ?? [] });
+      set((state) => ({ compositionProposals: reconcileCompositionProposals(state.compositionProposals, proposals ?? []) }));
     } catch {
-      set({ error: "Failed to load composition proposals. Please try again." });
+      if (isCurrent()) set({ error: "Failed to load composition proposals. Please try again." });
     }
   },
 
   async acceptProposal(proposalId: string) {
     const { activeSessionId } = get();
+    const publicationGeneration = guidedPublicationGeneration;
+    const isCurrent = () =>
+      get().activeSessionId === activeSessionId &&
+      guidedPublicationGeneration === publicationGeneration;
     if (!activeSessionId) {
       throw new Error("acceptProposal called without active session");
     }
@@ -2349,35 +2416,44 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         get().compositionProposals.find((item) => item.id === proposalId)
           ?.pipeline_metadata?.draft_hash ?? null,
       );
-      const [compositionState, proposals] = await Promise.all([
-        api.fetchCompositionState(activeSessionId),
-        api.fetchCompositionProposals(activeSessionId),
-      ]);
-      if (get().activeSessionId !== activeSessionId) {
+      if (!isCurrent()) return;
+      getExecutionStore().clearValidation();
+      // The write receipt remains authoritative even if read-model hydration fails.
+      // Do not expose the pre-accept pipeline as the accepted composition.
+      set((state) => ({
+        compositionState: null,
+        compositionStateLoaded: false,
+        compositionProposals: mergeCompositionProposals(state.compositionProposals, [proposal]),
+      }));
+      let compositionState: CompositionState | null;
+      let proposals: CompositionProposal[];
+      try {
+        [compositionState, proposals] = await Promise.all([
+          api.fetchCompositionState(activeSessionId),
+          api.fetchCompositionProposals(activeSessionId),
+        ]);
+      } catch {
+        if (isCurrent()) {
+          set({ error: "Proposal accepted, but the updated pipeline could not be loaded. Reload the session to refresh it." });
+        }
         return;
       }
-      getExecutionStore().clearValidation();
-      set({
+      if (!isCurrent()) return;
+      set((state) => ({
         compositionState,
+        compositionStateLoaded: true,
         compositionProposals: mergeCompositionProposals(
-          proposals ?? [],
+          reconcileCompositionProposals(state.compositionProposals, proposals ?? []),
           [proposal],
         ),
-      });
+      }));
       // Surface any interpretation reviews accepting this proposal created
       // (see the invariant on refreshInterpretationEventsForSession). Freeform
       // is fire-and-forget (`void`); only guided respondGuided awaits it.
       void refreshInterpretationEventsForSession(activeSessionId);
     } catch (err) {
       if (isHttpConflict(err)) {
-        await get().loadCompositionProposals(activeSessionId);
-        if (get().activeSessionId === activeSessionId) {
-          set((state) => ({
-            staleProposalIds: Array.from(
-              new Set([...state.staleProposalIds, proposalId]),
-            ),
-          }));
-        }
+        await reconcileProposalConflict(activeSessionId, proposalId, err as ApiError, isCurrent);
       } else {
         const apiErr = err as ApiError;
         // proposal_validation_failed (HTTP 422) carries structured
@@ -2392,7 +2468,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         if (isProposalValidationFailure) {
           await get().loadCompositionProposals(activeSessionId);
         }
-        if (get().activeSessionId === activeSessionId) {
+        if (isCurrent()) {
           const validationEntries = apiErr.validation_errors as
             | Array<{ message?: string }>
             | undefined;
@@ -2409,7 +2485,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         }
       }
     } finally {
-      if (get().activeSessionId === activeSessionId) {
+      if (isCurrent()) {
         set((state) => ({
           proposalActionPendingIds: state.proposalActionPendingIds.filter(
             (id) => id !== proposalId,
@@ -2421,6 +2497,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   async rejectProposal(proposalId: string) {
     const { activeSessionId } = get();
+    const publicationGeneration = guidedPublicationGeneration;
+    const isCurrent = () =>
+      get().activeSessionId === activeSessionId &&
+      guidedPublicationGeneration === publicationGeneration;
     if (!activeSessionId) {
       throw new Error("rejectProposal called without active session");
     }
@@ -2438,34 +2518,39 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         activeSessionId,
         proposalId,
       );
-      const proposals = await api.fetchCompositionProposals(activeSessionId);
-      if (get().activeSessionId !== activeSessionId) {
+      if (!isCurrent()) return;
+      set((state) => ({
+        compositionProposals: mergeCompositionProposals(state.compositionProposals, [proposal]),
+      }));
+      let proposals: CompositionProposal[];
+      try {
+        proposals = await api.fetchCompositionProposals(activeSessionId);
+      } catch {
+        if (isCurrent()) {
+          set({ error: "Proposal rejected, but the proposal list could not be refreshed. Reload the session to refresh it." });
+        }
         return;
       }
-      set({
+      if (!isCurrent()) {
+        return;
+      }
+      set((state) => ({
         compositionProposals: mergeCompositionProposals(
-          proposals ?? [],
+          reconcileCompositionProposals(state.compositionProposals, proposals ?? []),
           [proposal],
         ),
-      });
+      }));
     } catch (err) {
       if (isHttpConflict(err)) {
-        await get().loadCompositionProposals(activeSessionId);
-        if (get().activeSessionId === activeSessionId) {
-          set((state) => ({
-            staleProposalIds: Array.from(
-              new Set([...state.staleProposalIds, proposalId]),
-            ),
-          }));
-        }
-      } else {
+        await reconcileProposalConflict(activeSessionId, proposalId, err as ApiError, isCurrent);
+      } else if (isCurrent()) {
         const apiErr = err as ApiError;
         set({
           error: apiErr.detail ?? "Failed to reject proposal. Please try again.",
         });
       }
     } finally {
-      if (get().activeSessionId === activeSessionId) {
+      if (isCurrent()) {
         set((state) => ({
           proposalActionPendingIds: state.proposalActionPendingIds.filter(
             (id) => id !== proposalId,

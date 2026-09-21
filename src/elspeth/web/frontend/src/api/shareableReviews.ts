@@ -1,3 +1,4 @@
+import { authFetch } from "./authSession";
 /**
  * API client for the shareable-reviews endpoints (Phase 6A backend, Phase 6B frontend).
  *
@@ -179,7 +180,7 @@ export async function markReadyForReview(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<MarkReadyForReviewResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/mark-ready-for-review`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/mark-ready-for-review`, {
     method: "POST",
     headers: authHeaders(),
     signal,
@@ -192,7 +193,7 @@ export async function fetchShareableLink(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<ShareableLinkResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/shareable-link`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/shareable-link`, {
     method: "GET",
     headers: authHeaders(),
     signal,
@@ -205,7 +206,7 @@ export async function fetchSharedInspect(
   token: string,
   signal?: AbortSignal,
 ): Promise<SharedInspectResponse> {
-  const response = await fetch(`/api/sessions/shared/${encodeURIComponent(token)}`, {
+  const response = await authFetch(`/api/sessions/shared/${encodeURIComponent(token)}`, {
     method: "GET",
     headers: authHeaders(),
     signal,

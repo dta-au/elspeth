@@ -35,12 +35,9 @@
 //     backend may still hold pending DB rows but they're no longer
 //     surfaced.
 //
-// Tier-discipline note: InterpretationEvent arriving from the API client
-// has already passed pydantic strict-mode validation server-side and
-// typed parseResponse<T>() client-side.  Inside this store it's Tier-2
-// data — direct field access is correct.  No defensive `.get()` /
-// `?.optional()` patterns; if a wire field is missing the upstream
-// invariant has already broken and a crash is the right answer.
+// Wire validation belongs at the API boundary; TypeScript annotations
+// alone do not validate responses. This store consumes the declared event
+// contract and owns projection ordering, not wire parsing.
 //
 // Telemetry: NONE.  The backend Landscape is the canonical record for
 // every interpretation-event mutation; emitting client-side telemetry
@@ -103,6 +100,12 @@ export function selectApprovedInterpretations(
 }
 
 interface InterpretationEventsState {
+  /** Shared request ownership for both snapshot endpoints; reset clears it. */
+  refreshRequestBySession: Record<string, symbol>;
+  /** Every terminal choice suppresses cards, including uncounted retirements. */
+  terminalIdsBySession: Record<string, ReadonlySet<string>>;
+  /** Outstanding writes belong to this store lifetime, never a later login. */
+  mutationRequests: ReadonlySet<symbol>;
   // ── Primary projections ──────────────────────────────────────────────────
   pendingBySession: Record<string, Record<string, InterpretationEvent>>;
   resolvedCountBySession: Record<string, ResolvedCounts>;
@@ -161,7 +164,7 @@ interface InterpretationEventsState {
    * returns the new composition state so the caller can update its
    * own composition-state view atomically.
    *
-   * On error: throws (rejection propagated); store state is untouched
+   * On error: throws (rejection propagated); event projections are untouched
    * (atomicity — if the wire write didn't happen, the projection must
    * not pretend it did).
    */
@@ -180,7 +183,7 @@ interface InterpretationEventsState {
    * opt-out rows are NOT pre-counted here — the audit-readiness panel
    * fetches /opt_out_summary on demand).
    *
-   * On error: throws; store state untouched.
+   * On error: throws; event projections are untouched.
    */
   optOut: (sessionId: string) => Promise<void>;
 
@@ -259,13 +262,24 @@ function incrementResolvedCount(
 // ── Store ────────────────────────────────────────────────────────────────────
 
 export const useInterpretationEventsStore = create<InterpretationEventsState>(
-  (set) => ({
+  (set, get) => ({
     pendingBySession: {},
     resolvedCountBySession: {},
     resolvedBySession: {},
     optedOutBySession: {},
+    refreshRequestBySession: {},
+    terminalIdsBySession: {},
+    mutationRequests: new Set(),
 
     async refreshPending(sessionId: string) {
+      const request = Symbol();
+      const pendingAtStart = get().pendingBySession[sessionId] ?? {};
+      set((state) => ({
+        refreshRequestBySession: {
+          ...state.refreshRequestBySession,
+          [sessionId]: request,
+        },
+      }));
       // The API client returns InterpretationEvent[] (envelope already
       // unwrapped).  Project into the {eventId: event} map.
       const events = await api.listInterpretationEvents(sessionId, "pending");
@@ -273,12 +287,33 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
       for (const event of events) {
         map[event.id] = event;
       }
-      set((state) => ({
-        pendingBySession: { ...state.pendingBySession, [sessionId]: map },
-      }));
+      set((state) => {
+        if (state.refreshRequestBySession[sessionId] !== request) return state;
+        for (const [id, event] of Object.entries(state.pendingBySession[sessionId] ?? {})) {
+          if (pendingAtStart[id] !== event) map[id] = event;
+        }
+        const terminalIds = state.terminalIdsBySession[sessionId];
+        for (const id of Object.keys(map)) {
+          if (terminalIds?.has(id)) delete map[id];
+        }
+        return {
+          pendingBySession: {
+            ...state.pendingBySession,
+            [sessionId]: state.optedOutBySession[sessionId] ? {} : map,
+          },
+        };
+      });
     },
 
     async refreshAll(sessionId: string) {
+      const request = Symbol();
+      const pendingAtStart = get().pendingBySession[sessionId] ?? {};
+      set((state) => ({
+        refreshRequestBySession: {
+          ...state.refreshRequestBySession,
+          [sessionId]: request,
+        },
+      }));
       const events = await api.listInterpretationEvents(sessionId, "all");
       const pendingMap: Record<string, InterpretationEvent> = {};
       // Resolved-event list for the Phase 6B NarrativeResults overlay.
@@ -306,6 +341,11 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
         // if needed.
       }
       set((state) => {
+        if (state.refreshRequestBySession[sessionId] !== request) return state;
+        const terminalIds = new Set(state.terminalIdsBySession[sessionId]);
+        for (const event of events) {
+          if (event.choice !== "pending") terminalIds.add(event.id);
+        }
         // The resolved slice is write-MONOTONIC (elspeth-292505e1c3):
         // resolution is terminal server-side (resolved rows are audit
         // records, never deleted), so a row present locally but missing
@@ -336,8 +376,13 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
           }
         }
         const nextPending: Record<string, InterpretationEvent> = {};
+        // Inline compose receipts received after the GET began are absent
+        // from its snapshot. Preserve them, unless a terminal row retires them.
+        for (const [id, event] of Object.entries(state.pendingBySession[sessionId] ?? {})) {
+          if (pendingAtStart[id] !== event) pendingMap[id] = event;
+        }
         for (const [id, event] of Object.entries(pendingMap)) {
-          if (!mergedResolved.some((resolved) => resolved.id === id)) {
+          if (!terminalIds.has(id)) {
             nextPending[id] = event;
           }
         }
@@ -345,6 +390,10 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
         const optedOut =
           optedOutFromHistory || state.optedOutBySession[sessionId] === true;
         return {
+          terminalIdsBySession: {
+            ...state.terminalIdsBySession,
+            [sessionId]: terminalIds,
+          },
           pendingBySession: {
             ...state.pendingBySession,
             [sessionId]: optedOut ? {} : nextPending,
@@ -369,13 +418,28 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
       eventId: string,
       body: InterpretationResolveRequest,
     ) {
-      // Call the API first; on error the throw propagates and the store
-      // is untouched (atomicity invariant).
-      const response = await api.resolveInterpretation(sessionId, eventId, body);
+      // Register request custody, then call the API. Errors propagate without
+      // changing the event projections (atomicity invariant).
+      const request = Symbol();
+      set((state) => ({
+        mutationRequests: new Set([...state.mutationRequests, request]),
+      }));
+      let response;
+      try {
+        response = await api.resolveInterpretation(sessionId, eventId, body);
+      } catch (error) {
+        set((state) => ({
+          mutationRequests: new Set(
+            [...state.mutationRequests].filter((id) => id !== request),
+          ),
+        }));
+        throw error;
+      }
       const resolvedChoice = response.event.choice;
       const resolvedEvent = response.event;
 
       set((state) => {
+        if (!state.mutationRequests.has(request)) return state;
         // Remove the event from pending.  Use a fresh inner map rather
         // than mutating the existing one (Zustand selectors compare by
         // reference identity).
@@ -408,6 +472,15 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
           : [...priorResolved, resolvedEvent];
 
         return {
+          mutationRequests: new Set(
+            [...state.mutationRequests].filter((id) => id !== request),
+          ),
+          terminalIdsBySession: {
+            ...state.terminalIdsBySession,
+            [sessionId]: new Set([
+              ...(state.terminalIdsBySession[sessionId] ?? []), eventId,
+            ]),
+          },
           pendingBySession: {
             ...state.pendingBySession,
             [sessionId]: nextSessionPending,
@@ -430,23 +503,41 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
     },
 
     async optOut(sessionId: string) {
-      // API first; on error, throw and leave store untouched.
-      await api.optOutOfInterpretations(sessionId);
-
+      // Register request custody; API errors leave event projections untouched.
+      const request = Symbol();
       set((state) => ({
-        optedOutBySession: { ...state.optedOutBySession, [sessionId]: true },
-        // Clear pending events for the session — the UX is "interpretations
-        // silenced from now on".  The backend may still hold pending rows
-        // in the DB; we don't fetch /opt_out_summary here because the panel
-        // surface owns that fetch (lazy, on demand).
-        pendingBySession: { ...state.pendingBySession, [sessionId]: {} },
-        // Bump the opted_out counter to represent the opt-out event itself.
-        resolvedCountBySession: incrementResolvedCount(
-          state.resolvedCountBySession,
-          sessionId,
-          "opted_out",
-        ),
+        mutationRequests: new Set([...state.mutationRequests, request]),
       }));
+      try {
+        await api.optOutOfInterpretations(sessionId);
+      } catch (error) {
+        set((state) => ({
+          mutationRequests: new Set(
+            [...state.mutationRequests].filter((id) => id !== request),
+          ),
+        }));
+        throw error;
+      }
+
+      set((state) => {
+        if (!state.mutationRequests.has(request)) return state;
+        return {
+          mutationRequests: new Set(
+            [...state.mutationRequests].filter((id) => id !== request),
+          ),
+          optedOutBySession: { ...state.optedOutBySession, [sessionId]: true },
+          // Clear pending events for the session — the UX is "interpretations
+          // silenced from now on". The backend may still hold pending rows
+          // in the DB; the panel owns the lazy opt-out summary fetch.
+          pendingBySession: { ...state.pendingBySession, [sessionId]: {} },
+          // Count the opt-out event itself.
+          resolvedCountBySession: incrementResolvedCount(
+            state.resolvedCountBySession,
+            sessionId,
+            "opted_out",
+          ),
+        };
+      });
     },
 
     addPendingEvent(sessionId: string, event: InterpretationEvent) {
@@ -454,6 +545,12 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
       // compose-loop response path.  The caller is responsible for only
       // dispatching pending events here; counts/opt-out are not touched.
       set((state) => {
+        if (
+          state.optedOutBySession[sessionId] ||
+          state.terminalIdsBySession[sessionId]?.has(event.id)
+        ) {
+          return state;
+        }
         const sessionPending = state.pendingBySession[sessionId] ?? {};
         return {
           pendingBySession: {

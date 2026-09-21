@@ -1,15 +1,16 @@
+import { authFetch } from "./authSession";
 import { authHeaders, parseResponse } from "./client";
 import type { LibraryCuratorAction, LibraryEntry, LibraryFork, LibraryList, LibraryView } from "@/types/library";
 
 const segment = encodeURIComponent;
 
 async function get<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: authHeaders(), cache: "no-store" });
+  const response = await authFetch(url, { headers: authHeaders(), cache: "no-store" });
   return parseResponse<T>(response);
 }
 
 async function post<T>(url: string, body?: object): Promise<T> {
-  const response = await fetch(url, {
+  const response = await authFetch(url, {
     method: "POST",
     headers: authHeaders(body === undefined ? undefined : "application/json"),
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),

@@ -1,3 +1,4 @@
+import { authFetch, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
 //
@@ -244,19 +245,12 @@ export async function parseResponse<T>(
   options: ParseResponseOptions = {},
 ): Promise<T> {
   if (!response.ok) {
-    // Global 401 interceptor -- trigger logout on any auth failure.
+    // A rejected credential can only invalidate the login that sent it.
     // Dynamic import avoids circular dependency at module load time
     // (authStore imports from client, client imports authStore for logout).
-    //
-    // Skip the logout call when the store already shows no token. Otherwise a
-    // 401 from an unauthenticated request (e.g., a pre-login probe) calls
-    // logout() against an already-empty session — harmless on its own, but if
-    // the response arrives AFTER a successful login completes, it would wipe
-    // the freshly-acquired token. Guarding on token!==null defuses that race
-    // without changing the legitimate "token expired mid-session" path.
     if (response.status === 401 && options.logoutOnUnauthorized !== false) {
       const { useAuthStore } = await import("@/stores/authStore");
-      if (useAuthStore.getState().token !== null) {
+      if (responseOwnsCredential(response, useAuthStore.getState().token)) {
         await useAuthStore.getState().logout();
       }
     }
@@ -502,7 +496,7 @@ export async function parseResponse<T>(
  * callable before login. Returns provider type and OIDC params.
  */
 export async function fetchAuthConfig(): Promise<AuthConfig> {
-  const response = await fetch("/api/auth/config", { cache: "no-store" });
+  const response = await authFetch("/api/auth/config", { cache: "no-store" });
   return parseResponse<AuthConfig>(response);
 }
 
@@ -514,7 +508,7 @@ export async function login(
   username: string,
   password: string,
 ): Promise<{ access_token: string }> {
-  const response = await fetch("/api/auth/login", {
+  const response = await authFetch("/api/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
@@ -526,7 +520,7 @@ export async function login(
  * Refresh the current auth token. Returns a new access token.
  */
 export async function refreshToken(): Promise<{ access_token: string }> {
-  const response = await fetch("/api/auth/token", {
+  const response = await authFetch("/api/auth/token", {
     method: "POST",
     headers: authHeaders("application/json"),
   });
@@ -537,11 +531,11 @@ export async function refreshToken(): Promise<{ access_token: string }> {
  * Get the current user's profile. Used to validate the stored token
  * on page load and to populate the user display.
  */
-export async function fetchCurrentUser(): Promise<UserProfile> {
-  const response = await fetch("/api/auth/me", {
+export async function fetchCurrentUser(options: ParseResponseOptions = {}): Promise<UserProfile> {
+  const response = await authFetch("/api/auth/me", {
     headers: authHeaders(),
   });
-  return parseResponse<UserProfile>(response);
+  return parseResponse<UserProfile>(response, options);
 }
 
 // ── Dev-admin user management (env-gated; 404 unless the backend's
@@ -549,7 +543,7 @@ export async function fetchCurrentUser(): Promise<UserProfile> {
 
 /** List every local-auth account (dev admin only). */
 export async function fetchAdminUsers(): Promise<{ users: AdminUserSummary[] }> {
-  const response = await fetch("/api/auth/admin/users", {
+  const response = await authFetch("/api/auth/admin/users", {
     headers: authHeaders(),
   });
   return parseResponse<{ users: AdminUserSummary[] }>(response);
@@ -561,7 +555,7 @@ export async function createAdminUser(body: {
   display_name: string;
   email?: string;
 }): Promise<AdminGeneratedPassword> {
-  const response = await fetch("/api/auth/admin/users", {
+  const response = await authFetch("/api/auth/admin/users", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -573,7 +567,7 @@ export async function createAdminUser(body: {
 export async function resetAdminUserPassword(
   userId: string,
 ): Promise<AdminGeneratedPassword> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/auth/admin/users/${encodeURIComponent(userId)}/reset-password`,
     { method: "POST", headers: authHeaders() },
   );
@@ -590,7 +584,7 @@ export const DELETE_ADMIN_USER_REASON_MAX_LENGTH = 480;
  * in the body, not the query string, which access logs record.
  */
 export async function deleteAdminUser(userId: string, reason: string): Promise<void> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/auth/admin/users/${encodeURIComponent(userId)}`,
     {
       method: "DELETE",
@@ -609,7 +603,7 @@ export async function fetchSystemStatus(): Promise<SystemStatus> {
   // for the OS connect timeout (30-120s), which made the outage banner's
   // Retry button look dead (operator-observed). 5s is generous for a
   // same-origin health endpoint.
-  const response = await fetch("/api/system/status", {
+  const response = await authFetch("/api/system/status", {
     signal: AbortSignal.timeout(5000),
   });
   return parseResponse<SystemStatus>(response);
@@ -624,7 +618,7 @@ export async function fetchSessions(includeArchived = true): Promise<Session[]> 
     params.set("include_archived", "true");
   }
   const query = params.size > 0 ? `?${params.toString()}` : "";
-  const response = await fetch(`/api/sessions${query}`, {
+  const response = await authFetch(`/api/sessions${query}`, {
     headers: authHeaders(),
   });
   return parseResponse<Session[]>(response);
@@ -637,7 +631,7 @@ export async function fetchSessions(includeArchived = true): Promise<Session[]> 
  * shares one naming convention (elspeth-ef8c18a6cb).
  */
 export async function createSession(): Promise<Session> {
-  const response = await fetch("/api/sessions", {
+  const response = await authFetch("/api/sessions", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({}),
@@ -647,7 +641,7 @@ export async function createSession(): Promise<Session> {
 
 /** Get a single session by ID. */
 export async function getSession(sessionId: string): Promise<Session> {
-  const response = await fetch(`/api/sessions/${sessionId}`, {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
     headers: authHeaders(),
   });
   return parseResponse<Session>(response);
@@ -658,7 +652,7 @@ export async function renameSession(
   sessionId: string,
   title: string,
 ): Promise<Session> {
-  const response = await fetch(`/api/sessions/${sessionId}`, {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
     method: "PATCH",
     headers: authHeaders("application/json"),
     body: JSON.stringify({ title }),
@@ -675,7 +669,7 @@ export async function runTutorialPipeline(
   body: TutorialRunRequest,
   signal?: AbortSignal,
 ): Promise<TutorialRunResponse> {
-  const response = await fetch("/api/tutorial/run", {
+  const response = await authFetch("/api/tutorial/run", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -693,7 +687,7 @@ export async function runTutorialPipeline(
 export async function cancelTutorialRun(
   sessionId: string,
 ): Promise<TutorialCancelResponse> {
-  const response = await fetch("/api/tutorial/cancel", {
+  const response = await authFetch("/api/tutorial/cancel", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({ session_id: sessionId }),
@@ -710,7 +704,7 @@ export async function cancelTutorialRun(
  * `navigator.sendBeacon` cannot carry, so this is a keepalive fetch (the
  * browser lets it outlive the page). */
 export function sendTutorialAbandonBeacon(): void {
-  void fetch("/api/tutorial/abandon", {
+  void authFetch("/api/tutorial/abandon", {
     method: "POST",
     headers: authHeaders(),
     keepalive: true,
@@ -724,7 +718,7 @@ export async function getRunAuditSummary(
   sessionId: string,
   runId: string,
 ): Promise<RunAuditStoryResponse> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/runs/${runId}/audit-story`,
     { headers: authHeaders() },
   );
@@ -733,7 +727,7 @@ export async function getRunAuditSummary(
 
 /** Clean up orphaned tutorial sessions for the authenticated user. */
 export async function deleteTutorialOrphans(): Promise<TutorialOrphanCleanupResponse> {
-  const response = await fetch("/api/tutorial/orphans", {
+  const response = await authFetch("/api/tutorial/orphans", {
     method: "DELETE",
     headers: authHeaders(),
   });
@@ -742,7 +736,7 @@ export async function deleteTutorialOrphans(): Promise<TutorialOrphanCleanupResp
 
 /** Archive (soft-delete) a session. Backend returns 204 No Content. */
 export async function archiveSession(sessionId: string): Promise<void> {
-  const response = await fetch(`/api/sessions/${sessionId}`, {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
     method: "DELETE",
     headers: authHeaders(),
   });
@@ -755,7 +749,7 @@ export async function archiveSession(sessionId: string): Promise<void> {
 
 /** Get all messages for a session. */
 export async function fetchMessages(sessionId: string): Promise<ChatMessage[]> {
-  const response = await fetch(`/api/sessions/${sessionId}/messages`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
     headers: authHeaders(),
   });
   return parseResponse<ChatMessage[]>(response);
@@ -771,7 +765,7 @@ export async function fetchRecoveryTranscript(
     limit: String(opts.limit ?? 500),
     offset: String(opts.offset ?? 0),
   });
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/messages?${params}`,
     {
       headers: authHeaders(),
@@ -784,7 +778,7 @@ export async function fetchRecoveryTranscript(
 export async function fetchComposerProgress(
   sessionId: string,
 ): Promise<ComposerProgressSnapshot> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/composer-progress`,
     {
       headers: authHeaders(),
@@ -797,7 +791,7 @@ export async function fetchComposerProgress(
 export async function fetchComposerPreferences(
   sessionId: string,
 ): Promise<ComposerPreferences> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/composer/preferences`,
     {
       headers: authHeaders(),
@@ -811,7 +805,7 @@ export async function updateComposerPreferences(
   sessionId: string,
   body: Pick<ComposerPreferences, "trust_mode" | "density_default">,
 ): Promise<ComposerPreferences> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/composer/preferences`,
     {
       method: "PATCH",
@@ -828,7 +822,7 @@ export async function updateComposerPreferences(
 
 /** Get the user's account-level composer preferences. */
 export async function fetchUserComposerPreferences(): Promise<UserComposerPreferencesPayload> {
-  const response = await fetch("/api/composer-preferences", {
+  const response = await authFetch("/api/composer-preferences", {
     headers: authHeaders(),
   });
   return decodeUserComposerPreferences(await parseResponse<unknown>(response));
@@ -838,7 +832,7 @@ export async function fetchUserComposerPreferences(): Promise<UserComposerPrefer
 export async function updateUserComposerPreferences(
   payload: UpdateUserComposerPreferencesPayload,
 ): Promise<UserComposerPreferencesPayload> {
-  const response = await fetch("/api/composer-preferences", {
+  const response = await authFetch("/api/composer-preferences", {
     method: "PATCH",
     headers: authHeaders("application/json"),
     body: JSON.stringify(payload),
@@ -850,7 +844,7 @@ export async function updateUserComposerPreferences(
 export async function fetchCompositionProposals(
   sessionId: string,
 ): Promise<CompositionProposal[]> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/proposals?status=pending`,
     {
       headers: authHeaders(),
@@ -865,7 +859,7 @@ export async function acceptCompositionProposal(
   proposalId: string,
   draftHash: string | null,
 ): Promise<CompositionProposal> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/proposals/${proposalId}/accept`,
     {
       method: "POST",
@@ -881,7 +875,7 @@ export async function rejectCompositionProposal(
   sessionId: string,
   proposalId: string,
 ): Promise<CompositionProposal> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/proposals/${proposalId}/reject`,
     {
       method: "POST",
@@ -909,7 +903,7 @@ export async function sendMessage(
   if (stateId) {
     body.state_id = stateId;
   }
-  const response = await fetch(`/api/sessions/${sessionId}/messages`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -924,7 +918,7 @@ export async function recompose(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/recompose`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/recompose`, {
     method: "POST",
     headers: authHeaders("application/json"),
     signal,
@@ -955,7 +949,7 @@ export async function getGuided(
   signal?: AbortSignal,
   probe = false,
 ): Promise<GetGuidedResponse | null> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided${probe ? "?probe=true" : ""}`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/guided${probe ? "?probe=true" : ""}`, {
     method: "GET",
     headers: authHeaders(),
     signal,
@@ -978,7 +972,7 @@ export async function getTutorialSample(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<TutorialSampleResponse> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/guided/tutorial-sample`,
     {
       method: "GET",
@@ -1017,7 +1011,7 @@ export async function startGuidedSession(
   command: GuidedStartCommand,
   signal?: AbortSignal,
 ): Promise<GetGuidedResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/start`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/guided/start`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({
@@ -1042,7 +1036,7 @@ export async function reconcileGuidedStartOperation(
   operationId: string,
   signal?: AbortSignal,
 ): Promise<GuidedStartOperationReconciliation> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/guided/start/${operationId}/reconcile`,
     {
       method: "POST",
@@ -1066,7 +1060,7 @@ export async function respondGuided(
   body: GuidedRespondRequest,
   signal?: AbortSignal,
 ): Promise<GuidedRespondResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/respond`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/guided/respond`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -1093,7 +1087,7 @@ export async function reenterGuided(
   operationId: string,
   signal?: AbortSignal,
 ): Promise<GetGuidedResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/reenter`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/guided/reenter`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({ operation_id: operationId }),
@@ -1126,7 +1120,7 @@ export async function convertToGuided(
   operationId: string,
   signal?: AbortSignal,
 ): Promise<GetGuidedResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/convert`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/guided/convert`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({ operation_id: operationId, intent }),
@@ -1152,7 +1146,7 @@ export async function chatGuided(
   body: GuidedChatRequest,
   signal?: AbortSignal,
 ): Promise<GuidedChatResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/chat`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/guided/chat`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -1168,7 +1162,7 @@ export async function forkFromMessage(
   fromMessageId: string,
   newMessageContent: string,
 ): Promise<{ session_id: string }> {
-  const response = await fetch(`/api/sessions/${sessionId}/fork`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/fork`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({
@@ -1193,7 +1187,7 @@ export async function forkFromMessage(
 export async function fetchCompositionState(
   sessionId: string,
 ): Promise<CompositionState | null> {
-  const response = await fetch(`/api/sessions/${sessionId}/state`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/state`, {
     headers: authHeaders(),
   });
   if (response.status === 404) {
@@ -1207,7 +1201,7 @@ export async function fetchCompositionState(
 export async function fetchStateVersions(
   sessionId: string,
 ): Promise<CompositionStateVersion[]> {
-  const response = await fetch(`/api/sessions/${sessionId}/state/versions`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/state/versions`, {
     headers: authHeaders(),
   });
   return decodeCompositionStateVersions(await parseResponse<unknown>(response));
@@ -1223,7 +1217,7 @@ export async function revertToVersion(
   stateId: string,
   operationId: string,
 ): Promise<CompositionState> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/state/revert`,
     {
       method: "POST",
@@ -1248,7 +1242,7 @@ export async function revertToVersion(
 export async function fetchYaml(
   sessionId: string,
 ): Promise<{ yaml: string; source_blob_ids?: Record<string, string> }> {
-  const response = await fetch(`/api/sessions/${sessionId}/state/yaml`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/state/yaml`, {
     headers: authHeaders(),
   });
   return parseResponse<{ yaml: string; source_blob_ids?: Record<string, string> }>(
@@ -1299,7 +1293,7 @@ export async function importCompositionYaml(
   const body: ImportCompositionYamlRequest = sourceBlobIds
     ? { yaml: yamlText, source_blob_ids: sourceBlobIds }
     : { yaml: yamlText };
-  const response = await fetch(`/api/sessions/${sessionId}/state/yaml`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/state/yaml`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -1324,7 +1318,7 @@ async function parsePluginSnapshotResponse<T>(
 
 /** Fetch the current principal's immutable plugin-policy snapshot metadata. */
 export async function fetchPluginPolicy(): Promise<PluginSnapshotResponse<PluginPolicyResponse>> {
-  const response = await fetch("/api/catalog/policy", {
+  const response = await authFetch("/api/catalog/policy", {
     headers: authHeaders(),
     cache: "no-store",
   });
@@ -1333,7 +1327,7 @@ export async function fetchPluginPolicy(): Promise<PluginSnapshotResponse<Plugin
 
 /** List available source plugins. */
 export async function listSources(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
-  const response = await fetch("/api/catalog/sources", {
+  const response = await authFetch("/api/catalog/sources", {
     headers: authHeaders(),
   });
   return parsePluginSnapshotResponse<PluginSummary[]>(response);
@@ -1341,7 +1335,7 @@ export async function listSources(): Promise<PluginSnapshotResponse<PluginSummar
 
 /** List available transform plugins. */
 export async function listTransforms(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
-  const response = await fetch("/api/catalog/transforms", {
+  const response = await authFetch("/api/catalog/transforms", {
     headers: authHeaders(),
   });
   return parsePluginSnapshotResponse<PluginSummary[]>(response);
@@ -1349,7 +1343,7 @@ export async function listTransforms(): Promise<PluginSnapshotResponse<PluginSum
 
 /** List available sink plugins. */
 export async function listSinks(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
-  const response = await fetch("/api/catalog/sinks", {
+  const response = await authFetch("/api/catalog/sinks", {
     headers: authHeaders(),
   });
   return parsePluginSnapshotResponse<PluginSummary[]>(response);
@@ -1367,7 +1361,7 @@ export async function getPluginSchema(
   // REST URL uses plural path segments; the route handler translates
   // plural -> singular before calling CatalogService.
   const pluralType = `${pluginType}s`;
-  const response = await fetch(
+  const response = await authFetch(
     `/api/catalog/${pluralType}/${pluginName}/schema`,
     { headers: authHeaders() },
   );
@@ -1389,7 +1383,7 @@ export async function validatePipeline(
     params.set("state_id", stateId);
   }
   const query = params.size > 0 ? `?${params.toString()}` : "";
-  const response = await fetch(`/api/sessions/${sessionId}/validate${query}`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/validate${query}`, {
     method: "POST",
     headers: authHeaders("application/json"),
   });
@@ -1432,13 +1426,13 @@ export async function executePipeline(
     }
     init.body = JSON.stringify(body);
   }
-  const response = await fetch(`/api/sessions/${sessionId}/execute${query}`, init);
+  const response = await authFetch(`/api/sessions/${sessionId}/execute${query}`, init);
   return parseResponse<{ run_id: string }>(response);
 }
 
 /** Get the status of a specific run. */
 export async function getRunStatus(runId: string): Promise<Run> {
-  const response = await fetch(`/api/runs/${runId}`, {
+  const response = await authFetch(`/api/runs/${runId}`, {
     headers: authHeaders(),
   });
   return parseResponse<Run>(response);
@@ -1446,7 +1440,7 @@ export async function getRunStatus(runId: string): Promise<Run> {
 
 /** Cancel a running pipeline execution. */
 export async function cancelRun(runId: string): Promise<CancelRunResponse> {
-  const response = await fetch(`/api/runs/${runId}/cancel`, {
+  const response = await authFetch(`/api/runs/${runId}/cancel`, {
     method: "POST",
     headers: authHeaders("application/json"),
   });
@@ -1457,7 +1451,7 @@ export async function cancelRun(runId: string): Promise<CancelRunResponse> {
 export async function createRunWebSocketTicket(
   runId: string,
 ): Promise<WebSocketTicketResponse> {
-  const response = await fetch(`/api/runs/${runId}/ws-ticket`, {
+  const response = await authFetch(`/api/runs/${runId}/ws-ticket`, {
     method: "POST",
     headers: authHeaders("application/json"),
   });
@@ -1468,7 +1462,7 @@ export async function createRunWebSocketTicket(
 export async function getRunResults(
   runId: string,
 ): Promise<Run> {
-  const response = await fetch(`/api/runs/${runId}/results`, {
+  const response = await authFetch(`/api/runs/${runId}/results`, {
     headers: authHeaders(),
   });
   return parseResponse<Run>(response);
@@ -1476,7 +1470,7 @@ export async function getRunResults(
 
 /** List runs for a session. */
 export async function fetchRuns(sessionId: string): Promise<Run[]> {
-  const response = await fetch(`/api/sessions/${sessionId}/runs`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/runs`, {
     headers: authHeaders(),
   });
   return parseResponse<Run[]>(response);
@@ -1487,7 +1481,7 @@ export async function fetchRunDiagnostics(
   runId: string,
   limit = 50,
 ): Promise<RunDiagnostics> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/runs/${runId}/diagnostics?limit=${encodeURIComponent(String(limit))}`,
     {
       headers: authHeaders(),
@@ -1501,7 +1495,7 @@ export async function evaluateRunDiagnostics(
   runId: string,
   limit = 50,
 ): Promise<RunDiagnosticsEvaluation> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/runs/${runId}/diagnostics/evaluate?limit=${encodeURIComponent(String(limit))}`,
     {
       method: "POST",
@@ -1518,7 +1512,7 @@ export async function evaluateRunDiagnostics(
  * unbounded and intended for the per-run Outputs section.
  */
 export async function fetchRunOutputs(runId: string): Promise<RunOutputsResponse> {
-  const response = await fetch(`/api/runs/${runId}/outputs`, {
+  const response = await authFetch(`/api/runs/${runId}/outputs`, {
     headers: authHeaders(),
   });
   return parseResponse<RunOutputsResponse>(response);
@@ -1532,7 +1526,7 @@ export async function fetchRunOutputPreview(
   runId: string,
   artifactId: string,
 ): Promise<RunOutputArtifactPreview> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/runs/${runId}/outputs/${encodeURIComponent(artifactId)}/preview`,
     {
       headers: authHeaders(),
@@ -1556,7 +1550,7 @@ export async function downloadRunOutputContent(
   runId: string,
   artifactId: string,
 ): Promise<{ data: Blob; filename: string }> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/runs/${runId}/outputs/${encodeURIComponent(artifactId)}/content`,
     { headers: authHeaders() },
   );
@@ -1586,7 +1580,7 @@ export async function uploadBlob(
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`/api/sessions/${sessionId}/blobs`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/blobs`, {
     method: "POST",
     headers,
     body: formData,
@@ -1596,7 +1590,7 @@ export async function uploadBlob(
 
 /** List all blobs for a session. */
 export async function listBlobs(sessionId: string): Promise<BlobMetadata[]> {
-  const response = await fetch(`/api/sessions/${sessionId}/blobs`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/blobs`, {
     headers: authHeaders(),
   });
   return parseResponse<BlobMetadata[]>(response);
@@ -1645,7 +1639,7 @@ export async function getBlobMetadata(
   sessionId: string,
   blobId: string,
 ): Promise<BlobMetadata> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}`,
     { headers: authHeaders() },
   );
@@ -1657,7 +1651,7 @@ export async function downloadBlobContent(
   sessionId: string,
   blobId: string,
 ): Promise<{ data: Blob; filename: string }> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}/content`,
     { headers: authHeaders() },
   );
@@ -1677,7 +1671,7 @@ export async function previewBlobContent(
   sessionId: string,
   blobId: string,
 ): Promise<string> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}/content`,
     { headers: authHeaders() },
   );
@@ -1699,7 +1693,7 @@ export async function previewBlobContentSnippet(
   blobId: string,
   limit: number,
 ): Promise<BlobContentPreview> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}/preview?limit=${limit}`,
     { headers: authHeaders() },
   );
@@ -1719,7 +1713,7 @@ export async function deleteBlob(
   sessionId: string,
   blobId: string,
 ): Promise<void> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}`,
     { method: "DELETE", headers: authHeaders() },
   );
@@ -1739,7 +1733,7 @@ function emitPluginCatalogInvalidation(): void {
 
 /** List all available secret references (no values). */
 export async function listSecrets(): Promise<SecretInventoryItem[]> {
-  const response = await fetch("/api/secrets", { headers: authHeaders() });
+  const response = await authFetch("/api/secrets", { headers: authHeaders() });
   return parseResponse<SecretInventoryItem[]>(response);
 }
 
@@ -1748,7 +1742,7 @@ export async function createSecret(
   name: string,
   value: string,
 ): Promise<{ name: string; scope: string; available: boolean }> {
-  const response = await fetch("/api/secrets", {
+  const response = await authFetch("/api/secrets", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({ name, value }),
@@ -1760,7 +1754,7 @@ export async function createSecret(
 
 /** Delete a user-scoped secret. */
 export async function deleteSecret(name: string): Promise<void> {
-  const response = await fetch(`/api/secrets/${encodeURIComponent(name)}`, {
+  const response = await authFetch(`/api/secrets/${encodeURIComponent(name)}`, {
     method: "DELETE",
     headers: authHeaders(),
   });
@@ -1813,7 +1807,7 @@ export async function listInterpretationEvents(
   // does percent-encoding correctly for any future status-value extension
   // and keeps the call site free of manual string concatenation.
   const qs = new URLSearchParams({ status });
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/interpretations?${qs.toString()}`,
     {
       method: "GET",
@@ -1843,7 +1837,7 @@ export async function resolveInterpretation(
   body: InterpretationResolveRequest,
   signal?: AbortSignal,
 ): Promise<InterpretationResolveResponse> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/interpretations/${eventId}/resolve`,
     {
       method: "POST",
@@ -1869,7 +1863,7 @@ export async function optOutOfInterpretations(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<InterpretationOptOutResponse> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/interpretations/opt_out`,
     {
       method: "POST",
@@ -1897,7 +1891,7 @@ export async function getInterpretationOptOutSummary(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<InterpretationEvent[]> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/interpretations/opt_out_summary`,
     {
       method: "GET",
@@ -1943,7 +1937,7 @@ export async function register(
   if (email !== undefined) {
     body.email = email;
   }
-  const response = await fetch("/api/auth/register", {
+  const response = await authFetch("/api/auth/register", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -1955,7 +1949,7 @@ export async function register(
  * Consume an email-verification token and return a normal local-auth JWT.
  */
 export async function verifyEmail(token: string): Promise<AuthTokenResponse> {
-  const response = await fetch("/api/auth/verify-email", {
+  const response = await authFetch("/api/auth/verify-email", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token }),
@@ -1973,7 +1967,7 @@ export async function verifyEmail(token: string): Promise<AuthTokenResponse> {
  * must not evict a session that may already be signed in.
  */
 export async function completeSsoLogin(code: string): Promise<AuthTokenResponse> {
-  const response = await fetch("/api/auth/sso/complete", {
+  const response = await authFetch("/api/auth/sso/complete", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code }),

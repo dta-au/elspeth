@@ -288,12 +288,7 @@ describe("auditReadiness API client", () => {
     expect(localStorage.getItem("auth_token")).toBeNull();
   });
 
-  // Defuses the token-wipe race: a 401 response that arrives AFTER a successful
-  // login (token swapped in by another caller) must not call logout() and wipe
-  // the fresh token. The guard at client.ts inside parseResponse() short-
-  // circuits when the store already shows no token at the moment the
-  // interceptor runs. Here we simulate the inverse — a 401 fired while token
-  // is null — and confirm no spurious state change occurs.
+  // An unauthenticated request has no credential that a 401 can invalidate.
   it("does not invoke logout when a 401 arrives with no token in the store", async () => {
     // Start with no token (the cold-load / pre-auth scenario).
     expect(useAuthStore.getState().token).toBeNull();

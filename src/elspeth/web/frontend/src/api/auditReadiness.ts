@@ -1,3 +1,4 @@
+import { authFetch } from "./authSession";
 /**
  * API client for the audit-readiness panel (Phase 2).
  *
@@ -210,7 +211,7 @@ export async function fetchAuditReadiness(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<AuditReadinessSnapshot> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/audit-readiness`,
     { method: "GET", headers: authHeaders(), signal },
   );
@@ -221,7 +222,7 @@ export async function fetchAuditReadinessExplain(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<AuditReadinessExplain> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/audit-readiness/explain`,
     { method: "GET", headers: authHeaders(), signal },
   );

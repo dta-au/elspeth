@@ -96,6 +96,157 @@ describe("interpretationEventsStore", () => {
     });
   });
 
+  describe("snapshot ordering", () => {
+    it("does not restore a resolution after a store reset", async () => {
+      let finish!: (response: InterpretationResolveResponse) => void;
+      vi.mocked(api.resolveInterpretation).mockImplementationOnce(
+        () => new Promise((resolve) => { finish = resolve; }),
+      );
+      const resolution = useInterpretationEventsStore.getState().resolveEvent(
+        "sess-1", "evt-1", { choice: "accepted_as_drafted" },
+      );
+      resetStore(useInterpretationEventsStore);
+      finish({
+        event: makePendingEvent({ choice: "accepted_as_drafted" }),
+        new_state: makeCompositionState(),
+      });
+      await resolution;
+      expect(useInterpretationEventsStore.getState().resolvedBySession).toEqual({});
+      expect(useInterpretationEventsStore.getState().pendingBySession).toEqual({});
+      expect(useInterpretationEventsStore.getState().mutationRequests.size).toBe(0);
+    });
+
+    it("does not restore an opt-out after a store reset", async () => {
+      let finish!: (response: InterpretationOptOutResponse) => void;
+      vi.mocked(api.optOutOfInterpretations).mockImplementationOnce(
+        () => new Promise((resolve) => { finish = resolve; }),
+      );
+      const optOut = useInterpretationEventsStore.getState().optOut("sess-1");
+      resetStore(useInterpretationEventsStore);
+      finish({ session_id: "sess-1", interpretation_review_disabled: true, opted_out_at: "2026-05-18T00:05:00Z" });
+      await optOut;
+      expect(useInterpretationEventsStore.getState().optedOutBySession).toEqual({});
+      expect(useInterpretationEventsStore.getState().pendingBySession).toEqual({});
+      expect(useInterpretationEventsStore.getState().mutationRequests.size).toBe(0);
+    });
+
+    it.each(["superseded", "abandoned"] as const)(
+      "does not resurrect a %s card from an older request",
+      async (choice) => {
+        let finish!: (events: InterpretationEvent[]) => void;
+        vi.mocked(api.listInterpretationEvents).mockImplementationOnce(
+          () => new Promise((resolve) => { finish = resolve; }),
+        );
+        const older = useInterpretationEventsStore.getState().refreshAll("sess-1");
+        vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([
+          makePendingEvent({ choice, resolved_at: "2026-05-18T00:01:00Z" }),
+        ]);
+        await useInterpretationEventsStore.getState().refreshAll("sess-1");
+        finish([makePendingEvent()]);
+        await older;
+        expect(useInterpretationEventsStore.getState().pendingBySession["sess-1"]).toEqual({});
+        expect(useInterpretationEventsStore.getState().resolvedBySession["sess-1"]).toEqual([]);
+      },
+    );
+
+    it.each(["refreshAll", "refreshPending"] as const)(
+      "%s cannot erase a card delivered by a newer refresh",
+      async (action) => {
+        let finish!: (events: InterpretationEvent[]) => void;
+        vi.mocked(api.listInterpretationEvents).mockImplementationOnce(
+          () => new Promise((resolve) => { finish = resolve; }),
+        );
+        const older = useInterpretationEventsStore.getState()[action]("sess-1");
+        const event = makePendingEvent();
+        vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([event]);
+        await useInterpretationEventsStore.getState().refreshAll("sess-1");
+        finish([]);
+        await older;
+        expect(useInterpretationEventsStore.getState().pendingBySession["sess-1"]).toEqual({ [event.id]: event });
+      },
+    );
+
+    it.each(["refreshAll", "refreshPending"] as const)(
+      "%s cannot erase an inline event delivered during its request",
+      async (action) => {
+        let finish!: (events: InterpretationEvent[]) => void;
+        vi.mocked(api.listInterpretationEvents).mockImplementationOnce(
+          () => new Promise((resolve) => { finish = resolve; }),
+        );
+        const older = useInterpretationEventsStore.getState()[action]("sess-1");
+        const event = makePendingEvent();
+        useInterpretationEventsStore.getState().addPendingEvent("sess-1", event);
+        finish([]);
+        await older;
+        expect(useInterpretationEventsStore.getState().pendingBySession["sess-1"]).toEqual({ [event.id]: event });
+      },
+    );
+
+    it("retains terminal tombstones even in a later stale snapshot", async () => {
+      const event = makePendingEvent();
+      vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([
+        makePendingEvent({ choice: "superseded", resolved_at: "2026-05-18T00:01:00Z" }),
+      ]);
+      await useInterpretationEventsStore.getState().refreshAll("sess-1");
+      vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([event]);
+      await useInterpretationEventsStore.getState().refreshPending("sess-1");
+      useInterpretationEventsStore.getState().addPendingEvent("sess-1", event);
+      expect(useInterpretationEventsStore.getState().pendingBySession["sess-1"]).toEqual({});
+    });
+
+    it("ingests retirements while preserving an unrelated inline event", async () => {
+      const retired = makePendingEvent();
+      const fresh = makePendingEvent({ id: "evt-new" });
+      useInterpretationEventsStore.getState().addPendingEvent("sess-1", retired);
+      let finish!: (events: InterpretationEvent[]) => void;
+      vi.mocked(api.listInterpretationEvents).mockImplementationOnce(
+        () => new Promise((resolve) => { finish = resolve; }),
+      );
+      const refresh = useInterpretationEventsStore.getState().refreshAll("sess-1");
+      useInterpretationEventsStore.getState().addPendingEvent("sess-1", fresh);
+      finish([makePendingEvent({ choice: "superseded", resolved_at: "2026-05-18T00:01:00Z" })]);
+      await refresh;
+      expect(useInterpretationEventsStore.getState().pendingBySession["sess-1"]).toEqual({ [fresh.id]: fresh });
+    });
+
+    it("a fresh snapshot can remove a pending event that predates its request", async () => {
+      useInterpretationEventsStore.getState().addPendingEvent("sess-1", makePendingEvent());
+      vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([]);
+      await useInterpretationEventsStore.getState().refreshAll("sess-1");
+      expect(useInterpretationEventsStore.getState().pendingBySession["sess-1"]).toEqual({});
+    });
+
+    it("keeps concurrent refresh ownership independent across sessions", async () => {
+      let finish!: (events: InterpretationEvent[]) => void;
+      vi.mocked(api.listInterpretationEvents).mockImplementationOnce(
+        () => new Promise((resolve) => { finish = resolve; }),
+      );
+      const first = useInterpretationEventsStore.getState().refreshAll("sess-1");
+      const secondEvent = makePendingEvent({ session_id: "sess-2" });
+      vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([secondEvent]);
+      await useInterpretationEventsStore.getState().refreshAll("sess-2");
+      const firstEvent = makePendingEvent();
+      finish([firstEvent]);
+      await first;
+      expect(useInterpretationEventsStore.getState().pendingBySession).toEqual({
+        "sess-1": { [firstEvent.id]: firstEvent },
+        "sess-2": { [secondEvent.id]: secondEvent },
+      });
+    });
+
+    it("does not rehydrate a reset store with a previous request", async () => {
+      let finish!: (events: InterpretationEvent[]) => void;
+      vi.mocked(api.listInterpretationEvents).mockImplementationOnce(
+        () => new Promise((resolve) => { finish = resolve; }),
+      );
+      const older = useInterpretationEventsStore.getState().refreshAll("sess-1");
+      resetStore(useInterpretationEventsStore);
+      finish([makePendingEvent()]);
+      await older;
+      expect(useInterpretationEventsStore.getState().pendingBySession).toEqual({});
+    });
+  });
+
   describe("selectApprovedInterpretations (elspeth-3a8a843c47)", () => {
     it("admits exactly the two operator-approval choices", () => {
       const accepted = makePendingEvent({

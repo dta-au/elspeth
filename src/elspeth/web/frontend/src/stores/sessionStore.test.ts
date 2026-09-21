@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { useSessionStore } from "./sessionStore";
+import { createInterpretationResolutionHandler, useSessionStore } from "./sessionStore";
 import { useBlobStore } from "./blobStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
@@ -2761,6 +2761,84 @@ describe("sessionStore", () => {
   });
 
   describe("composer proposals", () => {
+    it("keeps a decision receipt when an older list read finishes afterward", async () => {
+      const api = await import("@/api/client");
+      const pending = makeCompositionProposal();
+      const receipt = makeCompositionProposal({ status: "rejected" });
+      let finishRead!: (proposals: CompositionProposal[]) => void;
+      vi.mocked(api.fetchCompositionProposals)
+        .mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }))
+        .mockResolvedValueOnce([receipt]);
+      vi.mocked(api.rejectCompositionProposal).mockResolvedValue(receipt);
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending] });
+      const oldRead = useSessionStore.getState().loadCompositionProposals();
+      await useSessionStore.getState().rejectProposal(pending.id);
+      finishRead([pending]);
+      await oldRead;
+      expect(useSessionStore.getState().compositionProposals).toEqual([receipt]);
+      expect(api.rejectCompositionProposal).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["accept", "reject"] as const)("keeps a pending proposal actionable after %s contention", async (action) => {
+      const api = await import("@/api/client");
+      const proposal = makeCompositionProposal();
+      vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal)
+        .mockRejectedValue({ status: 409, detail: "Session operation is already active" });
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([proposal]);
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [proposal] });
+      await useSessionStore.getState()[action === "accept" ? "acceptProposal" : "rejectProposal"](proposal.id);
+      expect(useSessionStore.getState().staleProposalIds).not.toContain(proposal.id);
+      expect(useSessionStore.getState().compositionProposals).toEqual([proposal]);
+      expect(useSessionStore.getState().error).toBe("Session operation is already active");
+    });
+
+    it.each(["accept", "reject"] as const)("retains a successful %s receipt when hydration fails", async (action) => {
+      const api = await import("@/api/client");
+      const proposal = makeCompositionProposal();
+      const receipt = makeCompositionProposal({ status: action === "accept" ? "committed" : "rejected" });
+      vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal).mockResolvedValue(receipt);
+      vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+      vi.mocked(api.fetchCompositionProposals).mockRejectedValue(new TypeError("Failed to fetch"));
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [proposal], compositionState: makeCompositionState(1), compositionStateLoaded: true });
+      await useSessionStore.getState()[action === "accept" ? "acceptProposal" : "rejectProposal"](proposal.id);
+      expect(useSessionStore.getState().compositionProposals).toEqual([receipt]);
+      expect(useSessionStore.getState().error).toMatch(/Proposal (accepted|rejected), but/);
+      expect(useSessionStore.getState().proposalActionPendingIds).toEqual([]);
+      if (action === "accept") {
+        expect(useSessionStore.getState().compositionStateLoaded).toBe(false);
+        expect(useSessionStore.getState().compositionState).toBeNull();
+      }
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([receipt]);
+      await useSessionStore.getState().loadCompositionProposals("session-1");
+      expect(vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal)).toHaveBeenCalledTimes(1);
+      expect(useSessionStore.getState().compositionProposals).toEqual([receipt]);
+    });
+
+    it.each(["accept", "reject"] as const)("keeps the %s receipt over a stale pending refresh", async (action) => {
+      const api = await import("@/api/client");
+      const pending = makeCompositionProposal();
+      const receipt = makeCompositionProposal({ status: action === "accept" ? "committed" : "rejected" });
+      vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal).mockResolvedValue(receipt);
+      vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(2));
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([pending]);
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending] });
+      await useSessionStore.getState()[action === "accept" ? "acceptProposal" : "rejectProposal"](pending.id);
+      expect(useSessionStore.getState().compositionProposals).toEqual([receipt]);
+      expect(useSessionStore.getState().error).toBeNull();
+    });
+
+    it.each(["accept", "reject"] as const)("preserves %s conflict detail when reconciliation fails", async (action) => {
+      const api = await import("@/api/client");
+      const pending = makeCompositionProposal();
+      vi.mocked(action === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal).mockRejectedValue({ status: 409, detail: "Session operation is already active" });
+      vi.mocked(api.fetchCompositionProposals).mockRejectedValue(new TypeError("Failed to fetch"));
+      useSessionStore.setState({ activeSessionId: "session-1", compositionProposals: [pending] });
+      await useSessionStore.getState()[action === "accept" ? "acceptProposal" : "rejectProposal"](pending.id);
+      expect(useSessionStore.getState().compositionProposals).toEqual([pending]);
+      expect(useSessionStore.getState().staleProposalIds).toEqual([]);
+      expect(useSessionStore.getState().error).toBe("Session operation is already active");
+    });
+
     it("loads proposals when selecting a session", async () => {
       const apiClient = await import("@/api/client");
       const proposal = makeCompositionProposal();
@@ -2874,6 +2952,32 @@ describe("sessionStore", () => {
   });
 
   describe("applyResolvedInterpretation", () => {
+    it.each([false, true])("guards delayed approval publication across activation changes (guided=%s)", async (guided) => {
+      const api = await import("@/api/client");
+      vi.mocked(api.fetchMessages).mockResolvedValue([]);
+      vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(2));
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+      useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1) });
+      const resolve = createInterpretationResolutionHandler("session-1", guided);
+      await useSessionStore.getState().selectSession("session-2");
+      const destination = useSessionStore.getState().compositionState;
+      validateMock.mockClear();
+      resolve(makeCompositionState(3));
+      expect(useSessionStore.getState().compositionState).toBe(destination);
+      expect(validateMock).not.toHaveBeenCalled();
+      await useSessionStore.getState().selectSession("session-1");
+      const reactivated = useSessionStore.getState().compositionState;
+      validateMock.mockClear();
+      resolve(makeCompositionState(3));
+      expect(useSessionStore.getState().compositionState).toBe(reactivated);
+      expect(validateMock).not.toHaveBeenCalled();
+      const currentResolve = createInterpretationResolutionHandler("session-1", guided);
+      const accepted = makeCompositionState(4);
+      currentResolve(accepted);
+      expect(useSessionStore.getState().compositionState).toBe(accepted);
+      if (!guided) expect(validateMock).toHaveBeenCalledWith("session-1");
+    });
+
     it("applies the patched composition state and re-validates so the run-gate can reopen", () => {
       const newState = makeCompositionState(3, ["analyze_colors"]);
       useSessionStore.setState({

@@ -139,7 +139,7 @@ describe("YamlView", () => {
     expect(fetchYaml).not.toHaveBeenCalled();
   });
 
-  it("shows a validation-blocked alert when YAML export returns 409", async () => {
+  it("preserves the validation reason when YAML export returns 409", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockRejectedValue({
       status: 409,
@@ -154,7 +154,7 @@ describe("YamlView", () => {
     render(<YamlView />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "YAML export is blocked by validation errors.",
+      "Failed to load YAML.",
     );
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Current composition state is invalid. Fix validation errors before exporting YAML.",
@@ -162,6 +162,25 @@ describe("YamlView", () => {
     expect(
       screen.queryByText("YAML will appear here once your pipeline has components."),
     ).not.toBeInTheDocument();
+  });
+
+  it("allows retrying a busy export without claiming pipeline invalidity", async () => {
+    const { fetchYaml } = await import("@/api/client");
+    vi.mocked(fetchYaml)
+      .mockRejectedValueOnce({ status: 409, detail: "Session operation is already active" })
+      .mockResolvedValueOnce({ yaml: "source:\n  plugin: text\n" });
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState() });
+    render(<YamlView />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Session operation is already active");
+    expect(alert).not.toHaveTextContent("validation errors");
+    await userEvent.click(screen.getByRole("button", { name: "Retry YAML export" }));
+
+    await screen.findByRole("button", { name: "Copy YAML to clipboard" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(fetchYaml).toHaveBeenCalledTimes(2);
+    expect(fetchYaml).toHaveBeenLastCalledWith("session-1");
   });
 
   it("clears stale YAML controls while refetching after a composition version change", async () => {
@@ -335,7 +354,7 @@ describe("YamlView", () => {
     render(<YamlView />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "YAML export is blocked by validation errors.",
+      "Failed to load YAML.",
     );
     expect(screen.getByText(/Pending YAML change/)).toBeInTheDocument();
 
@@ -410,7 +429,7 @@ describe("YamlView", () => {
     });
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "YAML export is blocked by validation errors.",
+      "Failed to load YAML.",
     );
     expect(useSessionStore.getState().exportedYamlBlobBinding).toBeNull();
   });

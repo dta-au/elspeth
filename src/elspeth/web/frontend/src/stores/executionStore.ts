@@ -616,23 +616,13 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         });
         return null;
       }
-      // A 409 conflict on /execute is not always the same conflict: the
-      // strict materializer's drift guard (InterpretationReviewIntegrityError,
-      // routes.py) also answers 409 with error_type=interpretation_review_drift
-      // and a fixed, component-naming detail string the backend stands
-      // behind. That must reach the user verbatim rather than being folded
-      // into the generic "already running" copy below, which would tell the
-      // user to wait for a run that was never started. Checked before the
-      // generic 409 fallback so only THIS discriminator borrows apiErr.detail
-      // here; every other 409 (e.g. run_already_active) still gets the fixed
-      // copy regardless of what detail the backend happened to send.
+      // A conflict can mean operation contention or review drift without a
+      // run existing. Only the active-run discriminator establishes that fact.
       const message =
-        apiErr.status === 409 && apiErr.error_type === "interpretation_review_drift"
-          ? apiErr.detail
-          : apiErr.status === 409
-            ? "A run is already in progress for this pipeline."
-            : apiErr.detail ??
-              "Pipeline execution failed. Check the run results panel for error details.";
+        apiErr.status === 409 && apiErr.error_type === "run_already_active"
+          ? "A run is already in progress for this pipeline."
+          : apiErr.detail ??
+            "Pipeline execution failed. Check the run results panel for error details.";
       set({
         isExecuting: false,
         error: message,
