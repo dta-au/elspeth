@@ -78,6 +78,8 @@ from elspeth.web.composer.tools.declarations import (
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
+    approved_prompt_artifact_hash_from_options,
     composition_review_contract_error,
     reconcile_authoritative_reviews,
     serialize_authoring_review_options,
@@ -1653,6 +1655,19 @@ def _execute_patch_node_options(
     if runtime_owned_error is not None:
         error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in patch else None
         return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
+    if (
+        current.plugin == "llm"
+        and current.options.get(PROMPT_TEMPLATE_PARTS_KEY) is not None
+        and "prompt_template" in patch
+        and patch["prompt_template"] != current.options.get("prompt_template")
+        and PROMPT_TEMPLATE_PARTS_KEY not in patch
+    ):
+        return _failure_result(
+            state,
+            f"Node '{node_id}': edit prompt_template_parts to change this structured prompt, "
+            "preserving its interpretation_ref entries; prompt_template is compiled from those parts.",
+            error_code="prompt_template_parts_required",
+        )
     patch = _canonicalize_authored_interpretation_requirements(
         patch,
         component_id=node_id,
@@ -1714,7 +1729,38 @@ def _execute_patch_node_options(
         if prompt_surface_error is not None:
             return _failure_result(state, prompt_surface_error)
 
-        prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, new_options)
+    new_node = replace(current, options=new_options)
+    # Third canonical mutation boundary: a patch that would break a queue's
+    # intrinsic contract is rejected before creating the candidate state.
+    queue_contract_error = queue_node_contract_error(new_node)
+    if queue_contract_error is not None:
+        return _failure_result(state, queue_contract_error)
+    proposed_state = state.with_node(new_node)
+    invariant_error = _post_mutation_invariant_error(proposed_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
+    try:
+        # Reconciliation invalidates inherited approval and renders structured
+        # prompts. Verify the stored evidence first so an unrelated patch cannot
+        # heal a corrupt digest, then validate the exact reconciled candidate.
+        if (
+            current.plugin == "llm"
+            and "approved_prompt_artifact_hash" in current.options
+            and current.options["approved_prompt_artifact_hash"] != approved_prompt_artifact_hash_from_options(current.options)
+        ):
+            raise ValueError("Stored approved_prompt_artifact_hash does not match the current prompt artifact")
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
+    reconciled_node = next(node for node in new_state.nodes if node.id == node_id)
+    reconciled_options = reconciled_node.options
+    if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
+        prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, reconciled_options)
         if prevalidation_error is not None:
             return _failure_result(
                 state,
@@ -1728,39 +1774,17 @@ def _execute_patch_node_options(
         # the prevalidation above already validated the LOWERED executable. The
         # raw provider-config policy would false-positive on the absent private
         # retry budget (see set_pipeline in sessions.py for the full rationale).
-        if "profile" not in new_options:
-            provider_policy_error = _validate_transform_provider_config_policy(new_options, plugin=current.plugin)
+        if "profile" not in reconciled_options:
+            provider_policy_error = _validate_transform_provider_config_policy(reconciled_options, plugin=current.plugin)
             if provider_policy_error is not None:
                 return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
 
         # S2: confine nested provider_config persist_directory (RAG retrieval).
         # A merge-patch can introduce an escaping path just as upsert_node can.
-        provider_path_error = _validate_transform_provider_config_path(new_options, context.data_dir, session_id=context.session_id)
+        provider_path_error = _validate_transform_provider_config_path(reconciled_options, context.data_dir, session_id=context.session_id)
         if provider_path_error is not None:
             return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
 
-    new_node = replace(current, options=new_options)
-    # Third canonical mutation boundary: a patch that would break a queue's
-    # intrinsic contract (unknown option, non-string description) is rejected
-    # by the single shared guard before with_node, leaving state atomically
-    # unchanged. Returns None for every non-queue node, so this is a no-op for
-    # transform/gate/aggregation/coalesce patches.
-    queue_contract_error = queue_node_contract_error(new_node)
-    if queue_contract_error is not None:
-        return _failure_result(state, queue_contract_error)
-    proposed_state = state.with_node(new_node)
-    invariant_error = _post_mutation_invariant_error(proposed_state)
-    if invariant_error is not None:
-        message, error_code = invariant_error
-        return _failure_result(state, message, error_code=error_code)
-    try:
-        new_state = reconcile_authoritative_reviews(state, proposed_state)
-    except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
-            state,
-            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
-            error_code="review_reconciliation_failed",
-        )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)
@@ -1811,6 +1835,8 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     description="Apply a shallow merge-patch to a node's options. Use this for option-only edits. "
     "Keys in the patch overwrite existing keys. "
     "Keys set to null are deleted. Missing keys are unchanged. "
+    "For an existing structured LLM prompt, edit prompt_template_parts and preserve interpretation_ref entries; "
+    "prompt_template is compiled from those parts. Changed prompt context requires fresh review. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "
     "use upsert_edge or upsert_node for routing edits. Gate on_error is node-level and must use upsert_node.",
     json_schema={
@@ -1827,6 +1853,8 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                     "Node-level routing fields such as on_success, on_error, input, routes, "
                     "and fork_to are siblings of options; edit them with upsert_edge or upsert_node. "
                     "For a gate, edit on_error only with upsert_node. "
+                    "If prompt_template_parts exists, edit that structure while preserving interpretation_ref entries; "
+                    "do not change only the compiled prompt_template. "
                     "A patched schema: block declares what ARRIVES at the node, never its transformed "
                     "result; to change what arrives, declare the type on the SOURCE schema "
                     "(patch_source_options) or insert a type_coerce upstream." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE

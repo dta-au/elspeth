@@ -238,10 +238,29 @@ async def test_set_pipeline_invalid_provider_envelope_is_closed_arg_error_before
     invocation = result.tool_invocations[0]
     assert invocation.status is ComposerToolStatus.ARG_ERROR
     assert result.tool_outcomes[0].error_class == "TypeError"
+    expected_error = "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."
+    assert invocation.error_message == expected_error
+    assert result.tool_outcomes[0].error_message == expected_error
     assert json.loads(invocation.arguments_canonical) == {
         "_redaction_status": "invalid_tool_arguments",
         "error_class": "TypeError",
     }
+
+
+def test_provider_discovery_explains_how_to_wrap_round_trip_pipeline_arguments(
+    fake_composer_service: ComposerServiceImpl,
+) -> None:
+    tools = fake_composer_service._get_litellm_tools()
+    discovery = next(tool["function"] for tool in tools if tool["function"]["name"] == "get_pipeline_state")
+    mutation = next(tool["function"] for tool in tools if tool["function"]["name"] == "set_pipeline")
+
+    assert mutation["parameters"]["required"] == ["pipeline"]
+    for description in (
+        discovery["description"],
+        discovery["parameters"]["properties"]["component"]["description"],
+    ):
+        assert '"pipeline":' in description
+        assert "flat" in description
 
 
 @pytest.mark.asyncio

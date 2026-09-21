@@ -71,7 +71,11 @@ from elspeth.plugins.transforms.llm.base import (
     multi_query_source_row_columns,
     multi_query_undeclared_columns_message,
 )
-from elspeth.web.composer._validation_probe import prepare_validation_probe_options
+from elspeth.web.composer._validation_probe import (
+    DeferredBlobContractProbe,
+    is_inline_content_reference,
+    prepare_validation_probe_options,
+)
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
@@ -1992,7 +1996,7 @@ def _is_plugin_config_probe_exception(exc: Exception, *, config_error_prefix: st
     from elspeth.plugins.infrastructure.templates import TemplateError
     from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError
 
-    if isinstance(exc, (PluginConfigError, PluginNotFoundError, TemplateError, UnknownPluginTypeError)):
+    if isinstance(exc, (DeferredBlobContractProbe, PluginConfigError, PluginNotFoundError, TemplateError, UnknownPluginTypeError)):
         return True
     return type(exc) is ValueError and str(exc).startswith(config_error_prefix)
 
@@ -2088,14 +2092,42 @@ class ValidationProbeCache:
     def _construct(self, key: tuple[str, int], plugin: str, holder: NodeSpec | ProducerEntry) -> TransformProtocol:
         # Imported at call time, like every probe site before it: tests
         # substitute the shared manager by patching this module attribute.
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
         from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+        from elspeth.plugins.infrastructure.validation import get_transform_config_model
 
         try:
+            probe_options = prepare_validation_probe_options(holder.options, plugin=plugin)
             with plugin_preflight_mode(True):
-                instance = get_shared_plugin_manager().create_transform(
-                    plugin, prepare_validation_probe_options(holder.options, plugin=plugin)
-                )
+                try:
+                    instance = get_shared_plugin_manager().create_transform(plugin, probe_options)
+                except Exception as exc:
+                    if not _is_config_probe_exception(exc):
+                        raise
+                    # A marker can live in an unused option while construction
+                    # still computes a valid contract. Defer only after failure,
+                    # and only when every typed error rejects an unresolved
+                    # marker in a string field. Unknown fields and mixed config
+                    # errors remain failures, even if their values are markers.
+                    try:
+                        config_model = get_transform_config_model(plugin, probe_options)
+                    except ValueError:
+                        # Provider dispatch rejects before a config model exists;
+                        # retain the manager's original classified config error.
+                        raise exc from None
+                    if config_model is not None:
+                        try:
+                            config_model.from_dict(probe_options, plugin_name=plugin)
+                        except (PluginConfigError, PydanticValidationError) as config_error:
+                            cause = config_error if isinstance(config_error, PydanticValidationError) else config_error.__cause__
+                            if isinstance(cause, PydanticValidationError):
+                                details = cause.errors(include_url=False, include_context=False)
+                                if details and all(
+                                    detail["type"] == "string_type" and is_inline_content_reference(detail["input"]) for detail in details
+                                ):
+                                    raise DeferredBlobContractProbe from exc
+                    raise
         except Exception as exc:
             # Remembered so every later site sees the same failure, then
             # re-raised for this site's own tolerance arm.
@@ -4948,6 +4980,22 @@ def _check_schema_contracts(
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
+            if isinstance(exc, DeferredBlobContractProbe):
+                if producer.producer_id not in contract_probe_failed_producers:
+                    contract_probe_failed_producers.add(producer.producer_id)
+                    contract_warnings.append(
+                        _warn(
+                            f"node:{producer.producer_id}",
+                            f"Contract preview for node '{producer.producer_id}' is deferred until authorized blob materialization. "
+                            "Inline-content bytes are not available to this authoring probe; execution validation must resolve "
+                            "them and validate the plugin contract before the pipeline can run.",
+                            "medium",
+                            "contract_probe_deferred",
+                        )
+                    )
+                # Unknown content proves no guarantees. In particular, never
+                # promote authored guaranteed_fields into a verified contract.
+                return True, frozenset()
             # Keep Stage 1 tolerant of partially configured draft nodes for
             # non-pass-through transforms — constructor-time errors must not
             # crash preview/export endpoints. For known pass-through plugins
@@ -4974,9 +5022,10 @@ def _check_schema_contracts(
                         _warn(
                             f"node:{producer.producer_id}",
                             f"Computed contract probe for node '{producer.producer_id}' failed during preview "
-                            f"({type(exc).__name__}); pipeline rejected "
-                            f"(pass-through transform requires successful probe to mirror runtime propagation).",
+                            f"({type(exc).__name__}); pass-through output guarantees could not be established. "
+                            "Check this node's plugin options and run execution validation for an authoritative result.",
                             "high",
+                            "contract_probe_failed",
                         )
                     )
                 else:
