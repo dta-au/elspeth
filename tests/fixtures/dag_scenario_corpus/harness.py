@@ -99,7 +99,6 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     ConfigEvidence,
     ExpansionChildEnqueueRecoveryEvidence,
     GraphEvidence,
-    GraphNodeType,
     GraphNodeTypeCount,
     HarnessCaseSpec,
     OutputArtifactExpectation,
@@ -387,7 +386,7 @@ def build_scenario(
         node_count=len(graph.get_nodes()),
         edge_count=len(graph.get_edges()),
         node_type_counts=tuple(
-            GraphNodeTypeCount(node_type=cast(GraphNodeType, node_type), count=count)
+            GraphNodeTypeCount.model_validate({"node_type": node_type, "count": count})
             for node_type, count in sorted(node_type_counts.items())
         ),
         edge_labels=tuple(sorted(edge.label for edge in graph.get_edges())),

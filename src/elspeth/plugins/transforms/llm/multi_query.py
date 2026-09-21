@@ -181,6 +181,14 @@ class QueryDefinition(BaseModel):
         description="Per-query max_tokens override (None = use the config-level max_tokens).",
     )
 
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def reject_boolean_max_tokens(cls, value: object) -> object:
+        """Preserve boolean rejection at the authoring boundary, before coercion."""
+        if isinstance(value, bool):
+            raise ValueError("max_tokens must be an integer, not a boolean")
+        return value
+
 
 @dataclass(frozen=True, slots=True)
 class QuerySpec:
