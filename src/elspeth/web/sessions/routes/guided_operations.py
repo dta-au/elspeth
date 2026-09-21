@@ -90,6 +90,10 @@ async def bounded_admission_guard(lock: asyncio.Lock) -> AsyncIterator[None]:
 
 
 _SAFE_FAILURES: dict[str, tuple[int, str]] = {
+    "cost_unavailable": (
+        503,
+        "The composer could not determine the model cost. Ask an administrator to configure or correct model pricing before trying again.",
+    ),
     "provider_unavailable": (503, "The provider is unavailable. Retry with a new operation id."),
     "provider_timeout": (504, "The operation timed out. Retry with a new operation id."),
     # "Retry the request." rather than "Retry with a new operation id.": the

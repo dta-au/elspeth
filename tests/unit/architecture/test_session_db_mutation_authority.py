@@ -5984,7 +5984,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "5684c68046118475",
         1,
         None,
-        line=478,
+        line=496,
         connection_escape=True,
     ),
 )

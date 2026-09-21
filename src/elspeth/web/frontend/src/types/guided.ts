@@ -180,6 +180,7 @@ export type GuidedOperationFailureCode =
   | "provider_unavailable"
   | "provider_timeout"
   | "invalid_provider_response"
+  | "cost_unavailable"
   /** Planner-owned non-convergence (elspeth-5904b1683a): the provider answered
    *  every repair turn but the planner never converged on a valid pipeline.
    *  Transient — a retry can win, so retry affordances stay enabled. */

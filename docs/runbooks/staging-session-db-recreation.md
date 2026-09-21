@@ -2,9 +2,9 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.1 replica recovery, identity admission and prompt provenance (session epoch 63 and Landscape epoch 43)
+## Current Cutover: 0.8.1 replica recovery, identity admission and prompt provenance (session epoch 64 and Landscape epoch 43)
 
-0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 63 and Landscape
+0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 64 and Landscape
 `SQLITE_SCHEMA_EPOCH` from 38 to 43. Session epoch 54 adds durable Composer
 progress snapshots and exact request lifecycle leases. Landscape epoch 39
 adds immutable web run-start permit binding and recoverable pre-effect
@@ -45,6 +45,9 @@ Session epoch 63 also adds `interpretation_events.surface_origin`: review cards 
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
 model, provider and `composer_skill_hash` columns.
+Session epoch 64 adds the distinct `cost_unavailable` guided-operation failure
+classification so missing model pricing directs administrators to repair pricing
+instead of asking users to retry an invalid provider response.
 These intermediate definitions
 share one prepared 0.8.1 cutover; installing the intermediate ACA pair is not
 required. This procedure describes an operator action, not an already
@@ -187,9 +190,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-63 release forward,
+unsupported: keep the service drained, repair the epoch-64 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-63/Landscape-epoch-43 record when binding candidate and rollback
+session-epoch-64/Landscape-epoch-43 record when binding candidate and rollback
 decisions.
 
 For a later candidate that has used identity administration, the window also
@@ -807,7 +810,7 @@ sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
 resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 63 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 64 (== SESSION_SCHEMA_EPOCH)
 sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 43 (== SQLITE_SCHEMA_EPOCH)
 ```
 

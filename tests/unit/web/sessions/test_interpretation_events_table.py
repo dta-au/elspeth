@@ -205,7 +205,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_63() -> None:
+def test_current_session_schema_epoch_is_64() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -240,7 +240,7 @@ def test_current_session_schema_epoch_is_63() -> None:
     # 60: durable guided fork failure diagnostics.
     # 63: blob_inline_resolutions.content_hash CHECK carries the lowercase-hex
     # class as well as the length (elspeth-f99b16fc2f).
-    assert SESSION_SCHEMA_EPOCH == 63
+    assert SESSION_SCHEMA_EPOCH == 64
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

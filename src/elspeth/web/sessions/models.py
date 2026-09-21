@@ -353,7 +353,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #     interpretation_events' LLM provenance columns; the same cut adds
 #     interpretation_events.surface_origin and ties provenance to it.
 #     Pairs with Landscape epoch 43. Pre-1.0 delete/recreate.
-SESSION_SCHEMA_EPOCH = 63
+# 64: guided operation failures distinguish unavailable cost accounting from
+#     malformed provider content. Pre-1.0 delete/recreate.
+SESSION_SCHEMA_EPOCH = 64
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1135,7 +1137,7 @@ guided_operations_table = Table(
     ),
     CheckConstraint(
         "failure_code IS NULL OR failure_code IN ('provider_unavailable', 'provider_timeout', "
-        "'invalid_provider_response', 'planner_repair_exhausted', 'policy_blocked', 'admission_refused', 'stale_conflict', 'integrity_error', 'custody_error', "
+        "'invalid_provider_response', 'cost_unavailable', 'planner_repair_exhausted', 'policy_blocked', 'admission_refused', 'stale_conflict', 'integrity_error', 'custody_error', "
         "'quota_exceeded', 'operation_failed', 'request_cancelled')",
         name="ck_guided_operations_failure_code",
     ),

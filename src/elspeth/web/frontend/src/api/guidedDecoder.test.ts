@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { decodeGetGuidedResponse } from "./guidedDecoder";
+import { decodeGetGuidedResponse, decodeGuidedStartOperationReconciliation } from "./guidedDecoder";
 import compositionStateFixture from "../../../../../../tests/fixtures/web/composer/composition_state_validation_errors.json";
+
+it("preserves cost accounting failures when reconciling a guided operation", () => {
+  expect(decodeGuidedStartOperationReconciliation({ status: "failed", failure_code: "cost_unavailable" })).toEqual({
+    status: "failed",
+    failure_code: "cost_unavailable",
+  });
+  expect(() => decodeGuidedStartOperationReconciliation({ status: "failed", failure_code: "unknown_cost_code" })).toThrow();
+});
 
 describe("shared composition state HTTP contract", () => {
   it.each(Object.entries(compositionStateFixture.states))("decodes producer-backed %s state in a guided envelope", (_case, state) => {

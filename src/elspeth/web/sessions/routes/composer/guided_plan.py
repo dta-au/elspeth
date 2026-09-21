@@ -139,6 +139,14 @@ def _guided_full_complete_outcome_unreadable_progress_event() -> ComposerProgres
 
 
 def _guided_full_failed_progress_event(failure_code: GuidedOperationFailureCode) -> ComposerProgressEvent:
+    if failure_code == "cost_unavailable":
+        return ComposerProgressEvent(
+            phase="failed",
+            headline="The composer could not determine the model cost.",
+            evidence=("Cost accounting could not admit the model response.",),
+            likely_next="Ask an administrator to configure or correct model pricing before trying again.",
+            reason="service_setup_failed",
+        )
     if failure_code == "admission_refused":
         return ComposerProgressEvent(
             phase="failed",
@@ -296,6 +304,8 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
             return "provider_timeout"
         if exc.code == "PROVIDER_ERROR":
             return "provider_unavailable"
+        if exc.code == "COST_UNAVAILABLE":
+            return "cost_unavailable"
         if exc.code == "REPAIR_EXHAUSTED":
             # Honest exhaustion envelope (elspeth-5904b1683a): the provider
             # answered every repair turn — it was the planner loop that could
@@ -307,7 +317,6 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
         if exc.code in {
             "COMPLETION_TOKENS_EXCEEDED",
             "COMPOSITION_EXHAUSTED",
-            "COST_UNAVAILABLE",
             "DISCOVERY_CYCLE",
             "DISCOVERY_EXHAUSTED",
             "DISCOVERY_ONLY",

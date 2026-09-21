@@ -54,8 +54,8 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
-    # Epoch 63 tightens the inline blob resolution hash CHECK to lowercase hex.
-    assert SESSION_SCHEMA_EPOCH == 63
+    # Epoch 64 admits the distinct cost-accounting failure classification.
+    assert SESSION_SCHEMA_EPOCH == 64
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
     # Epoch 43 gives every Landscape digest column a shape CHECK; pairs with session 63.

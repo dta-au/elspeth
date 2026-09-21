@@ -157,6 +157,16 @@ def _malformed_completion() -> Any:
     return completion
 
 
+def _cost_unavailable_completion() -> Any:
+    async def completion(**_kwargs: Any) -> _Response:
+        return _Response(
+            choices=[_Choice(message=_Message(content=_PROVIDER_LEAK_SENTINEL))],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+
+    return completion
+
+
 def _timeout_completion() -> Any:
     """A provider timeout — trips the planner wall-clock TIMEOUT code."""
 
@@ -515,8 +525,9 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
         # LiteLLM API errors are the declared retryable provider failure, so
         # every configured physical attempt must be present in the audit.
         (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 3),
+        (_cost_unavailable_completion, 503, "cost_unavailable", "COST_UNAVAILABLE", 1),
     ],
-    ids=["malformed", "timeout", "provider_error"],
+    ids=["malformed", "timeout", "provider_error", "cost_unavailable"],
 )
 def test_send_message_freeform_planner_failure_is_translated(
     tmp_path: Path,
@@ -547,6 +558,10 @@ def test_send_message_freeform_planner_failure_is_translated(
     progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
     assert progress["phase"] == "failed"
     assert progress["reason"] is not None
+    if expected_failure_code == "cost_unavailable":
+        assert progress["reason"] == "service_setup_failed"
+        assert "pricing" in progress["likely_next"]
+        assert "administrator" in body["detail"]["detail"]
 
     # (c) exactly one durable closed failure-disposition record, mirroring guided.
     disposition_rows = _disposition_rows(engine)

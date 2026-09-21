@@ -1189,7 +1189,7 @@ def test_guided_full_blob_failures_keep_custody_and_integrity_distinct() -> None
         ("PROVIDER_ERROR", "provider_unavailable"),
         ("MALFORMED_RESPONSE", "invalid_provider_response"),
         ("VALIDATION_FAILED", "invalid_provider_response"),
-        ("COST_UNAVAILABLE", "invalid_provider_response"),
+        ("COST_UNAVAILABLE", "cost_unavailable"),
         ("COMPLETION_TOKENS_EXCEEDED", "invalid_provider_response"),
         ("PROVIDER_CALLS_EXHAUSTED", "invalid_provider_response"),
         ("TOOL_CALLS_EXHAUSTED", "invalid_provider_response"),

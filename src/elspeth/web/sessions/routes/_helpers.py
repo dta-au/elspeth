@@ -2872,7 +2872,6 @@ _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
     {
         "COMPLETION_TOKENS_EXCEEDED",
         "COMPOSITION_EXHAUSTED",
-        "COST_UNAVAILABLE",
         "DISCOVERY_CYCLE",
         "DISCOVERY_EXHAUSTED",
         "DISCOVERY_ONLY",
@@ -2906,6 +2905,10 @@ PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
 # ``_SAFE_FAILURES`` the freeform planner can reach; the detail text is
 # provider-safe (no exception message, no provider content).
 _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
+    "cost_unavailable": (
+        503,
+        "The composer could not determine the model cost. Ask an administrator to configure or correct model pricing before trying again.",
+    ),
     "provider_timeout": (504, "The composer model timed out before producing a pipeline. Retry the request."),
     "provider_unavailable": (503, "The composer model is unavailable. Retry the request."),
     "invalid_provider_response": (502, "The composer model returned an unusable pipeline plan. Retry the request."),
@@ -2962,6 +2965,7 @@ def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
 # that vocabulary is a frontend/contract change rather than an attribution fix. It therefore
 # still reads ``provider_unavailable`` — a known residual, not an oversight.
 _FREEFORM_PLANNER_PROGRESS_REASONS: Final[dict[str, ComposerProgressReason]] = {
+    "COST_UNAVAILABLE": "service_setup_failed",
     "REPAIR_EXHAUSTED": "planner_repair_exhausted",
     "COMPOSITION_EXHAUSTED": "convergence_composition_budget",
     "DISCOVERY_EXHAUSTED": "convergence_discovery_budget",
@@ -2990,6 +2994,8 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
         return "provider_timeout"
     if exc.code == "PROVIDER_ERROR":
         return "provider_unavailable"
+    if exc.code == "COST_UNAVAILABLE":
+        return "cost_unavailable"
     if exc.code == "REPAIR_EXHAUSTED":
         # Honest exhaustion envelope (elspeth-5904b1683a) — byte-parity with
         # the guided branch: the provider answered every repair turn; the

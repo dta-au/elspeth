@@ -192,6 +192,7 @@ GuidedOperationFailureCode = Literal[
     "provider_unavailable",
     "provider_timeout",
     "invalid_provider_response",
+    "cost_unavailable",
     # The planner ran out of repair budget (or short-circuited a blind repeat)
     # without converging on a valid pipeline (elspeth-5904b1683a). Transient —
     # the first candidate is model-stochastic, so a retry can win. Distinct

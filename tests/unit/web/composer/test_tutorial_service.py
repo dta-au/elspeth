@@ -32,7 +32,7 @@ from elspeth.web.composer.tutorial_service import (
     _tutorial_launch_blocker,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.sessions.protocol import RunRecord
+from elspeth.web.sessions.protocol import RunRecord, SessionRunStatus
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.helpers.session_fences import RecordingSessionOperationAuthority, make_execute_context
@@ -437,7 +437,13 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
 
 
 @pytest.mark.asyncio
-async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("status", "rows_succeeded"),
+    [("failed", 0), ("completed_with_failures", 0), ("empty", 0), ("completed", 0), ("completed_with_failures", 1)],
+)
+async def test_failed_live_tutorial_run_response_omits_raw_run_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: SessionRunStatus, rows_succeeded: int
+) -> None:
     run_id = uuid4()
     session_id = uuid4()
     state_id = uuid4()
@@ -464,23 +470,40 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
                 id=run_id,
                 session_id=session_id,
                 state_id=state_id,
-                status="failed",
+                status=status,
                 started_at=now,
                 finished_at=now,
-                rows_processed=0,
-                rows_succeeded=0,
-                rows_failed=0,
+                rows_processed=3 + rows_succeeded if status == "completed_with_failures" else 0,
+                rows_succeeded=rows_succeeded,
+                rows_failed=3 if status == "completed_with_failures" else 0,
                 rows_routed_success=0,
                 rows_routed_failure=0,
                 rows_quarantined=0,
                 error=sentinel_error,
-                landscape_run_id=None,
+                landscape_run_id=None if status == "failed" else "audited-zero-output-run",
                 pipeline_yaml=None,
             )
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService())))
     settings = _make_tutorial_settings(tmp_path)
     user = SimpleNamespace(user_id="tutorial-user")
+
+    def project_missing_artifacts(*args: Any, **kwargs: Any) -> Any:
+        return _rows_from_artifacts([], data_dir=tmp_path, run_id=str(run_id), session_id=str(session_id))
+
+    monkeypatch.setattr(tutorial_service_module, "_project_live_tutorial_output", project_missing_artifacts)
+
+    if status == "completed" or rows_succeeded > 0:
+        with pytest.raises(TutorialRunIntegrityError, match="no row-bearing artifact"):
+            await tutorial_service_module._run_live_tutorial(
+                request=request,
+                user=user,
+                session_id=session_id,
+                state_id=state_id,
+                settings=settings,
+                session_service=FakeSessionService(),
+            )
+        return
 
     with pytest.raises(HTTPException) as exc_info:
         await tutorial_service_module._run_live_tutorial(
@@ -492,11 +515,17 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
             session_service=FakeSessionService(),
         )
 
-    assert exc_info.value.status_code == 500
+    assert exc_info.value.status_code == (500 if status == "failed" else 409)
     detail = exc_info.value.detail
     assert detail["error_type"] == "tutorial_live_run_failed"
-    assert detail["status"] == "failed"
-    assert detail["detail"] == "The tutorial run did not complete successfully."
+    assert detail["status"] == status
+    if status == "failed":
+        assert detail["detail"] == "The tutorial run did not complete successfully."
+    else:
+        assert detail["run_id"] == str(run_id)
+        assert detail["rows_succeeded"] == 0
+        assert detail["rows_failed"] == (3 if status == "completed_with_failures" else 0)
+        assert "no output rows" in detail["detail"]
     assert sentinel_error not in repr(detail)
 
 

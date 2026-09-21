@@ -649,8 +649,16 @@ def register_message_routes(router: APIRouter) -> None:
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not build a pipeline for this request.",
-                            evidence=("The composer model did not return a usable pipeline plan.",),
-                            likely_next="Retry the request; if it keeps failing, simplify it or check the composer provider.",
+                            evidence=(
+                                "Cost accounting could not admit the model response."
+                                if exc.code == "COST_UNAVAILABLE"
+                                else "The composer model did not return a usable pipeline plan.",
+                            ),
+                            likely_next=(
+                                "Ask an administrator to configure or correct model pricing before trying again."
+                                if exc.code == "COST_UNAVAILABLE"
+                                else "Retry the request; if it keeps failing, simplify it or check the composer provider."
+                            ),
                             # Attribute the failure to its actual actor rather than blaming the
                             # provider for every planner code — the guided mirror already does
                             # (guided_plan.py), and the closed vocabulary carries the codes.

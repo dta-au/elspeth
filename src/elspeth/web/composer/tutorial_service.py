@@ -439,6 +439,24 @@ async def _run_live_tutorial(
     if run_record.landscape_run_id is None:
         raise TutorialRunIntegrityError(f"Completed tutorial run {run_id} has no Landscape run id")
 
+    # These are ordinary executor outcomes, not proof of a missing artifact:
+    # an empty source or a run whose rows all failed can legitimately publish
+    # no sink output. Report the durable outcome before attempting a preview.
+    # A completed run or a partial success still requires verified artifacts.
+    if run_record.status in {"completed_with_failures", "empty"} and run_record.rows_succeeded == 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_type": "tutorial_live_run_failed",
+                "status": run_record.status,
+                "run_id": str(run_id),
+                "rows_processed": run_record.rows_processed,
+                "rows_succeeded": run_record.rows_succeeded,
+                "rows_failed": run_record.rows_failed,
+                "detail": "The run produced no output rows. Open the run details to review row errors and source results.",
+            },
+        )
+
     projection = await run_sync_in_worker(
         _project_live_tutorial_output,
         settings,
