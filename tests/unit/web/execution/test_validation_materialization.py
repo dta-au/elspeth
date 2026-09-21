@@ -445,6 +445,44 @@ def test_materialization_rejects_non_dict_yaml_as_an_uncaught_invariant() -> Non
 
 
 @pytest.mark.parametrize(
+    ("source_name", "component_id"),
+    [("source", "source"), ("orders", "source:orders"), ("7", "source:7"), (7, "source:<invalid>"), (None, "source:<invalid>")],
+)
+@pytest.mark.parametrize("policy_case", ["aws_endpoint", "aws_source", "llm_base_url"])
+def test_provider_policy_source_component_ids(source_name: object, component_id: str, policy_case: str) -> None:
+    source = (
+        _source(plugin="llm", options={"base_url": "https://provider.example/v1"})
+        if policy_case == "llm_base_url"
+        else _source(plugin="aws_s3", options={"endpoint_url": "https://storage.example"})
+    )
+    state = CompositionState(
+        sources={cast(str, source_name): source},
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    artifact = _materialized(state)
+    if policy_case == "aws_endpoint":
+        result = validate_aws_s3_endpoint_url_policy(artifact, plugin_snapshot=_web_snapshot())
+        error_code = "aws_s3_endpoint_url_not_allowed"
+    elif policy_case == "aws_source":
+        result = validate_aws_s3_source_policy(artifact, plugin_snapshot=_web_snapshot())
+        error_code = "aws_s3_source_profile_required"
+    else:
+        result = validate_llm_base_url_policy(artifact)
+        error_code = "llm_base_url_not_allowed"
+
+    assert isinstance(result, PhaseFailure)
+    assert [(error.component_id, error.component_type, error.error_code) for error in result.errors] == [
+        (component_id, "source", error_code)
+    ]
+    assert result.failed_check.affected_nodes == (component_id,)
+    assert result.readiness.blockers[0].component_id == component_id
+
+
+@pytest.mark.parametrize(
     ("phase_name", "policy_state", "check_name", "error_code"),
     [
         ("retry", _state(nodes=(_node(plugin="llm", options={"queries": [{}]}),)), "llm_retry_budget_policy", None),
