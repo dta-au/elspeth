@@ -23,7 +23,8 @@ class RepositorySessionWebsocketTicketAuthority:
     """Handle-free ticket authority; every call owns its complete transaction.
 
     ``websocket_tickets.user_id`` binds the canonical identity id, never the
-    provider subject. Lock order is identity, session, ticket. The first ticket
+    provider subject. Lock order is session, identity, ticket, matching
+    session-fenced writers and their identity foreign-key checks. The first ticket
     read only locates these locks; consumption re-reads under the ticket lock
     and uses an atomic conditional update. Wrong-run attempts burn the ticket,
     matching the local store. Database failures propagate to the caller.
@@ -43,14 +44,14 @@ class RepositorySessionWebsocketTicketAuthority:
     def issue(self, *, run_id: str | UUID, user: UserIdentity) -> WebSocketTicket:
         """Issue only after proving current active identity and session ownership."""
         with self._engine.begin() as conn:
-            identity = conn.execute(
-                select(identities_table).where(identities_table.c.identity_id == user.user_id).with_for_update()
-            ).one_or_none()
             session = conn.execute(
                 select(sessions_table)
                 .join(runs_table, runs_table.c.session_id == sessions_table.c.id)
                 .where(runs_table.c.id == str(run_id))
                 .with_for_update(of=sessions_table)
+            ).one_or_none()
+            identity = conn.execute(
+                select(identities_table).where(identities_table.c.identity_id == user.user_id).with_for_update()
             ).one_or_none()
             if (
                 identity is None
@@ -101,14 +102,14 @@ class RepositorySessionWebsocketTicketAuthority:
             candidate = conn.execute(select(websocket_tickets_table).where(websocket_tickets_table.c.ticket_digest == digest)).one_or_none()
             if candidate is None:
                 return None
-            identity = conn.execute(
-                select(identities_table).where(identities_table.c.identity_id == candidate.user_id).with_for_update()
-            ).one_or_none()
             session = conn.execute(
                 select(sessions_table)
                 .join(runs_table, runs_table.c.session_id == sessions_table.c.id)
                 .where(runs_table.c.id == candidate.run_id)
                 .with_for_update(of=sessions_table)
+            ).one_or_none()
+            identity = conn.execute(
+                select(identities_table).where(identities_table.c.identity_id == candidate.user_id).with_for_update()
             ).one_or_none()
             record = conn.execute(
                 select(websocket_tickets_table).where(websocket_tickets_table.c.ticket_digest == digest).with_for_update()

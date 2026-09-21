@@ -863,7 +863,7 @@ class TestStep2IntraStep:
             },
         )
         assert inspected["next_turn"]["type"] == "inspect_and_confirm"
-        _respond(client, session_id, edited_values={"columns": ["text", "category"]})
+        _respond(client, session_id, edited_values={"columns": inspected["next_turn"]["payload"]["observed"]["columns"]})
         return _finish_review(client, session_id, "source")
 
     def _stage_proposal(
@@ -880,7 +880,7 @@ class TestStep2IntraStep:
     def _stage_proposal_from_step_2(self, client: TestClient, session_id: str, *, filename: str) -> dict:
         """Stage from the Step 2 SINGLE_SELECT state (after the source is bound)."""
         _respond(client, session_id, chosen=["json"])
-        _respond(
+        selecting = _respond(
             client,
             session_id,
             edited_values={
@@ -893,7 +893,7 @@ class TestStep2IntraStep:
                 },
             },
         )
-        _respond(client, session_id, chosen=["text"], custom_inputs=[])
+        _respond(client, session_id, chosen=[selecting["next_turn"]["payload"]["options"][0]["id"]], custom_inputs=[])
         return _finish_review(client, session_id, "output")
 
     @pytest.mark.parametrize("profile", ("live", "tutorial"))
