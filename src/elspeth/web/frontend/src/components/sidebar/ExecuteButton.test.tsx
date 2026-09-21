@@ -35,12 +35,12 @@ import {
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 
-const READY_READINESS = {
+const READY_READINESS: ValidationResult["readiness"] = {
   authoring_valid: true,
   execution_ready: true,
   completion_ready: true,
   blockers: [],
-} as const;
+};
 
 const NOT_READY_READINESS = {
   authoring_valid: false,
@@ -126,6 +126,9 @@ describe("ExecuteButton", () => {
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
+      isComposing: false,
+      guidedChatPending: false,
+      guidedResponsePending: false,
     } as never);
     resetStore(useInterpretationEventsStore);
     resetStore(useAuditReadinessStore);
@@ -156,6 +159,49 @@ describe("ExecuteButton", () => {
     expect(
       screen.getByRole("button", { name: /run pipeline/i }),
     ).toBeInTheDocument();
+  });
+
+  it.each(["isComposing", "guidedChatPending", "guidedResponsePending"] as const)(
+    "blocks Run and its shortcut while %s, then re-enables Run",
+    (pendingFlag) => {
+      useExecutionStore.setState({
+        validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS },
+        runDisclosureAckBySession: { "sess-1": true },
+      });
+      useSessionStore.setState({ activeSessionId: "sess-1" });
+      render(<ExecuteButton />);
+      const button = screen.getByRole("button", { name: "Run pipeline" });
+      expect(button).toBeEnabled();
+
+      act(() => useSessionStore.setState({ [pendingFlag]: true }));
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute("aria-disabled", "true");
+      expect(screen.getByText("Wait for the composer to finish thinking.")).toBeInTheDocument();
+      fireEvent.click(button);
+      fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+      expect(useExecutionStore.getState().execute).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+
+      act(() => useSessionStore.setState({ [pendingFlag]: false }));
+      expect(button).toBeEnabled();
+      expect(button).not.toHaveAttribute("aria-disabled");
+      fireEvent.click(button);
+      expect(useExecutionStore.getState().execute).toHaveBeenCalledWith("sess-1");
+    },
+  );
+
+  it("blocks an open Run confirmation when Composer starts thinking", () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS },
+    });
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: "Run pipeline" }));
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
+
+    act(() => useSessionStore.setState({ isComposing: true }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run pipeline" }));
+    expect(useExecutionStore.getState().execute).not.toHaveBeenCalled();
   });
 
   describe("launch failure beside Run (operator placement ruling 2026-09-13)", () => {
@@ -1247,6 +1293,7 @@ describe("primaryRunBlockReason", () => {
   const allClear = {
     isExecuting: false,
     progressRunning: false,
+    composerBusy: false,
     isRunBlocked: false,
     validationFailing: false,
     executionReadinessBlocked: false,
