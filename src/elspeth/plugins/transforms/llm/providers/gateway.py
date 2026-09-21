@@ -51,10 +51,12 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
+from elspeth.core.llm_pricing import provider_cost_from_response
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
@@ -80,6 +82,7 @@ from elspeth.plugins.llm.config_validation import (
     validate_gateway_single_prompt_structured_output_capability,
     validate_gateway_structured_output_capability,
 )
+from elspeth.plugins.llm.pricing import observe_http_provider_cost
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.multi_query import ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.provider import (
@@ -525,6 +528,7 @@ class GatewayLLMProvider:
         limiter: Any = None,
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
+        pricing_model: str | None = None,
     ) -> None:
         # Re-validate defensively (mirrors OpenRouterLLMProvider): GatewayConfig
         # already enforces this shape at config-construction time, but this
@@ -549,6 +553,7 @@ class GatewayLLMProvider:
         self._limiter = limiter
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
+        self._pricing_model = pricing_model
 
         # Client cache with reference counting for parallel multi-query safety
         # — same pattern as OpenRouterLLMProvider.
@@ -590,6 +595,7 @@ class GatewayLLMProvider:
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
         observed_usage = TokenUsage.unknown()
+        observed_response_body = b""
         try:
             request_body: dict[str, Any] = {
                 "model": model,
@@ -604,6 +610,7 @@ class GatewayLLMProvider:
 
             response = self._post_chat_completion(http_client, request_body)
             observed_usage = observe_http_token_usage(response.content)
+            observed_response_body = response.content
             self._validate_completion_status(response)
 
             data, content, usage, finish_reason, response_model = _validate_gateway_success_response(
@@ -629,12 +636,17 @@ class GatewayLLMProvider:
             return result
         except LLMClientError as exc:
             primary_error = exc
+            observed_cost, observed_cost_source = observe_http_provider_cost(
+                observed_response_body, model_requested=self._pricing_model or model
+            )
             self._record_logical_llm_error(
                 audit_parent=audit_parent,
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 exc=exc,
                 usage=observed_usage,
+                provider_cost=observed_cost,
+                provider_cost_source=observed_cost_source,
                 attempt_id=attempt_id,
             )
             raise
@@ -731,6 +743,8 @@ class GatewayLLMProvider:
         attempt_id: str | None,
     ) -> None:
         """Record the semantic LLM call that the HTTP transport fulfilled."""
+        pricing_model = self._pricing_model or request_payload.model
+        provider_cost, provider_cost_source = provider_cost_from_response(raw_response, pricing_model=pricing_model)
         call_index = audit_parent.allocate_call_index(self._recorder)
         call = audit_parent.record_call(
             self._recorder,
@@ -741,6 +755,9 @@ class GatewayLLMProvider:
             response_data=LLMCallResponse(
                 content=content,
                 model=model,
+                pricing_model=pricing_model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
                 usage=usage,
                 raw_response=raw_response,
             ),
@@ -761,6 +778,8 @@ class GatewayLLMProvider:
         request_payload: LLMCallRequest,
         exc: LLMClientError,
         usage: TokenUsage,
+        provider_cost: float | None,
+        provider_cost_source: ComposerLLMProviderCostSource,
         attempt_id: str | None,
     ) -> None:
         call_index = audit_parent.allocate_call_index(self._recorder)
@@ -776,6 +795,9 @@ class GatewayLLMProvider:
                 type=type(exc).__name__,
                 message=message,
                 retryable=exc.retryable,
+                pricing_model=self._pricing_model or request_payload.model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,

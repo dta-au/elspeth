@@ -4,7 +4,8 @@ import litellm
 import pytest
 from structlog.testing import capture_logs
 
-from elspeth.web.composer.llm_response_parsing import _calculate_missing_provider_cost
+from elspeth.core.canonical import stable_hash
+from elspeth.core.llm_pricing import calculate_missing_provider_cost
 
 
 def test_calculator_exception_emits_only_safe_structured_debug_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -13,7 +14,7 @@ def test_calculator_exception_emits_only_safe_structured_debug_metadata(monkeypa
 
     monkeypatch.setattr(litellm, "cost_per_token", unavailable)
     with capture_logs() as logs:
-        result = _calculate_missing_provider_cost({"prompt_tokens": 11, "completion_tokens": 3}, model_requested="azure/gpt-4.1")
+        result = calculate_missing_provider_cost({"prompt_tokens": 11, "completion_tokens": 3}, pricing_model="azure/gpt-4.1")
     assert result == (None, "not_available")
     assert logs == [
         {
@@ -21,7 +22,7 @@ def test_calculator_exception_emits_only_safe_structured_debug_metadata(monkeypa
             "log_level": "debug",
             "reason": "calculator_exception",
             "error_class": "RuntimeError",
-            "model_requested": "azure/gpt-4.1",
+            "model_identity_hash": stable_hash({"pricing_model": "azure/gpt-4.1"}),
             "prompt_tokens": 11,
             "completion_tokens": 3,
             "cached_prompt_tokens": None,
@@ -38,25 +39,28 @@ def test_successful_cost_recovery_does_not_create_parallel_call_result_log(monke
 
     monkeypatch.setattr(litellm, "cost_per_token", priced)
     with capture_logs() as logs:
-        result = _calculate_missing_provider_cost({"prompt_tokens": 11, "completion_tokens": 3}, model_requested="azure/gpt-4.1")
+        result = calculate_missing_provider_cost({"prompt_tokens": 11, "completion_tokens": 3}, pricing_model="azure/gpt-4.1")
     assert result == (0.03, "litellm.cost_per_token")
     assert logs == []
 
 
-def test_diagnostic_model_identity_is_redacted_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_diagnostic_model_identity_is_hashed_without_exporting_provider_address(monkeypatch: pytest.MonkeyPatch) -> None:
     def unavailable(**kwargs: object) -> tuple[float, float]:
         raise ValueError("private exception prose")
 
-    monkeypatch.setattr(litellm, "cost_per_token", unavailable)
+    # Fail the lookup itself so an unregistered, potentially sensitive pricing
+    # identity reaches the exception diagnostic without needing a catalogue row.
+    monkeypatch.setattr(litellm, "get_model_info", unavailable)
+    pricing_model = "https://private-provider.invalid/secret-deployment/" + "x" * 1000
     with capture_logs() as logs:
-        result = _calculate_missing_provider_cost(
+        result = calculate_missing_provider_cost(
             {"prompt_tokens": 11, "completion_tokens": 3},
-            model_requested="https://private-provider.invalid/secret-deployment/" + "x" * 1000,
+            pricing_model=pricing_model,
         )
     assert result == (None, "not_available")
     assert len(logs) == 1
-    identity = logs[0]["model_requested"]
-    assert len(identity) <= 512
-    assert "private-provider" not in identity
-    assert "secret-deployment" not in identity
-    assert "raw_error_hash=" in identity
+    identity = logs[0]["model_identity_hash"]
+    assert identity == stable_hash({"pricing_model": pricing_model})
+    assert "private-provider" not in str(logs)
+    assert "secret-deployment" not in str(logs)
+    assert "private exception prose" not in str(logs)

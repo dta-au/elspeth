@@ -692,10 +692,12 @@ class PlannerModelConfig:
     # latency on every tool-choreography turn.
     discovery_reasoning_effort: str
     candidate_reasoning_effort: str
+    pricing_model: str | None = None
     # Senior advisor model for the one-shot escape-hatch overtime turn.
     # None disables the hatch: budget exhaustion raises exactly as before.
     escape_hatch_model: str | None = None
     escape_hatch_provider: str | None = None
+    escape_hatch_pricing_model: str | None = None
     # Endpoint affordance (Phase 3 Task 2): when the operator has pointed the
     # PRIMARY composer role at a custom OpenAI-compatible endpoint, these are
     # forwarded as ``api_base``/``api_key`` on every ordinary (non-hatch)
@@ -724,6 +726,11 @@ class PlannerModelConfig:
             type(self.escape_hatch_provider) is not str or not self.escape_hatch_provider.strip()
         ):
             raise ValueError("escape_hatch_provider must be a non-empty exact string or None")
+        for name, value in (("pricing_model", self.pricing_model), ("escape_hatch_pricing_model", self.escape_hatch_pricing_model)):
+            if value is not None and (type(value) is not str or not value.strip()):
+                raise ValueError(f"{name} must be a non-empty exact string or None")
+        if self.escape_hatch_pricing_model is not None and self.escape_hatch_model is None:
+            raise ValueError("escape_hatch_pricing_model requires escape_hatch_model")
         if (self.escape_hatch_model is None) != (self.escape_hatch_provider is None):
             raise ValueError("escape_hatch_model and escape_hatch_provider must be configured together")
         if self.escape_hatch_api_base is not None and self.escape_hatch_model is None:
@@ -3793,6 +3800,7 @@ async def _plan_pipeline_inner(
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
         nonlocal total_calls, total_cost
         effective_model = model_override or model_config.model_identifier
+        effective_pricing_model = model_config.escape_hatch_pricing_model if model_override is not None else model_config.pricing_model
         active_tools = tools if tools_override is None else tools_override
         cache_marked_messages, cache_marked_tools = (
             apply_anthropic_cache_markers(messages, active_tools)
@@ -3836,6 +3844,7 @@ async def _plan_pipeline_inner(
         ) -> None:
             failed_call = build_llm_call_record(
                 model_requested=effective_model,
+                pricing_model=effective_pricing_model,
                 messages=marked_messages,
                 tools=marked_tools,
                 status=status,
@@ -3932,6 +3941,7 @@ async def _plan_pipeline_inner(
             except asyncio.CancelledError as exc:
                 cancelled_call = build_llm_call_record(
                     model_requested=effective_model,
+                    pricing_model=effective_pricing_model,
                     messages=marked_messages,
                     tools=marked_tools,
                     status=ComposerLLMCallStatus.CANCELLED,
@@ -3951,6 +3961,7 @@ async def _plan_pipeline_inner(
             except TimeoutError as exc:
                 timed_out_call = build_llm_call_record(
                     model_requested=effective_model,
+                    pricing_model=effective_pricing_model,
                     messages=marked_messages,
                     tools=marked_tools,
                     status=ComposerLLMCallStatus.TIMEOUT,
@@ -4011,6 +4022,7 @@ async def _plan_pipeline_inner(
 
             call = build_llm_call_record(
                 model_requested=effective_model,
+                pricing_model=effective_pricing_model,
                 messages=marked_messages,
                 tools=marked_tools,
                 status=ComposerLLMCallStatus.SUCCESS,

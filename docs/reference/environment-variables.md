@@ -201,6 +201,30 @@ unavailable with a provider-inference error.
 The defaults (`gpt-5.5` primary, `anthropic/claude-sonnet-4-6` advisor) are
 development conveniences. Production deployments should set both explicitly.
 
+Custom endpoints may route on an operator-defined deployment alias that is
+absent from the pricing catalogue. Set `ELSPETH_WEB__COMPOSER_PRICING_MODEL`
+and `ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL` independently to the matching
+LiteLLM catalogue identities. These optional settings affect fallback cost
+calculation only; routing names and requested/returned model audit fields are
+preserved, and `pricing_model` records the effective billing identity. Each
+role uses its routing identity when its pricing override is
+unset. A missing catalogue price remains unavailable, never zero.
+
+For example, when both roles use the approved Azure deployment through a
+configured OpenAI-compatible endpoint:
+
+```bash
+ELSPETH_WEB__COMPOSER_MODEL=openai/gpt-5.6-sol-datazone
+ELSPETH_WEB__COMPOSER_PRICING_MODEL=azure/gpt-5.6-sol
+ELSPETH_WEB__COMPOSER_ADVISOR_MODEL=openai/gpt-5.6-sol-datazone
+ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL=azure/gpt-5.6-sol
+ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true
+```
+
+The operator must select the catalogue entry matching the actual deployment's
+model and billing terms. An alias containing a region or date does not create
+a catalogue entry.
+
 **The two models must differ by default.** The advisor is the independent reviewer of
 the primary Composer's work, so the service refuses to start when both
 resolve to the same canonical model id. Distinctness is checked on the final
@@ -333,6 +357,7 @@ with `-` or `_`).
 | --- | --- | --- |
 | `provider` | all | `bedrock`, `openrouter`, or `azure` |
 | `model` | all | Bedrock: LiteLLM `bedrock/<model-id>` form. Azure: must equal `deployment_name`. |
+| `pricing_model` | all | Optional LiteLLM catalogue identity for cost calculation, separate from the routed deployment/model. Operator-owned; an authored node cannot override it. |
 | `credential_scope` | openrouter, azure | `server` or `user`. Required for these providers; forbidden for Bedrock. |
 | `credential_ref` | openrouter, azure | Uppercase secret name (for example `OPENROUTER_API_KEY`). Required for these providers; forbidden for Bedrock. |
 | `base_url` | openrouter | Optional OpenAI-compatible API base URL. HTTPS is required except for an explicit loopback HTTP endpoint such as `http://127.0.0.1:8199/v1`. |

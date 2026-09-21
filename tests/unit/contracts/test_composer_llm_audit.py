@@ -109,6 +109,19 @@ def test_provider_cost_fields_are_serialized_without_fabricating_cost() -> None:
     assert payload["provider_cost_source"] == "response_usage.cost"
 
 
+def test_pricing_identity_is_retained_in_serialized_audit() -> None:
+    call = _make_call(model_requested="openai/operator-datazone", pricing_model="azure/gpt-4o")
+    payload = call.to_dict()
+    assert payload["model_requested"] == "openai/operator-datazone"
+    assert payload["pricing_model"] == "azure/gpt-4o"
+
+
+@pytest.mark.parametrize("value", ["", " ", "\t"])
+def test_pricing_identity_cannot_be_blank(value: str) -> None:
+    with pytest.raises(ValueError, match="pricing_model"):
+        _make_call(pricing_model=value)
+
+
 def test_private_provider_cost_source_is_serialized_with_provenance() -> None:
     call = _make_call(
         provider_cost=0.01234,

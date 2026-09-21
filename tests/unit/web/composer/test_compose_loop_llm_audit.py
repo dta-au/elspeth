@@ -443,7 +443,9 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_text_only_success_records_llm_call_metadata() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(
+        catalog=_mock_catalog(), settings=_make_settings(composer_pricing_model="openai/gpt-4o-2024-08-06")
+    )
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.")
 
@@ -465,8 +467,9 @@ async def test_text_only_success_records_llm_call_metadata() -> None:
     assert call.prompt_tokens == 11
     assert call.completion_tokens == 7
     assert call.total_tokens == 18
-    assert call.provider_cost is None
-    assert call.provider_cost_source == "not_available"
+    assert call.pricing_model == "openai/gpt-4o-2024-08-06"
+    assert call.provider_cost == pytest.approx(0.0000975)
+    assert call.provider_cost_source == "litellm.cost_per_token"
     assert call.provider_request_id == "chatcmpl-123"
     assert call.messages_hash == stable_hash(request_kwargs["messages"])
     assert call.tools_spec_hash == stable_hash(request_kwargs["tools"])
@@ -741,7 +744,7 @@ def test_pydantic_extra_unset_slot_reads_as_no_extras_without_raising() -> None:
     """A declared-but-unset ``__pydantic_extra__`` slot is third-party state a
     partially constructed provider object can legitimately carry: the boundary
     answers None ("no extras"), it never propagates the AttributeError."""
-    from elspeth.web.composer.llm_response_parsing import _pydantic_extra_fields
+    from elspeth.core.llm_pricing import _pydantic_extra_fields
 
     class _UnsetSlot:
         __slots__ = ("__pydantic_extra__",)

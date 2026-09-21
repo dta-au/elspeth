@@ -26,8 +26,9 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, get_args, runtime_checkable
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
 from elspeth.contracts.token_usage import TokenUsage
 
@@ -199,6 +200,23 @@ class LLMCallRequest:
         return d
 
 
+def _require_llm_pricing(
+    pricing_model: str | None, provider_cost: float | None, provider_cost_source: ComposerLLMProviderCostSource
+) -> None:
+    if pricing_model is not None:
+        _require_non_empty_str(pricing_model, "pricing_model")
+        if not pricing_model.strip():
+            raise ValueError("pricing_model must not be blank")
+    if provider_cost_source not in get_args(ComposerLLMProviderCostSource):
+        raise ValueError("provider_cost_source is not recognized")
+    if provider_cost is not None:
+        _require_finite_number(provider_cost, "provider_cost")
+        if provider_cost < 0:
+            raise ValueError("provider_cost must be nonnegative")
+    if (provider_cost is None) != (provider_cost_source == "not_available"):
+        raise ValueError("provider_cost and provider_cost_source must agree on availability")
+
+
 @dataclass(frozen=True, slots=True)
 class LLMCallResponse:
     """Audit record for an LLM API response."""
@@ -207,6 +225,9 @@ class LLMCallResponse:
     model: str
     usage: TokenUsage
     raw_response: Mapping[str, Any]
+    pricing_model: str | None = None
+    provider_cost: float | None = None
+    provider_cost_source: ComposerLLMProviderCostSource = "not_available"
 
     def __post_init__(self) -> None:
         freeze_fields(self, "raw_response")
@@ -215,6 +236,7 @@ class LLMCallResponse:
         if type(self.usage) is not TokenUsage:
             raise TypeError(f"usage must be TokenUsage, got {type(self.usage).__name__}: {self.usage!r}")
         _require_mapping(self.raw_response, "raw_response")
+        _require_llm_pricing(self.pricing_model, self.provider_cost, self.provider_cost_source)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
@@ -226,6 +248,9 @@ class LLMCallResponse:
             "model": self.model,
             "usage": self.usage.to_dict(),
             "raw_response": deep_thaw(self.raw_response),
+            "pricing_model": self.pricing_model,
+            "provider_cost": self.provider_cost,
+            "provider_cost_source": self.provider_cost_source,
         }
 
 
@@ -236,12 +261,16 @@ class LLMCallError:
     type: str
     message: str
     retryable: bool
+    pricing_model: str | None = None
+    provider_cost: float | None = None
+    provider_cost_source: ComposerLLMProviderCostSource = "not_available"
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.type, "LLMCallError.type")
         _require_non_empty_str(self.message, "LLMCallError.message")
         if type(self.retryable) is not bool:
             raise TypeError(f"LLMCallError.retryable must be bool, got {type(self.retryable).__name__}: {self.retryable!r}")
+        _require_llm_pricing(self.pricing_model, self.provider_cost, self.provider_cost_source)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
@@ -252,6 +281,9 @@ class LLMCallError:
             "type": self.type,
             "message": self.message,
             "retryable": self.retryable,
+            "pricing_model": self.pricing_model,
+            "provider_cost": self.provider_cost,
+            "provider_cost_source": self.provider_cost_source,
         }
 
 

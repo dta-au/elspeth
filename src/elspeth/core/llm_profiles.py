@@ -40,6 +40,7 @@ LLM_PROFILE_PRIVATE_FIELDS = frozenset(
         "profile_alias",
         "provider",
         "model",
+        "pricing_model",
         "api_key",
         "api_key_secret",
         # Bedrock's static IAM credentials: provider-binding credentials like
@@ -115,6 +116,7 @@ class LLMProfileSettings(BaseModel):
 
     provider: str = Field(repr=False)
     model: str = Field(min_length=1, max_length=512, repr=False)
+    pricing_model: str | None = Field(default=None, min_length=1, max_length=512, pattern=r"\S", strict=True, repr=False)
     credential_scope: CredentialScope | None = Field(default=None, repr=False)
     credential_ref: str | None = Field(default=None, repr=False)
     base_url: str | None = Field(default=None, repr=False)
@@ -218,7 +220,13 @@ class RuntimeLLMProfile:
             ),
         }
         options: tuple[tuple[str, object], ...] = tuple(
-            (name, value) for name, value in (*provider_fields[settings.provider], ("max_tokens", settings.max_tokens)) if value is not None
+            (name, value)
+            for name, value in (
+                *provider_fields[settings.provider],
+                ("max_tokens", settings.max_tokens),
+                ("pricing_model", settings.pricing_model),
+            )
+            if value is not None
         )
         # Omission leaves the provider config default intact. Explicit null
         # is an operator instruction to omit temperature from the wire.

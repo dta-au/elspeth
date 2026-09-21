@@ -1417,6 +1417,7 @@ def _record_llm_call(
     *,
     recorder: BufferingRecorder | None,
     model: str,
+    pricing_model: str | None = None,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     status: ComposerLLMCallStatus | None,
@@ -1435,6 +1436,7 @@ def _record_llm_call(
         recorder.record_llm_call(
             build_llm_call_record(
                 model_requested=model,
+                pricing_model=pricing_model,
                 messages=messages,
                 tools=tools,
                 status=status,
@@ -2762,6 +2764,7 @@ class DeferredIntentManagementChatRequest:
     seed: int | None
     timeout_seconds: float
     context_block: StepChatContextInput
+    pricing_model: str | None = None
     # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
     # composer role only (see module callers), so this always carries the
     # primary endpoint, never the advisor's. None/None reproduces the exact
@@ -2871,6 +2874,7 @@ async def maybe_manage_deferred_intent_chat(
         _record_llm_call(
             recorder=recorder,
             model=request.model,
+            pricing_model=request.pricing_model,
             messages=messages,
             tools=tools,
             status=status,
@@ -3171,6 +3175,7 @@ async def _bounded_acompletion(kwargs: dict[str, Any], timeout_seconds: float) -
 async def maybe_resolve_step_1_source_chat(
     *,
     model: str,
+    pricing_model: str | None = None,
     user_message: str,
     plugin_hint: str | None,
     current_source: SourceResolved | None,
@@ -3795,6 +3800,7 @@ async def maybe_resolve_step_1_source_chat(
             _record_llm_call(
                 recorder=recorder,
                 model=model,
+                pricing_model=pricing_model,
                 messages=messages,
                 tools=tools,
                 status=status,
@@ -4243,6 +4249,7 @@ type Step2SinkChatOutcome = (
 async def maybe_resolve_step_2_sink_chat(
     *,
     model: str,
+    pricing_model: str | None = None,
     user_message: str,
     current_sink: SinkResolved | None,
     temperature: float | None,
@@ -4812,6 +4819,7 @@ async def maybe_resolve_step_2_sink_chat(
             _record_llm_call(
                 recorder=recorder,
                 model=model,
+                pricing_model=pricing_model,
                 messages=request_messages,
                 tools=tools,
                 status=status,
@@ -4841,6 +4849,7 @@ async def maybe_resolve_step_2_sink_chat(
 async def solve_step_chat(
     *,
     model: str,
+    pricing_model: str | None = None,
     step: GuidedStep,
     user_message: str,
     temperature: float | None,
@@ -4994,6 +5003,7 @@ async def solve_step_chat(
         _record_llm_call(
             recorder=recorder,
             model=model,
+            pricing_model=pricing_model,
             messages=messages,
             tools=None,
             status=status,

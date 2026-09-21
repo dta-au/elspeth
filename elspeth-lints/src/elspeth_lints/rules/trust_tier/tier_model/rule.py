@@ -534,8 +534,6 @@ class TierModelVisitor(ast.NodeVisitor):
             {
                 "_first_response_message",
                 "_json_safe_provider_artifact",
-                "_provider_cost_from_response",
-                "_provider_details_payload",
                 "_reasoning_metadata_from_response",
                 "_response_field",
                 "_safe_provider_request_id",

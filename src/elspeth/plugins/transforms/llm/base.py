@@ -205,6 +205,14 @@ class LLMConfig(TransformDataConfig):
 
     provider: Literal["azure", "openrouter", "bedrock", "gateway"] = Field(..., description="LLM provider")
     model: str | None = Field(None, description="Model identifier (optional — Azure uses deployment_name)")
+    pricing_model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+        pattern=r"\S",
+        strict=True,
+        description="LiteLLM catalog identity for audit costing; never changes endpoint routing",
+    )
     queries: list[QueryDefinition] | dict[str, QueryDefinition] | None = Field(
         None, description="Multi-query specs (None = single-query mode)"
     )

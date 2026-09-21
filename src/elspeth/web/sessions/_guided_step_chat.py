@@ -482,6 +482,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
     session_id: str,
     user_id: str,
     model: str,
+    pricing_model: str | None = None,
     user_message: str,
     plugin_hint: str | None,
     current_source: SourceResolved | None,
@@ -511,6 +512,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
     try:
         outcome = await maybe_resolve_step_1_source_chat(
             model=model,
+            pricing_model=pricing_model,
             user_message=user_message,
             plugin_hint=plugin_hint,
             current_source=current_source,
@@ -735,6 +737,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     session_id: str,
     user_id: str,
     model: str,
+    pricing_model: str | None = None,
     user_message: str,
     current_sink: SinkResolved | None,
     temperature: float | None,
@@ -776,6 +779,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     try:
         outcome = await maybe_resolve_step_2_sink_chat(
             model=model,
+            pricing_model=pricing_model,
             user_message=user_message,
             current_sink=current_sink,
             temperature=temperature,
@@ -981,6 +985,7 @@ async def solve_step_chat_with_auto_drop(
     session_id: str,
     user_id: str,
     model: str,
+    pricing_model: str | None = None,
     step: GuidedStep,
     user_message: str,
     temperature: float | None,
@@ -1061,6 +1066,7 @@ async def solve_step_chat_with_auto_drop(
     try:
         message = await solve_step_chat(
             model=model,
+            pricing_model=pricing_model,
             step=step,
             user_message=user_message,
             temperature=temperature,

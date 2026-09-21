@@ -1359,6 +1359,9 @@ class ComposerSettings(Protocol):
     def composer_model(self) -> str: ...
 
     @property
+    def composer_pricing_model(self) -> str | None: ...
+
+    @property
     def compartment_id(self) -> str | None: ...
 
     @property
@@ -1414,6 +1417,9 @@ class ComposerSettings(Protocol):
 
     @property
     def composer_advisor_model(self) -> str: ...
+
+    @property
+    def composer_advisor_pricing_model(self) -> str | None: ...
 
     @property
     def composer_advisor_endpoint_base_url(self) -> str | None: ...

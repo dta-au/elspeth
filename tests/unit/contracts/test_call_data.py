@@ -255,7 +255,7 @@ class TestLLMCallRequestConstructionInvariants:
 
 
 class TestLLMCallResponse:
-    """LLMCallResponse.to_dict() produces identical hashes to old dict."""
+    """Response serialization includes explicit pricing availability."""
 
     def test_hash_stability(self) -> None:
         usage = TokenUsage.known(prompt_tokens=10, completion_tokens=20)
@@ -265,6 +265,9 @@ class TestLLMCallResponse:
             "model": "gpt-4",
             "usage": usage.to_dict(),
             "raw_response": raw,
+            "pricing_model": None,
+            "provider_cost": None,
+            "provider_cost_source": "not_available",
         }
         new_dict = LLMCallResponse(
             content="Hello world",
@@ -284,6 +287,21 @@ class TestLLMCallResponse:
             raw_response={},
         ).to_dict()
         assert d["usage"] == {}
+
+    def test_billing_identity_does_not_replace_returned_model(self) -> None:
+        response = LLMCallResponse(
+            content="Hello",
+            model="gpt-4o-2024-11-20",
+            usage=TokenUsage.known(prompt_tokens=10, completion_tokens=20),
+            raw_response={},
+            pricing_model="azure/gpt-4o",
+            provider_cost=0.0,
+            provider_cost_source="litellm.cost_per_token",
+        ).to_dict()
+        assert response["model"] == "gpt-4o-2024-11-20"
+        assert response["pricing_model"] == "azure/gpt-4o"
+        assert response["provider_cost"] == 0.0
+        assert response["provider_cost_source"] == "litellm.cost_per_token"
 
     def test_frozen(self) -> None:
         obj = LLMCallResponse(
@@ -315,6 +333,12 @@ class TestLLMCallResponseConstructionInvariants:
             {"model": ""},
             {"usage": {"prompt_tokens": 1}},
             {"raw_response": ["not", "a", "mapping"]},
+            {"pricing_model": "   "},
+            {"provider_cost": 0.0},
+            {"provider_cost_source": "litellm.cost_per_token"},
+            {"provider_cost": -1, "provider_cost_source": "litellm.cost_per_token"},
+            {"provider_cost": True, "provider_cost_source": "litellm.cost_per_token"},
+            {"provider_cost": float("inf"), "provider_cost_source": "litellm.cost_per_token"},
         ],
     )
     def test_rejects_malformed_response_shape(self, overrides: dict[str, object]) -> None:
@@ -336,13 +360,16 @@ class TestLLMCallResponseConstructionInvariants:
 
 
 class TestLLMCallError:
-    """LLMCallError.to_dict() produces identical hashes to old dict."""
+    """Failures retain explicit pricing availability alongside their cause."""
 
     def test_retryable_error_hash_stability(self) -> None:
         old_dict = {
             "type": "RateLimitError",
             "message": "429 Too Many Requests",
             "retryable": True,
+            "pricing_model": None,
+            "provider_cost": None,
+            "provider_cost_source": "not_available",
         }
         new_dict = LLMCallError(
             type="RateLimitError",
@@ -357,6 +384,9 @@ class TestLLMCallError:
             "type": "ContentPolicyError",
             "message": "Content policy violation",
             "retryable": False,
+            "pricing_model": None,
+            "provider_cost": None,
+            "provider_cost_source": "not_available",
         }
         new_dict = LLMCallError(
             type="ContentPolicyError",
@@ -370,6 +400,19 @@ class TestLLMCallError:
         obj = LLMCallError(type="err", message="msg", retryable=False)
         with pytest.raises(AttributeError):
             obj.type = "other"  # type: ignore[misc]
+
+    def test_billable_failure_retains_cost(self) -> None:
+        error = LLMCallError(
+            type="ContentPolicyError",
+            message="Refused",
+            retryable=False,
+            pricing_model="azure/gpt-4o",
+            provider_cost=0.125,
+            provider_cost_source="response_usage.cost",
+        ).to_dict()
+        assert error["provider_cost"] == 0.125
+        assert error["pricing_model"] == "azure/gpt-4o"
+        assert error["type"] == "ContentPolicyError"
 
 
 # ---------------------------------------------------------------------------

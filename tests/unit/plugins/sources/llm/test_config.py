@@ -84,6 +84,12 @@ def test_azure_source_accepts_a_null_temperature(provider_configs: dict[str, dic
     assert cfg.temperature is None
 
 
+@pytest.mark.parametrize("pricing_model", ["", "  ", "\n", 10, False])
+def test_source_rejects_invalid_pricing_identity(provider_configs: dict[str, dict[str, Any]], pricing_model: object) -> None:
+    with pytest.raises(PluginConfigError):
+        AzureOpenAILLMSourceConfig.from_dict({**provider_configs["azure"], "pricing_model": pricing_model})
+
+
 def test_source_prompt_rejects_row_access_but_accepts_lookup(openrouter_config: Callable[..., dict[str, Any]]) -> None:
     with pytest.raises(PluginConfigError, match="row"):
         OpenRouterLLMSourceConfig.from_dict(

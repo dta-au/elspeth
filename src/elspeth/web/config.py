@@ -254,6 +254,9 @@ class WebSettings(BaseModel):
         default=None
     )
     composer_model: str = "gpt-5.5"
+    composer_pricing_model: str | None = Field(
+        default=None, min_length=1, description="LiteLLM catalog identity for missing-cost calculation; defaults to the routing model."
+    )
     # Reasoning-effort hints for the composer plane (elspeth-dc459d438e).
     # All composer roles run reasoning-capable models; these knobs bound the
     # thinking budget per call class instead of letting the model pick an
@@ -356,6 +359,11 @@ class WebSettings(BaseModel):
     composer_expose_provider_errors: bool = False
     e2e_state_seed_enabled: bool = False
     composer_advisor_model: str = "anthropic/claude-sonnet-4-6"
+    composer_advisor_pricing_model: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Advisor LiteLLM catalog identity for missing-cost calculation; defaults to its routing model.",
+    )
     composer_allow_same_advisor_model: bool = Field(
         default=False,
         description="Allow Composer and Advisor to use the same model, accepting correlated review blind spots.",
@@ -764,6 +772,13 @@ class WebSettings(BaseModel):
         if _is_loopback_or_private_origin(safe_url) and not (parsed.scheme == "http" and _is_loopback_origin(safe_url)):
             raise ValueError("public_base_url must target a public origin unless using HTTP loopback for local development")
         return safe_url
+
+    @field_validator("composer_pricing_model", "composer_advisor_pricing_model")
+    @classmethod
+    def _validate_pricing_model(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("pricing model must be nonblank")
+        return value
 
     @field_validator("composer_endpoint_base_url")
     @classmethod

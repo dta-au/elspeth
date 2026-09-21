@@ -230,6 +230,7 @@ class BedrockLLMProvider:
         limiter: Any = None,
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
+        pricing_model: str | None = None,
     ) -> None:
         self._region_name = region_name
         self._credentials = credentials
@@ -239,6 +240,7 @@ class BedrockLLMProvider:
         self._limiter = limiter
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
+        self._pricing_model = pricing_model
         self._llm_clients: dict[str, AuditedLLMClient] = {}
         self._llm_clients_lock = Lock()
         self._underlying_client: _LiteLLMSDKAdapter | None = None
@@ -306,6 +308,7 @@ class BedrockLLMProvider:
             telemetry_emit=self._telemetry_emit,
             underlying_client=self._get_underlying_client(),
             provider="bedrock",
+            pricing_model=self._pricing_model,
             limiter=self._limiter,
             llm_call_governance=self._llm_call_governance,
         )
@@ -341,6 +344,7 @@ class BedrockLLMProvider:
                     telemetry_emit=self._telemetry_emit,
                     underlying_client=self._get_underlying_client(),
                     provider="bedrock",
+                    pricing_model=self._pricing_model,
                     limiter=self._limiter,
                     llm_call_governance=self._llm_call_governance,
                     **audit_parent.client_kwargs(),

@@ -18,6 +18,7 @@ from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, RawCallPayload
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.events import ExternalCallCompleted
@@ -26,6 +27,7 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
+from elspeth.core.llm_pricing import provider_cost_from_captured_usage
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 
 if TYPE_CHECKING:
@@ -324,6 +326,7 @@ class AuditedLLMClient(AuditedClientBase):
         underlying_client: Any,  # openai.OpenAI or openai.AzureOpenAI
         *,
         provider: str = "openai",
+        pricing_model: str | None = None,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         operation_id: str | None = None,
@@ -365,6 +368,7 @@ class AuditedLLMClient(AuditedClientBase):
         )
         self._client = underlying_client
         self._provider = provider
+        self._pricing_model = pricing_model
         self._max_tokens_param = max_tokens_param
 
     def _emit_telemetry_after_audit(
@@ -520,6 +524,7 @@ class AuditedLLMClient(AuditedClientBase):
                 request_data=request_dto,
                 error=LLMCallError(
                     type=error_type,
+                    pricing_model=self._pricing_model or model,
                     message=_AUDIT_SAFE_PROVIDER_ERROR,
                     retryable=is_retryable,
                 ),
@@ -574,8 +579,13 @@ class AuditedLLMClient(AuditedClientBase):
         # AttributeError here, so they share the guard. usage defaults to
         # unknown() so the error handler can still run if the usage read is what
         # failed (the LLM call happened — it must be recorded, not vanish).
+        pricing_model = self._pricing_model or model
+        provider_cost: float | None = None
+        provider_cost_source: ComposerLLMProviderCostSource = "not_available"
         try:
-            usage = _extract_usage_from_provider_response(response.usage)
+            provider_usage = response.usage
+            usage = _extract_usage_from_provider_response(provider_usage)
+            provider_cost, provider_cost_source = provider_cost_from_captured_usage(response, provider_usage, pricing_model=pricing_model)
             raw_response = response.model_dump()
         except (TypeError, ValueError, RecursionError, AttributeError) as dump_exc:
             # The LLM call happened — record it before re-raising so the
@@ -589,6 +599,9 @@ class AuditedLLMClient(AuditedClientBase):
                 request_data=request_dto,
                 error=LLMCallError(
                     type="ResponseProcessingError",
+                    pricing_model=pricing_model,
+                    provider_cost=provider_cost,
+                    provider_cost_source=provider_cost_source,
                     message=f"Failed to read LLM response: {dump_exc}",
                     retryable=False,
                 ),
@@ -632,6 +645,9 @@ class AuditedLLMClient(AuditedClientBase):
                 request_data=request_dto,
                 response_data=response_payload,
                 error=LLMCallError(
+                    pricing_model=pricing_model,
+                    provider_cost=provider_cost,
+                    provider_cost_source=provider_cost_source,
                     type="MalformedResponseError",
                     message=error_msg,
                     retryable=False,
@@ -660,6 +676,9 @@ class AuditedLLMClient(AuditedClientBase):
             response_dto = LLMCallResponse(
                 content="",  # No content available
                 model=response_model,
+                pricing_model=pricing_model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
                 usage=usage,
                 raw_response=raw_response,
             )
@@ -671,6 +690,9 @@ class AuditedLLMClient(AuditedClientBase):
                 request_data=request_dto,
                 response_data=response_dto,
                 error=LLMCallError(
+                    pricing_model=pricing_model,
+                    provider_cost=provider_cost,
+                    provider_cost_source=provider_cost_source,
                     type="EmptyChoicesError",
                     message=error_msg,
                     retryable=False,
@@ -716,6 +738,9 @@ class AuditedLLMClient(AuditedClientBase):
                 response_data=response_payload,
                 error=LLMCallError(
                     type="MalformedResponseError",
+                    pricing_model=pricing_model,
+                    provider_cost=provider_cost,
+                    provider_cost_source=provider_cost_source,
                     message=error_msg,
                     retryable=False,
                 ),
@@ -746,6 +771,9 @@ class AuditedLLMClient(AuditedClientBase):
                 response_dto = LLMCallResponse(
                     content="",  # No text content available
                     model=response_model,
+                    pricing_model=pricing_model,
+                    provider_cost=provider_cost,
+                    provider_cost_source=provider_cost_source,
                     usage=usage,
                     raw_response=raw_response,
                 )
@@ -757,6 +785,9 @@ class AuditedLLMClient(AuditedClientBase):
                     request_data=request_dto,
                     response_data=response_dto,
                     error=LLMCallError(
+                        pricing_model=pricing_model,
+                        provider_cost=provider_cost,
+                        provider_cost_source=provider_cost_source,
                         type="UnsupportedResponseError",
                         message=error_msg,
                         retryable=False,
@@ -787,6 +818,9 @@ class AuditedLLMClient(AuditedClientBase):
             response_dto = LLMCallResponse(
                 content="",  # Null content normalized for DTO
                 model=response_model,
+                pricing_model=pricing_model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
                 usage=usage,
                 raw_response=raw_response,
             )
@@ -798,6 +832,9 @@ class AuditedLLMClient(AuditedClientBase):
                 request_data=request_dto,
                 response_data=response_dto,
                 error=LLMCallError(
+                    pricing_model=pricing_model,
+                    provider_cost=provider_cost,
+                    provider_cost_source=provider_cost_source,
                     type="ContentPolicyError",
                     message=error_msg,
                     retryable=False,
@@ -841,6 +878,9 @@ class AuditedLLMClient(AuditedClientBase):
                 error=LLMCallError(
                     type="MalformedResponseError",
                     message=error_msg,
+                    pricing_model=pricing_model,
+                    provider_cost=provider_cost,
+                    provider_cost_source=provider_cost_source,
                     retryable=False,
                 ),
                 latency_ms=latency_ms,
@@ -865,6 +905,9 @@ class AuditedLLMClient(AuditedClientBase):
         response_dto = LLMCallResponse(
             content=content,
             model=response_model,
+            pricing_model=pricing_model,
+            provider_cost=provider_cost,
+            provider_cost_source=provider_cost_source,
             usage=usage,
             raw_response=raw_response,
         )

@@ -343,6 +343,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "seed",
     "provider_cost",
     "provider_cost_source",
+    "pricing_model",
     "max_completion_tokens_requested",
     "planner_policy_hash",
     "planner_call_ordinal",

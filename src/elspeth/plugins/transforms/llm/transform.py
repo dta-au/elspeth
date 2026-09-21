@@ -1206,7 +1206,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:69c4e135586d5d27"
+    source_file_hash: str | None = "sha256:a81bfd6827329531"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1779,6 +1779,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
         if isinstance(self._config, AzureOpenAIConfig):
             return AzureLLMProvider(
+                pricing_model=self._config.pricing_model,
                 endpoint=self._config.endpoint,
                 api_key=self._config.api_key,
                 api_version=self._config.api_version,
@@ -1792,6 +1793,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             )
         elif isinstance(self._config, OpenRouterConfig):
             return OpenRouterLLMProvider(
+                pricing_model=self._config.pricing_model,
                 api_key=self._config.api_key,
                 base_url=self._config.base_url,
                 timeout_seconds=self._config.timeout_seconds,
@@ -1804,6 +1806,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             )
         elif isinstance(self._config, BedrockConfig):
             return BedrockLLMProvider(
+                pricing_model=self._config.pricing_model,
                 region_name=self._config.region_name,
                 credentials=self._config.credentials(),
                 recorder=self._recorder,
@@ -1823,6 +1826,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # report for why an earlier direct ``EnvSecretLoader`` lookup at
             # this call site was replaced with this shared path.
             return GatewayLLMProvider(
+                pricing_model=self._config.pricing_model,
                 endpoint=self._config.endpoint,
                 api_key=self._config.api_key,
                 contract_major=self._config.contract_major,

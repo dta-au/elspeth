@@ -226,6 +226,8 @@ files:
     Mapping[str, object]: 1
     dict[str, Any]: 1
     dict[str, object]: 3
+  src/elspeth/core/llm_pricing.py:
+    Mapping[str, Any]: 5
   src/elspeth/core/llm_profiles.py:
     Mapping[str, object]: 2
     dict[str, object]: 4
@@ -778,7 +780,7 @@ files:
   src/elspeth/web/composer/inventory_response_contracts.py:
     Mapping[str, object]: 1
   src/elspeth/web/composer/llm_response_parsing.py:
-    Mapping[str, Any]: 7
+    Mapping[str, Any]: 2
     dict[str, Any]: 9
   src/elspeth/web/composer/no_tool_policy.py:
     Mapping[str, Any]: 1

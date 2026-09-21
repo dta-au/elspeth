@@ -44,6 +44,20 @@
         }
       },
       {
+        "default": null,
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Static Jinja2 prompt template",
         "kind": "text",
         "label": "Prompt Template",
@@ -308,6 +322,20 @@
         }
       },
       {
+        "default": null,
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Static Jinja2 prompt template",
         "kind": "text",
         "label": "Prompt Template",
@@ -553,6 +581,20 @@
         "name": "model",
         "nullable": false,
         "required": true,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "bedrock",
@@ -834,6 +876,20 @@
         "name": "model",
         "nullable": false,
         "required": true,
+        "tier": "common",
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "gateway",

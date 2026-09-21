@@ -31,10 +31,12 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
+from elspeth.core.llm_pricing import provider_cost_from_response
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     CONTEXT_LENGTH_PATTERNS,
@@ -53,6 +55,7 @@ from elspeth.plugins.llm.config_validation import (
     normalize_openrouter_base_url,
     validate_openrouter_base_url,
 )
+from elspeth.plugins.llm.pricing import observe_http_provider_cost
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.provider import (
     LLMAuditParent,
@@ -303,6 +306,7 @@ class OpenRouterLLMProvider:
         limiter: Any = None,
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
+        pricing_model: str | None = None,
     ) -> None:
         # Pre-build auth headers — avoids storing the raw API key as a named attribute
         self._request_headers = {
@@ -325,6 +329,7 @@ class OpenRouterLLMProvider:
         # SHA-256.
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
+        self._pricing_model = pricing_model
 
         # Client cache with reference counting for parallel multi-query safety.
         # Multiple parallel queries share the same row parent, so _get_http_client()
@@ -380,6 +385,7 @@ class OpenRouterLLMProvider:
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
         observed_usage = TokenUsage.unknown()
+        observed_response_body = b""
         try:
             # Build request body
             wire = wire_messages(messages)
@@ -402,6 +408,7 @@ class OpenRouterLLMProvider:
                     headers={"Content-Type": "application/json"},
                 )
                 observed_usage = observe_http_token_usage(response.content)
+                observed_response_body = response.content
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
                 status_code = e.response.status_code
@@ -448,12 +455,17 @@ class OpenRouterLLMProvider:
             return result
         except LLMClientError as exc:
             primary_error = exc
+            observed_cost, observed_cost_source = observe_http_provider_cost(
+                observed_response_body, model_requested=self._pricing_model or model
+            )
             self._record_logical_llm_error(
                 audit_parent=audit_parent,
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 exc=exc,
                 usage=observed_usage,
+                provider_cost=observed_cost,
+                provider_cost_source=observed_cost_source,
                 attempt_id=attempt_id,
             )
             raise
@@ -514,6 +526,8 @@ class OpenRouterLLMProvider:
         attempt_id: str | None,
     ) -> None:
         """Record the semantic LLM call that the HTTP transport fulfilled."""
+        pricing_model = self._pricing_model or request_payload.model
+        provider_cost, provider_cost_source = provider_cost_from_response(raw_response, pricing_model=pricing_model)
         call_index = audit_parent.allocate_call_index(self._recorder)
         call = audit_parent.record_call(
             self._recorder,
@@ -524,6 +538,9 @@ class OpenRouterLLMProvider:
             response_data=LLMCallResponse(
                 content=content,
                 model=model,
+                pricing_model=pricing_model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
                 usage=usage,
                 raw_response=raw_response,
             ),
@@ -544,6 +561,8 @@ class OpenRouterLLMProvider:
         request_payload: LLMCallRequest,
         exc: LLMClientError,
         usage: TokenUsage,
+        provider_cost: float | None,
+        provider_cost_source: ComposerLLMProviderCostSource,
         attempt_id: str | None,
     ) -> None:
         call_index = audit_parent.allocate_call_index(self._recorder)
@@ -559,6 +578,9 @@ class OpenRouterLLMProvider:
                 type=type(exc).__name__,
                 message=message,
                 retryable=exc.retryable,
+                pricing_model=self._pricing_model or request_payload.model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,

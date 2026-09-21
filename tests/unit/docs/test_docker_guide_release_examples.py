@@ -64,7 +64,8 @@ def test_docker_guide_has_a_runnable_standalone_web_container() -> None:
     assert "web --host 0.0.0.0 --port 8451" in section
     assert "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15" in section
     assert "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10" in section
-    assert "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0" in section
+    assert "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=300.0" in section
+    assert "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS=360.0" in section
     assert "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60" in section
     for variable in (
         "ELSPETH_WEB__SECRET_KEY",

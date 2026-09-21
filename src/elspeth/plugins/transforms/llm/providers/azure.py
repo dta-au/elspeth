@@ -153,6 +153,7 @@ class AzureLLMProvider:
         limiter: Any = None,
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
+        pricing_model: str | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._api_key: str | None = api_key
@@ -167,6 +168,7 @@ class AzureLLMProvider:
         # carries the matching SHA-256.
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
+        self._pricing_model = pricing_model
 
         # Client caches — lock ordering: _llm_clients_lock → _underlying_client_lock
         # (always acquire _llm_clients_lock first to prevent deadlock)
@@ -260,6 +262,7 @@ class AzureLLMProvider:
             telemetry_emit=self._telemetry_emit,
             underlying_client=self._get_underlying_client(),
             provider="azure",
+            pricing_model=self._pricing_model,
             limiter=self._limiter,
             llm_call_governance=self._llm_call_governance,
             max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
@@ -309,6 +312,7 @@ class AzureLLMProvider:
                     telemetry_emit=self._telemetry_emit,
                     underlying_client=self._get_underlying_client(),
                     provider="azure",
+                    pricing_model=self._pricing_model,
                     limiter=self._limiter,
                     llm_call_governance=self._llm_call_governance,
                     max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
