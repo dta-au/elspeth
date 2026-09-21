@@ -8,6 +8,14 @@ from litellm import ModelResponse, Usage
 from elspeth.web.composer.llm_response_parsing import _provider_cost_from_response
 
 
+def _mock_catalog(monkeypatch: pytest.MonkeyPatch, model: str, **rates: Any) -> None:
+    import litellm
+
+    info = {"key": model, "input_cost_per_token": 0.0, "output_cost_per_token": 0.0, **rates}
+    monkeypatch.setitem(litellm.model_cost, model, info)
+    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: info)
+
+
 def _usage() -> dict[str, Any]:
     return {
         "prompt_tokens": 100,
@@ -83,7 +91,7 @@ def test_missing_or_invalid_required_cache_rate_prevents_calculator(monkeypatch:
     import litellm
 
     field = "cache_creation_input_token_cost_above_1hr" if one_hour else "cache_creation_input_token_cost"
-    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: {field: rate})
+    _mock_catalog(monkeypatch, "bedrock/model", **{field: rate})
 
     def forbidden(**kwargs: Any) -> tuple[float, float]:
         pytest.fail("required cache-write price is unavailable")
@@ -106,7 +114,7 @@ def test_supported_default_cache_write_rate_is_preserved() -> None:
 def test_explicit_zero_cache_write_rate_is_not_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     import litellm
 
-    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: {"cache_creation_input_token_cost_above_1hr": 0.0})
+    _mock_catalog(monkeypatch, "bedrock/model", cache_creation_input_token_cost_above_1hr=0.0)
     monkeypatch.setattr(litellm, "cost_per_token", lambda **kwargs: (0.0, 0.0))
     assert _provider_cost_from_response({"usage": _usage()}, model_requested="bedrock/model") == (0.0, "litellm.cost_per_token")
 
@@ -140,7 +148,7 @@ def test_malformed_selected_cache_rate_rejects(monkeypatch: pytest.MonkeyPatch, 
 
     key = "cache_creation_input_token_cost" + ("_above_200k_tokens" if threshold else "") + "_priority"
     info = {"cache_creation_input_token_cost": 0.001, "input_cost_per_token_above_200k_tokens": 0.002, key: rate}
-    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: info)
+    _mock_catalog(monkeypatch, "openai/model", **info)
 
     def forbidden(**kwargs: Any) -> tuple[float, float]:
         pytest.fail("selected cache rate is malformed")
@@ -159,7 +167,7 @@ def test_zero_selected_threshold_rate_is_available(monkeypatch: pytest.MonkeyPat
     import litellm
 
     info = {"input_cost_per_token_above_200k_tokens": 0.002, "cache_creation_input_token_cost_above_200k_tokens_priority": 0.0}
-    monkeypatch.setattr(litellm, "get_model_info", lambda **kwargs: info)
+    _mock_catalog(monkeypatch, "openai/model", **info)
     monkeypatch.setattr(litellm, "cost_per_token", lambda **kwargs: (0.0, 0.0))
     response = {"usage": {"prompt_tokens": 300000, "completion_tokens": 20, "cache_creation_input_tokens": 80}, "service_tier": "priority"}
     assert _provider_cost_from_response(response, model_requested="openai/model") == (0.0, "litellm.cost_per_token")

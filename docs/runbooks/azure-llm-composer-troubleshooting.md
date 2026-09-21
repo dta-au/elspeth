@@ -28,6 +28,11 @@ It does not estimate tokens from response text, substitute the returned
 deployment name, or fabricate zero cost. Explicit `null`, boolean, string,
 negative, non-finite, or overflowing costs remain unavailable. An unsupported
 requested model or failed pricing calculation also remains unavailable.
+The fallback verifies that LiteLLM resolves the model to a real catalog entry
+with explicit input and output token prices. A zero returned for an unknown
+deployment alias is not pricing evidence: ELSPETH records `provider_cost=null`
+and `provider_cost_source="not_available"`. Explicit zero prices in a valid
+catalog entry remain valid.
 The planner applies its cumulative cost cap to calculated costs exactly as
 it does to costs already present in the response.
 

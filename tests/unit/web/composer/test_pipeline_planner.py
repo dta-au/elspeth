@@ -5010,6 +5010,33 @@ async def test_missing_provider_cost_is_audited_before_fail_closed(
     assert recorder.llm_calls[0].provider_cost is None
 
 
+@pytest.mark.asyncio
+async def test_unknown_deployment_pricing_is_audited_before_fail_closed(tmp_path: Path, tool_context: ToolContext) -> None:
+    response = ModelResponse(
+        model="gpt-5.6-sol-2026-07-09",
+        usage=Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+        choices=[{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+    )
+    response._hidden_params = {}
+    completion = _ScriptedCompletion(response)
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError, match="provider cost metadata"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"model_identifier": "openai/gpt-5.6-sol-datazone", "provider": "openai"},
+        )
+
+    assert len(completion.requests) == 1
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].model_requested == "openai/gpt-5.6-sol-datazone"
+    assert recorder.llm_calls[0].provider_cost is None
+    assert recorder.llm_calls[0].provider_cost_source == "not_available"
+
+
 def test_budget_policy_is_frozen_slotted_and_rejects_non_decimal_cost() -> None:
     policy = _budget()
     with pytest.raises(TypeError):

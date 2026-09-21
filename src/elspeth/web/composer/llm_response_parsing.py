@@ -491,6 +491,33 @@ def _cache_write_prices_available(
     return True
 
 
+@observation_boundary(
+    tier=3,
+    source="LiteLLM's raw model pricing catalog and SDK-resolved model identity",
+    source_param="catalog",
+    suppresses=("R1", "R5"),
+    invariant="requires a real catalog entry with explicit finite nonnegative input and output token rates; unknown models are never free",
+)
+def _catalog_token_prices_available(catalog: Any, *, model_info: Any) -> bool:
+    """Reject the zero prices LiteLLM synthesizes for unknown deployments.
+
+    Use the SDK's resolved key so supported provider prefixes and aliases
+    retain their catalog identity. Check the raw entry because get_model_info
+    fills absent rates with zero, including for entirely unknown models.
+    """
+    key = _provider_field(model_info, "key")
+    if type(key) is not str or not isinstance(catalog, Mapping) or key not in catalog:
+        return False
+    entry = catalog[key]
+    if not isinstance(entry, Mapping):
+        return False
+    for name in ("input_cost_per_token", "output_cost_per_token"):
+        rate, _ = _validated_provider_cost(entry.get(name), PROVIDER_COST_SOURCE_COST_PER_TOKEN)
+        if rate is None:
+            return False
+    return True
+
+
 def _calculate_missing_provider_cost(
     usage: Any | None, *, model_requested: str | None, service_tier: Any | None = None
 ) -> tuple[float | None, ComposerLLMProviderCostSource]:
@@ -516,6 +543,9 @@ def _calculate_missing_provider_cost(
     import litellm
 
     try:
+        model_info = litellm.get_model_info(model=model_requested)
+        if not _catalog_token_prices_available(litellm.model_cost, model_info=model_info):
+            return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
         # Reconstruct only admitted counters. Passing the original response
         # to completion_cost permits LiteLLM to select Azure's returned alias
         # instead of the supplied request model, recreating COST_UNAVAILABLE.
@@ -528,7 +558,7 @@ def _calculate_missing_provider_cost(
             short_writes = creation_details is None or _provider_field(creation_details, "ephemeral_5m_input_tokens") > 0
             long_writes = creation_details is not None and _provider_field(creation_details, "ephemeral_1h_input_tokens") > 0
             if not _cache_write_prices_available(
-                litellm.get_model_info(model=model_requested),
+                model_info,
                 short_writes=short_writes,
                 long_writes=long_writes,
                 prompt_tokens=reported.prompt_tokens,

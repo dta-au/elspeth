@@ -143,6 +143,35 @@ def test_unpriceable_requested_model_stays_unavailable() -> None:
     assert record.provider_cost_source == "not_available"
 
 
+@pytest.mark.parametrize("model", ["openai/gpt-5.6-sol-datazone", "azure/gpt-5.6-unpriceable-deployment-pricing-regression"])
+def test_unknown_deployment_alias_never_becomes_free(model: str) -> None:
+    assert litellm.get_model_info(model=model)["key"] not in litellm.model_cost
+    record = _record(_response(), model_requested=model)
+    assert record.provider_cost is None
+    assert record.provider_cost_source == "not_available"
+
+
+def test_explicit_zero_catalog_prices_remain_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = "openai/explicit-free-pricing-control"
+    monkeypatch.setitem(
+        litellm.model_cost, model, {**litellm.model_cost["gpt-4o-2024-08-06"], "input_cost_per_token": 0.0, "output_cost_per_token": 0.0}
+    )
+    record = _record(_response(), model_requested=model)
+    assert record.provider_cost == 0.0
+    assert record.provider_cost_source == "litellm.cost_per_token"
+
+
+@pytest.mark.parametrize("missing_rate", ["input_cost_per_token", "output_cost_per_token"])
+def test_missing_catalog_rate_remains_unavailable(monkeypatch: pytest.MonkeyPatch, missing_rate: str) -> None:
+    model = f"openai/missing-{missing_rate}-pricing-control"
+    incomplete = dict(litellm.model_cost["gpt-4o-2024-08-06"])
+    del incomplete[missing_rate]
+    monkeypatch.setitem(litellm.model_cost, model, incomplete)
+    record = _record(_response(), model_requested=model)
+    assert record.provider_cost is None
+    assert record.provider_cost_source == "not_available"
+
+
 @pytest.mark.parametrize("costs", [None, [], [0.1, 0.2], (), (0.1,), (0.1, 0.2, 0.3), (1e308, 1e308)])
 def test_malformed_calculator_result_stays_unavailable(monkeypatch: pytest.MonkeyPatch, costs: object) -> None:
     def malformed(**kwargs: Any) -> object:
