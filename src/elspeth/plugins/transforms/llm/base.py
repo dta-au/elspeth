@@ -363,6 +363,14 @@ class LLMConfig(TransformDataConfig):
             max_capacity_retry_seconds=self.max_capacity_retry_seconds,
         )
 
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def reject_boolean_max_tokens(cls, value: object) -> object:
+        """Reject booleans before Pydantic converts them into integer budgets."""
+        if isinstance(value, bool):
+            raise ValueError("max_tokens must be an integer, not a boolean")
+        return value
+
     @field_validator("response_field")
     @classmethod
     def validate_response_field(cls, v: str) -> str:
