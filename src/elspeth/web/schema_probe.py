@@ -12,6 +12,7 @@ from typing import TypedDict
 from sqlalchemy import Connection, Engine, inspect, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import Pool, QueuePool
 
 from elspeth.contracts.advisory_locks import ELSPETH_SCHEMA_INIT_LOCK_CLASSID
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -370,3 +371,28 @@ def init_landscape_schema(engine: Engine) -> None:
             raise SchemaCompatibilityError("Landscape database initialization did not produce the current schema.")
 
     _run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)
+
+
+@trust_boundary(
+    tier=3,
+    source="SQLAlchemy-owned connection pool implementation and optional public occupancy counters",
+    source_param="pool",
+    suppresses=("R5",),
+    invariant="admits only QueuePool counters as exact integers, rejects negative size/checkedout "
+    "and malformed counters to None, preserves legitimate negative overflow, and reports unsupported "
+    "pool implementations as unavailable; never checks out a connection or suppresses vendor failures",
+    test_ref="tests/unit/web/test_schema_probe.py::test_pool_diagnostics_propagate_vendor_failure",
+    test_fingerprint="2e91d473d6f10934a5778a29e9e51810aee7d432a6fcb74efb7af61318ae3a7a",
+)
+def admit_pool_diagnostics(pool: Pool) -> tuple[int | None, int | None, int | None]:
+    """Observe supported vendor counters without acquiring another database connection."""
+    if not isinstance(pool, QueuePool):
+        return None, None, None
+    size = pool.size()
+    checked_out = pool.checkedout()
+    overflow = pool.overflow()
+    return (
+        size if type(size) is int and size >= 0 else None,
+        checked_out if type(checked_out) is int and checked_out >= 0 else None,
+        overflow if type(overflow) is int else None,
+    )

@@ -1023,6 +1023,8 @@ def test_worker_settles_terminal_saga_only_after_output_finalization(
     terminal_status: RunStatus,
     finalization: str,
 ) -> None:
+    from elspeth.web.sessions.protocol import SessionOperationMutationTransaction, SessionOperationRunMutations
+
     run_id = str(uuid4())
     result = _orchestrator_result_stub(
         run_id=run_id,
@@ -1033,7 +1035,8 @@ def test_worker_settles_terminal_saga_only_after_output_finalization(
     )
     terminal = _run_record_stub(id=UUID(run_id), status=terminal_status.value)
     mock_session_service.get_run.return_value = terminal
-    transaction = MagicMock()
+    transaction = MagicMock(spec_set=SessionOperationMutationTransaction)
+    transaction.runs = create_autospec(SessionOperationRunMutations, instance=True, spec_set=True)
     mock_session_service.session_operation_authority.mutate.side_effect = lambda context, mutation: mutation(transaction)
     settlement_error: Exception | None = None
     if finalization == "stale_owner":
@@ -1102,9 +1105,12 @@ def test_worker_settles_terminal_saga_only_after_output_finalization(
 def test_cancelled_worker_settles_saga_after_terminal_status(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, finalization_succeeds: bool
 ) -> None:
+    from elspeth.web.sessions.protocol import SessionOperationMutationTransaction, SessionOperationRunMutations
+
     run_id = str(uuid4())
     mock_session_service.get_run.return_value = _run_record_stub(id=UUID(run_id), status="cancelled")
-    transaction = MagicMock()
+    transaction = MagicMock(spec_set=SessionOperationMutationTransaction)
+    transaction.runs = create_autospec(SessionOperationRunMutations, instance=True, spec_set=True)
     mock_session_service.session_operation_authority.mutate.side_effect = lambda context, mutation: mutation(transaction)
     cast(Any, service)._call_async = real_loop.run_until_complete
     shutdown = threading.Event()

@@ -34,6 +34,36 @@ from elspeth.web.sessions.schema import SessionSchemaError
 _SENTINEL = "opaque-sentinel-secret SELECT raw_secret FROM vault"
 
 
+@pytest.mark.parametrize("bad_counter", [True, "SECRET_COUNTER", 1.5, None])
+@pytest.mark.parametrize("counter_name", ["size", "checkedout", "overflow"])
+def test_pool_diagnostics_reject_malformed_vendor_counter(tmp_path, monkeypatch, bad_counter, counter_name) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pool.db'}", pool_size=2)
+    try:
+        with engine.connect():
+            assert schema_probe_module.admit_pool_diagnostics(engine.pool) == (2, 1, -1)
+            with monkeypatch.context() as patch:
+                patch.setattr(engine.pool, counter_name, lambda: bad_counter)
+                expected = {"size": (None, 1, -1), "checkedout": (2, None, -1), "overflow": (2, 1, None)}
+                assert schema_probe_module.admit_pool_diagnostics(engine.pool) == expected[counter_name]
+    finally:
+        engine.dispose()
+
+
+def test_pool_diagnostics_propagate_vendor_failure(tmp_path, monkeypatch) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pool.db'}")
+
+    def broken_counter():
+        raise RuntimeError("vendor counter failed")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(engine.pool, "size", broken_counter)
+            with pytest.raises(RuntimeError, match="vendor counter failed"):
+                schema_probe_module.admit_pool_diagnostics(engine.pool)
+    finally:
+        engine.dispose()
+
+
 class _ScalarResult:
     def __init__(self, value: object) -> None:
         self._value = value
