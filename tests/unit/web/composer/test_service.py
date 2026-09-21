@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import threading
 import tracemalloc
@@ -1979,16 +1980,26 @@ class TestComposerMultiTurnToolCalls:
         # repair's own tool-call/tool-result messages must survive.
         assert not any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[2])
         assert any(m.get("role") == "tool" for m in captured_messages[2])
+        # The repair call answered an exchange the model could see in full:
+        # its own superseded reply, then the advisor injection.
+        superseded_reply = {"role": "assistant", "content": "Looks ready to me."}
+        assert captured_messages[1][-2] == superseded_reply
+        assert "Completion advisory review" in captured_messages[1][-1]["content"]
         # Surgical removal, not an accidental match on the wrong entry: turn
-        # 3's list is turn 2's list with exactly the one advisor message
-        # removed and exactly the repair's two messages (assistant tool-call
-        # + tool result) appended — net +1, not some other count.
-        assert len(captured_messages[2]) == len(captured_messages[1]) + 1
-        # Every message present in turn 2's context OTHER than the advisor
-        # injection survives verbatim (by identity) into turn 3's context —
-        # the drain removed exactly one entry and touched nothing else.
-        turn2_minus_advisor = [m for m in captured_messages[1] if "Completion advisory review" not in (m.get("content") or "")]
-        assert captured_messages[2][: len(turn2_minus_advisor)] == turn2_minus_advisor
+        # 3's list is turn 2's list with exactly that exchange removed — the
+        # advisor message AND the reply it answered, so the repair's assistant
+        # tool-call message never directly follows another assistant message —
+        # and exactly the repair's two messages (assistant tool-call + tool
+        # result) appended — net zero, not some other count.
+        assert len(captured_messages[2]) == len(captured_messages[1])
+        assert superseded_reply not in captured_messages[2]
+        # Every message present in turn 2's context OTHER than that exchange
+        # survives verbatim (by identity) into turn 3's context — the drain
+        # removed exactly the pair and touched nothing else.
+        turn2_minus_exchange = captured_messages[1][:-2]
+        assert captured_messages[2][: len(turn2_minus_exchange)] == turn2_minus_exchange
+        roles = [m.get("role") for m in captured_messages[2]]
+        assert all(pair != ("assistant", "assistant") for pair in itertools.pairwise(roles))
 
     @pytest.mark.asyncio
     async def test_flagged_repair_clean_replaces_every_public_and_persisted_echo_surface(self) -> None:
@@ -2191,6 +2202,148 @@ class TestComposerMultiTurnToolCalls:
         assert second_arguments["attempted_actions"] == ["No successful pipeline mutation occurred since the prior advisor pass."]
         assert "current evidence identity" in second_arguments["problem_summary"].lower()
         assert "prior evidence identity" in second_arguments["problem_summary"].lower()
+
+    @staticmethod
+    def _wired_source_only_state() -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    @pytest.mark.asyncio
+    async def test_superseded_no_tool_reply_stays_in_model_context_for_the_repair_turn(self) -> None:
+        """A no-tool reply answered by a repair injection must remain in the
+        provider context. Without it the next call shows a user-role repair
+        message answering an assistant turn the model cannot see."""
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        replies = [_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")]
+        provider_contexts: list[list[dict[str, Any]]] = []
+
+        async def scripted_call_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+            provider_contexts.append([dict(item) for item in messages])
+            return replies[len(provider_contexts) - 1]
+
+        with (
+            patch.object(service, "_call_llm", side_effect=scripted_call_llm),
+            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(
+                service,
+                "_run_advisor_checkpoint",
+                new_callable=AsyncMock,
+                side_effect=[
+                    AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: missing output"),
+                    AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
+                ],
+            ),
+        ):
+            await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
+
+        assert len(provider_contexts) == 2
+        repair_context = provider_contexts[1]
+        assert repair_context[-1]["role"] == "user"
+        assert "[Completion advisory review — BLOCKING." in repair_context[-1]["content"]
+        assert repair_context[-2] == {"role": "assistant", "content": "Looks ready."}
+
+    @pytest.mark.asyncio
+    async def test_superseded_no_tool_reply_is_recoverable_from_a_withheld_reply_audit_row(self) -> None:
+        """The reply a repair gate supersedes is never published, so it must be
+        kept as a non-rendered audit row: ``ComposerLLMCall`` stores no response
+        text, and without this row the model's words exist nowhere."""
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+        from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_messages
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+
+        with (
+            patch.object(
+                service,
+                "_call_llm",
+                new_callable=AsyncMock,
+                side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
+            ),
+            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(
+                service,
+                "_run_advisor_checkpoint",
+                new_callable=AsyncMock,
+                side_effect=[
+                    AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: missing output"),
+                    AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
+                ],
+            ),
+        ):
+            await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
+
+        assert service._sessions_service is not None
+        stored = await service._sessions_service.get_messages(UUID(session_id))
+        withheld = [
+            row for row in stored if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+        ]
+        superseded = [row for row in withheld if row.tool_calls[0]["origin"] == "repair_gate_superseded"]
+        assert [row.content for row in superseded] == ["Looks ready."]
+        # Recoverable is not rendered and not replayed: the row stays out of the
+        # chat view and out of later provider history.
+        assert withheld[0] not in _composer_conversation_messages(stored)
+        assert all(item["content"] != "Looks ready." for item in _composer_chat_history(stored))
+
+    @pytest.mark.asyncio
+    async def test_advisor_cohort_keeps_every_replaced_reply_recoverable(self) -> None:
+        """The advisor-repair cohort publishes fixed copy in place of the
+        model's prose on the repair tool turn and on the terminal. What the
+        user sees is unchanged; the replaced words must still exist somewhere."""
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        responses = [
+            _make_llm_response(content="Looks ready to me."),
+            _make_llm_response(
+                content="Renaming it as the review asked.",
+                tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
+            ),
+            _make_llm_response(content="Pipeline is ready."),
+        ]
+
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses),
+            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(
+                service,
+                "_run_advisor_checkpoint",
+                new_callable=AsyncMock,
+                side_effect=[
+                    AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
+                    AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
+                ],
+            ),
+        ):
+            result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
+
+        # Published behaviour is untouched: fixed copy, prose withheld.
+        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
+        assert result.raw_assistant_content is None
+
+        assert service._sessions_service is not None
+        stored = await service._sessions_service.get_messages(UUID(session_id))
+        withheld = [
+            (row.tool_calls[0]["origin"], row.content)
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+        ]
+        assert withheld == [
+            ("repair_gate_superseded", "Looks ready to me."),
+            ("advisor_repair_tool_turn", "Renaming it as the review asked."),
+            ("advisor_repair_terminal", "Pipeline is ready."),
+        ]
+        assert all(row.content != "Renaming it as the review asked." for row in stored if row.role == "assistant")
 
     @pytest.mark.asyncio
     async def test_flagged_discovery_only_tool_call_does_not_elide_advisor_message(self) -> None:

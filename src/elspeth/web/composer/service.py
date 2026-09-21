@@ -219,6 +219,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools._registry import resolve_tool_effects
 from elspeth.web.composer.tools.declarations import EffectDomain
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, interpretation_rate_cap_hit
+from elspeth.web.composer.withheld_replies import WithheldReplyOrigin, withheld_reply_envelope
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
@@ -3323,6 +3324,36 @@ class ComposerServiceImpl:
             publication=publication,
         )
 
+    async def _persist_withheld_reply(
+        self,
+        origin: WithheldReplyOrigin,
+        content: str,
+        *,
+        session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
+    ) -> None:
+        """Keep a model reply this turn will not publish as a non-rendered audit row.
+
+        ``ComposerLLMCall`` stores no response text, so an unpublished reply is
+        otherwise unrecoverable. The row is an ``audit`` row with its own
+        envelope kind (see ``withheld_replies``): out of the chat view, and out
+        of later provider context. A sessionless compose has nowhere to write;
+        a blank reply has no words to keep.
+        """
+        if session_id is None or not content.strip():
+            return
+        # Fenced session write (P4-D6 family A2b), like the advisor disclosure row.
+        if session_operation_context is None:
+            raise TypeError("withheld reply record requires the turn's session_operation_context")
+        await self._require_sessions_service().add_message(
+            UUID(session_id),
+            "audit",
+            content,
+            writer_principal="compose_loop",
+            tool_calls=[withheld_reply_envelope(origin, content)],
+            session_operation_context=session_operation_context,
+        )
+
     async def _qualified_advisor_repair_public_result(
         self,
         result: ComposerResult,
@@ -3364,6 +3395,16 @@ class ComposerServiceImpl:
                 llm_calls=result.llm_calls,
                 plugin_snapshot=plugin_snapshot,
             )
+        # The replacer publishes fixed copy in place of the model's terminal
+        # prose. ``raw_assistant_content`` is that prose whenever the finalize
+        # tail augmented it; otherwise the tail passed it through as
+        # ``message`` verbatim.
+        await self._persist_withheld_reply(
+            "advisor_repair_terminal",
+            result.message if result.raw_assistant_content is None else result.raw_assistant_content,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
         published = _replace_advisor_repair_public_result(result, outstanding_findings=outstanding_findings)
         await self._persist_advisor_terminal_publication(
             published,
@@ -5383,6 +5424,14 @@ class ComposerServiceImpl:
         persisted_assistant_message = assistant_message
         persisted_raw_assistant_content = raw_assistant_content
         if advisor_repair_context_introduced:
+            # The assistant row below holds the fixed status line, so the
+            # turn's own prose is kept as a non-rendered audit row first.
+            await self._persist_withheld_reply(
+                "advisor_repair_tool_turn",
+                assistant_message.content or "",
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
             persisted_assistant_message = _AdmittedAssistantMessage(
                 content=_ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE,
             )
@@ -7033,6 +7082,22 @@ class ComposerServiceImpl:
             )
             # If no tool calls, the LLM is done — apply the final gate and return
             if not call_model.completion.tool_batch.calls:
+                # A repair gate below may answer this reply with a user-role
+                # injection and continue. The reply has to be in the provider
+                # context first, or the next call shows a repair message
+                # answering an assistant turn the model cannot see. Appended
+                # BEFORE the gate so the gate's own
+                # ``advisor_injection_index = len(llm_messages)`` stays exact,
+                # and withdrawn again on ``action="return"``, where the reply
+                # is published rather than superseded and the provider context
+                # is left exactly as it was. A blank reply is skipped:
+                # providers reject empty assistant content, and there are no
+                # words to keep.
+                superseded_reply = call_model.completion.message.content or ""
+                superseded_reply_index: int | None = None
+                if superseded_reply.strip():
+                    superseded_reply_index = len(llm_messages)
+                    llm_messages.append({"role": "assistant", "content": superseded_reply})
                 terminate = await self._try_terminate_no_tools(
                     assistant_message=call_model.completion.message,
                     session_operation_context=session_operation_context,
@@ -7064,6 +7129,8 @@ class ComposerServiceImpl:
                 if terminate.advisor_review_state is not None:
                     advisor_review_state = terminate.advisor_review_state
                 if terminate.action == "return":
+                    if superseded_reply_index is not None:
+                        del llm_messages[superseded_reply_index]
                     # Offensive guard (explicit raise, not assert): ``python -O``
                     # strips assert statements. The contract between
                     # ``_dispatch_terminate_phase`` and this caller is that
@@ -7092,10 +7159,26 @@ class ComposerServiceImpl:
                     return terminate.result
                 repair_turns_used += terminate.repair_turns_delta
                 advisor_checkpoint_passes_used += terminate.advisor_passes_delta
+                # The gate superseded this reply: it is never published, so keep
+                # the model's words as a non-rendered audit row.
+                if superseded_reply_index is not None:
+                    await self._persist_withheld_reply(
+                        "repair_gate_superseded",
+                        superseded_reply,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                    )
                 if terminate.advisor_injection_index is not None:
                     advisor_repair_context_introduced = True
                     if _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE:
                         pending_advisor_elision_indices.append(terminate.advisor_injection_index)
+                        # Elide the superseded reply WITH the advisor message it
+                        # was answered by. Dropping only the injection would
+                        # leave this reply directly before the repair turn's
+                        # assistant tool-call message — two consecutive
+                        # assistant messages, which some providers reject.
+                        if superseded_reply_index is not None:
+                            pending_advisor_elision_indices.append(superseded_reply_index)
                 continue
 
             cancellation_requested = asyncio.Event()
