@@ -1876,6 +1876,7 @@ class TestComposerEndpointCredentialPairing:
 
 
 def test_advisor_must_differ_from_primary_exact() -> None:
+    assert _settings().composer_allow_same_advisor_model is False
     with pytest.raises(ValidationError, match="composer_advisor_model must differ from composer_model"):
         _settings(composer_model="gpt-5.5", composer_advisor_model="gpt-5.5")
 
@@ -1889,6 +1890,48 @@ def test_advisor_distinct_normalizes_provider_prefix() -> None:
 def test_advisor_distinct_accepts_different_models() -> None:
     s = _settings(composer_model="claude-sonnet-4-6", composer_advisor_model="claude-opus-4-7")
     assert s.composer_advisor_model == "claude-opus-4-7"
+
+
+@pytest.mark.parametrize("composer_model", ["gpt-5.5", "openrouter/openai/gpt-5.5"])
+def test_advisor_same_model_requires_explicit_override(composer_model: str) -> None:
+    with pytest.raises(ValidationError, match="must differ"):
+        _settings(
+            composer_model=composer_model,
+            composer_advisor_model="gpt-5.5",
+            composer_allow_same_advisor_model=False,
+        )
+    settings = _settings(
+        composer_model=composer_model,
+        composer_advisor_model="gpt-5.5",
+        composer_allow_same_advisor_model=True,
+    )
+    assert settings.composer_model == composer_model
+    assert settings.composer_advisor_model == "gpt-5.5"
+
+
+@pytest.mark.usefixtures("required_web_env")
+@pytest.mark.parametrize("override", ["true", "false", "invalid"])
+def test_advisor_same_model_environment_override(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_MODEL", "gpt-5.5")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", "gpt-5.5")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL", override)
+    if override == "true":
+        settings = web_config.settings_from_env()
+        assert settings.composer_allow_same_advisor_model is True
+        assert settings.composer_model == settings.composer_advisor_model == "gpt-5.5"
+    else:
+        with pytest.raises(ValidationError, match="must differ" if override == "false" else "composer_allow_same_advisor_model"):
+            web_config.settings_from_env()
+
+
+def test_advisor_same_model_override_keeps_endpoint_credentials_required() -> None:
+    with pytest.raises(ValidationError, match="composer_advisor_endpoint_base_url and composer_advisor_endpoint_api_key"):
+        _settings(
+            composer_model="gpt-5.5",
+            composer_advisor_model="gpt-5.5",
+            composer_allow_same_advisor_model=True,
+            composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+        )
 
 
 def test_advisor_checkpoint_budget_default_and_floor() -> None:

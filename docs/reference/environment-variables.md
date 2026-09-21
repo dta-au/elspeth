@@ -201,12 +201,27 @@ unavailable with a provider-inference error.
 The defaults (`gpt-5.5` primary, `anthropic/claude-sonnet-4-6` advisor) are
 development conveniences. Production deployments should set both explicitly.
 
-**The two models must differ.** The advisor is the independent reviewer of
+**The two models must differ by default.** The advisor is the independent reviewer of
 the primary Composer's work, so the service refuses to start when both
 resolve to the same canonical model id. Distinctness is checked on the final
 path segment, so a provider prefix cannot mask a same-model pairing:
-`bedrock/anthropic.claude-x` and `openrouter/anthropic/claude-x` count as the
+`openai/gpt-5.5` and `openrouter/openai/gpt-5.5` count as the
 same model.
+
+To explicitly allow the same model for both roles, set
+`ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true` (default: `false`),
+or `composer_allow_same_advisor_model=True` when constructing `WebSettings`.
+This accepts the shared model's correlated blind spots. The advisor remains
+mandatory and still makes its own provider calls; endpoint and credential
+settings remain separate for each role. For example:
+
+```bash
+ELSPETH_WEB__COMPOSER_MODEL=openai/gpt-5.5
+ELSPETH_WEB__COMPOSER_ADVISOR_MODEL=openai/gpt-5.5
+ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true
+```
+
+Restart the web service after changing these settings.
 
 Composer credentials come from the web process environment, keyed by the
 inferred provider. Both the primary and the advisor contract must be

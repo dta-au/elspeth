@@ -356,10 +356,14 @@ class WebSettings(BaseModel):
     composer_expose_provider_errors: bool = False
     e2e_state_seed_enabled: bool = False
     composer_advisor_model: str = "anthropic/claude-sonnet-4-6"
+    composer_allow_same_advisor_model: bool = Field(
+        default=False,
+        description="Allow Composer and Advisor to use the same model, accepting correlated review blind spots.",
+    )
     # Independent endpoint affordance for the ADVISOR role — see
     # composer_endpoint_base_url. Deliberately separate settings: the
-    # two-model independence rule (_validate_advisor_distinct_from_primary)
-    # keeps the advisor's failure modes independent of the primary composer,
+    # default two-model rule (_validate_advisor_distinct_from_primary)
+    # promotes independence from the primary composer's failure modes,
     # and an operator may legitimately run the advisor direct against its
     # provider while the primary composer goes through a gateway (or vice
     # versa). Neither role defaults to the other's endpoint.
@@ -1206,7 +1210,7 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_advisor_distinct_from_primary(self) -> WebSettings:
-        """The advisor must be a different model from the primary composer.
+        """Require different models unless the operator explicitly allows sharing.
 
         Independence of failure modes: a model checking its own work shares
         its blind spots. Exact-string distinctness on the canonical model id
@@ -1214,6 +1218,8 @@ class WebSettings(BaseModel):
         do not mask a same-model pairing). The advisor is mandatory — there is
         no enable flag — so this runs for every boot.
         """
+        if self.composer_allow_same_advisor_model:
+            return self
 
         def _canonical(model_id: str) -> str:
             return model_id.rsplit("/", 1)[-1].strip()
@@ -1222,7 +1228,8 @@ class WebSettings(BaseModel):
             raise ValueError(
                 "composer_advisor_model must differ from composer_model "
                 f"(both resolve to {_canonical(self.composer_model)!r}); the advisor "
-                "is the independent reviewer and cannot be the primary composer"
+                "is the independent reviewer. Set composer_allow_same_advisor_model=true "
+                "to explicitly accept a same-model pairing"
             )
         return self
 
