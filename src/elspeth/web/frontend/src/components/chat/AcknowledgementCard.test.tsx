@@ -556,9 +556,12 @@ describe("AcknowledgementCard — amend", () => {
 // ── Error mapping ────────────────────────────────────────────────────────────
 
 describe("AcknowledgementCard — error mapping", () => {
-  it("409 → already-resolved-in-another-tab message", async () => {
+  it("coded 409 reports an already-resolved review without inventing another tab", async () => {
     const user = userEvent.setup();
-    vi.mocked(api.resolveInterpretation).mockRejectedValue(makeApiError(409));
+    vi.mocked(api.resolveInterpretation).mockRejectedValue({
+      ...makeApiError(409),
+      error_type: "interpretation_already_resolved",
+    });
     renderCard(makeEvent());
     await user.click(
       screen.getByRole("button", {
@@ -566,7 +569,8 @@ describe("AcknowledgementCard — error mapping", () => {
       }),
     );
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/already resolved in another tab/i);
+    expect(alert.textContent).toMatch(/already resolved/i);
+    expect(alert.textContent).not.toMatch(/another tab/i);
   });
 
   it("other (500) → generic could-not-resolve message with detail", async () => {

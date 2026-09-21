@@ -23,7 +23,7 @@
 //     flags, displayed error, opt-out confirm dialog visibility).
 //   * The four handlers (handleUseMine, handleSubmitAmend, handleConfirmOptOut,
 //     and the open/cancel helpers).
-//   * The error-shape mapper (409 → multi-tab, 422 → validation detail,
+//   * The error-shape mapper (coded 409 → resolved review, 422 → validation detail,
 //     other → generic with detail).
 //   * The 8 KB amendment cap measured in UTF-8 bytes (mirrors the backend
 //     pydantic validator in contracts/composer_interpretation.py).
@@ -94,14 +94,18 @@ function isApiError(err: unknown): err is ApiError {
 
 export function describeError(err: unknown): DisplayedError {
   if (isApiError(err)) {
-    if (err.status === 409) {
-      // F-12 multi-tab TOCTOU: the event was already resolved on the
-      // server (typically by another browser tab on the same session).
+    if (
+      err.status === 409 &&
+      err.error_type === "interpretation_already_resolved"
+    ) {
+      // Session-operation contention also returns 409. Only the explicit
+      // event code establishes that this review is no longer pending;
+      // it does not establish who resolved it or whether it was approved.
       return {
         heading: "Already resolved",
         body:
-          "This interpretation was already resolved in another tab — " +
-          "reload to see the latest.",
+          "This interpretation is no longer pending. " +
+          "Reload to see the latest.",
       };
     }
     if (err.status === 422) {
