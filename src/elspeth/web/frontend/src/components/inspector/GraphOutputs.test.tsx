@@ -1,11 +1,12 @@
 import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { CompositionState, NodeSpec } from "@/types";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { GraphOutputs } from "./GraphOutputs";
 
 describe("GraphOutputs", () => {
-  it("shows named gate routes and implicit success connections without counting routes as nodes", () => {
+  it("shows named gate routes and implicit success connections without counting routes as nodes", async () => {
     const common: NodeSpec = {
       id: "filter", node_type: "gate", plugin: null, input: "source_out",
       on_success: null, on_error: null, options: {},
@@ -28,7 +29,11 @@ describe("GraphOutputs", () => {
 
     render(<GraphOutputs state={state} />);
 
-    expect(screen.getByText("Routing (3)")).toBeInTheDocument();
+    const summary = screen.getByText("Wiring (3)");
+    expect(summary.closest("details")).not.toHaveAttribute("open");
+    await userEvent.setup().click(summary);
+    expect(summary.closest("details")).toHaveAttribute("open");
+    expect(screen.getByRole("group", { name: "Wiring table" })).toHaveAttribute("tabindex", "0");
     const gate = screen.getByRole("row", { name: /Gate: filter/ });
     expect(gate).toHaveTextContent("accepted: Fork to combined, combined");
     expect(gate).toHaveTextContent("rejected: Discard row (audit recorded)");
@@ -40,7 +45,7 @@ describe("GraphOutputs", () => {
     expect(unfinished).toHaveTextContent("No failure route set");
   });
 
-  it("resolves success and failure connections to node names and routes queues through their consumers", () => {
+  it("resolves success and failure connections to node names and routes queues through their consumers", async () => {
     const state: CompositionState = {
       id: "session", ...compositionStateAuthorityFields, version: 1,
       metadata: { name: null, description: null }, edges: [],
@@ -66,6 +71,7 @@ describe("GraphOutputs", () => {
       ],
     };
     render(<GraphOutputs state={state} />);
+    await userEvent.setup().click(screen.getByText("Wiring (7)"));
     const source = screen.getByRole("row", { name: /Source: source/ });
     expect(source).toHaveTextContent("Send to classify");
     expect(within(source).getByText("classify").tagName).toBe("CODE");

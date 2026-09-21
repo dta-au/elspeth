@@ -1623,10 +1623,10 @@ class ValidationSummary:
     emitted only where the sink requires fields AND the producer makes a
     static claim (the ADR-007 abstention clause). An absent pair is
     therefore "not checked", never "checked and satisfied".
-    semantic_contracts shows one check per (producer, consumer, required
-    field) triple, an unresolvable producer recorded under a ``"?"``
-    from_id (Phase 1: line_explode + web_scrape only). All are tuples for
-    structured component attribution.
+    semantic_contracts shows one check per declared consumer requirement
+    for each real upstream producer, including requirements sharing a field
+    or code. An unresolvable producer is recorded under a ``"?"`` from_id.
+    All are tuples for structured component attribution.
     """
 
     is_valid: bool

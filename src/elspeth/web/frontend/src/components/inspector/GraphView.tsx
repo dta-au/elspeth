@@ -2242,7 +2242,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
           )}
         </div>
         {compositionState && (
-          <ErrorBoundary label="Routing table">
+          <ErrorBoundary label="Wiring table">
             <GraphOutputs state={compositionState} />
           </ErrorBoundary>
         )}

@@ -298,9 +298,8 @@ def test_redact_guided_snapshot_projects_canonical_blob_sentinel_by_exact_name()
             "pending_source_intents": {},
         },
         "implicit_decisions": {
-            "schema_version": 1,
+            "schema_version": 2,
             "entries": [{"path": "source.path", "value": real_path, "category": "source"}],
-            "normalization_events": [],
         },
     }
 
@@ -1139,7 +1138,7 @@ def _sentinel_projection_meta(real_path: str, sentinel: str, entries: object) ->
             },
             "pending_source_intents": {},
         },
-        "implicit_decisions": {"schema_version": 1, "entries": entries, "normalization_events": []},
+        "implicit_decisions": {"schema_version": 2, "entries": entries},
     }
 
 
@@ -1247,9 +1246,8 @@ def test_redact_guided_snapshot_raw_correlation_stamps_sentinel_over_generic_mas
         }
     }
     composer_meta["implicit_decisions"] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "entries": [{"path": "source.path", "value": real_path, "category": "source"}],
-        "normalization_events": [],
     }
     generic_sources = redact_source_storage_path({"sources": raw_sources})["sources"]
 
@@ -1314,13 +1312,12 @@ def _two_guided_committed_sources_repointed_after_exit(terminal: object) -> tupl
             "terminal": terminal,
         },
         "implicit_decisions": {
-            "schema_version": 1,
+            "schema_version": 2,
             "entries": [
                 {"path": "source.path", "value": _PRIVATE_A, "category": "source"},
                 {"path": "source.file", "value": _PRIVATE_B, "category": "source"},
                 {"path": "output.path", "value": "outputs/out.jsonl", "category": "output"},
             ],
-            "normalization_events": [],
         },
     }
     return sources, composer_meta
@@ -1563,7 +1560,7 @@ def test_redact_guided_snapshot_malformed_implicit_decisions_is_not_a_custody_co
             "pending_source_intents": {},
             "terminal": terminal,
         },
-        "implicit_decisions": {"schema_version": 1, "entries": "not-a-list"},
+        "implicit_decisions": {"schema_version": 2, "entries": "not-a-list"},
     }
     with pytest.raises(AuditIntegrityError, match="implicit-decision projection is malformed") as excinfo:
         _project(sources, composer_meta)

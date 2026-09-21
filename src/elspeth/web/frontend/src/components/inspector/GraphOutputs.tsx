@@ -106,11 +106,11 @@ function policyRows(state: CompositionState): PolicyRow[] {
 export function GraphOutputs({ state }: { state: CompositionState }): JSX.Element {
   const rows = policyRows(state);
   return (
-    <details className="graph-detail-table" open>
+    <details className="graph-detail-table">
       {/* Row kinds are the canonical node names (Source, Transform, Gate, ...,
           Sink); the section and its columns use routing vocabulary. */}
-      <summary>Routing ({rows.length})</summary>
-      <div className="graph-detail-table-scroll" tabIndex={0} role="group" aria-label="Routing table">
+      <summary>Wiring ({rows.length})</summary>
+      <div className="graph-detail-table-scroll" tabIndex={0} role="group" aria-label="Wiring table">
         <table>
           <thead>
             <tr><th scope="col">Component</th><th scope="col">On success</th><th scope="col">On failure</th></tr>

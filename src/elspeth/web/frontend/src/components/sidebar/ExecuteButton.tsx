@@ -409,26 +409,28 @@ export function isRunGatingReadinessRow(
   }
 }
 
-/** Which of the (up to) three run-blocking gates is currently active, for
+/** Which run-blocking gate is currently active, for
  *  the plain-language reason text rendered under the button
  *  (elspeth-088bf83922 T-2). Priority order: an in-flight run takes
- *  precedence (nothing else matters until it finishes); pending
- *  interpretation review is next (it also drives the dedicated
+ *  precedence (nothing else matters until it finishes); Composer activity
+ *  and pending interpretation review follow (review also drives the dedicated
  *  aria-disabled/title/aria-describedby treatment below); then no validation
  *  result, structural validation failure, and backend execution-readiness
  *  refusal. Returns null when none apply, i.e. when `canExecute` is true.
  *  Exported for the corresponding test. */
-export type RunBlockReason = "running" | "interpretation" | "validation" | "readiness" | "not_validated";
+export type RunBlockReason = "running" | "composing" | "interpretation" | "validation" | "readiness" | "not_validated";
 
 export function primaryRunBlockReason(input: {
   isExecuting: boolean;
   progressRunning: boolean;
+  composerBusy: boolean;
   isRunBlocked: boolean;
   validationFailing: boolean;
   executionReadinessBlocked: boolean;
   validationNotRun: boolean;
 }): RunBlockReason | null {
   if (input.isExecuting || input.progressRunning) return "running";
+  if (input.composerBusy) return "composing";
   if (input.isRunBlocked) return "interpretation";
   // "not_validated" (no validation result yet — empty composition, or a
   // snapshot still in flight) is distinct from "validation" (a result exists
@@ -448,6 +450,7 @@ export function primaryRunBlockReason(input: {
  *  mouse/some-AT users, this visible line for everyone else). */
 const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
   running: "The pipeline is already running.",
+  composing: "Wait for the composer to finish thinking.",
   interpretation: INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
   validation: "Fix the validation errors shown in the Checks tab before running.",
   readiness: "The backend has not admitted this pipeline for execution.",
@@ -495,8 +498,8 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
  * panel's rows other than validation/llm_interpretations never block Run —
  * this button previously gave no hint of that distinction. `canExecute`
  * explicitly gates on backend execution readiness, interpretation review,
- * and active-run state; the visible surfaces make those decisions legible:
- *   - when disabled, a one-line reason for an active run, pending
+ * active-run state, and Composer activity; the visible surfaces make those decisions legible:
+ *   - when disabled, a one-line reason for an active run, a busy Composer, pending
  *     interpretation, missing validation, structural validation failure, or
  *     backend readiness refusal renders below the button, driven by
  *     `primaryRunBlockReason`;
@@ -507,6 +510,9 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
 export function ExecuteButton(): JSX.Element | null {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
+  const composerBusy = useSessionStore(
+    (s) => s.isComposing || s.guidedChatPending || s.guidedResponsePending,
+  );
   const validationResult = useExecutionStore((s) => s.validationResult);
   const isExecuting = useExecutionStore((s) => s.isExecuting);
   const progress = useExecutionStore((s) => s.progress);
@@ -576,16 +582,18 @@ export function ExecuteButton(): JSX.Element | null {
   const canExecute =
     activeSessionId !== null &&
     validationResult?.readiness?.execution_ready === true &&
+    !composerBusy &&
     !isExecuting &&
     progress?.status !== "running" &&
     !isRunBlocked;
 
   // Gate legibility (elspeth-088bf83922 T-2) — derived, non-gating. These
-  // three inputs mirror `canExecute`'s own conditions exactly; none of them
+  // inputs mirror `canExecute`'s own conditions exactly; none of them
   // feed back into `canExecute`.
   const blockReason = primaryRunBlockReason({
     isExecuting,
     progressRunning: progress?.status === "running",
+    composerBusy,
     isRunBlocked,
     validationNotRun: validationResult == null,
     validationFailing: validationResult != null && validationResult.is_valid !== true,
