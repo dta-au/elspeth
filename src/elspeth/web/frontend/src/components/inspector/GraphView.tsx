@@ -57,6 +57,7 @@ import { plural } from "@/utils/plural";
 import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
 import { Button, Icon, TypeBadge } from "@/components/ui";
 import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import { llmBindingLabel } from "@/lib/llmBindingLabel";
 import type { CompositionState } from "@/types/index";
 
 import { ConfigRows } from "./ConfigRows";
@@ -1069,6 +1070,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       validationStatus?: ValidationStatus,
       validationTooltip?: string,
       isSelected?: boolean,
+      modelLabel?: string,
     ): PipelineGraphNodeModel {
       const validationMarker = validationStatus
         ? VALIDATION_STATUS_MARKERS[validationStatus]
@@ -1145,8 +1147,12 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
                 )}
               </div>
               {subtitle && (
-                <div className="graph-node-subtitle">
-                  {subtitle}
+                <div
+                  className="graph-node-subtitle"
+                  title={modelLabel ? `${subtitle} · ${modelLabel}` : undefined}
+                  style={modelLabel ? { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } : undefined}
+                >
+                  {subtitle}{modelLabel && <> · {modelLabel}</>}
                 </div>
               )}
             </div>
@@ -1204,6 +1210,9 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
           nodeValidationMap[node.id],
           nodeMessageMap[node.id],
           selectedNodeId === node.id,
+          node.node_type === "transform" && node.plugin === "llm"
+            ? llmBindingLabel(node.options)
+            : undefined,
         ),
       );
     }
@@ -2038,7 +2047,11 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       out.push(describe(sourceComponentId(sourceName), "source", source.plugin));
     }
     for (const node of compositionState.nodes) {
-      out.push(describe(node.id, node.node_type, node.plugin));
+      const description = describe(node.id, node.node_type, node.plugin);
+      if (node.node_type === "transform" && node.plugin === "llm") {
+        description.label += `. ${llmBindingLabel(node.options)}`;
+      }
+      out.push(description);
     }
     for (const output of compositionState.outputs) {
       out.push(describe(output.name, "sink", output.plugin));
