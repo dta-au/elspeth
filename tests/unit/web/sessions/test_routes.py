@@ -13050,7 +13050,8 @@ async def test_state_data_persists_structured_implicit_decisions_report() -> Non
 
     assert state_data.composer_meta is not None
     report = state_data.composer_meta["implicit_decisions"]
-    assert report["schema_version"] == 1
+    assert set(report) == {"schema_version", "entries"}
+    assert report["schema_version"] == 2
     by_path = {entry["path"]: entry for entry in report["entries"]}
 
     assert by_path["node.fetch_pages.options.http.abuse_contact"]["value"] == "ops@agency.gov.au"
@@ -13061,7 +13062,6 @@ async def test_state_data_persists_structured_implicit_decisions_report() -> Non
     assert by_path["output.summaries_out.options.path"]["value"] == "outputs/summaries_out.json"
     assert by_path["output.summaries_out.options.collision_policy"]["provenance"] == "default"
     assert by_path["node.fetch_pages.on_error"]["category"] == "error_routing"
-    assert list(report["normalization_events"]) == []
 
 
 def test_runtime_preflight_failure_500_detail_does_not_promise_journal_traceback() -> None:
