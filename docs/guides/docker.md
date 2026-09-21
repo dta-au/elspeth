@@ -62,8 +62,8 @@ sudo chmod 0700 ./data ./data/blobs ./data/outputs
 ```
 
 Generate fresh signing keys in the shell, then pass all required web settings
-into the container. The values below for the four Composer limits match the
-project's browser-test configuration:
+into the container. The Composer timeout is five minutes, with a six-minute
+declared transport ceiling; any proxy in front must support that ceiling:
 
 ```bash
 export ELSPETH_WEB_SECRET_KEY="$(openssl rand -hex 32)"
@@ -76,7 +76,8 @@ docker run --rm --name elspeth-web \
   -e ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="${ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY}" \
   -e ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15 \
   -e ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10 \
-  -e ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0 \
+  -e ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=300.0 \
+  -e ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS=360.0 \
   -e ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60 \
   -v "$(pwd)/data:/app/data" \
   ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
@@ -347,12 +348,12 @@ Do not install another proxy or overwrite an existing TLS configuration blindly.
 The HTTP-scope map and upstream `Upgrade`/`Connection` headers preserve
 WebSocket negotiation through `/ws/runs/...`; ordinary authenticated requests
 continue through the same proxy. A healthy `/api/ready` does not prove upgrade
-works. Both nginx proxy timeouts are 240 seconds, matching the bundle's declared
-transport ceiling. Composer has 180 seconds with 30 seconds of required
-headroom. Any additional CDN or load balancer must allow at least 240 seconds;
+works. Both nginx proxy timeouts are 360 seconds, matching the bundle's declared
+transport ceiling. Composer has 300 seconds (five minutes) with 30 seconds of required
+headroom. Any additional CDN or load balancer must allow at least 360 seconds;
 otherwise lower the declared ceiling to the smallest actual hop and lower the
 Composer timeout to preserve headroom. The 15/10 turn settings are upper bounds,
-not a promise that all 25 provider turns fit inside 180 seconds.
+not a promise that all 25 provider turns fit inside 300 seconds.
 
 The nginx access log uses `$uri` without query strings and records status and
 timings. Stock nginx error logs can include the full request with a one-use
