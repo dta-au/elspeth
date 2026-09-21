@@ -293,6 +293,7 @@ async def test_guided_chat_route_uses_primary_endpoint_not_advisor(monkeypatch: 
         return _text_response("The selected output is ready.")
 
     monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture_provider)
+    recorder = BufferingRecorder()
 
     await guided_chat_atomic_module.run_guided_chat_provider_attempt(
         session_id=uuid4(),
@@ -303,6 +304,7 @@ async def test_guided_chat_route_uses_primary_endpoint_not_advisor(monkeypatch: 
         message="Explain this output.",
         settings=SimpleNamespace(
             composer_model="test/model",
+            composer_pricing_model="azure/operator-billing-model",
             composer_temperature=None,
             composer_discovery_reasoning_effort="none",
             composer_seed=None,
@@ -319,12 +321,14 @@ async def test_guided_chat_route_uses_primary_endpoint_not_advisor(monkeypatch: 
         catalog=SimpleNamespace(),
         plugin_snapshot=None,
         secret_service=None,
-        recorder=BufferingRecorder(),
+        recorder=recorder,
         progress=None,
     )
 
     assert captured["api_base"] == "https://primary-gateway.example.test/v1"
     assert captured["api_key"] == _SENTINEL_CREDENTIAL
+    assert "pricing_model" not in captured
+    assert recorder.llm_calls[-1].pricing_model == "azure/operator-billing-model"
 
 
 # --- reasoning-effort threading (elspeth-dc459d438e) --------------------------

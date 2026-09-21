@@ -84,7 +84,7 @@ def test_azure_source_preserves_temperature_wire_contract(
         api_version="2024-10-21",
         http_client=httpx.Client(transport=httpx.MockTransport(reply)),
     )
-    monkeypatch.setattr(openai, "AzureOpenAI", lambda **kwargs: sdk)
+    monkeypatch.setattr(AzureLLMProvider, "_get_underlying_client", lambda self: sdk)
     config = provider_configs["azure"]
     if temperature != "omitted":
         config["temperature"] = temperature
@@ -101,6 +101,7 @@ def test_azure_source_preserves_temperature_wire_contract(
             assert requests[0]["temperature"] == temperature
     finally:
         source.close()
+        sdk.close()
 
 
 def _install_runtime_rejecting_schema(source: LLMSource) -> None:
@@ -1249,6 +1250,7 @@ def test_on_start_constructs_real_provider_variant_without_preflight(
     provider_type: type[AzureLLMProvider | OpenRouterLLMProvider | BedrockLLMProvider | GatewayLLMProvider],
 ) -> None:
     config = dict(provider_configs[provider_name])
+    config["pricing_model"] = "azure/gpt-4o"
     if provider_name == "azure":
         config.update(api_version="2025-01-01-preview")
     elif provider_name == "openrouter":
@@ -1273,6 +1275,7 @@ def test_on_start_constructs_real_provider_variant_without_preflight(
         assert provider._telemetry_emit is source_context.telemetry_emit
         assert provider._limiter is source._limiter
         assert provider._approved_prompt_artifact_hash is None
+        assert provider._pricing_model == "azure/gpt-4o"
         if isinstance(provider, AzureLLMProvider):
             assert provider._endpoint == "https://example.openai.azure.com"
             assert provider._api_key == "test-api-key"

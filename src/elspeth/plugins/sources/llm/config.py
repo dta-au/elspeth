@@ -59,6 +59,14 @@ class LLMSourceConfig(DataPluginConfig):
 
     provider: Literal["azure", "openrouter", "bedrock", "gateway"] = Field(..., description="LLM provider")
     model: str | None = Field(default=None, description="Model identifier")
+    pricing_model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+        pattern=r"\S",
+        strict=True,
+        description="LiteLLM catalog identity for audit costing; never changes endpoint routing",
+    )
     prompt_template: str = Field(..., description="Static Jinja2 prompt template")
     system_prompt: str | None = Field(default=None, description="Optional system prompt")
     temperature: float | None = Field(

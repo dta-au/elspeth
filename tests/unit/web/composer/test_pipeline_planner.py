@@ -8605,6 +8605,49 @@ async def test_escape_hatch_fires_on_discovery_cycle(
     assert "discovery guards" in notice
 
 
+@pytest.mark.parametrize("field", ["pricing_model", "escape_hatch_pricing_model"])
+@pytest.mark.parametrize("value", ["", " ", 42])
+def test_planner_rejects_invalid_pricing_identity(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        _model(_ScriptedCompletion(), **{field: value})
+
+
+def test_planner_rejects_advisor_pricing_without_advisor() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_pricing_model requires escape_hatch_model"):
+        _model(_ScriptedCompletion(), escape_hatch_pricing_model="azure/gpt-4o")
+
+
+@pytest.mark.asyncio
+async def test_primary_and_escape_hatch_use_independent_pricing_identities(tmp_path: Path, tool_context: ToolContext) -> None:
+    responses = [
+        _response_with_call_id("discovery-a", "list_sources", {}),
+        _response_with_call_id("discovery-b", "list_sources", {}),
+        _response_with_call_id("discovery-c", "list_sources", {}),
+        _response_with_call_id("hatch", "emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}),
+    ]
+    for response in responses:
+        response.usage = {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+    completion = _ScriptedCompletion(*responses)
+    recorder = BufferingRecorder()
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        model_overrides={
+            "model_identifier": "openai/primary-datazone",
+            "pricing_model": "openai/gpt-4o-2024-08-06",
+            "escape_hatch_model": "openai/advisor-datazone",
+            "escape_hatch_provider": "openai",
+            "escape_hatch_pricing_model": "openai/gpt-4o-mini-2024-07-18",
+        },
+    )
+    assert [request["model"] for request in completion.requests] == ["openai/primary-datazone"] * 3 + ["openai/advisor-datazone"]
+    assert [call.model_requested for call in recorder.llm_calls] == ["openai/primary-datazone"] * 3 + ["openai/advisor-datazone"]
+    assert [call.provider_cost for call in recorder.llm_calls] == pytest.approx([0.00045] * 3 + [0.000027])
+    assert all(call.provider_cost_source == "litellm.cost_per_token" for call in recorder.llm_calls)
+
+
 @pytest.mark.asyncio
 async def test_discovery_cycle_without_hatch_still_raises(
     tmp_path: Path,

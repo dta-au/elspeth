@@ -55,7 +55,6 @@ look up the catalog without importing anything from the plugin layer.
 from __future__ import annotations
 
 import hashlib
-import os
 import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -67,22 +66,9 @@ import structlog
 
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import register_catalog_reader
+from elspeth.core.litellm_policy import configure_litellm_pricing
 
-# LiteLLM fetches its model-cost map from raw.githubusercontent.com at
-# ``import litellm`` time unless told to use the copy bundled with the
-# installed package. A deployment must not silently egress to third
-# parties it never configured (elspeth-c67ba40e4a), so force the local
-# map here — this module is ELSPETH's single point of truth for litellm
-# access and is imported (via the web app / the LLM transform's provider
-# modules) before any lazy ``import litellm`` in this repo runs.
-# ``setdefault`` preserves an explicit operator override: setting
-# ``LITELLM_LOCAL_MODEL_COST_MAP`` to anything other than ``"True"`` in
-# the deployment environment re-enables litellm's remote fetch.
-# Trade-off: litellm-calculated response costs are priced from the map
-# bundled with the pinned litellm version rather than live prices —
-# deterministic and audit-reproducible, at the cost of staleness for
-# models newer than the installed litellm.
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+configure_litellm_pricing()
 
 __all__ = [
     "MODEL_CATALOG_OPENROUTER",

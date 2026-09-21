@@ -12,11 +12,12 @@ rendered as a generic invalid-provider-response error.
 
 Cost admission now uses this order:
 
-1. Preserve a present `usage.cost` value.
-2. If the public field is absent, preserve a present
+1. Preserve a present, non-null `usage.cost` value.
+2. If the public field is absent or null, preserve a present, non-null
    `_hidden_params.response_cost` value.
-3. Only when both fields are absent, call `litellm.cost_per_token` with the
-   original requested model and ELSPETH's validated token counts. Record the
+3. Only when neither field supplies a non-null value, call `litellm.cost_per_token` with the
+   operator's pricing identity (or the requested model when unset) and
+   ELSPETH's validated token counts. Record the
    provenance as `litellm.cost_per_token`.
 
 The third path requires valid reported prompt and completion token counts,
@@ -25,9 +26,9 @@ and rejects malformed counters or impossible cache or reasoning subtotals.
 `completion_cost` is deliberately not used: it can prefer the
 returned deployment alias even when given the requested model.
 It does not estimate tokens from response text, substitute the returned
-deployment name, or fabricate zero cost. Explicit `null`, boolean, string,
+deployment name, or fabricate zero cost. Boolean, string,
 negative, non-finite, or overflowing costs remain unavailable. An unsupported
-requested model or failed pricing calculation also remains unavailable.
+pricing model or failed pricing calculation also remains unavailable.
 The fallback verifies that LiteLLM resolves the model to a real catalog entry
 with explicit input and output token prices. A zero returned for an unknown
 deployment alias is not pricing evidence: ELSPETH records `provider_cost=null`
@@ -42,6 +43,13 @@ unpriceable `gpt-5.6-terra-2026-07-09` deployment alias. The model must actually
 exist in the running LiteLLM catalog; installing the code does not add prices
 for unsupported models.
 
+For a custom routing name such as `openai/gpt-5.6-sol-datazone`, configure
+`ELSPETH_WEB__COMPOSER_PRICING_MODEL=azure/gpt-5.6-sol` and, independently,
+`ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL=azure/gpt-5.6-sol` when those
+catalogue entries match the actual deployment. The routing name still goes to
+the endpoint and remains `model_requested` in audit records. These overrides
+do not replace valid provider-reported costs or manufacture missing prices.
+
 If cost admission still fails, inspect the failed call's sanitized audit:
 
 - `model_requested` and `model_returned` distinguish request identity from
@@ -53,8 +61,9 @@ If cost admission still fails, inspect the failed call's sanitized audit:
 - `COST_UNAVAILABLE` indicates accounting failed before proposal parsing or
   tool dispatch. Repeating the request cannot repair a missing catalog entry.
 
-Preserve the distinction between an absent cost field and a field explicitly
-set to `null` when investigating the SDK response. Do not log raw prompts,
+Absent and explicit `null` cost fields both mean that the provider supplied
+no price. They permit catalogue calculation, but never fabricate a known price.
+Do not log raw prompts,
 credentials, or full provider responses to diagnose pricing.
 
 ### Clean-process pricing differs from the web worker
@@ -102,6 +111,35 @@ representation hides the API key; malformed response envelopes retain an
 error audit record and telemetry. Azure HTTP 429 is retryable, HTTP 401 is
 not made retryable by incidental numbers in its message, and `content_filter`
 is classified as a content-policy rejection.
+
+## Execution model and billing identity
+
+LLM transforms and sources accept an optional `pricing_model`. For a
+profile-bound pipeline, set it in the operator's profile alongside the routing
+binding:
+
+```yaml
+llm_profiles:
+  sol:
+    provider: azure
+    model: gpt-5.6-sol-datazone
+    deployment_name: gpt-5.6-sol-datazone
+    pricing_model: azure/gpt-5.6-sol
+    endpoint: https://your-resource.openai.azure.com
+    credential_scope: server
+    credential_ref: AZURE_OPENAI_API_KEY
+```
+
+The equivalent web profile belongs in `ELSPETH_WEB__LLM_PROFILES`. A direct
+YAML LLM node can set `pricing_model` in its provider options; an authored node
+that selects an operator profile cannot override its private billing identity.
+
+The provider still receives `gpt-5.6-sol-datazone`. Call-response audit payloads
+retain the provider-returned model and record `pricing_model`, `provider_cost`,
+and `provider_cost_source`. This accounting works without an external tracing
+service. Missing pricing stays `null` / `not_available`; it does not fail an
+otherwise successful transform. Composer's separate cost-budget refusal remains
+in force. Token quotas and provider routing do not change with this setting.
 
 ## Azure LLM temperature
 

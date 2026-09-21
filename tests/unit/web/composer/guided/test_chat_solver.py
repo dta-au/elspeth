@@ -4472,6 +4472,7 @@ async def test_guided_chat_route_selects_active_output_for_revision_and_keeps_al
         message="Explain the outputs.",
         settings=SimpleNamespace(
             composer_model="test/model",
+            composer_pricing_model=None,
             composer_temperature=None,
             composer_discovery_reasoning_effort="none",
             composer_seed=None,
@@ -4550,6 +4551,7 @@ async def test_guided_chat_route_preserves_gapped_index_for_single_advisory_outp
         message="Explain this output.",
         settings=SimpleNamespace(
             composer_model="test/model",
+            composer_pricing_model=None,
             composer_temperature=None,
             composer_discovery_reasoning_effort="none",
             composer_seed=None,
@@ -4649,6 +4651,7 @@ async def test_applied_component_chat_revision_is_form_directed_without_mutation
         message="Change the private path and failure policy.",
         settings=SimpleNamespace(
             composer_model="test/model",
+            composer_pricing_model=None,
             composer_temperature=None,
             composer_discovery_reasoning_effort="none",
             composer_seed=None,
@@ -4746,6 +4749,7 @@ async def test_step_1_empty_specialised_result_falls_through_to_the_advisory_sol
         message="What kind of input should I use?",
         settings=SimpleNamespace(
             composer_model="test/model",
+            composer_pricing_model=None,
             composer_temperature=None,
             composer_discovery_reasoning_effort="none",
             composer_seed=None,

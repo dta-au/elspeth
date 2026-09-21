@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts.call_data import LLMCallResponse
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
@@ -34,8 +35,9 @@ DYNAMIC_SCHEMA = {"mode": "observed"}
 
 @pytest.mark.parametrize("multi_query", [False, True])
 @pytest.mark.parametrize("temperature", ["omitted", None, 0.0, 0.7])
+@pytest.mark.parametrize("pricing_model", [None, "azure/gpt-4o"])
 def test_missing_cost_with_dated_model_does_not_block_transform(
-    multi_query: bool, temperature: str | float | None, monkeypatch: pytest.MonkeyPatch
+    multi_query: bool, temperature: str | float | None, pricing_model: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import httpx
     import litellm
@@ -68,6 +70,13 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
     def forbidden(**kwargs: Any) -> None:
         pytest.fail("Azure transform must not require a LiteLLM price lookup")
 
+    def calculate(**kwargs: Any) -> tuple[float, float]:
+        assert pricing_model is not None
+        assert kwargs["model"] == pricing_model
+        assert kwargs["prompt_tokens"] == 100
+        assert kwargs["completion_tokens"] == 20
+        return 0.01, 0.02
+
     sdk = openai.AzureOpenAI(
         api_key="probe-key",
         azure_endpoint="https://probe.openai.azure.com",
@@ -75,7 +84,7 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
         http_client=httpx.Client(transport=httpx.MockTransport(reply)),
     )
     monkeypatch.setattr(openai, "AzureOpenAI", lambda **kwargs: sdk)
-    monkeypatch.setattr(litellm, "cost_per_token", forbidden)
+    monkeypatch.setattr(litellm, "cost_per_token", calculate if pricing_model is not None else forbidden)
     monkeypatch.setattr(litellm, "completion_cost", forbidden)
     config = _make_azure_config(deployment_name="private-production-deployment", prompt_template="{{ row.text }}")
     if multi_query:
@@ -88,6 +97,7 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
         LLMProfileSettings(
             provider="azure",
             model="private-production-deployment",
+            pricing_model=pricing_model,
             deployment_name="private-production-deployment",
             endpoint="https://probe.openai.azure.com",
             credential_scope="server",
@@ -117,6 +127,14 @@ def test_missing_cost_with_dated_model_does_not_block_transform(
         assert len(requests) == expected_calls
         assert writer.record_call.call_count == expected_calls
         assert all(request["model"] == "private-production-deployment" for request in requests)
+        assert all("pricing_model" not in request for request in requests)
+        for call in writer.record_call.calls:
+            response_payload = call["response_data"]
+            assert isinstance(response_payload, LLMCallResponse)
+            assert response_payload.model == "gpt-4o-2099-01-01"
+            assert response_payload.pricing_model == (pricing_model or "private-production-deployment")
+            assert response_payload.provider_cost == (0.03 if pricing_model is not None else None)
+            assert response_payload.provider_cost_source == ("litellm.cost_per_token" if pricing_model is not None else "not_available")
         for request in requests:
             if temperature is None or temperature == "omitted":
                 assert "temperature" not in request
@@ -135,12 +153,14 @@ class _RecordCallSpy:
     def __init__(self) -> None:
         self.called = False
         self.call_count = 0
+        self.calls: list[dict[str, object]] = []
         self._lock = threading.Lock()
 
     def __call__(self, *args: object, **kwargs: object) -> SimpleNamespace:
         with self._lock:
             self.called = True
             self.call_count += 1
+            self.calls.append(kwargs)
         return SimpleNamespace(
             call_id=f"call-{self.call_count}",
             call_index=kwargs.get("call_index", self.call_count - 1),

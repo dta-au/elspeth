@@ -634,6 +634,8 @@ def advisor_provider_failure_types() -> tuple[type[Exception], ...]:
 )
 def _capture_composer_llm_completion_fields(
     response: Any,
+    *,
+    pricing_model: str | None = None,
 ) -> tuple[_AdmittedAssistantMessage, tuple[Any, ...], _AdmittedLLMProviderMetadata]:
     """Read the response/message surface once, before validating its tool batch."""
 
@@ -645,6 +647,7 @@ def _capture_composer_llm_completion_fields(
         response,
         choice=choice,
         message=None if message is missing else message,
+        pricing_model=pricing_model,
     )
     if choices is missing or not isinstance(choices, list | tuple):
         raise _MalformedLLMResponseError(
@@ -680,10 +683,11 @@ def _admit_composer_llm_completion(
     response: Any,
     *,
     wrap_tool_batch_error: bool = True,
+    pricing_model: str | None = None,
 ) -> _AdmittedLLMCompletion:
     """Read one LiteLLM completion once and discard the provider objects."""
 
-    message, tool_calls, provider_metadata = _capture_composer_llm_completion_fields(response)
+    message, tool_calls, provider_metadata = _capture_composer_llm_completion_fields(response, pricing_model=pricing_model)
     return _admit_captured_composer_llm_completion(
         message,
         tool_calls,
@@ -4263,8 +4267,10 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,
+                    escape_hatch_pricing_model=self._settings.composer_advisor_pricing_model,
                     api_base=self._endpoint_base_url,
                     api_key=self._endpoint_api_key,
                     escape_hatch_api_base=self._advisor_endpoint_base_url,
@@ -4673,8 +4679,10 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,
+                    escape_hatch_pricing_model=self._settings.composer_advisor_pricing_model,
                     api_base=self._endpoint_base_url,
                     api_key=self._endpoint_api_key,
                     escape_hatch_api_base=self._advisor_endpoint_base_url,
@@ -5161,8 +5169,10 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,
+                    escape_hatch_pricing_model=self._settings.composer_advisor_pricing_model,
                     api_base=self._endpoint_base_url,
                     api_key=self._endpoint_api_key,
                     escape_hatch_api_base=self._advisor_endpoint_base_url,
@@ -5323,7 +5333,11 @@ class ComposerServiceImpl:
             failed_turn=failed_turn,
         )
         completion = (
-            returned if type(returned) is _AdmittedLLMCompletion else _admit_composer_llm_completion(returned, wrap_tool_batch_error=False)
+            returned
+            if type(returned) is _AdmittedLLMCompletion
+            else _admit_composer_llm_completion(
+                returned, wrap_tool_batch_error=False, pricing_model=self._settings.composer_pricing_model or self._model
+            )
         )
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
@@ -5807,7 +5821,9 @@ class ComposerServiceImpl:
                 completion = (
                     returned
                     if type(returned) is _AdmittedLLMCompletion
-                    else _admit_composer_llm_completion(returned, wrap_tool_batch_error=False)
+                    else _admit_composer_llm_completion(
+                        returned, wrap_tool_batch_error=False, pricing_model=self._settings.composer_pricing_model or self._model
+                    )
                 )
                 self._enforce_tool_call_cap(
                     assistant_tool_calls=completion.tool_batch.calls,
@@ -7571,7 +7587,7 @@ class ComposerServiceImpl:
             ) from exc
         # One Tier-3 admission owns every retained field. The raw response and
         # message never cross this return boundary.
-        return _admit_composer_llm_completion(response)
+        return _admit_composer_llm_completion(response, pricing_model=self._settings.composer_pricing_model or self._model)
 
     async def _call_text_llm(
         self,
@@ -7605,7 +7621,9 @@ class ComposerServiceImpl:
         if not response.choices:
             raise _MalformedLLMResponseError(
                 "LLM returned empty choices array — cannot explain run diagnostics",
-                provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
+                provider_metadata=admit_llm_provider_metadata(
+                    response, choice=None, message=None, pricing_model=self._settings.composer_pricing_model or self._model
+                ),
             )
         return response
 
@@ -8061,7 +8079,9 @@ class ComposerServiceImpl:
             if not response.choices:
                 raise _MalformedLLMResponseError(
                     "Advisor returned empty choices array",
-                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
+                    provider_metadata=admit_llm_provider_metadata(
+                        response, choice=None, message=None, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
+                    ),
                 )
             # F4: validate content BEFORE marking SUCCESS. None / empty /
             # whitespace-only content (content-filter triggered, malformed
@@ -8075,7 +8095,9 @@ class ComposerServiceImpl:
             except (AttributeError, IndexError, KeyError, TypeError):
                 raise _MalformedLLMResponseError(
                     "Advisor response carries no message content",
-                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
+                    provider_metadata=admit_llm_provider_metadata(
+                        response, choice=None, message=None, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
+                    ),
                 ) from None
             # elspeth-b6be9e991f: exact runtime type check, mirroring the
             # diagnostics path. The earlier ``str(raw_content).strip()``
@@ -8084,7 +8106,9 @@ class ComposerServiceImpl:
             if type(raw_content) is not str or not raw_content.strip():
                 raise _MalformedLLMResponseError(
                     "Advisor returned empty, whitespace-only, or non-string content",
-                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
+                    provider_metadata=admit_llm_provider_metadata(
+                        response, choice=None, message=None, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
+                    ),
                 )
             guidance = raw_content
             status = ComposerLLMCallStatus.SUCCESS
@@ -8148,6 +8172,7 @@ class ComposerServiceImpl:
                 recorder.record_llm_call(
                     build_llm_call_record(
                         model_requested=advisor_model,
+                        pricing_model=self._settings.composer_advisor_pricing_model,
                         messages=messages,
                         tools=None,
                         status=status,
@@ -8820,7 +8845,9 @@ class ComposerServiceImpl:
                 completion = returned
                 response_metadata = returned.provider_metadata
             else:
-                message, tool_calls, response_metadata = _capture_composer_llm_completion_fields(returned)
+                message, tool_calls, response_metadata = _capture_composer_llm_completion_fields(
+                    returned, pricing_model=self._settings.composer_pricing_model or self._model
+                )
                 completion = _admit_captured_composer_llm_completion(
                     message,
                     tool_calls,
@@ -8895,6 +8922,7 @@ class ComposerServiceImpl:
                 recorder.record_llm_call(
                     build_llm_call_record(
                         model_requested=self._model,
+                        pricing_model=self._settings.composer_pricing_model,
                         messages=messages,
                         tools=tools or None,
                         status=status,
@@ -8941,12 +8969,16 @@ class ComposerServiceImpl:
             except (AttributeError, IndexError, TypeError):
                 raise _MalformedLLMResponseError(
                     "LLM returned a malformed diagnostics explanation",
-                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
+                    provider_metadata=admit_llm_provider_metadata(
+                        response, choice=None, message=None, pricing_model=self._settings.composer_pricing_model or self._model
+                    ),
                 ) from None
             if type(content) is not str or not content.strip():
                 raise _MalformedLLMResponseError(
                     "LLM returned an empty diagnostics explanation",
-                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
+                    provider_metadata=admit_llm_provider_metadata(
+                        response, choice=None, message=None, pricing_model=self._settings.composer_pricing_model or self._model
+                    ),
                 )
             status = ComposerLLMCallStatus.SUCCESS
             return content.strip()
@@ -8998,6 +9030,7 @@ class ComposerServiceImpl:
                 recorder.record_llm_call(
                     build_llm_call_record(
                         model_requested=self._model,
+                        pricing_model=self._settings.composer_pricing_model,
                         messages=cast(list[dict[str, Any]], messages),
                         tools=None,
                         status=status,

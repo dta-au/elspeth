@@ -171,6 +171,8 @@ class ComposerLLMCall:
     reasoning_details: Any | None = None
     thinking_blocks: Any | None = None
     provider_cost: float | None = None
+    # Catalog identity configured for fallback pricing, independent of routing.
+    pricing_model: str | None = None
     provider_cost_source: ComposerLLMProviderCostSource = PROVIDER_COST_SOURCE_NOT_AVAILABLE
     max_completion_tokens_requested: int | None = None
     planner_policy_hash: str | None = None
@@ -181,6 +183,7 @@ class ComposerLLMCall:
         if type(self.status) is not ComposerLLMCallStatus:
             raise TypeError(f"status must be ComposerLLMCallStatus, got {type(self.status).__name__}: {self.status!r}")
         _require_non_empty_str(self.model_requested, "model_requested")
+        _require_non_empty_str(self.pricing_model, "pricing_model", optional=True)
         _require_non_empty_str(self.call_id, "call_id", optional=True)
         _require_non_empty_str(self.model_returned, "model_returned", optional=True)
         _require_non_empty_str(self.provider_request_id, "provider_request_id", optional=True)

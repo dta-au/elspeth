@@ -6,8 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
+import litellm
 import pytest
+from litellm.types.utils import ModelResponse
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
@@ -25,6 +28,148 @@ from elspeth.plugins.infrastructure.clients.llm import (
 from tests.fixtures.mock_audit import mock_audit_authority
 
 _DEFAULT_USAGE = object()
+
+
+@pytest.mark.parametrize("content", ["answer", None])
+def test_execution_pricing_identity_does_not_change_routing_or_returned_model(content: str | None) -> None:
+    response = ModelResponse(
+        model="provider-concrete-model",
+        choices=[{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+    response._hidden_params = {}
+    sdk = FakeOpenAIClient(response=response)
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        pricing_model="azure/gpt-4o",
+    )
+    with patch.object(litellm, "cost_per_token", return_value=(0.01, 0.02)) as calculator:
+        if content is None:
+            with pytest.raises(ContentPolicyError):
+                client.chat_completion(model="operator-datazone-alias", messages=[ChatMessage(role="user", content="Hello")])
+        else:
+            result = client.chat_completion(model="operator-datazone-alias", messages=[ChatMessage(role="user", content="Hello")])
+            assert result.model == "provider-concrete-model"
+    assert calculator.call_args.kwargs["model"] == "azure/gpt-4o"
+    assert sdk.single_create_kwargs()["model"] == "operator-datazone-alias"
+    assert "pricing_model" not in sdk.single_create_kwargs()
+    recorded = execution.last_record_call_kwargs
+    assert recorded["request_data"].to_dict()["model"] == "operator-datazone-alias"
+    payload = recorded["response_data"].to_dict()
+    assert payload["model"] == "provider-concrete-model"
+    assert payload["pricing_model"] == "azure/gpt-4o"
+    assert payload["provider_cost"] == 0.03
+    assert payload["provider_cost_source"] == "litellm.cost_per_token"
+
+
+@pytest.mark.parametrize("cost", [0.0, 0.125, "bad"])
+def test_execution_preserves_provider_cost_metadata(cost: object) -> None:
+    response = ModelResponse(
+        model="provider-model",
+        choices=[{"message": {"role": "assistant", "content": "answer"}, "finish_reason": "stop"}],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": cost},
+    )
+    response.usage = {"prompt_tokens": 10, "completion_tokens": 5, "cost": cost}
+    sdk = FakeOpenAIClient(response=response)
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        pricing_model="azure/gpt-4o",
+    )
+    with patch.object(litellm, "cost_per_token") as calculator:
+        client.chat_completion(model="operator-alias", messages=[ChatMessage(role="user", content="Hello")])
+    calculator.assert_not_called()
+    payload = execution.last_record_call_kwargs["response_data"].to_dict()
+    assert payload["provider_cost"] == (cost if isinstance(cost, float) else None)
+    assert payload["provider_cost_source"] == ("response_usage.cost" if isinstance(cost, float) else "not_available")
+
+
+def test_execution_unknown_pricing_is_explicitly_unavailable_and_does_not_block() -> None:
+    sdk = FakeOpenAIClient(response=provider_response())
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        pricing_model="elspeth-unknown-catalogue-model",
+    )
+    result = client.chat_completion(model="operator-alias", messages=[ChatMessage(role="user", content="Hello")])
+    assert result.content == "Hello!"
+    payload = execution.last_record_call_kwargs["response_data"].to_dict()
+    assert payload["provider_cost"] is None
+    assert payload["provider_cost_source"] == "not_available"
+
+
+def test_execution_cost_uses_the_same_usage_snapshot_as_token_audit() -> None:
+    class ChangingUsageResponse:
+        model = "provider-model"
+
+        def __init__(self) -> None:
+            self.usage_reads = 0
+            self.choices = [ProviderChoice(message=ProviderMessage("answer"))]
+
+        @property
+        def usage(self) -> dict[str, int]:
+            self.usage_reads += 1
+            return {"prompt_tokens": self.usage_reads * 10, "completion_tokens": 5}
+
+        def model_dump(self) -> dict[str, str]:
+            return {"model": self.model}
+
+    response = ChangingUsageResponse()
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(response=response),
+        pricing_model="azure/gpt-4o",
+    )
+    with patch.object(litellm, "cost_per_token", return_value=(0.01, 0.02)) as calculator:
+        client.chat_completion(model="operator-alias", messages=[ChatMessage(role="user", content="Hello")])
+    assert response.usage_reads == 1
+    assert calculator.call_args.kwargs["prompt_tokens"] == 10
+    assert execution.last_record_call_kwargs["token_usage"] == TokenUsage.known(10, 5)
+
+
+def test_serialization_failure_preserves_already_observed_provider_cost() -> None:
+    response = provider_response(
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.125},
+        model_dump_error=ValueError("cannot serialize"),
+    )
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(response=response),
+        pricing_model="azure/gpt-4o",
+    )
+    with pytest.raises(LLMClientError, match="serialize"):
+        client.chat_completion(model="operator-alias", messages=[ChatMessage(role="user", content="Hello")])
+    error = execution.last_record_call_kwargs["error"].to_dict()
+    assert error["provider_cost"] == 0.125
+    assert error["provider_cost_source"] == "response_usage.cost"
+    assert error["pricing_model"] == "azure/gpt-4o"
+
 
 # Smallest valid 1x1 PNG (signature-correct real image) — same fixture as
 # tests/unit/contracts/test_chat_parts.py.

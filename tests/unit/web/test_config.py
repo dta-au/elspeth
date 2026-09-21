@@ -28,6 +28,25 @@ _REQUIRED_WEB_ENV = {
 }
 
 
+def test_composer_pricing_identities_load_from_environment(required_web_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_MODEL", "openai/primary-datazone")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", "openai/advisor-datazone")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_PRICING_MODEL", "azure/gpt-4o")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL", "azure/gpt-4o-mini")
+    settings = web_config.settings_from_env()
+    assert settings.composer_model == "openai/primary-datazone"
+    assert settings.composer_advisor_model == "openai/advisor-datazone"
+    assert settings.composer_pricing_model == "azure/gpt-4o"
+    assert settings.composer_advisor_pricing_model == "azure/gpt-4o-mini"
+
+
+@pytest.mark.parametrize("field", ["composer_pricing_model", "composer_advisor_pricing_model"])
+@pytest.mark.parametrize("value", ["", " ", "\t"])
+def test_composer_pricing_identity_rejects_blank(field: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(**{field: value})
+
+
 @pytest.fixture
 def required_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The five no-default WebSettings fields, supplied by the test, not by an operator's .env.

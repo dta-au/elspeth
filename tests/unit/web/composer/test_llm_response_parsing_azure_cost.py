@@ -22,9 +22,10 @@ def _response() -> ModelResponse:
     return response
 
 
-def _record(response: Any, *, model_requested: str = "openai/gpt-4o-2024-08-06"):
+def _record(response: Any, *, model_requested: str = "openai/gpt-4o-2024-08-06", pricing_model: str | None = None):
     return build_llm_call_record(
         model_requested=model_requested,
+        pricing_model=pricing_model,
         messages=[{"role": "user", "content": "hello"}],
         tools=None,
         status=ComposerLLMCallStatus.SUCCESS,
@@ -34,6 +35,31 @@ def _record(response: Any, *, model_requested: str = "openai/gpt-4o-2024-08-06")
         seed=None,
         response=response,
     )
+
+
+def test_separate_pricing_identity_preserves_requested_and_returned_models() -> None:
+    record = _record(_response(), model_requested="openai/operator-datazone", pricing_model="openai/gpt-4o-2024-08-06")
+    assert record.provider_cost == pytest.approx(0.00045)
+    assert record.provider_cost_source == "litellm.cost_per_token"
+    assert record.model_requested == "openai/operator-datazone"
+    assert record.pricing_model == "openai/gpt-4o-2024-08-06"
+    assert record.model_returned == "gpt-5.6-terra-2026-07-09"
+
+
+def test_unknown_pricing_override_remains_unavailable_even_with_known_route() -> None:
+    record = _record(_response(), pricing_model="openai/unknown-operator-billing-model")
+    assert record.provider_cost is None
+    assert record.provider_cost_source == "not_available"
+    assert record.pricing_model == "openai/unknown-operator-billing-model"
+
+
+@pytest.mark.parametrize("cost", [0.0, 0.123])
+def test_pricing_override_does_not_replace_provider_cost(cost: float) -> None:
+    response = _response()
+    response.usage.cost = cost
+    record = _record(response, pricing_model="openai/unknown-operator-billing-model")
+    assert record.provider_cost == cost
+    assert record.provider_cost_source == "response_usage.cost"
 
 
 def test_requested_model_prices_real_sdk_response_with_unpriceable_returned_alias(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,7 +120,7 @@ def test_impossible_token_subtotals_never_reach_calculator(monkeypatch: pytest.M
 
 
 @pytest.mark.parametrize("location", ["usage", "hidden"])
-@pytest.mark.parametrize("cost", [None, True, "0.1", -0.1, math.nan, math.inf])
+@pytest.mark.parametrize("cost", [True, "0.1", -0.1, math.nan, math.inf])
 def test_present_invalid_cost_never_calls_calculator(monkeypatch: pytest.MonkeyPatch, location: str, cost: object) -> None:
     def forbidden(**kwargs: Any) -> float:
         pytest.fail("present malformed cost must not be replaced by calculated cost")
@@ -107,6 +133,43 @@ def test_present_invalid_cost_never_calls_calculator(monkeypatch: pytest.MonkeyP
         response._hidden_params["response_cost"] = cost
 
     record = _record(response)
+
+    assert record.provider_cost is None
+    assert record.provider_cost_source == "not_available"
+
+
+@pytest.mark.parametrize("hidden_cost", [0.0, 0.125])
+def test_null_public_cost_preserves_valid_private_cost(hidden_cost: float) -> None:
+    response = _response()
+    response.usage.cost = None
+    response._hidden_params["response_cost"] = hidden_cost
+
+    record = _record(response, pricing_model="openai/unknown-billing-model")
+
+    assert record.provider_cost == hidden_cost
+    assert record.provider_cost_source == "_hidden_params.response_cost"
+
+
+@pytest.mark.parametrize("location", ["usage", "hidden", "both"])
+def test_null_cost_allows_known_catalog_pricing(location: str) -> None:
+    response = _response()
+    if location in ("usage", "both"):
+        response.usage.cost = None
+    if location in ("hidden", "both"):
+        response._hidden_params["response_cost"] = None
+
+    record = _record(response)
+
+    assert record.provider_cost == pytest.approx(0.00045)
+    assert record.provider_cost_source == "litellm.cost_per_token"
+
+
+def test_null_cost_with_unknown_catalog_remains_unavailable() -> None:
+    response = _response()
+    response.usage.cost = None
+    response._hidden_params["response_cost"] = None
+
+    record = _record(response, pricing_model="openai/unknown-billing-model")
 
     assert record.provider_cost is None
     assert record.provider_cost_source == "not_available"

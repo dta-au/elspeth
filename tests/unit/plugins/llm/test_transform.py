@@ -216,6 +216,26 @@ def _make_transform_with_mock_provider(
 class TestProviderDispatch:
     """Verify correct provider creation based on provider field."""
 
+    @pytest.mark.parametrize("provider_name", ["azure", "openrouter", "bedrock"])
+    def test_pricing_identity_reaches_provider_without_changing_route(self, provider_name: str) -> None:
+        from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider
+        from elspeth.plugins.transforms.llm.providers.bedrock import BedrockLLMProvider
+        from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        transform = LLMTransform(_make_config(provider=provider_name, pricing_model="azure/gpt-4o"))
+        ctx = _make_ctx()
+        ctx.landscape = object()
+        transform.on_start(ctx)
+        try:
+            provider = transform._provider
+            assert isinstance(provider, (AzureLLMProvider, OpenRouterLLMProvider, BedrockLLMProvider))
+            assert provider._pricing_model == "azure/gpt-4o"
+            if isinstance(provider, AzureLLMProvider):
+                assert provider._deployment_name == "gpt-4o"
+        finally:
+            transform.close()
+
     def test_unknown_provider_raises_with_valid_options(self) -> None:
         from elspeth.plugins.transforms.llm.transform import LLMTransform
 

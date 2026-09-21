@@ -1052,6 +1052,7 @@ Options common to all providers:
 | `provider` | `azure` \| `openrouter` \| `bedrock` | **Yes** | — | Provider variant |
 | `prompt_template` | string | **Yes** | — | Jinja2 prompt template |
 | `model` | string | provider-dependent | — | Model identifier; required for `openrouter` and `bedrock`, defaulted from `deployment_name` for `azure` |
+| `pricing_model` | string or null | No | (none) | LiteLLM catalogue identity used for cost calculation without changing the routed model. For profile-bound nodes, configure this in the operator's `llm_profiles` entry; it cannot be overridden in node options |
 | `system_prompt` | string | No | (none) | Optional system message |
 | `temperature` | float or null | No | Azure: `null`; other providers: `0.0` | Sampling temperature, `0.0`–`2.0`. Azure omits it by default for compatibility with reasoning deployments. Set an explicit value for a model that supports adjustable temperature; `null` omits the parameter and uses the provider default |
 | `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0. The `azure` provider sends it as `max_completion_tokens`, which also counts reasoning tokens |
