@@ -156,10 +156,19 @@ _ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVIS
 # (``ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE``, elspeth-88592f5be7) already
 # states it plainly. Fail-closed STRUCTURE is unchanged (every readiness axis
 # stays withheld); only the wording stops claiming a preflight ran.
+#
+# Ruling 2026-09-22 (elspeth-032ec69c41): the END gate stands aside for an
+# unchanged graph whose prior state row carries a blocked fact, so a block
+# that PERSISTED is re-reviewed only after the next pipeline change — the
+# GREEN/RED notices say so. A fact persists only with a new state row, which
+# only a mutating turn writes, and this ABSENT shape is produced only on an
+# unchanged turn (``_reuse_or_recompute_runtime_preflight`` returns ``None``
+# solely when the version did not move). Such a block persists nothing, so
+# for this family the review genuinely does run again on the next message.
 _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE: Final = (
     "Completion advisory review did not clear after the available attempts. "
     "Composer completion is withheld. Pipeline readiness was not re-verified this turn; "
-    "validation and the advisory review run again after your next pipeline change."
+    "validation and the advisory review run again on your next message."
 )
 _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE: Final = _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE)
@@ -181,18 +190,30 @@ _ADVISOR_SIGNOFF_MALFORMED_CAUSE: Final = (
     "Completion advisory review could not be obtained: the advisor returned no usable verdict after a format retry. "
     "Composer completion is withheld."
 )
-_ADVISOR_SIGNOFF_UNRENDERED_NEXT_STEP: Final = "Retry the request, or check the advisor model configuration; validation and the advisory review run again after your next pipeline change."
+# The next step splits by shape for the same reason the UNVERIFIED notice
+# above gives: a GREEN outage block rides a state row and persists, so a
+# retry on the unchanged graph meets the END gate's skip and cannot obtain a
+# fresh verdict — only a pipeline change can; an ABSENT outage block persists
+# nothing, so a retry is re-reviewed on the next message.
+_ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP: Final = (
+    "Check the advisor model configuration; validation and the advisory review run again after your next pipeline change."
+)
+_ADVISOR_SIGNOFF_UNRENDERED_UNVERIFIED_NEXT_STEP: Final = (
+    "Retry the request, or check the advisor model configuration; validation and the advisory review run again on your next message."
+)
 _ADVISOR_SIGNOFF_READINESS_NOT_REVERIFIED_CLAUSE: Final = "Pipeline readiness was not re-verified this turn."
 # GREEN shape (the preflight ran and passed).
 _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE: Final = (
-    _ADVISOR_SIGNOFF_UNAVAILABLE_CAUSE + " " + _ADVISOR_SIGNOFF_UNRENDERED_NEXT_STEP
+    _ADVISOR_SIGNOFF_UNAVAILABLE_CAUSE + " " + _ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP
 )
 _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE: Final = (
     _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
 _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE)
 _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE)
-_ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE: Final = _ADVISOR_SIGNOFF_MALFORMED_CAUSE + " " + _ADVISOR_SIGNOFF_UNRENDERED_NEXT_STEP
+_ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_MALFORMED_CAUSE + " " + _ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP
+)
 _ADVISOR_SIGNOFF_MALFORMED_PENDING_NOTICE: Final = (
     _ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
@@ -204,7 +225,7 @@ _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE: Final = (
     + " "
     + _ADVISOR_SIGNOFF_READINESS_NOT_REVERIFIED_CLAUSE
     + " "
-    + _ADVISOR_SIGNOFF_UNRENDERED_NEXT_STEP
+    + _ADVISOR_SIGNOFF_UNRENDERED_UNVERIFIED_NEXT_STEP
 )
 _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_NOTICE: Final = (
     _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
@@ -214,7 +235,11 @@ _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_truste
     _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE
 )
 _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE: Final = (
-    _ADVISOR_SIGNOFF_MALFORMED_CAUSE + " " + _ADVISOR_SIGNOFF_READINESS_NOT_REVERIFIED_CLAUSE + " " + _ADVISOR_SIGNOFF_UNRENDERED_NEXT_STEP
+    _ADVISOR_SIGNOFF_MALFORMED_CAUSE
+    + " "
+    + _ADVISOR_SIGNOFF_READINESS_NOT_REVERIFIED_CLAUSE
+    + " "
+    + _ADVISOR_SIGNOFF_UNRENDERED_UNVERIFIED_NEXT_STEP
 )
 _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_NOTICE: Final = (
     _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
@@ -260,7 +285,7 @@ _ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_
 _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE: Final = (
     _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
     + " Pipeline readiness was not re-verified this turn. Reword your message and resend; validation and "
-    "the advisory review run again after your next pipeline change."
+    "the advisory review run again on your next message."
 )
 _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE: Final = (
     _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE

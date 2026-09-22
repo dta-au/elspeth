@@ -855,15 +855,50 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
     assert segments[-1].content == no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE
 
 
-def _composer_sources_containing(phrase: str) -> list[str]:
-    import elspeth.web.composer as composer_pkg
+# Ruling 2026-09-22 (elspeth-032ec69c41): the END gate stands aside for an
+# unchanged graph whose prior state row already carries a blocked fact, so a
+# block that PERSISTED is re-reviewed only after the next pipeline change. A
+# fact persists only with a new state row, which only a mutating turn writes;
+# the ABSENT-preflight ("not re-verified this turn") notices are emitted only
+# on unchanged turns, so those blocks persist nothing and the review genuinely
+# runs again on the next message. Each family's copy must say its own truth.
+_NOTICES_FOR_A_PERSISTED_BLOCK = (
+    no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER,
+    no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER,
+    no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE,
+)
+_NOTICES_FOR_AN_UNCHANGED_TURN_BLOCK = (
+    no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE,
+)
 
-    root = Path(composer_pkg.__file__).parent
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*.py") if phrase in p.read_text(encoding="utf-8"))
+
+@pytest.mark.parametrize("notice", _NOTICES_FOR_A_PERSISTED_BLOCK)
+def test_persisted_block_notice_promises_a_review_after_a_pipeline_change(notice: str) -> None:
+    assert "after your next pipeline change" in notice
+    assert "on your next message" not in notice
+    # A retry on an unchanged graph now hits the skip, so no persisted-block
+    # notice may offer "Retry the request" as a way to a fresh verdict.
+    assert "Retry the request" not in notice
 
 
-def test_no_notice_promises_a_review_on_the_next_message() -> None:
-    """Ruling 2026-09-22: a blocked graph is re-reviewed after the next pipeline CHANGE."""
-    # Control: the instrument must find a phrase known to be present.
-    assert _composer_sources_containing("Composer completion is withheld") != []
-    assert _composer_sources_containing("on your next message") == []
+@pytest.mark.parametrize("notice", _NOTICES_FOR_AN_UNCHANGED_TURN_BLOCK)
+def test_unchanged_turn_block_notice_promises_a_review_on_the_next_message(notice: str) -> None:
+    assert "on your next message" in notice
+    assert "pipeline change" not in notice
+
+
+def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change() -> None:
+    """The (detail, suggestion) pair persisted in the gate fact is read back by /validate only while the block is durable."""
+    from elspeth.web.composer.service import _advisor_signoff_blocked_wording
+
+    for findings, authored in (("", False), ("field 'prompt_template' on step 'rate'", True)):
+        _detail, suggestion = _advisor_signoff_blocked_wording(
+            reason="flagged_final_pass", findings=findings, findings_backend_authored=authored
+        )
+        assert "after your next pipeline change" in suggestion
+        assert "on your next message" not in suggestion
