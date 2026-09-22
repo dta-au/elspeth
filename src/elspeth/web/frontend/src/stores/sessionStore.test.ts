@@ -2489,6 +2489,235 @@ describe("sessionStore", () => {
             .map((m) => m.id),
         ).toEqual(["msg-poll-user", "msg-poll-tool"]);
       });
+
+      it("keeps the newer message list when overlapping ticks resolve out of order", async () => {
+        // The interval launches a read without awaiting the previous one, so
+        // two reads of the SAME generation can be in flight together. The
+        // ownership fence passes both; only response ordering keeps the older
+        // one from rolling the list back (polling audit 2026-09-22, finding 3).
+        vi.useFakeTimers();
+        try {
+          const { fetchMessages } = await import("@/api/client");
+          const firstTick = deferred<ChatMessage[]>();
+          (fetchMessages as ReturnType<typeof vi.fn>)
+            .mockReturnValueOnce(firstTick.promise)
+            .mockResolvedValueOnce([pollUser, pollReply]);
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+          useSessionStore.getState().startInflightMessagesPolling("session-1");
+
+          await vi.advanceTimersByTimeAsync(1500);
+          expect(fetchMessages).toHaveBeenCalledTimes(1);
+          await vi.advanceTimersByTimeAsync(1500);
+          expect(fetchMessages).toHaveBeenCalledTimes(2);
+          expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+            "msg-poll-user",
+            "msg-poll-reply",
+          ]);
+
+          // The first tick finally answers, carrying the list as it was two
+          // ticks ago.
+          firstTick.resolve([pollUser]);
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+            "msg-poll-user",
+            "msg-poll-reply",
+          ]);
+        } finally {
+          useSessionStore.getState().stopInflightMessagesPolling();
+          vi.useRealTimers();
+        }
+      });
+
+      it("keeps the owning turn's sync when an earlier tick of the same generation lands after it", async () => {
+        // The owning turn's post-settle sync runs BEFORE its finally stops the
+        // poller, so a tick already in flight is still the live generation for
+        // the live session — every ownership check passes and only ordering
+        // stops it erasing the reply the sync just brought in.
+        const { fetchMessages } = await import("@/api/client");
+        const staleTick = deferred<ChatMessage[]>();
+        (fetchMessages as ReturnType<typeof vi.fn>)
+          .mockReturnValueOnce(staleTick.promise)
+          .mockResolvedValueOnce([pollUser, pollReply]);
+
+        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+        const owner = useSessionStore
+          .getState()
+          .startInflightMessagesPolling("session-1");
+        try {
+          const tick = useSessionStore.getState().loadInflightMessages("session-1");
+          await useSessionStore.getState().loadInflightMessages("session-1", owner);
+          expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+            "msg-poll-user",
+            "msg-poll-reply",
+          ]);
+
+          staleTick.resolve([pollUser]);
+          await tick;
+
+          expect(useSessionStore.getState().messages.map((m) => m.id)).toEqual([
+            "msg-poll-user",
+            "msg-poll-reply",
+          ]);
+        } finally {
+          useSessionStore.getState().stopInflightMessagesPolling();
+        }
+      });
+    });
+
+    describe("progress poll fence (polling audit 2026-09-22)", () => {
+      function snapshot(
+        requestId: string,
+        phase: ComposerProgressSnapshot["phase"] = "using_tools",
+      ): ComposerProgressSnapshot {
+        return {
+          session_id: "session-1",
+          request_id: requestId,
+          phase,
+          headline: requestId,
+          evidence: [],
+          likely_next: null,
+          reason: null,
+          updated_at: "2026-04-26T10:00:00Z",
+        };
+      }
+
+      const reply: ChatMessage = {
+        id: "assistant-1",
+        session_id: "session-1",
+        role: "assistant",
+        content: "Done",
+        tool_calls: null,
+        created_at: "2026-04-26T10:00:02Z",
+      };
+
+      it("drops a progress tick that resolves after the turn settled and polling stopped", async () => {
+        // The turn's finally stops the poller and takes one last explicit read
+        // to pick up the terminal snapshot. A tick still in flight from before
+        // that stop must not roll the finished turn back to "using tools".
+        vi.useFakeTimers();
+        try {
+          const { sendMessage: mockSendMessage, fetchComposerProgress, fetchMessages } =
+            await import("@/api/client");
+          const sendDeferred = deferred<{ message: ChatMessage; state: null }>();
+          const staleTick = deferred<ComposerProgressSnapshot>();
+          (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+            sendDeferred.promise,
+          );
+          (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+          (fetchComposerProgress as ReturnType<typeof vi.fn>)
+            .mockResolvedValueOnce(snapshot("live"))
+            .mockReturnValueOnce(staleTick.promise)
+            .mockResolvedValueOnce(snapshot("live", "complete"));
+
+          useSessionStore.setState({ activeSessionId: "session-1" });
+          const sendPromise = useSessionStore.getState().sendMessage("hi");
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(1500);
+          expect(fetchComposerProgress).toHaveBeenCalledTimes(2);
+
+          sendDeferred.resolve({ message: reply, state: null });
+          await sendPromise;
+          expect(useSessionStore.getState().composerProgress?.phase).toBe("complete");
+
+          staleTick.resolve(snapshot("live"));
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(useSessionStore.getState().composerProgress?.phase).toBe("complete");
+        } finally {
+          useSessionStore.getState().stopComposerProgressPolling();
+          vi.useRealTimers();
+        }
+      });
+
+      it("drops an old turn's progress read once a newer same-session turn owns the poller", async () => {
+        vi.useFakeTimers();
+        try {
+          const { sendMessage: mockSendMessage, fetchComposerProgress, fetchMessages } =
+            await import("@/api/client");
+          const firstSend = deferred<{ message: ChatMessage; state: null }>();
+          const secondSend = deferred<{ message: ChatMessage; state: null }>();
+          const staleRead = deferred<ComposerProgressSnapshot>();
+          (mockSendMessage as ReturnType<typeof vi.fn>)
+            .mockReturnValueOnce(firstSend.promise)
+            .mockReturnValueOnce(secondSend.promise);
+          (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+          (fetchComposerProgress as ReturnType<typeof vi.fn>)
+            .mockReturnValueOnce(staleRead.promise)
+            .mockResolvedValueOnce(snapshot("turn-1", "complete"))
+            .mockResolvedValue(snapshot("turn-2"));
+
+          useSessionStore.setState({ activeSessionId: "session-1" });
+          const firstPromise = useSessionStore.getState().sendMessage("first");
+          await Promise.resolve();
+          firstSend.resolve({ message: reply, state: null });
+          await firstPromise;
+
+          const secondPromise = useSessionStore.getState().sendMessage("second");
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(0);
+          expect(useSessionStore.getState().composerProgress?.request_id).toBe("turn-2");
+
+          // The first turn's very first read finally answers, two turns late.
+          staleRead.resolve(snapshot("turn-1"));
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(useSessionStore.getState().composerProgress?.request_id).toBe("turn-2");
+
+          secondSend.resolve({ message: reply, state: null });
+          await secondPromise;
+        } finally {
+          useSessionStore.getState().stopComposerProgressPolling();
+          vi.useRealTimers();
+        }
+      });
+
+      it("keeps the newer snapshot when overlapping progress ticks resolve out of order", async () => {
+        vi.useFakeTimers();
+        try {
+          const { fetchComposerProgress } = await import("@/api/client");
+          const slowTick = deferred<ComposerProgressSnapshot>();
+          (fetchComposerProgress as ReturnType<typeof vi.fn>)
+            .mockResolvedValueOnce(snapshot("first"))
+            .mockReturnValueOnce(slowTick.promise)
+            .mockResolvedValueOnce(snapshot("third"));
+
+          useSessionStore.setState({ activeSessionId: "session-1" });
+          useSessionStore.getState().startComposerProgressPolling("session-1");
+          await vi.advanceTimersByTimeAsync(0);
+          expect(useSessionStore.getState().composerProgress?.request_id).toBe("first");
+
+          await vi.advanceTimersByTimeAsync(1500);
+          await vi.advanceTimersByTimeAsync(1500);
+          expect(fetchComposerProgress).toHaveBeenCalledTimes(3);
+          expect(useSessionStore.getState().composerProgress?.request_id).toBe("third");
+
+          slowTick.resolve(snapshot("second"));
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(useSessionStore.getState().composerProgress?.request_id).toBe("third");
+        } finally {
+          useSessionStore.getState().stopComposerProgressPolling();
+          vi.useRealTimers();
+        }
+      });
+
+      it("control: drops a progress read for a session the user has navigated away from", async () => {
+        const { fetchComposerProgress } = await import("@/api/client");
+        const pending = deferred<ComposerProgressSnapshot>();
+        (fetchComposerProgress as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+          pending.promise,
+        );
+
+        useSessionStore.setState({ activeSessionId: "session-1" });
+        const read = useSessionStore.getState().loadComposerProgress("session-1");
+        useSessionStore.setState({ activeSessionId: "session-2" });
+        pending.resolve(snapshot("orphan"));
+        await read;
+
+        expect(useSessionStore.getState().composerProgress).toBeNull();
+      });
     });
 
     it("drops a stale send response after the active session changes", async () => {
