@@ -129,6 +129,9 @@ describe("projectDecisionRows", () => {
       {
         kind: "blocker",
         suggestion: null,
+        // elspeth-032ec69c41: carried from the wire blocker; null here, and
+        // deliberately absent from the id above, which is unchanged.
+        note: null,
         id: expect.stringContaining("blocker:"),
         code: "advisor_signoff_blocked",
         componentId: "pipeline",

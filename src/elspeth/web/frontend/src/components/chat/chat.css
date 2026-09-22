@@ -2322,6 +2322,34 @@
   flex-shrink: 0;
 }
 
+/* elspeth-032ec69c41: the advisory reviewer's note takes its own full-width
+   line under the blocker's detail. The wrap is scoped to blocker rows, and a
+   row without a note still has only its two children, so nothing wraps and
+   every other row's layout is untouched. */
+.decision-panel-item--blocker {
+  flex-wrap: wrap;
+}
+
+.decision-panel-reviewer-note {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+
+.decision-panel-reviewer-note-label {
+  display: block;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}
+
+/* The note is provider prose: honour its own line breaks and break long
+   unbroken runs rather than letting one overflow the panel. */
+.decision-panel-reviewer-note-text {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* A suggestion never clears a block by itself; the row says so in words. */
 .decision-panel-optional {
   border: 1px solid var(--color-border);

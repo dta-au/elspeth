@@ -562,6 +562,7 @@ describe("ArtifactWorkspace", () => {
               componentId: null,
               detail: "Review is required.",
               suggestion: null,
+              note: null,
             }]}
             blockedVerbs={["save_for_review"]}
             count={1}
