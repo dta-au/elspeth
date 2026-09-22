@@ -11119,14 +11119,22 @@ def _advisor_signoff_blocked_wording(
             notice,
             "Review the pipeline; validation and the advisory review run again after your next pipeline change.",
         )
+    # Ruling 2026-09-22 (elspeth-032ec69c41): this pair is what the durable
+    # gate fact carries to /validate and the DecisionPanel, and a durable
+    # block is cleared only by a pipeline change — a retry on the unchanged
+    # graph meets the END gate's skip — so neither suggestion may offer a
+    # retry. The chat notice for the same block says the same
+    # (``_ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP``).
     if reason == "unavailable":
         return (
             f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-            "The advisor model was unavailable after retry; retry the request, or check the advisor model configuration.",
+            "The advisor model was unavailable after retry; check the advisor model configuration. "
+            "Validation and the advisory review run again after your next pipeline change.",
         )
     return (
         f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-        "The advisor returned no usable verdict after a format retry; retry the request, or check the advisor model configuration.",
+        "The advisor returned no usable verdict after a format retry; check the advisor model configuration. "
+        "Validation and the advisory review run again after your next pipeline change.",
     )
 
 

@@ -11446,22 +11446,29 @@ class TestComposerProgressRoutes:
         assert body["state"]["composer_meta"]["guided_session"]["transition_consumed"] is True
 
     @pytest.mark.asyncio
-    async def test_send_message_hands_the_prior_rows_advisor_block_to_the_composer(self, tmp_path) -> None:
+    @pytest.mark.parametrize("envelope_writer", ["production_writer", "carry_forward"])
+    async def test_send_message_hands_the_prior_rows_advisor_block_to_the_composer(self, tmp_path, envelope_writer: str) -> None:
         """Ruling 2026-09-22 (elspeth-032ec69c41): the persisted fact must reach ``compose`` as the writer wrote it.
 
         The END gate's skip is decided on ``completion_gates``; the unit tests
         inject a hand-built fact, so this is the one place that proves the
         route derives that object from the prior state row's envelope rather
-        than from something else (or nothing). Seeds the envelope through the
-        writer-side helper so a drift in either serializer shows here.
+        than from something else (or nothing). Seeds the envelope through BOTH
+        writers — the compose-save writer (``completion_gates_meta_value`` over
+        the blocked ``ValidationResult`` the END gate builds) and the
+        recovery-save carry-forward (``completion_gates_meta_from_facts``) —
+        so a drift in either serializer shows here.
         """
+        from elspeth.web.composer.service import _advisor_signoff_blocked_validation
         from elspeth.web.execution.completion_gates import (
             COMPLETION_GATES_META_KEY,
             AdvisorSignoffGateFact,
             CompletionGateFacts,
             completion_gate_fingerprint,
             completion_gates_meta_from_facts,
+            completion_gates_meta_value,
         )
+        from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
 
         seeded_state = CompositionState(
             source=SourceSpec(plugin="csv", on_success="main", options={}, on_validation_failure="discard"),
@@ -11471,13 +11478,26 @@ class TestComposerProgressRoutes:
             metadata=PipelineMetadata(name="blocked graph"),
             version=4,
         )
-        seeded_fact = CompletionGateFacts(
-            advisor_signoff=AdvisorSignoffGateFact(
-                detail="Completion advisory review did not clear after the available attempts.",
-                suggestion="Review the pipeline.",
-                for_graph=completion_gate_fingerprint(seeded_state),
+        if envelope_writer == "production_writer":
+            blocked_preflight = _advisor_signoff_blocked_validation(reason="flagged_final_pass", findings="")
+            envelope = completion_gates_meta_value(blocked_preflight, seeded_state)
+            (blocker,) = [b for b in blocked_preflight.readiness.blockers if b.code == ADVISOR_SIGNOFF_BLOCKED_CODE]
+            seeded_fact = CompletionGateFacts(
+                advisor_signoff=AdvisorSignoffGateFact(
+                    detail=blocker.detail,
+                    suggestion=blocker.suggestion,
+                    for_graph=completion_gate_fingerprint(seeded_state),
+                )
             )
-        )
+        else:
+            seeded_fact = CompletionGateFacts(
+                advisor_signoff=AdvisorSignoffGateFact(
+                    detail="Completion advisory review did not clear after the available attempts.",
+                    suggestion="Review the pipeline.",
+                    for_graph=completion_gate_fingerprint(seeded_state),
+                )
+            )
+            envelope = completion_gates_meta_from_facts(seeded_fact)
         app, service = _make_progress_route_app(tmp_path)
         seeded_d = seeded_state.to_dict()
         await _save_test_composition_state(
@@ -11491,7 +11511,7 @@ class TestComposerProgressRoutes:
                 metadata_=seeded_d["metadata"],
                 is_valid=True,
                 validation_errors=None,
-                composer_meta={COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(seeded_fact)},
+                composer_meta={COMPLETION_GATES_META_KEY: envelope},
             ),
             provenance="session_seed",
         )

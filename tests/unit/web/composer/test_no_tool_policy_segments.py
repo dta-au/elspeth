@@ -892,13 +892,26 @@ def test_unchanged_turn_block_notice_promises_a_review_on_the_next_message(notic
     assert "pipeline change" not in notice
 
 
-def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change() -> None:
-    """The (detail, suggestion) pair persisted in the gate fact is read back by /validate only while the block is durable."""
+@pytest.mark.parametrize(
+    ("reason", "findings", "authored"),
+    [
+        ("flagged_final_pass", "", False),
+        ("flagged_final_pass", "field 'prompt_template' on step 'rate'", True),
+        ("flagged_no_repair", "", False),
+        ("unavailable", "Model unavailable.", False),
+        ("malformed", "No usable verdict.", False),
+    ],
+)
+def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reason: str, findings: str, authored: bool) -> None:
+    """The (detail, suggestion) pair persisted in the gate fact is read back by /validate only while the block is durable.
+
+    A durable block is cleared only by a pipeline change (a retry on the
+    unchanged graph meets the END gate's skip), so no persisted suggestion may
+    offer a retry, and the chat notice and the DecisionPanel must agree.
+    """
     from elspeth.web.composer.service import _advisor_signoff_blocked_wording
 
-    for findings, authored in (("", False), ("field 'prompt_template' on step 'rate'", True)):
-        _detail, suggestion = _advisor_signoff_blocked_wording(
-            reason="flagged_final_pass", findings=findings, findings_backend_authored=authored
-        )
-        assert "after your next pipeline change" in suggestion
-        assert "on your next message" not in suggestion
+    _detail, suggestion = _advisor_signoff_blocked_wording(reason=reason, findings=findings, findings_backend_authored=authored)
+    assert "after your next pipeline change" in suggestion
+    assert "on your next message" not in suggestion
+    assert "retry the request" not in suggestion.lower()

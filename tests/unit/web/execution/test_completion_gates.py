@@ -188,7 +188,10 @@ def test_advisor_suggestion_survives_reload_and_clears_on_graph_change() -> None
 
     state = _make_state()
     result = _advisor_signoff_pending_validation(_green_result(), reason="unavailable", findings="Model unavailable.")
-    suggestion = "The advisor model was unavailable after retry; retry the request, or check the advisor model configuration."
+    suggestion = (
+        "The advisor model was unavailable after retry; check the advisor model configuration. "
+        "Validation and the advisory review run again after your next pipeline change."
+    )
     assert result.readiness.blockers[0].suggestion == suggestion
     facts = parse_completion_gates({COMPLETION_GATES_META_KEY: completion_gates_meta_value(result, state)})
     reloaded = merge_completion_gates(_green_result(), facts, state)

@@ -2977,7 +2977,17 @@ async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
     message = outcome.result.message
     assert "could not be obtained" in message
     assert class_phrase in message
-    assert "retry the request, or check the advisor model configuration" in message.lower()
+    # Ruling 2026-09-22 (elspeth-032ec69c41): a GREEN outage block rides a
+    # state row and persists, so a retry on the unchanged graph meets the END
+    # gate's skip — only a pipeline change obtains a fresh verdict. An ABSENT
+    # outage block persists nothing, so a retry IS re-reviewed next message.
+    if preflight_shape == "absent":
+        assert "retry the request, or check the advisor model configuration" in message.lower()
+        assert "on your next message" in message
+    else:
+        assert "retry the request" not in message.lower()
+        assert "check the advisor model configuration" in message.lower()
+        assert "after your next pipeline change" in message
     assert "did not clear" not in message
     assert "Review the pipeline" not in message
     assert _PREFLIGHT_NOTICE_HEADER not in message
