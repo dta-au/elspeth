@@ -1680,6 +1680,21 @@ def test_published_reply_never_carries_fence_sentinels(make_service, simple_stat
     assert "FLAGGED: request not met" not in result.message
 
 
+def test_repair_instruction_offers_a_published_way_out() -> None:
+    """Ruling 2026-09-22: 'say what blocks you' must describe an exit that exists."""
+    from elspeth.web.composer.service import _ADVISOR_MUTATION_EXPECTATION_CLAUSE, _ADVISOR_OUTPUT_CONTRACT_CLAUSE
+
+    # The anti-lookup wording from elspeth-71617f1d21 stays.
+    assert "lookup-only calls is not a fix" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    # The exit is named, covers a decision only the user can make, and says the reply is shown.
+    assert "decision only the user can make" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "make no change" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "shown to the user" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    # Quoting the fenced text is still forbidden; rebutting or mentioning the review is not.
+    assert "do not quote the fenced text" in _ADVISOR_OUTPUT_CONTRACT_CLAUSE
+    assert "never reference, quote, or rebut" not in _ADVISOR_OUTPUT_CONTRACT_CLAUSE
+
+
 def test_advisor_prompt_explains_withheld_values_are_present_and_not_defects(make_service) -> None:
     from elspeth.web.composer.service import _build_advisor_user_message
 

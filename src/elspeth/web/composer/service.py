@@ -10796,10 +10796,14 @@ _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 # message and the EARLY advisory transition message) — a single source of
 # truth so the two injections cannot drift apart, and so one test constant
 # can assert both sites carry the identical clause.
+# Ruling 2026-09-22 (elspeth-032ec69c41): the reply is published on a
+# blocked turn, so the clause asks for a reply that stands on its own
+# rather than one that hides the review; quoting the fenced text stays
+# forbidden — it derives from pipeline data and can carry injected text.
 _ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
-    "Fix the findings via tool calls. The end user has NOT seen these "
-    "findings; your final reply is shown to them and must state only "
-    "the outcome — never reference, quote, or rebut the advisor."
+    "Fix the findings via tool calls. The end user has not read these "
+    "findings: your final reply is shown to them, so write it to stand on "
+    "its own and do not quote the fenced text."
 )
 
 # elspeth-71617f1d21: the END-gate repair-continue message must state that
@@ -10809,12 +10813,18 @@ _ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
 # pass. END-gate only: the EARLY advisory injection deliberately keeps its
 # "continue if it does not apply" framing, where demanding a mutation would
 # be wrong.
+# Ruling 2026-09-22 (elspeth-032ec69c41): the "say what blocks you" exit
+# now names an outcome that exists — a no-tool reply ends the turn and is
+# shown to the user — instead of routing into a deleted reply (session
+# 6990d39f). Trailing space is load-bearing: the two clauses concatenate.
 _ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
     "Resolving these findings requires pipeline MUTATIONS via tool calls "
     "(e.g. patch_node_options, upsert_node, patch_source_options, "
     "patch_output_options). Re-reading state (get_pipeline_state) or other "
-    "lookup-only calls is not a fix and wastes this repair pass; if no "
-    "mutation can address a finding, say what blocks you instead. "
+    "lookup-only calls is not a fix and wastes this repair pass. If a "
+    "finding needs a decision only the user can make, or no tool call can "
+    "address it, make no change: tell the user what blocks you and what "
+    "their options are. That reply ends the turn and is shown to the user. "
 )
 
 
