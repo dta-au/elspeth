@@ -1471,3 +1471,106 @@ transition, with the documentation note given.
   already permits the controls this audit recommends adding. Only the
   "single developer" premise sentence needs rewriting (F-34) — the test survives
   intact.
+
+---
+
+# Addendum, 2026-09-23 — controls 1–4 are now MEASURED, and all six are ABSENT
+
+The audit above asks, as its single missing piece of evidence, that "someone with
+admin should run `gh api repos/dta-au/elspeth/branches/main/protection` and record
+the output". The maintainer subsequently authorised use of the `johnm-dta` account
+for the GitHub migration. That account holds
+`{"admin":true,"maintain":true,"push":true,"triage":true}` on this repository, so
+the command was run. This addendum records the output and corrects the table.
+
+## What the command returned
+
+```
+$ gh api repos/dta-au/elspeth/branches/main/protection
+{"message":"Branch not protected", ... "status":"404"}
+exit=1
+```
+
+**A 404 under an admin token is a substantive answer, not a permission ceiling.**
+The audit was right to refuse to read the earlier 404 that way — under
+`admin:false` the two cases are genuinely indistinguishable — but with admin the
+ambiguity is gone: `main` carries no *classic* branch protection.
+
+It is nonetheless reported as `protected: true` by the branches API. The
+protection is a **repository ruleset**, which the classic endpoint does not
+report:
+
+```
+$ gh api repos/dta-au/elspeth/rulesets
+[{"id":12348893,"name":"main","target":"branch","enforcement":"active", ...}]
+```
+
+## The ruleset, rule by rule
+
+Ruleset 12348893, `enforcement: active`, `conditions.ref_name.include:
+["~DEFAULT_BRANCH"]`, `bypass_actors: []`, `current_user_can_bypass: "never"`.
+
+| Rule | Parameter | Value |
+|---|---|---|
+| `pull_request` | `required_approving_review_count` | **0** |
+| `pull_request` | `dismiss_stale_reviews_on_push` | **false** |
+| `pull_request` | `require_last_push_approval` | **false** |
+| `pull_request` | `required_review_thread_resolution` | **false** |
+| `pull_request` | `require_code_owner_review` | **false** |
+| `pull_request` | `require_extra_approval_for_unattributed_changes` | true |
+| `required_status_checks` | contexts | `CI Success`, `CodeQL`, `Check cohort-attribution trailers on PR commits`, `redaction-gate` |
+| `required_status_checks` | `strict_required_status_checks_policy` | true |
+| `deletion`, `non_fast_forward` | — | present |
+
+## The corrected table
+
+| # | Control (GOVERNANCE.md:77-82) | Prior state | **Measured state** | Evidence |
+|---|---|---|---|---|
+| 1 | one required approving review | Unmeasured | **ABSENT** | `required_approving_review_count: 0` |
+| 2 | stale-review dismissal on new commits | Unmeasured | **ABSENT** | `dismiss_stale_reviews_on_push: false` |
+| 3 | last-push approval protection | Unmeasured | **ABSENT** | `require_last_push_approval: false` |
+| 4 | required conversation resolution | Unmeasured | **ABSENT** | `required_review_thread_resolution: false` |
+| 5 | CODEOWNERS / ownership map | ABSENT | **ABSENT** (confirmed twice) | no CODEOWNERS file; `require_code_owner_review: false` |
+| 6 | review requirements for release branches | ABSENT | **ABSENT** | ruleset targets `~DEFAULT_BRANCH` only; all six `release/*` branches `protected: false` |
+
+**All six named two-maintainer controls are now measured, and all six are absent.**
+The audit's split of "2 absent, 4 unmeasured" is superseded. No finding is
+withdrawn; F-09 and F-10 are unchanged, and F-07/F-08 are upgraded from a stated
+limit to a measurement.
+
+## Two things this changes
+
+**It sharpens F-01 rather than softening it.** The ruleset condition is
+`~DEFAULT_BRANCH` — `main` alone. Re-measured the same day:
+
+```
+release/0.6.0  protected=false      release/0.7.1  protected=false
+release/0.6.1  protected=false      release/0.8.0  protected=false
+release/0.7.0  protected=false      release/0.8.1  protected=false
+```
+
+So the branches onto which `ci.yaml` injects the judge HMAC key are exactly the
+branches with no rule of any kind. The fix named in the audit — a wildcard
+ruleset over `release/**` — is now a concrete edit to an existing, working
+mechanism rather than a green-field configuration.
+
+**Some of the posture is stronger than the audit could see.** Three controls
+nobody claimed are in force on `main`: no deletion, no force-push, and
+`bypass_actors: []` with `current_user_can_bypass: "never"` — the ruleset binds
+administrators too, which is the property that makes the required checks
+meaningful rather than advisory. `CodeQL` and `redaction-gate` are required
+contexts that `GOVERNANCE.md` does not mention at all.
+
+The `pull_request` rule with zero required approvals is also not nothing: it
+**requires a pull request** to land on `main`, so direct pushes to the default
+branch are already blocked. That is the honest shape of single-maintainer mode —
+the process gate exists, the human-approval gate is deliberately empty — and it
+means the step-up for controls 1–4 is four boolean changes to one existing
+ruleset, not a new control surface.
+
+## Limit of this addendum
+
+Organisation-level rulesets were **not** readable: `gh api orgs/dta-au/rulesets`
+returned 404 with `This API operation needs the "admin:org" scope`. An org-level
+ruleset could add controls not visible here. It could not remove any of the above,
+so every "ABSENT" verdict stands, but a stricter org policy may exist unmeasured.
