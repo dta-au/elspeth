@@ -24,6 +24,14 @@ MEASURED STATE (2026-09-13): Phase 2 auth core 6/6 and Phase 1 5/6 are done; Pha
 
 This is product governance — approvals and quotas for the people using ELSPETH. It is not the internal signing/tier-model ceremony that the 2026-09-23 ruling kept out of the GitHub migration.
 
+## A note on completeness
+
+Three of the rows below — Phase 3 (lane A'), Phase 5 (lane B') and Phase 6 — carried a
+title and nothing else in the tracker: they were pure grouping containers with no
+description or notes. Their headings appear with no body for that reason, not because
+anything was dropped. Every other row's description and notes are reproduced in full, and
+`tracker-rows.json` holds all 17 rows exactly as the tracker returned them.
+
 ## Scope
 
 Closed container rows: `elspeth-07cd19ba73` (milestone) and 16 children.
