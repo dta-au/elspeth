@@ -497,7 +497,21 @@ class DatabaseComposerProgressRegistry:
             raise
 
     async def finish_request(self, lease: ComposerRequestLease) -> None:
-        await run_sync_in_worker(self._authority.end_request, lease)
+        # Ordinary worker submissions are cancelled while still queued when
+        # their caller is abandoned. This teardown is the exact-token deletion
+        # the lifecycle owes regardless of how the request unwound, so it is
+        # shielded and joined the same way cancelled admission cleanup is:
+        # the lease row must not linger until expiry while progress keeps
+        # counting the request as live.
+        cleanup = asyncio.create_task(
+            run_sync_in_worker(self._authority.end_request, lease),
+            name="composer-progress-finish",
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await _join_cancelled_request_task(cleanup)
+            raise
 
     async def renew_request(self, lease: ComposerRequestLease) -> None:
         await run_sync_in_worker(self._authority.heartbeat_request, lease)
