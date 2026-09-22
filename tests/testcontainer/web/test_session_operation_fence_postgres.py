@@ -37,6 +37,98 @@ from elspeth.web.sessions.schema import initialize_session_schema
 pytestmark = pytest.mark.testcontainer
 
 
+@pytest.mark.asyncio
+async def test_advisor_only_recovery_rejects_stale_operation_fence(postgres_engine: Engine) -> None:
+    """A review-only write uses the same PostgreSQL authority as graph edits."""
+    from dataclasses import replace
+
+    import structlog
+    from tests.fixtures.identities import ensure_test_identity
+    from tests.unit.web.sessions.test_routes import _make_authoring_valid_partial
+
+    from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
+    from elspeth.web.execution.completion_gates import (
+        CompletionGateFacts,
+        completion_gate_fingerprint,
+        completion_gates_meta_from_facts,
+        parse_completion_gates,
+    )
+    from elspeth.web.sessions.converters import state_from_record
+    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.service import SessionServiceImpl
+    from elspeth.web.sessions.telemetry import build_sessions_telemetry
+
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
+    service = SessionServiceImpl(postgres_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await service.create_session("alice", "Advisor fence", "local")
+    repository = service.session_operation_authority
+    current = repository.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+    state = _make_authoring_valid_partial("advisor-fence")
+    fingerprint = completion_gate_fingerprint(state)
+    facts = CompletionGateFacts(
+        advisor_signoff=AdvisorSignoffGateFact(
+            detail="Advisor unavailable",
+            suggestion=None,
+            note=None,
+            for_graph=fingerprint,
+            cause=AdvisorBlockCause.UNAVAILABLE,
+        )
+    )
+    state_d = state.to_dict()
+    data = CompositionStateData(
+        sources=state_d["sources"],
+        nodes=state_d["nodes"],
+        edges=state_d["edges"],
+        outputs=state_d["outputs"],
+        metadata_=state_d["metadata"],
+        is_valid=True,
+        validation_errors=None,
+        composer_meta={"completion_gates": completion_gates_meta_from_facts(facts)},
+    )
+    await service.save_composition_state(session.id, data, provenance="post_compose", session_operation_context=current)
+    before = await service.get_current_state(session.id)
+    assert before is not None
+    repository.release(current)
+    successor = repository.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+    clean_data = replace(data, composer_meta={"completion_gates": {"schema_version": 2}})
+    try:
+        with pytest.raises(SessionOperationFenceLost):
+            await service.save_composition_state(
+                session.id,
+                clean_data,
+                provenance="post_compose",
+                session_operation_context=current,
+            )
+        unchanged = await service.get_current_state(session.id)
+        assert unchanged is not None
+        assert unchanged.id == before.id
+        assert parse_completion_gates(unchanged.composer_meta) == facts
+        await service.save_composition_state(
+            session.id,
+            clean_data,
+            provenance="post_compose",
+            session_operation_context=successor,
+        )
+        recovered = await service.get_current_state(session.id)
+        assert recovered is not None
+        assert recovered.id != before.id
+        assert completion_gate_fingerprint(state_from_record(recovered)) == fingerprint
+        assert parse_completion_gates(recovered.composer_meta) == CompletionGateFacts(advisor_signoff=None)
+    finally:
+        repository.release(successor)
+
+
 @pytest.fixture(scope="module")
 def postgres_engine(external_deployment_postgres_url: str) -> Engine:
     engine = create_session_engine(external_deployment_postgres_url)

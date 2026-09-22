@@ -107,5 +107,11 @@ def test_completion_gate_parser_needs_no_shape_suppressions() -> None:
     # Persisted envelopes admit only the closed dict/MappingProxyType
     # representations produced by JSON decoding and owned record freezing.
     # The former arbitrary-Mapping R5 probes no longer need adjudication.
-    assert findings == []
+    # Only the new resolver's two nominal checks over owned decision classes
+    # remain active adjudication candidates, as required by ADR-032. Pin them
+    # explicitly so a new parser shape probe still fails this regression.
+    assert [f"{finding.rule_id}:{':'.join(finding.symbol_context)}" for finding in findings] == [
+        "R5:resolve_completion_gate_facts",
+        "R5:resolve_completion_gate_facts",
+    ]
     assert suppressed == []

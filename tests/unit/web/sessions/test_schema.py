@@ -536,9 +536,9 @@ def test_previous_epoch_rejection_does_not_rewrite_store() -> None:
 def test_epoch_61_is_rejected_before_reading_old_advisor_gate_grammar() -> None:
     from elspeth.web.execution.completion_gates import parse_completion_gates
 
-    # The preceding epoch allowed blocked facts without an actionable suggestion.
-    # The current parser deliberately has no historical default for owned data.
-    with pytest.raises(ValueError, match="suggestion is required"):
+    # The preceding epoch allowed unversioned blocked facts without a suggestion.
+    # The current parser rejects their envelope before inspecting fact fields.
+    with pytest.raises(ValueError, match="schema_version must be 2"):
         parse_completion_gates(
             {
                 "completion_gates": {

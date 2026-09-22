@@ -639,20 +639,23 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
     outputs-only and rejects a state whose sink writes to the session's own
     blob subtree — a state /validate and /execute both accept.
     """
-    from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+    from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
+    from elspeth.web.execution.completion_gates import CompletionGateFacts
 
     snapshot = _readiness_snapshot(session_record.id)
     state_record = replace(
         state_record,
         composer_meta={
             "completion_gates": {
+                "schema_version": 2,
                 "advisor_signoff": {
                     "suggestion": None,
                     "status": "blocked",
                     "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                     "for_graph": "0" * 64,
                     "note": None,
-                }
+                    "cause": "unavailable",
+                },
             }
         },
     )
@@ -680,6 +683,7 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
                 note=None,
+                cause=AdvisorBlockCause.UNAVAILABLE,
             )
         )
     ]

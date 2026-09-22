@@ -61,6 +61,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService as CatalogServiceProtocol
 from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, chat_ingress_input
 from elspeth.web.composer import yaml_generator
+from elspeth.web.composer.advisor_decision import AdvisorGateDecision
 from elspeth.web.composer.audit import (
     BufferingRecorder,
     audit_envelope,
@@ -143,8 +144,8 @@ from elspeth.web.execution.completion_gates import (
     COMPLETION_GATES_META_KEY,
     CompletionGatesDict,
     completion_gates_meta_from_facts,
-    completion_gates_meta_value,
     parse_completion_gates,
+    resolve_completion_gate_facts,
 )
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
@@ -993,7 +994,7 @@ async def _durable_completion_gates(
     """
     record = await service.get_current_state(session_id)
     if record is None:
-        return {}
+        return completion_gates_meta_from_facts(None)
     return completion_gates_meta_from_facts(parse_completion_gates(record.composer_meta))
 
 
@@ -2660,6 +2661,7 @@ async def _state_data_from_composer_state(
     telemetry_source: _ComposerPreflightTelemetrySource,
     composer_meta: Mapping[str, Any] | None = None,
     prior_completion_gates: CompletionGatesDict | None = None,
+    advisor_gate_decision: AdvisorGateDecision | None = None,
 ) -> tuple[CompositionStateData, ValidationSummary]:
     try:
         authoring = validate_authored_composition_state(
@@ -2753,28 +2755,12 @@ async def _state_data_from_composer_state(
     if state.guided_session is not None and "guided_session" not in surface_meta:
         surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
-    # Completion-gate facts (advisor sign-off first) are durable only here:
-    # the key is OVERWRITTEN on every ADJUDICATING compose-preflight save —
-    # populated when the preflight withheld completion, empty when it did
-    # not — so a stale blocked fact cannot survive a clean compose turn.
-    # Exact-type dispatch mirrors the ``_RuntimePreflightOutcome``
-    # convention above: a captured ``_RuntimePreflightFailed`` persists
-    # ``is_valid=False`` and carries no gate verdict.
-    #
-    # Saves whose caller passed no adjudicated result (``runtime_preflight``
-    # argument was not a ``ValidationResult`` — the recovery persists and
-    # seeds) re-derive a plain preflight that can NEVER emit the advisor
-    # blocker, so overwriting would silently erase a durable advisor fact.
-    # Those callers hand in ``prior_completion_gates`` and the fact is
-    # carried forward verbatim; ``merge_completion_gates``' ``for_graph``
-    # fingerprint check downgrades it to pending wording on read if the
-    # graph moved, so the verdict is never re-attributed.
-    completion_gates_value = completion_gates_meta_value(
-        runtime if type(runtime) is ValidationResult else None,
-        state,
+    # Runtime validation is not an advisor verdict. Only an explicit END
+    # decision can replace a prior fact, including on graph-unchanged saves.
+    prior_facts = parse_completion_gates(
+        {COMPLETION_GATES_META_KEY: prior_completion_gates} if prior_completion_gates is not None else composer_meta
     )
-    if not completion_gates_value and prior_completion_gates and type(runtime_preflight) is not ValidationResult:
-        completion_gates_value = prior_completion_gates
+    completion_gates_value = completion_gates_meta_from_facts(resolve_completion_gate_facts(prior_facts, advisor_gate_decision, state))
     persisted_composer_meta = {
         **persisted_composer_meta,
         COMPLETION_GATES_META_KEY: completion_gates_value,

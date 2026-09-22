@@ -89,6 +89,7 @@ from elspeth.web.blobs.protocol import (
     BlobServiceProtocol,
     BlobStateError,
 )
+from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
 from elspeth.web.coordination.approval_authority import ApprovalGateInputs
 from elspeth.web.coordination.contracts import StartPermitState
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -1699,7 +1700,6 @@ class TestExecutionFlow:
         """Completion facts bind to the persisted graph, not runtime materialization."""
         from elspeth.web.composer.state import SourceSpec
         from elspeth.web.execution.completion_gates import (
-            AdvisorSignoffGateFact,
             CompletionGateFacts,
             completion_gate_fingerprint,
         )
@@ -1711,6 +1711,7 @@ class TestExecutionFlow:
         session_id = selected_record.session_id
         authored_state = state_from_record(selected_record)
         fact = AdvisorSignoffGateFact(
+            cause=AdvisorBlockCause.GRAPH_REJECTED,
             suggestion=None,
             detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
             for_graph=completion_gate_fingerprint(authored_state),
@@ -1718,13 +1719,15 @@ class TestExecutionFlow:
         )
         selected_record.composer_meta = {
             "completion_gates": {
+                "schema_version": 2,
                 "advisor_signoff": {
+                    "cause": "graph_rejected",
                     "suggestion": None,
                     "status": "blocked",
                     "detail": fact.detail,
                     "for_graph": fact.for_graph,
                     "note": None,
-                }
+                },
             }
         }
         runtime_state = authored_state.with_named_source(
@@ -1779,11 +1782,15 @@ class TestExecutionFlow:
         private_persisted_detail = "private-persisted-advisor-detail"
         selected_record.composer_meta = {
             "completion_gates": {
+                "schema_version": 2,
                 "advisor_signoff": {
                     "status": "blocked",
                     "detail": private_persisted_detail,
+                    "suggestion": None,
+                    "note": None,
+                    "cause": "graph_rejected",
                     # Required for_graph intentionally absent: Tier-1 corruption.
-                }
+                },
             }
         }
 
@@ -1904,7 +1911,6 @@ class TestExecutionFlow:
     ) -> None:
         """A persisted advisor sign-off blocker survives the fresh recompute."""
         from elspeth.web.execution.completion_gates import (
-            AdvisorSignoffGateFact,
             CompletionGateFacts,
             completion_gate_fingerprint,
         )
@@ -1913,6 +1919,7 @@ class TestExecutionFlow:
         state = state_from_record(mock_session_service.get_current_state.return_value)
         facts = CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph=completion_gate_fingerprint(state),
@@ -1948,18 +1955,20 @@ class TestExecutionFlow:
         mock_session_service: MagicMock,
     ) -> None:
         """validate() parses the record's composer_meta and threads the facts through."""
-        from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+        from elspeth.web.execution.completion_gates import CompletionGateFacts
 
         session_id = uuid4()
         mock_session_service.get_current_state.return_value.composer_meta = {
             "completion_gates": {
+                "schema_version": 2,
                 "advisor_signoff": {
+                    "cause": "graph_rejected",
                     "suggestion": None,
                     "status": "blocked",
                     "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                     "for_graph": "0" * 64,
                     "note": None,
-                }
+                },
             }
         }
         expected = ValidationResult(
@@ -1981,6 +1990,7 @@ class TestExecutionFlow:
         validate_state.assert_awaited_once()
         assert validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,

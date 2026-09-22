@@ -190,13 +190,9 @@ _ADVISOR_SIGNOFF_MALFORMED_CAUSE: Final = (
     "Completion advisory review could not be obtained: the advisor returned no usable verdict after a format retry. "
     "Composer completion is withheld."
 )
-# The next step splits by shape for the same reason the UNVERIFIED notice
-# above gives: a GREEN outage block rides a state row and persists, so a
-# retry on the unchanged graph meets the END gate's skip and cannot obtain a
-# fresh verdict — only a pipeline change can; an ABSENT outage block persists
-# nothing, so a retry is re-reviewed on the next message.
+# Provider failures are retried on a later turn even when the graph is unchanged.
 _ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP: Final = (
-    "Check the advisor model configuration; validation and the advisory review run again after your next pipeline change."
+    "Retry the request, or check the advisor model configuration; validation and the advisory review run again on your next message."
 )
 _ADVISOR_SIGNOFF_UNRENDERED_UNVERIFIED_NEXT_STEP: Final = (
     "Retry the request, or check the advisor model configuration; validation and the advisory review run again on your next message."
@@ -371,7 +367,7 @@ _ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE = _bare_trusted_suffix(
 _ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER: Final = (
     "The evidence-scoped completion advisory review could also not be obtained, so the Composer cannot "
     "mark this turn complete. Fix the validation failure above; validation and the advisory review run "
-    "again after your next pipeline change."
+    "again on your next message."
 )
 _ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER: Final = (
     _ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE

@@ -9,7 +9,7 @@ from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
 from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.execution.completion_gates import parse_completion_gates
+from elspeth.web.execution.completion_gates import completion_gate_decision_changes, parse_completion_gates
 from elspeth.web.sessions.titles import is_default_session_title
 
 from ._helpers import (
@@ -842,13 +842,15 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     post_compose_state_id = route_settlement.settlement.state.id
                     assistant_msg = route_settlement.settlement.transition_message
-                elif result.state.version != state.version:
+                elif result.state.version != state.version or completion_gate_decision_changes(
+                    prior_completion_gates_facts, result.advisor_gate_decision, result.state
+                ):
                     await _publish_progress(
                         progress_sink,
                         event=ComposerProgressEvent(
                             phase="validating",
-                            headline="The composer has updated the pipeline and is validating the result.",
-                            evidence=("The updated pipeline state is being checked before persistence.",),
+                            headline="The composer is validating the pipeline and its review status.",
+                            evidence=("The pipeline state and review outcome are being checked before persistence.",),
                             likely_next="ELSPETH will save the validated pipeline snapshot.",
                         ),
                     )
@@ -867,6 +869,7 @@ def register_message_routes(router: APIRouter) -> None:
                             initial_version=state.version,
                             telemetry_source="compose",
                             composer_meta=_post_compose_meta,
+                            advisor_gate_decision=result.advisor_gate_decision,
                         )
                     except ComposerRuntimePreflightError as rpf_exc:
                         rpf_exc = ComposerRuntimePreflightError(
@@ -910,7 +913,7 @@ def register_message_routes(router: APIRouter) -> None:
                         progress_sink,
                         event=ComposerProgressEvent(
                             phase="saving",
-                            headline="ELSPETH is saving the pipeline update.",
+                            headline="ELSPETH is saving the pipeline and review status.",
                             evidence=("A new composition state version is being stored for this session.",),
                             likely_next="The assistant response will appear after the save completes.",
                         ),

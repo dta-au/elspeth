@@ -11454,21 +11454,18 @@ class TestComposerProgressRoutes:
         inject a hand-built fact, so this is the one place that proves the
         route derives that object from the prior state row's envelope rather
         than from something else (or nothing). Seeds the envelope through BOTH
-        writers — the compose-save writer (``completion_gates_meta_value`` over
-        the blocked ``ValidationResult`` the END gate builds) and the
+        writers — the compose-save writer (explicit advisor decision) and the
         recovery-save carry-forward (``completion_gates_meta_from_facts``) —
         so a drift in either serializer shows here.
         """
-        from elspeth.web.composer.service import _advisor_signoff_blocked_validation
+        from elspeth.web.composer.advisor_decision import AdvisorBlockCause
         from elspeth.web.execution.completion_gates import (
             COMPLETION_GATES_META_KEY,
             AdvisorSignoffGateFact,
             CompletionGateFacts,
             completion_gate_fingerprint,
             completion_gates_meta_from_facts,
-            completion_gates_meta_value,
         )
-        from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
 
         seeded_state = CompositionState(
             source=SourceSpec(plugin="csv", on_success="main", options={}, on_validation_failure="discard"),
@@ -11478,29 +11475,24 @@ class TestComposerProgressRoutes:
             metadata=PipelineMetadata(name="blocked graph"),
             version=4,
         )
+        blocked_fact = AdvisorSignoffGateFact(
+            detail="Completion advisory review did not clear after the available attempts.",
+            suggestion="Review the pipeline.",
+            for_graph=completion_gate_fingerprint(seeded_state),
+            note=None,
+            cause=AdvisorBlockCause.GRAPH_REJECTED,
+        )
+        seeded_fact = CompletionGateFacts(advisor_signoff=blocked_fact)
         if envelope_writer == "production_writer":
-            blocked_preflight = _advisor_signoff_blocked_validation(
-                reason="flagged_final_pass", findings="", category="other", step_ids=(), note=None
+            from elspeth.web.composer.advisor_decision import AdvisorGateBlocked
+
+            data = await _state_data_with_preflight(
+                seeded_state,
+                _advisor_blocked_preflight(seeded_state),
+                advisor_gate_decision=AdvisorGateBlocked(blocked_fact),
             )
-            envelope = completion_gates_meta_value(blocked_preflight, seeded_state)
-            (blocker,) = [b for b in blocked_preflight.readiness.blockers if b.code == ADVISOR_SIGNOFF_BLOCKED_CODE]
-            seeded_fact = CompletionGateFacts(
-                advisor_signoff=AdvisorSignoffGateFact(
-                    detail=blocker.detail,
-                    suggestion=blocker.suggestion,
-                    for_graph=completion_gate_fingerprint(seeded_state),
-                    note=None,
-                )
-            )
+            envelope = data.composer_meta[COMPLETION_GATES_META_KEY]
         else:
-            seeded_fact = CompletionGateFacts(
-                advisor_signoff=AdvisorSignoffGateFact(
-                    detail="Completion advisory review did not clear after the available attempts.",
-                    suggestion="Review the pipeline.",
-                    for_graph=completion_gate_fingerprint(seeded_state),
-                    note=None,
-                )
-            )
             envelope = completion_gates_meta_from_facts(seeded_fact)
         app, service = _make_progress_route_app(tmp_path)
         seeded_d = seeded_state.to_dict()
@@ -12848,6 +12840,7 @@ async def _state_data_with_preflight(
     runtime_preflight: ValidationResultModel | None,
     composer_meta: Mapping[str, Any] | None = None,
     prior_completion_gates: Mapping[str, Any] | None = None,
+    advisor_gate_decision=None,
 ):
     from elspeth.web.sessions.routes import _state_data_from_composer_state
 
@@ -12866,16 +12859,30 @@ async def _state_data_with_preflight(
         telemetry_source="compose",
         composer_meta=composer_meta,
         prior_completion_gates=prior_completion_gates,
+        advisor_gate_decision=advisor_gate_decision,
     )
     return state_data
 
 
 @pytest.mark.asyncio
 async def test_state_data_writes_blocked_completion_gate() -> None:
+    from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorSignoffGateFact
     from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 
     state = _make_authoring_valid_partial("gate-blocked")
-    state_data = await _state_data_with_preflight(state, _advisor_blocked_preflight(state))
+    state_data = await _state_data_with_preflight(
+        state,
+        _advisor_blocked_preflight(state),
+        advisor_gate_decision=AdvisorGateBlocked(
+            AdvisorSignoffGateFact(
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                suggestion=None,
+                note=None,
+                for_graph=completion_gate_fingerprint(state),
+                cause=AdvisorBlockCause.UNAVAILABLE,
+            )
+        ),
+    )
 
     assert state_data.composer_meta is not None
     gates = state_data.composer_meta["completion_gates"]
@@ -12893,27 +12900,39 @@ async def test_state_data_writes_empty_gates_on_clean_preflight() -> None:
     state_data = await _state_data_with_preflight(state, ValidationResult(is_valid=True, checks=[], errors=[]))
 
     assert state_data.composer_meta is not None
-    assert state_data.composer_meta["completion_gates"] == {}
+    assert state_data.composer_meta["completion_gates"] == {"schema_version": 2}
 
 
 @pytest.mark.asyncio
 async def test_state_data_overwrites_carried_forward_gate() -> None:
-    """A clean compose turn must clear a stale blocked fact riding composer_meta."""
+    """An explicit clean advisor decision clears a stale fact riding composer_meta."""
+    from elspeth.web.composer.advisor_decision import AdvisorGatePassed
+    from elspeth.web.execution.completion_gates import completion_gate_fingerprint
+
     state = _make_authoring_valid_partial("gate-overwrite")
     stale_meta = {
         "repair_turns_used": 2,
         "completion_gates": {
-            "advisor_signoff": {"status": "blocked", "detail": "stale verdict", "for_graph": "0" * 64, "note": None, "suggestion": None}
+            "schema_version": 2,
+            "advisor_signoff": {
+                "status": "blocked",
+                "detail": "stale verdict",
+                "for_graph": "0" * 64,
+                "note": None,
+                "suggestion": None,
+                "cause": "unavailable",
+            },
         },
     }
     state_data = await _state_data_with_preflight(
         state,
         ValidationResult(is_valid=True, checks=[], errors=[]),
         composer_meta=stale_meta,
+        advisor_gate_decision=AdvisorGatePassed(completion_gate_fingerprint(state)),
     )
 
     assert state_data.composer_meta is not None
-    assert state_data.composer_meta["completion_gates"] == {}
+    assert state_data.composer_meta["completion_gates"] == {"schema_version": 2}
     # Unrelated envelope keys are carried forward untouched.
     assert state_data.composer_meta["repair_turns_used"] == 2
 
@@ -12928,7 +12947,15 @@ async def test_state_data_preserves_prior_gate_on_non_adjudicating_save(monkeypa
 
     state = _make_authoring_valid_partial("gate-preserve")
     prior_gates = {
-        "advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64, "note": None, "suggestion": None}
+        "schema_version": 2,
+        "advisor_signoff": {
+            "status": "blocked",
+            "detail": "durable verdict",
+            "for_graph": "0" * 64,
+            "note": None,
+            "suggestion": None,
+            "cause": "unavailable",
+        },
     }
 
     async def fake_preflight(*args: Any, **kwargs: Any) -> ValidationResult:
@@ -12945,21 +12972,32 @@ async def test_state_data_preserves_prior_gate_on_non_adjudicating_save(monkeypa
 
 @pytest.mark.asyncio
 async def test_state_data_adjudicated_clean_save_still_clears_prior_gate() -> None:
-    """An adjudicated clean compose result overwrites: offering a prior fact
-    must not make a blocked verdict sticky across a clean advisor turn."""
+    """An explicit clean advisor decision overwrites a prior blocked verdict."""
+    from elspeth.web.composer.advisor_decision import AdvisorGatePassed
+    from elspeth.web.execution.completion_gates import completion_gate_fingerprint
+
     state = _make_authoring_valid_partial("gate-clear-adjudicated")
     prior_gates = {
-        "advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64, "note": None, "suggestion": None}
+        "schema_version": 2,
+        "advisor_signoff": {
+            "status": "blocked",
+            "detail": "durable verdict",
+            "for_graph": "0" * 64,
+            "note": None,
+            "suggestion": None,
+            "cause": "unavailable",
+        },
     }
 
     state_data = await _state_data_with_preflight(
         state,
         ValidationResult(is_valid=True, checks=[], errors=[]),
         prior_completion_gates=prior_gates,
+        advisor_gate_decision=AdvisorGatePassed(completion_gate_fingerprint(state)),
     )
 
     assert state_data.composer_meta is not None
-    assert state_data.composer_meta["completion_gates"] == {}
+    assert state_data.composer_meta["completion_gates"] == {"schema_version": 2}
 
 
 @pytest.mark.asyncio

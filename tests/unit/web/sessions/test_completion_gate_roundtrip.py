@@ -22,6 +22,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.composer.advisor_decision import AdvisorBlockCause
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -116,13 +117,15 @@ async def _save_with_gate(service: SessionServiceImpl, state: CompositionState, 
         composer_meta={
             "repair_turns_used": 1,
             COMPLETION_GATES_META_KEY: {
+                "schema_version": 2,
                 "advisor_signoff": {
+                    "cause": "unavailable",
                     "suggestion": None,
                     "status": "blocked",
                     "detail": _BLOCKED_DETAIL,
                     "for_graph": for_graph,
                     "note": None,
-                }
+                },
             },
         },
     )
@@ -157,7 +160,11 @@ async def test_blocked_gate_survives_db_roundtrip_and_blocks_recompute(service) 
     facts = parse_completion_gates(record.composer_meta)
     assert facts == CompletionGateFacts(
         advisor_signoff=AdvisorSignoffGateFact(
-            detail=_BLOCKED_DETAIL, for_graph=completion_gate_fingerprint(state), note=None, suggestion=None
+            detail=_BLOCKED_DETAIL,
+            for_graph=completion_gate_fingerprint(state),
+            note=None,
+            suggestion=None,
+            cause=AdvisorBlockCause.UNAVAILABLE,
         )
     )
 
@@ -216,14 +223,16 @@ async def test_durable_completion_gates_returns_prior_envelope_verbatim(service)
 
     carried = await _durable_completion_gates(service, record.session_id)
     assert carried == {
+        "schema_version": 2,
         "advisor_signoff": {
+            "cause": "unavailable",
             "suggestion": None,
             "status": "blocked",
             "detail": _BLOCKED_DETAIL,
             "for_graph": fingerprint,
             "note": None,
-        }
+        },
     }
 
     fresh = await service.create_session("alice", "No gate yet", "local")
-    assert await _durable_completion_gates(service, fresh.id) == {}
+    assert await _durable_completion_gates(service, fresh.id) == {"schema_version": 2}

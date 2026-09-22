@@ -27,6 +27,7 @@ from starlette.routing import Route
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
 from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.execution.accounting import RunAccountingBatch
 from elspeth.web.execution.progress import ProgressBroadcaster
@@ -511,7 +512,7 @@ class TestValidateEndpoint:
     @pytest.mark.asyncio
     async def test_validate_state_id_passes_persisted_completion_gates(self) -> None:
         """The state_id branch parses the record's completion-gate envelope."""
-        from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+        from elspeth.web.execution.completion_gates import CompletionGateFacts
 
         session_id = uuid4()
         state_id = uuid4()
@@ -528,7 +529,9 @@ class TestValidateEndpoint:
                 state_id=state_id,
                 composer_meta={
                     "completion_gates": {
+                        "schema_version": 2,
                         "advisor_signoff": {
+                            "cause": "graph_rejected",
                             "suggestion": None,
                             "status": "blocked",
                             "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
@@ -537,7 +540,7 @@ class TestValidateEndpoint:
                             # the persisted fact, so the /validate seam must
                             # carry it to the service that merges it.
                             "note": "choose per-branch sinks",
-                        }
+                        },
                     }
                 },
             ),
@@ -552,6 +555,7 @@ class TestValidateEndpoint:
         svc.validate_state.assert_awaited_once()
         assert svc.validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,

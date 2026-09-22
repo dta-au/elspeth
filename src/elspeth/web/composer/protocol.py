@@ -41,6 +41,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.advisor_audit import AdvisorTerminalPublication
+from elspeth.web.composer.advisor_decision import AdvisorGateDecision
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
@@ -269,6 +270,8 @@ class ComposerResult:
     message: str
     state: CompositionState
     runtime_preflight: ValidationResult | None = None
+    # Only a completed END checkpoint can replace a durable advisor fact.
+    advisor_gate_decision: AdvisorGateDecision | None = None
     raw_assistant_content: str | None = None
     pipeline_commit_intent: PipelineCommitIntent | None = None
     # Per-tool-call audit trail produced during this compose() invocation.
@@ -339,6 +342,9 @@ class ComposerResult:
         return self.advisor_terminal_publication is not None and self.advisor_terminal_publication.branch == "terminal_block"
 
     def __post_init__(self) -> None:
+        if self.advisor_gate_decision is not None and self.pipeline_commit_intent is not None:
+            raise ValueError("An advisor decision cannot accompany an unsettled pipeline commit intent")
+
         # Two directions of the field-pairing invariant. Both matter:
         #
         # 1. preflight failed with no raw_assistant_content →

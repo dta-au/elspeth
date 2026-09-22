@@ -25,18 +25,19 @@ the same commit; the rules live there, the history lives here.
   "not verified by ELSPETH" label — never markdown, never `dangerouslySetInnerHTML`.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
-- **2026-09-22 — the END advisor gate stands aside for an unchanged graph the advisor already blocked** (elspeth-032ec69c41;
+- **2026-09-22 — the END advisor gate stands aside only for a classified graph rejection** (elspeth-032ec69c41;
   ruling on session 6990d39f). `_evaluate_terminal_no_tool_advisor_gate` returns `fall_through` when the turn changed
-  nothing AND the prior state row's `completion_gates` fact was recorded for this exact graph
+  nothing AND the prior state row's `completion_gates` fact is `graph_rejected` for this exact graph
   (`advisor_block_covers_unchanged_graph` in `web/execution/completion_gates.py`); the finalize tail then folds the
   same durable fact back into the turn's preflight with `merge_completion_gates`. Decided on `state.version` and the
   persisted fact only, never on user text. `completion_gates=None` always reviews, so an omitting caller fails toward
   reviewing; a new caller of `compose()` that holds a state row should pass `parse_completion_gates(record.composer_meta)`
-  (Tier 1: parse it outside every `try`). Known limit: a fact persists only with a new state row, so a block that first
-  arises on an unmutated turn persists nothing and the skip cannot cover it. Blocked-turn copy splits by family: a
-  persisted block says "after your next pipeline change"; the ABSENT-preflight ("not re-verified this turn") family is
-  emitted only on unchanged turns, persists nothing, and keeps "on your next message"
-  (`tests/unit/web/composer/test_no_tool_policy_segments.py` pins both).
+  (Tier 1: parse it outside every `try`). Unavailable, malformed and message-scoped failures are reviewed again on a
+  later turn. `ComposerResult.advisor_gate_decision` is the explicit authority to replace a fact; a green runtime
+  preflight alone cannot clear it. Both routes save changed review outcomes in a new fenced snapshot even when the
+  graph is unchanged. Gate envelopes require schema version 2 and a cause; no old-format compatibility is provided.
+  Blocked-turn copy follows the cause: graph rejection requires a pipeline change, transient failures permit retry,
+  and message rejection asks for rewording (`tests/unit/web/composer/test_no_tool_policy_segments.py`).
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
 - **2026-09-07 — auto-gc was deadlocked by its own warning file: `.git/gc.log` blocked every `--auto` run, and the two-week default prune expiry could never clear it**
