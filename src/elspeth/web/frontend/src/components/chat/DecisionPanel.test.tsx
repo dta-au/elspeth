@@ -240,7 +240,7 @@ describe("DecisionPanel", () => {
     fireEvent.click(screen.getByRole("button", {
       name: "Ask the composer about this: Completion advisory review did not clear after the available attempts.",
     }));
-    expect(onAskAboutBlocker).toHaveBeenCalledWith(blockerRow.kind === "blocker" ? blockerRow.detail : "", "pipeline");
+    expect(onAskAboutBlocker).toHaveBeenCalledWith(blockerRow.kind === "blocker" ? blockerRow.detail : "", "pipeline", null);
     expect(handlers.onApplySuggestion).not.toHaveBeenCalled();
   });
 
@@ -445,8 +445,8 @@ describe("DecisionPanelLiveRegion", () => {
 
 // Ruling 2026-09-22 (elspeth-032ec69c41): the advisory reviewer's own words
 // reach the user here, labelled and as plain text. They are provider output:
-// never markdown, never a link, and never folded into the question the Ask
-// button drafts — that draft is the backend's own detail sentence.
+// never markdown and never a link. The Ask button drafts it as labelled,
+// untrusted evidence for the composer.
 describe("DecisionPanel reviewer's note", () => {
   it("renders the reviewer's note under an advisor blocker as plain text", () => {
     renderPanel({ rows: [advisorBlockerRow("Choose per-branch sinks **or** best_effort.")], count: 1 });
@@ -468,14 +468,14 @@ describe("DecisionPanel reviewer's note", () => {
     expect(screen.queryByTestId("decision-panel-reviewer-note")).toBeNull();
   });
 
-  it("does not put the note into the ask-the-composer draft", () => {
+  it("passes the displayed note to the ask-the-composer draft", () => {
     const onAskAboutBlocker = vi.fn();
     renderPanel({ rows: [advisorBlockerRow("SECRET_NOTE")], count: 1, onAskAboutBlocker });
 
     fireEvent.click(screen.getByRole("button", { name: /Ask the composer about this/ }));
 
     expect(onAskAboutBlocker).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(onAskAboutBlocker.mock.calls[0])).not.toContain("SECRET_NOTE");
+    expect(onAskAboutBlocker).toHaveBeenCalledWith(blockerRow.kind === "blocker" ? blockerRow.detail : "", "pipeline", "SECRET_NOTE");
   });
 
   it("keeps the note out of the button's accessible name", () => {

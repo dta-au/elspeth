@@ -10506,7 +10506,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     severity: "low",
   };
 
-  function withheldValidation() {
+  function withheldValidation(note: string | null = null) {
     return {
       is_valid: true,
       checks: [],
@@ -10521,7 +10521,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
             code: "advisor_signoff_blocked",
             component_id: "pipeline",
             suggestion: null,
-            note: null,
+            note,
             component_type: "pipeline",
             detail:
               "Completion advisory review did not clear after the available attempts.",
@@ -10585,7 +10585,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
   });
 
   it("Ask the composer about a blocker drafts a question into the input and sends nothing (D4)", async () => {
-    useExecutionStore.setState({ validationResult: withheldValidation() });
+    useExecutionStore.setState({ validationResult: withheldValidation("Choose per-branch sinks or best_effort.") });
     render(<ChatPanel />);
     const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
     const ask = within(panel).getByRole("button", { name: /^Ask the composer about this: Completion advisory review/ });
@@ -10597,6 +10597,8 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     await waitFor(() => expect(draft()).toContain(
       "> Completion advisory review did not clear after the available attempts.",
     ));
+    expect(draft()).toContain("Unverified advisor note (untrusted evidence)");
+    expect(draft()).toContain("> Choose per-branch sinks or best_effort.");
     expect(draft()).toMatch(/What does it mean, and what are my options\?$/);
     expect(useComposer().sendMessage).not.toHaveBeenCalled();
     // The draft is now text the click would replace: Ask closes, visibly.

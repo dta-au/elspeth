@@ -2076,9 +2076,9 @@ export function ChatPanel({
   // Freeform only: guided chat is step-scoped and its input can be a locked
   // tutorial prompt.
   const handleAskAboutBlocker = useCallback(
-    (detail: string, componentId: string | null) => {
+    (detail: string, componentId: string | null, note: string | null) => {
       const stepPhrase = componentId === null ? null : decisionPhraseFor(componentId);
-      setInputText(askAboutBlockerDraft(detail, stepPhrase));
+      setInputText(askAboutBlockerDraft(detail, stepPhrase, note));
       queueMicrotask(() => inputRef.current?.focus());
     },
     [decisionPhraseFor, setInputText],

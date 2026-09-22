@@ -63,8 +63,8 @@ export type DecisionRow =
       /**
        * The advisory reviewer's own bounded words (elspeth-032ec69c41), or
        * null for every blocker with no reviewer behind it. Provider output:
-       * rendered as labelled plain text, never as markdown, and never folded
-       * into the question the Ask button drafts. Deliberately NOT part of
+       * rendered as labelled plain text, never as markdown. The Ask draft
+       * quotes it as untrusted evidence. Deliberately NOT part of
        * ``id``: the note is extra content on a blocker the other four fields
        * already identify, and ``detail`` already moves when the verdict does.
        */

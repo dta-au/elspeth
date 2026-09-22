@@ -28,6 +28,8 @@
 //     clears a block by itself, and the row must say so;
 //   * a blocker row offers `Ask the composer about this: <detail>`, which
 //     DRAFTS a question into the chat input and sends nothing (ruling D4).
+//     Product decision 2026-09-23: an advisor note travels with the draft as
+//     labelled, untrusted evidence so the composer can explain that finding.
 //     It is not a fix button: a blocker has no server-vetted remedy text;
 //   * `Open checks` always renders. The workspace handles the view intent by
 //     revealing Pipeline on narrow screens, then selecting and focusing Checks.
@@ -74,7 +76,7 @@ export interface DecisionPanelProps {
   onApplySuggestion: (suggestion: ValidationEntryDTO) => void;
   /** Draft a question about a blocker into the chat input. Undefined where
    *  there is no freeform input to draft into: the button is not rendered. */
-  onAskAboutBlocker?: (detail: string, componentId: string | null) => void;
+  onAskAboutBlocker?: (detail: string, componentId: string | null, note: string | null) => void;
   /** Visible reason Ask is held closed (the input already holds a draft the
    *  click would replace), or null while it is open. */
   askDisabledReason?: string | null;
@@ -245,7 +247,7 @@ export function DecisionPanel({
                       className="decision-panel-ask-btn"
                       disabled={askDisabledReason !== null}
                       aria-label={`Ask the composer about this: ${row.detail}`}
-                      onClick={() => onAskAboutBlocker(row.detail, row.componentId)}
+                      onClick={() => onAskAboutBlocker(row.detail, row.componentId, row.note)}
                     >
                       Ask the composer about this
                     </Button>
