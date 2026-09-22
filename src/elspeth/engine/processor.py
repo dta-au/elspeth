@@ -258,7 +258,6 @@ class _FlushContext:
     (_process_batch_aggregation_node) so shared helpers can handle both.
 
     Parametric differences:
-    - error_msg: "...during timeout flush" vs "Batch transform failed"
     - expand_parent_token: buffered_tokens[0] (timeout) vs current_token (count)
     - triggering_token: None (timeout) vs current_token (count)
     - coalesce info: derived from tokens (timeout) vs passed from WorkItem (count)
@@ -270,7 +269,6 @@ class _FlushContext:
     settings: AggregationSettings
     buffered_tokens: tuple[TokenInfo, ...]
     batch_id: str
-    error_msg: str
     expand_parent_token: TokenInfo
     triggering_token: TokenInfo | None
     coalesce_node_id: NodeID | None
@@ -664,8 +662,9 @@ class RowProcessor:
         self._work_items = WorkItemFactory(self._nav)
 
         # Build error edge map: processing node_id -> DIVERT edge_id.
-        # Scans edge_map for __error_{name}__ labels created for transforms and
-        # config gates whose on_error points to a real sink, not "discard".
+        # Scans edge_map for __error_{name}__ labels created for transforms,
+        # config gates and aggregations whose on_error points to a real sink,
+        # not "discard".
         _edge_map = edge_map or {}
         error_edge_ids: dict[NodeID, str] = {}
         for (node_id, label), edge_id in _edge_map.items():
@@ -702,7 +701,9 @@ class RowProcessor:
             span_factory,
             self._step_resolver,
             run_id,
+            data_flow=data_flow,
             aggregation_settings=aggregation_settings,
+            error_edge_ids=error_edge_ids,
             clock=self._clock,
         )
         self._telemetry_manager = telemetry_manager
@@ -1284,15 +1285,18 @@ class RowProcessor:
     def _handle_flush_error(
         self,
         fctx: _FlushContext,
+        error_detail: str,
     ) -> tuple[RowResult, ...]:
-        """Handle failed aggregation flush for both passthrough and transform modes.
+        """Record every member of a failed batch discarded (``on_error: discard``).
 
         Both modes now have BUFFERED (non-terminal) at buffer time,
         so FAILED can be recorded as the terminal outcome for all tokens.
+        ``error_detail`` is the scrubbed batch reason, so each member's
+        error_hash binds to WHY the batch failed.
         """
-        error_hash = compute_error_hash(fctx.error_msg, exception_type="TransformError")
+        error_hash = compute_error_hash(error_detail, exception_type="TransformError")
         results: list[RowResult] = []
-        failure = FailureInfo(exception_type="TransformError", message=fctx.error_msg)
+        failure = FailureInfo(exception_type="TransformError", message=error_detail)
 
         for token in fctx.buffered_tokens:
             try:
@@ -1311,7 +1315,7 @@ class RowProcessor:
                     f"Audit trail is INCOMPLETE — some buffered tokens may already "
                     f"be terminalized while others remain BUFFERED. "
                     f"Recorder failure: {type(record_failure).__name__}: {record_failure}. "
-                    f"Original flush error: {fctx.error_msg}"
+                    f"Original flush error: {error_detail}"
                 ) from record_failure
             with best_effort(
                 "TokenCompleted telemetry after batch-flush FAILED audit",
@@ -1336,6 +1340,31 @@ class RowProcessor:
             )
 
         return tuple(results)
+
+    @staticmethod
+    def _route_flush_error_to_sink(fctx: _FlushContext, error_detail: str) -> tuple[RowResult, ...]:
+        """Plan every member of a failed batch to its aggregation's on_error sink.
+
+        The batch is reassembled best effort: each buffered token goes to the
+        sink carrying its ORIGINAL row (``token.row_data``, the pre-batch
+        input) and the one batch reason. Nothing is recorded here — like the
+        per-row routed arm (``token_traversal``), the sink records each
+        ``(FAILURE, ON_ERROR_ROUTED)`` outcome after durability, and
+        ``_complete_aggregation_flush`` hands every member BLOCKED ->
+        PENDING_SINK in one journal transaction first.
+        """
+        failure = FailureInfo(exception_type="TransformError", message=error_detail)
+        return tuple(
+            RowResult(
+                token=token,
+                final_data=token.row_data,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.ON_ERROR_ROUTED,
+                sink_name=fctx.settings.on_error,
+                error=failure,
+            )
+            for token in fctx.buffered_tokens
+        )
 
     def _cross_check_flush_output(
         self,
@@ -2005,7 +2034,6 @@ class RowProcessor:
                 settings=settings,
                 buffered_tokens=tuple(buffered_tokens),
                 batch_id=batch_id,
-                error_msg="Batch transform failed during timeout flush",
                 expand_parent_token=buffered_tokens[0],
                 triggering_token=None,
                 coalesce_node_id=coalesce_node_id,
@@ -2038,9 +2066,31 @@ class RowProcessor:
         fctx = validated_context[0] if result.status == "success" else build_flush_context(buffered_tokens, batch_id)
 
         if result.status != "success":
-            flush_error = self._handle_flush_error(fctx)
-            self._mark_buffered_scheduler_work_terminal(node_id, tuple(buffered_tokens))
-            return flush_error, []
+            # The executor has already scrubbed the reason and written it back,
+            # recorded the members' transform_errors rows and (for a named
+            # sink) the DIVERT routing_event, and failed the state and batch.
+            if not result.reason:
+                raise OrchestrationInvariantError(
+                    f"Aggregation {settings.name!r} flush failed without a reason; refusing to fabricate one for audit hashing"
+                )
+            error_detail = str(result.reason)
+            if settings.on_error == "discard":
+                flush_error = self._handle_flush_error(fctx, error_detail)
+                self._mark_buffered_scheduler_work_terminal(node_id, tuple(buffered_tokens))
+                return flush_error, []
+            # Named sink: the whole batch goes to it. Every member moves
+            # BLOCKED -> PENDING_SINK in place in ONE journal transaction; the
+            # sink records each outcome after durability. No processor-side
+            # terminal (that would be a second terminal for the same token).
+            routed_results, _pending_sink_token_ids = self._complete_aggregation_flush(
+                node_id,
+                self._route_flush_error_to_sink(fctx, error_detail),
+                buffered_tokens,
+                [],
+                batch_id=batch_id,
+                output_was_empty=False,
+            )
+            return routed_results, []
 
         # Emit TransformCompleted telemetry for all buffered tokens
         for token in buffered_tokens:
@@ -2090,7 +2140,8 @@ class RowProcessor:
 
         Engine buffers rows and calls transform.process(rows: list[dict])
         when the trigger fires. Flush handling is delegated to shared helpers
-        (_handle_flush_error, _route_passthrough_results, _route_transform_results).
+        (_handle_flush_error, _route_flush_error_to_sink, _route_passthrough_results,
+        _route_transform_results).
 
         TEMPORAL DECOUPLING:
 
@@ -4575,7 +4626,6 @@ class RowProcessor:
                 settings=settings,
                 buffered_tokens=buffered_tokens,
                 batch_id=receipt.batch_id,
-                error_msg="Committed aggregation output recovery failed",
                 expand_parent_token=expand_parent,
                 triggering_token=None,
                 coalesce_node_id=coalesce_node_id,
@@ -4692,7 +4742,12 @@ class RowProcessor:
         batch_id: str,
         output_was_empty: bool,
     ) -> tuple[tuple[RowResult, ...], frozenset[str]]:
-        """Complete a successful aggregation flush as ONE atomic journal transition.
+        """Complete an aggregation flush as ONE atomic journal transition.
+
+        Serves every successful flush and the named-sink arm of a FAILED
+        flush (every member is a sink-bound ON_ERROR_ROUTED handoff, none is
+        consumed; the batch is FAILED, so the COMPLETED-receipt restore arms
+        below never see it).
 
         Consumes the buffered tokens' BLOCKED rows and emits every sink-bound
         flush output as a durable PENDING_SINK row, plus every non-sink

@@ -156,7 +156,12 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
 # by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
 # this literal is not load-bearing and was resolved purely for readability.
-_CLOCK_BOUNDARY_DIGEST = "e41b6c7f0c6ce3321053df8a51817b6488f321cb5d4e0283895c244d6d8233ac"
+# AGG-ERROR-EDGE (elspeth-d2e3f29d10, operator ruling B5): e41b6c7f… → the value
+# below, +1 identity: ErrorAuditRepository.record_batch_transform_errors_leader opens
+# its own fenced_leader_transaction (one transform_errors row per member of a FAILED
+# aggregation batch), so it reads the Landscape clock to verify-and-extend the seat.
+# Re-derived by RUNNING the gate on the changed tree.
+_CLOCK_BOUNDARY_DIGEST = "f130aec70412db75e572bba7e11a7d2477e20b92e1887836b63600938ed8356a"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -227,6 +232,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.can_resume"),
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.get_resume_point"),
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
+        ("src/elspeth/core/landscape/data_flow/errors.py", "ErrorAuditRepository.record_batch_transform_errors_leader"),
         ("src/elspeth/core/landscape/data_flow/errors.py", "ErrorAuditRepository.record_validation_error"),
         ("src/elspeth/core/landscape/data_flow/graph.py", "GraphAuditRepository.register_edge"),
         ("src/elspeth/core/landscape/data_flow/graph.py", "GraphAuditRepository.register_node"),

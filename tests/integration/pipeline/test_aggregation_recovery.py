@@ -271,16 +271,24 @@ def _build_eof_aggregation_pipeline(
     downstream: _CountingPassTransform | None = None,
     *,
     output_mode: str = "transform",
+    error_sink: CollectSink | None = None,
 ) -> tuple[PipelineConfig, ExecutionGraph]:
-    """Count-triggered transform-mode aggregation whose flush only fires at EOF."""
+    """Count-triggered transform-mode aggregation whose flush only fires at EOF.
+
+    ``error_sink`` names the aggregation's on_error sink; without it failed
+    batches are discarded.
+    """
     aggregation_output = "aggregate_ready" if downstream is not None else "output"
     transform.on_success = aggregation_output
+    sinks = {"output": as_sink(output_sink)}
+    if error_sink is not None:
+        sinks[error_sink.name] = as_sink(error_sink)
     agg_settings = AggregationSettings(
         name="eof_sum",
         plugin=transform.name,
         input="batch_in",
         on_success=aggregation_output,
-        on_error="discard",
+        on_error=error_sink.name if error_sink is not None else "discard",
         trigger=TriggerConfig(count=100, timeout_seconds=3600),
         output_mode=output_mode,
     )
@@ -299,7 +307,7 @@ def _build_eof_aggregation_pipeline(
         sources={"primary": as_source(source)},
         source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="batch_in", options={})},
         transforms=wired_transforms,
-        sinks={"output": as_sink(output_sink)},
+        sinks=sinks,
         aggregations={"eof_sum": (as_transform(transform), agg_settings)},
         gates=[],
     )
@@ -311,7 +319,7 @@ def _build_eof_aggregation_pipeline(
         # Regular transforms must retain their graph sequence before the
         # graph-confirmed aggregation plugin, whose node_id is pre-assigned.
         transforms=([as_transform(downstream)] if downstream is not None else []) + [as_transform(transform)],
-        sinks={"output": as_sink(output_sink)},
+        sinks=sinks,
         aggregation_settings={agg_node_id: agg_settings},
     )
     return config, graph
@@ -947,7 +955,7 @@ class _FailBatchTransform(BaseTransform):
     def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
         if isinstance(row, list):
             self.batch_calls += 1
-            return TransformResult.error({"reason": "injected batch flush failure"})
+            return TransformResult.error({"reason": "batch_failed", "error": "injected batch flush failure"})
         return TransformResult.success(row, success_reason={"action": "buffer"})
 
 
@@ -1066,6 +1074,194 @@ class TestFailedFlushReconcile:
             )
         assert work_statuses
         assert set(work_statuses) <= {"terminal"}, f"expected all-terminal journal, got {set(work_statuses)!r}"
+
+
+@pytest.mark.timeout(120)
+class TestFailedFlushRoutedToErrorSinkResume:
+    """elspeth-d2e3f29d10: a failed batch routed to its on_error sink survives
+    a crash in either window without routing any member twice.
+
+    The routed arm writes (1) executor-side audit — per-member transform_errors,
+    ONE DIVERT routing_event, node_state FAILED, batch FAILED — then (2) ONE
+    ``complete_barrier`` handing every member BLOCKED -> PENDING_SINK, then
+    (3) the sink write, which records each member's single terminal.
+    """
+
+    @staticmethod
+    def _run_until_crash(tmp_path: Any, error_sink: CollectSink) -> tuple[Any, ...]:
+        from elspeth.core.payload_store import FilesystemPayloadStore
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
+        transform = _FailBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink, error_sink=error_sink)
+        orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+        return db, payload_store, checkpoint_mgr, source, transform, output_sink, config, graph, orchestrator
+
+    @staticmethod
+    def _resume(db: LandscapeDB, checkpoint_mgr: CheckpointManager, orchestrator: Orchestrator, run_id: str, **kwargs: Any) -> Any:
+        recovery = RecoveryManager(db, checkpoint_mgr)
+        check = recovery.can_resume(run_id, kwargs["graph"])
+        assert check.can_resume, f"Expected resumable run, got: {check.reason}"
+        resume_point = recovery.get_resume_point(run_id, kwargs["graph"])
+        assert resume_point is not None
+        return orchestrator.resume(resume_point=resume_point, **kwargs)
+
+    @staticmethod
+    def _routed_audit(db: LandscapeDB, run_id: str) -> dict[str, Any]:
+        from elspeth.core.landscape.schema import node_states_table, routing_events_table, transform_errors_table
+
+        with db.connection() as conn:
+            return {
+                "terminals": conn.execute(
+                    select(token_outcomes_table.c.token_id, token_outcomes_table.c.path, token_outcomes_table.c.sink_name)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                ).all(),
+                "failed_flush_states": set(
+                    conn.execute(
+                        select(node_states_table.c.state_id)
+                        .where(node_states_table.c.run_id == run_id)
+                        .where(node_states_table.c.status == "failed")
+                    ).scalars()
+                ),
+                "routing_state_ids": list(
+                    conn.execute(select(routing_events_table.c.state_id).where(routing_events_table.c.run_id == run_id)).scalars()
+                ),
+                "transform_error_count": len(
+                    conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == run_id)).all()
+                ),
+                "batches": conn.execute(
+                    select(batches_table.c.batch_id, batches_table.c.status).where(batches_table.c.run_id == run_id)
+                ).all(),
+                "work_statuses": set(
+                    conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)).scalars()
+                ),
+            }
+
+    def test_crash_before_the_barrier_handoff_resumes_and_routes_each_member_once(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Crash after the executor finalized the FAILED batch, before
+        ``complete_barrier``: the members are still BLOCKED with live BUFFERED
+        outcomes and no terminal. Resume retries the FAILED batch, the flush
+        runs again and fails again (a second, legitimate attempt: its own
+        node_state and its own DIVERT), and every member reaches the sink
+        exactly once."""
+        from elspeth.engine.processor import RowProcessor
+
+        error_sink = CollectSink("quarantine")
+        db, payload_store, checkpoint_mgr, _source, transform, output_sink, config, graph, orchestrator = self._run_until_crash(
+            tmp_path, error_sink
+        )
+        real_complete = RowProcessor._complete_aggregation_flush
+        crashed: list[bool] = []
+
+        def _crash_once(self: RowProcessor, *args: Any, **kwargs: Any) -> Any:
+            if not crashed:
+                crashed.append(True)
+                raise RuntimeError("injected crash before barrier handoff")
+            return real_complete(self, *args, **kwargs)
+
+        monkeypatch.setattr(RowProcessor, "_complete_aggregation_flush", _crash_once)
+
+        with pytest.raises(RuntimeError, match="injected crash before barrier handoff"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().first())
+        before = self._routed_audit(db, run_id)
+        assert before["terminals"] == []
+        assert before["work_statuses"] == {"blocked"}
+        assert len(before["routing_state_ids"]) == 1
+        assert before["transform_error_count"] == 3
+        assert error_sink.results == []
+
+        result = self._resume(db, checkpoint_mgr, orchestrator, run_id, config=config, graph=graph, payload_store=payload_store)
+
+        assert result.status == RunStatus.FAILED
+        assert result.rows_routed_failure == 3
+        assert transform.batch_calls == 2, "the batch is retried once on resume"
+        assert error_sink.results == [{"value": 10}, {"value": 20}, {"value": 30}], "every member written exactly once"
+        assert output_sink.results == []
+        after = self._routed_audit(db, run_id)
+        assert sorted(after["terminals"]) == sorted((token_id, "on_error_routed", "quarantine") for token_id, _p, _s in after["terminals"])
+        assert len(after["terminals"]) == len({token_id for token_id, _p, _s in after["terminals"]}) == 3
+        # One DIVERT per failed flush attempt, each on its own flush state.
+        assert len(after["routing_state_ids"]) == 2
+        assert set(after["routing_state_ids"]) == after["failed_flush_states"]
+        # The original batch and its resume retry both FAILED: one per attempt.
+        assert sorted(status for _batch_id, status in after["batches"]) == ["failed", "failed"]
+        assert after["transform_error_count"] == 6
+        assert after["work_statuses"] == {"terminal"}
+
+    def test_crash_after_the_barrier_handoff_delivers_the_pending_rows_without_replay(self, tmp_path: Any) -> None:
+        """Crash in the sink write after ``complete_barrier``: every member is a
+        durable PENDING_SINK handoff carrying the batch reason's hash. Resume
+        delivers them from the journal with the ORIGINAL error hash, never
+        re-runs the flush, and the FAILED batch's resume retry stays inert."""
+        from elspeth.engine._error_hash import compute_error_hash
+
+        error_sink = _FailOnceSink("quarantine")
+        db, payload_store, checkpoint_mgr, _source, transform, output_sink, config, graph, orchestrator = self._run_until_crash(
+            tmp_path, error_sink
+        )
+
+        with pytest.raises(RuntimeError, match="injected sink write crash"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().first())
+            pending = conn.execute(
+                select(token_work_items_table.c.pending_path, token_work_items_table.c.pending_error_hash)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == "pending_sink")
+            ).all()
+        expected_hash = compute_error_hash(
+            str({"reason": "batch_failed", "error": "injected batch flush failure"}), exception_type="TransformError"
+        )
+        assert pending == [("on_error_routed", expected_hash)] * 3
+        assert transform.batch_calls == 1
+
+        expired_at = datetime.now(UTC) - timedelta(seconds=1)
+        with db.write_connection() as conn:
+            expired = conn.execute(
+                update(sink_effects_table)
+                .where(sink_effects_table.c.run_id == run_id, sink_effects_table.c.state == "in_flight")
+                .values(lease_heartbeat_at=expired_at - timedelta(seconds=1), lease_expires_at=expired_at)
+            )
+        assert expired.rowcount == 1
+
+        result = self._resume(db, checkpoint_mgr, orchestrator, run_id, config=config, graph=graph, payload_store=payload_store)
+
+        assert result.status == RunStatus.FAILED
+        assert transform.batch_calls == 1, "resume must deliver the journal-durable handoffs, not re-run the flush"
+        assert error_sink.results == [{"value": 10}, {"value": 20}, {"value": 30}]
+        assert output_sink.results == []
+        after = self._routed_audit(db, run_id)
+        assert len(after["terminals"]) == len({token_id for token_id, _p, _s in after["terminals"]}) == 3
+        assert {(path, sink) for _t, path, sink in after["terminals"]} == {("on_error_routed", "quarantine")}
+        # handle_incomplete_batches still retries the FAILED batch into a DRAFT
+        # on resume (pre-existing, elspeth-35d03f1f28). With every member
+        # already handed off there is nothing BLOCKED to restore into it, so it
+        # never flushes: inert, which batch_calls == 1 above proves.
+        assert sorted(status for _batch_id, status in after["batches"]) == ["draft", "failed"]
+        assert len(after["routing_state_ids"]) == 1, "no second flush attempt, so no second DIVERT"
+        assert after["transform_error_count"] == 3
+        assert after["work_statuses"] == {"terminal"}
+        with db.connection() as conn:
+            outcome_hashes = set(
+                conn.execute(
+                    select(token_outcomes_table.c.error_hash)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                ).scalars()
+            )
+        assert outcome_hashes == {expected_hash}
 
 
 # =============================================================================
@@ -1615,6 +1811,7 @@ class TestAggregationRecoveryIntegration:
             span_factory=span_factory,
             step_resolver=lambda node_id: 1,
             run_id=run.run_id,
+            data_flow=factory.data_flow,
             aggregation_settings=agg_settings,
         )
 

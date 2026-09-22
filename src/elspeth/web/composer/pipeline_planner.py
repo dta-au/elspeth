@@ -2239,6 +2239,7 @@ _ROUTE_DESTINATION_FACT_CODES: Final[frozenset[str]] = frozenset(
         "aggregation_on_success_dangling",
         "transform_on_error_unknown_sink",
         "gate_on_error_unknown_sink",
+        "aggregation_on_error_unknown_sink",
         "coalesce_on_success_unknown_sink",
     }
 )

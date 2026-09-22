@@ -738,6 +738,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "record_routing_event",
         "record_token_outcome_leader",
         "record_validation_error",
+        "record_batch_transform_errors_leader",
         "register_edge",
         "register_node",
         "retry_batch",
@@ -955,6 +956,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "test_stale_epoch_refuses_without_payload_mutation",
         ),
         "record_validation_error": (
+            "tests/unit/core/landscape/test_data_flow_fencing.py",
+            "test_stale_epoch_refuses_without_payload_mutation",
+        ),
+        "record_batch_transform_errors_leader": (
             "tests/unit/core/landscape/test_data_flow_fencing.py",
             "test_stale_epoch_refuses_without_payload_mutation",
         ),

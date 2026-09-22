@@ -16,12 +16,14 @@ from elspeth.contracts import (
     TokenInfo,
     TransformResult,
 )
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import (
     BatchStatus,
     NodeStateStatus,
     OutputMode,
+    RoutingMode,
     TriggerType,
 )
 from elspeth.contracts.errors import (
@@ -35,9 +37,11 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.node_state_context import AggregationBatchContext, AggregationFlushContext
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.secret_scrub import scrub_transform_error_reason
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import AggregationSettings
+from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine.aggregation_result import aggregation_result_members, validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
@@ -163,7 +167,7 @@ class AggregationExecutor:
     NOT stored in node_states.status (which is always "completed" for successful accepts).
 
     Example:
-        executor = AggregationExecutor(execution, span_factory, step_resolver, run_id)
+        executor = AggregationExecutor(execution, span_factory, step_resolver, run_id, data_flow=data_flow)
 
         # Accept rows into batch
         batch_id, ordinal = executor.open_batch_membership(node_id, coordination_token=coordination_token)
@@ -179,7 +183,9 @@ class AggregationExecutor:
         step_resolver: StepResolver,
         run_id: str,
         *,
+        data_flow: DataFlowRepository,
         aggregation_settings: dict[NodeID, AggregationSettings] | None = None,
+        error_edge_ids: Mapping[NodeID, str] | None = None,
         clock: "Clock | None" = None,
     ) -> None:
         """Initialize executor.
@@ -189,11 +195,18 @@ class AggregationExecutor:
             span_factory: Span factory for tracing
             step_resolver: Resolves NodeID to 1-indexed audit step position
             run_id: Run identifier for batch creation
+            data_flow: Data flow repository; records the per-member
+                transform_errors rows of a failed flush.
             aggregation_settings: Map of node_id -> AggregationSettings for trigger evaluation
+            error_edge_ids: Map of aggregation node_id -> DIVERT edge_id of its
+                ``__error_<name>__`` edge. Built by the processor from the edge
+                map; populated only for aggregations whose on_error names a sink.
             clock: Optional clock for time access. Defaults to system clock.
                    Inject MockClock for deterministic testing.
         """
         self._execution = execution
+        self._data_flow = data_flow
+        self._error_edge_ids: Mapping[NodeID, str] = error_edge_ids or {}
         self._spans = span_factory
         self._step_resolver = step_resolver
         self._run_id = run_id
@@ -552,21 +565,78 @@ class AggregationExecutor:
     def _complete_error_flush(
         self,
         *,
-        coordination_token: CoordinationToken,
+        node_id: NodeID,
+        node: _AggregationNodeState,
+        transform: BatchTransformProtocol,
+        ctx: PluginContext,
         result: TransformResult,
         guard: NodeStateGuard,
         duration_ms: float,
         batch_id: str,
         trigger_type: TriggerType,
+        buffered_tokens: Sequence[TokenInfo],
     ) -> None:
-        """Record transform-returned error result as failed node state and batch."""
+        """Record a transform-returned batch failure and apply the declared error route.
+
+        The whole batch failed (the transform's verdict), so every buffered
+        member shares the one batch reason. In order (record-before-complete,
+        parity with ``TransformExecutor``'s error-result branch):
+
+        1. require ``result.reason``, scrub it, and WRITE IT BACK onto
+           ``result.reason`` — the processor builds each routed member's
+           FailureInfo (and so its durable ``pending_error_message``) from it;
+        2. one ``transform_errors`` row per buffered member, destination =
+           ``on_error`` (a sink name, or ``"discard"``), in ONE leader-fenced
+           write;
+        3. for a named sink, ONE DIVERT ``routing_event`` on this flush's
+           node_state along the ``__error_<name>__`` edge;
+        4. the node_state FAILED with the scrubbed reason dict, then the batch
+           FAILED.
+
+        The DIVERT edge is resolved before any write, so a missing edge
+        refuses without leaving half an envelope. A write that raises before
+        step 4 leaves the guard to auto-fail the state and propagates.
+        """
+        if result.reason is None:
+            raise OrchestrationInvariantError(
+                f"Aggregation transform '{transform.name}' returned error but reason is None. "
+                'Use TransformResult.error({"reason": "...", ...}) to create error results.'
+            )
+        scrubbed_reason = scrub_transform_error_reason(result.reason)
+        result.reason = scrubbed_reason
+
+        on_error = node.settings.on_error
+        divert_edge_id: str | None = None
+        if on_error != "discard":
+            try:
+                divert_edge_id = self._error_edge_ids[node_id]
+            except KeyError as exc:
+                raise OrchestrationInvariantError(
+                    f"Aggregation '{node.settings.name}' has on_error={on_error!r} but no DIVERT edge "
+                    f"registered. DAG construction should have created an __error_{node.settings.name}__ edge "
+                    "in from_plugin_instances()."
+                ) from exc
+
+        coordination_token = ctx.require_coordination_token()
+        self._data_flow.record_batch_transform_errors_leader(
+            members=tuple((TokenRef(token_id=token.token_id, run_id=self._run_id), token.row_data) for token in buffered_tokens),
+            transform_id=str(node_id),
+            error_details=scrubbed_reason,
+            destination=on_error,
+            coordination_token=coordination_token,
+        )
+        if divert_edge_id is not None:
+            self._execution.record_routing_event(
+                member_token=ctx.require_member_token(),
+                state_id=guard.state_id,
+                edge_id=divert_edge_id,
+                mode=RoutingMode.DIVERT,
+                reason=scrubbed_reason,
+            )
         guard.complete(
             NodeStateStatus.FAILED,
             duration_ms=duration_ms,
-            error=ExecutionError(
-                exception=str(result.reason) if result.reason else "Transform returned error",
-                exception_type="TransformError",
-            ),
+            error=scrubbed_reason,
         )
         self._execution.complete_batch(
             coordination_token=coordination_token,
@@ -629,7 +699,10 @@ class AggregationExecutor:
         1. Transitions batch to "executing" with trigger reason
         2. Records node_state for the flush operation
         3. Executes the batch-aware transform
-        4. Transitions batch to "completed" or "failed"
+        4. Transitions batch to "completed" or "failed"; a returned error
+           first records one transform_errors row per member and, for a
+           named on_error sink, one DIVERT routing_event on the flush state
+           (``_complete_error_flush``)
         5. Resets batch_id for next batch
 
         The step position in the DAG is resolved internally via StepResolver
@@ -748,12 +821,16 @@ class AggregationExecutor:
                 else:
                     self._spans.mark_error(aggregation_span, AggregationResultError())
                     self._complete_error_flush(
-                        coordination_token=ctx.require_coordination_token(),
+                        node_id=node_id,
+                        node=node,
+                        transform=transform,
+                        ctx=ctx,
                         result=result,
                         guard=guard,
                         duration_ms=duration_ms,
                         batch_id=batch_id,
                         trigger_type=trigger_type,
+                        buffered_tokens=snapshot.buffered_tokens,
                     )
                     batch_finalized = True
 

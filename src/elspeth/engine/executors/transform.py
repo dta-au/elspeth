@@ -2,7 +2,7 @@
 
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -41,7 +41,7 @@ from elspeth.contracts.errors import (
     ZeroEmissionSuccessContractViolation,
 )
 from elspeth.contracts.plugin_context import PluginContext, plugin_context_scope
-from elspeth.contracts.secret_scrub import scrub_payload_for_audit
+from elspeth.contracts.secret_scrub import scrub_transform_error_reason
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -59,14 +59,6 @@ if TYPE_CHECKING:
     from elspeth.contracts import TransformErrorReason
     from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.engine.batch_adapter import SharedBatchAdapter
-
-
-def _scrub_transform_error_details(error_details: "TransformErrorReason") -> "TransformErrorReason":
-    """Scrub freeform transform error payload while preserving category fields."""
-    scrubbed = scrub_payload_for_audit(error_details)
-    if scrubbed == error_details:
-        return error_details
-    return cast("TransformErrorReason", scrubbed)
 
 
 class TransformResultError(Exception):
@@ -102,7 +94,7 @@ def record_transform_error_with_routing(
     if node_id is None:
         raise OrchestrationInvariantError(f"Transform '{transform.name}' executed without node_id - orchestrator bug")
 
-    scrubbed_error_details = _scrub_transform_error_details(error_details)
+    scrubbed_error_details = scrub_transform_error_reason(error_details)
 
     # Validate the complete DIVERT envelope before writing either half. A
     # transform_error without its required routing_event is contradictory
@@ -944,7 +936,7 @@ class TransformExecutor:
                             f"Transform '{transform.name}' returned error but reason is None. "
                             'Use TransformResult.error({{"reason": "...", ...}}) to create error results.'
                         )
-                    sanitized_reason = _scrub_transform_error_details(result.reason)
+                    sanitized_reason = scrub_transform_error_reason(result.reason)
                     result.reason = sanitized_reason
 
                     # Record transform_error + DIVERT routing_event BEFORE terminal

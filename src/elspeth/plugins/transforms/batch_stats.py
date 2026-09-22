@@ -126,7 +126,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f288b3e52978198d"
+    source_file_hash: str | None = "sha256:fb377389d00c7d3b"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -371,8 +371,9 @@ class BatchStats(BaseTransform):
                 skipped_missing_indices.append(row_index)
                 continue
 
-            # Contract enforcement: value_field must be numeric (int or float)
-            # Tier 2 pipeline data - wrong types indicate upstream bug
+            # Contract enforcement: value_field must be numeric (int or float).
+            # A wrong type in Tier 2 row data fails the WHOLE batch (below);
+            # it is not a plugin crash.
             # Use type() instead of isinstance() to reject bool (bool is subclass of int)
             if type(raw_value) not in (int, float):
                 # BATCH-level failure, not a skip. The two branches around this
@@ -564,8 +565,11 @@ class BatchStats(BaseTransform):
             # Requirement 2 of the ruling: the batch records that it failed and
             # WHY — which row, which field, what was found where a number was
             # required. The structural caller owns disposition: an aggregation
-            # applies its declared error route, while a collector turns this
-            # into a whole-group failure settled by scope policy and nesting.
+            # applies its declared on_error (AggregationExecutor._complete_error_flush
+            # records the reason and the DIVERT; RowProcessor.handle_timeout_flush
+            # sends every buffered row to the on_error sink, or records it
+            # discarded), while a collector turns this into a whole-group
+            # failure settled by scope policy and nesting.
             return TransformResult.error(exc.as_reason(), retryable=False)
 
     def _aggregate_all_groups(self, rows: list[PipelineRow]) -> TransformResult:

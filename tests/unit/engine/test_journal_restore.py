@@ -678,6 +678,7 @@ class TestAggregationFacadeValidateBeforeMutate:
             MagicMock(spec=SpanFactory),
             lambda nid: 1,
             run_id="run_1",
+            data_flow=MagicMock(spec=DataFlowRepository),
             aggregation_settings={node_id: _agg_settings()},
             clock=MockClock(start=100.0),
         )

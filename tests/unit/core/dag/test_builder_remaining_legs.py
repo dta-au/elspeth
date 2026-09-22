@@ -182,3 +182,126 @@ def test_builder_sets_the_name_keyed_transform_id_map() -> None:
     assert set(name_map) == {"worker"}
     assert name_map["worker"] == seq_map[0]
     assert str(name_map["worker"]).startswith("transform_worker_")
+
+
+# ---------------------------------------------------------------------------
+# Aggregation error edge (elspeth-d2e3f29d10)
+# ---------------------------------------------------------------------------
+
+
+def _aggregation_graph(on_error: str, *, extra_sinks: tuple[str, ...] = ("quarantine",)) -> ExecutionGraph:
+    """source -> aggregation(batch_stats) -> output, plus the named extra sinks."""
+    from elspeth.core.config import AggregationSettings, TriggerConfig
+    from elspeth.plugins.transforms.batch_stats import BatchStats
+    from tests.fixtures.base_classes import as_sink, as_source, as_transform
+    from tests.fixtures.plugins import CollectSink, ListSource
+
+    source = ListSource([{"value": 1}], on_success="agg_in")
+    stats = BatchStats({"schema": {"mode": "observed"}, "value_field": "value"})
+    settings = AggregationSettings(
+        name="stats",
+        plugin=stats.name,
+        input="agg_in",
+        on_success="output",
+        on_error=on_error,
+        trigger=TriggerConfig(count=2),
+    )
+    sinks = {name: CollectSink(name) for name in ("output", *extra_sinks)}
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": as_source(source)},
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="agg_in", options={})},
+        transforms=[],
+        sinks={name: as_sink(sink) for name, sink in sinks.items()},
+        aggregations={"stats": (as_transform(stats), settings)},
+        gates=[],
+    )
+
+
+def test_aggregation_on_error_sink_gets_a_divert_edge_and_the_graph_validates() -> None:
+    """A named aggregation on_error sink is wired, so it is reachable.
+
+    Before elspeth-d2e3f29d10 no aggregation error-edge loop existed, so the
+    sink named by on_error had no inbound edge and ``validate()`` refused the
+    graph as "unreachable node" — every pipeline naming an aggregation error
+    sink was unbuildable.
+    """
+    from elspeth.contracts import RoutingMode
+    from elspeth.contracts.enums import error_edge_label
+    from elspeth.contracts.types import AggregationName, SinkName
+
+    graph = _aggregation_graph("quarantine")
+    graph.validate()
+
+    agg_id = graph.get_aggregation_id_map()[AggregationName("stats")]
+    quarantine_id = graph.get_sink_id_map()[SinkName("quarantine")]
+    diverts = [edge for edge in graph.get_edges() if edge.from_node == agg_id and edge.mode is RoutingMode.DIVERT]
+    assert [(edge.to_node, edge.label) for edge in diverts] == [(quarantine_id, error_edge_label("stats"))]
+
+
+def test_aggregation_on_error_discard_adds_no_divert_edge() -> None:
+    from elspeth.contracts import RoutingMode
+    from elspeth.contracts.types import AggregationName
+
+    graph = _aggregation_graph("discard", extra_sinks=())
+    graph.validate()
+
+    agg_id = graph.get_aggregation_id_map()[AggregationName("stats")]
+    assert [edge for edge in graph.get_edges() if edge.from_node == agg_id and edge.mode is RoutingMode.DIVERT] == []
+
+
+def test_aggregation_node_id_does_not_depend_on_on_error() -> None:
+    """on_error is not part of the aggregation node identity.
+
+    The route is recorded by the DIVERT ``edges`` row. Folding on_error into
+    the node config would re-hash every aggregation node_id and every
+    checkpoint's topology hash for no audit gain.
+    """
+    from elspeth.contracts.types import AggregationName
+
+    discard_id = _aggregation_graph("discard").get_aggregation_id_map()[AggregationName("stats")]
+    routed_id = _aggregation_graph("quarantine").get_aggregation_id_map()[AggregationName("stats")]
+    assert discard_id == routed_id
+
+
+def test_aggregation_on_error_rejects_unknown_sink_with_suggestion() -> None:
+    with pytest.raises(
+        GraphValidationError, match=r"Aggregation 'stats' on_error 'quarantin' references unknown sink\. Did you mean: quarantine\?"
+    ):
+        _aggregation_graph("quarantin")
+
+
+def test_aggregation_on_error_naming_a_closer_is_an_unknown_sink() -> None:
+    """Aggregations get no rule-9 closer deferral.
+
+    Rule 6 bans aggregations inside every bound region, so an aggregation can
+    never sit inside the region a closer closes. A closer-named on_error is
+    therefore rejected as an unknown sink at the error-edge loop, never
+    deferred to a rule-9 resolution that could only ever refuse it.
+    """
+    from elspeth.core.config import AggregationSettings, CoalesceSettings, GateSettings, TriggerConfig
+    from elspeth.plugins.transforms.batch_stats import BatchStats
+    from tests.fixtures.base_classes import as_sink, as_source, as_transform
+    from tests.fixtures.plugins import CollectSink, ListSource
+
+    source = ListSource([{"value": 1}], on_success="agg_in")
+    stats = BatchStats({"schema": {"mode": "observed"}, "value_field": "value"})
+    settings = AggregationSettings(
+        name="stats",
+        plugin=stats.name,
+        input="agg_in",
+        on_success="stats_out",
+        on_error="merge",
+        trigger=TriggerConfig(count=2),
+    )
+    with pytest.raises(GraphValidationError, match=r"Aggregation 'stats' on_error 'merge' references unknown sink\."):
+        ExecutionGraph.from_plugin_instances(
+            sources={"primary": as_source(source)},
+            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="agg_in", options={})},
+            transforms=[],
+            sinks={"output": as_sink(CollectSink("output"))},
+            aggregations={"stats": (as_transform(stats), settings)},
+            gates=[GateSettings(name="splitter", input="stats_out", condition="'all'", routes={"all": "fork"}, fork_to=["p", "q"])],
+            coalesce_settings=[
+                CoalesceSettings(name="merge", branches={"p": "p", "q": "q"}, policy="require_all", merge="union", on_success="output")
+            ],
+        )

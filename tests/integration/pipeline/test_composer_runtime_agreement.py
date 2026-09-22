@@ -2216,7 +2216,9 @@ class TestComposerRuntimeRouteTargetAgreement:
     Empirical scope of the original gap (post-investigation):
 
     * Aggregation ``on_error`` -> unknown sink: composer was silent (the
-      original reproducer). Now caught at ``route_target_resolution``.
+      original reproducer), then caught at ``route_target_resolution``. Since
+      elspeth-d2e3f29d10 wired the aggregation error edge, the DAG builder
+      also refuses it, so it is now defense-in-depth like the transform axis.
     * Source ``on_validation_failure`` -> unknown sink: composer was silent.
       Now caught at ``route_target_resolution``.
     * Transform ``on_error`` -> unknown sink: was already caught at
@@ -2226,8 +2228,8 @@ class TestComposerRuntimeRouteTargetAgreement:
       ``graph_structure`` (``builder.py:859``). The new check is
       defense-in-depth.
 
-    Each gap-closing test (aggregation/source) exercises both paths from
-    independent inputs and asserts the error messages are byte-identical.
+    Each gap-closing test (source) exercises both paths from independent
+    inputs and asserts the error messages are byte-identical.
     Each defense-in-depth test asserts both layers reject and the dangling
     target name is present in both messages.
     """
@@ -2301,7 +2303,13 @@ class TestComposerRuntimeRouteTargetAgreement:
 
     def test_both_reject_aggregation_on_error_dangling_sink(self, tmp_path: Path) -> None:
         """Original reproducer (S2 v1 from docs/composer/evidence/composer-llm-eval-2026-05-01.md):
-        aggregation ``on_error: aggregation_errors`` with no sink of that name."""
+        aggregation ``on_error: aggregation_errors`` with no sink of that name.
+
+        Defense-in-depth since elspeth-d2e3f29d10: the DAG builder wires the
+        aggregation's ``__error_<name>__`` DIVERT edge and refuses an unknown
+        sink while doing so, exactly as it does for a transform. Both walls
+        reject: composer ``/validate`` and runtime graph construction, and
+        the dangling name appears in both messages."""
         csv_path = self._csv_input(tmp_path)
         output_path = self._csv_output(tmp_path)
 
@@ -2348,7 +2356,15 @@ class TestComposerRuntimeRouteTargetAgreement:
             metadata=PipelineMetadata(),
             version=1,
         )
-        composer_detail = self._composer_route_target_failure(state, tmp_path)
+        composer_result = validate_pipeline_for_trained_operator(
+            state,
+            self._validation_settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
+        assert composer_result.is_valid is False
+        composer_messages = " | ".join(err.message for err in composer_result.errors)
+        assert "aggregation_errors" in composer_messages
 
         # Runtime: equivalent ElspethSettings.
         config = ElspethSettings(
@@ -2378,11 +2394,18 @@ class TestComposerRuntimeRouteTargetAgreement:
                 ),
             },
         )
-        runtime_msg = self._runtime_route_target_failure(config)
-
-        assert "aggregation_errors" in composer_detail
-        assert "aggregation_errors" in runtime_msg
-        assert composer_detail == runtime_msg, "Composer and runtime must surface identical RouteValidationError"
+        plugins = instantiate_plugins_from_config(config)
+        with pytest.raises(GraphValidationError) as runtime_exc:
+            ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=list(config.gates),
+                coalesce_settings=list(config.coalesce) if config.coalesce else None,
+            )
+        assert "Aggregation 'agg1' on_error 'aggregation_errors' references unknown sink." in str(runtime_exc.value)
 
     def test_both_reject_transform_on_error_dangling_sink(self, tmp_path: Path) -> None:
         """Defense-in-depth axis: the DAG builder (``graph.validate()`` via

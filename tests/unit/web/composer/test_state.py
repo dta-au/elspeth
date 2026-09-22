@@ -1157,6 +1157,46 @@ class TestStage1Validation:
         assert any("Fork branch names must not be empty" in m for m in messages), result.errors
         assert any("Fork branch name '__hidden' starts with '__'" in m for m in messages), result.errors
 
+    @pytest.mark.parametrize(
+        ("on_error", "fragment"),
+        [
+            pytest.param("   ", "on_error must be a sink name or 'discard'", id="blank"),
+            pytest.param("__errors", "starts with '__'", id="dunder"),
+            pytest.param("has space", "invalid characters", id="chars"),
+        ],
+    )
+    def test_aggregation_on_error_follows_runtime_label_rules(self, on_error: str, fragment: str) -> None:
+        """AggregationSettings.on_error has the same parse-time validator as a
+        transform's (it is now a live __error_<name>__ edge target), so Stage 1
+        mirrors it (elspeth-d2e3f29d10)."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="agg_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="stats",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="agg_in",
+                on_success="main",
+                on_error=on_error,
+                options={"schema": {"mode": "observed"}, "value_field": "value"},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 2},
+                output_mode="transform",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        messages = [e.message for e in result.errors if e.error_code == "connection_label_invalid" and e.component == "node:stats"]
+        assert any(fragment in m for m in messages), result.errors
+
     def test_coalesce_branch_labels_follow_runtime_rules(self) -> None:
         """Branch keys/values must be non-empty, valid, and not collide after trimming or repeat in list form."""
 
@@ -10322,6 +10362,62 @@ def test_gate_on_error_must_reference_declared_sink_or_discard() -> None:
         "dangling_on_error": "missing_error_sink",
         "declared_sinks": ["high", "standard"],
     }
+
+
+@pytest.mark.parametrize("on_error", ["missing_error_sink", "merge"])
+def test_aggregation_on_error_route_facts_match_the_unknown_sink_rule(on_error: str) -> None:
+    """An aggregation's dangling on_error ships repair facts like a transform's.
+
+    No rule-9 closer relax for an aggregation: a closer-shaped value ('merge'
+    names a coalesce here) is still an unknown sink, both in the error rule
+    and in the facts, because rule 6 keeps aggregations out of every bound
+    region (elspeth-d2e3f29d10 parity with the DAG builder).
+    """
+    aggregation = NodeSpec(
+        id="stats",
+        node_type="aggregation",
+        plugin="batch_stats",
+        input="rows",
+        on_success="high",
+        on_error=on_error,
+        options={"schema": {"mode": "observed"}, "value_field": "amount"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        trigger={"count": 2},
+        output_mode="transform",
+    )
+    merge = NodeSpec(
+        id="merge",
+        node_type="coalesce",
+        plugin=None,
+        input="merge_in",
+        on_success="high",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={"a": "a_in", "b": "b_in"},
+        policy="require_all",
+        merge="union",
+    )
+    state = CompositionState(
+        source=SourceSpec(plugin="csv", on_success="rows", options={}, on_validation_failure="discard"),
+        nodes=(aggregation, merge),
+        edges=(),
+        outputs=(OutputSpec(name="high", plugin="csv", options={}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    result = state.validate()
+
+    assert ("node:stats", "aggregation_on_error_unknown_sink") in {(entry.component, entry.error_code) for entry in result.errors}
+    assert route_destination_facts(state)["node:stats"] == {"dangling_on_error": on_error, "declared_sinks": ["high"]}
 
 
 def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:

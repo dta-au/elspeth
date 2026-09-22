@@ -226,3 +226,308 @@ def test_wrong_typed_row_value_is_reported_with_its_type_and_never_its_value(
     rendered = repr(sorted(result.reason.items()))
     assert reported_type in rendered
     assert repr(row[bad_field]) not in rendered
+
+
+# ---------------------------------------------------------------------------
+# The batch half: a wrongly-typed row at an AGGREGATION fails the whole batch,
+# and the batch goes to the aggregation's on_error (elspeth-d2e3f29d10).
+# ---------------------------------------------------------------------------
+
+# Observed CSV: every value arrives as ``str``, so batch_stats' numeric guard
+# fires on the first row of the batch (BATCH index 0). The aggregation's own
+# schema is observed as well — a fixed one would re-coerce the strings or trip
+# the engine's batch-input validation, and this test would arm nothing.
+_CSV_ROWS = (("1", "12.5"), ("2", "not-a-number"), ("3", "31.75"))
+_CSV_VALUES = tuple(amount for _id, amount in _CSV_ROWS)
+
+
+def _read_jsonl(path: Any) -> list[dict[str, Any]]:
+    import json
+
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _run_csv_batch_stats_pipeline(tmp_path: Any, *, on_error: str, trigger: str) -> tuple[Any, Any, Any, Any]:
+    """Real CSV source (observed) -> batch_stats aggregation -> JSON sinks.
+
+    Built through the production assembly path (settings YAML ->
+    instantiate_plugins_from_config -> ExecutionGraph.from_plugin_instances ->
+    assemble_and_validate_pipeline_config -> Orchestrator), so the DAG builder
+    wires (or refuses) the aggregation error edge exactly as ``elspeth run``.
+    """
+    from elspeth.cli_helpers import instantiate_plugins_from_config
+    from elspeth.config_loading import load_settings_from_yaml_string
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
+
+    input_path = tmp_path / "amounts.csv"
+    input_path.write_text("id,amount\n" + "".join(f"{row_id},{amount}\n" for row_id, amount in _CSV_ROWS))
+    output_path = tmp_path / "stats.jsonl"
+    quarantine_path = tmp_path / "quarantine.jsonl"
+    trigger_line = "    trigger:\n      count: 3\n" if trigger == "count" else ""
+    quarantine_sink = (
+        f"""
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {quarantine_path}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+        if on_error == "quarantine"
+        else ""
+    )
+    settings = load_settings_from_yaml_string(
+        f"""
+sources:
+  amounts:
+    plugin: csv
+    on_success: stats_in
+    options:
+      path: {input_path}
+      on_validation_failure: discard
+      schema:
+        mode: observed
+aggregations:
+  - name: stats
+    plugin: batch_stats
+    input: stats_in
+    on_success: output
+    on_error: {on_error}
+{trigger_line}    options:
+      schema:
+        mode: observed
+      value_field: amount
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema:
+        mode: observed
+{quarantine_sink}
+"""
+    )
+    bundle = instantiate_plugins_from_config(settings)
+    graph = ExecutionGraph.from_plugin_instances(
+        sources=bundle.sources,
+        source_settings_map=bundle.source_settings_map,
+        transforms=bundle.transforms,
+        sinks=bundle.sinks,
+        aggregations=bundle.aggregations,
+        gates=list(settings.gates),
+    )
+    # The structural check `elspeth run` / `elspeth validate` apply: before the
+    # aggregation error edge existed, a named on_error sink failed here as an
+    # unreachable node.
+    graph.validate()
+    config = assemble_and_validate_pipeline_config(
+        sources=bundle.sources,
+        transforms=bundle.transforms,
+        sinks=bundle.sinks,
+        aggregations=bundle.aggregations,
+        settings=settings,
+        graph=graph,
+    )
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
+    return result, db, _read_jsonl(output_path), _read_jsonl(quarantine_path)
+
+
+def _expected_batch_reason() -> dict[str, Any]:
+    """The reason batch_stats returns for this input: row 0's str amount."""
+    from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
+
+    return dict(BatchRowTypeError(field="amount", row_index=0, expected="numeric (int or float)", found="str").as_reason())
+
+
+def _assert_value_free(text: str) -> None:
+    for value in _CSV_VALUES:
+        assert value not in text, f"row value {value!r} leaked into the audit record: {text}"
+
+
+def _failed_flush_audit(db: Any, run_id: str) -> dict[str, Any]:
+    """Every audit row the failed flush wrote, keyed for assertions."""
+    from elspeth.core.landscape.schema import (
+        batches_table,
+        edges_table,
+        node_states_table,
+        nodes_table,
+        routing_events_table,
+        tokens_table,
+        transform_errors_table,
+    )
+
+    with db.engine.connect() as conn:
+        agg_node_ids = (
+            conn.execute(
+                select(nodes_table.c.node_id).where(nodes_table.c.run_id == run_id).where(nodes_table.c.node_type == "aggregation")
+            )
+            .scalars()
+            .all()
+        )
+        [agg_node_id] = agg_node_ids
+        return {
+            "agg_node_id": agg_node_id,
+            "outcomes": conn.execute(
+                select(token_outcomes_table).where(token_outcomes_table.c.run_id == run_id).where(token_outcomes_table.c.completed == 1)
+            ).all(),
+            "row_token_ids": set(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id)).scalars()),
+            "failed_states": conn.execute(
+                select(node_states_table)
+                .where(node_states_table.c.run_id == run_id)
+                .where(node_states_table.c.node_id == agg_node_id)
+                .where(node_states_table.c.status == "failed")
+            ).all(),
+            "routing": conn.execute(
+                select(routing_events_table, edges_table.c.label, edges_table.c.from_node_id, edges_table.c.to_node_id)
+                .join(edges_table, edges_table.c.edge_id == routing_events_table.c.edge_id)
+                .where(routing_events_table.c.run_id == run_id)
+            ).all(),
+            "batches": conn.execute(select(batches_table).where(batches_table.c.run_id == run_id)).all(),
+            "transform_errors": conn.execute(select(transform_errors_table).where(transform_errors_table.c.run_id == run_id)).all(),
+        }
+
+
+@pytest.mark.parametrize("trigger", ["count", "end_of_source"])
+def test_wrong_typed_row_at_an_aggregation_routes_the_whole_batch_to_on_error(trigger: str, tmp_path: Any) -> None:
+    """The batch is reassembled and quarantined: every buffered row reaches the
+    on_error sink with its ORIGINAL values, each token is decided once as
+    ``(failure, on_error_routed, 'quarantine')``, and the record says which
+    row, which field, and the expected vs found type — never the value.
+
+    ``count`` flushes at intake (barrier coordination consumes the results);
+    ``end_of_source`` flushes from the orchestrator. Both reach the one
+    failed-flush seam, and both must route.
+
+    Before elspeth-d2e3f29d10 this pipeline could not be built at all: no
+    aggregation error edge existed, so the quarantine sink was an
+    unreachable node and ``from_plugin_instances``/``validate`` refused it.
+    """
+    import json
+
+    from elspeth.engine._error_hash import compute_error_hash
+
+    result, db, output_rows, quarantine_rows = _run_csv_batch_stats_pipeline(tmp_path, on_error="quarantine", trigger=trigger)
+
+    assert result.status is RunStatus.FAILED
+    assert (result.rows_processed, result.rows_succeeded, result.rows_failed) == (3, 0, 3)
+    assert result.rows_routed_failure == 3
+    assert result.rows_quarantined == 0
+
+    # Reassembled best effort: every buffered row, original values, in order.
+    assert quarantine_rows == [{"id": row_id, "amount": amount} for row_id, amount in _CSV_ROWS]
+    assert output_rows == []
+
+    audit = _failed_flush_audit(db, result.run_id)
+    reason = _expected_batch_reason()
+    reason_text = str(reason)
+
+    # One terminal per token, written by the sink after durability; batch_id
+    # stays on batch_members, not on the routed outcome.
+    assert len(audit["outcomes"]) == 3
+    assert {outcome.token_id for outcome in audit["outcomes"]} == audit["row_token_ids"]
+    for outcome in audit["outcomes"]:
+        assert (outcome.outcome, outcome.path, outcome.sink_name, outcome.completed) == (
+            TerminalOutcome.FAILURE.value,
+            TerminalPath.ON_ERROR_ROUTED.value,
+            "quarantine",
+            1,
+        )
+        assert outcome.batch_id is None
+        assert outcome.error_hash == compute_error_hash(reason_text, exception_type="TransformError")
+
+    # The journal handoff carried the same scrubbed reason to the sink.
+    from elspeth.core.landscape.schema import token_work_items_table
+
+    with db.engine.connect() as conn:
+        handoffs = conn.execute(
+            select(token_work_items_table.c.token_id, token_work_items_table.c.pending_error_message)
+            .where(token_work_items_table.c.run_id == result.run_id)
+            .where(token_work_items_table.c.pending_path == TerminalPath.ON_ERROR_ROUTED.value)
+        ).all()
+    assert {handoff.token_id for handoff in handoffs} == audit["row_token_ids"]
+    for handoff in handoffs:
+        assert handoff.pending_error_message == reason_text
+        _assert_value_free(handoff.pending_error_message)
+
+    # The flush node_state failed with the scrubbed reason DICT (not a repr).
+    [failed_state] = audit["failed_states"]
+    stored_reason = json.loads(failed_state.error_json)
+    assert stored_reason == reason
+    assert stored_reason["field"] == "amount"
+    assert (stored_reason["expected"], stored_reason["actual_type"]) == ("numeric (int or float)", "str")
+    assert "in row 0" in stored_reason["error"]
+    _assert_value_free(failed_state.error_json)
+
+    # Exactly one DIVERT routing_event, on the flush state, along __error_stats__.
+    [routing] = audit["routing"]
+    assert routing.mode == "divert"
+    assert routing.label == "__error_stats__"
+    assert routing.from_node_id == audit["agg_node_id"]
+    assert routing.state_id == failed_state.state_id
+
+    [batch] = audit["batches"]
+    assert batch.status == "failed"
+    assert batch.trigger_type == trigger
+
+    # One transform_errors row per buffered token, same reason, own row.
+    assert len(audit["transform_errors"]) == 3
+    assert {row.token_id for row in audit["transform_errors"]} == audit["row_token_ids"]
+    for error_row in audit["transform_errors"]:
+        assert error_row.transform_id == audit["agg_node_id"]
+        assert error_row.destination == "quarantine"
+        assert json.loads(error_row.error_details_json) == reason
+        _assert_value_free(error_row.error_details_json)
+    assert sorted(json.loads(row.row_data_json)["amount"] for row in audit["transform_errors"]) == sorted(_CSV_VALUES)
+
+
+@pytest.mark.parametrize("trigger", ["count", "end_of_source"])
+def test_wrong_typed_row_at_a_discard_aggregation_records_every_member_without_routing(trigger: str, tmp_path: Any) -> None:
+    """Negative control for the route above: ``on_error: discard`` writes no
+    sink and no DIVERT, but still decides every member once and records, per
+    member, that the batch failed and why (transform_errors, destination
+    'discard'), with an error_hash that binds to the reason — not to a
+    constant shared by every failed batch."""
+    import json
+
+    from elspeth.engine._error_hash import compute_error_hash
+
+    result, db, output_rows, quarantine_rows = _run_csv_batch_stats_pipeline(tmp_path, on_error="discard", trigger=trigger)
+
+    assert result.status is RunStatus.FAILED
+    assert (result.rows_processed, result.rows_succeeded, result.rows_failed) == (3, 0, 3)
+    assert result.rows_routed_failure == 0
+    assert result.rows_quarantined == 0
+    assert output_rows == []
+    assert quarantine_rows == []
+
+    audit = _failed_flush_audit(db, result.run_id)
+    reason = _expected_batch_reason()
+
+    assert len(audit["outcomes"]) == 3
+    assert {outcome.token_id for outcome in audit["outcomes"]} == audit["row_token_ids"]
+    for outcome in audit["outcomes"]:
+        assert (outcome.outcome, outcome.path, outcome.sink_name, outcome.completed) == (
+            TerminalOutcome.FAILURE.value,
+            TerminalPath.UNROUTED.value,
+            None,
+            1,
+        )
+        assert outcome.error_hash == compute_error_hash(str(reason), exception_type="TransformError")
+
+    assert audit["routing"] == []
+    [failed_state] = audit["failed_states"]
+    assert json.loads(failed_state.error_json) == reason
+    [batch] = audit["batches"]
+    assert batch.status == "failed"
+
+    assert len(audit["transform_errors"]) == 3
+    assert {row.token_id for row in audit["transform_errors"]} == audit["row_token_ids"]
+    assert {row.destination for row in audit["transform_errors"]} == {"discard"}

@@ -4773,6 +4773,48 @@ def test_gate_on_error_repair_feedback_carries_sink_connectivity_and_guidance() 
     assert "private_error_sink_canary" not in entry.get("suggested_fix", "")
 
 
+def test_aggregation_on_error_repair_feedback_carries_sink_connectivity_and_guidance() -> None:
+    """elspeth-d2e3f29d10 parity: a ghost aggregation on_error sink is refused
+    by the runtime builder too, so the planner's repair turn gets the same
+    connectivity facts and catalogue guidance a transform or gate gets —
+    including for a closer-shaped value, which is NOT relaxed for an
+    aggregation (rule 6 bans aggregations inside bound regions)."""
+    base = _dangling_destination_state()
+    aggregation = NodeSpec(
+        id="stats",
+        node_type="aggregation",
+        plugin="batch_stats",
+        input="rows",
+        on_success="cleaned",
+        on_error="private_batch_sink_canary",
+        options={"schema": {"mode": "observed"}, "value_field": "amount"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        trigger={"count": 2},
+        output_mode="transform",
+    )
+    state = replace(base, sources={"source": replace(base.sources["source"], on_success="rows")}, nodes=(aggregation,))
+    validation = state.validate()
+    assert ("node:stats", "aggregation_on_error_unknown_sink") in {(e.component, e.error_code) for e in validation.errors}
+    result = ToolResult(success=False, updated_state=state, validation=validation, affected_nodes=())
+
+    feedback = _allowlisted_candidate_feedback(result)
+
+    entry = next(item for item in feedback["validation"]["errors"] if item["error_code"] == "aggregation_on_error_unknown_sink")
+    assert entry["connectivity"] == {
+        "dangling_on_error": "private_batch_sink_canary",
+        "declared_sinks": ["cleaned"],
+    }
+    assert "aggregation" in entry["explanation"].lower()
+    assert "declared_sinks" in entry["suggested_fix"]
+    assert "private_batch_sink_canary" not in entry.get("explanation", "")
+    assert "private_batch_sink_canary" not in entry.get("suggested_fix", "")
+
+
 def test_route_destination_feedback_rejects_missing_internal_fact(monkeypatch: pytest.MonkeyPatch) -> None:
     """A destination-dangling code with no matching fact fails loud, not silent."""
     import elspeth.web.composer.pipeline_planner as planner_module

@@ -38,6 +38,7 @@ from elspeth.core.landscape.schema import (
     transform_errors_table,
     validation_errors_table,
 )
+from elspeth.testing import make_pipeline_row
 from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, member_token_for
 
 _SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -151,7 +152,17 @@ def _leader_outcome(h: _Harness, leader: CoordinationToken) -> None:
     h.factory.data_flow.record_token_outcome_leader(h.ref, None, TerminalPath.ABANDONED, coordination_token=leader)
 
 
-_LEADER_WRITES = [_node, _edge, _row, _quarantine, _token, _validation, _leader_outcome]
+def _batch_transform_errors(h: _Harness, leader: CoordinationToken) -> None:
+    h.factory.data_flow.record_batch_transform_errors_leader(
+        ((h.ref, make_pipeline_row({"value": 1})),),
+        "transform",
+        {"reason": "invalid_input"},
+        "discard",
+        coordination_token=leader,
+    )
+
+
+_LEADER_WRITES = [_node, _edge, _row, _quarantine, _token, _validation, _leader_outcome, _batch_transform_errors]
 
 
 @pytest.mark.parametrize("write", _LEADER_WRITES, ids=lambda write: write.__name__)

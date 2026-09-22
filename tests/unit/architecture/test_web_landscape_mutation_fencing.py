@@ -614,7 +614,12 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # already took an UPDATE through depart_worker and evict_worker, so this is a
 # new construction of an existing write shape, not a new shape. Re-derived from
 # this file's own printed output on the rebased tree, applied and run.
-_EXPECTED_DML_COUNT = 158
+# AGG-ERROR-EDGE (elspeth-d2e3f29d10, operator ruling B5): 158 -> 159, +1 identity —
+# ErrorAuditRepository.record_batch_transform_errors_leader's ONE executemany INSERT
+# into transform_errors (one row per member of a FAILED aggregation batch), inside its
+# own fenced_leader_transaction. Write set UNCHANGED (transform_errors/insert already
+# existed via record_transform_error). Measured by scripts/fencing_inventory.py.
+_EXPECTED_DML_COUNT = 159
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -693,7 +698,8 @@ _EXPECTED_DML_COUNT = 158
 # GraphAuditRepository.register_node's insert fingerprint (and its one
 # subordinate edge below); scripts/fencing_inventory.py against the base tree
 # classifies exactly that one identity as departed/arrived, write shapes 70/70.
-_EXPECTED_DML_INVENTORY_SHA256 = "f586b74e6d325e9e57bb8f56e3f562dac10b96f353228a178ffe7af8033c1568"
+# AGG-ERROR-EDGE: f586b74e… -> the value below for the one identity above.
+_EXPECTED_DML_INVENTORY_SHA256 = "14b71a754d496c74382ecd861bbe304c39c3f3b7e925595a229f76f7c3f9c41a"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -780,10 +786,14 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_lifecycle.complete_run#1
 #   + engine/orchestrator/abandon.py _acquire_leaderless_run_seat -> factory.run_coordination.acquire_run_leadership#1
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_coordination.release_seat#1
-_EXPECTED_CALL_COUNT = 280
+# AGG-ERROR-EDGE (elspeth-d2e3f29d10): 280 -> 281, +1 caller —
+# AggregationExecutor._complete_error_flush -> self._execution.record_routing_event,
+# the ONE DIVERT routing_event of a batch routed to its aggregation's on_error sink.
+_EXPECTED_CALL_COUNT = 281
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "0b7a93820401e5a6878e38c28827b557e51f712ba865facd26ade2dd92fd3fc4"
+# AGG-ERROR-EDGE: 0b7a9382… -> the value below for the one caller above.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "d82c45a58ecd464872136a29628739c99ce599c192e8a1eacb22977380f8fa6d"
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 138
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "d3b83b4cef4ce6ceae28d98c48ad49b0162b26ef96b7a7e7551e3ab4be89d26f"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
