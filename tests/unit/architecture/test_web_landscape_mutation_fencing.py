@@ -789,11 +789,16 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # AGG-ERROR-EDGE (elspeth-d2e3f29d10): 280 -> 281, +1 caller —
 # AggregationExecutor._complete_error_flush -> self._execution.record_routing_event,
 # the ONE DIVERT routing_event of a batch routed to its aggregation's on_error sink.
-_EXPECTED_CALL_COUNT = 281
+# AGG-DISCARD (operator ruling B3): 281 -> 279, -2 callers — RowProcessor._handle_flush_error
+# (per-member record_token_outcome_leader) and _mark_buffered_scheduler_work_terminal (the
+# separate BLOCKED-row release) are DELETED: a discarded failed batch's terminals now ride
+# complete_barrier's terminal_outcomes, the same transaction as the release.
+_EXPECTED_CALL_COUNT = 279
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
-# AGG-ERROR-EDGE: 0b7a9382… -> the value below for the one caller above.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "d82c45a58ecd464872136a29628739c99ce599c192e8a1eacb22977380f8fa6d"
+# AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
+# AGG-DISCARD: d82c45a5… -> the value below, the two callers deleted above.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "70bb43aa3a1c4434092259a341a96da340b59acd4b8ea2fc3be2dc386a917cff"
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 138
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "d3b83b4cef4ce6ceae28d98c48ad49b0162b26ef96b7a7e7551e3ab4be89d26f"
 _EXPECTED_COORDINATION_CALL_COUNT = 43

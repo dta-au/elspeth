@@ -64,7 +64,7 @@ from elspeth.contracts.identity import (
 )
 from elspeth.contracts.results import FailureInfo, GateResult
 from elspeth.contracts.routing import RoutingAction
-from elspeth.contracts.scheduler import SourceIngestSpec, TokenWorkItem
+from elspeth.contracts.scheduler import BarrierTerminalOutcomeSpec, SourceIngestSpec, TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, GateName, NodeID, RowUnionName, SinkName
@@ -2562,98 +2562,6 @@ class TestProcessRowNoTransforms:
         )
         assert processor._barrier_key_for_live_hold("token-a") == "aggregation_a"
 
-    def test_handle_flush_error_telemetry_failure_does_not_interrupt_failed_outcomes(self) -> None:
-        """Batch-flush failure terminalization must continue after telemetry errors."""
-        _db, factory = _make_factory()
-        processor = _make_processor(factory)
-        transform = _make_mock_transform(node_id="aggregate-1", name="batch-transform")
-        token_a = make_token_info(row_id="row-a", token_id="token-a", data={"value": 1})
-        token_b = make_token_info(row_id="row-b", token_id="token-b", data={"value": 2})
-        token_c = make_token_info(row_id="row-c", token_id="token-c", data={"value": 3})
-        fctx = _FlushContext(
-            node_id=NodeID("aggregate-1"),
-            transform=transform,
-            settings=AggregationSettings(
-                name="agg",
-                plugin="batch-plugin",
-                input="source",
-                on_error="discard",
-                trigger={"count": 3},
-            ),
-            buffered_tokens=(token_a, token_b, token_c),
-            batch_id="batch-1",
-            expand_parent_token=token_a,
-            triggering_token=token_c,
-            coalesce_node_id=None,
-            coalesce_name=None,
-        )
-
-        with (
-            patch.object(factory.data_flow, "record_token_outcome_leader") as mock_record_token_outcome,
-            patch.object(
-                processor,
-                "_emit_token_completed",
-                side_effect=[None, RuntimeError("telemetry down"), None],
-            ),
-        ):
-            results = processor._handle_flush_error(fctx, "batch flush failed")
-
-        assert mock_record_token_outcome.call_count == 3
-        recorded_refs = [call.kwargs["ref"].token_id for call in mock_record_token_outcome.call_args_list]
-        assert recorded_refs == ["token-a", "token-b", "token-c"]
-        assert tuple(result.token.token_id for result in results) == ("token-a", "token-b", "token-c")
-        assert tuple((result.outcome, result.path) for result in results) == (
-            (TerminalOutcome.FAILURE, TerminalPath.UNROUTED),
-            (TerminalOutcome.FAILURE, TerminalPath.UNROUTED),
-            (TerminalOutcome.FAILURE, TerminalPath.UNROUTED),
-        )
-
-    def test_handle_flush_error_recorder_failure_raises_audit_integrity_error(self) -> None:
-        """Recorder failure during batch-flush terminalization must crash loudly."""
-        _db, factory = _make_factory()
-        processor = _make_processor(factory)
-        transform = _make_mock_transform(node_id="aggregate-1", name="batch-transform")
-        token_a = make_token_info(row_id="row-a", token_id="token-a", data={"value": 1})
-        token_b = make_token_info(row_id="row-b", token_id="token-b", data={"value": 2})
-        token_c = make_token_info(row_id="row-c", token_id="token-c", data={"value": 3})
-        fctx = _FlushContext(
-            node_id=NodeID("aggregate-1"),
-            transform=transform,
-            settings=AggregationSettings(
-                name="agg",
-                plugin="batch-plugin",
-                input="source",
-                on_error="discard",
-                trigger={"count": 3},
-            ),
-            buffered_tokens=(token_a, token_b, token_c),
-            batch_id="batch-1",
-            expand_parent_token=token_a,
-            triggering_token=token_c,
-            coalesce_node_id=None,
-            coalesce_name=None,
-        )
-
-        attempted_refs: list[str] = []
-
-        def fail_on_second_record(*args: Any, **kwargs: Any) -> None:
-            token_id = kwargs["ref"].token_id
-            attempted_refs.append(token_id)
-            if token_id == "token-b":
-                raise LandscapeRecordError("audit DB down")
-
-        with (
-            patch.object(factory.data_flow, "record_token_outcome_leader", side_effect=fail_on_second_record),
-            pytest.raises(
-                AuditIntegrityError,
-                match=r"Failed to record FAILED outcome for token 'token-b'",
-            ) as exc_info,
-        ):
-            processor._handle_flush_error(fctx, "batch flush failed")
-
-        assert attempted_refs == ["token-a", "token-b"]
-        assert isinstance(exc_info.value.__cause__, LandscapeRecordError)
-
     def test_empty_batch_flush_plans_dropped_outcomes_without_early_audit_writes(self) -> None:
         """Zero-row routing stays pure until the atomic barrier completion."""
         _db, factory = _make_factory()
@@ -3040,39 +2948,38 @@ class TestAggregationFailureMatrix:
         )
         return db, factory, processor, transform, agg_node
 
-    def test_flush_failure_passthrough_records_failed_outcomes(self) -> None:
-        """Passthrough flush failure records FAILED terminal outcomes for buffered tokens.
-
-        Slice 3 re-pin (ADR-030 §E.2): the arrival returns a real
-        (None, BUFFERED) RowResult and the count flush fires from the NEXT
-        drain iteration's journal-first intake; the BUFFERED audit record is
-        written by the fenced adoption verb (not record_token_outcome), so
-        only the flush-failure FAILED record goes through the repository
-        method.
+    @pytest.mark.parametrize("output_mode", ["passthrough", "transform"])
+    def test_flush_failure_with_discard_terminates_every_member_inside_the_barrier(self, output_mode: str) -> None:
+        """Operator ruling B3: ``on_error: discard`` at the batch seam matches the
+        per-row discard. Every buffered member is (FAILURE, QUARANTINED_AT_SOURCE)
+        with an error_hash that binds to the batch reason (B4), and each terminal
+        is written INSIDE the complete_barrier transaction that consumes its
+        BLOCKED row — no processor-side leader write, no second transaction to
+        crash between. A TokenCompleted telemetry failure afterwards does not
+        undo or interrupt the durable terminals.
         """
-        _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="passthrough")
+        _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode=output_mode)
         source_row = _make_source_row({"value": 10})
         ctx = make_context(
             landscape=factory.plugin_audit_writer(),
             coordination_token=leader_coordination_token(factory, "test-run"),
         )
         captured: dict[str, TokenInfo] = {}
+        reason = {"reason": "invalid_input", "field": "value", "error": "must be numeric, got str in row 0"}
 
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
         def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
-            return (
-                TransformResult.error({"reason": "flush_failed"}, retryable=False),
-                [captured["token"]],
-                "batch-1",
-            )
+            return (TransformResult.error(reason, retryable=False), [captured["token"]], "batch-1")
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
             patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
             patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
             patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
+            patch.object(processor._scheduler, "complete_barrier", wraps=processor._scheduler.complete_barrier) as complete_barrier,
+            patch.object(processor, "_emit_token_completed", side_effect=RuntimeError("telemetry down")),
         ):
             results = processor.process_row(
                 row_index=0,
@@ -3085,64 +2992,24 @@ class TestAggregationFailureMatrix:
 
         assert len(results) == 2
         _assert_outcome_pair(results[0], None, TerminalPath.BUFFERED)
-        _assert_outcome_pair(results[1], TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
-        # The intake adoption verb wrote the BUFFERED record durably inside
-        # its fenced transaction; the repository method sees only the flush
-        # failure's FAILED record.
-        assert [(call.kwargs["outcome"], call.kwargs["path"]) for call in record_outcome.call_args_list] == [
-            (TerminalOutcome.FAILURE, TerminalPath.UNROUTED),
-        ]
+        discarded = results[1]
+        _assert_outcome_pair(discarded, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+        assert discarded.sink_name is None
+        assert discarded.token.token_id == captured["token"].token_id
 
-    def test_flush_failure_transform_records_failed_for_buffered_tokens(self) -> None:
-        """T26: Transform-mode flush failure records FAILED for BUFFERED tokens.
-
-        Before T26, transform-mode buffer time recorded CONSUMED_IN_BATCH (terminal),
-        so flush failures couldn't record FAILED. Now tokens are BUFFERED (non-terminal)
-        at buffer time, allowing FAILED to be recorded on flush error.
-        """
-        _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="transform")
-        source_row = _make_source_row({"value": 10})
-        ctx = make_context(
-            landscape=factory.plugin_audit_writer(),
-            coordination_token=leader_coordination_token(factory, "test-run"),
+        record_outcome.assert_not_called()
+        complete_barrier.assert_called_once()
+        barrier = complete_barrier.call_args.kwargs
+        assert barrier["consumed_token_ids"] == (captured["token"].token_id,)
+        assert barrier["emitted_pending_sink"] == ()
+        assert barrier["terminal_outcomes"] == (
+            BarrierTerminalOutcomeSpec(
+                token_id=captured["token"].token_id,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash=compute_error_hash(str(reason)),
+            ),
         )
-        captured: dict[str, TokenInfo] = {}
-
-        def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
-            captured["token"] = token
-
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
-            return (
-                TransformResult.error({"reason": "flush_failed"}, retryable=False),
-                [captured["token"]],
-                "batch-1",
-            )
-
-        with (
-            patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
-            patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
-        ):
-            results = processor.process_row(
-                row_index=0,
-                source_row=source_row,
-                transforms=[transform],
-                ctx=ctx,
-                source_row_index=0,
-                ingest_sequence=0,
-            )
-
-        # Slice 3 re-pin (ADR-030 §E.2): the arrival returns a real BUFFERED
-        # RowResult; the count flush fires from the next iteration's intake.
-        assert len(results) == 2
-        _assert_outcome_pair(results[0], None, TerminalPath.BUFFERED)
-        _assert_outcome_pair(results[1], TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
-        outcomes = [(call.kwargs["outcome"], call.kwargs["path"]) for call in record_outcome.call_args_list]
-        # The intake adoption verb wrote the BUFFERED record durably inside
-        # its fenced transaction; only the flush failure's FAILED record goes
-        # through the repository method.
-        assert outcomes == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
 
     @pytest.mark.parametrize("output_mode", ["passthrough", "transform"])
     def test_flush_failure_with_named_on_error_hands_every_member_to_the_sink(self, output_mode: str) -> None:
@@ -3151,9 +3018,8 @@ class TestAggregationFailureMatrix:
         Every buffered member becomes a sink-bound (FAILURE, ON_ERROR_ROUTED)
         result carrying its ORIGINAL row and the batch reason, handed off
         BLOCKED -> PENDING_SINK in ONE complete_barrier (nothing consumed).
-        No processor-side terminal is written and the failed-flush journal
-        release is never used: the sink records the one terminal per token
-        after durability.
+        No processor-side terminal is written: the sink records the one
+        terminal per token after durability.
         """
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode=output_mode, on_error="quarantine")
         source_row = _make_source_row({"value": 10})
@@ -3175,7 +3041,6 @@ class TestAggregationFailureMatrix:
             patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
             patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
             patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
-            patch.object(processor, "_mark_buffered_scheduler_work_terminal") as release_failed,
             patch.object(processor._scheduler, "complete_barrier", wraps=processor._scheduler.complete_barrier) as complete_barrier,
         ):
             results = processor.process_row(
@@ -3199,7 +3064,6 @@ class TestAggregationFailureMatrix:
         assert routed.error.message == str(reason)
 
         record_outcome.assert_not_called()
-        release_failed.assert_not_called()
         complete_barrier.assert_called_once()
         barrier = complete_barrier.call_args.kwargs
         assert barrier["consumed_token_ids"] == ()
@@ -9297,7 +9161,7 @@ class TestNotifyCoalesceOfLostBranch:
                 [token],
                 child_items,
                 batch_id="batch-1",
-                output_was_empty=True,
+                members_terminate=True,
             )
 
         coalesce.notify_branch_lost.assert_not_called()
@@ -9327,7 +9191,7 @@ class TestNotifyCoalesceOfLostBranch:
                 [token],
                 child_items,
                 batch_id="batch-1",
-                output_was_empty=True,
+                members_terminate=True,
             )
 
         assert ordered_events == ["aggregation_committed", "loss_replayed"]

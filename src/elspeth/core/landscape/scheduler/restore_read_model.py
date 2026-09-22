@@ -707,9 +707,13 @@ class BarrierRestoreReadModel:
     def find_failed_unrouted_terminal_token_ids(self, run_id: str, token_ids: Sequence[str]) -> frozenset[str]:
         """Token ids holding terminal ``(FAILURE, UNROUTED)`` outcomes.
 
-        This is the ADR-030 aggregation restore reconcile signature for a crash
-        after failed-flush terminal writes but before BLOCKED scheduler rows are
-        released.
+        This is the ADR-030 §E.3a restore reconcile signature for a crash after
+        terminal writes but before BLOCKED scheduler rows are released: an
+        aggregation flush's Tier-1 cross-check violation
+        (``RowProcessor._record_flush_violation``), a late row_union arrival,
+        and a row_union failed closure. A failed flush's discard terminals
+        commit inside ``complete_barrier`` with the release (operator ruling
+        B3), so ``(FAILURE, QUARANTINED_AT_SOURCE)`` is deliberately not read.
         """
         if not token_ids:
             return frozenset()

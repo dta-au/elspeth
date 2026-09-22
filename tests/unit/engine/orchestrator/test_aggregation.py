@@ -502,8 +502,13 @@ class TestCheckAggregationTimeouts:
         assert len(pending["output"]) == 1
 
     def test_timeout_flush_failed_results(self) -> None:
-        """Failed results from flush increment failed counter."""
-        failed = _make_result(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
+        """A discarded failed batch's members count failed AND quarantined.
+
+        Operator ruling B3: a failed flush with ``on_error: discard`` returns
+        every member as (FAILURE, QUARANTINED_AT_SOURCE), the per-row discard
+        pair — no longer (FAILURE, UNROUTED).
+        """
+        failed = _make_result(TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
 
         agg_transform = _make_batch_transform(node_id="agg-1")
         config = _make_config(
@@ -527,6 +532,7 @@ class TestCheckAggregationTimeouts:
         )
 
         assert result.rows_failed == 1
+        assert result.rows_quarantined == 1
         assert result.rows_succeeded == 0
 
     def test_work_items_continue_processing(self) -> None:

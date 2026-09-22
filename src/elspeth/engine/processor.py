@@ -1282,64 +1282,27 @@ class RowProcessor:
                 return self._row_union_node_ids[row_union_name], row_union_name
         return None, None
 
-    def _handle_flush_error(
-        self,
-        fctx: _FlushContext,
-        error_detail: str,
-    ) -> tuple[RowResult, ...]:
-        """Record every member of a failed batch discarded (``on_error: discard``).
+    @staticmethod
+    def _discard_flush_error_members(fctx: _FlushContext, error_detail: str) -> tuple[RowResult, ...]:
+        """Plan every member of a failed batch discarded (``on_error: discard``).
 
-        Both modes now have BUFFERED (non-terminal) at buffer time,
-        so FAILED can be recorded as the terminal outcome for all tokens.
-        ``error_detail`` is the scrubbed batch reason, so each member's
-        error_hash binds to WHY the batch failed.
+        The per-row discard twin (``token_traversal``): each member is
+        ``(FAILURE, QUARANTINED_AT_SOURCE)`` carrying the batch reason. Nothing
+        is recorded here — ``_complete_aggregation_flush`` writes every
+        member's terminal inside the SAME ``complete_barrier`` transaction
+        that releases its BLOCKED row, so no crash can split the two.
         """
-        error_hash = compute_error_hash(error_detail, exception_type="TransformError")
-        results: list[RowResult] = []
         failure = FailureInfo(exception_type="TransformError", message=error_detail)
-
-        for token in fctx.buffered_tokens:
-            try:
-                self._data_flow.record_token_outcome_leader(
-                    coordination_token=self._require_coordination_token(),
-                    ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
-                    outcome=TerminalOutcome.FAILURE,
-                    path=TerminalPath.UNROUTED,
-                    error_hash=error_hash,
-                )
-            except LandscapeRecordError as record_failure:
-                raise AuditIntegrityError(
-                    f"Failed to record FAILED outcome for token {token.token_id!r} "
-                    f"during batch flush failure handling "
-                    f"(transform={fctx.transform.name!r}, node={fctx.node_id!r}). "
-                    f"Audit trail is INCOMPLETE — some buffered tokens may already "
-                    f"be terminalized while others remain BUFFERED. "
-                    f"Recorder failure: {type(record_failure).__name__}: {record_failure}. "
-                    f"Original flush error: {error_detail}"
-                ) from record_failure
-            with best_effort(
-                "TokenCompleted telemetry after batch-flush FAILED audit",
-                run_id=self._run_id,
-                token_id=token.token_id,
-                transform_node_id=fctx.node_id,
-                transform_name=fctx.transform.name,
-            ):
-                self._emit_token_completed(
-                    token,
-                    outcome=TerminalOutcome.FAILURE,
-                    path=TerminalPath.UNROUTED,
-                )
-            results.append(
-                RowResult(
-                    token=token,
-                    final_data=token.row_data,
-                    outcome=TerminalOutcome.FAILURE,
-                    path=TerminalPath.UNROUTED,
-                    error=failure,
-                )
+        return tuple(
+            RowResult(
+                token=token,
+                final_data=token.row_data,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error=failure,
             )
-
-        return tuple(results)
+            for token in fctx.buffered_tokens
+        )
 
     @staticmethod
     def _route_flush_error_to_sink(fctx: _FlushContext, error_detail: str) -> tuple[RowResult, ...]:
@@ -2075,9 +2038,20 @@ class RowProcessor:
                 )
             error_detail = str(result.reason)
             if settings.on_error == "discard":
-                flush_error = self._handle_flush_error(fctx, error_detail)
-                self._mark_buffered_scheduler_work_terminal(node_id, tuple(buffered_tokens))
-                return flush_error, []
+                # Discard matches the per-row discard (operator ruling B3):
+                # every member (FAILURE, QUARANTINED_AT_SOURCE), each terminal
+                # written in the same transaction that releases its BLOCKED
+                # row, with an error_hash that binds to the batch reason.
+                discarded_results, _no_handoffs = self._complete_aggregation_flush(
+                    node_id,
+                    self._discard_flush_error_members(fctx, error_detail),
+                    buffered_tokens,
+                    [],
+                    batch_id=batch_id,
+                    members_terminate=True,
+                    quarantine_error_hash=compute_error_hash(error_detail),
+                )
+                return discarded_results, []
             # Named sink: the whole batch goes to it. Every member moves
             # BLOCKED -> PENDING_SINK in place in ONE journal transaction; the
             # sink records each outcome after durability. No processor-side
@@ -2088,7 +2062,7 @@ class RowProcessor:
                 buffered_tokens,
                 [],
                 batch_id=batch_id,
-                output_was_empty=False,
+                members_terminate=False,
             )
             return routed_results, []
 
@@ -2111,7 +2085,7 @@ class RowProcessor:
                 buffered_tokens,
                 child_items,
                 batch_id=batch_id,
-                output_was_empty=result.rows == (),
+                members_terminate=result.rows == (),
             )
             return flush_results, child_items
         if settings.output_mode == OutputMode.TRANSFORM:
@@ -2122,7 +2096,7 @@ class RowProcessor:
                 buffered_tokens,
                 child_items,
                 batch_id=batch_id,
-                output_was_empty=result.rows == (),
+                members_terminate=result.rows == (),
             )
             return flush_results, child_items
         raise OrchestrationInvariantError(f"Unknown output_mode: {settings.output_mode}")
@@ -2140,8 +2114,8 @@ class RowProcessor:
 
         Engine buffers rows and calls transform.process(rows: list[dict])
         when the trigger fires. Flush handling is delegated to shared helpers
-        (_handle_flush_error, _route_flush_error_to_sink, _route_passthrough_results,
-        _route_transform_results).
+        (_discard_flush_error_members, _route_flush_error_to_sink,
+        _route_passthrough_results, _route_transform_results).
 
         TEMPORAL DECOUPLING:
 
@@ -4374,25 +4348,6 @@ class RowProcessor:
         if blocked_token_ids:
             self.mark_blocked_barrier_terminal(str(coalesce_name), blocked_token_ids, group_losses=group_losses)
 
-    def _mark_buffered_scheduler_work_terminal(
-        self,
-        node_id: NodeID,
-        tokens: Sequence[TokenInfo],
-    ) -> None:
-        """Mark scheduler work for aggregation-buffered tokens consumed by a FAILED flush.
-
-        Failure arm only (the flush produced no outputs to emit). Successful
-        flush completions go through ``_complete_aggregation_flush`` — ONE
-        atomic journal transition per barrier completion (F1/D6).
-        """
-        blocked_token_ids = tuple(token.token_id for token in tokens)
-        if not blocked_token_ids:
-            return
-        self.mark_blocked_barrier_terminal(
-            str(node_id),
-            blocked_token_ids,
-        )
-
     def _sink_emission_from_result(self, result: RowResult) -> BarrierEmission:
         """Build the sink-bound barrier emission for one flush output result.
 
@@ -4652,7 +4607,7 @@ class RowProcessor:
             list(fctx.buffered_tokens),
             child_items,
             batch_id=fctx.batch_id,
-            output_was_empty=not prepared.output_rows,
+            members_terminate=not prepared.output_rows,
         )
 
     def _load_committed_barrier_payload(
@@ -4740,14 +4695,25 @@ class RowProcessor:
         child_items: list[WorkItem],
         *,
         batch_id: str,
-        output_was_empty: bool,
+        members_terminate: bool,
+        quarantine_error_hash: str | None = None,
     ) -> tuple[tuple[RowResult, ...], frozenset[str]]:
         """Complete an aggregation flush as ONE atomic journal transition.
 
-        Serves every successful flush and the named-sink arm of a FAILED
-        flush (every member is a sink-bound ON_ERROR_ROUTED handoff, none is
-        consumed; the batch is FAILED, so the COMPLETED-receipt restore arms
-        below never see it).
+        Serves every successful flush and both arms of a FAILED flush: the
+        named-sink arm hands every member off as a sink-bound ON_ERROR_ROUTED
+        result (none consumed), and the discard arm terminates every member
+        (FAILURE, QUARANTINED_AT_SOURCE) here. The batch of a failed flush is
+        FAILED, so the COMPLETED-receipt restore arms below never see it.
+
+        ``members_terminate``: every buffered member's terminal is planned in
+        ``results`` and is written inside ``complete_barrier`` — an empty
+        successful output (filter-dropped / quarantined members) or a
+        discarded failed batch. ``quarantine_error_hash`` is the error_hash
+        every QUARANTINED_AT_SOURCE member of this completion carries: the
+        failed batch's reason hash on the discard arm. ``None`` derives the
+        per-ordinal ``quarantined_in_batch`` witness of a successful batch
+        that quarantined some members.
 
         Consumes the buffered tokens' BLOCKED rows and emits every sink-bound
         flush output as a durable PENDING_SINK row, plus every non-sink
@@ -4797,8 +4763,8 @@ class RowProcessor:
 
         consumed_token_ids = tuple(token.token_id for token in buffered_tokens if token.token_id not in emitted_token_ids)
         terminal_outcomes: list[BarrierTerminalOutcomeSpec] = []
-        if output_was_empty:
-            buffered_by_id = {token.token_id: token for token in buffered_tokens}
+        buffered_by_id = {token.token_id: token for token in buffered_tokens}
+        if members_terminate:
             terminal_results: dict[str, RowResult] = {}
             for result in results:
                 token_id = result.token.token_id
@@ -4806,22 +4772,24 @@ class RowProcessor:
                     continue
                 if token_id in terminal_results:
                     raise AuditIntegrityError(
-                        f"Empty aggregation flush for node {node_id!r} produced duplicate terminal plans for token_id={token_id!r}."
+                        f"Aggregation flush for node {node_id!r} produced duplicate terminal plans for token_id={token_id!r}."
                     )
                 terminal_results[token_id] = result
             if frozenset(terminal_results) != frozenset(buffered_by_id):
-                raise AuditIntegrityError(
-                    f"Empty aggregation flush for node {node_id!r} lacks an exact terminal plan for every batch member."
-                )
+                raise AuditIntegrityError(f"Aggregation flush for node {node_id!r} lacks an exact terminal plan for every batch member.")
             for ordinal, token in enumerate(buffered_tokens):
                 result = terminal_results[token.token_id]
                 if result.outcome is TerminalOutcome.SUCCESS and result.path is TerminalPath.FILTER_DROPPED:
                     error_hash = None
                 elif result.outcome is TerminalOutcome.FAILURE and result.path is TerminalPath.QUARANTINED_AT_SOURCE:
-                    error_hash = compute_error_hash(f"quarantined_in_batch:{batch_id}:{ordinal}")
+                    error_hash = (
+                        quarantine_error_hash
+                        if quarantine_error_hash is not None
+                        else compute_error_hash(f"quarantined_in_batch:{batch_id}:{ordinal}")
+                    )
                 else:
                     raise AuditIntegrityError(
-                        f"Empty aggregation flush for node {node_id!r} has illegal terminal plan "
+                        f"Aggregation flush for node {node_id!r} has illegal terminal plan "
                         f"({result.outcome!r}, {result.path!r}) for token_id={token.token_id!r}."
                     )
                 terminal_outcomes.append(
@@ -4865,7 +4833,7 @@ class RowProcessor:
 
         for terminal_outcome in terminal_outcomes:
             with best_effort(
-                "TokenCompleted telemetry after atomic empty batch-flush completion",
+                "TokenCompleted telemetry after atomic batch-flush member terminals",
                 run_id=self._run_id,
                 token_id=terminal_outcome.token_id,
                 transform_node_id=node_id,

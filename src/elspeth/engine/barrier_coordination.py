@@ -1875,11 +1875,11 @@ class BarrierRecoveryCoordinator:
                     scalars.aggregation[str(node_id)] if str(node_id) in scalars.aggregation else AggregationNodeScalars(None, None)
                 )
                 # ---- ADR-030 §E.3a aggregation reconcile (elspeth-55546a6fd6) ---
-                # A FAILED out-of-claim flush records terminal FAILURE/UNROUTED
-                # token_outcomes for every buffered token (_handle_flush_error)
-                # and THEN releases their BLOCKED scheduler rows in a SEPARATE
-                # transaction (_mark_buffered_scheduler_work_terminal). A crash
-                # between the two strands durable BLOCKED rows whose tokens are
+                # A flush whose cross-check raises a Tier-1 declaration-contract
+                # violation records terminal FAILURE/UNROUTED token_outcomes for
+                # every buffered token (RowProcessor._record_flush_violation) and
+                # the run then dies before any journal release. That strands
+                # durable BLOCKED rows whose tokens are
                 # already terminally failed: they carry NO live BUFFERED outcome,
                 # so _derive_restored_batch_id below would refuse loudly and
                 # brick EVERY resume attempt. Mirror the coalesce §E.3a holdless
@@ -1889,6 +1889,14 @@ class BarrierRecoveryCoordinator:
                 # tokens. A fully-reconciled node then falls through to the
                 # counter-only branch below ("flushes all FAILED" — exactly the
                 # state that branch already anticipates).
+                #
+                # A FAILED flush that returned its error has no such window
+                # since operator ruling B3: a discarded batch's
+                # (FAILURE, QUARANTINED_AT_SOURCE) terminals ride the same
+                # complete_barrier transaction that consumes its BLOCKED rows,
+                # and a batch routed to its on_error sink writes no
+                # processor-side terminal. So the reconcile stays scoped to
+                # (FAILURE, UNROUTED) and never needs the discard pair.
                 #
                 # A successful transform-mode flush may have committed its
                 # batch result and expanded children before complete_barrier.

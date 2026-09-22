@@ -249,13 +249,15 @@ def _read_jsonl(path: Any) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def _run_csv_batch_stats_pipeline(tmp_path: Any, *, on_error: str, trigger: str) -> tuple[Any, Any, Any, Any]:
+def _run_csv_batch_stats_pipeline(tmp_path: Any, *, on_error: str, trigger: str, db: Any | None = None) -> tuple[Any, Any, Any, Any]:
     """Real CSV source (observed) -> batch_stats aggregation -> JSON sinks.
 
     Built through the production assembly path (settings YAML ->
     instantiate_plugins_from_config -> ExecutionGraph.from_plugin_instances ->
     assemble_and_validate_pipeline_config -> Orchestrator), so the DAG builder
     wires (or refuses) the aggregation error edge exactly as ``elspeth run``.
+    ``db`` defaults to a file SQLite Landscape under ``tmp_path``; the
+    PostgreSQL proof passes its own.
     """
     from elspeth.cli_helpers import instantiate_plugins_from_config
     from elspeth.config_loading import load_settings_from_yaml_string
@@ -335,7 +337,8 @@ sinks:
         settings=settings,
         graph=graph,
     )
-    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    if db is None:
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
     return result, db, _read_jsonl(output_path), _read_jsonl(quarantine_path)
 
@@ -489,22 +492,27 @@ def test_wrong_typed_row_at_an_aggregation_routes_the_whole_batch_to_on_error(tr
 
 
 @pytest.mark.parametrize("trigger", ["count", "end_of_source"])
-def test_wrong_typed_row_at_a_discard_aggregation_records_every_member_without_routing(trigger: str, tmp_path: Any) -> None:
-    """Negative control for the route above: ``on_error: discard`` writes no
-    sink and no DIVERT, but still decides every member once and records, per
-    member, that the batch failed and why (transform_errors, destination
-    'discard'), with an error_hash that binds to the reason — not to a
-    constant shared by every failed batch."""
+def test_wrong_typed_row_at_a_discard_aggregation_quarantines_every_member_without_routing(trigger: str, tmp_path: Any) -> None:
+    """Negative control for the route above, and operator ruling B3.
+
+    ``on_error: discard`` writes no sink and no DIVERT, and matches the
+    per-row discard: every member is ``(failure, quarantined_at_source)`` —
+    counted quarantined, so a run whose every row was discarded is
+    COMPLETED_WITH_FAILURES exactly as for a per-row discard — with an
+    error_hash that binds to the batch reason (B4), not to a constant shared
+    by every failed batch. Each member still records that the batch failed and
+    why (transform_errors, destination 'discard'; B5).
+    """
     import json
 
     from elspeth.engine._error_hash import compute_error_hash
 
     result, db, output_rows, quarantine_rows = _run_csv_batch_stats_pipeline(tmp_path, on_error="discard", trigger=trigger)
 
-    assert result.status is RunStatus.FAILED
+    assert result.status is RunStatus.COMPLETED_WITH_FAILURES
     assert (result.rows_processed, result.rows_succeeded, result.rows_failed) == (3, 0, 3)
+    assert result.rows_quarantined == 3
     assert result.rows_routed_failure == 0
-    assert result.rows_quarantined == 0
     assert output_rows == []
     assert quarantine_rows == []
 
@@ -516,11 +524,11 @@ def test_wrong_typed_row_at_a_discard_aggregation_records_every_member_without_r
     for outcome in audit["outcomes"]:
         assert (outcome.outcome, outcome.path, outcome.sink_name, outcome.completed) == (
             TerminalOutcome.FAILURE.value,
-            TerminalPath.UNROUTED.value,
+            TerminalPath.QUARANTINED_AT_SOURCE.value,
             None,
             1,
         )
-        assert outcome.error_hash == compute_error_hash(str(reason), exception_type="TransformError")
+        assert outcome.error_hash == compute_error_hash(str(reason))
 
     assert audit["routing"] == []
     [failed_state] = audit["failed_states"]
