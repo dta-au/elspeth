@@ -110,6 +110,16 @@ interface ExecutionState {
   validationError: string | null;
   isExecuting: boolean;
   wsDisconnected: boolean;
+  /**
+   * The progress stream ended for good and will not reconnect, while the run
+   * was still live (polling audit 2026-09-22, finding 1). Distinguishes the
+   * two ways `wsDisconnected` becomes true: a transient drop the socket is
+   * retrying, versus a terminal close (1000/1011) after which this store's
+   * own REST recovery poll — not the socket — is what retires the run. The
+   * only consumer is the progress banner's copy, which must not promise a
+   * reconnect that is never coming.
+   */
+  wsStreamEnded: boolean;
   error: string | null;
   /** Last exact-state approval refusal from execute; also shown beside readiness. */
   pendingApproval: string | null;
@@ -121,9 +131,8 @@ interface ExecutionState {
    * 3s loadRuns loop) also records it when the poll observes the active run
    * terminal while progress still says in-flight — the WS-drop degraded
    * path must not silently reinstate the off-Run-tab silence this state
-   * exists to fix. Known gap: that poll only runs while the Run tab body is
-   * mounted, so a WS drop with the Run tab closed still surfaces the
-   * outcome only on the next Run-tab visit.
+   * exists to fix. With the Run tab closed, the store-owned recovery poll
+   * armed on a stream that ends for good (1000/1011) records it instead.
    */
   lastRunOutcome: RunOutcome | null;
   /**
@@ -173,6 +182,52 @@ interface ValidateOptions {
 let wsConnection: WebSocketConnection | null = null;
 let validationRequestSeq = 0;
 let executionRequestSeq = 0;
+
+/**
+ * Store-owned REST recovery for a run whose progress stream ended for good
+ * (polling audit 2026-09-22, finding 1).
+ *
+ * The socket does not reconnect after close codes 1000 and 1011, and the only
+ * other REST fallback — InlineRunResults' 3s loadRuns loop — unmounts with the
+ * Run tab. A server-side failure therefore left an off-tab run looking live
+ * until the next Run-tab visit. This timer lives beside wsConnection, in the
+ * store, precisely so it outlives any component: it retires itself as soon as
+ * loadRuns' degraded-path reconciliation observes the run terminal, when the
+ * tab stops following the run, when a new connection supersedes it, or on
+ * reset().
+ *
+ * It is deliberately NOT armed for the closes that reconnect — 1006, and 4503
+ * where the server reports a backend failure a later read may not hit — since
+ * the socket owns recovery there and a poll would only duplicate it. Nor for
+ * the terminal refusals (4001/4004), where polling could only repeat the
+ * refusal. 1011 is the remaining case: the server could read nothing, and
+ * retrying the same read would fail the same way, so REST is the only route
+ * left.
+ */
+const RUN_RECOVERY_POLL_INTERVAL_MS = 3000;
+let runRecoveryPollTimer: ReturnType<typeof setInterval> | null = null;
+// The read a recovery tick is still waiting on. A tick never starts a second
+// read while one is pending: this poll exists for a degraded server, where a
+// read can outlast the interval, and overlapping reads answer in whatever
+// order the network returns them — the same fault the composer pollers'
+// read tickets fix. Deliberately NOT cleared by stopRunRecoveryPoll, so a
+// read left over from a superseded poll still holds off the next one, and
+// only the read that set it may release it.
+//
+// Bounded by age because authFetch sets no timeout: a read that never
+// settles would otherwise stop recovery for good, which is worse than the
+// overlap it prevents. Past the bound a tick starts a fresh read anyway; the
+// late reply is then harmless, because loadRuns' reconciliation only ever
+// moves progress from live to terminal.
+const RUN_RECOVERY_READ_STALE_MS = 30_000;
+let runRecoveryPollInFlight: { read: Promise<unknown>; startedAt: number } | null = null;
+
+function stopRunRecoveryPoll(): void {
+  if (runRecoveryPollTimer !== null) {
+    clearInterval(runRecoveryPollTimer);
+    runRecoveryPollTimer = null;
+  }
+}
 
 function shouldApplyValidationResult(
   sessionId: string,
@@ -418,6 +473,7 @@ function applyRunEvent(
     runs: updatedRuns,
     lastRunOutcome,
     wsDisconnected: false,
+    wsStreamEnded: false,
   };
 }
 
@@ -443,6 +499,7 @@ const initialExecutionState = {
   validationError: null as string | null,
   isExecuting: false,
   wsDisconnected: false,
+  wsStreamEnded: false,
   error: null as string | null,
   pendingApproval: null as string | null,
   lastRunOutcome: null as RunOutcome | null,
@@ -747,7 +804,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   connectWebSocket(runId: string) {
     // Close any existing WebSocket connection
     wsConnection?.close();
-    set({ wsDisconnected: false });
+    // A live stream supersedes the previous stream's REST recovery.
+    stopRunRecoveryPoll();
+    set({ wsDisconnected: false, wsStreamEnded: false });
 
     const getTicket = async (): Promise<string> => {
       const response = await api.createRunWebSocketTicket(runId);
@@ -773,12 +832,55 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       }
     }
 
+    function runStillLive(): boolean {
+      const { activeRunId, progress } = get();
+      return (
+        activeRunId === runId &&
+        progress !== null &&
+        !isTerminalRunStatus(progress.status)
+      );
+    }
+
     wsConnection = connectToRun(runId, getTicket, {
       onConnected() {
-        set({ wsDisconnected: false });
+        stopRunRecoveryPoll();
+        set({ wsDisconnected: false, wsStreamEnded: false });
       },
       onDisconnected() {
-        set({ wsDisconnected: true });
+        set({ wsDisconnected: true, wsStreamEnded: false });
+      },
+      onStreamEnded() {
+        // Nothing will reconnect. A stream that ended on a run already known
+        // terminal owes nothing: the outcome is recorded and the banner is
+        // hidden, so leave the connection state clean rather than reporting a
+        // loss that did not happen.
+        if (!runStillLive()) return;
+        set({ wsDisconnected: true, wsStreamEnded: true });
+        stopRunRecoveryPoll();
+        runRecoveryPollTimer = setInterval(() => {
+          if (!runStillLive()) {
+            stopRunRecoveryPoll();
+            return;
+          }
+          if (
+            runRecoveryPollInFlight !== null &&
+            Date.now() - runRecoveryPollInFlight.startedAt < RUN_RECOVERY_READ_STALE_MS
+          ) {
+            return;
+          }
+          const sessionId = useSessionStore.getState().activeSessionId;
+          if (sessionId === null) return;
+          // loadRuns carries the degraded-path reconciliation that records
+          // the outcome and retires progress; the next tick then sees the
+          // terminal status and stops this poll. It never rejects (it maps
+          // every failure to "unavailable"), so the release always runs.
+          const read = get().loadRuns(sessionId);
+          const claim = { read, startedAt: Date.now() };
+          runRecoveryPollInFlight = claim;
+          void read.finally(() => {
+            if (runRecoveryPollInFlight === claim) runRecoveryPollInFlight = null;
+          });
+        }, RUN_RECOVERY_POLL_INTERVAL_MS);
       },
       onProgress(event: RunEvent, _data: RunEventProgress) {
         applyActiveRunEvent(event);
@@ -816,9 +918,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         useAuthStore.getState().logout();
       },
       onRunUnavailable() {
-        // Close code 4004 -- run not found or not owned.
+        // Close code 4004 -- run not found or not owned. A definitive
+        // refusal: polling REST could only repeat it.
+        stopRunRecoveryPoll();
         set({
           wsDisconnected: false,
+          wsStreamEnded: false,
           error: "Run is unavailable or you do not have access.",
         });
       },
@@ -888,9 +993,11 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         // terminal event was lost — record the outcome (stamped with the
         // LAUNCH session) and reconcile progress.status so the always-mounted
         // surfaces (toast, badge) and ProgressView retire instead of showing
-        // a live run forever. Known gap: this poll only runs while the Run
-        // tab body is mounted (InlineRunResults' 3s loop), so a WS drop with
-        // the Run tab closed still surfaces only on the next Run-tab visit.
+        // a live run forever. Two callers drive it: InlineRunResults' 3s loop
+        // while the Run tab body is mounted, and the store-owned recovery
+        // poll (see RUN_RECOVERY_POLL_INTERVAL_MS) armed when the stream ends
+        // for good on 1000/1011, which covers the Run tab being closed. A
+        // drop that reconnects (1006/4503) is recovered by the socket itself.
         const activeRow =
           state.activeRunId !== null
             ? runs.find((run) => run.id === state.activeRunId)
@@ -1085,6 +1192,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     executionRequestSeq += 1;
     wsConnection?.close();
     wsConnection = null;
+    stopRunRecoveryPoll();
     // runDisclosureAckBySession survives reset(): reset fires on every
     // session switch (hooks/useSession.ts), and the pre-run disclosure
     // opt-out is per composer session, not per activation. It is cleared

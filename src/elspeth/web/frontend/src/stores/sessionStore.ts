@@ -545,6 +545,20 @@ let composerProgressPollSeenNonTerminal = false;
 // loop) from stopping the pollers a newer same-session turn now owns.
 let composerProgressPollGeneration = 0;
 let inflightMessagesPollGeneration = 0;
+// Response ORDERING, which ownership generations cannot supply: both intervals
+// launch a read without awaiting the previous one, so several reads of the
+// same generation for the same session are in flight together and answer in
+// whatever order the network returns them. Every one of them passes the
+// ownership fence, so without this an older reply rolls the UI back over a
+// newer one — progress regressing from "complete" to "using tools", or a
+// message list erasing the reply the post-settle sync just brought in
+// (polling audit 2026-09-22, finding 3). Each read takes a monotone ticket
+// before its fetch and is applied only if no later ticket has been applied
+// already; the counters are global because the pollers are.
+let composerProgressReadTicket = 0;
+let composerProgressAppliedTicket = 0;
+let inflightMessagesReadTicket = 0;
+let inflightMessagesAppliedTicket = 0;
 let guidedPublicationGeneration = 0;
 // Exact owner of guidedResponsePending. Session identity is insufficient: an
 // old request for A can settle after A -> B -> A and otherwise clear the flag
@@ -1489,9 +1503,16 @@ interface SessionState {
   loadCompositionProposals: (sessionId?: string) => Promise<void>;
   acceptProposal: (proposalId: string) => Promise<void>;
   rejectProposal: (proposalId: string) => Promise<void>;
+  /**
+   * Omit ownerGeneration for the interval tick (fenced on the live poller
+   * claim, like loadInflightMessages). The owning turn's explicit post-stop
+   * read passes the generation its startComposerProgressPolling returned —
+   * that read runs AFTER the poller was deliberately stopped, so the stop is
+   * not a reason to drop it; only a newer turn claiming the poller is.
+   */
   loadComposerProgress: (
     sessionId?: string,
-    options?: { discardStaleTerminal?: boolean },
+    options?: { discardStaleTerminal?: boolean; ownerGeneration?: number },
   ) => Promise<void>;
   /**
    * The pollers are MODULE-GLOBAL singletons, so ownership must be
@@ -2387,9 +2408,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       get().stopInflightMessagesPolling(activeSessionId, inflightPollGeneration);
       get().stopComposerProgressPolling(activeSessionId, progressPollGeneration);
       // One-shot terminal pickup — only while this turn still owns the
-      // poller; a newer turn's own polling handles it otherwise.
+      // poller; a newer turn's own polling handles it otherwise. The
+      // generation goes THROUGH the read as well, because a newer turn can
+      // claim the poller during its await.
       if (progressPollGeneration === composerProgressPollGeneration) {
-        await get().loadComposerProgress(activeSessionId);
+        await get().loadComposerProgress(activeSessionId, {
+          ownerGeneration: progressPollGeneration,
+        });
       }
     }
   },
@@ -2585,17 +2610,52 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   async loadComposerProgress(
     sessionId?: string,
-    options?: { discardStaleTerminal?: boolean },
+    options?: { discardStaleTerminal?: boolean; ownerGeneration?: number },
   ) {
     const targetSessionId = sessionId ?? get().activeSessionId;
     if (!targetSessionId) return;
 
+    // Ownership fence (polling audit 2026-09-22, finding 2), two modes, the
+    // same shape loadInflightMessages already uses.
+    //
+    // Interval tick (ownerGeneration omitted): the poller claim is captured
+    // BEFORE the fetch and the reply applies only while that same claim is
+    // still live for this session. Stopped, rebound to another session, or
+    // reclaimed by a newer same-session turn all drop it — otherwise a tick
+    // started mid-turn lands after the turn's own final read and rolls the
+    // finished turn back to a non-terminal phase, with no poller left to
+    // repair it.
+    //
+    // Owning turn's explicit read (ownerGeneration = what its
+    // startComposerProgressPolling returned): it deliberately runs after the
+    // stop, so the poller being stopped must NOT drop it. Only the session
+    // changing, or a newer turn claiming the poller, does.
+    const pollGeneration = composerProgressPollGeneration;
+    const readTicket = ++composerProgressReadTicket;
     try {
       const progress = await api.fetchComposerProgress(targetSessionId);
       const current = get();
       if (current.activeSessionId !== targetSessionId) {
         return;
       }
+      if (options?.ownerGeneration === undefined) {
+        if (
+          composerProgressPollSessionId !== targetSessionId ||
+          composerProgressPollGeneration !== pollGeneration
+        ) {
+          return;
+        }
+      } else if (composerProgressPollGeneration !== options.ownerGeneration) {
+        return;
+      }
+      // Ordering, once ownership holds: a reply older than one already
+      // applied is stale by arrival, not by owner. Claimed before the
+      // content decision below so a discarded stale-terminal reply still
+      // retires the tickets beneath it.
+      if (readTicket <= composerProgressAppliedTicket) {
+        return;
+      }
+      composerProgressAppliedTicket = readTicket;
       const isTerminal = TERMINAL_COMPOSER_PROGRESS_PHASES.has(progress.phase);
       if (options?.discardStaleTerminal && isTerminal && !composerProgressPollSeenNonTerminal) {
         // Stale carry-over from the PREVIOUS turn's terminal snapshot,
@@ -2681,6 +2741,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // dropped only when the session is no longer active or a newer turn on
     // the SAME session has claimed the poller (that turn owns the sync now).
     const pollGeneration = inflightMessagesPollGeneration;
+    const readTicket = ++inflightMessagesReadTicket;
     try {
       const fresh = await api.fetchMessages(sessionId);
       if (get().activeSessionId !== sessionId) return null;
@@ -2696,6 +2757,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       ) {
         return null;
       }
+      // Ordering fence (finding 3). Both modes take a ticket: the owning
+      // turn's sync runs while the poller is still live, so a tick of the
+      // SAME generation can answer after it and pass every check above while
+      // carrying the list from before the final reply was persisted.
+      if (readTicket <= inflightMessagesAppliedTicket) {
+        return null;
+      }
+      inflightMessagesAppliedTicket = readTicket;
       set((s) => {
         if (s.activeSessionId !== sessionId) return s;
         const localOptimistic = s.messages.filter((m) =>
@@ -2927,9 +2996,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       get().stopInflightMessagesPolling(activeSessionId, inflightPollGeneration);
       get().stopComposerProgressPolling(activeSessionId, progressPollGeneration);
       // One-shot terminal pickup — only while this turn still owns the
-      // poller; a newer turn's own polling handles it otherwise.
+      // poller; a newer turn's own polling handles it otherwise. The
+      // generation goes THROUGH the read as well, because a newer turn can
+      // claim the poller during its await.
       if (progressPollGeneration === composerProgressPollGeneration) {
-        await get().loadComposerProgress(activeSessionId);
+        await get().loadComposerProgress(activeSessionId, {
+          ownerGeneration: progressPollGeneration,
+        });
       }
     }
   },
@@ -3888,9 +3961,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // One-shot terminal pickup — only while this turn still owns the
       // poller; a newer turn's own polling handles it otherwise. Mirrors
       // sendMessage/chatGuided's finally semantics, scoped to the session
-      // captured before the await.
+      // captured before the await, and re-checked inside the read itself.
       if (progressPollGeneration === composerProgressPollGeneration) {
-        await get().loadComposerProgress(requestedSessionId);
+        await get().loadComposerProgress(requestedSessionId, {
+          ownerGeneration: progressPollGeneration,
+        });
       }
     }
   },
@@ -4501,7 +4576,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // guidedChatPending flips the pending strip away.
       get().stopComposerProgressPolling(requestedSessionId, progressPollGeneration);
       if (progressPollGeneration === composerProgressPollGeneration) {
-        await get().loadComposerProgress(requestedSessionId);
+        await get().loadComposerProgress(requestedSessionId, {
+          ownerGeneration: progressPollGeneration,
+        });
       }
     }
   },

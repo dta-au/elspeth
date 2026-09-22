@@ -96,6 +96,7 @@ from elspeth.web.execution.schemas import (
     revalidated_with_discard_summary,
 )
 from elspeth.web.execution.secret_guard import SECRET_GUARD_ERROR_TYPE, ExecutionSecretApprovalRequired
+from elspeth.web.execution.websocket_close import TRANSIENT_BACKEND_FAILURES, RunStreamCloseCode
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.interpretation_state import InterpretationReviewIntegrityError
 from elspeth.web.middleware.rate_limit import get_rate_limiter
@@ -1627,20 +1628,20 @@ def create_execution_router() -> APIRouter:
         service: ExecutionService = websocket.app.state.execution_service
 
         if token is not None:
-            await websocket.close(code=4001, reason="Use a WebSocket ticket, not a session token")
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Use a WebSocket ticket, not a session token")
             return
         if ticket is None:
-            await websocket.close(code=4001, reason="Missing WebSocket ticket")
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Missing WebSocket ticket")
             return
         store = _get_websocket_ticket_store(websocket.app)
         user = await run_sync_in_worker(store.consume, ticket=ticket, run_id=run_id)
         if user is None:
-            await websocket.close(code=4001, reason="Invalid or expired WebSocket ticket")
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Invalid or expired WebSocket ticket")
             return
 
         await websocket.accept()
         if type(after_sequence) is not int or after_sequence < 0:
-            await websocket.close(code=4004, reason="Invalid run event cursor")
+            await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Invalid run event cursor")
             return
 
         reader = websocket.app.state.run_progress_reader
@@ -1654,7 +1655,7 @@ def create_execution_router() -> APIRouter:
         try:
             run_ownership = await service.verify_run_ownership(user, run_id)
             if not run_ownership:
-                await websocket.close(code=4004, reason="Run not found")
+                await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
                 return
         except RunSessionIntegrityError as integrity_exc:
             # Tier-1 sessions-DB corruption: an existing run references a
@@ -1674,11 +1675,13 @@ def create_execution_router() -> APIRouter:
                 )
             finally:
                 try:
-                    await websocket.close(code=1011, reason="Run ownership check failed internal integrity validation")
+                    await websocket.close(
+                        code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run ownership check failed internal integrity validation"
+                    )
                 finally:
                     raise integrity_exc
         except ValueError:
-            await websocket.close(code=4004, reason="Run not found")
+            await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
             return
 
         # Subscribe BEFORE checking terminal status to close the race
@@ -1693,7 +1696,7 @@ def create_execution_router() -> APIRouter:
             try:
                 current_snapshot = await _load_run_status_snapshot_with_accounting(UUID(run_id), app=websocket.app, service=service)
             except _RunStatusNotFoundError:
-                await websocket.close(code=4004, reason="Run not found")
+                await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
                 return
             except (ValidationError, _RunStatusIntegrityError) as integrity_exc:
                 # Tier-1 accounting projection failed integrity validation on
@@ -1712,7 +1715,9 @@ def create_execution_router() -> APIRouter:
                     )
                 finally:
                     try:
-                        await websocket.close(code=1011, reason="Run status failed internal accounting validation")
+                        await websocket.close(
+                            code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run status failed internal accounting validation"
+                        )
                     finally:
                         raise integrity_exc
             current = current_snapshot.response
@@ -1727,12 +1732,12 @@ def create_execution_router() -> APIRouter:
                 if replay_event.event_type in ("completed", "cancelled", "failed"):
                     replayed_terminal = True
             if replayed_terminal:
-                await websocket.close(code=1000)
+                await websocket.close(code=RunStreamCloseCode.NORMAL)
                 return
             if current.status in RUN_STATUS_TERMINAL_VALUES:
                 event = _build_terminal_run_event(current, cancelled_run_record=current_snapshot.record)
                 await websocket.send_json(event.model_dump(mode="json"))
-                await websocket.close(code=1000)
+                await websocket.close(code=RunStreamCloseCode.NORMAL)
                 return
             while True:
                 try:
@@ -1777,14 +1782,16 @@ def create_execution_router() -> APIRouter:
                             )
                         finally:
                             try:
-                                await websocket.close(code=1011, reason="Run status failed internal accounting validation")
+                                await websocket.close(
+                                    code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run status failed internal accounting validation"
+                                )
                             finally:
                                 raise integrity_exc
                     current = current_snapshot.response
                     if current.status in RUN_STATUS_TERMINAL_VALUES:
                         terminal_event = _build_terminal_run_event(current, cancelled_run_record=current_snapshot.record)
                         await websocket.send_json(terminal_event.model_dump(mode="json"))
-                        await websocket.close(code=1000)
+                        await websocket.close(code=RunStreamCloseCode.NORMAL)
                         break
                     continue
                 if event.event_sequence is not None and event.event_sequence <= max_replayed_sequence:
@@ -1795,18 +1802,25 @@ def create_execution_router() -> APIRouter:
                 # "error" events are non-terminal (per-row exceptions).
                 # "completed", "cancelled", and "failed" are terminal.
                 if event.event_type in ("completed", "cancelled", "failed"):
-                    await websocket.close(code=1000)
+                    await websocket.close(code=RunStreamCloseCode.NORMAL)
                     break
         except WebSocketDisconnect:
             pass  # Client disconnected — fall through to finally
         except (ConnectionError, OSError) as exc:
+            # Not split into BACKEND_UNAVAILABLE. This arm cannot see a backend
+            # outage: the only database read in the loop above is
+            # `_load_run_status_snapshot_with_accounting`, which raises
+            # SQLAlchemyError and so escapes past here entirely. What lands
+            # here is `send_json` to a socket the client has already dropped,
+            # which is why the close below is itself wrapped -- there is
+            # usually no longer a peer to receive any code at all.
             slog.error(
                 "websocket_handler_error",
                 run_id=run_id,
                 error=str(exc),
             )
             try:
-                await websocket.close(code=1011, reason="Internal server error")
+                await websocket.close(code=RunStreamCloseCode.INTERNAL_ERROR, reason="Internal server error")
             except (WebSocketDisconnect, ConnectionError, OSError) as close_err:
                 slog.error("websocket_close_failed", run_id=run_id, error=str(close_err))
         finally:
@@ -2107,14 +2121,14 @@ async def _poll_durable_run_progress(
                 reader.read_after, identity_id=user.user_id, run_id=parsed_run_id, after_sequence=after_sequence
             )
             if records is None:
-                await websocket.close(code=4004, reason="Run not found")
+                await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
                 return
             for record in records:
                 event = _run_event_from_record(record)
                 await websocket.send_json(event.model_dump(mode="json"))
                 after_sequence = record.sequence
                 if event.event_type in ("completed", "cancelled", "failed"):
-                    await websocket.close(code=1000)
+                    await websocket.close(code=RunStreamCloseCode.NORMAL)
                     return
             if records:
                 # Drain all committed pages before considering a fallback.
@@ -2130,13 +2144,13 @@ async def _poll_durable_run_progress(
                     reader.read_after, identity_id=user.user_id, run_id=parsed_run_id, after_sequence=after_sequence
                 )
                 if final_records is None:
-                    await websocket.close(code=4004, reason="Run not found")
+                    await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
                     return
                 if final_records:
                     continue
                 terminal = _build_terminal_run_event(snapshot.response, cancelled_run_record=snapshot.record)
                 await websocket.send_json(terminal.model_dump(mode="json"))
-                await websocket.close(code=1000)
+                await websocket.close(code=RunStreamCloseCode.NORMAL)
                 return
             await asyncio.sleep(0.25)
     except WebSocketDisconnect:
@@ -2146,14 +2160,26 @@ async def _poll_durable_run_progress(
             slog.error("websocket_run_status_integrity_error", run_id=run_id, phase="durable_poll", exc_class=type(exc).__name__)
         finally:
             try:
-                await websocket.close(code=1011, reason="Run progress failed internal integrity validation")
+                await websocket.close(code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run progress failed internal integrity validation")
             finally:
                 raise
     except ValueError:
-        await websocket.close(code=4004, reason="Invalid run event cursor")
+        await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Invalid run event cursor")
+    except TRANSIENT_BACKEND_FAILURES as exc:
+        # MUST stay above the broad arm below, which would otherwise shadow it:
+        # every member of this tuple is a SQLAlchemyError subclass, so writing
+        # the arms the other way round leaves this one permanently unreachable
+        # while the code still compiles and still closes the socket -- just
+        # with the wrong code, and with no client able to tell. The ordering is
+        # pinned behaviourally in tests/unit/web/execution/test_websocket.py.
+        try:
+            slog.error("websocket_run_progress_backend_unavailable", run_id=run_id, exc_class=type(exc).__name__)
+        finally:
+            await websocket.close(code=RunStreamCloseCode.BACKEND_UNAVAILABLE, reason="Run progress temporarily unavailable")
+        raise
     except (SQLAlchemyError, ConnectionError, OSError) as exc:
         try:
             slog.error("websocket_handler_error", run_id=run_id, exc_class=type(exc).__name__)
         finally:
-            await websocket.close(code=1011, reason="Run progress unavailable")
+            await websocket.close(code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run progress unavailable")
         raise

@@ -22,6 +22,7 @@ from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.coordination.composer_progress_authority import ComposerProgressIdentityInactive
 from elspeth.web.coordination.contracts import (
     FenceLossReason,
     SessionOperationContext,
@@ -873,7 +874,15 @@ def register_session_routes(router: APIRouter) -> None:
         is the right surface for inspecting a terminal outcome.
         """
         registry = _get_composer_progress_registry(request)
-        snapshots = await registry.list_active(user_id=str(user.user_id))
+        # The durable authority re-checks the committed identity inside its
+        # own snapshot; an identity disabled after authentication is denied
+        # there and answered with the same opaque 401 the per-request token
+        # check gives a revoked principal (auth/session_token.py), not a
+        # server error.
+        try:
+            snapshots = await registry.list_active(user_id=str(user.user_id))
+        except ComposerProgressIdentityInactive:
+            raise HTTPException(status_code=401, detail="Invalid token") from None
         return list(snapshots)
 
     @router.get("/{session_id}", response_model=SessionResponse)

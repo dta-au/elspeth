@@ -11332,6 +11332,54 @@ class TestComposerProgressRoutes:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_progress_endpoint_translates_identity_revoked_between_checks(self, tmp_path) -> None:
+        """An identity disabled after auth but before the authority's snapshot is a 401, not a 500.
+
+        The durable authority re-checks the committed identity and ownership
+        state inside its own snapshot and denies with a typed
+        ``PermissionError``; the route owns translating that expected
+        concurrent access change into the same non-disclosing responses the
+        earlier checks give (elspeth polling audit 2026-09-22, finding 4).
+        """
+        from elspeth.web.coordination.composer_progress_authority import ComposerProgressIdentityInactive
+
+        app, service = _make_progress_route_app(tmp_path)
+
+        class _RevokingRegistry:
+            async def get_latest(self, session_id: str, user_id: str) -> Any:
+                raise ComposerProgressIdentityInactive("Composer progress identity is inactive")
+
+        app.state.composer_progress_registry = _RevokingRegistry()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get(f"/api/sessions/{service.session.id}/composer-progress")
+
+        # The same opaque answer the per-request token check gives a revoked
+        # principal (auth/session_token.py): this endpoint must not tell a
+        # revoked user more than every other endpoint does.
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Invalid token"
+
+    @pytest.mark.asyncio
+    async def test_progress_endpoint_translates_session_archived_between_checks(self, tmp_path) -> None:
+        """A session archived after the route's ownership check is a 404, matching the earlier check."""
+        from elspeth.web.coordination.composer_progress_authority import ComposerProgressSessionUnavailable
+
+        app, service = _make_progress_route_app(tmp_path)
+
+        class _ArchivedRegistry:
+            async def get_latest(self, session_id: str, user_id: str) -> Any:
+                raise ComposerProgressSessionUnavailable("Composer progress session is unavailable")
+
+        app.state.composer_progress_registry = _ArchivedRegistry()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get(f"/api/sessions/{service.session.id}/composer-progress")
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Session not found"
+
+    @pytest.mark.asyncio
     async def test_send_message_marks_terminal_progress_with_user_message_id(self, tmp_path) -> None:
         app, service = _make_progress_route_app(tmp_path)
         composer = _ProgressAwareComposer()
@@ -11650,6 +11698,25 @@ class TestComposerInFlightEndpoint:
 
         assert resp.status_code == 200
         assert resp.json() == []
+
+    @pytest.mark.asyncio
+    async def test_active_list_translates_identity_revoked_between_checks(self, tmp_path) -> None:
+        """An identity disabled after auth but before the authority's read is a 401, not a 500."""
+        from elspeth.web.coordination.composer_progress_authority import ComposerProgressIdentityInactive
+
+        app, _ = _make_progress_route_app(tmp_path)
+
+        class _RevokingRegistry:
+            async def list_active(self, *, user_id: str) -> Any:
+                raise ComposerProgressIdentityInactive("Composer progress identity is inactive")
+
+        app.state.composer_progress_registry = _RevokingRegistry()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/api/sessions/_active")
+
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Invalid token"
 
     @pytest.mark.asyncio
     async def test_route_path_does_not_collide_with_session_id_route(self, tmp_path) -> None:

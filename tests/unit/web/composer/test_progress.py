@@ -712,3 +712,60 @@ async def test_database_admission_cancellation_joins_and_releases_exact_request(
         cleaned.set()
         await asyncio.gather(task, return_exceptions=True)
         engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_database_finish_request_survives_caller_cancellation_while_queued(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancelling the lifecycle teardown cannot discard a queued exact-token deletion.
+
+    Ordinary worker submissions are cancelled while still queued when their
+    caller abandons them; ``finish_request`` is the one teardown that must run
+    regardless, otherwise the lease row lingers until expiry and progress keeps
+    reporting live work after the request has already unwound.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from sqlalchemy import create_engine
+
+    from elspeth.web import async_workers
+    from elspeth.web.composer.progress import ComposerRequestLease
+    from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry, SessionComposerProgressAuthority
+
+    engine = create_engine("postgresql+psycopg://localhost/composer_cancellation_test")
+    authority = SessionComposerProgressAuthority(engine, owner_instance_id="replica")
+    registry = DatabaseComposerProgressRegistry(authority)
+    lease = ComposerRequestLease(request_token="request-token", session_id="session", user_id="user")
+    occupant_release = Event()
+    released: list[ComposerRequestLease] = []
+
+    def end(request_lease: ComposerRequestLease) -> None:
+        released.append(request_lease)
+
+    monkeypatch.setattr(authority, "end_request", end)
+    # A private one-thread pool whose only thread is held busy, so the
+    # cleanup submission sits in the queue where caller cancellation can
+    # reach it. The process-wide pool is not touched.
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="finish-request-test")
+    monkeypatch.setattr(async_workers, "_SHARED_EXECUTOR", executor)
+    occupant = executor.submit(lambda: occupant_release.wait(10))
+
+    task = asyncio.create_task(registry.finish_request(lease))
+    try:
+        async with asyncio.timeout(10):
+            while async_workers.outstanding_admissions() < 1:
+                await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done(), "teardown exited before the queued exact-token cleanup ran"
+        occupant_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert released == [lease]
+    finally:
+        occupant_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        occupant.result(10)
+        executor.shutdown(wait=True)
+        engine.dispose()
