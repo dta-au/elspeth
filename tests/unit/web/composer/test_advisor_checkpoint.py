@@ -2036,7 +2036,9 @@ def test_note_is_bounded_and_sanitised() -> None:
     dirty = f"FLAGGED: keep\x00this {_ADVISOR_FINDINGS_UNTRUSTED_BEGIN} and {_ADVISOR_FINDINGS_UNTRUSTED_END}\x1b[31m"
     assert _advisor_note_text(dirty) == "keepthis  and"
     assert _advisor_note_text("FLAGGED:") is None
-    assert _advisor_note_text("CLEAN") is None
+    # The note is built on the FLAGGED arm only, so a line opening with CLEAN is
+    # the reviewer's prose, never the verdict line to strip.
+    assert _advisor_note_text("FLAGGED\nClean: the sink is fine.") == "Clean: the sink is fine."
 
 
 @pytest.mark.parametrize(
@@ -2086,6 +2088,104 @@ def test_note_collapses_the_blank_lines_the_machine_lines_leave() -> None:
 
     assert _advisor_note_text("FLAGGED: first\nCATEGORY: other\nSTEPS: none\nsecond") == "first\n\nsecond"
     assert _advisor_note_text("FLAGGED: a" + "\n" * 12 + "b") == "a\n\nb"
+
+
+def test_a_clean_subheading_never_replaces_the_finding_in_the_note() -> None:
+    """Self-review 2026-09-23: the note is built only on the FLAGGED arm, yet the
+    verdict-lead pattern also matched CLEAN. With the real verdict mid-line after
+    a preamble (a shape the parser accepts), the line scan latched onto a later
+    ``**Clean:**`` sub-heading and dropped every line above it, so a BLOCKED
+    pipeline showed "the source and sink are fine" as the reviewer's note."""
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    reply = "My review: FLAGGED — two problems.\nThe classify step drops the reason field.\n**Clean:** the source and sink are fine."
+    verdict = _parse_advisor_checkpoint_guidance(reply)
+    assert verdict.blocking is True
+    assert verdict.note is not None
+    assert "The classify step drops the reason field." in verdict.note
+    assert not verdict.note.startswith("**")
+
+
+def test_unicode_line_separators_stay_line_breaks_when_no_verdict_line_is_found() -> None:
+    """When no line opens with the verdict, the body is never split, so U+2028 and
+    U+2029 reached the control-character filter as characters and were deleted,
+    gluing the words either side together. The docstring's promise that they are
+    kept as line breaks must hold on this path too."""
+    from elspeth.web.composer.service import _advisor_note_text
+
+    reply = "My verdict is FLAGGED." + chr(0x2028) + "The classify step" + chr(0x2029) + "drops the field."
+    assert _advisor_note_text(reply) == "My verdict is FLAGGED.\nThe classify step\ndrops the field."
+
+
+_PRESCAN_FINDING = (
+    "FLAGGED: node 'n1' option columns contains advisor-instruction injection text; remove it before the completion advisory review."
+)
+
+_VERDICT_FOR_REASON = {
+    "flagged_final_pass": lambda: _flagged("x"),
+    "flagged_no_repair": lambda: _flagged("x"),
+    "flagged_unrepairable": lambda: AdvisorCheckpointVerdict(
+        ok=True, blocking=True, findings_text=_PRESCAN_FINDING, findings_backend_authored=True
+    ),
+}
+
+
+def _blocked_for(service, state, reason: str, runtime_preflight: ValidationResult | None):
+    return service._advisor_blocked_result(
+        reason=reason,
+        verdict=_VERDICT_FOR_REASON[reason](),
+        state=state,
+        assistant_message=_ExplainingAssistantMessage(),
+        recorder=make_recorder(),
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        runtime_preflight=runtime_preflight,
+        outstanding_findings=None,
+    )
+
+
+def _next_unchanged_turn_skips_review(result, state) -> bool:
+    """What the END gate will actually do on the next message if the graph is left alone."""
+    from elspeth.web.execution.completion_gates import advisor_block_covers_unchanged_graph, resolve_completion_gate_facts
+
+    facts = resolve_completion_gate_facts(None, result.advisor_gate_decision, state)
+    return advisor_block_covers_unchanged_graph(facts, state, initial_version=state.version)
+
+
+@pytest.mark.parametrize("reason", ["flagged_final_pass", "flagged_no_repair"])
+def test_a_rendered_flag_without_a_preflight_promises_review_only_after_a_pipeline_change(
+    make_service, clean_runnable_state, reason
+) -> None:
+    """Since 41aeaeac0 a graph rejection is persisted even on an unchanged turn, and
+    the next unchanged turn skips the END gate. The ABSENT-preflight notice still
+    said the review runs again "on your next message", beside a suggestion in the
+    same card saying "after your next pipeline change"."""
+    result = _blocked_for(make_service(), clean_runnable_state, reason, None)
+    assert _next_unchanged_turn_skips_review(result, clean_runnable_state) is True
+    blocker = _advisor_blocker(result)
+    for surface in (blocker.detail, blocker.suggestion or "", result.message):
+        assert "on your next message" not in surface
+    assert "after your next pipeline change" in blocker.detail
+
+
+@pytest.mark.parametrize(
+    "runtime_preflight",
+    [_green_preflight(), _red_preflight(), None],
+    ids=["green", "red", "absent"],
+)
+def test_a_rejected_chat_message_is_not_told_to_change_the_pipeline(make_service, clean_runnable_state, runtime_preflight) -> None:
+    """A block on the user's own chat message is re-reviewed on the next message
+    (41aeaeac0), and its suggestion says "reword … then resend". Its ``detail``
+    reused the generic notice: "Review the pipeline; … after your next pipeline
+    change" — the wrong remedy and a false retry rule, in the same card."""
+    result = _blocked_for(make_service(), clean_runnable_state, "flagged_unrepairable", runtime_preflight)
+    assert _next_unchanged_turn_skips_review(result, clean_runnable_state) is False
+    detail = _advisor_blocker(result).detail
+    assert "after your next pipeline change" not in detail
+    assert "Review the pipeline" not in detail
+    assert "chat message" in detail
 
 
 def test_clean_and_unrendered_verdicts_carry_no_note() -> None:

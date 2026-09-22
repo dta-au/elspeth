@@ -426,6 +426,7 @@ _compose_advisor_signoff_unrepairable_red_message = _no_tool_policy.compose_advi
 _compose_advisor_signoff_flagged_red_message = _no_tool_policy.compose_advisor_signoff_flagged_red_message
 _compose_advisor_signoff_unrendered_red_message = _no_tool_policy.compose_advisor_signoff_unrendered_red_message
 _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE
+_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER = _no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
 _compose_advisor_pending_handoff_message = _no_tool_policy.compose_advisor_pending_handoff_message
 _compose_interpretation_review_handoff_message = _no_tool_policy.compose_interpretation_review_handoff_message
 _advisor_signoff_pending_handoff_wording = _no_tool_policy.advisor_signoff_pending_handoff_wording
@@ -11062,8 +11063,12 @@ def _strip_note_control_characters(text: str) -> str:
 # rather than pre-stripping the line is what keeps underscores in the prose:
 # ``_ADVISOR_MARKDOWN_EMPHASIS_RE`` would delete them from step ids and from
 # the fence sentinels this function still has to find.
+# FLAGGED only (self-review 2026-09-23): a note is built on the FLAGGED arm
+# alone, so a line opening with CLEAN is never the verdict. Matching it let a
+# ``**Clean:** the source is fine`` sub-heading stand in for a mid-line
+# verdict, dropping the actual finding above it from the note.
 _ADVISOR_NOTE_VERDICT_LEAD_RE: Final[re.Pattern[str]] = re.compile(
-    r"^[*_`~\s]*(?:verdict\s*[:\-]\s*)?[*_`~\s]*(?:CLEAN|FLAGGED)[*_`~]*\s*(?:[:.\-" + chr(0x2013) + chr(0x2014) + r"]\s*|$)",
+    r"^[*_`~\s]*(?:verdict\s*[:\-]\s*)?[*_`~\s]*FLAGGED[*_`~]*\s*(?:[:.\-" + chr(0x2013) + chr(0x2014) + r"]\s*|$)",
     re.IGNORECASE,
 )
 # Three or more newlines collapse to a blank line (final review M-3/M-1):
@@ -11093,7 +11098,10 @@ def _advisor_note_text(findings_text: str) -> str | None:
     note then agree, which is the property I-2 is about.
     """
     lines = findings_text.strip().splitlines()
-    body = findings_text.strip()
+    # Rejoined with ``\n`` even when no verdict line is found below: the raw
+    # text would carry U+2028/U+2029 to the control filter, which deletes them
+    # and glues the words either side together.
+    body = "\n".join(lines)
     for index, raw_line in enumerate(lines):
         if _ADVISOR_NOTE_VERDICT_LEAD_RE.match(raw_line.strip()) is None:
             continue
@@ -11362,8 +11370,16 @@ def _advisor_signoff_blocked_wording(
         # This wording pair serves the RED and ABSENT builders, where an
         # affirmative "no pipeline change is needed" is false or unknowable;
         # that claim lives solely in the GREEN chat notice.
+        # Self-review 2026-09-23: ``detail`` names the chat message, not the
+        # shared ``notice``. That notice says "Review the pipeline" and states a
+        # retry rule for graph rejections — the wrong remedy, and false here: a
+        # message rejection is re-reviewed on the next message (the END gate's
+        # unchanged-graph skip covers graph rejections only), which is what the
+        # suggestion below tells the user to do.
         return (
-            f"{notice} {findings}" if findings_backend_authored and findings else notice,
+            f"{_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER} {findings}"
+            if findings_backend_authored and findings
+            else _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER,
             "Reword your chat message to avoid text that reads as instructions to the reviewer, then resend.",
         )
     if reason in {"flagged_final_pass", "flagged_no_repair"}:

@@ -757,18 +757,19 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
 
 
 # Ruling 2026-09-22 (elspeth-032ec69c41): the END gate stands aside for an
-# unchanged graph whose prior state row already carries a blocked fact, so a
-# block that PERSISTED is re-reviewed only after the next pipeline change. A
-# fact persists only with a new state row, which only a mutating turn writes;
-# the ABSENT-preflight ("not re-verified this turn") notices are emitted only
-# on unchanged turns, so those blocks persist nothing and the review genuinely
-# runs again on the next message. Each family's copy must say its own truth.
-_NOTICES_FOR_A_PERSISTED_BLOCK = (
+# unchanged graph whose prior state row carries a GRAPH REJECTION, so that
+# block is re-reviewed only after the next pipeline change. Since 41aeaeac0 a
+# decision persists even on an unchanged turn, so the retry rule follows the
+# block's CAUSE, not whether this turn moved the graph: every rendered-flag
+# notice (the ABSENT "not re-verified" one included) says "after your next
+# pipeline change"; unrendered verdicts and message rejections are
+# re-reviewed on the next message. Each cause's copy must say its own truth.
+_NOTICES_FOR_A_GRAPH_REJECTION = (
     no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
     no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER,
-)
-_NOTICES_FOR_AN_UNCHANGED_TURN_BLOCK = (
     no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
+)
+_NOTICES_RE_REVIEWED_ON_THE_NEXT_MESSAGE = (
     no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE,
     no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE,
     no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE,
@@ -778,8 +779,8 @@ _NOTICES_FOR_AN_UNCHANGED_TURN_BLOCK = (
 )
 
 
-@pytest.mark.parametrize("notice", _NOTICES_FOR_A_PERSISTED_BLOCK)
-def test_persisted_block_notice_promises_a_review_after_a_pipeline_change(notice: str) -> None:
+@pytest.mark.parametrize("notice", _NOTICES_FOR_A_GRAPH_REJECTION)
+def test_graph_rejection_notice_promises_a_review_after_a_pipeline_change(notice: str) -> None:
     assert "after your next pipeline change" in notice
     assert "on your next message" not in notice
     # A retry on an unchanged graph now hits the skip, so no persisted-block
@@ -787,8 +788,8 @@ def test_persisted_block_notice_promises_a_review_after_a_pipeline_change(notice
     assert "Retry the request" not in notice
 
 
-@pytest.mark.parametrize("notice", _NOTICES_FOR_AN_UNCHANGED_TURN_BLOCK)
-def test_unchanged_turn_block_notice_promises_a_review_on_the_next_message(notice: str) -> None:
+@pytest.mark.parametrize("notice", _NOTICES_RE_REVIEWED_ON_THE_NEXT_MESSAGE)
+def test_re_reviewed_notice_promises_a_review_on_the_next_message(notice: str) -> None:
     assert "on your next message" in notice
     assert "pipeline change" not in notice
 
