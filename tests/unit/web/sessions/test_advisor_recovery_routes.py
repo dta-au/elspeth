@@ -8,10 +8,12 @@ from httpx import ASGITransport, AsyncClient
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorGatePassed, AdvisorSignoffGateFact
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalKind, TerminalReason, TerminalState
-from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.completion_gates import (
+    ADVISOR_SIGNOFF_PENDING_DETAIL,
     CompletionGateFacts,
+    advisor_block_covers_unchanged_graph,
     completion_gate_fingerprint,
     completion_gates_meta_from_facts,
     merge_completion_gates,
@@ -21,6 +23,79 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.unit.web.sessions.test_completion_gate_roundtrip import _green_result
 from tests.unit.web.sessions.test_routes import _make_app, _make_authoring_valid_partial
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["messages", "recompose"])
+@pytest.mark.parametrize(
+    "patch", [{"name": "Renamed intent"}, {"description": "Different stated intent"}, {}], ids=["name", "description", "unchanged"]
+)
+async def test_metadata_recovery_save_does_not_reattribute_prior_advisor_note(tmp_path, route, patch):
+    app, service = _make_app(tmp_path)
+    session = await service.create_session("alice", "Metadata recovery", "local")
+    reviewed = _make_authoring_valid_partial("metadata-recovery")
+    facts = CompletionGateFacts(
+        advisor_signoff=AdvisorSignoffGateFact(
+            detail="The reviewed intent does not match the pipeline.",
+            suggestion="Revise the stated intent.",
+            note="The pipeline does not perform the requested transformation.",
+            for_graph=completion_gate_fingerprint(reviewed),
+            cause=AdvisorBlockCause.GRAPH_REJECTED,
+        )
+    )
+    state_d = reviewed.to_dict()
+    await service.save_composition_state(
+        session.id,
+        CompositionStateData(
+            sources=state_d["sources"],
+            nodes=state_d["nodes"],
+            edges=state_d["edges"],
+            outputs=state_d["outputs"],
+            metadata_=state_d["metadata"],
+            is_valid=True,
+            validation_errors=None,
+            composer_meta={"completion_gates": completion_gates_meta_from_facts(facts)},
+        ),
+        provenance="session_seed",
+    )
+    before = await service.get_current_state(session.id)
+    assert before is not None
+
+    class InterruptedComposer:
+        async def compose(self, message, chat_messages, state: CompositionState, **kwargs):
+            del message, chat_messages
+            assert kwargs["completion_gates"] == facts
+            # Production metadata mutation increments the version. The turn
+            # then fails before adjudication and the route saves its partial state.
+            raise ComposerConvergenceError(max_turns=5, budget_exhausted="composition", partial_state=state.with_metadata(patch))
+
+    app.state.composer_service = InterruptedComposer()
+    if route == "recompose":
+        await service.add_message(session.id, "user", "Revise the intent", writer_principal="route_user_message")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/sessions/{session.id}/{route}",
+            **({"json": {"content": "Revise the intent"}} if route == "messages" else {}),
+        )
+    assert response.status_code == 422, response.text
+    after = await service.get_current_state(session.id)
+    assert after is not None
+    assert after.id != before.id
+    assert after.version == before.version + 1
+    assert response.json()["detail"]["partial_state"]["id"] == str(after.id)
+    rebuilt = state_from_record(after)
+    assert rebuilt.metadata == reviewed.with_metadata(patch).metadata
+    reloaded_facts = parse_completion_gates(after.composer_meta)
+    assert reloaded_facts == facts
+    result = merge_completion_gates(_green_result(), reloaded_facts, rebuilt)
+    assert result.readiness.completion_ready is False
+    (blocker,) = result.readiness.blockers
+    assert facts.advisor_signoff is not None
+    assert blocker.detail == (ADVISOR_SIGNOFF_PENDING_DETAIL if patch else facts.advisor_signoff.detail)
+    assert blocker.note == (None if patch else facts.advisor_signoff.note)
+    assert blocker.suggestion == (None if patch else facts.advisor_signoff.suggestion)
+    # The next unchanged turn must not skip review of the changed intent.
+    assert advisor_block_covers_unchanged_graph(reloaded_facts, rebuilt, initial_version=rebuilt.version) is (not patch)
 
 
 @pytest.mark.asyncio
