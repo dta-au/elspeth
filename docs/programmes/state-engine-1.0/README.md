@@ -23,6 +23,18 @@ verbatim in `tracker-rows.json` alongside this file — nothing was summarised a
 
 The epic is already the flattened form of a cancelled milestone/phase/step tree (elspeth-4b3d734e3a). It absorbed four proof-cohort steps, the final assessment step, and all 13 open '[state engine]' tasks and bugs.
 
+## A note on the `elspeth-…` identifiers
+
+The identifiers below are rows from **filigree**, the internal tracker ELSPETH used
+before moving to GitHub Issues. They are opaque local ids: they name nothing outside that
+tracker, and the tracker is being retired.
+
+They are kept here deliberately, because this folder exists to preserve the provenance of
+work whose tracker rows were closed — the id is the link between a closed row and the
+content that replaced it. They should **not** appear in GitHub issue bodies, where they
+would read as a dangling reference to a system a reader cannot see;
+`docs/github-issues/check_issues.py` blocks them there for that reason.
+
 ## Scope
 
 Closed container rows: `elspeth-1040aa2143` (epic) and 6 children.
