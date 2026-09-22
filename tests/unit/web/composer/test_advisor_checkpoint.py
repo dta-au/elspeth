@@ -1716,6 +1716,23 @@ def test_unknown_step_ids_are_dropped_from_the_header(make_service, clean_runnab
     assert "ghost_step" not in detail and "DROP TABLE" not in detail
 
 
+def test_header_falls_back_to_other_for_a_category_outside_the_closed_set() -> None:
+    """Characterisation pin for the explicit fallback in ``_advisor_flagged_header``.
+
+    The parser normalises the category, so this branch is unreachable from the
+    END gate; it exists because the wording helper takes a plain ``str``. The
+    fallback is written out rather than hidden in a ``dict.get`` default
+    (trust-tier R1), and this pins that an unknown category still yields the
+    generic sentence rather than raising on a user-facing surface.
+    """
+    from elspeth.web.composer.service import _advisor_flagged_header
+
+    assert _advisor_flagged_header("vibes", ()) == "The reviewer flagged this pipeline."
+    assert _advisor_flagged_header("error_handling", ("a", "b")) == (
+        "The reviewer flagged how failures are handled. Steps named by the reviewer: a, b."
+    )
+
+
 def test_no_valid_step_ids_means_no_step_sentence(make_service, clean_runnable_state) -> None:
     result = _blocked(make_service(), clean_runnable_state, _flagged("x", category="other", steps=("ghost",)), _green_preflight())
     detail = _advisor_blocker(result).detail

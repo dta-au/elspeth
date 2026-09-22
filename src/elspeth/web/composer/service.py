@@ -10834,8 +10834,18 @@ def _validated_advisor_step_ids(state: CompositionState, raw: Sequence[str]) -> 
 
 
 def _advisor_flagged_header(category: str, step_ids: Sequence[str]) -> str:
-    """The backend-authored header sentence(s) for a rendered FLAG."""
-    header = _ADVISOR_CATEGORY_HEADERS.get(category, _ADVISOR_CATEGORY_HEADERS["other"])
+    """The backend-authored header sentence(s) for a rendered FLAG.
+
+    The parser already normalises ``category`` into
+    :data:`ADVISOR_FINDING_CATEGORIES`, but this function is reachable with a
+    plain ``str`` from the wording helper's default, so the fall back to
+    "other" is written out rather than hidden in a ``dict.get`` default: an
+    unrecognised category is a caller bug we want visible in the code, not a
+    silently absorbed lookup.
+    """
+    if category not in _ADVISOR_CATEGORY_HEADERS:
+        category = "other"
+    header = _ADVISOR_CATEGORY_HEADERS[category]
     if step_ids:
         return f"{header} Steps named by the reviewer: {', '.join(step_ids)}."
     return header
