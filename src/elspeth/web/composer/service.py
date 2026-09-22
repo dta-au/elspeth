@@ -108,12 +108,6 @@ from elspeth.web.composer.advisor_decision import (
     AdvisorSignoffGateFact,
 )
 from elspeth.web.composer.advisor_output import (
-    ADVISOR_FINDING_CATEGORIES as ADVISOR_FINDING_CATEGORIES,
-)
-from elspeth.web.composer.advisor_output import (
-    ADVISOR_NOTE_MAX_CHARS as ADVISOR_NOTE_MAX_CHARS,
-)
-from elspeth.web.composer.advisor_output import (
     parse_advisor_checkpoint_response,
     sanitize_advisor_note,
 )
@@ -10808,7 +10802,7 @@ def _advisor_flagged_header(category: str, step_ids: Sequence[str]) -> str:
     """The backend-authored header sentence(s) for a rendered FLAG.
 
     The parser already normalises ``category`` into
-    :data:`ADVISOR_FINDING_CATEGORIES`, but this function is reachable with a
+    :data:`advisor_output.ADVISOR_FINDING_CATEGORIES`, but this function is reachable with a
     plain ``str`` from the wording helper's default, so the fall back to
     "other" is written out rather than hidden in a ``dict.get`` default: an
     unrecognised category is a caller bug we want visible in the code, not a

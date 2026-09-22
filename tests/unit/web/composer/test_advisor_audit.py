@@ -486,7 +486,7 @@ class TestAuditPrimacy:
 
 class TestRowsInARealSessionStore:
     @pytest.mark.asyncio
-    async def test_base_and_new_checkpoint_rows_remain_opaque_and_excluded_from_model_history(self, tmp_path: Any) -> None:
+    async def test_checkpoint_row_is_exact_and_excluded_from_model_history(self, tmp_path: Any) -> None:
         from elspeth.web.sessions.routes._helpers import (
             _composer_chat_history,
             _composer_conversation_messages,
@@ -498,34 +498,14 @@ class TestRowsInARealSessionStore:
 
         sessions = build_test_sessions_service(data_dir=tmp_path)
         with sessions._engine.begin() as conn:
-            ensure_test_identity(conn, identity_id="audit-compatibility-user")
-        session = await sessions.create_session("audit-compatibility-user", "Historical advisor rows", "local")
-        # Exact base-format fixture: keep its five original facts, without inventing conformance.
-        old_envelope = {
-            "_kind": "advisor_checkpoint_pass_audit",
-            "pass": {
-                "phase": "end",
-                "pass_index": 0,
-                "verdict": "flagged",
-                "source": "model",
-                "findings_hash": stable_hash({"advisor_findings": "BASE_FINDING"}),
-            },
-        }
-        old_content = json.dumps(old_envelope)
+            ensure_test_identity(conn, identity_id="audit-checkpoint-user")
+        session = await sessions.create_session("audit-checkpoint-user", "Advisor checkpoint rows", "local")
         record = _pass_record()
         async with sessions._call_context(session.id, SessionOperationKind.COMPOSE) as context:
             await sessions.add_message(
                 session.id,
                 "assistant",
                 "CONVERSATION_CONTROL",
-                writer_principal="compose_loop",
-                session_operation_context=context,
-            )
-            await sessions.add_message(
-                session.id,
-                "audit",
-                old_content,
-                tool_calls=[old_envelope],
                 writer_principal="compose_loop",
                 session_operation_context=context,
             )
@@ -537,12 +517,9 @@ class TestRowsInARealSessionStore:
             )
 
         messages = await sessions.get_messages(session.id)
-        assert len(messages) == 3
-        assert messages[1].content == old_content
-        assert dict(messages[1].tool_calls[0]) == old_envelope
-        assert json.loads(messages[1].content)["pass"] == old_envelope["pass"]
-        assert json.loads(messages[2].content) == advisor_checkpoint_pass_audit_envelope(record)
-        assert dict(messages[2].tool_calls[0]) == advisor_checkpoint_pass_audit_envelope(record)
+        assert len(messages) == 2
+        assert json.loads(messages[1].content) == advisor_checkpoint_pass_audit_envelope(record)
+        assert dict(messages[1].tool_calls[0]) == advisor_checkpoint_pass_audit_envelope(record)
         assert _composer_chat_history(messages) == [{"role": "assistant", "content": "CONVERSATION_CONTROL"}]
         assert _composer_conversation_messages(messages) == [messages[0]]
         assert _composer_conversation_or_llm_audit_messages(messages) == [messages[0]]

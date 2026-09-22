@@ -2000,10 +2000,10 @@ def _parsed_note(note: str) -> str | None:
 
 
 def test_note_is_bounded_and_sanitised() -> None:
+    from elspeth.web.composer.advisor_output import ADVISOR_NOTE_MAX_CHARS
     from elspeth.web.composer.service import (
         _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
         _ADVISOR_FINDINGS_UNTRUSTED_END,
-        ADVISOR_NOTE_MAX_CHARS,
     )
 
     note = _parsed_note("a" * (ADVISOR_NOTE_MAX_CHARS + 50))
