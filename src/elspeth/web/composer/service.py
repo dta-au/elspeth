@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -10998,26 +10999,83 @@ ADVISOR_FINDING_CATEGORIES: Final[frozenset[str]] = frozenset(
 _ADVISOR_CATEGORY_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\s*CATEGORY\s*:\s*([a-z_]+)\s*$", re.IGNORECASE | re.MULTILINE)
 _ADVISOR_STEPS_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\s*STEPS\s*:\s*(.*?)\s*$", re.IGNORECASE | re.MULTILINE)
 _ADVISOR_STEP_ID_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_.\-]+")
-# ANSI CSI escape sequences first, then C0 controls (minus \t \n \r) and DEL:
-# ESC is itself a C0 byte, so with the classes the other way round the
-# alternation consumed the ESC alone and left ``[31m`` in the note.
-_ADVISOR_NOTE_CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# ANSI CSI escape sequences, stripped before the character filter below: ESC
+# is itself a C0 control, so removing controls first would take the ESC alone
+# and leave ``[31m`` behind as text.
+_ADVISOR_NOTE_ANSI_CSI_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Everything the note drops by Unicode CATEGORY rather than by an explicit
+# class (final review I-2): ``Cc`` is the C0/C1 controls, ``Cf`` the format
+# block -- bidirectional overrides and isolates, the zero-width family, the
+# BOM -- and ``Zl``/``Zp`` the line and paragraph separators. Left in, a note
+# can render differently from the text stored beside it, so an operator
+# reading the session DB sees something other than what the user was shown.
+# Expressed as CATEGORIES, not literals: an invisible character in source is
+# precisely what this removes, and a character class of them is unreviewable.
+_ADVISOR_NOTE_STRIPPED_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
+_ADVISOR_NOTE_KEPT_CONTROLS: Final[frozenset[str]] = frozenset("\t\n\r")
+
+
+def _strip_note_control_characters(text: str) -> str:
+    """Drop ANSI escapes and every control/format character but tab and newline."""
+    without_escapes = _ADVISOR_NOTE_ANSI_CSI_RE.sub("", text)
+    return "".join(
+        character
+        for character in without_escapes
+        if character in _ADVISOR_NOTE_KEPT_CONTROLS or unicodedata.category(character) not in _ADVISOR_NOTE_STRIPPED_CATEGORIES
+    )
+
+
+# The verdict LEAD as the note strips it: the token, optionally wrapped in
+# markdown emphasis and optionally introduced by a ``Verdict:`` label, closed
+# by a verdict-shaped terminator or end-of-line — the same terminator guard
+# ``_ADVISOR_VERDICT_LINE_RE`` uses, so adjectival prose ("flagged rows are
+# routed to the reject sink") is not a verdict. Matching the emphasis HERE
+# rather than pre-stripping the line is what keeps underscores in the prose:
+# ``_ADVISOR_MARKDOWN_EMPHASIS_RE`` would delete them from step ids and from
+# the fence sentinels this function still has to find.
+_ADVISOR_NOTE_VERDICT_LEAD_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[*_`~\s]*(?:verdict\s*[:\-]\s*)?[*_`~\s]*(?:CLEAN|FLAGGED)[*_`~]*\s*(?:[:.\-" + chr(0x2013) + chr(0x2014) + r"]\s*|$)",
+    re.IGNORECASE,
+)
+# Three or more newlines collapse to a blank line (final review M-3/M-1):
+# removing a CATEGORY/STEPS line leaves its newline behind, and a note that is
+# mostly newlines pushes the blocker's own button down the panel.
+_ADVISOR_NOTE_BLANK_RUN_RE: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
 
 
 def _advisor_note_text(findings_text: str) -> str | None:
     """The advisor's prose after the verdict token, bounded and sanitised, or None.
 
-    Removes the leading verdict token (``_ADVISOR_VERDICT_LINE_RE``, the
-    anchored CLEAN/FLAGGED lead), the CATEGORY/STEPS machine lines, the
-    untrusted-findings fence sentinels and control characters. Markdown
-    emphasis is left alone on purpose: ``_ADVISOR_MARKDOWN_EMPHASIS_RE``
-    strips underscores, which would mangle step ids the note names.
+    Removes the verdict line, the CATEGORY/STEPS machine lines, the
+    untrusted-findings fence sentinels and control characters.
+
+    The verdict line is found the way the SCANNER finds it (final review I-1),
+    not with one start-anchored match: ``_parse_advisor_checkpoint_guidance``
+    deliberately accepts ``**FLAGGED**``, ``Verdict: FLAGGED``, a preamble
+    before the verdict and a bare ``FLAGGED`` on its own line — its docstring
+    names these as observed live — and a note that opens with the protocol
+    token is exactly the noise the header exists to replace. The emphasis is
+    matched as part of the lead pattern rather than stripped from the line,
+    so underscores survive in the body — in the step ids the note names and
+    in the fence sentinels removed below.
+
+    Unicode line and paragraph separators arrive as line breaks (``splitlines``
+    honours them) and are kept as ``\\n``: the stored note and the rendered
+    note then agree, which is the property I-2 is about.
     """
-    body = _ADVISOR_VERDICT_LINE_RE.sub("", findings_text.strip(), count=1)
+    lines = findings_text.strip().splitlines()
+    body = findings_text.strip()
+    for index, raw_line in enumerate(lines):
+        if _ADVISOR_NOTE_VERDICT_LEAD_RE.match(raw_line.strip()) is None:
+            continue
+        remainder = _ADVISOR_NOTE_VERDICT_LEAD_RE.sub("", raw_line.strip(), count=1)
+        body = "\n".join([remainder, *lines[index + 1 :]])
+        break
     body = _ADVISOR_CATEGORY_LINE_RE.sub("", body)
     body = _ADVISOR_STEPS_LINE_RE.sub("", body)
     body = body.replace(_ADVISOR_FINDINGS_UNTRUSTED_BEGIN, "").replace(_ADVISOR_FINDINGS_UNTRUSTED_END, "")
-    body = _ADVISOR_NOTE_CONTROL_RE.sub("", body).strip()
+    body = _strip_note_control_characters(body)
+    body = _ADVISOR_NOTE_BLANK_RUN_RE.sub("\n\n", body).strip()
     if not body:
         return None
     if len(body) > ADVISOR_NOTE_MAX_CHARS:

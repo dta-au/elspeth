@@ -7,7 +7,7 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
-to 64 for durable Composer progress, request lifecycle leases, identity owner
+to 65 for durable Composer progress, request lifecycle leases, identity owner
 foreign keys, approval revocation provenance, run admission decisions, sparse
 proposal arguments, structured validation errors, approved prompt artifact provenance,
 64-bit quota policy limits, nullable token-ledger prompt/completion measures
@@ -27,6 +27,10 @@ model, provider and `composer_skill_hash` columns.
 Session epoch 64 adds the distinct `cost_unavailable` guided-operation failure
 classification so missing model pricing directs administrators to repair pricing
 instead of asking users to retry an invalid provider response.
+Session epoch 65 makes `completion_gates.advisor_signoff.note` a required key in
+the persisted composer-meta envelope, so a blocked turn can show the advisory
+reviewer's own bounded words beside the block; the strict parser refuses an
+envelope written without the key rather than defaulting one.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 43 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching

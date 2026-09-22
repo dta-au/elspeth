@@ -206,7 +206,13 @@ def completion_gates_meta_value(
             detail=blocked[0].detail,
             suggestion=blocked[0].suggestion,
             for_graph=completion_gate_fingerprint(state),
-            note=blocked[0].note,
+            # ``or None``: the reader refuses an empty note (a note with no
+            # words is writer drift, not a reviewer saying nothing — that is
+            # null), so normalising here keeps a builder that passes "" from
+            # persisting a row every later read rejects. ``parse_completion_gates``
+            # is called uncaught from /validate, execute, compose and messages,
+            # so such a row would brick the session rather than degrade it.
+            note=blocked[0].note or None,
         )
     }
 

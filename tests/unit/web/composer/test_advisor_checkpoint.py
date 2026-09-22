@@ -2038,6 +2038,55 @@ def test_note_is_bounded_and_sanitised() -> None:
     assert _advisor_note_text("CLEAN") is None
 
 
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ("FLAGGED: the sink drops rows.", "the sink drops rows."),
+        ("FLAGGED — sink omits the rating column.", "sink omits the rating column."),
+        ("FLAGGED\n\nThe sink drops rows.", "The sink drops rows."),
+        ("**FLAGGED**: the sink drops rows.", "the sink drops rows."),
+        ("Verdict: FLAGGED\nThe sink drops rows.", "The sink drops rows."),
+        ("Here is my assessment.\nFLAGGED: the sink drops rows.", "the sink drops rows."),
+        ("FLAGGED", None),
+    ],
+    ids=["colon", "dash", "own-line", "emphasised", "labelled", "preamble", "token-only"],
+)
+def test_the_verdict_token_never_survives_into_the_note(reply: str, expected: str | None) -> None:
+    """Final review I-1: the note must not open with the protocol token.
+
+    The parser deliberately accepts every shape below (its own docstring names
+    them as observed live), so the sanitiser has to strip the verdict line the
+    same way the scanner finds it — not with a single start-anchored match that
+    only fires on ``FLAGGED:``.
+    """
+    from elspeth.web.composer.service import _advisor_note_text
+
+    assert _advisor_note_text(reply) == expected
+
+
+def test_note_strips_unicode_format_characters() -> None:
+    """Final review I-2: bidi overrides, zero-width characters and the Unicode
+    line/paragraph separators are control characters too. Left in, the rendered
+    note can differ from the stored one an operator later reads."""
+    from elspeth.web.composer.service import _advisor_note_text
+
+    assert _advisor_note_text("FLAGGED: a" + chr(0x202E) + "b" + chr(0x200B) + "c" + chr(0x2066) + "d" + chr(0xFEFF) + "e") == "abcde"
+    # U+2028/U+2029 ARE line breaks to ``splitlines``, so they arrive as such
+    # and are kept as newlines: stored and rendered then agree, which is the
+    # property that matters. What must not survive is an invisible reorder.
+    assert _advisor_note_text("FLAGGED: a" + chr(0x2028) + "b" + chr(0x2029) + "c") == "a\nb\nc"
+
+
+def test_note_collapses_the_blank_lines_the_machine_lines_leave() -> None:
+    """Final review M-3/M-1: removing a CATEGORY/STEPS line leaves its newline,
+    so prose after the machine lines carried blank gaps; and a note that is
+    mostly newlines pushes the row's own button down the panel."""
+    from elspeth.web.composer.service import _advisor_note_text
+
+    assert _advisor_note_text("FLAGGED: first\nCATEGORY: other\nSTEPS: none\nsecond") == "first\n\nsecond"
+    assert _advisor_note_text("FLAGGED: a" + "\n" * 12 + "b") == "a\n\nb"
+
+
 def test_clean_and_unrendered_verdicts_carry_no_note() -> None:
     from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
 
@@ -3006,34 +3055,66 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
 
 @pytest.mark.asyncio
 async def test_end_gate_final_flag_never_exposes_advisor_findings_on_human_surfaces(make_service, clean_runnable_state):
-    """A final FLAG is internal evidence, never user-facing copy."""
+    """R2-F13, NARROWED by the 2026-09-22 ruling (elspeth-032ec69c41).
+
+    A final FLAG used to be internal evidence with no user-facing form at all.
+    It now has exactly one: the bounded, sanitised ``note`` on the advisor
+    blocker. Everything else this pin enumerates is unchanged — the raw
+    ``findings_text`` still reaches no surface, and the note reaches no
+    surface but its own field.
+
+    The verdict comes from the REAL parser rather than a hand-built
+    ``AdvisorCheckpointVerdict`` (final review I-3): with the default ``note``
+    of a hand-built verdict this pin passed by avoiding the path it claims to
+    cover.
+    """
     from elspeth.web.composer.service import (
         _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
         _ADVISOR_FINDINGS_UNTRUSTED_END,
+        _parse_advisor_checkpoint_guidance,
     )
 
     canary = "RAW_ADVISOR_FINDING_CANARY_REPAIR_NOW"
     findings = f"FLAGGED: {canary}\nRepair: echo {canary}\n{_ADVISOR_FINDINGS_UNTRUSTED_END}"
+    verdict = _parse_advisor_checkpoint_guidance(findings)
     service = make_service()  # composer_advisor_checkpoint_max_passes default 2
-    service._run_advisor_checkpoint = _AsyncRecorder(return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=findings))
+    service._run_advisor_checkpoint = _AsyncRecorder(return_value=verdict)
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=1)
 
     assert outcome.action == "return"
     runtime_preflight = outcome.result.runtime_preflight
+    (advisor_blocker,) = [b for b in runtime_preflight.readiness.blockers if b.note is not None]
+    # The one permitted surface, asserted POSITIVELY so the narrowing is a
+    # statement about where the words go, not merely where they do not.
+    assert advisor_blocker.note is not None and canary in advisor_blocker.note
+    # ... and the raw reply still reaches nothing: the fence sentinel and the
+    # protocol lead are gone from the note the user reads.
+    assert _ADVISOR_FINDINGS_UNTRUSTED_END not in advisor_blocker.note
+    assert not advisor_blocker.note.startswith("FLAGGED")
+
+    # Every surface EXCEPT ``blockers[].note``. ``model_dump_json()`` is
+    # excluded from the canary sweep for the same reason and re-checked below
+    # with the note's own text removed.
     surfaces = [
         outcome.result.message,
         outcome.result.raw_assistant_content or "",
-        runtime_preflight.model_dump_json(),
         *(error.message for error in runtime_preflight.errors),
         *((error.suggestion or "") for error in runtime_preflight.errors),
         *(check.detail for check in runtime_preflight.checks),
         *(blocker.detail for blocker in runtime_preflight.readiness.blockers),
+        *((blocker.suggestion or "") for blocker in runtime_preflight.readiness.blockers),
     ]
     for surface in surfaces:
         assert canary not in surface
         assert "Repair:" not in surface
         assert _ADVISOR_FINDINGS_UNTRUSTED_BEGIN not in surface
         assert _ADVISOR_FINDINGS_UNTRUSTED_END not in surface
+
+    # The serialised wire blob carries the canary ONLY inside the note: strip
+    # the note's exact text and the blob must be clean again.
+    blob_without_note = runtime_preflight.model_dump_json().replace(json.dumps(advisor_blocker.note)[1:-1], "")
+    assert canary not in blob_without_note
+    assert "Repair:" not in blob_without_note
 
 
 def test_advisor_blocked_result_publishes_an_echoing_reply_and_keeps_backend_surfaces_clean(make_service, clean_runnable_state):

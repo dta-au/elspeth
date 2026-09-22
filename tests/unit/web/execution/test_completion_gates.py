@@ -645,6 +645,31 @@ def test_gate_fact_note_null_round_trips() -> None:
     assert merge_completion_gates(_green_result(), parsed, state).readiness.blockers[0].note is None
 
 
+def test_writer_normalises_an_empty_note_to_null() -> None:
+    """Final review M-2: the reader rejects ``note=""`` but nothing on the
+    write path forbade it, so a builder that passed the empty string would
+    persist a row every later read rejects — and ``parse_completion_gates`` is
+    called UNCAUGHT from /validate, execute, compose, messages, audit readiness
+    and shareable reviews. That is a bricked session row, not a degraded one.
+    Unreachable today; closed at the writer so it stays that way."""
+    state = _make_state()
+    result = _advisor_signoff_pending_validation_with_note("")
+    assert result.readiness.blockers[0].note == ""
+    envelope = completion_gates_meta_value(result, state)
+    assert envelope["advisor_signoff"]["note"] is None
+    parsed = parse_completion_gates({COMPLETION_GATES_META_KEY: envelope})
+    assert parsed is not None and parsed.advisor_signoff is not None
+    assert parsed.advisor_signoff.note is None
+
+
+def _advisor_signoff_pending_validation_with_note(note: str | None) -> ValidationResult:
+    from elspeth.web.composer.service import _advisor_signoff_pending_validation
+
+    return _advisor_signoff_pending_validation(
+        _green_result(), reason="flagged_final_pass", findings="FLAGGED: x", category="other", step_ids=(), note=note
+    )
+
+
 @pytest.mark.parametrize("bad", ["", 7, b"x"], ids=["empty", "int", "bytes"])
 def test_gate_fact_note_must_be_a_non_empty_string_or_null(bad: object) -> None:
     envelope = {
