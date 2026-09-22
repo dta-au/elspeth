@@ -1618,7 +1618,7 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
   "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 64, "landscape_epoch": 43, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 65, "landscape_epoch": 43, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
     "structural_changes": "session_epoch_35_to_64_landscape_epoch_29_to_43_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema",
     "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
@@ -1646,12 +1646,12 @@ Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 64, Landscape epoch 43 and `run_web_plugin_policy` presence,
+session epoch 65, Landscape epoch 43 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
 any later deployment action. The 0.7.1 image understands session epoch 35,
-not epoch 64. Pre-1.0 candidates do not migrate predecessor schemas: the old
+not epoch 65. Pre-1.0 candidates do not migrate predecessor schemas: the old
 deployment is stopped and uninstalled, required evidence is archived/exported,
 and the databases are recreated before the candidate is installed. The previous
 image cannot reopen the recreated current database, so Scenario B rollback is
