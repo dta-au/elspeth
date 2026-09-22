@@ -11113,11 +11113,11 @@ def _advisor_signoff_blocked_wording(
         if findings_backend_authored and findings:
             return (
                 f"{notice} {findings}",
-                "Remove the flagged text from the named field; the advisory review runs again on your next message.",
+                "Remove the flagged text from the named field; the advisory review runs again after your next pipeline change.",
             )
         return (
             notice,
-            "Review the pipeline; validation and the advisory review run again on your next message.",
+            "Review the pipeline; validation and the advisory review run again after your next pipeline change.",
         )
     if reason == "unavailable":
         return (

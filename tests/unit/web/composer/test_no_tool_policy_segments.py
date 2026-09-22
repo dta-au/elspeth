@@ -107,7 +107,7 @@ def test_completion_advisory_notice_is_evidence_scoped_trusted_copy() -> None:
     assert visible_message_segments(content=content, raw_content="") == (
         TrustedSystemNoticeSegment(
             "Completion advisory review did not clear after the available attempts. "
-            "Composer completion is withheld. Review the pipeline; validation and the advisory review run again on your next message. "
+            "Composer completion is withheld. Review the pipeline; validation and the advisory review run again after your next pipeline change. "
             "ELSPETH withheld the composer's own summary of this exchange; "
             "verify the pipeline before assuming every requested change was applied."
         ),
@@ -853,3 +853,17 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
     assert len(segments) == 2
     assert all(isinstance(segment, no_tool_policy.TrustedSystemNoticeSegment) for segment in segments)
     assert segments[-1].content == no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE
+
+
+def _composer_sources_containing(phrase: str) -> list[str]:
+    import elspeth.web.composer as composer_pkg
+
+    root = Path(composer_pkg.__file__).parent
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*.py") if phrase in p.read_text(encoding="utf-8"))
+
+
+def test_no_notice_promises_a_review_on_the_next_message() -> None:
+    """Ruling 2026-09-22: a blocked graph is re-reviewed after the next pipeline CHANGE."""
+    # Control: the instrument must find a phrase known to be present.
+    assert _composer_sources_containing("Composer completion is withheld") != []
+    assert _composer_sources_containing("on your next message") == []
