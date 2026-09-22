@@ -114,7 +114,7 @@ from elspeth.web.composer.audit import (
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.availability import ComposerAvailability as ComposerAvailability  # re-export; genuine home is availability.py
-from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
+from elspeth.web.composer.control_messages import anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
 )
@@ -5585,9 +5585,6 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         advisor_checkpoint_passes_used: int,
-        # REQUIRED (no default): forwarded to the END advisor gate, where it
-        # alone decides whether a terminal block withholds the model's prose.
-        advisor_repair_context_introduced: bool,
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
@@ -5944,7 +5941,6 @@ class ComposerServiceImpl:
                             initial_version=initial_version,
                             session_scope=session_scope,
                             plugin_snapshot=plugin_snapshot,
-                            advisor_repair_context_introduced=advisor_repair_context_introduced,
                             advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                             deadline=deadline,
                         )
@@ -6071,9 +6067,6 @@ class ComposerServiceImpl:
         persisted_assistant_content: str | None,
         persisted_tool_call_turn: bool,
         advisor_checkpoint_passes_used: int,
-        # REQUIRED (no default): forwarded to the END advisor gate, where it
-        # alone decides whether a terminal block withholds the model's prose.
-        advisor_repair_context_introduced: bool,
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
@@ -6267,7 +6260,6 @@ class ComposerServiceImpl:
                 initial_version=initial_version,
                 session_scope=session_scope,
                 plugin_snapshot=plugin_snapshot,
-                advisor_repair_context_introduced=advisor_repair_context_introduced,
                 advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                 deadline=deadline,
             )
@@ -6664,13 +6656,6 @@ class ComposerServiceImpl:
         # preflight under a diverging plugin view. Both production sites hold
         # a real snapshot; a caller without one must say ``None`` explicitly.
         plugin_snapshot: PluginAvailabilitySnapshot | None,
-        # REQUIRED (no default): whether internal advisor findings entered the
-        # model's context earlier this turn (an END-gate repair-continue or the
-        # early checkpoint). A terminal block withholds the model's prose only
-        # then; a defaulted False would publish prose that may quote findings
-        # the user never saw, a defaulted True would delete a reply that
-        # nothing hidden could have reached.
-        advisor_repair_context_introduced: bool,
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
@@ -6834,38 +6819,11 @@ class ComposerServiceImpl:
                     session_operation_context=session_operation_context,
                     deadline=deadline,
                 )
-            # elspeth-2306940c70: once advisor context has entered the turn the
-            # blocked result below withholds the model's prose
-            # (raw_assistant_content=""), so this turn replays into later
-            # model context as an EMPTY assistant message — the next turn's
-            # model would read the withhold as silent compliance and assert
-            # the refused instruction is live. Persist a durable user-role
-            # disclosure before returning; like the anti-anchor hint, audit
-            # publication is a precondition of the provider-visible
-            # intervention. The withheld words themselves are kept first, as a
-            # non-rendered, non-replayed audit row. With no advisor context the
-            # prose is published and replays as itself, so neither record
-            # applies.
-            if advisor_repair_context_introduced:
-                await self._persist_withheld_reply(
-                    "advisor_terminal_block",
-                    assistant_message.content or "",
-                    session_id=session_id,
-                    session_operation_context=session_operation_context,
-                )
-            if advisor_repair_context_introduced and session_id is not None:
-                # Fenced session write (P4-D6 family A2b): the disclosure row
-                # carries the compose operation this turn runs under.
-                if session_operation_context is None:
-                    raise TypeError("advisor disclosure requires the turn's session_operation_context")
-                await self._require_sessions_service().add_message(
-                    UUID(session_id),
-                    "audit",
-                    _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE,
-                    writer_principal="compose_loop",
-                    tool_calls=[advisor_signoff_withheld_control_envelope(_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE)],
-                    session_operation_context=session_operation_context,
-                )
+            # The blocked result publishes the model's prose (ruling
+            # 2026-09-22, elspeth-032ec69c41), so this turn replays into later
+            # model context as itself; the withheld-reply row and the
+            # withheld-prose disclosure that elspeth-2306940c70 wrote here are
+            # gone with the withholding.
             # R2-F14: ``failure_class`` is READ here rather than every
             # ``ok=False`` being labelled "unavailable". Only the EXACT value
             # ``"unavailable"`` maps to the outage wording; ``"malformed"``,
@@ -6890,11 +6848,10 @@ class ComposerServiceImpl:
                 persisted_tool_call_turn=persisted_tool_call_turn,
                 runtime_preflight=runtime_preflight,
                 outstanding_findings=outstanding_findings,
-                advisor_repair_context_introduced=advisor_repair_context_introduced,
             )
-            # Audit row for the branch that spoke, after the disclosure row
-            # above and before the telemetry mirror — the replacer will pass
-            # this result through without publishing it a second time.
+            # Audit row for the branch that spoke, before the telemetry
+            # mirror — the replacer will pass this result through without
+            # publishing it a second time.
             await self._persist_advisor_terminal_publication(
                 blocked,
                 session_id=session_id,
@@ -7183,7 +7140,6 @@ class ComposerServiceImpl:
                     persisted_assistant_content=persisted_assistant_content,
                     persisted_tool_call_turn=persisted_tool_call_turn,
                     advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
-                    advisor_repair_context_introduced=advisor_repair_context_introduced,
                     plugin_snapshot=plugin_snapshot,
                     advisor_review_state=advisor_review_state,
                     deadline=deadline,
@@ -7540,7 +7496,6 @@ class ComposerServiceImpl:
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
                 advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
-                advisor_repair_context_introduced=advisor_repair_context_introduced,
                 plugin_snapshot=plugin_snapshot,
                 advisor_review_state=advisor_review_state,
             )
@@ -8470,7 +8425,7 @@ class ComposerServiceImpl:
         reason: AdvisorTerminalBlockReason,
         verdict: AdvisorCheckpointVerdict,
         state: CompositionState,
-        assistant_message: _AdmittedAssistantMessage,
+        assistant_message: _AdmittedAssistantMessage | None,
         recorder: BufferingRecorder,
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
@@ -8483,23 +8438,18 @@ class ComposerServiceImpl:
         persisted_tool_call_turn: bool,
         runtime_preflight: ValidationResult | None,
         outstanding_findings: ValidationResult | None,
-        # REQUIRED (no default): whether internal advisor findings entered the
-        # model's context earlier this turn. It alone decides whether the
-        # model's terminal prose is withheld, and ``reason`` cannot stand in
-        # for it — see the docstring.
-        advisor_repair_context_introduced: bool,
     ) -> ComposerResult:
         """Build the end-gate ``ComposerResult`` for a sign-off that did not pass.
 
-        ``advisor_repair_context_introduced`` decides what happens to the
-        model's terminal prose. Prose written AFTER hidden advisor findings
-        entered the model's context may quote or rebut them, so it is withheld
-        and the notice carries the withheld-prose disclosure. When nothing was
-        injected the prose is the model's own and is published with the notice
-        appended, exactly as the preflight-invalid finalize branches do.
-        ``reason`` is independent of that fact in both directions: a first-pass
-        advisor outage followed by a last-pass FLAG is ``flagged_final_pass``
-        with nothing ever injected, a FLAG-and-repair followed by an outage is
+        The model's terminal prose is published with the notice appended,
+        exactly as the preflight-invalid finalize branches do — whether or not
+        advisor findings entered the model's context earlier this turn
+        (operator ruling 2026-09-22, elspeth-032ec69c41). ``assistant_message``
+        may be ``None`` for a turn that produced no admitted reply; it is then
+        empty prose under the same notice. ``reason`` is independent of the
+        injection history in both directions: a first-pass advisor outage
+        followed by a last-pass FLAG is ``flagged_final_pass`` with nothing
+        ever injected, a FLAG-and-repair followed by an outage is
         ``unavailable`` with findings in context, and ``flagged_unrepairable``
         blocks on the first pass by construction.
 
@@ -8542,8 +8492,8 @@ class ComposerServiceImpl:
         * any other red preflight remains fully red under the
           runtime-preflight header.
 
-        The provider's findings always remain internal, and so does the primary
-        model's terminal prose once advisor context has entered the turn. Every
+        The provider's findings always remain internal; the primary model's
+        terminal prose is published. Every
         backend-authored field is synthesized from fixed backend copy — except
         the backend-authored deterministic pre-scan finding, which is itself
         fixed backend copy naming the triggering key/field and rides the
@@ -8558,8 +8508,15 @@ class ComposerServiceImpl:
             preflight_shape=_advisor_preflight_shape(runtime_preflight),
             findings_backend_authored=verdict.findings_backend_authored,
         )
-        prose_withheld = advisor_repair_context_introduced
-        raw_content = "" if prose_withheld else (assistant_message.content or "")
+        # Operator ruling 2026-09-22 (elspeth-032ec69c41): a blocked turn
+        # publishes the composer's reply. The withholding existed so prose
+        # written after advisor findings entered context could not leak them;
+        # findings are no longer secret from the user. Case 5 (the repair
+        # replacer) keeps its own withholding and does not pass through here.
+        # The local name stays: the notice composers below share this one
+        # decision, and a literal at each call would hide that.
+        prose_withheld = False
+        raw_content = (assistant_message.content or "") if assistant_message is not None else ""
         validated_base = runtime_preflight if runtime_preflight is not None and runtime_preflight.is_valid else None
         if validated_base is not None:
             runtime_result = _advisor_signoff_pending_validation(
@@ -10858,19 +10815,6 @@ _ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
     "patch_output_options). Re-reading state (get_pipeline_state) or other "
     "lookup-only calls is not a fix and wastes this repair pass; if no "
     "mutation can address a finding, say what blocks you instead. "
-)
-
-# elspeth-2306940c70: durable provider-visible disclosure persisted on every
-# terminal END-gate withhold. Fixed backend copy only — no advisor findings
-# ride this string, so replaying it into later turns cannot re-introduce the
-# repair-cohort contamination that forced the prose withhold in the first
-# place.
-_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE: Final[str] = (
-    "[composer-system] The completion advisory review did not clear, so "
-    "ELSPETH withheld composer completion for the preceding request. Do not "
-    "assume that request was applied: the pipeline state supplied in the "
-    "current context is the authoritative record. Verify against it before "
-    "describing any earlier instruction as applied or in effect."
 )
 
 

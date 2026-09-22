@@ -16,14 +16,17 @@ from elspeth.contracts.errors import AuditIntegrityError
 COMPOSER_CONTROL_MESSAGE_KIND = "composer_control_message"
 COMPOSER_CONTROL_MESSAGE_SCHEMA = "composer.control-message.v1"
 _ANTI_ANCHOR_ORIGIN = "anti_anchor"
-_ADVISOR_SIGNOFF_WITHHELD_ORIGIN = "advisor_signoff_withheld"
 # Closed origin vocabulary: every registered origin pins the exact provider
 # role its replayed message carries. An origin outside this mapping (or a
 # role that disagrees with it) fails replay closed — see
-# ``replay_composer_control_message``.
+# ``replay_composer_control_message``. The ``advisor_signoff_withheld``
+# origin (elspeth-2306940c70) was retired when the END gate's terminal block
+# started publishing the model's prose (ruling 2026-09-22,
+# elspeth-032ec69c41): the turn replays as itself, so no disclosure row is
+# written and a historical one fails replay closed like any other unknown
+# origin.
 _CONTROL_ORIGIN_PROVIDER_ROLES = {
     _ANTI_ANCHOR_ORIGIN: "user",
-    _ADVISOR_SIGNOFF_WITHHELD_ORIGIN: "user",
 }
 _ANTI_ANCHOR_PROVIDER_ROLE = _CONTROL_ORIGIN_PROVIDER_ROLES[_ANTI_ANCHOR_ORIGIN]
 _CONTROL_ENVELOPE_KEYS = frozenset({"_kind", "schema", "origin", "provider_role", "content_hash"})
@@ -49,20 +52,6 @@ def anti_anchor_control_envelope(content: str) -> dict[str, str]:
     """Return bounded provenance for one redacted anti-anchor hint."""
 
     return _control_envelope(_ANTI_ANCHOR_ORIGIN, content)
-
-
-def advisor_signoff_withheld_control_envelope(content: str) -> dict[str, str]:
-    """Return bounded provenance for one advisor-withheld disclosure.
-
-    elspeth-2306940c70: the END advisor gate's terminal withhold publishes
-    fixed backend copy with the model's prose withheld, so the turn replays
-    into later model context as an empty assistant message. This envelope
-    makes the non-completion durable and provider-visible: the disclosure
-    replays as a user-role control message so the next turn's model cannot
-    read the withheld turn as silent compliance.
-    """
-
-    return _control_envelope(_ADVISOR_SIGNOFF_WITHHELD_ORIGIN, content)
 
 
 def replay_composer_control_message(
