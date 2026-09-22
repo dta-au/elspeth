@@ -21,7 +21,6 @@ import json
 import re
 import sys
 import time
-import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -108,6 +107,17 @@ from elspeth.web.composer.advisor_decision import (
     AdvisorGatePassed,
     AdvisorSignoffGateFact,
 )
+from elspeth.web.composer.advisor_output import (
+    ADVISOR_FINDING_CATEGORIES as ADVISOR_FINDING_CATEGORIES,
+)
+from elspeth.web.composer.advisor_output import (
+    ADVISOR_NOTE_MAX_CHARS as ADVISOR_NOTE_MAX_CHARS,
+)
+from elspeth.web.composer.advisor_output import (
+    parse_advisor_checkpoint_response,
+    sanitize_advisor_note,
+)
+from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -601,9 +611,10 @@ def _preflight_verdict(result: ValidationResult) -> str:
 class _MalformedLLMResponseError(ComposerServiceError):
     """Malformed completion with only already-admitted provider facts."""
 
-    def __init__(self, message: str, *, provider_metadata: _AdmittedLLMProviderMetadata) -> None:
+    def __init__(self, message: str, *, provider_metadata: _AdmittedLLMProviderMetadata, text_received: bool = False) -> None:
         super().__init__(message)
         self.provider_metadata = provider_metadata
+        self.text_received = text_received
 
 
 def advisor_provider_failure_types() -> tuple[type[Exception], ...]:
@@ -854,7 +865,7 @@ def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_
         kwargs["api_key"] = api_key
 
 
-async def _litellm_acompletion(**kwargs: Any) -> Any:
+async def _litellm_acompletion(*, on_provider_dispatch: Callable[[], None] | None = None, **kwargs: Any) -> Any:
     """Call LiteLLM lazily so app startup never imports provider machinery.
 
     Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
@@ -869,6 +880,8 @@ async def _litellm_acompletion(**kwargs: Any) -> Any:
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
     await admit_provider_attempt()
+    if on_provider_dispatch is not None:
+        on_provider_dispatch()
     return await litellm.acompletion(**kwargs)
 
 
@@ -8195,6 +8208,8 @@ class ComposerServiceImpl:
         *,
         recorder: BufferingRecorder | None,
         timeout: float | None = None,
+        structured_output: bool = False,
+        on_provider_dispatch: Callable[[], None] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -8254,20 +8269,20 @@ class ComposerServiceImpl:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
-        kwargs: dict[str, Any] = {
-            "model": advisor_model,
-            "messages": messages,
-            "max_tokens": max_completion,
-        }
-        if self._settings.composer_temperature is not None:
-            kwargs["temperature"] = self._settings.composer_temperature
-        if self._settings.composer_seed is not None:
-            kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
-        apply_reasoning_kwargs(kwargs, model=advisor_model, effort=self._settings.composer_advisor_reasoning_effort)
-        _apply_endpoint_kwargs(kwargs, base_url=self._advisor_endpoint_base_url, api_key=self._advisor_endpoint_api_key)
+        kwargs = build_advisor_request_options(
+            model=advisor_model,
+            temperature=self._settings.composer_temperature,
+            seed=self._settings.composer_seed,
+            max_tokens=max_completion,
+            reasoning_effort=self._settings.composer_advisor_reasoning_effort,
+            api_base=self._advisor_endpoint_base_url,
+            api_key=self._advisor_endpoint_api_key,
+            structured_output=structured_output,
+        )
+        kwargs["messages"] = messages
         try:
             response = await asyncio.wait_for(
-                _litellm_acompletion(**kwargs),
+                _litellm_acompletion(on_provider_dispatch=on_provider_dispatch, **kwargs),
                 timeout=effective_timeout,
             )
             if not response.choices:
@@ -8300,6 +8315,7 @@ class ComposerServiceImpl:
             if type(raw_content) is not str or not raw_content.strip():
                 raise _MalformedLLMResponseError(
                     "Advisor returned empty, whitespace-only, or non-string content",
+                    text_received=type(raw_content) is str,
                     provider_metadata=admit_llm_provider_metadata(
                         response, choice=None, message=None, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
                     ),
@@ -8497,13 +8513,6 @@ class ComposerServiceImpl:
                 "further entries exist but are not shown; never FLAG an option, field, or "
                 "contract merely because its value or entry is withheld, and never read a "
                 "withheld entry as absent. "
-                "CLEAN means only that no blocking defect is visible in the supplied advisory evidence; "
-                "it is not certification of withheld, omitted, or truncated constraints. "
-                "Start your reply with CLEAN or FLAGGED. After a FLAGGED verdict, end with two "
-                "lines: 'CATEGORY: <request_not_met|error_handling|prompt_defect|schema_mismatch|other>' "
-                "and 'STEPS: <comma-separated step ids from the pipeline excerpt, or none>'. "
-                "Your FLAGGED prose is shown to the user as your note: write it for them, "
-                "name the step and the option, and do not quote user text or row data."
             ),
             "recent_errors": recent_errors,
             "attempted_actions": attempted_actions,
@@ -8823,8 +8832,8 @@ class ComposerServiceImpl:
         explicit ``ok=False`` verdict. Internal failures propagate unchanged.
         Callers decide degrade (early) vs fail-closed (end).
 
-        ``blocking`` is True iff the guidance is a FLAGGED sign-off; a leading
-        ``CLEAN`` (case-insensitive) is non-blocking. ``session_id`` is part of
+        ``blocking`` is True iff the admitted JSON verdict is FLAGGED; an
+        admitted CLEAN is non-blocking. ``session_id`` is part of
         the checkpoint contract (threaded by callers and consumed downstream);
         it is intentionally not forwarded into the advisor call here.
 
@@ -8840,10 +8849,15 @@ class ComposerServiceImpl:
         completed pass is recorded under: every completion persists an
         ``advisor_checkpoint_pass_audit`` row through the sessions service
         before its telemetry mirror fires (audit primacy). A sessionless
-        compose (``session_id is None``) has no store and emits telemetry
-        only; a session without its context is refused, never written
+        compose (``session_id is None``) has no store and emits no pass mirror;
+        a session without its context is refused, never written
         unfenced.
         """
+
+        provider_attempts = 0
+        first_attempt_schema_valid: bool | None = None
+        first_attempt_accepted: bool | None = None
+        format_reprompt_sent = False
 
         async def completed(verdict: AdvisorCheckpointVerdict, *, source: AdvisorCheckpointVerdictSource) -> AdvisorCheckpointVerdict:
             audit_verdict: Literal["clean", "flagged", "unavailable", "malformed"]
@@ -8861,6 +8875,17 @@ class ComposerServiceImpl:
                     verdict=audit_verdict,
                     source=source,
                     findings_text=verdict.findings_text,
+                    provider_attempts=provider_attempts,
+                    first_attempt_schema_valid=first_attempt_schema_valid,
+                    first_attempt_accepted=first_attempt_accepted,
+                    format_reprompt_sent=format_reprompt_sent,
+                    step_ids_offered=len(verdict.affected_step_ids) if source == "model" and verdict.ok else None,
+                    step_ids_kept=len(_validated_advisor_step_ids(state, verdict.affected_step_ids))
+                    if source == "model" and verdict.ok
+                    else None,
+                    note_present=verdict.response_note_present if source == "model" and verdict.ok else None,
+                    url_redactions=verdict.url_redactions if source == "model" and verdict.ok else None,
+                    email_redactions=verdict.email_redactions if source == "model" and verdict.ok else None,
                 ),
             )
             return verdict
@@ -8890,6 +8915,14 @@ class ComposerServiceImpl:
         last_exc: Exception | None = None
         last_response_unparseable = False
         call_arguments: dict[str, Any] = arguments
+
+        def provider_dispatched() -> None:
+            nonlocal provider_attempts, format_reprompt_sent
+            # Quota admission is awaited before the physical provider call.
+            # A timeout there must not fabricate a call or a sent re-prompt.
+            provider_attempts += 1
+            format_reprompt_sent = format_reprompt_sent or call_arguments is not arguments
+
         for _ in range(attempts):
             remaining: float | None = None
             if deadline is not None:
@@ -8910,23 +8943,43 @@ class ComposerServiceImpl:
                     guidance, _meta = await self._call_advisor_with_audit(
                         call_arguments,
                         recorder=recorder,
+                        structured_output=True,
+                        on_provider_dispatch=provider_dispatched,
                     )
                 else:
                     guidance, _meta = await self._call_advisor_with_audit(
                         call_arguments,
                         recorder=recorder,
                         timeout=remaining,
+                        structured_output=True,
+                        on_provider_dispatch=provider_dispatched,
                     )
+            except _MalformedLLMResponseError as exc:
+                last_exc = exc
+                last_response_unparseable = False
+                # Empty text is malformed schema evidence; absent/non-text
+                # content supplies no schema observation. The call boundary
+                # preserves this distinction without carrying provider text.
+                if exc.text_received:
+                    if provider_attempts == 1:
+                        first_attempt_schema_valid = False
+                        first_attempt_accepted = False
+                    call_arguments = _advisor_arguments_with_format_reprompt(arguments)
+                else:
+                    call_arguments = arguments
+                continue
             except provider_failures as exc:
                 # Only declared provider failures become retryable verdicts.
                 # Audit failures and defects in controlled code must propagate.
-                # The raw exception is retained only to CLASSIFY the failure
-                # below (transport vs malformed) — never to render user text.
+                # Retain exceptions only to classify the final outcome.
                 last_exc = exc
                 last_response_unparseable = False
                 call_arguments = arguments
                 continue
             verdict = _parse_advisor_checkpoint_guidance(guidance)
+            if provider_attempts == 1:
+                first_attempt_schema_valid = verdict.response_schema_valid
+                first_attempt_accepted = verdict.ok
             if verdict.ok:
                 return await completed(verdict, source="model")
             # R2-F14 (elspeth-5403f346c0): a transport-SUCCESSFUL reply that
@@ -9452,9 +9505,15 @@ _ADVISOR_CHECKPOINT_SYSTEM_INSTRUCTIONS: Final[str] = (
     "- Do not assume the composer is stuck. A correct pipeline requires no invented repair.\n"
     "- Follow the phase-specific problem rubric and its evidence limits exactly. Do not infer facts that are withheld, "
     "omitted, truncated, or redacted.\n"
-    "- If a concrete blocking defect is visible, start with FLAGGED and give one specific repair grounded in the "
-    "supplied evidence.\n"
-    "- If no blocking defect is visible, start with CLEAN and do not manufacture a hint.\n"
+    "- Return only a JSON object matching the supplied schema, with all five fields required.\n"
+    "- Set verdict to FLAGGED for a concrete visible blocking defect, or CLEAN when none is visible; "
+    "do not manufacture a hint. CLEAN means only that no blocking defect is visible in the supplied advisory evidence; "
+    "it is not certification of withheld, omitted, or truncated constraints.\n"
+    "- category is request_not_met, error_handling, prompt_defect, schema_mismatch, or other. "
+    "steps contains step ids from the pipeline excerpt.\n"
+    "- findings gives the composer a precise technical repair. A FLAGGED finding must be nonempty. "
+    "note is a plain explanation for the user: name the step and option, never quote user text or row data.\n"
+    "- For CLEAN, steps must be empty and note must be null.\n"
     "- This is advisory review, not authority to change the pipeline. Be specific and brief: under 250 words."
 )
 
@@ -9496,57 +9555,6 @@ _ADVISOR_UNTRUSTED_USER_MESSAGE_HEADER: Final[str] = (
     "visible here and compare them only when the pipeline excerpt exposes the corresponding fact. "
     "Do not infer omitted request text):"
 )
-# R2-F14 (elspeth-5403f346c0): CLEAN acceptance is deliberately verdict-shaped.
-# The advisor prompt asks for a literal ``CLEAN``/``FLAGGED`` token, and an
-# anywhere-in-line scan fails OPEN on negated, quoted, or adjectival uses. A
-# bare CLEAN reply is accepted only through the line-start-anchored
-# ``_ADVISOR_VERDICT_LINE_RE`` below. The observed uppercase ``Verdict: CLEAN``
-# format has its own anchored tolerance arm; ``Verdict: clean`` is deliberately
-# re-prompted rather than widening the any-register CLEAN surface.
-#
-# FLAGGED is different (acceptance-r2 final review, parked T8 residual): it is
-# ADDITIONALLY matched any-register anywhere in a line via
-# ``_ADVISOR_FLAGGED_ANYCASE_RE`` (defined with the R2-F14 EOF block below),
-# terminator-guarded so adjectival prose ("flagged records are routed to the
-# reject sink") still does not match. Widening FLAGGED is the fail-CLOSED
-# direction — a false FLAGGED costs a repair turn; it can never mint a
-# sign-off — so the asymmetry with CLEAN is deliberate, not an oversight.
-_ADVISOR_VERDICT_MARKER_RE: Final[re.Pattern[str]] = re.compile(r"\b(CLEAN|FLAGGED)\b")
-# The anchored arm requires the marker to be the WHOLE leading token, closed by
-# a verdict-shaped terminator (``:``, ``.``, a dash, or end-of-line). The
-# previous ``|\s+|`` alternative accepted a bare token followed by any
-# whitespace, so ordinary prose that merely STARTS with the word — "clean rows
-# are emitted by the source, but the sink drops them" — signed the build off. A
-# genuine verdict token ends its clause; an adjectival one is followed by the
-# noun it modifies.
-_ADVISOR_VERDICT_LINE_RE: Final[re.Pattern[str]] = re.compile(
-    # \u2013 / \u2014 are the en/em dashes models actually type; spelled as
-    # escapes so the literal cannot be confused with an ASCII hyphen on review.
-    r"^(CLEAN|FLAGGED)\s*(?:[:.\-\u2013\u2014]|$)",
-    re.IGNORECASE,
-)
-# CLEAN acceptance uses its own anchored arm. An ASCII hyphen JOINS compound
-# words ("Clean-up needed: ...", "Clean-room rewrite ...") and a full stop
-# joins a file name ("clean.csv is the input"): each is a reply describing
-# something, and each used to mint a sign-off through the unconditional
-# ``-`` / ``.`` terminators this arm copied from the shared set above. So a
-# run of hyphens or full stops terminates the token only when whitespace or
-# end-of-line follows the run. That still accepts ``CLEAN.``,
-# ``CLEAN...``, ``CLEAN - ok`` and the ASCII double-hyphen dash models type
-# (``CLEAN -- no issues found.``). The en/em dash and ``:`` close the token
-# unconditionally. FLAGGED keeps the shared pattern: a false FLAGGED is the
-# fail-closed direction, and its matching is not changed by this tightening.
-# Both CLEAN arms read this one terminator so they cannot drift apart.
-_ADVISOR_CLEAN_VERDICT_TERMINATOR: Final[str] = r"(?:[:\u2013\u2014]|\.+(?=\s|$)|-+(?=\s|$)|$)"
-_ADVISOR_CLEAN_VERDICT_LINE_RE: Final[re.Pattern[str]] = re.compile(
-    r"^CLEAN\s*" + _ADVISOR_CLEAN_VERDICT_TERMINATOR,
-    re.IGNORECASE,
-)
-# The labeled tolerance arm preserves the observed ``Verdict: CLEAN`` model
-# formatting without treating an arbitrary uppercase CLEAN mention as a sign-
-# off. The label is case-insensitive, but CLEAN deliberately is not: the bare
-# lowercase form is accepted only by the stricter line-start arm above.
-_ADVISOR_CLEAN_VERDICT_LABEL_RE: Final[re.Pattern[str]] = re.compile(r"^(?i:verdict):\s*CLEAN\s*" + _ADVISOR_CLEAN_VERDICT_TERMINATOR)
 # Each family below trips the scan ALONE (elspeth-4f7377f99d/C2): a template
 # author does not need both an "ignore/override" verb-phrase AND a
 # CLEAN-imperative in the same string to be flagged. IGNORE_RE requires the
@@ -9789,112 +9797,44 @@ class AdvisorCheckpointVerdict:
     # applied inline by ``_run_advisor_checkpoint``'s exception handling and
     # read by ``_evaluate_terminal_no_tool_advisor_gate``.
     failure_class: Literal["none", "unavailable", "malformed"] = "none"
-    # elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): populated on
-    # the FLAGGED arm of ``_parse_advisor_checkpoint_guidance`` only. The
-    # category is already normalised to ``ADVISOR_FINDING_CATEGORIES``; the
-    # step ids are RAW, as the advisor wrote them, and are checked against
-    # the pipeline state by the blocker builder, not here; the note is the
-    # advisor's own prose after the verdict token, bounded and sanitised by
-    # ``_advisor_note_text`` — the one place the advisor's words are prepared
-    # for a user surface. ``None`` for CLEAN, for ``ok=False`` (the
-    # "findings" there are fixed backend copy) and for an empty body.
+    # Schema-admitted category and raw step ids; publication revalidates ids
+    # against live state. Only the sanitized note may reach user surfaces.
     category: str = "other"
     affected_step_ids: tuple[str, ...] = ()
     note: str | None = None
+    # None identifies verdicts without a textual model response (prescan or
+    # provider failure). These observations feed required durable pass fields.
+    response_schema_valid: bool | None = None
+    response_note_present: bool | None = None
+    url_redactions: int | None = None
+    email_redactions: int | None = None
 
 
 def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdict:
-    """Map an advisor reply to a verdict, tolerating real model formatting.
-
-    R2-F14 (elspeth-5403f346c0). The prompt asks only "Start your reply with
-    CLEAN or FLAGGED", and live advisor models comply in spirit while breaking
-    a strict first-line-anchored match: ``**CLEAN**``, ``Verdict: FLAGGED``, a
-    one-line preamble before the verdict, or a FLAGGED verdict whose prose
-    mentions CLEAN ("FLAGGED — ... otherwise this would be CLEAN"). Each of
-    those used to be declared MALFORMED and fail the build closed, which is a
-    formatting quibble presented to the user as a build failure.
-
-    So: strip markdown emphasis and scan. Explicit verdict-shaped CLEAN
-    acceptance is bounded to the first
-    :data:`_ADVISOR_VERDICT_SCAN_MAX_LINES` non-empty lines. Uppercase CLEAN in
-    a negation, quotation, or adjective is not a verdict. The old "reply
-    mentions both words => malformed" tripwire is gone; a genuinely
-    verdict-less reply is still MALFORMED, and the caller now spends a retry
-    re-asking for the format rather than terminating the build.
-
-    **FLAGGED dominates across the WHOLE reply.** Position does NOT decide.
-    A positional rule ("first marker wins") is a fail-OPEN here, because an
-    uppercase ``CLEAN`` token occurs naturally inside well-formed NEGATIONS —
-    "Not CLEAN. FLAGGED: …", "I cannot mark this CLEAN.", "Verdict: not CLEAN
-    — FLAGGED" — every one of which is a refusal to sign off that a positional
-    rule reads AS a sign-off. And bounding the FLAGGED scan to the CLEAN
-    window was itself a fail-OPEN (acceptance-r2 final review, T9xT8): the
-    END rubric instructs the advisor to QUOTE the user's explicit constraints,
-    so a quoted bare ``CLEAN`` can land inside the window while the advisor's
-    real ``FLAGGED`` verdict sits below it — under a window-bounded rule that
-    parsed as a silent sign-off with no format re-prompt. So a ``CLEAN`` that
-    coexists with a ``FLAGGED`` ANYWHERE in the reply is never a sign-off;
-    only a reply carrying an explicit in-window CLEAN verdict and no FLAGGED at
-    all passes.
-    The CLEAN window stays bounded (a sign-off buried under preamble is still
-    re-prompted — widening acceptance is the fail-open direction; widening
-    blocking is not). This still resolves each shape the fix exists to
-    handle (``**CLEAN**`` -> CLEAN, ``Verdict: FLAGGED`` -> FLAGGED,
-    preamble-then-verdict -> that verdict, FLAGGED-mentioning-CLEAN ->
-    FLAGGED) and errs toward blocking, the safe direction for a sign-off gate.
-    """
-    text = guidance.strip()
-    scanned = 0
-    saw_clean = False
-    for raw_line in text.splitlines():
-        line = _ADVISOR_MARKDOWN_EMPHASIS_RE.sub("", raw_line).strip()
-        if not line:
-            continue
-        scanned += 1
-        # The broad cased scan participates in FLAGGED dominance only. The
-        # anchored fallback adds a lowercase leading FLAGGED; CLEAN acceptance
-        # is decided separately by the explicit verdict-shaped arms below.
-        markers = [match.group(1).upper() for match in _ADVISOR_VERDICT_MARKER_RE.finditer(line)]
-        if not markers:
-            anchored = _ADVISOR_VERDICT_LINE_RE.match(line)
-            if anchored is not None:
-                markers = [anchored.group(1).upper()]
-        if "FLAGGED" in markers or _ADVISOR_FLAGGED_ANYCASE_RE.search(line) is not None:
-            # Dominance: nothing anywhere else in the reply can un-flag a
-            # FLAGGED, and the scan is unbounded in this direction only —
-            # blocking is the safe direction. The second arm is the widened
-            # any-register FLAGGED (terminator-guarded; see its definition).
-            # The machine lines are read from the whole reply: an absent or
-            # unrecognised CATEGORY is "other", an absent STEPS line or the
-            # literal "none" is no step ids.
-            category_match = _ADVISOR_CATEGORY_LINE_RE.search(text)
-            category = category_match.group(1).lower() if category_match else "other"
-            if category not in ADVISOR_FINDING_CATEGORIES:
-                category = "other"
-            steps_match = _ADVISOR_STEPS_LINE_RE.search(text)
-            raw_steps = steps_match.group(1) if steps_match else ""
-            affected = tuple(step for step in _ADVISOR_STEP_ID_RE.findall(raw_steps) if step.lower() != "none")
-            return AdvisorCheckpointVerdict(
-                ok=True,
-                blocking=True,
-                findings_text=text,
-                category=category,
-                affected_step_ids=affected,
-                note=_advisor_note_text(text),
-            )
-        # CLEAN acceptance reads its own scanned copy, in which a code span
-        # holding lowercase text keeps its backticks (quoted data, e.g. a field
-        # named ``clean``); FLAGGED dominance above keeps the full strip.
-        clean_line = _advisor_clean_acceptance_scan_line(raw_line)
-        explicit_clean = (
-            _ADVISOR_CLEAN_VERDICT_LINE_RE.match(clean_line) is not None or _ADVISOR_CLEAN_VERDICT_LABEL_RE.match(clean_line) is not None
+    """Admit the checkpoint JSON contract before constructing an owned verdict."""
+    admission = parse_advisor_checkpoint_response(guidance)
+    response = admission.response
+    if response is None:
+        return AdvisorCheckpointVerdict(
+            ok=False,
+            blocking=False,
+            findings_text=_ADVISOR_MALFORMED_USER_DETAIL,
+            failure_class="malformed",
+            response_schema_valid=admission.schema_valid,
         )
-        if scanned <= _ADVISOR_VERDICT_SCAN_MAX_LINES:
-            saw_clean = saw_clean or explicit_clean
-
-    if saw_clean:
-        return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text=text)
-    return AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=_ADVISOR_MALFORMED_USER_DETAIL, failure_class="malformed")
+    sanitized = sanitize_advisor_note(response.note)
+    return AdvisorCheckpointVerdict(
+        ok=True,
+        blocking=response.verdict == "FLAGGED",
+        findings_text=response.findings,
+        category=response.category,
+        affected_step_ids=tuple(response.steps),
+        note=sanitized.note,
+        response_schema_valid=True,
+        response_note_present=response.note is not None,
+        url_redactions=sanitized.url_redactions,
+        email_redactions=sanitized.email_redactions,
+    )
 
 
 def _looks_like_advisor_prompt_injection(value: str) -> bool:
@@ -11018,107 +10958,6 @@ _ADVISOR_FINDINGS_MAX_CHARS: Final[int] = 4_000
 _ADVISOR_FINDINGS_UNTRUSTED_BEGIN: Final[str] = "BEGIN_UNTRUSTED_ADVISOR_FINDINGS"
 _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 
-# elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): the advisor's own
-# words reach the user as a labelled note. Bounded here, once, before any
-# surface or row sees them. The category vocabulary is closed: the blocker
-# header is chosen from it server-side, never from advisor text.
-ADVISOR_NOTE_MAX_CHARS: Final[int] = 600
-ADVISOR_FINDING_CATEGORIES: Final[frozenset[str]] = frozenset(
-    {"request_not_met", "error_handling", "prompt_defect", "schema_mismatch", "other"}
-)
-_ADVISOR_CATEGORY_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\s*CATEGORY\s*:\s*([a-z_]+)\s*$", re.IGNORECASE | re.MULTILINE)
-_ADVISOR_STEPS_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\s*STEPS\s*:\s*(.*?)\s*$", re.IGNORECASE | re.MULTILINE)
-_ADVISOR_STEP_ID_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_.\-]+")
-# ANSI CSI escape sequences, stripped before the character filter below: ESC
-# is itself a C0 control, so removing controls first would take the ESC alone
-# and leave ``[31m`` behind as text.
-_ADVISOR_NOTE_ANSI_CSI_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-# Everything the note drops by Unicode CATEGORY rather than by an explicit
-# class (final review I-2): ``Cc`` is the C0/C1 controls, ``Cf`` the format
-# block -- bidirectional overrides and isolates, the zero-width family, the
-# BOM -- and ``Zl``/``Zp`` the line and paragraph separators. Left in, a note
-# can render differently from the text stored beside it, so an operator
-# reading the session DB sees something other than what the user was shown.
-# Expressed as CATEGORIES, not literals: an invisible character in source is
-# precisely what this removes, and a character class of them is unreviewable.
-_ADVISOR_NOTE_STRIPPED_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
-_ADVISOR_NOTE_KEPT_CONTROLS: Final[frozenset[str]] = frozenset("\t\n\r")
-
-
-def _strip_note_control_characters(text: str) -> str:
-    """Drop ANSI escapes and every control/format character but tab and newline."""
-    without_escapes = _ADVISOR_NOTE_ANSI_CSI_RE.sub("", text)
-    return "".join(
-        character
-        for character in without_escapes
-        if character in _ADVISOR_NOTE_KEPT_CONTROLS or unicodedata.category(character) not in _ADVISOR_NOTE_STRIPPED_CATEGORIES
-    )
-
-
-# The verdict LEAD as the note strips it: the token, optionally wrapped in
-# markdown emphasis and optionally introduced by a ``Verdict:`` label, closed
-# by a verdict-shaped terminator or end-of-line — the same terminator guard
-# ``_ADVISOR_VERDICT_LINE_RE`` uses, so adjectival prose ("flagged rows are
-# routed to the reject sink") is not a verdict. Matching the emphasis HERE
-# rather than pre-stripping the line is what keeps underscores in the prose:
-# ``_ADVISOR_MARKDOWN_EMPHASIS_RE`` would delete them from step ids and from
-# the fence sentinels this function still has to find.
-# FLAGGED only (self-review 2026-09-23): a note is built on the FLAGGED arm
-# alone, so a line opening with CLEAN is never the verdict. Matching it let a
-# ``**Clean:** the source is fine`` sub-heading stand in for a mid-line
-# verdict, dropping the actual finding above it from the note.
-_ADVISOR_NOTE_VERDICT_LEAD_RE: Final[re.Pattern[str]] = re.compile(
-    r"^[*_`~\s]*(?:verdict\s*[:\-]\s*)?[*_`~\s]*FLAGGED[*_`~]*\s*(?:[:.\-" + chr(0x2013) + chr(0x2014) + r"]\s*|$)",
-    re.IGNORECASE,
-)
-# Three or more newlines collapse to a blank line (final review M-3/M-1):
-# removing a CATEGORY/STEPS line leaves its newline behind, and a note that is
-# mostly newlines pushes the blocker's own button down the panel.
-_ADVISOR_NOTE_BLANK_RUN_RE: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
-
-
-def _advisor_note_text(findings_text: str) -> str | None:
-    """The advisor's prose after the verdict token, bounded and sanitised, or None.
-
-    Removes the verdict line, the CATEGORY/STEPS machine lines, the
-    untrusted-findings fence sentinels and control characters.
-
-    The verdict line is found the way the SCANNER finds it (final review I-1),
-    not with one start-anchored match: ``_parse_advisor_checkpoint_guidance``
-    deliberately accepts ``**FLAGGED**``, ``Verdict: FLAGGED``, a preamble
-    before the verdict and a bare ``FLAGGED`` on its own line — its docstring
-    names these as observed live — and a note that opens with the protocol
-    token is exactly the noise the header exists to replace. The emphasis is
-    matched as part of the lead pattern rather than stripped from the line,
-    so underscores survive in the body — in the step ids the note names and
-    in the fence sentinels removed below.
-
-    Unicode line and paragraph separators arrive as line breaks (``splitlines``
-    honours them) and are kept as ``\\n``: the stored note and the rendered
-    note then agree, which is the property I-2 is about.
-    """
-    lines = findings_text.strip().splitlines()
-    # Rejoined with ``\n`` even when no verdict line is found below: the raw
-    # text would carry U+2028/U+2029 to the control filter, which deletes them
-    # and glues the words either side together.
-    body = "\n".join(lines)
-    for index, raw_line in enumerate(lines):
-        if _ADVISOR_NOTE_VERDICT_LEAD_RE.match(raw_line.strip()) is None:
-            continue
-        remainder = _ADVISOR_NOTE_VERDICT_LEAD_RE.sub("", raw_line.strip(), count=1)
-        body = "\n".join([remainder, *lines[index + 1 :]])
-        break
-    body = _ADVISOR_CATEGORY_LINE_RE.sub("", body)
-    body = _ADVISOR_STEPS_LINE_RE.sub("", body)
-    body = body.replace(_ADVISOR_FINDINGS_UNTRUSTED_BEGIN, "").replace(_ADVISOR_FINDINGS_UNTRUSTED_END, "")
-    body = _strip_note_control_characters(body)
-    body = _ADVISOR_NOTE_BLANK_RUN_RE.sub("\n\n", body).strip()
-    if not body:
-        return None
-    if len(body) > ADVISOR_NOTE_MAX_CHARS:
-        body = body[: ADVISOR_NOTE_MAX_CHARS - 1].rstrip() + "…"
-    return body
-
 
 # R2-F12 (elspeth-bff8fe6864): the user-facing output-contract sentence
 # shared by BOTH advisor-injection sites (the END gate's FLAGGED repair
@@ -11222,76 +11061,14 @@ def _fence_advisor_findings(findings_text: str) -> str:
     return f"{_ADVISOR_FINDINGS_UNTRUSTED_BEGIN}\n{text}\n{_ADVISOR_FINDINGS_UNTRUSTED_END}"
 
 
-# R2-F14 (elspeth-5403f346c0): tolerant verdict parsing + budgeted format retry.
-# How many leading non-empty lines CLEAN ACCEPTANCE inspects. Bounded so a
-# rambling advisor reply cannot bury a sign-off token under arbitrary prose and
-# still be accepted: past this window a CLEAN is not a compliant sign-off and
-# is re-prompted instead. FLAGGED detection is deliberately NOT bounded by
-# this window (acceptance-r2 final review, T9xT8): the END rubric makes the
-# advisor quote the user's constraints, so a quoted CLEAN can occupy the
-# window while the real FLAGGED verdict sits below it — blocking must win from
-# anywhere in the reply.
-_ADVISOR_VERDICT_SCAN_MAX_LINES: Final[int] = 5
-# Any-register FLAGGED arm (parked T8 residual, folded into the T9xT8 fix).
-# Requires the token to be closed by a verdict-shaped terminator — the same
-# ``:`` / ``.`` / dash / end-of-line set as the anchored arm — so adjectival
-# prose ("flagged records are routed to the reject sink") stays unmatched. A
-# match can only BLOCK, never sign off, so unlike CLEAN this widening cannot
-# reopen the adjectival fail-open.
-_ADVISOR_FLAGGED_ANYCASE_RE: Final[re.Pattern[str]] = re.compile(
-    # \u2013 / \u2014 are the en/em dashes models actually type; spelled as
-    # escapes so the literal cannot be confused with an ASCII hyphen on review
-    # (same convention as ``_ADVISOR_VERDICT_LINE_RE``).
-    r"\bFLAGGED\b\s*(?:[:.\-\u2013\u2014]|$)",
-    re.IGNORECASE,
-)
-# Markdown emphasis / code-span punctuation stripped before the verdict scan.
-# ``*`` and backtick are already non-word characters (so ``**CLEAN**`` matches
-# ``\bCLEAN\b`` regardless), but ``_`` is a WORD character — without stripping
-# it, ``__CLEAN__`` never matches. Applied only to the scanned copy of the
-# line; ``findings_text`` keeps the advisor's original text verbatim.
-_ADVISOR_MARKDOWN_EMPHASIS_RE: Final[re.Pattern[str]] = re.compile(r"[*_`~]")
-# The CLEAN-acceptance scan's variant of the strip above: one left-to-right
-# pass that matches a whole code span first, so the span's own backticks are
-# decided as a unit rather than character by character. A code span follows
-# CommonMark: an opening backtick run closed by a run of the SAME length, with
-# neither run adjacent to a further backtick. Pairing single backticks instead
-# read the empty gap inside a double-backtick opener as an (uppercase) span.
-# A backtick outside any span is a literal character and is not stripped.
-_ADVISOR_CLEAN_SCAN_MARKUP_RE: Final[re.Pattern[str]] = re.compile(r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)|[*_~]")
-
-
-def _advisor_clean_acceptance_scan_line(raw_line: str) -> str:
-    """Return the copy of an advisor reply line that CLEAN acceptance scans.
-
-    Identical to the emphasis strip except for backticks. Stripping the
-    backticks of a code span holding lowercase text turned a quoted
-    identifier — "`clean`: requested as a boolean output field, but no node
-    emits it", or the same with a double-backtick span — into the bare
-    ``clean:`` verdict form and minted a sign-off for a reply describing a
-    defect. A span with lowercase text is quoted data and keeps its backticks,
-    so the anchored CLEAN arm cannot match it; an all-uppercase span such as
-    ``CLEAN`` is still unwrapped and accepted. An unbalanced backtick is kept
-    too: it cannot be told apart from a truncated quote, so the reply is
-    re-prompted rather than signed off.
-    """
-
-    def _strip(match: re.Match[str]) -> str:
-        span = match.group(2)
-        if span is None:
-            return ""
-        if span != span.upper():
-            return match.group(0)
-        return _ADVISOR_MARKDOWN_EMPHASIS_RE.sub("", span)
-
-    return _ADVISOR_CLEAN_SCAN_MARKUP_RE.sub(_strip, raw_line).strip()
-
-
 # The one-line re-prompt appended to the (Tier-1, backend-produced) checkpoint
 # ``problem_summary`` when a transport-successful reply could not be parsed as
 # a verdict. It travels the SAME contracted advisor-arguments channel as the
 # first attempt — there is no second, unaudited prompt path.
-_ADVISOR_VERDICT_FORMAT_REPROMPT: Final[str] = "Reply with exactly CLEAN or FLAGGED on line 1."
+_ADVISOR_VERDICT_FORMAT_REPROMPT: Final[str] = (
+    "The previous reply did not satisfy the checkpoint schema. Return only the required JSON object, "
+    "following the output contract in the system instructions."
+)
 
 
 def _advisor_arguments_with_format_reprompt(arguments: Mapping[str, Any]) -> dict[str, Any]:

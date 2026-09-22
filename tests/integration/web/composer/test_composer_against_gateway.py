@@ -522,7 +522,7 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
 
 # ---------------------------------------------------------------------------
 # The boot probe against the live gateway. ``probe_composer_config``
-# unconditionally sends ``max_tokens=16``, which LiteLLM's ``openai`` path
+# sends ``max_tokens=16`` for the planner, which LiteLLM's ``openai`` path
 # translates to the wire field ``max_completion_tokens``; the gateway's
 # ``extra="forbid"`` ``ChatRequest`` rejected that as an unknown field, so
 # the probe raised ``ComposerBootConfigError`` and ``app.py`` re-raised it --
@@ -542,6 +542,7 @@ async def test_boot_probe_succeeds_against_gateway(gateway_base_url: str) -> Non
     from elspeth.web.composer.boot_probe import probe_composer_config
 
     probed = await probe_composer_config(
+        role="planner",
         model=_MODEL_ALIAS,
         temperature=None,
         seed=None,
@@ -565,6 +566,7 @@ async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(gatewa
     from elspeth.web.composer.boot_probe import probe_composer_config
 
     probed = await probe_composer_config(
+        role="planner",
         model=_SAMPLING_MODEL_ALIAS,
         temperature=0.2,
         seed=7,
@@ -584,6 +586,7 @@ async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(gateway_
 
     with pytest.raises(ComposerBootConfigError, match="sampling rejected") as caught:
         await probe_composer_config(
+            role="planner",
             model=_MODEL_ALIAS,
             temperature=0.2,
             seed=7,

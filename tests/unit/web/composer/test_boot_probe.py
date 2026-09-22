@@ -2,10 +2,122 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
 import elspeth.web.composer.boot_probe as bp
+
+_CLEAN = '{"verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}'
+
+
+@pytest.mark.asyncio
+async def test_advisor_probe_uses_production_request_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer.advisor_request import build_advisor_request_options
+
+    calls: list[dict[str, object]] = []
+
+    async def complete(*, on_provider_dispatch: object = None, **kwargs: object) -> object:
+        assert on_provider_dispatch is None
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=_CLEAN, tool_calls=None))])
+
+    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    assert await bp.probe_composer_config(
+        role="advisor",
+        model="openrouter/anthropic/claude-sonnet-5",
+        temperature=0.2,
+        seed=42,
+        max_tokens=8192,
+        reasoning_effort="low",
+        api_base="https://openrouter.ai/api/v1",
+        api_key="test-token",
+    )
+    expected = build_advisor_request_options(
+        model="openrouter/anthropic/claude-sonnet-5",
+        temperature=0.2,
+        seed=42,
+        max_tokens=8192,
+        reasoning_effort="low",
+        api_base="https://openrouter.ai/api/v1",
+        api_key="test-token",
+        structured_output=True,
+    )
+    request = calls[0]
+    messages = request.pop("messages")
+    assert request == expected
+    assert isinstance(messages, list)
+    prompt = messages[0]["content"]
+    assert _CLEAN in prompt
+    assert "reply with ok" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "CLEAN",
+        "",
+        '{"verdict":',
+        '{"verdict":"FLAGGED","verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}',
+        json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": "bad"}),
+        json.dumps({"verdict": "FLAGGED", "category": "other", "steps": [], "findings": " ", "note": None}),
+        None,
+        4,
+    ],
+    ids=["prose", "empty", "truncated", "duplicate", "clean-note", "flagged-empty", "reasoning-only", "wrong-type"],
+)
+async def test_advisor_probe_rejects_nonconforming_content(monkeypatch: pytest.MonkeyPatch, content: object) -> None:
+    async def complete(**_kwargs: object) -> object:
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+
+    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    with pytest.raises(bp.ComposerBootConfigError, match=r"advisor.*probe-model.*structured-output"):
+        await bp.probe_composer_config(role="advisor", model="probe-model", temperature=None, seed=None, max_tokens=4096)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(choices=[]),
+        SimpleNamespace(choices="invalid"),
+        SimpleNamespace(choices=[SimpleNamespace()]),
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=_CLEAN, tool_calls=[object()]))]),
+    ],
+    ids=["missing-choices", "empty-choices", "wrong-choices", "missing-message", "tool-call"],
+)
+async def test_advisor_probe_rejects_malformed_provider_response(monkeypatch: pytest.MonkeyPatch, response: object) -> None:
+    async def complete(**_kwargs: object) -> object:
+        return response
+
+    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    with pytest.raises(bp.ComposerBootConfigError, match="structured-output"):
+        await bp.probe_composer_config(role="advisor", model="probe-model", temperature=None, seed=None, max_tokens=4096)
+
+
+@pytest.mark.asyncio
+async def test_advisor_probe_names_structured_capability_on_provider_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.exceptions import BadRequestError
+
+    async def complete(**_kwargs: object) -> object:
+        raise BadRequestError(message="schema unsupported", model="probe-model", llm_provider="openai")
+
+    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    with pytest.raises(bp.ComposerBootConfigError, match=r"advisor.*probe-model.*structured-output"):
+        await bp.probe_composer_config(role="advisor", model="probe-model", temperature=None, seed=None, max_tokens=4096)
+
+
+@pytest.mark.asyncio
+async def test_advisor_probe_timeout_remains_nonfatal(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def complete(**_kwargs: object) -> object:
+        raise TimeoutError
+
+    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    assert not await bp.probe_composer_config(role="advisor", model="probe-model", temperature=None, seed=None, max_tokens=4096)
 
 
 @pytest.mark.asyncio
@@ -22,7 +134,7 @@ async def test_probe_raises_boot_config_error_on_bad_request(monkeypatch: pytest
     monkeypatch.setattr(bp, "_litellm_acompletion", fake_acompletion)
 
     with pytest.raises(bp.ComposerBootConfigError, match="gpt-5"):
-        await bp.probe_composer_config(model="gpt-5", temperature=0.0, seed=None)
+        await bp.probe_composer_config(role="planner", model="gpt-5", temperature=0.0, seed=None)
 
 
 @pytest.mark.asyncio
@@ -39,7 +151,7 @@ async def test_probe_fatal_on_seed_bad_request_without_phrase_matching(monkeypat
     monkeypatch.setattr(bp, "_litellm_acompletion", fake_acompletion)
 
     with pytest.raises(bp.ComposerBootConfigError):
-        await bp.probe_composer_config(model="gpt-5", temperature=None, seed=99999999999)
+        await bp.probe_composer_config(role="planner", model="gpt-5", temperature=None, seed=99999999999)
 
 
 @pytest.mark.asyncio
@@ -49,21 +161,22 @@ async def test_probe_passes_through_on_success(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(bp, "_litellm_acompletion", fake_acompletion)
 
-    assert await bp.probe_composer_config(model="gpt-4o", temperature=0.0, seed=42) is True
+    assert await bp.probe_composer_config(role="planner", model="gpt-4o", temperature=0.0, seed=42) is True
 
 
 @pytest.mark.asyncio
 async def test_bedrock_probe_uses_default_aws_chain_without_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[dict[str, object]] = []
 
-    async def fake_acompletion(**kwargs: object) -> object:
+    async def fake_acompletion(*, on_provider_dispatch: object = None, **kwargs: object) -> object:
+        assert on_provider_dispatch is None
         captured.append(kwargs)
         return object()
 
     monkeypatch.setattr(bp, "_litellm_acompletion", fake_acompletion)
     model = "bedrock/global.anthropic.claude-sonnet-4-6"
 
-    assert await bp.probe_composer_config(model=model, temperature=None, seed=None) is True
+    assert await bp.probe_composer_config(role="planner", model=model, temperature=None, seed=None) is True
     assert captured == [
         {
             "model": model,
@@ -80,7 +193,7 @@ async def test_probe_is_graceful_on_transient(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(bp, "_litellm_acompletion", fake_acompletion)
 
-    assert await bp.probe_composer_config(model="gpt-4o", temperature=0.0, seed=42) is False
+    assert await bp.probe_composer_config(role="planner", model="gpt-4o", temperature=0.0, seed=42) is False
 
 
 @pytest.mark.asyncio
@@ -96,7 +209,7 @@ async def test_probe_is_graceful_on_litellm_provider_error(monkeypatch: pytest.M
 
     monkeypatch.setattr(bp, "_litellm_acompletion", fake_acompletion)
 
-    assert await bp.probe_composer_config(model="gpt-4o", temperature=0.0, seed=42) is False
+    assert await bp.probe_composer_config(role="planner", model="gpt-4o", temperature=0.0, seed=42) is False
 
 
 @pytest.mark.asyncio
@@ -107,7 +220,7 @@ async def test_probe_propagates_programmer_errors(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(bp, "_litellm_acompletion", fake_acompletion)
 
     with pytest.raises(TypeError, match="signature drift"):
-        await bp.probe_composer_config(model="gpt-4o", temperature=0.0, seed=42)
+        await bp.probe_composer_config(role="planner", model="gpt-4o", temperature=0.0, seed=42)
 
 
 # --- Endpoint affordance (Phase 3 Task 2) -----------------------------------
@@ -121,13 +234,14 @@ async def test_probe_propagates_programmer_errors(monkeypatch: pytest.MonkeyPatc
 async def test_probe_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[dict[str, object]] = []
 
-    async def fake_acompletion(**kwargs: object) -> object:
+    async def fake_acompletion(*, on_provider_dispatch: object = None, **kwargs: object) -> object:
+        assert on_provider_dispatch is None
         captured.append(kwargs)
         return object()
 
     monkeypatch.setattr(bp, "_litellm_acompletion", fake_acompletion)
 
-    assert await bp.probe_composer_config(model="gpt-4o", temperature=None, seed=None) is True
+    assert await bp.probe_composer_config(role="planner", model="gpt-4o", temperature=None, seed=None) is True
 
     assert "api_base" not in captured[0]
     assert "api_key" not in captured[0]
@@ -150,6 +264,7 @@ async def test_probe_sends_configured_endpoint(monkeypatch: pytest.MonkeyPatch) 
 
     assert (
         await bp.probe_composer_config(
+            role="planner",
             model="gpt-4o",
             temperature=0.0,
             seed=42,

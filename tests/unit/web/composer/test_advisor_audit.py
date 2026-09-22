@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from opentelemetry.metrics import Counter
+from structlog.typing import FilteringBoundLogger
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
@@ -50,7 +53,20 @@ def _context(session_id: str) -> SessionOperationContext:
 
 def _pass_record() -> AdvisorCheckpointPassRecord:
     return AdvisorCheckpointPassRecord.from_findings(
-        phase="end", pass_index=1, verdict="flagged", source="model", findings_text="FLAGGED: FINDINGS_CANARY"
+        phase="end",
+        pass_index=1,
+        verdict="flagged",
+        source="model",
+        findings_text="FLAGGED: FINDINGS_CANARY",
+        provider_attempts=1,
+        first_attempt_schema_valid=True,
+        first_attempt_accepted=True,
+        format_reprompt_sent=False,
+        step_ids_offered=3,
+        step_ids_kept=1,
+        note_present=True,
+        url_redactions=2,
+        email_redactions=1,
     )
 
 
@@ -79,6 +95,28 @@ class _OrderedSink:
 
 
 class TestRecords:
+    def test_checkpoint_pass_serialization_requires_explicit_conformance(self) -> None:
+        assert set(_pass_record().to_dict()) == {
+            "phase",
+            "pass_index",
+            "verdict",
+            "source",
+            "findings_hash",
+            "provider_attempts",
+            "first_attempt_schema_valid",
+            "first_attempt_accepted",
+            "format_reprompt_sent",
+            "step_ids_offered",
+            "step_ids_kept",
+            "note_present",
+            "url_redactions",
+            "email_redactions",
+        }
+
+    def test_checkpoint_pass_factory_rejects_missing_conformance(self) -> None:
+        with pytest.raises(TypeError, match="provider_attempts"):
+            AdvisorCheckpointPassRecord.from_findings(phase="early", pass_index=0, verdict="clean", source="model", findings_text="")
+
     def test_checkpoint_pass_hash_payload_shape_is_unchanged(self) -> None:
         """The journal has carried ``{"advisor_findings": text}`` since the
         event was introduced; the row must hash the same payload."""
@@ -109,9 +147,174 @@ class TestRecords:
         ],
     )
     def test_checkpoint_pass_rejects_values_outside_the_closed_vocabulary(self, kwargs: dict[str, Any]) -> None:
-        base: dict[str, Any] = {"phase": "end", "pass_index": 1, "verdict": "clean", "source": "model", "findings_hash": "h"}
+        base = _pass_record().to_dict()
         with pytest.raises(AuditIntegrityError):
             AdvisorCheckpointPassRecord(**{**base, **kwargs})
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "provider_attempts",
+            "first_attempt_schema_valid",
+            "first_attempt_accepted",
+            "format_reprompt_sent",
+            "step_ids_offered",
+            "step_ids_kept",
+            "note_present",
+            "url_redactions",
+            "email_redactions",
+        ],
+    )
+    def test_checkpoint_pass_constructor_requires_every_conformance_field(self, field: str) -> None:
+        values: dict[str, Any] = dict(_pass_record().to_dict())
+        del values[field]
+        with pytest.raises(TypeError, match=field):
+            AdvisorCheckpointPassRecord(**values)
+
+    @pytest.mark.parametrize("field", ["provider_attempts", "step_ids_offered", "step_ids_kept", "url_redactions", "email_redactions"])
+    @pytest.mark.parametrize("value", [True, -1, 1.0, "1"])
+    def test_checkpoint_counts_require_nonnegative_exact_ints(self, field: str, value: object) -> None:
+        with pytest.raises(AuditIntegrityError):
+            replace(_pass_record(), **{field: value})
+
+    @pytest.mark.parametrize("field", ["first_attempt_schema_valid", "first_attempt_accepted", "format_reprompt_sent", "note_present"])
+    @pytest.mark.parametrize("value", [0, 1, "true"])
+    def test_checkpoint_boolean_fields_require_exact_bools(self, field: str, value: object) -> None:
+        with pytest.raises(AuditIntegrityError):
+            replace(_pass_record(), **{field: value})
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"provider_attempts": 3},
+            {"provider_attempts": 0},
+            {"first_attempt_schema_valid": None},
+            {"first_attempt_accepted": None},
+            {"first_attempt_schema_valid": False},
+            {"first_attempt_accepted": False},
+            {"format_reprompt_sent": True},
+            {"step_ids_kept": 4},
+            {"step_ids_offered": None},
+            {"note_present": False},
+            {"note_present": None},
+            {"url_redactions": None},
+            {"email_redactions": None},
+            {"verdict": "clean"},
+            {"verdict": "malformed"},
+            {"source": "prescan"},
+            {"provider_attempts": 2},
+        ],
+    )
+    def test_checkpoint_cross_field_invariants_reject_inconsistent_facts(self, changes: dict[str, Any]) -> None:
+        with pytest.raises(AuditIntegrityError):
+            replace(_pass_record(), **changes)
+
+    @pytest.mark.parametrize(
+        ("attempts", "schema", "accepted", "reprompt", "verdict", "source", "has_final"),
+        [
+            (0, None, None, False, "flagged", "prescan", False),
+            (2, None, None, False, "flagged", "model", True),
+            (2, False, False, True, "flagged", "model", True),
+            (2, True, False, True, "flagged", "model", True),
+            (2, False, False, True, "unavailable", "model", False),
+            (1, False, False, False, "malformed", "model", False),
+        ],
+    )
+    def test_checkpoint_record_accepts_conformance_table(
+        self,
+        attempts: int,
+        schema: bool | None,
+        accepted: bool | None,
+        reprompt: bool,
+        verdict: Any,
+        source: Any,
+        has_final: bool,
+    ) -> None:
+        record = replace(
+            _pass_record(),
+            provider_attempts=attempts,
+            first_attempt_schema_valid=schema,
+            first_attempt_accepted=accepted,
+            format_reprompt_sent=reprompt,
+            verdict=verdict,
+            source=source,
+            step_ids_offered=3 if has_final else None,
+            step_ids_kept=1 if has_final else None,
+            note_present=True if has_final else None,
+            url_redactions=2 if has_final else None,
+            email_redactions=1 if has_final else None,
+        )
+        assert record.to_dict()["provider_attempts"] == attempts
+
+    def test_clean_record_requires_zero_counts_and_no_note(self) -> None:
+        record = replace(
+            _pass_record(), verdict="clean", step_ids_offered=0, step_ids_kept=0, note_present=False, url_redactions=0, email_redactions=0
+        )
+        assert record.to_dict()["note_present"] is False
+
+    @pytest.mark.parametrize("verdict", ["unavailable", "malformed"])
+    def test_undispatched_model_failure_has_zero_attempts_and_no_conformance(self, verdict: Any) -> None:
+        record = replace(
+            _pass_record(),
+            verdict=verdict,
+            provider_attempts=0,
+            first_attempt_schema_valid=None,
+            first_attempt_accepted=None,
+            format_reprompt_sent=False,
+            step_ids_offered=None,
+            step_ids_kept=None,
+            note_present=None,
+            url_redactions=None,
+            email_redactions=None,
+        )
+        assert record.to_dict() == {
+            "phase": "end",
+            "pass_index": 1,
+            "verdict": verdict,
+            "source": "model",
+            "findings_hash": stable_hash({"advisor_findings": "FLAGGED: FINDINGS_CANARY"}),
+            "provider_attempts": 0,
+            "first_attempt_schema_valid": None,
+            "first_attempt_accepted": None,
+            "format_reprompt_sent": False,
+            "step_ids_offered": None,
+            "step_ids_kept": None,
+            "note_present": None,
+            "url_redactions": None,
+            "email_redactions": None,
+        }
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"verdict": "clean"},
+            {"verdict": "flagged"},
+            {"first_attempt_schema_valid": False, "first_attempt_accepted": False},
+            {"first_attempt_schema_valid": True, "first_attempt_accepted": False},
+            {"format_reprompt_sent": True},
+            {"step_ids_offered": 0},
+            {"step_ids_kept": 0},
+            {"note_present": False},
+            {"url_redactions": 0},
+            {"email_redactions": 0},
+        ],
+    )
+    def test_undispatched_model_failure_rejects_invented_response_facts(self, changes: dict[str, Any]) -> None:
+        undispatched = replace(
+            _pass_record(),
+            verdict="unavailable",
+            provider_attempts=0,
+            first_attempt_schema_valid=None,
+            first_attempt_accepted=None,
+            format_reprompt_sent=False,
+            step_ids_offered=None,
+            step_ids_kept=None,
+            note_present=None,
+            url_redactions=None,
+            email_redactions=None,
+        )
+        with pytest.raises(AuditIntegrityError):
+            replace(undispatched, **changes)
 
     @pytest.mark.parametrize(
         ("branch", "reason", "shape", "backend"),
@@ -126,8 +329,14 @@ class TestRecords:
         ids=["branch", "block_without_reason", "reason_off_block", "reason_vocab", "shape", "backend_finding_off_block"],
     )
     def test_publication_rejects_inconsistent_records(self, branch: str, reason: str | None, shape: str, backend: bool) -> None:
+        values: dict[str, Any] = {
+            "branch": branch,
+            "reason": reason,
+            "preflight_shape": shape,
+            "findings_backend_authored": backend,
+        }
         with pytest.raises(AuditIntegrityError):
-            AdvisorTerminalPublication(branch=branch, reason=reason, preflight_shape=shape, findings_backend_authored=backend)  # type: ignore[arg-type]
+            AdvisorTerminalPublication(**values)
 
     def test_envelopes_carry_distinct_kinds_and_nothing_but_closed_fields(self) -> None:
         pass_envelope = advisor_checkpoint_pass_audit_envelope(_pass_record())
@@ -144,6 +353,15 @@ class TestRecords:
                 "verdict": "flagged",
                 "source": "model",
                 "findings_hash": stable_hash({"advisor_findings": "FLAGGED: FINDINGS_CANARY"}),
+                "provider_attempts": 1,
+                "first_attempt_schema_valid": True,
+                "first_attempt_accepted": True,
+                "format_reprompt_sent": False,
+                "step_ids_offered": 3,
+                "step_ids_kept": 1,
+                "note_present": True,
+                "url_redactions": 2,
+                "email_redactions": 1,
             },
         }
         assert publication_envelope == {
@@ -268,6 +486,68 @@ class TestAuditPrimacy:
 
 class TestRowsInARealSessionStore:
     @pytest.mark.asyncio
+    async def test_base_and_new_checkpoint_rows_remain_opaque_and_excluded_from_model_history(self, tmp_path: Any) -> None:
+        from elspeth.web.sessions.routes._helpers import (
+            _composer_chat_history,
+            _composer_conversation_messages,
+            _composer_conversation_or_llm_audit_messages,
+        )
+        from tests.fixtures.identities import ensure_test_identity
+
+        from .conftest import build_test_sessions_service
+
+        sessions = build_test_sessions_service(data_dir=tmp_path)
+        with sessions._engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="audit-compatibility-user")
+        session = await sessions.create_session("audit-compatibility-user", "Historical advisor rows", "local")
+        # Exact base-format fixture: keep its five original facts, without inventing conformance.
+        old_envelope = {
+            "_kind": "advisor_checkpoint_pass_audit",
+            "pass": {
+                "phase": "end",
+                "pass_index": 0,
+                "verdict": "flagged",
+                "source": "model",
+                "findings_hash": stable_hash({"advisor_findings": "BASE_FINDING"}),
+            },
+        }
+        old_content = json.dumps(old_envelope)
+        record = _pass_record()
+        async with sessions._call_context(session.id, SessionOperationKind.COMPOSE) as context:
+            await sessions.add_message(
+                session.id,
+                "assistant",
+                "CONVERSATION_CONTROL",
+                writer_principal="compose_loop",
+                session_operation_context=context,
+            )
+            await sessions.add_message(
+                session.id,
+                "audit",
+                old_content,
+                tool_calls=[old_envelope],
+                writer_principal="compose_loop",
+                session_operation_context=context,
+            )
+            await persist_advisor_checkpoint_pass(
+                sessions=sessions,
+                session_id=str(session.id),
+                session_operation_context=context,
+                record=record,
+            )
+
+        messages = await sessions.get_messages(session.id)
+        assert len(messages) == 3
+        assert messages[1].content == old_content
+        assert dict(messages[1].tool_calls[0]) == old_envelope
+        assert json.loads(messages[1].content)["pass"] == old_envelope["pass"]
+        assert json.loads(messages[2].content) == advisor_checkpoint_pass_audit_envelope(record)
+        assert dict(messages[2].tool_calls[0]) == advisor_checkpoint_pass_audit_envelope(record)
+        assert _composer_chat_history(messages) == [{"role": "assistant", "content": "CONVERSATION_CONTROL"}]
+        assert _composer_conversation_messages(messages) == [messages[0]]
+        assert _composer_conversation_or_llm_audit_messages(messages) == [messages[0]]
+
+    @pytest.mark.asyncio
     async def test_rows_persist_as_audit_only_and_stay_out_of_the_conversation(self, tmp_path: Any) -> None:
         """Through the live fence into SQLite: both rows land as ``role="audit"``
         with their envelopes, are excluded from the LLM conversation, and are
@@ -310,3 +590,16 @@ class TestRowsInARealSessionStore:
         assert all(json.loads(message.content) == dict(message.tool_calls[0]) for message in audit_rows)
         assert _composer_conversation_messages(messages) == []
         assert _composer_conversation_or_llm_audit_messages(messages) == []
+
+
+def test_checkpoint_event_mirrors_exact_counts_without_unbounded_metric_dimensions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer import advisor_checkpoint_telemetry as telemetry
+
+    counter = MagicMock(spec_set=Counter)
+    logger = MagicMock(spec_set=FilteringBoundLogger)
+    monkeypatch.setattr(telemetry, "_ADVISOR_CHECKPOINT_PASSES_COUNTER", counter)
+    monkeypatch.setattr(telemetry, "slog", logger)
+    record = replace(_pass_record(), step_ids_offered=5001, url_redactions=3003, email_redactions=2002)
+    telemetry.record_advisor_checkpoint_pass(session_id="session-canary", **record.to_dict())
+    logger.info.assert_called_once_with("composer.advisor_checkpoint_pass", session_id="session-canary", **record.to_dict())
+    counter.add.assert_called_once_with(1, {"phase": "end", "verdict": "flagged", "source": "model"})

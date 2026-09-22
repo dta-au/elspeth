@@ -687,15 +687,17 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
 
         # Advisor is mandatory, so the advisor model is always probed. Each
-        # role probes against ITS OWN configured endpoint (Phase 3 Task 2):
-        # a misconfigured custom endpoint must fail boot, not a user's first
-        # turn. None/None (both unset) reproduces the exact pre-affordance
-        # probe request for that role.
-        probe_roles: list[tuple[str, str | None, SecretStr | None]] = [
-            (settings.composer_model, settings.composer_endpoint_base_url, settings.composer_endpoint_api_key),
-            (settings.composer_advisor_model, settings.composer_advisor_endpoint_base_url, settings.composer_advisor_endpoint_api_key),
+        # role probes its own endpoint and capability even when model IDs match.
+        probe_roles: list[tuple[Literal["planner", "advisor"], str, str | None, SecretStr | None]] = [
+            ("planner", settings.composer_model, settings.composer_endpoint_base_url, settings.composer_endpoint_api_key),
+            (
+                "advisor",
+                settings.composer_advisor_model,
+                settings.composer_advisor_endpoint_base_url,
+                settings.composer_advisor_endpoint_api_key,
+            ),
         ]
-        for model, endpoint_base_url, endpoint_api_key in probe_roles:
+        for role, model, endpoint_base_url, endpoint_api_key in probe_roles:
             composer_probe_start = time.monotonic()
             probe_status = "started"
             attributes: dict[str, AttributeValue] = {
@@ -704,16 +706,21 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "composer_seed": str(settings.composer_seed),
                 "composer_advisor_model": settings.composer_advisor_model,
                 "probed_model": model,
+                "probed_role": role,
+                "structured_output": role == "advisor",
                 "probe_status": probe_status,
             }
             try:
                 ok = await asyncio.wait_for(
                     probe_composer_config(
+                        role=role,
                         model=model,
                         temperature=settings.composer_temperature,
                         seed=settings.composer_seed,
                         api_base=endpoint_base_url,
                         api_key=(endpoint_api_key.get_secret_value() if endpoint_api_key is not None else None),
+                        max_tokens=settings.composer_advisor_max_completion_tokens if role == "advisor" else None,
+                        reasoning_effort=settings.composer_advisor_reasoning_effort if role == "advisor" else None,
                     ),
                     timeout=_COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS,
                 )

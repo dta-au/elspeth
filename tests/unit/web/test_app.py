@@ -1963,6 +1963,8 @@ class TestLifespanShutdown:
         assert len(latency.calls) == 2
         counter_attributes = [attributes for _amount, attributes in counter.calls]
         assert [attrs["probed_model"] for attrs in counter_attributes] == probed_models
+        assert [attrs["probed_role"] for attrs in counter_attributes] == ["planner", "advisor"]
+        assert [attrs["structured_output"] for attrs in counter_attributes] == [False, True]
         for attributes in counter_attributes:
             assert attributes["composer_model"] == "gpt-5.5"
             assert attributes["composer_temperature"] == "0.0"
@@ -1984,11 +1986,14 @@ class TestLifespanShutdown:
             _settings(
                 tmp_path,
                 composer_boot_probe_enabled=True,
-                composer_advisor_model="anthropic/claude-sonnet-4-6",
                 composer_endpoint_base_url="https://primary-gateway.example.test/v1",
                 composer_endpoint_api_key="primary-bearer-token",  # secret-scan: allow-this-line
                 composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
                 composer_advisor_endpoint_api_key="advisor-bearer-token",  # secret-scan: allow-this-line
+                composer_advisor_model="gpt-5.5",
+                composer_allow_same_advisor_model=True,
+                composer_advisor_max_completion_tokens=8192,
+                composer_advisor_reasoning_effort="low",
             )
         )
         probed: list[dict[str, object]] = []
@@ -2012,7 +2017,13 @@ class TestLifespanShutdown:
         assert primary_call["model"] == "gpt-5.5"
         assert primary_call["api_base"] == "https://primary-gateway.example.test/v1"
         assert primary_call["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
-        assert advisor_call["model"] == "anthropic/claude-sonnet-4-6"
+        assert advisor_call["model"] == "gpt-5.5"
+        assert "role" in primary_call
+        assert "role" in advisor_call
+        assert primary_call["role"] == "planner"
+        assert advisor_call["role"] == "advisor"
+        assert advisor_call["max_tokens"] == 8192
+        assert advisor_call["reasoning_effort"] == "low"
         assert advisor_call["api_base"] == "https://advisor-gateway.example.test/v1"
         assert advisor_call["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
 
