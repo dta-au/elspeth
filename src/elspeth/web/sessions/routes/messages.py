@@ -9,6 +9,7 @@ from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
 from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.execution.completion_gates import parse_completion_gates
 from elspeth.web.sessions.titles import is_default_session_title
 
 from ._helpers import (
@@ -208,6 +209,11 @@ def register_message_routes(router: APIRouter) -> None:
             # send (elspeth-e08063c3a5). ``/recompose`` already seeds
             # from the head; this keeps the two routes symmetric.
             compose_base_state_id = state_record.id if state_record is not None else None
+            # The prior row's durable advisor gate fact, handed to the END
+            # gate (ruling 2026-09-22). Parsed here, outside every ``try``:
+            # a corrupt envelope is Tier 1 and must propagate, not be
+            # mistaken for a compose failure.
+            prior_completion_gates_facts = parse_completion_gates(state_record.composer_meta) if state_record is not None else None
             _policy_catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
             profile_registry = request.app.state.operator_profile_registry
 
@@ -369,6 +375,7 @@ def register_message_routes(router: APIRouter) -> None:
                             # would surface as an IntegrityError, not as a
                             # silent provenance corruption.
                             user_message_id=str(user_msg.id),
+                            completion_gates=prior_completion_gates_facts,
                         )
                 except ComposerConvergenceError as exc:
                     terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"

@@ -8,6 +8,20 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-22 — the END advisor gate stands aside for an unchanged graph the advisor already blocked** (elspeth-032ec69c41;
+  ruling on session 6990d39f). `_evaluate_terminal_no_tool_advisor_gate` returns `fall_through` when the turn changed
+  nothing AND the prior state row's `completion_gates` fact was recorded for this exact graph
+  (`advisor_block_covers_unchanged_graph` in `web/execution/completion_gates.py`); the finalize tail then folds the
+  same durable fact back into the turn's preflight with `merge_completion_gates`. Decided on `state.version` and the
+  persisted fact only, never on user text. `completion_gates=None` always reviews, so an omitting caller fails toward
+  reviewing; a new caller of `compose()` that holds a state row should pass `parse_completion_gates(record.composer_meta)`
+  (Tier 1: parse it outside every `try`). Known limit: a fact persists only with a new state row, so a block that first
+  arises on an unmutated turn persists nothing and the skip cannot cover it. Blocked-turn copy splits by family: a
+  persisted block says "after your next pipeline change"; the ABSENT-preflight ("not re-verified this turn") family is
+  emitted only on unchanged turns, persists nothing, and keeps "on your next message"
+  (`tests/unit/web/composer/test_no_tool_policy_segments.py` pins both).
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-09-07 — auto-gc was deadlocked by its own warning file: `.git/gc.log` blocked every `--auto` run, and the two-week default prune expiry could never clear it**
   `git gc --auto` had done no housekeeping for weeks. `.git/gc.log` held `warning: There are too many unreachable loose
   objects; run 'git prune' to remove them.`, and git prints that file and exits **0** instead of running whenever the

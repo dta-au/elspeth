@@ -107,7 +107,7 @@ def test_completion_advisory_notice_is_evidence_scoped_trusted_copy() -> None:
     assert visible_message_segments(content=content, raw_content="") == (
         TrustedSystemNoticeSegment(
             "Completion advisory review did not clear after the available attempts. "
-            "Composer completion is withheld. Review the pipeline; validation and the advisory review run again on your next message. "
+            "Composer completion is withheld. Review the pipeline; validation and the advisory review run again after your next pipeline change. "
             "ELSPETH withheld the composer's own summary of this exchange; "
             "verify the pipeline before assuming every requested change was applied."
         ),
@@ -853,3 +853,65 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
     assert len(segments) == 2
     assert all(isinstance(segment, no_tool_policy.TrustedSystemNoticeSegment) for segment in segments)
     assert segments[-1].content == no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE
+
+
+# Ruling 2026-09-22 (elspeth-032ec69c41): the END gate stands aside for an
+# unchanged graph whose prior state row already carries a blocked fact, so a
+# block that PERSISTED is re-reviewed only after the next pipeline change. A
+# fact persists only with a new state row, which only a mutating turn writes;
+# the ABSENT-preflight ("not re-verified this turn") notices are emitted only
+# on unchanged turns, so those blocks persist nothing and the review genuinely
+# runs again on the next message. Each family's copy must say its own truth.
+_NOTICES_FOR_A_PERSISTED_BLOCK = (
+    no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER,
+    no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER,
+    no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE,
+)
+_NOTICES_FOR_AN_UNCHANGED_TURN_BLOCK = (
+    no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE,
+)
+
+
+@pytest.mark.parametrize("notice", _NOTICES_FOR_A_PERSISTED_BLOCK)
+def test_persisted_block_notice_promises_a_review_after_a_pipeline_change(notice: str) -> None:
+    assert "after your next pipeline change" in notice
+    assert "on your next message" not in notice
+    # A retry on an unchanged graph now hits the skip, so no persisted-block
+    # notice may offer "Retry the request" as a way to a fresh verdict.
+    assert "Retry the request" not in notice
+
+
+@pytest.mark.parametrize("notice", _NOTICES_FOR_AN_UNCHANGED_TURN_BLOCK)
+def test_unchanged_turn_block_notice_promises_a_review_on_the_next_message(notice: str) -> None:
+    assert "on your next message" in notice
+    assert "pipeline change" not in notice
+
+
+@pytest.mark.parametrize(
+    ("reason", "findings", "authored"),
+    [
+        ("flagged_final_pass", "", False),
+        ("flagged_final_pass", "field 'prompt_template' on step 'rate'", True),
+        ("flagged_no_repair", "", False),
+        ("unavailable", "Model unavailable.", False),
+        ("malformed", "No usable verdict.", False),
+    ],
+)
+def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reason: str, findings: str, authored: bool) -> None:
+    """The (detail, suggestion) pair persisted in the gate fact is read back by /validate only while the block is durable.
+
+    A durable block is cleared only by a pipeline change (a retry on the
+    unchanged graph meets the END gate's skip), so no persisted suggestion may
+    offer a retry, and the chat notice and the DecisionPanel must agree.
+    """
+    from elspeth.web.composer.service import _advisor_signoff_blocked_wording
+
+    _detail, suggestion = _advisor_signoff_blocked_wording(reason=reason, findings=findings, findings_backend_authored=authored)
+    assert "after your next pipeline change" in suggestion
+    assert "on your next message" not in suggestion
+    assert "retry the request" not in suggestion.lower()

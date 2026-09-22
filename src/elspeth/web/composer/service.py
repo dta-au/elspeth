@@ -222,7 +222,12 @@ from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin, withheld_reply_envelope
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
+from elspeth.web.execution.completion_gates import (
+    CompletionGateFacts,
+    advisor_block_covers_unchanged_graph,
+    advisor_signoff_check_failed,
+    merge_completion_gates,
+)
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -3970,6 +3975,9 @@ class ComposerServiceImpl:
         guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -4090,6 +4098,7 @@ class ComposerServiceImpl:
                     plugin_snapshot=plugin_snapshot,
                     policy_catalog=policy_catalog,
                     session_operation_context=session_operation_context,
+                    completion_gates=completion_gates,
                 )
             except ComposerConvergenceError as exc:
                 await emit_progress(
@@ -5591,6 +5600,9 @@ class ComposerServiceImpl:
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> _ClassifyOutcome:
         """Phase P5 of the compose loop — anti-anchor + budget classify.
 
@@ -5947,6 +5959,7 @@ class ComposerServiceImpl:
                             advisor_repair_context_introduced=advisor_repair_context_introduced,
                             advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                             deadline=deadline,
+                            completion_gates=completion_gates,
                         )
                     except _AdvisorCheckpointComposeDeadlineExpired:
                         # The model had already replied; the timeout envelope
@@ -6081,6 +6094,9 @@ class ComposerServiceImpl:
         composition_turns_used: int = 0,
         discovery_turns_used: int = 0,
         failed_turn: FailedTurnMetadata | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> _TerminateOutcome:
         """Phase P2 of the compose loop — handle the no-tool-calls branch.
 
@@ -6270,6 +6286,7 @@ class ComposerServiceImpl:
                 advisor_repair_context_introduced=advisor_repair_context_introduced,
                 advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                 deadline=deadline,
+                completion_gates=completion_gates,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             # The model had already replied; the timeout envelope carries no
@@ -6354,6 +6371,17 @@ class ComposerServiceImpl:
             repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
         )
+        # The END gate stood aside for a graph the advisor already blocked
+        # (ruling 2026-09-22). Fold the same durable fact into this turn's
+        # preflight with the read-side merge the Run path uses, so the chat
+        # never reports completion that /validate and Run still withhold.
+        if result.runtime_preflight is not None and advisor_block_covers_unchanged_graph(
+            completion_gates, state, initial_version=initial_version
+        ):
+            result = replace(
+                result,
+                runtime_preflight=merge_completion_gates(result.runtime_preflight, completion_gates, state),
+            )
         # Thread repair_turns_used through to the result so the route handler can
         # persist it onto the new ``composition_states.composer_meta`` row (and the
         # API state response can surface ``composer_meta.repair_turns_used``) — see
@@ -6673,6 +6701,9 @@ class ComposerServiceImpl:
         advisor_repair_context_introduced: bool,
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
         """Run the shared terminal no-tool END advisor gate for P2 and P5.
 
@@ -6698,6 +6729,24 @@ class ComposerServiceImpl:
         """
         max_passes = self._settings.composer_advisor_checkpoint_max_passes
         if _state_is_structurally_empty(state) or advisor_checkpoint_passes_used >= max_passes:
+            return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
+
+        # Operator ruling 2026-09-22 (elspeth-032ec69c41): this turn changed
+        # nothing and the advisor has already blocked this exact graph. A
+        # gate fact persists only with a new state row, so another review
+        # could re-block or trap the turn but never clear anything. Observed
+        # live (session 6990d39f): "what does this block mean?" was answered,
+        # FLAGGED over the unchanged graph, and the repair injection ordered
+        # pipeline edits. Unlike the proof gate above (whose version guard was
+        # removed because a resumed session can carry an unreported blocker),
+        # the last advisor ruling is already durable on the state row.
+        if advisor_block_covers_unchanged_graph(completion_gates, state, initial_version=initial_version):
+            slog.info(
+                "composer_advisor_end_gate_skipped",
+                reason="unchanged_graph_already_blocked",
+                state_version=state.version,
+                session_id=session_id,
+            )
             return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
 
         orphaned_precheck = await self._missing_pending_interpretation_review_sites(
@@ -6957,6 +7006,9 @@ class ComposerServiceImpl:
         plugin_snapshot: PluginAvailabilitySnapshot,
         policy_catalog: PolicyCatalogView,
         session_operation_context: SessionOperationContext | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 
@@ -7190,6 +7242,7 @@ class ComposerServiceImpl:
                     composition_turns_used=composition_turns_used,
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
+                    completion_gates=completion_gates,
                 )
                 if terminate.advisor_review_state is not None:
                     advisor_review_state = terminate.advisor_review_state
@@ -7543,6 +7596,7 @@ class ComposerServiceImpl:
                 advisor_repair_context_introduced=advisor_repair_context_introduced,
                 plugin_snapshot=plugin_snapshot,
                 advisor_review_state=advisor_review_state,
+                completion_gates=completion_gates,
             )
             composition_turns_used += classify.composition_turns_delta
             discovery_turns_used += classify.discovery_turns_delta
@@ -11059,20 +11113,28 @@ def _advisor_signoff_blocked_wording(
         if findings_backend_authored and findings:
             return (
                 f"{notice} {findings}",
-                "Remove the flagged text from the named field; the advisory review runs again on your next message.",
+                "Remove the flagged text from the named field; the advisory review runs again after your next pipeline change.",
             )
         return (
             notice,
-            "Review the pipeline; validation and the advisory review run again on your next message.",
+            "Review the pipeline; validation and the advisory review run again after your next pipeline change.",
         )
+    # Ruling 2026-09-22 (elspeth-032ec69c41): this pair is what the durable
+    # gate fact carries to /validate and the DecisionPanel, and a durable
+    # block is cleared only by a pipeline change — a retry on the unchanged
+    # graph meets the END gate's skip — so neither suggestion may offer a
+    # retry. The chat notice for the same block says the same
+    # (``_ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP``).
     if reason == "unavailable":
         return (
             f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-            "The advisor model was unavailable after retry; retry the request, or check the advisor model configuration.",
+            "The advisor model was unavailable after retry; check the advisor model configuration. "
+            "Validation and the advisory review run again after your next pipeline change.",
         )
     return (
         f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-        "The advisor returned no usable verdict after a format retry; retry the request, or check the advisor model configuration.",
+        "The advisor returned no usable verdict after a format retry; check the advisor model configuration. "
+        "Validation and the advisory review run again after your next pipeline change.",
     )
 
 

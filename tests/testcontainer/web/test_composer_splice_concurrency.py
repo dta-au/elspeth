@@ -168,6 +168,7 @@ class _BlockingSpliceComposer:
         guided_terminal: Any = None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        completion_gates: Any = None,
     ) -> ComposerResult:
         del (
             message,
@@ -179,6 +180,7 @@ class _BlockingSpliceComposer:
             guided_terminal,
             user_message_id,
             session_operation_context,
+            completion_gates,
         )
         result = execute_tool(
             "splice_transform",

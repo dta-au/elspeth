@@ -312,3 +312,25 @@ def merge_completion_gates(
             ),
         }
     )
+
+
+def advisor_block_covers_unchanged_graph(
+    facts: CompletionGateFacts | None,
+    state: CompositionState,
+    *,
+    initial_version: int,
+) -> bool:
+    """True when this turn changed nothing AND the advisor already blocked this exact graph.
+
+    Operator ruling 2026-09-22 (elspeth-032ec69c41). A gate fact persists only
+    alongside a new state row, so re-reviewing a graph that is unchanged this
+    turn and already carries a blocked fact can re-block or trap the turn but
+    can never clear anything. ``None`` facts, a fact for other content, or any
+    version movement all answer False: a graph no advisor has ruled on still
+    gets its review. Decided on state and persisted facts, never on user text.
+    """
+    if state.version != initial_version:
+        return False
+    if facts is None or facts.advisor_signoff is None:
+        return False
+    return facts.advisor_signoff.for_graph == completion_gate_fingerprint(state)

@@ -9,6 +9,8 @@ docs-archive/specs/2026-08-01-composer-completion-gate-persistence-design.md.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from elspeth.web.composer.state import (
@@ -24,6 +26,7 @@ from elspeth.web.execution.completion_gates import (
     COMPLETION_GATES_META_KEY,
     AdvisorSignoffGateFact,
     CompletionGateFacts,
+    advisor_block_covers_unchanged_graph,
     completion_gate_fingerprint,
     completion_gates_meta_from_facts,
     completion_gates_meta_value,
@@ -185,7 +188,10 @@ def test_advisor_suggestion_survives_reload_and_clears_on_graph_change() -> None
 
     state = _make_state()
     result = _advisor_signoff_pending_validation(_green_result(), reason="unavailable", findings="Model unavailable.")
-    suggestion = "The advisor model was unavailable after retry; retry the request, or check the advisor model configuration."
+    suggestion = (
+        "The advisor model was unavailable after retry; check the advisor model configuration. "
+        "Validation and the advisory review run again after your next pipeline change."
+    )
     assert result.readiness.blockers[0].suggestion == suggestion
     facts = parse_completion_gates({COMPLETION_GATES_META_KEY: completion_gates_meta_value(result, state)})
     reloaded = merge_completion_gates(_green_result(), facts, state)
@@ -530,3 +536,40 @@ class TestMerge:
         assert len(_advisor_checks(twice)) == 1
         assert sum(blocker.code == ADVISOR_SIGNOFF_BLOCKED_CODE for blocker in twice.readiness.blockers) == 1
         _assert_canonical_check_order(twice)
+
+
+def _blocked_facts_for(state: CompositionState) -> CompletionGateFacts:
+    return CompletionGateFacts(
+        advisor_signoff=AdvisorSignoffGateFact(
+            detail=_BLOCKED_DETAIL,
+            suggestion=None,
+            for_graph=completion_gate_fingerprint(state),
+        )
+    )
+
+
+def test_block_covers_an_unchanged_graph_it_was_recorded_for() -> None:
+    state = _make_state(version=3)
+    facts = _blocked_facts_for(state)
+    assert advisor_block_covers_unchanged_graph(facts, state, initial_version=state.version) is True
+
+
+def test_block_does_not_cover_a_turn_that_changed_the_version() -> None:
+    state = _make_state(version=3)
+    facts = _blocked_facts_for(state)
+    assert advisor_block_covers_unchanged_graph(facts, state, initial_version=state.version - 1) is False
+
+
+def test_block_covers_is_false_without_a_fact() -> None:
+    state = _make_state(version=3)
+    assert advisor_block_covers_unchanged_graph(None, state, initial_version=state.version) is False
+    no_gate = CompletionGateFacts(advisor_signoff=None)
+    assert advisor_block_covers_unchanged_graph(no_gate, state, initial_version=state.version) is False
+
+
+def test_block_does_not_cover_a_different_graph() -> None:
+    state = _make_state(version=3)
+    blocked = _blocked_facts_for(state).advisor_signoff
+    assert blocked is not None
+    stale = CompletionGateFacts(advisor_signoff=replace(blocked, for_graph="0" * 64))
+    assert advisor_block_covers_unchanged_graph(stale, state, initial_version=state.version) is False
