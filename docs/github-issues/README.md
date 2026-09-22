@@ -54,10 +54,23 @@ fix the file, or add the pattern if a new class of leak is found.
 
 Two categories stay out of GitHub, both by operator ruling on 2026-09-23.
 
-**Internal governance** — the trust-tier allowlist burn-downs, judge-signing tooling, the
-lint gate's own internals, and the agent tooling. These are the project's own machinery
-rather than product defects, and they mean nothing to an outside contributor. They keep
-the `exclude:gh-migration` label in filigree.
+**Internal governance** — the trust-tier allowlist burn-downs, the lint gate's own
+internals, and the agent tooling. These are the project's own machinery rather than
+product defects, and they mean nothing to an outside contributor. They keep the
+`exclude:gh-migration` label in filigree.
+
+> **A security defect is not internal governance, even when it lives in governance
+> tooling.** An earlier draft of this file excluded "judge-signing tooling" wholesale,
+> which would have put the CI key-exposure findings — the work that makes this repository
+> safe to give several people push access to — in a local database those same people
+> cannot read. That is the opposite of what the migration is for, and it would have meant
+> filigree was not actually being retired.
+>
+> The exclusion covers *ceremony*: burn-downs, allowlist hygiene, the signing workflow
+> itself. It does not cover a vulnerability. An unfixed vulnerability belongs in a
+> **private GitHub security advisory**, where the developers who must fix it can see it
+> and the world cannot, and becomes a public issue once it is fixed. See
+> `docs/reviews/2026-09-23-single-developer-assumptions.md` F-01–F-04 and F-41.
 
 **Work awaiting a decision** — items held pending an operator call, labelled
 `wait:decision`. They migrate once decided, not before.

@@ -18,6 +18,12 @@ migrating work tracking from Filigree onto GitHub Issues.
   working tree `AGENTS.md:284` ("maintained by a single developer") is HEAD
   line 278; working tree `:132` is HEAD line 126.
 - All other files were clean at read time.
+- **Every `file:line` citation below was mechanically re-verified** against the
+  live files after drafting: each was extracted from this document, resolved with
+  `sed -n "<line>p"`, and checked to contain the quoted text. One error class was
+  caught and fixed that way — citations first taken from `sed -n 'A,Bp' | cat -n`
+  output carry the *offset from A*, not the file line. If you add a citation,
+  re-derive it with `grep -n` against the whole file.
 
 ### Instruments used, and their controls
 
@@ -47,13 +53,18 @@ an admin token and is not performed here.
 | Review & merge (F-07–F-13) | 7 | 5 | 2 | 0 |
 | Concurrency (F-14–F-19) | 6 | 0 | 2 | 4 |
 | Onboarding (F-20–F-26) | 7 | 2 | 5 | 0 |
-| Tracker (F-27–F-33) | 7 | 4 | 3 | 0 |
+| Tracker (F-27–F-33, F-41) | 8 | 5 | 3 | 0 |
 | Prose & framing (F-34–F-38) | 5 | 2 | 3 | 0 |
-| **Total** | **38** | **15** | **17** | **6** |
+| Mode-dependent reasoning (F-39–F-40) | 2 | 0 | 2 | 0 |
+| **Total** | **41** | **16** | **19** | **6** |
+
+F-39 and F-40 were surfaced by the ADR-024 reference audit and are documented in
+that subsection rather than under a theme. F-41 was surfaced by checking the
+in-flight GitHub Issues migration and sits under Tracker.
 
 Counts are derived from the finding headings, not hand-tallied:
-`grep -oE "^### F-[0-9]{2} .*" <this file> | grep -oE "MUST CHANGE|SHOULD CHANGE|DELIBERATE, KEEP" | sort | uniq -c`
-→ `6 DELIBERATE, KEEP` / `15 MUST CHANGE` / `17 SHOULD CHANGE`; `grep -cE "^### F-[0-9]{2} "` → `38`.
+`grep -oE "^(### |\*\*)F-[0-9]{2} .*" <this file> | grep -oE "MUST CHANGE|SHOULD CHANGE|DELIBERATE, KEEP" | sort | uniq -c`
+→ `6 DELIBERATE, KEEP` / `16 MUST CHANGE` / `19 SHOULD CHANGE`; total heading count → `41`.
 
 The single most serious finding is **F-01**: the judge-signature custody model's
 safety depends on an unstated precondition — that only the key holder can push to
@@ -67,6 +78,177 @@ The project has already written down that this transition is coming.
 itemised version of that row. Likewise `GOVERNANCE.md:77-82` pre-wrote the
 step-up checklist for two-maintainer mode; the trigger it describes is now
 firing, and none of the controls it names exist yet.
+
+---
+
+## The documented step-up: what it reaches, and what it does not
+
+`GOVERNANCE.md` § Maintainer Continuity (`:48` onward) is the authority for this
+transition, and this audit treats it as such. It defines two named modes and the
+trigger between them (`GOVERNANCE.md:55-56`):
+
+> "Single-maintainer mode holds until a second maintainer regularly participates
+> in release-critical delivery."
+
+**The headline result of mapping the audit onto that switch: the documented
+step-up closes 4 of 41 findings, partially reaches 1, and never reaches the other
+36.** The step-up is a well-specified *pull-request review* posture. It is not a
+key-custody, onboarding, tracker, or documentation posture, and it was written
+before the GitHub Issues migration existed. So "execute the step-up" is necessary
+and nowhere near sufficient.
+
+### The six named controls: current state, with evidence
+
+`GOVERNANCE.md:77-82` names six controls. Two are repository artefacts this
+project supplies; four are GitHub platform settings.
+
+| # | Control (GOVERNANCE.md:77-82) | Kind | Current state | Evidence |
+|---|---|---|---|---|
+| 1 | "one required approving review" | Platform | **Unmeasured** | Needs admin; this token has `admin:false`. No repository obstacle found: there is **no auto-merge automation** to conflict with it (`grep -rn "auto-merge\|automerge\|gh pr merge" .github/` → no matches). |
+| 2 | "stale-review dismissal on new commits" | Platform | **Unmeasured** | Needs admin. No repository dependency either way. |
+| 3 | "last-push approval protection" | Platform | **Unmeasured** | Needs admin. No repository dependency either way. |
+| 4 | "required conversation resolution" | Platform | **Unmeasured** | Needs admin. No repository dependency either way. |
+| 5 | "CODEOWNERS or an equivalent ownership map for security-sensitive paths" | **Repository** | **ABSENT — measured** | `find . -name CODEOWNERS` → three hits, all in `node_modules` vendor trees; none at `/`, `.github/` or `docs/`. See **F-10**. |
+| 6 | "review requirements for release tags or branches where the platform supports them" | **Repository + platform** | **ABSENT — measured** | `gh api repos/dta-au/elspeth/branches` → `main` `protected: true`; **every** `release/*` branch `protected: false`, including the live `release/0.8.1`. See **F-09**. |
+
+**Controls 5 and 6 are the actionable ones today** — they are the two the project
+can act on without admin access, and both are measurably absent.
+
+**Controls 1–4 are unmeasured, not absent.** I state that as a limit rather than
+a finding. `GOVERNANCE.md:73-75` already requires exactly this inspection:
+
+> "Platform-configured
+> controls such as branch protection require periodic inspection before they can
+> be claimed as enforced."
+
+That inspection needs a token with `admin` on `dta-au/elspeth`. The account used
+here (`tachyon-beep`) has `{"admin":false,"maintain":false,"push":true}`. A second
+account (`johnm-dta`) exists on this machine and may hold admin; I did **not**
+test it, because reading another account's token was refused by the permission
+system and working around that refusal would be wrong. **Someone with admin should
+run `gh api repos/dta-au/elspeth/branches/main/protection` and record the output**
+— that single command settles controls 1–4 and is the missing evidence in this
+audit.
+
+**One piece of good news, measured:** the aggregate required-status-check design
+the step-up depends on already exists and is correct. `ci.yaml:1332-1333` defines
+`ci-success` / "CI Success", and `enforce-allowlist-judge-gates.yaml:220-221`
+defines `judge-gates-success` / "Judge gates success", with the rationale at
+`enforce-allowlist-judge-gates.yaml:50-52` explaining why an aggregate is required
+rather than the individual jobs. Turning on required review does not require
+rebuilding the check topology.
+
+### The gap the step-up does not close: it is PR-shaped, the worst exposure is push-shaped
+
+**Every one of the six controls governs pull requests.** F-01 is not a
+pull-request exposure. The HMAC key is injected on `github.event_name !=
+'pull_request'` — that is, on **push** — and a direct push to an unprotected
+`release/*` branch never passes through review at all. Required approving review,
+stale dismissal, last-push protection and conversation resolution are all
+inapplicable to it.
+
+Control 6 is the only one that touches release branches, and its wording —
+"review *requirements* for release tags or branches" — is satisfiable by a review
+rule that still permits direct pushes. **F-01 is closed only if control 6 is
+implemented as full branch protection that blocks direct pushes, plus the
+environment gating in F-01's recommendation.** Implementing the step-up literally,
+as written, would leave the most serious finding in this audit open. That is the
+single most important thing this mapping surfaces.
+
+### Coverage map: all 41 findings against the step-up
+
+| Disposition | Count | Findings |
+|---|---|---|
+| **COVERED** — the documented step-up closes it | 4 | F-07, F-08, F-09, F-10 |
+| **PARTIAL** — a named control touches it but does not close it | 1 | F-01 (control 6, only if implemented as push-blocking protection) |
+| **GAP** — the switch does not reach it | 36 | F-02–F-06, F-11–F-38, F-39, F-40, F-41 |
+
+Gaps by theme, and why the step-up misses each:
+
+- **Custody & keys (F-02–F-06, 5 gaps).** The step-up says nothing about key
+  custody, the signing role, succession, or the Codex account a second signer
+  needs. `ROADMAP.md:161` — "Key custody and access to project records … Before
+  shared-maintainer operation under F.1" — is the project's own acknowledgment
+  that this is a separate decision from the review posture.
+- **Tracker (F-27–F-33, 7 gaps).** GOVERNANCE.md predates the GitHub Issues
+  migration; `GOVERNANCE.md:30` still says only "the project issue tracker". None
+  of the six controls touches the tracker, the 301 dangling ids, or the tracked
+  skills that drive agents to Filigree.
+- **Onboarding (F-20–F-26, 7 gaps).** Platform review settings do not fix a
+  tracked `SessionStart` hook that fails on a fresh clone (F-20), an undefined
+  security channel (F-24), or a `CONTRIBUTING.md` with no PR section (F-11).
+  Enabling required review while F-11 remains unwritten means a new contributor
+  faces a review requirement that no document explains.
+- **Concurrency (F-14–F-19, 6 gaps).** These are per-host rules about several
+  agents sharing one machine. Correct as-is; out of the step-up's scope by nature.
+- **Prose & framing (F-34–F-38, 5 gaps).** F-34 and F-35 are the textual
+  consequences of F-07: once approvals are non-zero, `AGENTS.md:284`
+  ("maintained by a single developer") and the three "ask the developer"
+  escalations are stale. The step-up changes the platform, not the covenant.
+
+**Sequencing consequence.** Do not flip the mode before F-11 and F-34/F-35, or
+the repository will enforce a review requirement that its own contributor
+documentation contradicts.
+
+### ADR-024 reference audit
+
+ADR-024 is retired (2026-09-13) and is **not** reported as live single-developer
+debt — F-38 handles it as history. Checking every tracked file that still cites
+it, as requested:
+
+**All redirects are already correct.** The three sibling ADRs named in ADR-024's
+own note have each been updated to mark it Retired and point at GOVERNANCE.md:
+
+- `docs/architecture/adr/025-multi-source-ingestion.md:544-545` — "**Retired 2026-09-13**; the assurance posture moved to `GOVERNANCE.md` § Maintainer Continuity."
+- `docs/architecture/adr/026-durable-token-scheduler.md:1069-1077` — same, and it additionally corrects a historical mis-attribution: "earlier revisions mis-attributed them to ADR-024, which never stated them. Retiring ADR-024 therefore changes nothing in this decision."
+- `docs/architecture/adr/029-journal-is-barrier-buffer-truth.md:446-447` — same redirect.
+- `docs/elspeth-lints/rationale.md:25-27` and `docs/architecture/adr/README.md:46` and `ARCHITECTURE.md:1037` — all already describe it as retired with the correct pointer.
+
+No file treats ADR-024 as a live authority. **This part of the tree is clean and
+needs no action.**
+
+**But two files carry live reasoning that depends on single-maintainer mode being
+current**, which the retirement did not touch and which the mode switch will
+falsify. These are new findings surfaced by this check:
+
+**F-39 — ADR-025 justifies a control by the absence of an independent reviewer. SHOULD CHANGE**
+
+`docs/architecture/adr/025-multi-source-ingestion.md:545-548`:
+
+> "The point stands under
+> that posture: with no independent reviewer available, a recorded
+> ADR is the control for a structural change of this size, and this"
+
+**Why it breaks.** The premise "no independent reviewer available" becomes false
+at the mode switch. The conclusion — that a recorded ADR substitutes for review —
+then rests on a condition that no longer holds. The ADR should still be recorded;
+the *reason given* needs restating.
+
+**Recommendation.** Reword to say an ADR is required for a structural change of
+this size on its own merits, independent of reviewer availability. Do this when
+GOVERNANCE.md is rewritten, in the same change.
+
+**F-40 — The analyzer's rationale binds its own evidentiary value to single-maintainer mode. SHOULD CHANGE**
+
+`docs/elspeth-lints/rationale.md:20-24`:
+
+> "For the repository governance posture that makes these analyzer results part of
+> single-maintainer delivery evidence, read
+> [GOVERNANCE.md](../../GOVERNANCE.md) § Maintainer Continuity. It records why
+> ELSPETH currently uses automated gates instead of non-meaningful
+> self-approval, and how the project steps up to two-person review when a second
+> maintainer is assigned."
+
+**Why it breaks.** This is unusually well-written — it already names the step-up
+and will not become *wrong*. But "single-maintainer delivery evidence" is the
+framing for why the custom analyzer exists at all (`ADR-023`), and after the
+switch the honest statement is that the analyzer complements two-person review
+rather than substituting for absent review. Left unedited, it undersells the tool
+and dates the rationale.
+
+**Recommendation.** Change "single-maintainer delivery evidence" to "delivery
+evidence" and keep the GOVERNANCE.md pointer, which will then describe the new
+mode automatically.
 
 ---
 
@@ -325,9 +507,15 @@ finding because it is a checklist with no owner, no target date, and no tracking
 item, and because *none* of its six controls exists today (CODEOWNERS measured
 absent, `release/*` measured unprotected). A checklist nobody owns is not a plan.
 
-**Recommendation.** Turn these six items into six GitHub issues in the migrated
-tracker, as the first milestone of ROADMAP F.1. Then change the prose from
+**Recommendation.** Make the six items trackable work with a named owner and
+target, as the first milestone of ROADMAP F.1, then change the prose from
 future-conditional to a record of what was enabled and when.
+
+**Where** to track them is not mine to assume, and there is a live tension — see
+**F-41**. The operator ruling recorded at `docs/github-issues/README.md:55-60`
+keeps "internal governance" work out of GitHub, and these six controls are
+plausibly that category. Raise the placement question rather than filing them
+somewhere by default.
 
 ### F-09 — Every `release/*` branch is unprotected; `main` is protected. MUST CHANGE
 
@@ -383,12 +571,13 @@ inert without "require review from Code Owners" in the ruleset.
 
 ### F-11 — CONTRIBUTING.md documents no pull-request, branching or review process. MUST CHANGE
 
-Measured section list from `CONTRIBUTING.md`: Development Setup (`:5`), Running
-Quality Checks (`:29`), Code Standards (`:52`), Writing Tests (`:59`), Whole-tree
-gates (`:93`), Commit Guidelines (`:826`), Reporting Issues (`:832`), License
-(`:843`). There is no PR section, no branching model, and no review expectation.
+Measured section list from `CONTRIBUTING.md` (`grep -n "^## "`, the complete set —
+there are exactly eight headings): Development Setup (`:5`), Running Quality
+Checks (`:29`), Code Standards (`:52`), Writing Tests (`:59`), Whole-tree gates
+(`:93`), Commit Guidelines (`:828`), Reporting Issues (`:834`), License (`:845`).
+There is no PR section, no branching model, and no review expectation.
 
-The entire commit-and-land guidance is `CONTRIBUTING.md:828-830`:
+The entire commit-and-land guidance is `CONTRIBUTING.md:830-832`:
 
 > "- Keep commits focused on a single logical change.
 > - Write commit messages that explain *why*, not just *what*.
@@ -412,7 +601,7 @@ Measured `.github/` contents: `actionlint.yaml`, `codeql/`, `dependabot.yml`,
 `workflows/`. No `ISSUE_TEMPLATE/`, no `PULL_REQUEST_TEMPLATE.md`.
 
 **Why it breaks.** `SUPPORT.md:21-32` ("What Maintainers Need") and
-`CONTRIBUTING.md:834-837` both describe what a good report contains — in prose, in
+`CONTRIBUTING.md:836-840` both describe what a good report contains — in prose, in
 two different files, where a submitter must find and read them first. That works
 when the submitter and the reader are the same person. It is also directly
 relevant to the migration: GitHub Issues is about to become the system of record,
@@ -770,6 +959,28 @@ canonical script, keeping the individual commands as the "what it runs" breakdow
 
 ## Theme E — Tracker (7)
 
+*Standing context, measured 2026-09-23: **the migration is already underway and
+tracked.*** `docs/github-issues/` exists in the index (`git ls-files` returns
+`README.md`, `STYLE.md`, `check_issues.py`, `held/`, `issues/`) and carries a
+staging directory, a house style with redaction rules, a fail-closed
+pre-publication gate, and an importer. Its README states the premise of this
+entire audit independently — `docs/github-issues/README.md:3-5`:
+
+> "ELSPETH tracked its work in **filigree**, an agent-native issue tracker with a local
+> database. That fitted a project with one developer and a fleet of agents. It does not fit
+> a project with several developers, so GitHub Issues becomes the system of record."
+
+**The findings below are therefore scoped to what that migration does not already
+cover.** Two of my original recommendations are superseded by work already done,
+and I have marked them inline: the id-mapping mechanism I proposed in F-28 already
+exists as `.import-state.jsonl` (`docs/github-issues/README.md:85-88`), and the
+redaction concern implicit in exporting tracker prose is already handled by
+`check_issues.py`, which `README.md:24-25` says "encodes exactly the patterns that
+were actually found, and it fails the build rather than warning". The remaining
+tracker findings — the AGENTS.md installer block (F-27), the atomic-claim rule
+(F-29), and the tracked skills (F-30) — are **not** in that migration's scope,
+because it stages *issues*, not the repository's standing agent instructions.
+
 ### F-27 — The covenant names Filigree as the system of record. MUST CHANGE
 
 `AGENTS.md:377-379`:
@@ -828,12 +1039,20 @@ exists. Once Filigree is gone, a reader who wants to check a claim hits an
 identifier with no resolver. That is worse than no citation, because it looks
 verifiable.
 
-**Recommendation.** Do not mass-rewrite. Instead: (a) preserve a read-only export
-of the Filigree database and commit a resolver note explaining the id format and
-where to look them up; (b) when migrating an issue, record the old id in the
-GitHub issue body so search resolves both ways; (c) rewrite ids only in the small
-set of living documents — `AGENTS.md`, `CONTRIBUTING.md`, and any ADR still being
-amended. The 72 ids in ADR-025 are history and should stay as history.
+**Recommendation.** Do not mass-rewrite. Part of this is already solved: the
+migration writes `.import-state.jsonl` mapping every slug to its issue number
+(`docs/github-issues/README.md:85-88`), which is the resolver substrate. Build on
+it rather than duplicating it: (a) extend that state file, or a note beside it, to
+carry the **old `elspeth-<hex>` id** alongside the slug, so the 301 in-tree
+citations resolve forward; (b) preserve a read-only export of the Filigree
+database for the ids that are never migrated — the 72 in ADR-025 and 50 in ADR-026
+are closed history and will have no issue number; (c) rewrite ids in prose only in
+the small set of living documents — `AGENTS.md`, `CONTRIBUTING.md`, and any ADR
+still being amended. Historical ADR citations should stay as history.
+
+**Timing matters.** Step (b) must happen before the Filigree database is
+decommissioned. Once it is gone, the ~300 ids that were never imported become
+permanently unresolvable, and that is the irreversible half of this finding.
 
 ### F-29 — Atomic-claim protocol has no GitHub equivalent and will mislead. MUST CHANGE
 
@@ -890,15 +1109,39 @@ regardless.
 > Written 2026-08-17 because the vocabulary had no definition anywhere in the
 > tree, so every session re-derived it by sampling issues."
 
-**Why it breaks.** The document exists precisely because undocumented vocabulary
-was already costing re-derivation with one developer. Migration is the moment that
-vocabulary either transfers or is lost — and GitHub labels must be created
-explicitly, so nothing carries over by default.
+**Measured correction to this finding.** The migration has **deliberately
+designed a replacement taxonomy**, and it does not include this vocabulary.
+`docs/github-issues/STYLE.md:127-129`:
 
-**Recommendation.** Use this file as the migration's label manifest: create the
-`p1-class:*` and `lane:*` values as GitHub labels with these descriptions, then
-retarget the document. This is a rare case where the migration is *easier* because
-someone already wrote the vocabulary down.
+> "- `labels` — pick from: `area/composer`, `area/engine`, `area/plugins`, `area/web`,
+>   `area/cli`, `area/audit`, `area/deployment`, `area/tests`, plus exactly one of
+>   `type/bug`, `type/task`, `type/epic`. Add `needs-triage` if the source is unclear."
+
+followed at `:131` by "Do not add any other front-matter key. The importer reads
+only these two." Confirmed by measurement: `grep -rn "p1-class\|lane:"
+docs/github-issues/` returns nothing. So recreating `p1-class:*` and `lane:*` as
+GitHub labels — which is what I would otherwise have recommended — would
+contradict a considered decision, and I withdraw it.
+
+**The real gap is narrower and worth raising.** The new scheme carries *subject*
+(`area/*`) and *kind* (`type/*`). It carries **no impact or priority axis at
+all**. The retired `p1-class:*` vocabulary was explicitly that axis —
+`docs/agents/tracker-label-vocabulary.md:9`:
+
+> "A closed 7-value vocabulary answering *what does it cost if this is not done*."
+
+With one developer, priority can live in one person's head. With several, "what
+should I pick up next" and "does this block the release" are exactly the questions
+a shared tracker has to answer, and `area/` + `type/` cannot answer either.
+
+**Recommendation.** Confirm with whoever owns the migration whether dropping the
+impact axis was intentional or incidental. If intentional, record why in
+`STYLE.md` so it is not re-litigated. If incidental, add a small priority axis
+(`P0`–`P4` already exists as a scale at `docs/maintainer/toolchain.md:160-166`)
+rather than reviving the seven-value `p1-class:*` set, which was tuned to a
+release horizon that has passed. Retarget or retire
+`docs/agents/tracker-label-vocabulary.md` either way — it currently documents a
+vocabulary with no live consumer.
 
 ### F-32 — GOVERNANCE.md points at an unnamed tracker. SHOULD CHANGE
 
@@ -913,9 +1156,69 @@ unambiguous when there was one tracker and one user.
 **Recommendation.** Name GitHub Issues with a URL, as the sibling bullets at
 `:27-29` do for `docs/architecture/adr/` and `docs/contracts/`.
 
+### F-41 — The work that makes the project safe for several developers is tracked where several developers cannot see it. MUST CHANGE
+
+`docs/github-issues/README.md:53-60`:
+
+> "## What is not migrating
+>
+> Two categories stay out of GitHub, both by operator ruling on 2026-09-23.
+>
+> **Internal governance** — the trust-tier allowlist burn-downs, judge-signing tooling, the
+> lint gate's own internals, and the agent tooling. These are the project's own machinery
+> rather than product defects, and they mean nothing to an outside contributor. They keep
+> the `exclude:gh-migration` label in filigree."
+
+**The ruling is reasonable on its own terms.** Lint-gate internals and agent
+tooling genuinely mean nothing to an outside contributor, and ADR-046 already
+says project tooling is not product. Nothing here argues with that.
+
+**Why it breaks anyway.** Two consequences follow that the ruling does not appear
+to have weighed:
+
+1. **Filigree is not actually retired.** It remains the system of record for one
+   class of work. So the project is heading for a **two-tracker state** — GitHub
+   for product defects, a local private database for governance — which no
+   document currently describes. `AGENTS.md:377` ("`filigree` tracks this
+   project's work") becomes half-true rather than false, and a new developer has
+   no way to learn which half.
+2. **The category is drawn in the wrong place for this transition.** Judge-signing
+   tooling and the trust-tier allowlist are "internal governance" by this
+   taxonomy — and they are also **F-01, F-02, F-03 and F-04**, four of the most
+   serious findings in this audit, including a key-exposure path. Work to make the
+   repository safe for several developers would therefore be tracked in a local
+   database on one person's machine that those developers cannot read, cannot be
+   assigned in, and cannot see the status of. That is a single-developer
+   assumption reproducing itself inside the fix for single-developer assumptions.
+
+The distinction that actually matters is not product-versus-tooling. It is
+**"does a second developer need to see this to work safely"** — and for key
+custody, branch protection and the signing role, the answer is yes.
+
+**Recommendation.** Keep the ruling's intent, but split the excluded category:
+
+- **Stays out of GitHub:** lint-gate internals, allowlist burn-down mechanics,
+  agent-tooling maintenance. Genuinely internal, genuinely uninteresting
+  externally. No change.
+- **Moves into GitHub:** anything a second developer must see to work safely —
+  key custody and the signing role (F-02, F-03, F-04), branch protection and
+  review controls (F-08, F-09, F-10), and the CI key exposure (F-01). These are
+  governance *decisions and access*, not tooling internals. F-01 in particular
+  should not sit in a private tracker; it is a live exposure with a named
+  remediation.
+- **Either way, document the split.** If any tracker other than GitHub Issues
+  remains a system of record for anything, `AGENTS.md` and `GOVERNANCE.md:30`
+  must say so explicitly, with the boundary stated. An undocumented second
+  tracker is worse than either tracker alone.
+
+If F-01's remediation is considered sensitive enough to keep off a public tracker,
+that is a legitimate call — but then it needs a private channel a second
+maintainer can actually reach, which is the same unresolved question as **F-24**
+and **F-22**.
+
 ### F-33 — Contributor-facing and agent-facing docs already disagree about the tracker. SHOULD CHANGE
 
-`SUPPORT.md:11-14` and `CONTRIBUTING.md:834` already direct people to GitHub:
+`SUPPORT.md:11-14` and `CONTRIBUTING.md:836` already direct people to GitHub:
 
 > "- For reproducible defects, open a GitHub issue with version, commit, command,
 >   expected behaviour, actual behaviour, and relevant logs."
@@ -1085,9 +1388,15 @@ superseded in practice, not only in filing. Leave the sibling citations alone.
 
 **Before the tracker migration cuts over:**
 
+4a. **F-41** — decide where governance work is tracked. The operator ruling at
+   `docs/github-issues/README.md:55-60` keeps it in filigree, which would put
+   F-01's remediation in a private local database a second developer cannot read.
+   This decision gates items 1–4 above, so make it first.
 5. **F-27 / F-30** — uninstall the Filigree AGENTS.md block (via its own uninstall
    verb, not by hand) and retarget the tracked skills; record it as an ADR-043
-   amendment.
+   amendment. Note this is only correct if F-41 resolves toward a single tracker;
+   if filigree is retained for governance, the block needs rewriting rather than
+   removing.
 6. **F-31** — create the GitHub labels from the existing vocabulary document
    *before* migrating issues, or the classification is lost in transit.
 7. **F-28** — commit a read-only Filigree export plus a resolver note, and carry
