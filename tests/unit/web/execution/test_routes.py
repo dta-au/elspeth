@@ -907,6 +907,7 @@ class TestExecuteEndpoint:
                 blockers=[
                     ValidationReadinessBlocker(
                         suggestion=None,
+                        note=None,
                         code="graph_structure",
                         component_id="rate",
                         component_type="transform",
@@ -936,6 +937,7 @@ class TestExecuteEndpoint:
 
         blocker = ValidationReadinessBlocker(
             suggestion=None,
+            note=None,
             code="runtime_admission",
             component_id="pipeline",
             component_type="pipeline",
@@ -961,6 +963,7 @@ class TestExecuteEndpoint:
                     "component_type": "pipeline",
                     "detail": "The selected runtime policy does not admit this pipeline.",
                     "suggestion": None,
+                    "note": None,
                 }
             ],
         }

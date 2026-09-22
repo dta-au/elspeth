@@ -1647,6 +1647,7 @@ def no_mutation_empty_state_validation(blocker: str) -> ValidationResult:
                 ValidationReadinessBlocker(
                     code="state_exists",
                     suggestion=None,
+                    note=None,
                     component_id=None,
                     component_type=None,
                     detail=detail,

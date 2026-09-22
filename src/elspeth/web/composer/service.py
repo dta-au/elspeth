@@ -1038,6 +1038,7 @@ def _proof_repair_exhausted_validation(
                 ValidationReadinessBlocker(
                     code=_PROOF_REPAIR_EXHAUSTED_CODE,
                     suggestion=None,
+                    note=None,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -1124,6 +1125,7 @@ def _orphaned_interpretation_review_validation(
                 ValidationReadinessBlocker(
                     code=_INTERPRETATION_REVIEW_ORPHANED_CODE,
                     suggestion=None,
+                    note=None,
                     component_id=component_id,
                     component_type=_component_type_for_kind(kind),
                     detail=detail,
@@ -10863,6 +10865,7 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) 
                 ValidationReadinessBlocker(
                     code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
                     suggestion=suggestion,
+                    note=None,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -11256,6 +11259,7 @@ def _advisor_signoff_pending_validation(
                     ValidationReadinessBlocker(
                         code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
                         suggestion=suggestion,
+                        note=None,
                         component_id="pipeline",
                         component_type="pipeline",
                         detail=detail,

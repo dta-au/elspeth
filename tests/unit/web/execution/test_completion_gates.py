@@ -154,6 +154,7 @@ def _failed_ledger_result() -> ValidationResult:
                 ValidationReadinessBlocker(
                     code=CHECK_PLUGIN_ENABLEMENT,
                     suggestion=None,
+                    note=None,
                     component_id="source",
                     component_type="source",
                     detail="Plugin enablement failed.",
@@ -270,6 +271,7 @@ def _signoff_blocked_result() -> ValidationResult:
                 ValidationReadinessBlocker(
                     code=ADVISOR_SIGNOFF_BLOCKED_CODE,
                     suggestion=None,
+                    note=None,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=_BLOCKED_DETAIL,
@@ -470,6 +472,7 @@ class TestMerge:
                     ValidationReadinessBlocker(
                         code="state_exists",
                         suggestion=None,
+                        note=None,
                         component_id=None,
                         component_type=None,
                         detail="No composition state exists for this session.",

@@ -256,6 +256,10 @@ class ValidationReadinessBlocker(_StrictResponse):
     component_type: str | None
     detail: str
     suggestion: str | None
+    # elspeth-032ec69c41: the advisor's own words, bounded and labelled, on the
+    # ``advisor_signoff_blocked`` row only. Every other blocker sets None.
+    # REQUIRED (no default) so a builder cannot forget the decision.
+    note: str | None
 
 
 class ValidationReadiness(_StrictResponse):

@@ -12828,6 +12828,7 @@ def _advisor_blocked_preflight(state: CompositionState) -> ValidationResultModel
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=ADVISOR_SIGNOFF_BLOCKED_CODE,
                     component_id="pipeline",
                     component_type="pipeline",

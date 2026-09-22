@@ -720,6 +720,7 @@ def test_validation_row_warns_when_advisor_completion_is_pending():
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code="advisor_signoff_blocked",
                     component_id="pipeline",
                     component_type="pipeline",

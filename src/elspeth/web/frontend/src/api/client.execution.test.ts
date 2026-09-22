@@ -64,7 +64,8 @@ describe("api/client execution state binding", () => {
       is_valid: true, checks: [], errors: [],
       readiness: { authoring_valid: true, execution_ready: true, completion_ready: false,
         blockers: [{ code: "advisor_signoff_blocked", component_id: "pipeline",
-          component_type: "pipeline", detail: "Review pending.", suggestion }] },
+          component_type: "pipeline", detail: "Review pending.", suggestion,
+          note: null }] },
     }), { status: 200 }));
     await expect(validatePipeline("session-1")).rejects.toMatchObject({
       detail: "Unexpected readiness shape from validate endpoint",
@@ -76,7 +77,8 @@ describe("api/client execution state binding", () => {
       is_valid: true, checks: [], errors: [],
       readiness: { authoring_valid: true, execution_ready: true, completion_ready: false,
         blockers: [{ code: "advisor_signoff_blocked", component_id: "pipeline",
-          component_type: "pipeline", detail: "Review pending.", suggestion }] },
+          component_type: "pipeline", detail: "Review pending.", suggestion,
+          note: null }] },
     }), { status: 200 }));
     const result = await validatePipeline("session-1");
     expect(result.readiness.blockers[0].suggestion).toBe(suggestion);

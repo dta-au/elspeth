@@ -392,6 +392,7 @@ def _merge_authoritative_proof_diagnostics(
             ValidationReadinessBlocker(
                 code=code,
                 suggestion=None,
+                note=None,
                 component_id=node_id,
                 component_type=component_type,
                 detail=f"Bounded source proof blocked execution: {code}.",
@@ -418,6 +419,7 @@ def _merge_authoritative_proof_diagnostics(
             ValidationReadinessBlocker(
                 code="proof_diagnostics",
                 suggestion=None,
+                note=None,
                 component_id=None,
                 component_type="pipeline",
                 detail=(
@@ -487,6 +489,7 @@ def _merge_unavailable_authoritative_proof(result: ValidationResult) -> Validati
                     ValidationReadinessBlocker(
                         code="source_inspection_failed",
                         suggestion=None,
+                        note=None,
                         component_id=None,
                         component_type="source",
                         detail="Bounded source proof was unavailable; execution fails closed.",
@@ -2030,6 +2033,7 @@ class ExecutionServiceImpl:
                             ValidationReadinessBlocker(
                                 code="llm_retry_budget_policy",
                                 suggestion=None,
+                                note=None,
                                 component_id=node.id,
                                 component_type="transform",
                                 detail=f"transform {node.id} uses an unsafe sequential multi-query LLM retry budget",
@@ -2772,6 +2776,7 @@ class ExecutionServiceImpl:
                         ValidationReadinessBlocker(
                             code="state_exists",
                             suggestion=None,
+                            note=None,
                             component_id=None,
                             component_type=None,
                             detail="No composition state exists for this session.",

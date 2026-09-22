@@ -1481,6 +1481,7 @@ class TestExecutionFlow:
                 blockers=[
                     ValidationReadinessBlocker(
                         suggestion=None,
+                        note=None,
                         code="graph_structure",
                         component_id="rate",
                         component_type="transform",
@@ -1510,6 +1511,7 @@ class TestExecutionFlow:
         """Execution admission follows readiness even when validation is green."""
         blocker = ValidationReadinessBlocker(
             suggestion=None,
+            note=None,
             code="runtime_admission",
             component_id="pipeline",
             component_type="pipeline",

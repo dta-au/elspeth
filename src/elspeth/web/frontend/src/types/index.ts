@@ -607,6 +607,8 @@ export interface ValidationReadinessBlocker {
   component_type: string | null;
   detail: string;
   suggestion: string | null;
+  /** The advisor's own words, bounded and labelled, on `advisor_signoff_blocked` only; null elsewhere. */
+  note: string | null;
 }
 
 export interface ValidationReadiness {

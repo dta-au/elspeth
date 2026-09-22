@@ -3646,6 +3646,7 @@ def _pending_handoff_preflight() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="rate",
                     component_type="transform",
@@ -3732,6 +3733,7 @@ def _masked_failure_preflight() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code="graph_structure",
                     component_id="sink_combined",
                     component_type="output",

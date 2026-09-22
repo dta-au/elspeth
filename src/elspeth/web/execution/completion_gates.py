@@ -141,6 +141,7 @@ def _reconcile_advisor_blocker(
         component_type="pipeline",
         detail=detail,
         suggestion=suggestion,
+        note=None,
     )
     reconciled: list[ValidationReadinessBlocker] = []
     replaced = False

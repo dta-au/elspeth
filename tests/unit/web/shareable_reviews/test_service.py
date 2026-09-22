@@ -402,6 +402,7 @@ def _pending_review_validation() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="assess",
                     component_type="transform",
@@ -443,6 +444,7 @@ def _completion_blocked_validation() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=ADVISOR_SIGNOFF_BLOCKED_CODE,
                     component_id="pipeline",
                     component_type="pipeline",
