@@ -120,6 +120,8 @@ CAPS_OK = {
     "CSV",
     "DAG",
     "DTO",
+    "MIME",
+    "SQLSTATE",
     "ELSPETH",
     "FAIL",
     "GET",
@@ -163,12 +165,20 @@ def scan(path: pathlib.Path) -> tuple[list[str], list[str]]:
     blocks: list[str] = []
     warns: list[str] = []
 
+    # BLOCK patterns scan EVERYTHING, fenced code included: a leaked account id inside a
+    # code block is still a leaked account id.
     for label, pattern in BLOCK:
         for m in dict.fromkeys(pattern.findall(text)):
             blocks.append(f"{label}: {m!r}")
 
+    # WARN patterns are about prose style, so they skip fenced code and inline spans.
+    # Capitals inside a code block are data — a constant name, a column header, a literal
+    # enum value — not shouting, and flagging them trains the reader to ignore the gate.
+    prose = re.sub(r"```.*?```", "", text, flags=re.S)
+    prose = re.sub(r"`[^`\n]*`", "", prose)
+
     for label, pattern in WARN:
-        for m in dict.fromkeys(pattern.findall(text)):
+        for m in dict.fromkeys(pattern.findall(prose)):
             if label.startswith("shouty") and m in CAPS_OK:
                 continue
             warns.append(f"{label}: {m!r}")
@@ -190,8 +200,23 @@ def scan(path: pathlib.Path) -> tuple[list[str], list[str]]:
         warns.append(f"very short ({words} words) — is it startable by a new dev?")
     if words > 900:
         warns.append(f"very long ({words} words) — length must be earned")
-    if "## Fix" not in body:
-        warns.append("no '## Fix' section — the most important one for a new dev")
+    # Every issue needs a section saying what someone would actually DO. A bug calls that
+    # "Fix"; a task more naturally calls it "Scope", and may pair it with "Verification"
+    # or "Proposed shape". Any of them satisfies the requirement — the point is that a new
+    # developer can tell what done looks like, not that a particular word appears.
+    ACTIONABLE = (
+        "## Fix",
+        "## What is needed",
+        "## Scope",
+        "## Proposed",
+        "## Verification",
+        "## What to do",
+        "## Acceptance",
+        "## Remediation",
+        "## Resolution",
+    )
+    if not any(h in body for h in ACTIONABLE):
+        warns.append("no actionable section (Fix / Scope / Proposed / Verification) — a new developer cannot tell what done looks like")
 
     return blocks, warns
 
