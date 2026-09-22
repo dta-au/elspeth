@@ -8596,6 +8596,14 @@ class ComposerServiceImpl:
         # decision, and a literal at each call would hide that.
         prose_withheld = False
         raw_content = (assistant_message.content or "") if assistant_message is not None else ""
+        # elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): computed
+        # once for every shape below. The step ids are checked against THIS
+        # state — an id the advisor invented, or an injection wearing an id's
+        # clothes, never reaches the header. A backend-authored pre-scan
+        # finding already rides ``detail`` in its own fixed wording and is not
+        # a reviewer's note, so it carries none.
+        step_ids = _validated_advisor_step_ids(state, verdict.affected_step_ids)
+        note = None if verdict.findings_backend_authored else verdict.note
         validated_base = runtime_preflight if runtime_preflight is not None and runtime_preflight.is_valid else None
         if validated_base is not None:
             runtime_result = _advisor_signoff_pending_validation(
@@ -8603,6 +8611,9 @@ class ComposerServiceImpl:
                 reason=reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
+                category=verdict.category,
+                step_ids=step_ids,
+                note=note,
             )
             # Same verdict-class split as the red arm below: did-not-clear is
             # true only for a rendered FLAG; an unrendered verdict names its
@@ -8636,6 +8647,9 @@ class ComposerServiceImpl:
                 reason=reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
+                category=verdict.category,
+                step_ids=step_ids,
+                note=note,
             )
             if verdict.ok:
                 augmented = _compose_advisor_signoff_unverified_message(raw_content, prose_withheld=prose_withheld)
@@ -8650,6 +8664,9 @@ class ComposerServiceImpl:
                 reason=reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
+                category=verdict.category,
+                step_ids=step_ids,
+                note=note,
             )
             # elspeth-b61894d93d: the chat copy is composed from the turn's
             # ACTUAL red preflight, never from the synthesized
@@ -10785,7 +10802,54 @@ _ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable af
 _ADVISOR_MALFORMED_USER_DETAIL: Final[str] = "advisor response was malformed"
 
 
-def _advisor_signoff_blocked_validation(*, reason: str, findings: str, findings_backend_authored: bool = False) -> ValidationResult:
+# elspeth-032ec69c41 (ruling 2026-09-22): one fixed backend sentence per closed
+# advisor category. The advisor picks the category from a closed vocabulary; the
+# SENTENCE is ours, so no provider text reaches the header even when the
+# category is attacker-influenced. An unrecognised category was already
+# normalised to "other" by the parser.
+_ADVISOR_CATEGORY_HEADERS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "request_not_met": "The reviewer found the request not fully met.",
+        "error_handling": "The reviewer flagged how failures are handled.",
+        "prompt_defect": "The reviewer flagged a prompt.",
+        "schema_mismatch": "The reviewer flagged a field or schema mismatch.",
+        "other": "The reviewer flagged this pipeline.",
+    }
+)
+
+
+def _validated_advisor_step_ids(state: CompositionState, raw: Sequence[str]) -> tuple[str, ...]:
+    """Keep only ids the state actually has, in the advisor's order, de-duplicated.
+
+    The advisor's ``STEPS:`` line is provider text: this is what makes the
+    header safe to render. ``state.sources`` is a mapping keyed by source name,
+    so its keys are the ids; nodes carry ``id`` and outputs carry ``name``.
+    """
+    known = set(state.sources) | {node.id for node in state.nodes} | {output.name for output in state.outputs}
+    kept: list[str] = []
+    for candidate in raw:
+        if candidate in known and candidate not in kept:
+            kept.append(candidate)
+    return tuple(kept)
+
+
+def _advisor_flagged_header(category: str, step_ids: Sequence[str]) -> str:
+    """The backend-authored header sentence(s) for a rendered FLAG."""
+    header = _ADVISOR_CATEGORY_HEADERS.get(category, _ADVISOR_CATEGORY_HEADERS["other"])
+    if step_ids:
+        return f"{header} Steps named by the reviewer: {', '.join(step_ids)}."
+    return header
+
+
+def _advisor_signoff_blocked_validation(
+    *,
+    reason: str,
+    findings: str,
+    findings_backend_authored: bool = False,
+    category: str,
+    step_ids: Sequence[str],
+    note: str | None,
+) -> ValidationResult:
     """Build the fully-red shape for a RED runtime preflight.
 
     Returned (not raised) by the END authoritative advisor gate
@@ -10810,11 +10874,21 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str, findings_
         reason=reason,
         findings=findings,
         findings_backend_authored=findings_backend_authored,
+        category=category,
+        step_ids=step_ids,
     )
-    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion)
+    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion, note=note)
 
 
-def _advisor_signoff_unverified_validation(*, reason: str, findings: str, findings_backend_authored: bool = False) -> ValidationResult:
+def _advisor_signoff_unverified_validation(
+    *,
+    reason: str,
+    findings: str,
+    findings_backend_authored: bool = False,
+    category: str,
+    step_ids: Sequence[str],
+    note: str | None,
+) -> ValidationResult:
     """Build the fully-blocking shape for an ABSENT runtime preflight.
 
     elspeth-2ae50afcd1 facet B (operator-adjudicated 2026-09-02). ``None``
@@ -10831,11 +10905,13 @@ def _advisor_signoff_unverified_validation(*, reason: str, findings: str, findin
         findings=findings,
         findings_backend_authored=findings_backend_authored,
         notice=_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+        category=category,
+        step_ids=step_ids,
     )
-    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion)
+    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion, note=note)
 
 
-def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) -> ValidationResult:
+def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str, note: str | None) -> ValidationResult:
     """Shared fully-blocking wire shape for the red and absent advisor blocks."""
     return ValidationResult(
         is_valid=False,
@@ -10865,7 +10941,7 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) 
                 ValidationReadinessBlocker(
                     code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
                     suggestion=suggestion,
-                    note=None,
+                    note=note,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -11131,6 +11207,8 @@ def _advisor_signoff_blocked_wording(
     findings: str,
     findings_backend_authored: bool = False,
     notice: str = _ADVISOR_SIGNOFF_PENDING_NOTICE,
+    category: str = "other",
+    step_ids: Sequence[str] = (),
 ) -> tuple[str, str]:
     """Return the (detail, suggestion) pair for one blocked-sign-off reason.
 
@@ -11156,11 +11234,21 @@ def _advisor_signoff_blocked_wording(
     ``findings_backend_authored`` is True (the deterministic pre-scan
     string: fixed shape, names the triggering surface, carries no provider
     text) the finding is appended so the operator can act. Advisor-MODEL
-    findings remain withheld on these branches (R2-F13: raw provider
-    findings never enter the composer's published prose or validation-wire
-    surfaces — scoped deliberately: a flagged model's subsequent TOOL CALLS
+    findings remain withheld on these branches (R2-F13, narrowed by the
+    2026-09-22 ruling: raw provider findings never enter ``detail``,
+    ``suggestion``, the check text or the composer's published prose — they
+    reach the user only through the blocker's ``note`` field, which the
+    caller sets. Scoped deliberately: a flagged model's subsequent TOOL CALLS
     can still write derived text into pipeline state the user inspects, and
     that state channel is uncontained by design, elspeth-25f7b757e7 A4).
+
+    ``category`` and ``step_ids`` (elspeth-032ec69c41) add the backend-authored
+    header to a RENDERED flag: one fixed sentence per closed category, plus the
+    ids the caller already validated against the state. Both are backend copy —
+    the advisor chooses which sentence, never its words — so they sit in
+    ``detail`` while the advisor's own prose stays in ``note``. A
+    backend-authored pre-scan finding keeps its existing wording and gets no
+    header: it is not a reviewer's judgement about a step.
     """
     if reason == "flagged_unrepairable":
         # elspeth-25f7b757e7 (A1): the trigger is the user's own chat message,
@@ -11183,8 +11271,14 @@ def _advisor_signoff_blocked_wording(
                 f"{notice} {findings}",
                 "Remove the flagged text from the named field; the advisory review runs again after your next pipeline change.",
             )
+        # Header first, then its step sentence, then the standing notice: the
+        # plan said "prefix the header, append the steps", but a step list
+        # placed after "run again after your next pipeline change" reads as
+        # part of the next-steps advice rather than as what the reviewer
+        # named. Keeping the two header sentences adjacent is the same copy,
+        # ordered as a person reads it.
         return (
-            notice,
+            f"{_advisor_flagged_header(category, step_ids)} {notice}",
             "Review the pipeline; validation and the advisory review run again after your next pipeline change.",
         )
     # Ruling 2026-09-22 (elspeth-032ec69c41): this pair is what the durable
@@ -11212,6 +11306,9 @@ def _advisor_signoff_pending_validation(
     reason: str,
     findings: str,
     findings_backend_authored: bool = False,
+    category: str,
+    step_ids: Sequence[str],
+    note: str | None,
 ) -> ValidationResult:
     """Gate COMPLETION only, on a pipeline whose validation genuinely passed.
 
@@ -11237,6 +11334,8 @@ def _advisor_signoff_pending_validation(
         reason=reason,
         findings=findings,
         findings_backend_authored=findings_backend_authored,
+        category=category,
+        step_ids=step_ids,
     )
     return base.model_copy(
         update={
@@ -11259,7 +11358,7 @@ def _advisor_signoff_pending_validation(
                     ValidationReadinessBlocker(
                         code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
                         suggestion=suggestion,
-                        note=None,
+                        note=note,
                         component_id="pipeline",
                         component_type="pipeline",
                         detail=detail,

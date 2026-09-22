@@ -11479,7 +11479,9 @@ class TestComposerProgressRoutes:
             version=4,
         )
         if envelope_writer == "production_writer":
-            blocked_preflight = _advisor_signoff_blocked_validation(reason="flagged_final_pass", findings="")
+            blocked_preflight = _advisor_signoff_blocked_validation(
+                reason="flagged_final_pass", findings="", category="other", step_ids=(), note=None
+            )
             envelope = completion_gates_meta_value(blocked_preflight, seeded_state)
             (blocker,) = [b for b in blocked_preflight.readiness.blockers if b.code == ADVISOR_SIGNOFF_BLOCKED_CODE]
             seeded_fact = CompletionGateFacts(

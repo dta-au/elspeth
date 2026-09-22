@@ -188,7 +188,9 @@ def test_advisor_suggestion_survives_reload_and_clears_on_graph_change() -> None
     from elspeth.web.composer.service import _advisor_signoff_pending_validation
 
     state = _make_state()
-    result = _advisor_signoff_pending_validation(_green_result(), reason="unavailable", findings="Model unavailable.")
+    result = _advisor_signoff_pending_validation(
+        _green_result(), reason="unavailable", findings="Model unavailable.", category="other", step_ids=(), note=None
+    )
     suggestion = (
         "The advisor model was unavailable after retry; check the advisor model configuration. "
         "Validation and the advisory review run again after your next pipeline change."
@@ -245,9 +247,9 @@ def test_advisor_readiness_never_publishes_model_findings(reason: str) -> None:
 
     findings = "PRIVATE_PROVIDER_FINDING credential-shaped-content"
     results = [
-        _advisor_signoff_blocked_validation(reason=reason, findings=findings),
-        _advisor_signoff_unverified_validation(reason=reason, findings=findings),
-        _advisor_signoff_pending_validation(_green_result(), reason=reason, findings=findings),
+        _advisor_signoff_blocked_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
+        _advisor_signoff_unverified_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
+        _advisor_signoff_pending_validation(_green_result(), reason=reason, findings=findings, category="other", step_ids=(), note=None),
     ]
     for result in results:
         blocker = result.readiness.blockers[0]
@@ -255,6 +257,38 @@ def test_advisor_readiness_never_publishes_model_findings(reason: str) -> None:
         assert findings not in result.model_dump_json()
         if result.errors:
             assert blocker.suggestion == result.errors[0].suggestion
+
+
+@pytest.mark.parametrize("reason", ["flagged_no_repair", "flagged_final_pass", "flagged_unrepairable"])
+def test_advisor_note_reaches_only_the_blocker_note_field(reason: str) -> None:
+    """Ruling 2026-09-22 (elspeth-032ec69c41) narrows R2-F13: the advisor's
+    bounded note IS published — in ``blockers[].note`` and nowhere else. The
+    raw ``findings_text`` stays off every surface, note included: the note is
+    the parser's sanitised extract, not the fenced reply."""
+    from elspeth.web.composer.service import (
+        _advisor_signoff_blocked_validation,
+        _advisor_signoff_pending_validation,
+        _advisor_signoff_unverified_validation,
+    )
+
+    findings = "PRIVATE_PROVIDER_FINDING credential-shaped-content"
+    note = "The merge step cannot route failures; pick per-branch sinks or a partial-arrival policy."
+    results = [
+        _advisor_signoff_blocked_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
+        _advisor_signoff_unverified_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
+        _advisor_signoff_pending_validation(
+            _green_result(), reason=reason, findings=findings, category="error_handling", step_ids=(), note=note
+        ),
+    ]
+    for result in results:
+        (blocker,) = [b for b in result.readiness.blockers if b.code == ADVISOR_SIGNOFF_BLOCKED_CODE]
+        assert blocker.note == note
+        assert findings not in result.model_dump_json()
+        # Every surface other than the note field is still free of the words.
+        assert note not in blocker.detail
+        assert note not in (blocker.suggestion or "")
+        assert all(note not in check.detail for check in result.checks)
+        assert all(note not in error.message and note not in (error.suggestion or "") for error in result.errors)
 
 
 def _signoff_blocked_result() -> ValidationResult:

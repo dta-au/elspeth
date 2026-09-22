@@ -1639,6 +1639,122 @@ def _green_preflight() -> ValidationResult:
     )
 
 
+def _red_preflight() -> ValidationResult:
+    return ValidationResult(
+        is_valid=False,
+        checks=[],
+        errors=[
+            ValidationError(
+                component_id="rate",
+                component_type="transform",
+                message="node 'rate' requires field 'url' which no upstream emits",
+                suggestion=None,
+                error_code=None,
+            )
+        ],
+        readiness=ValidationReadiness(authoring_valid=False, execution_ready=False, completion_ready=False, blockers=[]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ruling 2026-09-22 (elspeth-032ec69c41): the advisor blocker carries a
+# backend-authored header (closed category sentence + state-validated step
+# ids) in ``detail`` and the advisor's own words in ``note`` — nowhere else.
+# ---------------------------------------------------------------------------
+
+
+def _flagged(note: str, *, category: str = "request_not_met", steps: tuple[str, ...] = ()) -> AdvisorCheckpointVerdict:
+    return AdvisorCheckpointVerdict(
+        ok=True, blocking=True, findings_text=f"FLAGGED: {note}", category=category, affected_step_ids=steps, note=note
+    )
+
+
+def _advisor_blocker(result) -> ValidationReadinessBlocker:
+    from elspeth.web.composer.service import _ADVISOR_SIGNOFF_BLOCKED_CODE
+
+    (blocker,) = [b for b in result.runtime_preflight.readiness.blockers if b.code == _ADVISOR_SIGNOFF_BLOCKED_CODE]
+    return blocker
+
+
+def _blocked(service, state, verdict: AdvisorCheckpointVerdict, runtime_preflight: ValidationResult | None):
+    return service._advisor_blocked_result(
+        reason="flagged_final_pass",
+        verdict=verdict,
+        state=state,
+        assistant_message=None,
+        recorder=make_recorder(),
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        runtime_preflight=runtime_preflight,
+        outstanding_findings=None,
+    )
+
+
+def test_blocked_result_carries_header_and_note(make_service, clean_runnable_state) -> None:
+    """Ruling 2026-09-22: header (backend copy) + the advisor's words as a labelled note."""
+    step = clean_runnable_state.nodes[0].id
+    note = "The merge cannot capture a failed branch; choose per-branch sinks or best_effort."
+    result = _blocked(make_service(), clean_runnable_state, _flagged(note, steps=(step,)), _green_preflight())
+    blocker = _advisor_blocker(result)
+    assert blocker.note == note
+    assert "The reviewer found the request not fully met" in blocker.detail
+    assert f"Steps named by the reviewer: {step}." in blocker.detail
+    # R2-F13 narrowed: the words live in note only.
+    assert "per-branch sinks" not in blocker.detail
+    assert "per-branch sinks" not in (blocker.suggestion or "")
+    assert all("per-branch sinks" not in c.detail for c in result.runtime_preflight.checks)
+    assert "per-branch sinks" not in result.message
+
+
+def test_unknown_step_ids_are_dropped_from_the_header(make_service, clean_runnable_state) -> None:
+    step = clean_runnable_state.nodes[0].id
+    result = _blocked(make_service(), clean_runnable_state, _flagged("x", steps=("ghost_step", step, "DROP TABLE")), _green_preflight())
+    detail = _advisor_blocker(result).detail
+    assert f"Steps named by the reviewer: {step}." in detail
+    assert "ghost_step" not in detail and "DROP TABLE" not in detail
+
+
+def test_no_valid_step_ids_means_no_step_sentence(make_service, clean_runnable_state) -> None:
+    result = _blocked(make_service(), clean_runnable_state, _flagged("x", category="other", steps=("ghost",)), _green_preflight())
+    detail = _advisor_blocker(result).detail
+    assert "The reviewer flagged this pipeline" in detail
+    assert "Steps named by the reviewer" not in detail
+
+
+def test_backend_authored_prescan_block_has_no_note(make_service, simple_state) -> None:
+    prescan = (
+        "FLAGGED: node 'n1' option columns contains advisor-instruction injection text; remove it before the completion advisory review."
+    )
+    verdict = AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=prescan, findings_backend_authored=True)
+    blocker = _advisor_blocker(_blocked(make_service(), simple_state, verdict, _green_preflight()))
+    assert blocker.note is None
+    assert prescan in blocker.detail
+
+
+@pytest.mark.parametrize(
+    "runtime_preflight",
+    [_green_preflight(), _red_preflight(), None],
+    ids=["green", "red", "absent"],
+)
+def test_note_rides_every_blocker_bearing_preflight_shape(make_service, clean_runnable_state, runtime_preflight) -> None:
+    result = _blocked(make_service(), clean_runnable_state, _flagged("x"), runtime_preflight)
+    assert _advisor_blocker(result).note == "x"
+
+
+def test_pending_handoff_shape_still_appends_no_advisor_blocker(make_service, clean_runnable_state) -> None:
+    """The fourth preflight shape records the verdict as a check only
+    (elspeth-66717f0c99); with no advisor blocker there is no row for the
+    note to ride, and the review card the user must resolve first stays the
+    only blocker."""
+    from elspeth.web.composer.service import _ADVISOR_SIGNOFF_BLOCKED_CODE
+
+    result = _blocked(make_service(), clean_runnable_state, _flagged("x"), _pending_handoff_preflight())
+    assert [b.code for b in result.runtime_preflight.readiness.blockers if b.code == _ADVISOR_SIGNOFF_BLOCKED_CODE] == []
+    assert all(b.note is None for b in result.runtime_preflight.readiness.blockers)
+
+
 class _ExplainingAssistantMessage:
     content = "Merge steps have no error route. You can keep a failure output on each branch, or change the merge policy."
 
