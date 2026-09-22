@@ -48,7 +48,7 @@ from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff,
     visible_message_segments,
 )
-from elspeth.web.composer.protocol import ComposerConvergenceError
+from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
 from elspeth.web.composer.service import (
     _ADVISOR_MALFORMED_USER_DETAIL,
     _ADVISOR_UNAVAILABLE_USER_DETAIL,
@@ -67,6 +67,11 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.execution.completion_gates import (
+    AdvisorSignoffGateFact,
+    CompletionGateFacts,
+    completion_gate_fingerprint,
+)
 from elspeth.web.execution.schemas import (
     CHECK_ADVISOR_SIGNOFF,
     ValidationError,
@@ -2346,6 +2351,8 @@ async def drive_try_terminate(
     deadline: float | None = None,
     recorder: BufferingRecorder | None = None,
     initial_version: int = 1,
+    completion_gates: CompletionGateFacts | None = None,
+    finalize_result: ComposerResult | None = None,
     advisor_repair_context_introduced: bool = True,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
@@ -2359,11 +2366,9 @@ async def drive_try_terminate(
     gate runs) and the shared finalize tail to return a canned runnable
     result (so the clean fall-through is isolated from finalize plumbing).
     """
-    from elspeth.web.composer.protocol import ComposerResult
-
     service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_and_finalize_no_tools = _AsyncRecorder(
-        return_value=ComposerResult(message="Done — the pipeline is ready.", state=state)
+        return_value=finalize_result or ComposerResult(message="Done — the pipeline is ready.", state=state)
     )
     # The advisor-blocked terminal returns now run the surface+orphan-gate pair
     # (``_surface_pt_and_gate_orphans_or_none``) before building the blocked
@@ -2468,6 +2473,7 @@ async def drive_try_terminate(
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
         advisor_repair_context_introduced=advisor_repair_context_introduced,
+        completion_gates=completion_gates,
         **kwargs,
     )
 
@@ -5754,3 +5760,74 @@ def test_both_end_gate_call_sites_pass_the_durable_gate_fact():
     assert len(calls) == 2
     for call in calls:
         assert "completion_gates" in {kw.arg for kw in call.keywords}
+
+
+def _blocked_facts_for(state: CompositionState) -> CompletionGateFacts:
+    return CompletionGateFacts(
+        advisor_signoff=AdvisorSignoffGateFact(
+            detail="Completion advisory review did not clear after the available attempts.",
+            suggestion="Review the pipeline.",
+            for_graph=completion_gate_fingerprint(state),
+        )
+    )
+
+
+def _flagging_advisor() -> _AsyncRecorder:
+    return _AsyncRecorder(return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: unresolved"))
+
+
+@pytest.mark.asyncio
+async def test_question_on_an_already_blocked_graph_skips_the_review(make_service, clean_runnable_state):
+    """Ruling 2026-09-22 (session 6990d39f): asking what a block means must not re-enter the repair loop."""
+    service = make_service()
+    service._run_advisor_checkpoint = _flagging_advisor()
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        initial_version=clean_runnable_state.version,
+        completion_gates=_blocked_facts_for(clean_runnable_state),
+        message="What does this mean, and what are my options?",
+    )
+    assert service._run_advisor_checkpoint.calls == []
+    assert outcome.action == "return"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_turn_without_a_block_still_reviews(make_service, clean_runnable_state):
+    """Control and Review Focus 1: a graph no advisor has ruled on keeps its backstop review."""
+    service = make_service()
+    service._run_advisor_checkpoint = _flagging_advisor()
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        initial_version=clean_runnable_state.version,
+        completion_gates=None,
+    )
+    assert len(service._run_advisor_checkpoint.calls) == 1
+    assert outcome.action == "continue"
+
+
+@pytest.mark.asyncio
+async def test_skipped_turn_result_keeps_completion_withheld(make_service, clean_runnable_state):
+    """Review Focus 3: a green preview on a question turn must not publish completion over the durable block."""
+    green = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+    service = make_service()
+    service._run_advisor_checkpoint = _flagging_advisor()
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        initial_version=clean_runnable_state.version,
+        completion_gates=_blocked_facts_for(clean_runnable_state),
+        finalize_result=ComposerResult(message="Here are your options.", state=clean_runnable_state, runtime_preflight=green),
+    )
+    assert outcome.result.message == "Here are your options."
+    assert outcome.result.runtime_preflight.readiness.completion_ready is False
+    assert outcome.result.runtime_preflight.readiness.execution_ready is True

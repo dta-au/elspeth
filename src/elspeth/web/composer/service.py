@@ -222,7 +222,12 @@ from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin, withheld_reply_envelope
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.execution.completion_gates import CompletionGateFacts, advisor_signoff_check_failed
+from elspeth.web.execution.completion_gates import (
+    CompletionGateFacts,
+    advisor_block_covers_unchanged_graph,
+    advisor_signoff_check_failed,
+    merge_completion_gates,
+)
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -6366,6 +6371,17 @@ class ComposerServiceImpl:
             repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
         )
+        # The END gate stood aside for a graph the advisor already blocked
+        # (ruling 2026-09-22). Fold the same durable fact into this turn's
+        # preflight with the read-side merge the Run path uses, so the chat
+        # never reports completion that /validate and Run still withhold.
+        if result.runtime_preflight is not None and advisor_block_covers_unchanged_graph(
+            completion_gates, state, initial_version=initial_version
+        ):
+            result = replace(
+                result,
+                runtime_preflight=merge_completion_gates(result.runtime_preflight, completion_gates, state),
+            )
         # Thread repair_turns_used through to the result so the route handler can
         # persist it onto the new ``composition_states.composer_meta`` row (and the
         # API state response can surface ``composer_meta.repair_turns_used``) — see
@@ -6713,6 +6729,24 @@ class ComposerServiceImpl:
         """
         max_passes = self._settings.composer_advisor_checkpoint_max_passes
         if _state_is_structurally_empty(state) or advisor_checkpoint_passes_used >= max_passes:
+            return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
+
+        # Operator ruling 2026-09-22 (elspeth-032ec69c41): this turn changed
+        # nothing and the advisor has already blocked this exact graph. A
+        # gate fact persists only with a new state row, so another review
+        # could re-block or trap the turn but never clear anything. Observed
+        # live (session 6990d39f): "what does this block mean?" was answered,
+        # FLAGGED over the unchanged graph, and the repair injection ordered
+        # pipeline edits. Unlike the proof gate above (whose version guard was
+        # removed because a resumed session can carry an unreported blocker),
+        # the last advisor ruling is already durable on the state row.
+        if advisor_block_covers_unchanged_graph(completion_gates, state, initial_version=initial_version):
+            slog.info(
+                "composer_advisor_end_gate_skipped",
+                reason="unchanged_graph_already_blocked",
+                state_version=state.version,
+                session_id=session_id,
+            )
             return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
 
         orphaned_precheck = await self._missing_pending_interpretation_review_sites(
