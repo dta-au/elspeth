@@ -41,6 +41,7 @@ from elspeth.contracts.errors import (
     ZeroEmissionSuccessContractViolation,
 )
 from elspeth.contracts.plugin_context import PluginContext, plugin_context_scope
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.secret_scrub import scrub_transform_error_reason
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
@@ -446,7 +447,8 @@ class TransformExecutor:
             transform.input_schema.model_validate(input_dict, strict=True)
         except ValidationError as e:
             input_violation = PluginContractViolation(
-                f"Transform '{transform.name}' input validation failed: {e}. This indicates an upstream transform/source schema bug."
+                f"Transform '{transform.name}' input validation failed: {safe_validation_error_text(e)}. "
+                "This indicates an upstream transform/source schema bug."
             )
             raise input_violation from e
 
@@ -577,7 +579,7 @@ class TransformExecutor:
                 transform.output_schema.model_validate(emitted_row.to_dict(), strict=True)
             except ValidationError as e:
                 output_violation = PluginContractViolation(
-                    f"Transform '{transform.name}' output validation failed for emitted row {idx}: {e}. "
+                    f"Transform '{transform.name}' output validation failed for emitted row {idx}: {safe_validation_error_text(e)}. "
                     "This indicates a transform schema bug."
                 )
                 raise output_violation from e

@@ -749,7 +749,7 @@ class SourceRow:
             if on_validation_failure != "discard":
                 yield SourceRow.quarantined(
                     row=row,
-                    error=str(e),
+                    error=safe_validation_error_text(e),  # never str(e): it echoes the value
                     destination=on_validation_failure,
                     source_row_index=source_row_index,
                 )

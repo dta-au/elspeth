@@ -45,6 +45,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
 from elspeth.contracts.sink_effects import (
@@ -292,7 +293,8 @@ class SinkExecutor:
                     sink.input_schema.model_validate(row)
                 except ValidationError as e:
                     raise PluginContractViolation(
-                        f"Sink '{sink.name}' input validation failed: {e}. This indicates an upstream transform/source schema bug."
+                        f"Sink '{sink.name}' input validation failed: {safe_validation_error_text(e)}. "
+                        "This indicates an upstream transform/source schema bug."
                     ) from e
 
         if sink.declared_required_fields:

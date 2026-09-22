@@ -39,6 +39,7 @@ from pydantic import ValidationError
 
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TransformResult
 from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 
 
 def validate_batch_inputs(
@@ -64,7 +65,8 @@ def validate_batch_inputs(
             transform.input_schema.model_validate(row.to_dict(), strict=True)
         except ValidationError as exc:
             raise PluginContractViolation(
-                f"{node_kind} transform '{transform.name}' input validation failed for buffered row {idx}: {exc}. "
+                f"{node_kind} transform '{transform.name}' input validation failed for buffered row {idx}: "
+                f"{safe_validation_error_text(exc)}. "
                 "This indicates an upstream transform/source schema bug."
             ) from exc
 
@@ -98,6 +100,7 @@ def validate_success_outputs(
             transform.output_schema.model_validate(row.to_dict(), strict=True)
         except ValidationError as exc:
             raise PluginContractViolation(
-                f"{node_kind} transform '{transform.name}' output validation failed for emitted row {idx}: {exc}. "
+                f"{node_kind} transform '{transform.name}' output validation failed for emitted row {idx}: "
+                f"{safe_validation_error_text(exc)}. "
                 "This indicates a transform schema bug."
             ) from exc

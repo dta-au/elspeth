@@ -64,6 +64,10 @@ class _FakeBatchTransform:
         self.output_schema: type[PluginSchema] = _StrictItemSchema
 
 
+# A row value that must never reach an audit message.
+_SENTINEL = "SENTINEL-value-7f3a91"
+
+
 def _row(payload: dict[str, object]) -> PipelineRow:
     return make_pipeline_row(payload)
 
@@ -142,3 +146,31 @@ class TestSharedValidators:
         validate_success_outputs(
             _FakeBatchTransform(), TransformResult.success_empty(success_reason={"action": "noop"}), node_kind=node_kind
         )
+
+    def test_a_rejected_buffered_row_value_never_reaches_the_message(self, node_kind: str) -> None:
+        """The message names the row index, field and error type — never the VALUE.
+
+        Pydantic's ``str(ValidationError)`` echoes ``input_value=...``. This
+        message is the violation's audit text (the failed node_state, and the
+        routed reason once the flush routes it), so the row value must not be
+        in it.
+        """
+        with pytest.raises(PluginContractViolation) as excinfo:
+            validate_batch_inputs(_FakeBatchTransform(), [_row({"item": 1}), _row({"item": _SENTINEL})], node_kind=node_kind)
+
+        message = str(excinfo.value)
+        assert message.startswith(f"{node_kind} transform 'fake_batch' input validation failed for buffered row 1: ")
+        assert "item: " in message
+        assert "[int_type]" in message
+        assert _SENTINEL not in message
+
+    def test_a_rejected_emitted_row_value_never_reaches_the_message(self, node_kind: str) -> None:
+        result = TransformResult.success_multi((_row({"item": _SENTINEL}),), success_reason={"action": "collected"})
+
+        with pytest.raises(PluginContractViolation) as excinfo:
+            validate_success_outputs(_FakeBatchTransform(), result, node_kind=node_kind)
+
+        message = str(excinfo.value)
+        assert message.startswith(f"{node_kind} transform 'fake_batch' output validation failed for emitted row 0: ")
+        assert "[int_type]" in message
+        assert _SENTINEL not in message

@@ -24,7 +24,9 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from elspeth.contracts import RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts import Determinism, PluginSchema, RunStatus, TerminalOutcome, TerminalPath, TransformResult
+from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.config import ElspethSettings, SinkSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
@@ -539,3 +541,103 @@ def test_wrong_typed_row_at_a_discard_aggregation_quarantines_every_member_witho
     assert len(audit["transform_errors"]) == 3
     assert {row.token_id for row in audit["transform_errors"]} == audit["row_token_ids"]
     assert {row.destination for row in audit["transform_errors"]} == {"discard"}
+
+
+# ---------------------------------------------------------------------------
+# The engine-raised half: a row that fails a transform's DECLARED input schema.
+# The engine raises a Tier-2 ``PluginContractViolation`` and the processor
+# routes it, recording the violation's message as the routed reason. Pydantic's
+# ``str(ValidationError)`` echoes ``input_value=...``, so the message must be
+# rendered value-free at the raise site (C4).
+# ---------------------------------------------------------------------------
+
+_SENTINEL = "SENTINEL-value-7f3a91"
+
+
+class _StrictAmountSchema(PluginSchema):
+    """A declared input contract the sentinel row cannot meet: ``amount`` is an int."""
+
+    amount: int
+
+
+class _StrictInputTransform(BaseTransform):
+    """Declares ``amount: int``; the engine's input preflight rejects a str amount."""
+
+    name = "strict_input_transform"
+    determinism = Determinism.DETERMINISTIC
+    input_schema = _StrictAmountSchema
+    output_schema = PluginSchema
+    plugin_version = "1.0.0"
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__({"schema": {"mode": "observed"}, **config})
+        self.process_count = 0
+
+    def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+        self.process_count += 1
+        return TransformResult.success(row, success_reason={"action": "never reached"})
+
+
+def _audit_cells_containing(db: Any, needle: str) -> list[tuple[str, str]]:
+    """Every (table, column) text cell of the Landscape that contains ``needle``."""
+    from sqlalchemy import inspect, text
+
+    hits: list[tuple[str, str]] = []
+    with db.engine.connect() as conn:
+        inspector = inspect(conn)
+        for table in inspector.get_table_names():
+            columns = [column["name"] for column in inspector.get_columns(table)]
+            for row in conn.execute(text(f'SELECT * FROM "{table}"')).mappings():
+                hits.extend((table, column) for column in columns if type(row[column]) is str and needle in row[column])
+    return hits
+
+
+def test_a_row_failing_a_declared_input_schema_is_routed_without_its_value_in_the_audit_trail(tmp_path: Any) -> None:
+    """The routed contract-violation reason names the field and error type, never the value.
+
+    The scan covers every text cell of every Landscape table. The row VALUE is
+    allowed in exactly one place, ``transform_errors.row_data_json`` — the row
+    itself, kept by design, as the per-row plugin-returned error keeps it. That
+    hit is also the scan's positive control: a scan that found nothing could not
+    tell a clean trail from a scan that never looks.
+    """
+    import json
+
+    from elspeth.core.landscape.schema import routing_events_table, transform_errors_table
+
+    db = make_landscape_db()
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    row = {"id": 7, "amount": _SENTINEL}
+    transform = _StrictInputTransform({})
+    sinks, graph, settings, config = _build_pipeline(transform, row, on_error="quarantine")
+
+    result = Orchestrator(db).run(
+        config,
+        graph=graph,
+        settings=settings,
+        payload_store=payload_store,
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.rows_failed == 1
+    assert transform.process_count == 0, "the engine's input preflight rejects before the plugin body runs"
+    assert sinks["quarantine"].results == [row]
+
+    with db.engine.connect() as conn:
+        [transform_error] = conn.execute(select(transform_errors_table).where(transform_errors_table.c.run_id == result.run_id)).all()
+        [routing_event] = conn.execute(select(routing_events_table).where(routing_events_table.c.run_id == result.run_id)).all()
+
+    reason = json.loads(transform_error.error_details_json)
+    assert reason["reason"] == "contract_violation"
+    assert reason["error"].startswith("Transform 'strict_input_transform' input validation failed: 1 validation error: amount: ")
+    assert "[int_type]" in reason["error"], "the error type code survives for triage"
+    assert _SENTINEL not in transform_error.error_details_json
+    # The DIVERT reason is held in the payload store, not in a Landscape column.
+    assert routing_event.reason_ref is not None
+    routed_reason = payload_store.retrieve(routing_event.reason_ref).decode()
+    assert json.loads(routed_reason) == reason
+    assert _SENTINEL not in routed_reason
+
+    assert _audit_cells_containing(db, _SENTINEL) == [("transform_errors", "row_data_json")]

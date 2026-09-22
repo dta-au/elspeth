@@ -718,6 +718,32 @@ class TestTransformExecutor:
 
         transform.process.assert_not_called()
 
+    def test_input_validation_message_names_the_field_and_type_never_the_value(self) -> None:
+        """The violation message is routed as the row's reason; it must not echo the value.
+
+        ``str(ValidationError)`` carries ``input_value=...``; the executor renders
+        loc/msg/type only (``contracts.safe_validation_errors``).
+        """
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform()
+        from elspeth.contracts import PluginSchema
+
+        class StrictSchema(PluginSchema):
+            count: int
+
+        transform.input_schema = StrictSchema
+        sentinel = "SENTINEL-value-7f3a91"
+        token = _make_token(data={"count": sentinel})
+
+        with pytest.raises(PluginContractViolation) as excinfo:
+            executor.execute_transform(transform, token, make_context())
+
+        message = str(excinfo.value)
+        assert message.startswith(f"Transform '{transform.name}' input validation failed: 1 validation error: count: ")
+        assert "[int_type]" in message
+        assert sentinel not in message
+
     def test_input_schema_validation_rejects_coercible_wrong_runtime_type(self) -> None:
         """Transform input validation must not coerce Tier 2 runtime row values."""
         factory = _make_factory()
@@ -1105,6 +1131,35 @@ class TestTransformExecutor:
         assert kwargs["status"] == NodeStateStatus.FAILED
         assert kwargs["state_id"] == "state_001"
         assert kwargs["error"].exception_type == "PluginContractViolation"
+
+    def test_output_validation_message_and_failed_state_never_carry_the_emitted_value(self) -> None:
+        """An emitted row's value stays out of the violation and the FAILED node_state error."""
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        token = _make_token()
+        transform = _make_transform()
+
+        from elspeth.contracts import PluginSchema
+
+        class StrictOutputSchema(PluginSchema):
+            count: int
+
+        sentinel = "SENTINEL-value-7f3a91"
+        transform.output_schema = StrictOutputSchema
+        transform.process.return_value = TransformResult.success(
+            make_row({"count": sentinel}, contract=_make_output_contract()),
+            success_reason={"action": "test"},
+        )
+
+        with pytest.raises(PluginContractViolation) as excinfo:
+            executor.execute_transform(transform, token, make_context())
+
+        message = str(excinfo.value)
+        assert message.startswith(f"Transform '{transform.name}' output validation failed for emitted row 0: 1 validation error: count: ")
+        assert "[int_type]" in message
+        assert sentinel not in message
+        recorded_error = factory.execution.complete_node_state.call_args.kwargs["error"]
+        assert sentinel not in str(recorded_error.to_dict())
 
     # --- Error path (TransformResult.error) ---
 
