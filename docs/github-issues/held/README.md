@@ -22,6 +22,29 @@ describe only that, and move the file back into `issues/`.
 
 **To drop one:** close the tracker row and delete the file.
 
+## Held for a different reason — the publication review, 2026-09-23
+
+The two below were not held because the work is already done. They were held by the
+pre-publication review in `docs/reviews/2026-09-23-aps-publication-review.md`, which read
+all 46 files against the question of whether anything in them reflects badly on the
+Australian Public Service. It returned 34 PASS, 10 FIX and these 2 HOLD.
+
+**Read this before assuming a hold contains anything.** Every file in this directory is
+tracked and has been on `origin/release/0.8.1` — a public repository — since it was
+written. Withholding the import withholds *amplification*: a GitHub issue is indexed,
+notified, cross-linked and not deletable by the accounts available here. It does not
+withhold the text. For anything where the content itself is the concern, holding the
+import alone is theatre and the tracked file has to be dealt with too.
+
+| File | Why it is held | The decision needed |
+|---|---|---|
+| `sentinel-custody-projection-fails-open-when-live-source-op.md` | The one file of eight security-adjacent candidates where the reviewer could not answer "what does an attacker do differently after reading this?" with *nothing*. An unfixed control that fails open and emits an affirmative false assurance, in a product whose purpose is a trustworthy audit trail. | Does it meet this project's own bar in `../README.md` for a **private security advisory**? If yes, the remedy is the advisory *plus* redacting or removing the tracked file — not skipping the import. If the fix lands first, publish it in full and do not water it down. |
+| `release-0-8-1-pre-merge-findings-code-review-suite-state-2.md` | Not a security matter. A dated snapshot of a branch under review rather than an issue — it says of itself that "none of the numbers above are current", its per-finding evidence lives in child items outside this set, and it carries the set's most quotable process lines. No mechanical edit repairs "this file is a snapshot". | The reviewer offered publish / re-scope to the wrapper defect / drop, conditional on which wrapper misreported the exit code. **Settled since:** the source item says "the harness task notification reported exit code 0", so it is the agent harness, not `scripts/full-suite-gate.sh` — the project's own log recorded `SUITE exit=1` correctly. Agent tooling is excluded from this migration, so re-scoping is unavailable and dropping is the recommendation. The tracker row still has open children, so the close is not automatic. |
+
+Neither file was watered down and no technical claim in either was softened. The review's
+standing instruction applies to both: a project that finds its own fail-open and describes
+it this precisely is a project working correctly.
+
 Found by the technical-writing pass, not by the triage that preceded it — writing an
 issue for a reader who will actually pick it up is a stronger check on whether the
 defect still exists than reading the ticket was.

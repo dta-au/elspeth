@@ -23,7 +23,7 @@ Six contract-closure cohorts, plus a final assessment and the gates maintained a
 ## Where the detail lives
 
 - `docs/programmes/state-engine-1.0/README.md` — the programme's scope, its documents of record, and all six cohorts.
-- `docs/programmes/state-engine-1.0/tracker-rows.json` — the seven issues this one replaces, captured verbatim so nothing was lost in the consolidation.
+- `docs/programmes/state-engine-1.0/tracker-rows.json` — the seven work items this one replaces, retained so nothing was lost in the consolidation.
 
 ## Documents of record
 
@@ -33,7 +33,7 @@ Six contract-closure cohorts, plus a final assessment and the gates maintained a
 
 ## Size
 
-This is a programme, not a task, and it is not something to pick up cold. The published assessment records the verdict as not complete, with the largest gaps being lanes that have never been executed rather than known-broken code. Anyone starting here should read the architecture README first and then agree a single cohort with the maintainer; taking the whole thing on is not a realistic unit of work.
+This is a programme, not a task, and it is not something to pick up cold. The published assessment records the verdict as not complete. The largest gaps are verification profiles that have never been executed, rather than code known to be broken. Anyone starting here should read the architecture README first and then agree a single cohort with the maintainer; taking the whole thing on is not a realistic unit of work.
 
 ## Note
 

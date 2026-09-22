@@ -86,5 +86,5 @@ bricking but does not give the operator a way to retire the row.
 ## Size
 
 The narrow projection change is small and self-contained — a good first issue. The abandon
-path is a design decision first and should not be started until the maintainer has ruled on
-authorisation. Neither has been built.
+path is a design decision first and should not be started until the authorisation question
+above has been decided. Neither has been built.

@@ -17,7 +17,7 @@ The Playwright configuration that runs the browser tests against a deployed stag
 
 ## Impact
 
-This harness runs against a deployed environment with a real account. The bearer token sits on the runner's disk at default permissions for the life of the run and afterwards, and the set of tests that touch a shared deployment changes whenever anyone adds a spec file — without that being a decision anyone made.
+This harness runs against a deployed environment with a real account. It is invoked manually (`npm run test:e2e:staging`) and is not wired into any CI workflow, so the token is written to the disk of whichever machine runs it — at default permissions, for the life of the run and afterwards. The set of tests that touch a shared deployment changes whenever anyone adds a spec file, without that being a decision anyone made.
 
 ## Fix
 

@@ -97,7 +97,7 @@ any source-level repair.
 
 ## Note
 
-The source for this ticket records a work programme rather than a diagnosed mechanism. The
+This issue records a work programme rather than a diagnosed mechanism. The
 authentication-admission half is named in the title but nowhere characterised: no symptom, no
-mechanism, no location. Someone with the original context should supply that or drop it from
-the title.
+mechanism, no location. It should be characterised — symptom, mechanism and location — or
+removed from the title before anyone picks this up.

@@ -21,7 +21,7 @@ That silence is deliberate and documented in the helpers: a half-written node wh
 
 ## Impact
 
-The Composer is one of two authoring surfaces, and its premise is that validation happens while you author rather than after you run. A green result that cannot distinguish "your configuration is fine" from "your configuration cannot build and I could not tell" weakens that premise, and the author sees no difference until a run fails.
+The Composer is one of two authoring surfaces, and its premise is that validation happens while you author rather than after you run. A green result that cannot distinguish "this configuration is fine" from "this configuration cannot build and the check could not tell" weakens that premise, and the author sees no difference until a run fails.
 
 ## Fix
 

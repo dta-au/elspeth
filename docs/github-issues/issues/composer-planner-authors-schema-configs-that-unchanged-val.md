@@ -72,7 +72,7 @@ into this shape.
 
 There is no baseline to compare against. The deployment ran the 0.8.0 build from
 2 September 2026 until 14 September 2026, and the roll to 0.8.1 recreated its session
-store, destroying every earlier session. That 0.8.0's planner would have authored
+store, so no session from the earlier build survives for comparison. That 0.8.0's planner would have authored
 `{"mode": "observed"}` for the same prompt and passed is inference, not proof.
 
 ## Fix

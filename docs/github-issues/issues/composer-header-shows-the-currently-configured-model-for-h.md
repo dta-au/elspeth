@@ -10,11 +10,12 @@ session being viewed. Anyone reviewing a historical session is shown the wrong p
 ## What happens
 
 Measured on a staging deployment on 2026-09-13. One session composed on 2026-09-07 records
-its authoring model in its interpretation events:
+its authoring model in its interpretation events — three fields, all stamped at composition
+time:
 
-    model_identifier: openrouter/anthropic/claude-sonnet-5
-    model_version:    anthropic/claude-sonnet-5
-    provider:         openrouter
+    model_identifier: <provider>/<vendor>/<model-A>
+    model_version:    <vendor>/<model-A>
+    provider:         <provider>
 
 After `ELSPETH_WEB__COMPOSER_MODEL` was changed to a different model and the service
 restarted, that same unmodified session's header rendered the new model's display name. The

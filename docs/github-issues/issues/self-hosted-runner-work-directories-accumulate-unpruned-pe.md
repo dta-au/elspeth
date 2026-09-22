@@ -36,11 +36,11 @@ The per-run path was introduced deliberately, to stop stale shared workspaces br
 
 Per-directory sizes observed: static analysis and the two test jobs about 1.1–1.2 GB each, e2e-frontend 1.4–1.5 GB, judge-quality 649 MB, override-rate 542 MB, frontend-unit 514 MB. Each is a full repository tree plus its Python virtual environment and its copy of the uv download cache.
 
-Rate: the six `ci.yaml` jobs take a checkout on every run, so a single CI run leaves roughly 6 GB spread across the pool. The two judge-gate jobs run on their own triggers — `override-rate` on configured pull requests and pushes, `judge-quality` on trusted pushes only — so they add to the total without being part of every CI run, which is why their directories appear in the table. There were 28 runs on 5 September alone. The filesystem at the time of measurement: 1.7 TB total, 1.2 TB used, 463 GB available, 72% full. At the observed run rate the remaining headroom is weeks rather than months.
+Rate: the six `ci.yaml` jobs take a checkout on every run, so a single CI run leaves roughly 6 GB spread across the pool. The two judge-gate jobs run on their own triggers — `override-rate` on configured pull requests and pushes, `judge-quality` on trusted pushes only — so they add to the total without being part of every CI run, which is why their directories appear in the table. There were 28 runs on 5 September alone. At the observed run rate the accumulation is bounded only by the runners' available disk, so the growth ends in a full filesystem rather than a steady state.
 
 ## Impact beyond disk
 
-The same machines run the project's local test suites. Disk pressure and cache eviction on a host measured at load 41 during concurrent CI may be upstream of some of the intermittent CI timing failures seen on this project. That link is **not** claimed as measured — it is a reason to fix this rather than defer it.
+These runners are shared with the project's other test workloads, so disk pressure and cache eviction affect more than CI. Whether that contributes to the intermittent CI timing failures seen on this project is **not** claimed as measured — it is a reason to fix this rather than defer it.
 
 ## Fix
 

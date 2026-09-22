@@ -9,7 +9,7 @@ cannot claim it.
 
 ## What is needed
 
-An Azure development environment, the subscription and enclave access required to reach it,
+An Azure development environment, the subscription and network access required to reach it,
 and testing against live model providers rather than local substitutes — enough to exercise
 deployment acceptance end to end.
 
