@@ -56,7 +56,7 @@ class RoutingKind(StrEnum):
 class RoutingMode(StrEnum):
     MOVE = "move"      # Token exits current path, goes to destination only
     COPY = "copy"      # Token clones to destination AND continues (fork only)
-    DIVERT = "divert"  # Source quarantine or transform/config-gate on_error (structural)
+    DIVERT = "divert"  # Source quarantine or transform/config-gate/aggregation on_error (structural)
 ```
 
 ### RoutingAction
@@ -653,17 +653,19 @@ Aggregation collects multiple tokens until a trigger fires, then processes them 
 
 ```yaml
 aggregations:
-  - node_id: batch_stats
+  - name: amount_stats
+    plugin: batch_stats             # Must be a batch-aware transform (is_batch_aware = True)
+    input: amounts                  # Connection the aggregation consumes
+    on_success: stats_out           # Sink or connection for the batch output
+    on_error: quarantine            # Required: sink for a FAILED batch's rows, or "discard"
     trigger:
       count: 100                    # Fire after 100 rows
       timeout_seconds: 3600         # Or after 1 hour
     output_mode: transform          # N inputs → M outputs (default)
     expected_output_count: 1        # Optional cardinality validation
-
-transforms:
-  - plugin: summary_transform
-    node_id: batch_stats            # Must match aggregation node_id
-    # Transform must have is_batch_aware = True
+    options:
+      schema: {mode: observed}
+      value_field: amount
 ```
 
 ### Output Modes
@@ -708,6 +710,10 @@ AggregationExecutor.accept(token, node_id)
         ├── Batch state: draft → executing
         ├── Retrieve buffered rows as list[dict]
         ├── Call transform.process(rows, ctx)
+        ├── Returned error → the WHOLE batch fails (see Aggregation Invariants 2):
+        │   one transform_errors row per member, one DIVERT routing_event for a
+        │   named on_error sink, batch executing → failed, and every member goes
+        │   to on_error (below). Nothing else in this diagram runs.
         ├── Batch state: executing → completed
         │
         ├── transform mode:
@@ -740,7 +746,7 @@ rows.
 ### Aggregation Invariants
 
 1. **Engine owns the buffer** — Transforms never manage batch state. This enables crash recovery, consistent trigger evaluation, and clean audit trail.
-2. **Atomic batch execution** — If the transform returns `error`, ALL buffered rows fail together.
+2. **Atomic batch execution** — If the transform returns `error`, ALL buffered rows fail together, and every one of them follows the aggregation's `on_error` (elspeth-d2e3f29d10). A named sink receives each buffered row with its ORIGINAL values as `(failure, on_error_routed)` — all members hand off BLOCKED → PENDING_SINK in one `complete_barrier`, and the sink records each terminal after durability. `discard` records each member `(failure, quarantined_at_source)`, the per-row discard pair, inside that same transaction. Either way each member gets a `transform_errors` row carrying the batch reason, which names the row index, field and expected/found type, never a row value. A transform that RAISES still aborts the run.
 3. **Cardinality validation** — If `expected_output_count` is set and the transform returns a different count, the batch fails.
 4. **Passthrough preserves token identity** — In `passthrough` mode, the same `token_id` values continue after enrichment.
 5. **Transform mode creates new lineage** — New tokens are created via `expand_token()` with parent linkage.
@@ -751,8 +757,10 @@ rows.
 |--------|----------|
 | `batches` | `batch_id`, `trigger_type`, `aggregation_node_id`, `status` (draft/executing/completed/failed) |
 | `batch_members` | Which tokens belong to which batch (ordinal position) |
-| `node_states` | Transform input/output hashes for the batch call |
-| `token_outcomes` | Input tokens: `CONSUMED_IN_BATCH` or `BUFFERED`. Output tokens: determined by downstream journey. |
+| `node_states` | Transform input/output hashes for the batch call; a failed flush stores the scrubbed batch reason in `error_json` |
+| `token_outcomes` | Input tokens: `CONSUMED_IN_BATCH` or `BUFFERED`. Output tokens: determined by downstream journey. Failed batch: every input token `(failure, on_error_routed, <sink>)` or `(failure, quarantined_at_source)`. |
+| `routing_events` | Failed batch with a named `on_error` sink: ONE DIVERT event on the flush node_state along `__error_<name>__` |
+| `transform_errors` | Failed batch: one row per input token, destination = `on_error` |
 
 ---
 

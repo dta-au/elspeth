@@ -1867,7 +1867,7 @@ aggregations:
     plugin: batch_stats
     input: enriched
     on_success: output
-    on_error: discard           # Sink name for batch errors, or 'discard'
+    on_error: discard           # Sink for every row of a failed batch, or 'discard'
     trigger:
       count: 100              # Fire after 100 rows
       timeout_seconds: 3600   # Or after 1 hour
@@ -1887,8 +1887,8 @@ aggregations:
 | `plugin` | string | **Yes** | Aggregation plugin name |
 | `input` | string | **Yes** | Connection name to receive data from |
 | `on_success` | string | No | Where successful output rows go (sink name or connection name) |
-| `on_error` | string | **Yes** | Sink name for rows that fail batch processing, or `discard` |
-| `trigger` | object | **Yes** | When to flush the batch |
+| `on_error` | string | **Yes** | Where the rows of a FAILED batch go. A batch fails as a whole: when the batch transform returns an error, EVERY buffered row is written to this sink with its original values (each recorded `on_error_routed` with the batch reason), or with `discard` each row is recorded quarantined without being written. A batch transform that raises still aborts the run. |
+| `trigger` | object | No | When to flush the batch early; omit for end-of-source only |
 | `output_mode` | string | No | `passthrough` or `transform` (default: `transform`) |
 | `expected_output_count` | int | No | For `transform` mode: validate output row count |
 | `options` | object | No | Plugin-specific configuration |
@@ -1918,7 +1918,9 @@ Omit `trigger` to emit a single report covering all source rows at end-of-source
 
 ### Trigger Configuration
 
-At least one trigger type is required:
+Every trigger type is optional. Configure any combination for early flushes, or
+omit `trigger` (or use `{}`) to flush only at end of source, which is always
+checked:
 
 | Trigger | Type | Description |
 |---------|------|-------------|
