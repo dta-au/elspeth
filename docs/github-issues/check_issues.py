@@ -53,7 +53,16 @@ BLOCK: list[tuple[str, re.Pattern[str]]] = [
             r")\b"
         ),
     ),
-    ("user home path", re.compile(r"/(?:home|Users)/[A-Za-z_][\w-]*")),
+    # Two forms, both real. The ordinary absolute path `/home/<name>`, and the
+    # HYPHENATED form Claude Code uses for session scratchpad directories
+    # (`/tmp/claude-1000/-home-john-elspeth/...`), which encodes the same home
+    # directory with slashes replaced by hyphens. The second form passed this gate
+    # until 2026-09-23; those paths appear throughout the working notes this issue
+    # set was written from, so it was a live leak vector, not a theoretical one.
+    (
+        "user home path",
+        re.compile(r"(?:/(?:home|Users)/[A-Za-z_][\w-]*|(?:^|[/\s])-(?:home|Users)-[A-Za-z_][\w-]*)"),
+    ),
     (
         "credential-shaped assignment",
         re.compile(r"\b(?:api[_-]?key|password|passwd|secret|bearer|access[_-]?token)\s*[=:]\s*[\"']?[\w./+-]{6,}", re.I),
