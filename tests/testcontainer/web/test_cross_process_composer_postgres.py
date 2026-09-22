@@ -463,11 +463,20 @@ def test_peer_rechecks_revocation_and_teardown_still_removes_exact_token(
         assert _read(observer).inflight_requests == 1
         with engine.begin() as conn:
             conn.execute(update(identities_table).where(identities_table.c.identity_id == user_id).values(access_state="disabled"))
-        assert _command(observer, "read") == "PermissionError"
-        assert _command(observer, "active") == "PermissionError"
-        assert _command(observer, "begin") == "PermissionError"
-        assert _command(owner, "heartbeat") == "PermissionError"
-        assert _command(owner, "publish", ComposerProgressEvent(phase="complete", headline="After revocation")) == "PermissionError"
+        # The precise class, not the `PermissionError` base: only the identity
+        # was disabled, and `_ownership_query` reads `sessions` alone, so the
+        # session guard still passes on every one of these paths. Naming the
+        # subclass proves the identity check is what refused — the base class
+        # would accept a session-unavailable answer as though it were the same
+        # denial, which is exactly the conflation the typed hierarchy removes.
+        assert _command(observer, "read") == "ComposerProgressIdentityInactive"
+        assert _command(observer, "active") == "ComposerProgressIdentityInactive"
+        assert _command(observer, "begin") == "ComposerProgressIdentityInactive"
+        assert _command(owner, "heartbeat") == "ComposerProgressIdentityInactive"
+        assert (
+            _command(owner, "publish", ComposerProgressEvent(phase="complete", headline="After revocation"))
+            == "ComposerProgressIdentityInactive"
+        )
         assert _command(owner, "end") == "ended"
         with engine.connect() as conn:
             assert (
