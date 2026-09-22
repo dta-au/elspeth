@@ -250,6 +250,37 @@ def scan(path: pathlib.Path) -> tuple[list[str], list[str]]:
     return blocks, warns
 
 
+REPO_ROOT = ROOT.parent.parent
+
+# Repo-relative paths an issue points a reader at. A path that does not exist, or that
+# exists only locally and is not tracked, is a dead link in a public issue — the exact
+# failure this whole staging step exists to prevent. Four were found by hand on
+# 2026-09-23 (two stale package roots, one moved module, one untracked tfvars whose
+# `.example` is what a contributor actually clones), so the check is mechanical now.
+_PATH_RE = re.compile(r"`((?:docs|src|scripts|evals|tests|deploy|elspeth-lints|\.github)/[A-Za-z0-9_./*-]+)`")
+
+
+def check_referenced_paths(text: str, tracked: frozenset[str]) -> list[str]:
+    out: list[str] = []
+    for raw in dict.fromkeys(_PATH_RE.findall(text)):
+        path = raw.rstrip(".,);")
+        if "*" in path:  # a glob is prose, not a link
+            continue
+        target = REPO_ROOT / path
+        if not target.exists():
+            out.append(f"referenced path does not exist: {path}")
+        elif target.is_file() and path not in tracked:
+            out.append(f"referenced path is untracked (a clone will not have it): {path}")
+    return out
+
+
+def tracked_files() -> frozenset[str]:
+    import subprocess
+
+    r = subprocess.run(["git", "ls-files"], capture_output=True, text=True, cwd=REPO_ROOT)
+    return frozenset(r.stdout.splitlines()) if r.returncode == 0 else frozenset()
+
+
 def main() -> int:
     if not ISSUES.is_dir():
         print(f"no issues directory at {ISSUES}", file=sys.stderr)
@@ -259,9 +290,11 @@ def main() -> int:
         print(f"no .md files in {ISSUES}", file=sys.stderr)
         return 2
 
+    tracked = tracked_files()
     total_block = total_warn = 0
     for f in files:
         blocks, warns = scan(f)
+        warns.extend(check_referenced_paths(f.read_text(encoding="utf-8"), tracked))
         total_block += len(blocks)
         total_warn += len(warns)
         if blocks or warns:

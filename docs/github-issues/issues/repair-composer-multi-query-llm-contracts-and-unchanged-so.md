@@ -32,7 +32,7 @@ Context: the Composer is ELSPETH's web authoring interface, and a *multi-query L
 
 ## Where the work is
 
-Items 1 and 2 span the Composer's planner teaching surfaces and plugin assistance, plus the LLM config models in `src/elspeth/plugins/transforms/llm/` (`multi_query.py` holds the query and output-field models, `validation.py` the config guards). Item 3 is in the same package's output-schema construction. Item 4 is in the source mutation path and `reconcile_authoritative_reviews`; the existing fixtures that build a matching approval proof are `TestEchoedServerOwnedMetadata` in `tests/unit/web/composer/test_promote_set_pipeline.py` and `tests/unit/web/composer/test_promote_set_source_from_blob.py`.
+Items 1 and 2 span the Composer's planner teaching surfaces and plugin assistance, plus the LLM config models in `src/elspeth/plugins/transforms/llm/` (`multi_query.py` holds the query and output-field models, `validation.py` the config guards). Item 3 is in the same package's output-schema construction. Item 4 is in the source mutation path and `reconcile_authoritative_reviews`. The investigation exercised it using the `_bound_source` and `_resolved_state` helpers on `TestEchoedServerOwnedMetadata` in `tests/unit/web/composer/test_promote_set_source_from_blob.py`; that class exists to test echo-tolerant reserved-key gates rather than approvals, but its helpers build a source bound to a stored artefact proof, which is the state this item needs.
 
 ## Size and limits
 

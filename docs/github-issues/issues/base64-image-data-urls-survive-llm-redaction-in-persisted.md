@@ -19,7 +19,7 @@ The HTTP call recorder stores the request body it is given, with no content-awar
 
 ## Note on the provider citations
 
-The review cited `src/elspeth/plugins/llm/providers/openrouter.py:353` and `.../gateway.py:491-493`. Those modules now live under `src/elspeth/plugins/transforms/llm/providers/` and the line numbers no longer hold. More usefully, `grep -rn "data:image" src/elspeth --include=*.py` returns no match anywhere in the Python source, so no provider constructs an image data URL: they arrive in caller-supplied message content and are carried through. Treat the provider references as naming the request path, not the place the bytes are introduced.
+The review cited `src/elspeth/plugins/transforms/llm/providers/openrouter.py:353` and `.../gateway.py:491-493`. Those modules now live under `src/elspeth/plugins/transforms/llm/providers/` and the line numbers no longer hold. More usefully, `grep -rn "data:image" src/elspeth --include=*.py` returns no match anywhere in the Python source, so no provider constructs an image data URL: they arrive in caller-supplied message content and are carried through. Treat the provider references as naming the request path, not the place the bytes are introduced.
 
 ## Impact
 

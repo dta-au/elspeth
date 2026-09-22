@@ -12,7 +12,7 @@ Tracking issue for the identity and workflow governance programme: who can sign 
 - `README.md` — the scope, the documents of record, and all sixteen steps with their acceptance notes.
 - `tracker-rows.json` — the original work items, kept verbatim.
 
-Both files were written against a retired internal tracker and still refer to its identifiers. Those references no longer resolve anywhere; read them as labels, not as links.
+Both files carry identifiers from the tracker this project previously used. They are retained deliberately, to tie each closed row to the content that replaced it, and the folder README explains them. They are not links to follow.
 
 ## Scope
 

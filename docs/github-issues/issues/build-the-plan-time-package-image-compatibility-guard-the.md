@@ -59,7 +59,7 @@ Two traps the design must avoid:
 - **Pin the amd64 child manifest digest, never the multi-arch index.** An image published for
   several CPU architectures has one index digest pointing at one child manifest per
   architecture, so pinning the index does not identify the bytes that actually run.
-  `deploy/aws-ecs/terraform/examples/scenario-a.tfvars` already pins the child and says why.
+  `deploy/aws-ecs/terraform/examples/scenario-a.tfvars.example` already pins the child and says why.
 - **`candidate_sha` is a git commit SHA while `candidate_image` is a registry digest
   reference.** These two variables have been conflated before.
 

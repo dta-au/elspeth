@@ -37,6 +37,6 @@ Sources such as Dataverse, S3, Azure Blob and the blob-backed readers can carry 
 
 Once settled, the work is in two parts: a source-side trust contract so a source can declare that the rows it emits are externally controlled, and propagation through graph reachability so that declaration reaches every downstream consumer.
 
-Done looks like: a pipeline whose source declares untrusted content and which feeds a model with no shield in between is refused at graph build, with the same diagnostic a `web_scrape`-fed pipeline in the same shape produces today — and a test that mutates the declaration to trusted and confirms the refusal disappears.
+Done looks like: a pipeline whose source declares untrusted content and feeds a model with no shield in between reaches the same outcome that the equivalent `web_scrape`-fed pipeline reaches today, whatever that outcome turns out to be — the point is that the source case stops being invisible, not that a particular mechanism fires. Pair it with a test that flips the declaration back to trusted and confirms the difference disappears, so the propagation itself is what is being measured.
 
 This was deferred rather than folded into the earlier change that closed the transform side, because it needs the contract design and taint semantics above rather than a small edit.
