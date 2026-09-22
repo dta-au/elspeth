@@ -689,5 +689,13 @@ def test_coalesce_on_error_rejection_names_the_supported_alternatives() -> None:
     assert message is not None
     assert "Coalesce 'merge_ab' has no on_error route" in message
     assert "on_error of each branch transform" in message
+    # The consequence is stated as the engine applies it (``decide_coalesce``
+    # LOSS row): a lost branch fails the whole ``require_all`` group and the
+    # arrived branches are recorded failed with it — not a benign drop.
+    assert "the whole merge group then fails" in message
+    assert "recorded as failed too" in message
     assert "'best_effort'" in message
+    # ``'first'`` merges on the first arrival; it is not a sibling of
+    # ``'best_effort'`` and ``'quorum'`` and is described on its own.
+    assert "'first' merges on the first arrival" in message
     assert "ask the user" in message

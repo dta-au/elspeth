@@ -59,16 +59,22 @@ the same commit; the rules live there, the history lives here.
   worktrees and concurrent agent sessions.
   See [CONTRIBUTING: Convention: repository and process hygiene](../../CONTRIBUTING.md#convention-repository-and-process-hygiene).
 
-- **2026-09-22 — a turn blocked by the END advisor gate publishes the composer's reply; the `advisor_terminal_block` withheld row and the withheld disclosure are gone** (elspeth-032ec69c41 ruling; f776a8a8d, 21dd1bd64, 1658d77de)
+- **2026-09-22 — a turn blocked by the END advisor gate publishes the composer's reply; the `advisor_terminal_block` withheld row is gone, the `advisor_signoff_withheld` disclosure row is written on EVERY block** (elspeth-032ec69c41 ruling; f776a8a8d, 21dd1bd64, 1658d77de + the review fix pass)
   `_advisor_blocked_result` no longer takes `advisor_repair_context_introduced`: the notice composers select their
   `_PUBLISHED_` twins and `assistant_message=None` is empty prose under the same notice. Dead with the withholding and
-  removed in the same commit: the `advisor_terminal_block` `WithheldReplyOrigin`, the `advisor_signoff_withheld`
-  control-message origin (a historical row of that origin fails replay closed like any unregistered origin), and the
-  flag's forwarding parameter through `_classify_and_budget_turn`, `_try_terminate_no_tools` and the gate. Case 5
-  (`_replace_advisor_repair_public_result`, the CLEAN-after-repair replacement) still withholds and still reads
-  `advisor_repair_context_introduced` in `_compose_loop`; do not "align" it. The repair-continue clauses now name the
-  published exit ("make no change: tell the user what blocks you … That reply ends the turn and is shown to the user")
-  and the coalesce `on_error` rejection teaches the per-branch-sink and `best_effort`/`quorum`/`first` alternatives.
+  removed in the same commit: the `advisor_terminal_block` `WithheldReplyOrigin` and the flag's forwarding parameter
+  through `_classify_and_budget_turn`, `_try_terminate_no_tools` and the gate. NOT dead: the user-role
+  `advisor_signoff_withheld` control row (`_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE`) — its job changed from standing in
+  for withheld prose to asserting, in the backend's voice, that completion was withheld whatever the published prose
+  claims, so the gate now writes it unconditionally (both cohorts) ahead of the publication row. Measured limit: the
+  control envelope's hash binds content only, so swapping one registered user-role origin for another replays cleanly.
+  Nine `prose_withheld=True` composer arms in `no_tool_policy.py` now have no producer (only case 5 withholds); they
+  are kept pending an operator ruling, not by design. Case 5 (`_replace_advisor_repair_public_result`, the
+  CLEAN-after-repair replacement) still withholds and still reads `advisor_repair_context_introduced` in
+  `_compose_loop`; do not "align" it — and because of it the repair-continue clauses name the exit ("make no change:
+  tell the user what blocks you … That reply ends the turn.") without promising the user sees the reply. The coalesce
+  `on_error` rejection states the measured `require_all` consequence (the whole group fails, arrived branches recorded
+  failed) and describes `best_effort`, `quorum` and `first` separately.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
 - **2026-09-01 — secret wiring is deny-by-default at three seams, and collectors use the transform policy vocabulary** (elspeth-f3c1aafd25; 9da1b39b8, c163b6366)

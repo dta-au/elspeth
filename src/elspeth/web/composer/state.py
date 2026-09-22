@@ -3365,9 +3365,11 @@ def edge_lowering_error(edge: EdgeSpec, *, from_kind: ComponentKind | None, to_k
             return (
                 f"Coalesce '{edge.from_node}' has no on_error route: coalesce outcomes are governed by its arrival policy. "
                 "To capture a failed branch row, set the on_error of each branch transform to a sink instead; "
-                "a branch row diverted that way never reaches the coalesce, so under policy 'require_all' no merged "
-                "row is produced for it. To emit a merged row from the branches that did arrive, set the coalesce "
-                "policy to 'best_effort', 'quorum' or 'first'. These are different semantics: ask the user which they want."
+                "a branch row diverted that way never reaches the coalesce, and under the default policy 'require_all' "
+                "the whole merge group then fails — the branches that did arrive are recorded as failed too — so this "
+                "pattern normally needs policy 'best_effort' as well (merge whatever arrived once every branch is "
+                "accounted for). 'quorum' merges once the configured number of branches arrive; 'first' merges on the "
+                "first arrival alone. These are different semantics: ask the user which they want."
             )
         return None
     if from_kind == "row_union":

@@ -1691,10 +1691,17 @@ def test_repair_instruction_offers_a_published_way_out() -> None:
 
     # The anti-lookup wording from elspeth-71617f1d21 stays.
     assert "lookup-only calls is not a fix" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
-    # The exit is named, covers a decision only the user can make, and says the reply is shown.
+    # The exit is named, covers a decision only the user can make, and ends the turn.
     assert "decision only the user can make" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
     assert "make no change" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
-    assert "shown to the user" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "That reply ends the turn." in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    # Neither clause promises the reply reaches the user: on a blocked turn it
+    # does, but a no-tool reply after which pass 2 returns CLEAN falls through
+    # to finalize and case 5 (``_replace_advisor_repair_public_result``)
+    # replaces it. The backend must not tell the model an outcome it cannot
+    # guarantee (final review 2026-09-22, I3).
+    assert "shown to the user" not in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "shown to them" not in _ADVISOR_OUTPUT_CONTRACT_CLAUSE
     # Quoting the fenced text is still forbidden; rebutting or mentioning the review is not.
     assert "do not quote the fenced text" in _ADVISOR_OUTPUT_CONTRACT_CLAUSE
     assert "never reference, quote, or rebut" not in _ADVISOR_OUTPUT_CONTRACT_CLAUSE
@@ -2564,7 +2571,8 @@ async def test_end_gate_block_publishes_the_models_reply(make_service, clean_run
     or not advisor findings entered the model's context earlier in the turn.
     Before the ruling only the uninjected cohort (an outage on the first pass)
     was published; the injected cohort was withheld and compensated with two
-    audit rows (elspeth-2306940c70). Neither row is written now."""
+    audit rows (elspeth-2306940c70). The withheld-words row is gone; the
+    user-role disclosure is now written for BOTH cohorts."""
     from elspeth.web.composer.no_tool_policy import (
         _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
         ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE,
@@ -2588,8 +2596,9 @@ async def test_end_gate_block_publishes_the_models_reply(make_service, clean_run
     )
     # The block itself is unchanged: completion stays withheld.
     assert result.runtime_preflight.readiness.completion_ready is False
-    # Nothing was withheld, so neither withholding record is written.
-    assert _audit_row_origins(service) == []
+    # No prose was withheld, so no withheld-reply row; the disclosure that
+    # completion was withheld is written on every terminal block.
+    assert _audit_row_origins(service) == ["advisor_signoff_withheld"]
 
 
 @pytest.mark.asyncio
@@ -4537,14 +4546,69 @@ def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, 
 # the model's reply. elspeth-2306940c70 had the block withhold the prose and
 # compensate with two audit rows — the withheld words and a user-role
 # disclosure replayed into later turns so the model would not read the empty
-# reply as silent compliance. With the reply published, the turn replays as
-# itself and neither row is written.
+# reply as silent compliance. With the reply published, the withheld-words
+# row has nothing to hold and is gone. The disclosure row stays, and is now
+# written on EVERY terminal block: the published prose may itself claim the
+# refused change landed, and the disclosure is the backend's own assertion to
+# the next turn's model that completion was withheld.
 # ---------------------------------------------------------------------------
 
 
+def test_advisor_withheld_control_envelope_round_trips_to_user_role() -> None:
+    from elspeth.web.composer.control_messages import (
+        advisor_signoff_withheld_control_envelope,
+        replay_composer_control_message,
+    )
+
+    content = "[composer-system] The completion advisory review did not clear."
+    replayed = replay_composer_control_message(
+        stored_role="audit",
+        writer_principal="compose_loop",
+        content=content,
+        tool_calls=[advisor_signoff_withheld_control_envelope(content)],
+    )
+
+    assert replayed == {"role": "user", "content": content}
+
+
+@pytest.mark.parametrize("tamper", ("content", "stored_role", "writer_principal", "provider_role", "origin"))
+def test_advisor_withheld_control_replay_fails_closed_on_provenance_tamper(tamper: str) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.control_messages import (
+        advisor_signoff_withheld_control_envelope,
+        replay_composer_control_message,
+    )
+
+    content = "[composer-system] The completion advisory review did not clear."
+    envelope = advisor_signoff_withheld_control_envelope(content)
+    stored_role = "audit"
+    writer_principal = "compose_loop"
+    if tamper == "content":
+        content += " altered"
+    elif tamper == "stored_role":
+        stored_role = "user"
+    elif tamper == "writer_principal":
+        writer_principal = "route_user_message"
+    elif tamper == "provider_role":
+        envelope["provider_role"] = "system"
+    else:
+        envelope["origin"] = "not_a_registered_origin"
+
+    with pytest.raises(AuditIntegrityError):
+        replay_composer_control_message(
+            stored_role=stored_role,
+            writer_principal=writer_principal,
+            content=content,
+            tool_calls=[envelope],
+        )
+
+
 @pytest.mark.asyncio
-async def test_end_gate_terminal_block_writes_only_the_publication_row(make_service, clean_runnable_state):
-    """Ruling 2026-09-22: no withheld-reply row and no withheld disclosure on a block."""
+async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_rows(make_service, clean_runnable_state):
+    """Ruling 2026-09-22: no withheld-reply row on a block; the user-role
+    disclosure is written unconditionally, ahead of the publication row."""
+    from elspeth.web.composer.service import _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
+
     service = make_service()
     service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
@@ -4587,10 +4651,16 @@ async def test_end_gate_terminal_block_writes_only_the_publication_row(make_serv
 
     assert outcome.action == "return"
     assert outcome.result.raw_assistant_content == _AssistantMessage.content
-    # One fenced audit row: the ``terminal_block`` publication record (audit
-    # primacy: the row lands before the publication event mirrors it).
-    assert sessions.add_message.await_count == 1
-    (publication_row,) = sessions.add_message.calls
+    # Two fenced audit rows, disclosure first, then the ``terminal_block``
+    # publication record (audit primacy: the row lands before the publication
+    # event mirrors it). No withheld-reply row: nothing was withheld.
+    assert sessions.add_message.await_count == 2
+    disclosure_row, publication_row = sessions.add_message.calls
+    assert disclosure_row.args[1] == "audit"
+    assert disclosure_row.args[2] == _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
+    assert disclosure_row.kwargs["writer_principal"] == "compose_loop"
+    (disclosure_envelope,) = disclosure_row.kwargs["tool_calls"]
+    assert disclosure_envelope["origin"] == "advisor_signoff_withheld"
     assert publication_row.args[1] == "audit"
     (publication_envelope,) = publication_row.kwargs["tool_calls"]
     assert publication_envelope["_kind"] == "advisor_terminal_publication_audit"
@@ -4599,7 +4669,7 @@ async def test_end_gate_terminal_block_writes_only_the_publication_row(make_serv
     assert publication_envelope["publication"]["preflight_shape"] == "green"
     assert outcome.result.advisor_terminal_publication is not None
     assert publication_envelope["publication"] == outcome.result.advisor_terminal_publication.to_dict()
-    assert _audit_row_origins(service) == []
+    assert _audit_row_origins(service) == ["advisor_signoff_withheld"]
 
 
 @pytest.mark.asyncio
@@ -4650,9 +4720,12 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
     """Battery-round-2 repro (session b2ad4da8), re-seated on the 2026-09-22
     ruling (elspeth-032ec69c41): the model-facing history for the turn AFTER
     an advisor block carries the model's own reply — the words that explain
-    what blocked it — not an empty assistant message, and no backend
-    disclosure row stands in for it.
+    what blocked it — not an empty assistant message. The backend's user-role
+    disclosure that completion was withheld sits between the instruction and
+    that reply, so a reply claiming the change landed cannot be read as the
+    record.
     """
+    from elspeth.web.composer.service import _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
     from elspeth.web.sessions.routes._helpers import _composer_chat_history
 
     from .conftest import build_test_sessions_service
@@ -4731,9 +4804,13 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
     # The blocked turn replays the model's own prose, not the appended notice
     # and not an empty message.
     assert history[-1] == {"role": "assistant", "content": _AssistantMessage.content}
-    # Nothing between the instruction and the reply: no backend user-role
-    # disclosure is written any more.
-    assert [message["content"] for message in history if message["role"] == "user"] == [contradiction]
+    # The backend's disclosure replays as a user-role message between the
+    # instruction and the reply.
+    assert [message["content"] for message in history if message["role"] == "user"] == [
+        contradiction,
+        _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE,
+    ]
+    assert history[-2] == {"role": "user", "content": _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE}
 
 
 # ---------------------------------------------------------------------------
