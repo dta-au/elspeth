@@ -1191,6 +1191,7 @@ def _staged_handoff_preflight() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="rate_node",
                     component_type="transform",
@@ -1225,6 +1226,7 @@ def _masked_structural_failure() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code="graph_structure",
                     component_id="rate_node",
                     component_type="transform",

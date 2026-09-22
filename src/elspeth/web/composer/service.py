@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -1038,6 +1039,7 @@ def _proof_repair_exhausted_validation(
                 ValidationReadinessBlocker(
                     code=_PROOF_REPAIR_EXHAUSTED_CODE,
                     suggestion=None,
+                    note=None,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -1124,6 +1126,7 @@ def _orphaned_interpretation_review_validation(
                 ValidationReadinessBlocker(
                     code=_INTERPRETATION_REVIEW_ORPHANED_CODE,
                     suggestion=None,
+                    note=None,
                     component_id=component_id,
                     component_type=_component_type_for_kind(kind),
                     detail=detail,
@@ -8482,7 +8485,11 @@ class ComposerServiceImpl:
                 "withheld entry as absent. "
                 "CLEAN means only that no blocking defect is visible in the supplied advisory evidence; "
                 "it is not certification of withheld, omitted, or truncated constraints. "
-                "Start your reply with CLEAN or FLAGGED."
+                "Start your reply with CLEAN or FLAGGED. After a FLAGGED verdict, end with two "
+                "lines: 'CATEGORY: <request_not_met|error_handling|prompt_defect|schema_mismatch|other>' "
+                "and 'STEPS: <comma-separated step ids from the pipeline excerpt, or none>'. "
+                "Your FLAGGED prose is shown to the user as your note: write it for them, "
+                "name the step and the option, and do not quote user text or row data."
             ),
             "recent_errors": recent_errors,
             "attempted_actions": attempted_actions,
@@ -8590,6 +8597,14 @@ class ComposerServiceImpl:
         # decision, and a literal at each call would hide that.
         prose_withheld = False
         raw_content = (assistant_message.content or "") if assistant_message is not None else ""
+        # elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): computed
+        # once for every shape below. The step ids are checked against THIS
+        # state — an id the advisor invented, or an injection wearing an id's
+        # clothes, never reaches the header. A backend-authored pre-scan
+        # finding already rides ``detail`` in its own fixed wording and is not
+        # a reviewer's note, so it carries none.
+        step_ids = _validated_advisor_step_ids(state, verdict.affected_step_ids)
+        note = None if verdict.findings_backend_authored else verdict.note
         validated_base = runtime_preflight if runtime_preflight is not None and runtime_preflight.is_valid else None
         if validated_base is not None:
             runtime_result = _advisor_signoff_pending_validation(
@@ -8597,6 +8612,9 @@ class ComposerServiceImpl:
                 reason=reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
+                category=verdict.category,
+                step_ids=step_ids,
+                note=note,
             )
             # Same verdict-class split as the red arm below: did-not-clear is
             # true only for a rendered FLAG; an unrendered verdict names its
@@ -8630,6 +8648,9 @@ class ComposerServiceImpl:
                 reason=reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
+                category=verdict.category,
+                step_ids=step_ids,
+                note=note,
             )
             if verdict.ok:
                 augmented = _compose_advisor_signoff_unverified_message(raw_content, prose_withheld=prose_withheld)
@@ -8644,6 +8665,9 @@ class ComposerServiceImpl:
                 reason=reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
+                category=verdict.category,
+                step_ids=step_ids,
+                note=note,
             )
             # elspeth-b61894d93d: the chat copy is composed from the turn's
             # ACTUAL red preflight, never from the synthesized
@@ -9735,6 +9759,18 @@ class AdvisorCheckpointVerdict:
     # applied inline by ``_run_advisor_checkpoint``'s exception handling and
     # read by ``_evaluate_terminal_no_tool_advisor_gate``.
     failure_class: Literal["none", "unavailable", "malformed"] = "none"
+    # elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): populated on
+    # the FLAGGED arm of ``_parse_advisor_checkpoint_guidance`` only. The
+    # category is already normalised to ``ADVISOR_FINDING_CATEGORIES``; the
+    # step ids are RAW, as the advisor wrote them, and are checked against
+    # the pipeline state by the blocker builder, not here; the note is the
+    # advisor's own prose after the verdict token, bounded and sanitised by
+    # ``_advisor_note_text`` — the one place the advisor's words are prepared
+    # for a user surface. ``None`` for CLEAN, for ``ok=False`` (the
+    # "findings" there are fixed backend copy) and for an empty body.
+    category: str = "other"
+    affected_step_ids: tuple[str, ...] = ()
+    note: str | None = None
 
 
 def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdict:
@@ -9798,7 +9834,24 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
             # FLAGGED, and the scan is unbounded in this direction only —
             # blocking is the safe direction. The second arm is the widened
             # any-register FLAGGED (terminator-guarded; see its definition).
-            return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=text)
+            # The machine lines are read from the whole reply: an absent or
+            # unrecognised CATEGORY is "other", an absent STEPS line or the
+            # literal "none" is no step ids.
+            category_match = _ADVISOR_CATEGORY_LINE_RE.search(text)
+            category = category_match.group(1).lower() if category_match else "other"
+            if category not in ADVISOR_FINDING_CATEGORIES:
+                category = "other"
+            steps_match = _ADVISOR_STEPS_LINE_RE.search(text)
+            raw_steps = steps_match.group(1) if steps_match else ""
+            affected = tuple(step for step in _ADVISOR_STEP_ID_RE.findall(raw_steps) if step.lower() != "none")
+            return AdvisorCheckpointVerdict(
+                ok=True,
+                blocking=True,
+                findings_text=text,
+                category=category,
+                affected_step_ids=affected,
+                note=_advisor_note_text(text),
+            )
         # CLEAN acceptance reads its own scanned copy, in which a code span
         # holding lowercase text keeps its backticks (quoted data, e.g. a field
         # named ``clean``); FLAGGED dominance above keeps the full strip.
@@ -10750,7 +10803,64 @@ _ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable af
 _ADVISOR_MALFORMED_USER_DETAIL: Final[str] = "advisor response was malformed"
 
 
-def _advisor_signoff_blocked_validation(*, reason: str, findings: str, findings_backend_authored: bool = False) -> ValidationResult:
+# elspeth-032ec69c41 (ruling 2026-09-22): one fixed backend sentence per closed
+# advisor category. The advisor picks the category from a closed vocabulary; the
+# SENTENCE is ours, so no provider text reaches the header even when the
+# category is attacker-influenced. An unrecognised category was already
+# normalised to "other" by the parser.
+_ADVISOR_CATEGORY_HEADERS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "request_not_met": "The reviewer found the request not fully met.",
+        "error_handling": "The reviewer flagged how failures are handled.",
+        "prompt_defect": "The reviewer flagged a prompt.",
+        "schema_mismatch": "The reviewer flagged a field or schema mismatch.",
+        "other": "The reviewer flagged this pipeline.",
+    }
+)
+
+
+def _validated_advisor_step_ids(state: CompositionState, raw: Sequence[str]) -> tuple[str, ...]:
+    """Keep only ids the state actually has, in the advisor's order, de-duplicated.
+
+    The advisor's ``STEPS:`` line is provider text: this is what makes the
+    header safe to render. ``state.sources`` is a mapping keyed by source name,
+    so its keys are the ids; nodes carry ``id`` and outputs carry ``name``.
+    """
+    known = set(state.sources) | {node.id for node in state.nodes} | {output.name for output in state.outputs}
+    kept: list[str] = []
+    for candidate in raw:
+        if candidate in known and candidate not in kept:
+            kept.append(candidate)
+    return tuple(kept)
+
+
+def _advisor_flagged_header(category: str, step_ids: Sequence[str]) -> str:
+    """The backend-authored header sentence(s) for a rendered FLAG.
+
+    The parser already normalises ``category`` into
+    :data:`ADVISOR_FINDING_CATEGORIES`, but this function is reachable with a
+    plain ``str`` from the wording helper's default, so the fall back to
+    "other" is written out rather than hidden in a ``dict.get`` default: an
+    unrecognised category is a caller bug we want visible in the code, not a
+    silently absorbed lookup.
+    """
+    if category not in _ADVISOR_CATEGORY_HEADERS:
+        category = "other"
+    header = _ADVISOR_CATEGORY_HEADERS[category]
+    if step_ids:
+        return f"{header} Steps named by the reviewer: {', '.join(step_ids)}."
+    return header
+
+
+def _advisor_signoff_blocked_validation(
+    *,
+    reason: str,
+    findings: str,
+    findings_backend_authored: bool = False,
+    category: str,
+    step_ids: Sequence[str],
+    note: str | None,
+) -> ValidationResult:
     """Build the fully-red shape for a RED runtime preflight.
 
     Returned (not raised) by the END authoritative advisor gate
@@ -10775,11 +10885,21 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str, findings_
         reason=reason,
         findings=findings,
         findings_backend_authored=findings_backend_authored,
+        category=category,
+        step_ids=step_ids,
     )
-    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion)
+    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion, note=note)
 
 
-def _advisor_signoff_unverified_validation(*, reason: str, findings: str, findings_backend_authored: bool = False) -> ValidationResult:
+def _advisor_signoff_unverified_validation(
+    *,
+    reason: str,
+    findings: str,
+    findings_backend_authored: bool = False,
+    category: str,
+    step_ids: Sequence[str],
+    note: str | None,
+) -> ValidationResult:
     """Build the fully-blocking shape for an ABSENT runtime preflight.
 
     elspeth-2ae50afcd1 facet B (operator-adjudicated 2026-09-02). ``None``
@@ -10796,11 +10916,13 @@ def _advisor_signoff_unverified_validation(*, reason: str, findings: str, findin
         findings=findings,
         findings_backend_authored=findings_backend_authored,
         notice=_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+        category=category,
+        step_ids=step_ids,
     )
-    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion)
+    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion, note=note)
 
 
-def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) -> ValidationResult:
+def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str, note: str | None) -> ValidationResult:
     """Shared fully-blocking wire shape for the red and absent advisor blocks."""
     return ValidationResult(
         is_valid=False,
@@ -10830,6 +10952,7 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) 
                 ValidationReadinessBlocker(
                     code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
                     suggestion=suggestion,
+                    note=note,
                     component_id="pipeline",
                     component_type="pipeline",
                     detail=detail,
@@ -10864,6 +10987,102 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) 
 _ADVISOR_FINDINGS_MAX_CHARS: Final[int] = 4_000
 _ADVISOR_FINDINGS_UNTRUSTED_BEGIN: Final[str] = "BEGIN_UNTRUSTED_ADVISOR_FINDINGS"
 _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
+
+# elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): the advisor's own
+# words reach the user as a labelled note. Bounded here, once, before any
+# surface or row sees them. The category vocabulary is closed: the blocker
+# header is chosen from it server-side, never from advisor text.
+ADVISOR_NOTE_MAX_CHARS: Final[int] = 600
+ADVISOR_FINDING_CATEGORIES: Final[frozenset[str]] = frozenset(
+    {"request_not_met", "error_handling", "prompt_defect", "schema_mismatch", "other"}
+)
+_ADVISOR_CATEGORY_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\s*CATEGORY\s*:\s*([a-z_]+)\s*$", re.IGNORECASE | re.MULTILINE)
+_ADVISOR_STEPS_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\s*STEPS\s*:\s*(.*?)\s*$", re.IGNORECASE | re.MULTILINE)
+_ADVISOR_STEP_ID_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_.\-]+")
+# ANSI CSI escape sequences, stripped before the character filter below: ESC
+# is itself a C0 control, so removing controls first would take the ESC alone
+# and leave ``[31m`` behind as text.
+_ADVISOR_NOTE_ANSI_CSI_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Everything the note drops by Unicode CATEGORY rather than by an explicit
+# class (final review I-2): ``Cc`` is the C0/C1 controls, ``Cf`` the format
+# block -- bidirectional overrides and isolates, the zero-width family, the
+# BOM -- and ``Zl``/``Zp`` the line and paragraph separators. Left in, a note
+# can render differently from the text stored beside it, so an operator
+# reading the session DB sees something other than what the user was shown.
+# Expressed as CATEGORIES, not literals: an invisible character in source is
+# precisely what this removes, and a character class of them is unreviewable.
+_ADVISOR_NOTE_STRIPPED_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
+_ADVISOR_NOTE_KEPT_CONTROLS: Final[frozenset[str]] = frozenset("\t\n\r")
+
+
+def _strip_note_control_characters(text: str) -> str:
+    """Drop ANSI escapes and every control/format character but tab and newline."""
+    without_escapes = _ADVISOR_NOTE_ANSI_CSI_RE.sub("", text)
+    return "".join(
+        character
+        for character in without_escapes
+        if character in _ADVISOR_NOTE_KEPT_CONTROLS or unicodedata.category(character) not in _ADVISOR_NOTE_STRIPPED_CATEGORIES
+    )
+
+
+# The verdict LEAD as the note strips it: the token, optionally wrapped in
+# markdown emphasis and optionally introduced by a ``Verdict:`` label, closed
+# by a verdict-shaped terminator or end-of-line — the same terminator guard
+# ``_ADVISOR_VERDICT_LINE_RE`` uses, so adjectival prose ("flagged rows are
+# routed to the reject sink") is not a verdict. Matching the emphasis HERE
+# rather than pre-stripping the line is what keeps underscores in the prose:
+# ``_ADVISOR_MARKDOWN_EMPHASIS_RE`` would delete them from step ids and from
+# the fence sentinels this function still has to find.
+_ADVISOR_NOTE_VERDICT_LEAD_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[*_`~\s]*(?:verdict\s*[:\-]\s*)?[*_`~\s]*(?:CLEAN|FLAGGED)[*_`~]*\s*(?:[:.\-" + chr(0x2013) + chr(0x2014) + r"]\s*|$)",
+    re.IGNORECASE,
+)
+# Three or more newlines collapse to a blank line (final review M-3/M-1):
+# removing a CATEGORY/STEPS line leaves its newline behind, and a note that is
+# mostly newlines pushes the blocker's own button down the panel.
+_ADVISOR_NOTE_BLANK_RUN_RE: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
+
+
+def _advisor_note_text(findings_text: str) -> str | None:
+    """The advisor's prose after the verdict token, bounded and sanitised, or None.
+
+    Removes the verdict line, the CATEGORY/STEPS machine lines, the
+    untrusted-findings fence sentinels and control characters.
+
+    The verdict line is found the way the SCANNER finds it (final review I-1),
+    not with one start-anchored match: ``_parse_advisor_checkpoint_guidance``
+    deliberately accepts ``**FLAGGED**``, ``Verdict: FLAGGED``, a preamble
+    before the verdict and a bare ``FLAGGED`` on its own line — its docstring
+    names these as observed live — and a note that opens with the protocol
+    token is exactly the noise the header exists to replace. The emphasis is
+    matched as part of the lead pattern rather than stripped from the line,
+    so underscores survive in the body — in the step ids the note names and
+    in the fence sentinels removed below.
+
+    Unicode line and paragraph separators arrive as line breaks (``splitlines``
+    honours them) and are kept as ``\\n``: the stored note and the rendered
+    note then agree, which is the property I-2 is about.
+    """
+    lines = findings_text.strip().splitlines()
+    body = findings_text.strip()
+    for index, raw_line in enumerate(lines):
+        if _ADVISOR_NOTE_VERDICT_LEAD_RE.match(raw_line.strip()) is None:
+            continue
+        remainder = _ADVISOR_NOTE_VERDICT_LEAD_RE.sub("", raw_line.strip(), count=1)
+        body = "\n".join([remainder, *lines[index + 1 :]])
+        break
+    body = _ADVISOR_CATEGORY_LINE_RE.sub("", body)
+    body = _ADVISOR_STEPS_LINE_RE.sub("", body)
+    body = body.replace(_ADVISOR_FINDINGS_UNTRUSTED_BEGIN, "").replace(_ADVISOR_FINDINGS_UNTRUSTED_END, "")
+    body = _strip_note_control_characters(body)
+    body = _ADVISOR_NOTE_BLANK_RUN_RE.sub("\n\n", body).strip()
+    if not body:
+        return None
+    if len(body) > ADVISOR_NOTE_MAX_CHARS:
+        body = body[: ADVISOR_NOTE_MAX_CHARS - 1].rstrip() + "…"
+    return body
+
+
 # R2-F12 (elspeth-bff8fe6864): the user-facing output-contract sentence
 # shared by BOTH advisor-injection sites (the END gate's FLAGGED repair
 # message and the EARLY advisory transition message) — a single source of
@@ -11056,6 +11275,8 @@ def _advisor_signoff_blocked_wording(
     findings: str,
     findings_backend_authored: bool = False,
     notice: str = _ADVISOR_SIGNOFF_PENDING_NOTICE,
+    category: str = "other",
+    step_ids: Sequence[str] = (),
 ) -> tuple[str, str]:
     """Return the (detail, suggestion) pair for one blocked-sign-off reason.
 
@@ -11081,11 +11302,21 @@ def _advisor_signoff_blocked_wording(
     ``findings_backend_authored`` is True (the deterministic pre-scan
     string: fixed shape, names the triggering surface, carries no provider
     text) the finding is appended so the operator can act. Advisor-MODEL
-    findings remain withheld on these branches (R2-F13: raw provider
-    findings never enter the composer's published prose or validation-wire
-    surfaces — scoped deliberately: a flagged model's subsequent TOOL CALLS
+    findings remain withheld on these branches (R2-F13, narrowed by the
+    2026-09-22 ruling: raw provider findings never enter ``detail``,
+    ``suggestion``, the check text or the composer's published prose — they
+    reach the user only through the blocker's ``note`` field, which the
+    caller sets. Scoped deliberately: a flagged model's subsequent TOOL CALLS
     can still write derived text into pipeline state the user inspects, and
     that state channel is uncontained by design, elspeth-25f7b757e7 A4).
+
+    ``category`` and ``step_ids`` (elspeth-032ec69c41) add the backend-authored
+    header to a RENDERED flag: one fixed sentence per closed category, plus the
+    ids the caller already validated against the state. Both are backend copy —
+    the advisor chooses which sentence, never its words — so they sit in
+    ``detail`` while the advisor's own prose stays in ``note``. A
+    backend-authored pre-scan finding keeps its existing wording and gets no
+    header: it is not a reviewer's judgement about a step.
     """
     if reason == "flagged_unrepairable":
         # elspeth-25f7b757e7 (A1): the trigger is the user's own chat message,
@@ -11108,8 +11339,14 @@ def _advisor_signoff_blocked_wording(
                 f"{notice} {findings}",
                 "Remove the flagged text from the named field; the advisory review runs again after your next pipeline change.",
             )
+        # Header first, then its step sentence, then the standing notice: the
+        # plan said "prefix the header, append the steps", but a step list
+        # placed after "run again after your next pipeline change" reads as
+        # part of the next-steps advice rather than as what the reviewer
+        # named. Keeping the two header sentences adjacent is the same copy,
+        # ordered as a person reads it.
         return (
-            notice,
+            f"{_advisor_flagged_header(category, step_ids)} {notice}",
             "Review the pipeline; validation and the advisory review run again after your next pipeline change.",
         )
     # Ruling 2026-09-22 (elspeth-032ec69c41): this pair is what the durable
@@ -11137,6 +11374,9 @@ def _advisor_signoff_pending_validation(
     reason: str,
     findings: str,
     findings_backend_authored: bool = False,
+    category: str,
+    step_ids: Sequence[str],
+    note: str | None,
 ) -> ValidationResult:
     """Gate COMPLETION only, on a pipeline whose validation genuinely passed.
 
@@ -11162,6 +11402,8 @@ def _advisor_signoff_pending_validation(
         reason=reason,
         findings=findings,
         findings_backend_authored=findings_backend_authored,
+        category=category,
+        step_ids=step_ids,
     )
     return base.model_copy(
         update={
@@ -11184,6 +11426,7 @@ def _advisor_signoff_pending_validation(
                     ValidationReadinessBlocker(
                         code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
                         suggestion=suggestion,
+                        note=note,
                         component_id="pipeline",
                         component_type="pipeline",
                         detail=detail,

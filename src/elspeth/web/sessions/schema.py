@@ -34,7 +34,10 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 
 # Coupled cut: sparse proposal display, structured stored validation errors,
 # timestamp-leading quota scan indexes, and durable fork failure diagnostics.
-_COORDINATION_HARD_CUT_EPOCH = 64
+# Epoch 65 adds the required ``completion_gates.advisor_signoff.note`` key
+# (elspeth-032ec69c41): the strict parser refuses an envelope without it, so
+# rows written at epoch 64 cannot be read forward.
+_COORDINATION_HARD_CUT_EPOCH = 65
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",

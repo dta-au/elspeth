@@ -10521,6 +10521,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
             code: "advisor_signoff_blocked",
             component_id: "pipeline",
             suggestion: null,
+            note: null,
             component_type: "pipeline",
             detail:
               "Completion advisory review did not clear after the available attempts.",

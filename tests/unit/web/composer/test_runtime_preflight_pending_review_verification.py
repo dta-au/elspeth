@@ -80,6 +80,7 @@ def _handoff_result() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="llm_classify",
                     component_type="transform",
@@ -113,6 +114,7 @@ def _structural_failure_result() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code="graph_structure",
                     component_id="mapper",
                     component_type="transform",

@@ -48,7 +48,7 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_64(engine) -> None:
+def test_blob_inline_resolutions_schema_epoch_is_65(engine) -> None:
     # 51: the multi-replica session-operation substrate landed on top of
     # mainline's 50 (elspeth-4d6c0dd0f5).
     # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
@@ -63,9 +63,11 @@ def test_blob_inline_resolutions_schema_epoch_is_64(engine) -> None:
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 63 gives this table's content_hash the full lowercase SHA-256 CHECK.
-    assert SESSION_SCHEMA_EPOCH == 64
+    # Epoch 65: completion_gates.advisor_signoff.note became a required key
+    # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
+    assert SESSION_SCHEMA_EPOCH == 65
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 64
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 65
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

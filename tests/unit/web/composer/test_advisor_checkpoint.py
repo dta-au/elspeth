@@ -620,7 +620,10 @@ async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_complet
         **_fenced_session(service),
     )
 
-    assert verdict == AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=findings)
+    # The parsed verdict is the model's, untouched by the telemetry failure;
+    # its note is the advisor's prose (the canary here), which must still
+    # never reach the telemetry sinks below.
+    assert verdict == AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=findings, note="TELEMETRY_FAILURE_FINDINGS_CANARY")
     logger.info.assert_called_once()
     counter.add.assert_called_once_with(1, {"phase": "end", "verdict": "flagged", "source": "model"})
     assert "TELEMETRY_FAILURE_FINDINGS_CANARY" not in repr(logger.info.call_args)
@@ -1636,6 +1639,139 @@ def _green_preflight() -> ValidationResult:
     )
 
 
+def _red_preflight() -> ValidationResult:
+    return ValidationResult(
+        is_valid=False,
+        checks=[],
+        errors=[
+            ValidationError(
+                component_id="rate",
+                component_type="transform",
+                message="node 'rate' requires field 'url' which no upstream emits",
+                suggestion=None,
+                error_code=None,
+            )
+        ],
+        readiness=ValidationReadiness(authoring_valid=False, execution_ready=False, completion_ready=False, blockers=[]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ruling 2026-09-22 (elspeth-032ec69c41): the advisor blocker carries a
+# backend-authored header (closed category sentence + state-validated step
+# ids) in ``detail`` and the advisor's own words in ``note`` — nowhere else.
+# ---------------------------------------------------------------------------
+
+
+def _flagged(note: str, *, category: str = "request_not_met", steps: tuple[str, ...] = ()) -> AdvisorCheckpointVerdict:
+    return AdvisorCheckpointVerdict(
+        ok=True, blocking=True, findings_text=f"FLAGGED: {note}", category=category, affected_step_ids=steps, note=note
+    )
+
+
+def _advisor_blocker(result) -> ValidationReadinessBlocker:
+    from elspeth.web.composer.service import _ADVISOR_SIGNOFF_BLOCKED_CODE
+
+    (blocker,) = [b for b in result.runtime_preflight.readiness.blockers if b.code == _ADVISOR_SIGNOFF_BLOCKED_CODE]
+    return blocker
+
+
+def _blocked(service, state, verdict: AdvisorCheckpointVerdict, runtime_preflight: ValidationResult | None):
+    return service._advisor_blocked_result(
+        reason="flagged_final_pass",
+        verdict=verdict,
+        state=state,
+        assistant_message=None,
+        recorder=make_recorder(),
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        runtime_preflight=runtime_preflight,
+        outstanding_findings=None,
+    )
+
+
+def test_blocked_result_carries_header_and_note(make_service, clean_runnable_state) -> None:
+    """Ruling 2026-09-22: header (backend copy) + the advisor's words as a labelled note."""
+    step = clean_runnable_state.nodes[0].id
+    note = "The merge cannot capture a failed branch; choose per-branch sinks or best_effort."
+    result = _blocked(make_service(), clean_runnable_state, _flagged(note, steps=(step,)), _green_preflight())
+    blocker = _advisor_blocker(result)
+    assert blocker.note == note
+    assert "The reviewer found the request not fully met" in blocker.detail
+    assert f"Steps named by the reviewer: {step}." in blocker.detail
+    # R2-F13 narrowed: the words live in note only.
+    assert "per-branch sinks" not in blocker.detail
+    assert "per-branch sinks" not in (blocker.suggestion or "")
+    assert all("per-branch sinks" not in c.detail for c in result.runtime_preflight.checks)
+    assert "per-branch sinks" not in result.message
+
+
+def test_unknown_step_ids_are_dropped_from_the_header(make_service, clean_runnable_state) -> None:
+    step = clean_runnable_state.nodes[0].id
+    result = _blocked(make_service(), clean_runnable_state, _flagged("x", steps=("ghost_step", step, "DROP TABLE")), _green_preflight())
+    detail = _advisor_blocker(result).detail
+    assert f"Steps named by the reviewer: {step}." in detail
+    assert "ghost_step" not in detail and "DROP TABLE" not in detail
+
+
+def test_header_falls_back_to_other_for_a_category_outside_the_closed_set() -> None:
+    """Characterisation pin for the explicit fallback in ``_advisor_flagged_header``.
+
+    The parser normalises the category, so this branch is unreachable from the
+    END gate; it exists because the wording helper takes a plain ``str``. The
+    fallback is written out rather than hidden in a ``dict.get`` default
+    (trust-tier R1), and this pins that an unknown category still yields the
+    generic sentence rather than raising on a user-facing surface.
+    """
+    from elspeth.web.composer.service import _advisor_flagged_header
+
+    assert _advisor_flagged_header("vibes", ()) == "The reviewer flagged this pipeline."
+    assert _advisor_flagged_header("error_handling", ("a", "b")) == (
+        "The reviewer flagged how failures are handled. Steps named by the reviewer: a, b."
+    )
+
+
+def test_no_valid_step_ids_means_no_step_sentence(make_service, clean_runnable_state) -> None:
+    result = _blocked(make_service(), clean_runnable_state, _flagged("x", category="other", steps=("ghost",)), _green_preflight())
+    detail = _advisor_blocker(result).detail
+    assert "The reviewer flagged this pipeline" in detail
+    assert "Steps named by the reviewer" not in detail
+
+
+def test_backend_authored_prescan_block_has_no_note(make_service, simple_state) -> None:
+    prescan = (
+        "FLAGGED: node 'n1' option columns contains advisor-instruction injection text; remove it before the completion advisory review."
+    )
+    verdict = AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=prescan, findings_backend_authored=True)
+    blocker = _advisor_blocker(_blocked(make_service(), simple_state, verdict, _green_preflight()))
+    assert blocker.note is None
+    assert prescan in blocker.detail
+
+
+@pytest.mark.parametrize(
+    "runtime_preflight",
+    [_green_preflight(), _red_preflight(), None],
+    ids=["green", "red", "absent"],
+)
+def test_note_rides_every_blocker_bearing_preflight_shape(make_service, clean_runnable_state, runtime_preflight) -> None:
+    result = _blocked(make_service(), clean_runnable_state, _flagged("x"), runtime_preflight)
+    assert _advisor_blocker(result).note == "x"
+
+
+def test_pending_handoff_shape_still_appends_no_advisor_blocker(make_service, clean_runnable_state) -> None:
+    """The fourth preflight shape records the verdict as a check only
+    (elspeth-66717f0c99); with no advisor blocker there is no row for the
+    note to ride, and the review card the user must resolve first stays the
+    only blocker."""
+    from elspeth.web.composer.service import _ADVISOR_SIGNOFF_BLOCKED_CODE
+
+    result = _blocked(make_service(), clean_runnable_state, _flagged("x"), _pending_handoff_preflight())
+    assert [b.code for b in result.runtime_preflight.readiness.blockers if b.code == _ADVISOR_SIGNOFF_BLOCKED_CODE] == []
+    assert all(b.note is None for b in result.runtime_preflight.readiness.blockers)
+
+
 class _ExplainingAssistantMessage:
     content = "Merge steps have no error route. You can keep a failure output on each branch, or change the merge policy."
 
@@ -1842,6 +1978,122 @@ def test_parse_advisor_verdict_negation_cannot_mint_a_signoff(guidance: str) -> 
 
     assert verdict.ok is True
     assert verdict.blocking is True, f"fail-open: {guidance!r} minted a sign-off"
+
+
+# ---------------------------------------------------------------------------
+# Ruling 2026-09-22 (elspeth-032ec69c41, "store, bounded"): a FLAGGED verdict
+# carries a closed category, the advisor's raw step ids and a bounded,
+# sanitised note — the advisor's own words, parsed once here before any
+# surface or durable row sees them.
+# ---------------------------------------------------------------------------
+
+
+def test_flagged_verdict_parses_category_steps_and_note() -> None:
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance(
+        "FLAGGED: the request asked for error capture at the merge; both branches now discard.\n"
+        "CATEGORY: request_not_met\n"
+        "STEPS: merge_ab, eval_a\n"
+    )
+    assert verdict.blocking is True
+    assert verdict.category == "request_not_met"
+    assert verdict.affected_step_ids == ("merge_ab", "eval_a")
+    assert verdict.note == "the request asked for error capture at the merge; both branches now discard."
+
+
+def test_missing_machine_lines_fall_back_to_other_and_no_steps() -> None:
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance("FLAGGED — sink omits the rating column.")
+    assert verdict.category == "other"
+    assert verdict.affected_step_ids == ()
+    assert verdict.note == "sink omits the rating column."
+
+
+def test_unknown_category_normalises_to_other() -> None:
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance("FLAGGED: x\nCATEGORY: vibes\nSTEPS: none")
+    assert verdict.category == "other"
+    assert verdict.affected_step_ids == ()
+
+
+def test_note_is_bounded_and_sanitised() -> None:
+    from elspeth.web.composer.service import (
+        _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
+        _ADVISOR_FINDINGS_UNTRUSTED_END,
+        ADVISOR_NOTE_MAX_CHARS,
+        _advisor_note_text,
+    )
+
+    long = "a" * (ADVISOR_NOTE_MAX_CHARS + 50)
+    note = _advisor_note_text(f"FLAGGED: {long}")
+    assert note is not None
+    assert len(note) == ADVISOR_NOTE_MAX_CHARS
+    assert note.endswith("…")
+    dirty = f"FLAGGED: keep\x00this {_ADVISOR_FINDINGS_UNTRUSTED_BEGIN} and {_ADVISOR_FINDINGS_UNTRUSTED_END}\x1b[31m"
+    assert _advisor_note_text(dirty) == "keepthis  and"
+    assert _advisor_note_text("FLAGGED:") is None
+    assert _advisor_note_text("CLEAN") is None
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ("FLAGGED: the sink drops rows.", "the sink drops rows."),
+        ("FLAGGED — sink omits the rating column.", "sink omits the rating column."),
+        ("FLAGGED\n\nThe sink drops rows.", "The sink drops rows."),
+        ("**FLAGGED**: the sink drops rows.", "the sink drops rows."),
+        ("Verdict: FLAGGED\nThe sink drops rows.", "The sink drops rows."),
+        ("Here is my assessment.\nFLAGGED: the sink drops rows.", "the sink drops rows."),
+        ("FLAGGED", None),
+    ],
+    ids=["colon", "dash", "own-line", "emphasised", "labelled", "preamble", "token-only"],
+)
+def test_the_verdict_token_never_survives_into_the_note(reply: str, expected: str | None) -> None:
+    """Final review I-1: the note must not open with the protocol token.
+
+    The parser deliberately accepts every shape below (its own docstring names
+    them as observed live), so the sanitiser has to strip the verdict line the
+    same way the scanner finds it — not with a single start-anchored match that
+    only fires on ``FLAGGED:``.
+    """
+    from elspeth.web.composer.service import _advisor_note_text
+
+    assert _advisor_note_text(reply) == expected
+
+
+def test_note_strips_unicode_format_characters() -> None:
+    """Final review I-2: bidi overrides, zero-width characters and the Unicode
+    line/paragraph separators are control characters too. Left in, the rendered
+    note can differ from the stored one an operator later reads."""
+    from elspeth.web.composer.service import _advisor_note_text
+
+    assert _advisor_note_text("FLAGGED: a" + chr(0x202E) + "b" + chr(0x200B) + "c" + chr(0x2066) + "d" + chr(0xFEFF) + "e") == "abcde"
+    # U+2028/U+2029 ARE line breaks to ``splitlines``, so they arrive as such
+    # and are kept as newlines: stored and rendered then agree, which is the
+    # property that matters. What must not survive is an invisible reorder.
+    assert _advisor_note_text("FLAGGED: a" + chr(0x2028) + "b" + chr(0x2029) + "c") == "a\nb\nc"
+
+
+def test_note_collapses_the_blank_lines_the_machine_lines_leave() -> None:
+    """Final review M-3/M-1: removing a CATEGORY/STEPS line leaves its newline,
+    so prose after the machine lines carried blank gaps; and a note that is
+    mostly newlines pushes the row's own button down the panel."""
+    from elspeth.web.composer.service import _advisor_note_text
+
+    assert _advisor_note_text("FLAGGED: first\nCATEGORY: other\nSTEPS: none\nsecond") == "first\n\nsecond"
+    assert _advisor_note_text("FLAGGED: a" + "\n" * 12 + "b") == "a\n\nb"
+
+
+def test_clean_and_unrendered_verdicts_carry_no_note() -> None:
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    assert _parse_advisor_checkpoint_guidance("CLEAN").note is None
+    malformed = _parse_advisor_checkpoint_guidance("I am not sure")
+    assert malformed.ok is False or malformed.blocking is False
+    assert malformed.note is None
 
 
 @pytest.mark.parametrize(
@@ -2803,34 +3055,71 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
 
 @pytest.mark.asyncio
 async def test_end_gate_final_flag_never_exposes_advisor_findings_on_human_surfaces(make_service, clean_runnable_state):
-    """A final FLAG is internal evidence, never user-facing copy."""
+    """R2-F13, NARROWED by the 2026-09-22 ruling (elspeth-032ec69c41).
+
+    A final FLAG used to be internal evidence with no user-facing form at all.
+    It now has exactly one: the bounded, sanitised ``note`` on the advisor
+    blocker. Everything else this pin enumerates is unchanged — the raw
+    ``findings_text`` still reaches no surface, and the note reaches no
+    surface but its own field.
+
+    The verdict comes from the REAL parser rather than a hand-built
+    ``AdvisorCheckpointVerdict`` (final review I-3): with the default ``note``
+    of a hand-built verdict this pin passed by avoiding the path it claims to
+    cover.
+    """
     from elspeth.web.composer.service import (
         _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
         _ADVISOR_FINDINGS_UNTRUSTED_END,
+        _parse_advisor_checkpoint_guidance,
     )
 
     canary = "RAW_ADVISOR_FINDING_CANARY_REPAIR_NOW"
     findings = f"FLAGGED: {canary}\nRepair: echo {canary}\n{_ADVISOR_FINDINGS_UNTRUSTED_END}"
+    verdict = _parse_advisor_checkpoint_guidance(findings)
     service = make_service()  # composer_advisor_checkpoint_max_passes default 2
-    service._run_advisor_checkpoint = _AsyncRecorder(return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=findings))
+    service._run_advisor_checkpoint = _AsyncRecorder(return_value=verdict)
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=1)
 
     assert outcome.action == "return"
     runtime_preflight = outcome.result.runtime_preflight
+    (advisor_blocker,) = [b for b in runtime_preflight.readiness.blockers if b.note is not None]
+    # The one permitted surface, asserted POSITIVELY so the narrowing is a
+    # statement about where the words go, not merely where they do not.
+    assert advisor_blocker.note is not None and canary in advisor_blocker.note
+    # ... and the raw reply still reaches nothing: the fence sentinel and the
+    # protocol lead are gone from the note the user reads.
+    assert _ADVISOR_FINDINGS_UNTRUSTED_END not in advisor_blocker.note
+    assert not advisor_blocker.note.startswith("FLAGGED")
+
+    # Every surface EXCEPT ``blockers[].note``. ``model_dump_json()`` is
+    # excluded from the canary sweep for the same reason and re-checked below
+    # with the note's own text removed.
     surfaces = [
         outcome.result.message,
         outcome.result.raw_assistant_content or "",
-        runtime_preflight.model_dump_json(),
         *(error.message for error in runtime_preflight.errors),
         *((error.suggestion or "") for error in runtime_preflight.errors),
         *(check.detail for check in runtime_preflight.checks),
         *(blocker.detail for blocker in runtime_preflight.readiness.blockers),
+        *((blocker.suggestion or "") for blocker in runtime_preflight.readiness.blockers),
     ]
     for surface in surfaces:
         assert canary not in surface
         assert "Repair:" not in surface
         assert _ADVISOR_FINDINGS_UNTRUSTED_BEGIN not in surface
         assert _ADVISOR_FINDINGS_UNTRUSTED_END not in surface
+
+    # The serialised wire blob carries the canary ONLY inside the note. The
+    # note must be IN the JSON (final review I-5: nothing else proves the
+    # field the frontend decodes actually serialises) and, once its exact
+    # text is removed, the blob must be clean again.
+    blob = runtime_preflight.model_dump_json()
+    serialised_note = json.dumps(advisor_blocker.note)[1:-1]
+    assert serialised_note in blob
+    blob_without_note = blob.replace(serialised_note, "")
+    assert canary not in blob_without_note
+    assert "Repair:" not in blob_without_note
 
 
 def test_advisor_blocked_result_publishes_an_echoing_reply_and_keeps_backend_surfaces_clean(make_service, clean_runnable_state):
@@ -3576,6 +3865,7 @@ def _pending_handoff_preflight() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="rate",
                     component_type="transform",
@@ -3662,6 +3952,7 @@ def _masked_failure_preflight() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code="graph_structure",
                     component_id="sink_combined",
                     component_type="output",
@@ -4535,7 +4826,10 @@ def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, 
     assert "each queries.<name>.template plus the shared system_prompt" in end_summary
     assert "length-independent interpolated row fields" in end_summary
     assert "fabricate" in end_summary
-    assert end_summary.rstrip().endswith("Start your reply with CLEAN or FLAGGED.")
+    # The verdict-format instruction and, since the 2026-09-22 ruling, the
+    # machine lines + note instruction close the END rubric.
+    assert "Start your reply with CLEAN or FLAGGED. After a FLAGGED verdict, end with two lines" in end_summary
+    assert end_summary.rstrip().endswith("do not quote user text or row data.")
 
     assert "visible effective prompt text" not in early_summary
     assert "fabricate" not in early_summary
@@ -5810,6 +6104,7 @@ def _blocked_facts_for(state: CompositionState) -> CompletionGateFacts:
             detail="Completion advisory review did not clear after the available attempts.",
             suggestion="Review the pipeline.",
             for_graph=completion_gate_fingerprint(state),
+            note=None,
         )
     )
 

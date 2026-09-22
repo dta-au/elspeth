@@ -143,6 +143,7 @@ describe("auditReadiness API client", () => {
               component_type: "transform",
               detail: "first",
               suggestion: null,
+              note: null,
             },
           ],
         },
@@ -171,6 +172,7 @@ describe("auditReadiness API client", () => {
     validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
       code: "advisor_signoff_blocked", component_id: "pipeline",
       component_type: "pipeline", detail: "Review pending.", suggestion,
+      note: null,
     }] };
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
     const snapshot = await fetchAuditReadiness(SESSION_ID);
@@ -183,6 +185,7 @@ describe("auditReadiness API client", () => {
     validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
       code: "advisor_signoff_blocked", component_id: "pipeline",
       component_type: "pipeline", detail: "Review pending.", suggestion,
+      note: null,
     }] };
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
     await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({

@@ -196,6 +196,7 @@ class TestValidationResult:
                 blockers=[
                     ValidationReadinessBlocker(
                         suggestion=None,
+                        note=None,
                         code="interpretation_review_pending",
                         component_id="rate_coolness",
                         component_type="transform",
@@ -294,6 +295,7 @@ class TestValidationResult:
                 blockers=[
                     ValidationReadinessBlocker(
                         suggestion=None,
+                        note=None,
                         code="graph_structure",
                         component_id="gate_1",
                         component_type="gate",
@@ -367,6 +369,7 @@ class TestValidationResult:
                 blockers=[
                     ValidationReadinessBlocker(
                         suggestion=None,
+                        note=None,
                         code="settings_load",
                         component_id=None,
                         component_type=None,
@@ -1829,3 +1832,15 @@ class TestS8FabricationGuard:
         with pytest.raises(pydantic.ValidationError) as exc_info:
             CancelledData(**kwargs)  # type: ignore[arg-type]
         assert missing_field in str(exc_info.value)
+
+
+def test_readiness_blocker_requires_an_explicit_note() -> None:
+    """elspeth-032ec69c41: ``note`` is REQUIRED (nullable, no default) so a
+    blocker builder cannot forget the decision — the advisor's own words ride
+    the ``advisor_signoff_blocked`` row only; every other builder says None."""
+    without_note = {"code": "x", "component_id": None, "component_type": None, "detail": "d", "suggestion": None}
+    with pytest.raises(pydantic.ValidationError):
+        ValidationReadinessBlocker.model_validate(without_note)
+    blocker = ValidationReadinessBlocker.model_validate({**without_note, "note": None})
+    assert blocker.model_dump()["note"] is None
+    assert ValidationReadinessBlocker.model_validate({**without_note, "note": "the advisor's words"}).note == "the advisor's words"

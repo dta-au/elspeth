@@ -55,7 +55,9 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 64 admits the distinct cost-accounting failure classification.
-    assert SESSION_SCHEMA_EPOCH == 64
+    # Epoch 65: completion_gates.advisor_signoff.note became a required key
+    # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
+    assert SESSION_SCHEMA_EPOCH == 65
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
     # Epoch 43 gives every Landscape digest column a shape CHECK; pairs with session 63.

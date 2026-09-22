@@ -359,7 +359,9 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 61 defaults preferences to freeform and retires the mode banner.
     # Epoch 64 admits the distinct cost-accounting failure classification.
-    assert SESSION_SCHEMA_EPOCH == 64
+    # Epoch 65: completion_gates.advisor_signoff.note became a required key
+    # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
+    assert SESSION_SCHEMA_EPOCH == 65
     expected_tables = frozenset(
         {
             "web_instances",
@@ -544,6 +546,7 @@ def test_epoch_61_is_rejected_before_reading_old_advisor_gate_grammar() -> None:
                         "status": "blocked",
                         "detail": "Review pending.",
                         "for_graph": "reviewed-graph",
+                        "note": None,
                     }
                 }
             }

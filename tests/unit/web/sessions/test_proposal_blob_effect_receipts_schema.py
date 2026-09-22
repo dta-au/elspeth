@@ -19,7 +19,9 @@ def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
     # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 63 tightens the inline blob resolution hash CHECK to lowercase hex.
-    assert SESSION_SCHEMA_EPOCH == 64
+    # Epoch 65: completion_gates.advisor_signoff.note became a required key
+    # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
+    assert SESSION_SCHEMA_EPOCH == 65
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

@@ -402,6 +402,7 @@ def _pending_review_validation() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="assess",
                     component_type="transform",
@@ -443,6 +444,7 @@ def _completion_blocked_validation() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     suggestion=None,
+                    note=None,
                     code=ADVISOR_SIGNOFF_BLOCKED_CODE,
                     component_id="pipeline",
                     component_type="pipeline",
@@ -649,6 +651,7 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
                     "status": "blocked",
                     "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                     "for_graph": "0" * 64,
+                    "note": None,
                 }
             }
         },
@@ -676,6 +679,7 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
+                note=None,
             )
         )
     ]

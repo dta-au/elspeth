@@ -60,6 +60,15 @@ export type DecisionRow =
       componentId: string | null;
       detail: string;
       suggestion: string | null;
+      /**
+       * The advisory reviewer's own bounded words (elspeth-032ec69c41), or
+       * null for every blocker with no reviewer behind it. Provider output:
+       * rendered as labelled plain text, never as markdown, and never folded
+       * into the question the Ask button drafts. Deliberately NOT part of
+       * ``id``: the note is extra content on a blocker the other four fields
+       * already identify, and ``detail`` already moves when the verdict does.
+       */
+      note: string | null;
     }
   | {
       kind: "suggestion";
@@ -152,6 +161,7 @@ export function projectDecisionRows(input: DecisionRowsInput): DecisionRows {
         componentId: blocker.component_id,
         detail: blocker.detail,
         suggestion: blocker.suggestion,
+        note: blocker.note,
       });
     }
   }

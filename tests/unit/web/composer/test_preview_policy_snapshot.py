@@ -185,6 +185,7 @@ async def test_strict_and_tolerant_preview_share_the_admitted_snapshot(tmp_path:
                 else [
                     ValidationReadinessBlocker(
                         suggestion=None,
+                        note=None,
                         code="interpretation_review_pending",
                         component_id="source",
                         component_type="source",
@@ -271,6 +272,7 @@ async def test_preview_reads_uploaded_reference_table_with_operation_context(
                     blockers=[
                         ValidationReadinessBlocker(
                             suggestion=None,
+                            note=None,
                             code="interpretation_review_pending",
                             component_id="source",
                             component_type="source",

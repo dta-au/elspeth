@@ -112,6 +112,7 @@ describe("projectDecisionRows", () => {
             code: "advisor_signoff_blocked",
             component_id: "pipeline",
             suggestion: null,
+            note: null,
             component_type: "pipeline",
             detail: "Completion advisory review did not clear after the available attempts.",
           },
@@ -128,6 +129,9 @@ describe("projectDecisionRows", () => {
       {
         kind: "blocker",
         suggestion: null,
+        // elspeth-032ec69c41: carried from the wire blocker; null here, and
+        // deliberately absent from the id above, which is unchanged.
+        note: null,
         id: expect.stringContaining("blocker:"),
         code: "advisor_signoff_blocked",
         componentId: "pipeline",
@@ -165,6 +169,7 @@ describe("projectDecisionRows", () => {
             code: "interpretation_review_pending",
             component_id: "colour_questions",
             suggestion: null,
+            note: null,
             component_type: "transform",
             detail: "1 interpretation awaits review.",
           },
@@ -201,6 +206,7 @@ describe("projectDecisionRows", () => {
             code: "interpretation_review_pending",
             component_id: "colour_questions",
             suggestion: null,
+            note: null,
             component_type: "transform",
             detail: "1 interpretation awaits review.",
           },
@@ -239,6 +245,7 @@ describe("projectDecisionRows", () => {
             code: "advisor_signoff_blocked",
             component_id: "pipeline",
             suggestion: null,
+            note: null,
             component_type: "pipeline",
             detail: "withheld",
           },

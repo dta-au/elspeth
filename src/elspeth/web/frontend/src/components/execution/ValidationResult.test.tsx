@@ -200,6 +200,7 @@ describe("ValidationResultBanner", () => {
                 component_id: "pipeline",
                 component_type: "pipeline",
                 suggestion: null,
+                note: null,
                 detail:
                   "The evidence-scoped completion advisory review has not covered this pipeline version.",
               },

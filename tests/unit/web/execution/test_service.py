@@ -1481,6 +1481,7 @@ class TestExecutionFlow:
                 blockers=[
                     ValidationReadinessBlocker(
                         suggestion=None,
+                        note=None,
                         code="graph_structure",
                         component_id="rate",
                         component_type="transform",
@@ -1510,6 +1511,7 @@ class TestExecutionFlow:
         """Execution admission follows readiness even when validation is green."""
         blocker = ValidationReadinessBlocker(
             suggestion=None,
+            note=None,
             code="runtime_admission",
             component_id="pipeline",
             component_type="pipeline",
@@ -1712,6 +1714,7 @@ class TestExecutionFlow:
             suggestion=None,
             detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
             for_graph=completion_gate_fingerprint(authored_state),
+            note=None,
         )
         selected_record.composer_meta = {
             "completion_gates": {
@@ -1720,6 +1723,7 @@ class TestExecutionFlow:
                     "status": "blocked",
                     "detail": fact.detail,
                     "for_graph": fact.for_graph,
+                    "note": None,
                 }
             }
         }
@@ -1912,6 +1916,7 @@ class TestExecutionFlow:
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
 
@@ -1953,6 +1958,7 @@ class TestExecutionFlow:
                     "status": "blocked",
                     "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                     "for_graph": "0" * 64,
+                    "note": None,
                 }
             }
         }
@@ -1978,6 +1984,7 @@ class TestExecutionFlow:
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
+                note=None,
             )
         )
 

@@ -227,6 +227,18 @@ export function DecisionPanel({
               {row.kind === "blocker" && (
                 <>
                   <span className="decision-panel-item-text">{row.detail}{row.suggestion !== null && <> {row.suggestion}</>}</span>
+                  {row.note !== null && (
+                    // The advisory reviewer's own words (elspeth-032ec69c41).
+                    // Labelled as unverified and rendered as TEXT: this is
+                    // provider output, so no markdown renderer and no
+                    // dangerouslySetInnerHTML may ever touch it.
+                    <div className="decision-panel-reviewer-note" data-testid="decision-panel-reviewer-note">
+                      <span className="decision-panel-reviewer-note-label">
+                        {"Reviewer's note (the advisor's own words — not verified by ELSPETH):"}
+                      </span>
+                      <p className="decision-panel-reviewer-note-text">{row.note}</p>
+                    </div>
+                  )}
                   {onAskAboutBlocker !== undefined && (
                     <Button
                       compact

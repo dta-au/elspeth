@@ -26,14 +26,19 @@ const S1: ValidationEntryDTO = {
   severity: "low",
 };
 
-const blockerRow: DecisionRow = {
+const blockerRow: Extract<DecisionRow, { kind: "blocker" }> = {
   kind: "blocker",
   id: "blocker:advisor_signoff_blocked:pipeline",
   code: "advisor_signoff_blocked",
   componentId: "pipeline",
   detail: "Completion advisory review did not clear after the available attempts.",
   suggestion: null,
+  note: null,
 };
+
+function advisorBlockerRow(note: string | null): DecisionRow {
+  return { ...blockerRow, note };
+}
 
 const suggestionRow: DecisionRow = {
   kind: "suggestion",
@@ -435,6 +440,47 @@ describe("DecisionPanelLiveRegion", () => {
     expect(
       await screen.findByText("2 items need your decision"),
     ).toBeInTheDocument();
+  });
+});
+
+// Ruling 2026-09-22 (elspeth-032ec69c41): the advisory reviewer's own words
+// reach the user here, labelled and as plain text. They are provider output:
+// never markdown, never a link, and never folded into the question the Ask
+// button drafts — that draft is the backend's own detail sentence.
+describe("DecisionPanel reviewer's note", () => {
+  it("renders the reviewer's note under an advisor blocker as plain text", () => {
+    renderPanel({ rows: [advisorBlockerRow("Choose per-branch sinks **or** best_effort.")], count: 1 });
+
+    const note = screen.getByTestId("decision-panel-reviewer-note");
+    expect(note).toHaveTextContent("Reviewer's note");
+    expect(note).toHaveTextContent("Choose per-branch sinks **or** best_effort.");
+    expect(note.querySelector("strong")).toBeNull();
+    expect(note.querySelector("a")).toBeNull();
+  });
+
+  it("says the words are the advisor's and unverified", () => {
+    renderPanel({ rows: [advisorBlockerRow("x")], count: 1 });
+    expect(screen.getByTestId("decision-panel-reviewer-note")).toHaveTextContent("not verified by ELSPETH");
+  });
+
+  it("renders no note block when note is null", () => {
+    renderPanel({ rows: [advisorBlockerRow(null)], count: 1 });
+    expect(screen.queryByTestId("decision-panel-reviewer-note")).toBeNull();
+  });
+
+  it("does not put the note into the ask-the-composer draft", () => {
+    const onAskAboutBlocker = vi.fn();
+    renderPanel({ rows: [advisorBlockerRow("SECRET_NOTE")], count: 1, onAskAboutBlocker });
+
+    fireEvent.click(screen.getByRole("button", { name: /Ask the composer about this/ }));
+
+    expect(onAskAboutBlocker).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(onAskAboutBlocker.mock.calls[0])).not.toContain("SECRET_NOTE");
+  });
+
+  it("keeps the note out of the button's accessible name", () => {
+    renderPanel({ rows: [advisorBlockerRow("SECRET_NOTE")], count: 1, onAskAboutBlocker: vi.fn() });
+    expect(screen.getByRole("button", { name: /Ask the composer about this/ }).getAttribute("aria-label")).not.toContain("SECRET_NOTE");
   });
 });
 

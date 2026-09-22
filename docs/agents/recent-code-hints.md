@@ -8,6 +8,23 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-22 — the advisory reviewer's own words reach the user, as a bounded `note` on the advisor blocker; session epoch 65** (elspeth-032ec69c41 ruling; 351a15b6e, 6a34007fb, d8a6e2902, 37fc43c00, 539121b17, b5e458d1d, 9e13ef830)
+  R2-F13 is NARROWED, not lifted. A FLAGGED verdict now parses into
+  `AdvisorCheckpointVerdict.category` (closed set, `ADVISOR_FINDING_CATEGORIES`), `.affected_step_ids` (RAW) and `.note`
+  (`_advisor_note_text`: verdict token, CATEGORY/STEPS lines, fence sentinels and control characters stripped, capped at
+  `ADVISOR_NOTE_MAX_CHARS`). The blocker's `detail` gains a BACKEND-authored header — one fixed sentence per category
+  plus the step ids `_validated_advisor_step_ids` kept after checking them against the state — and the advisor's words
+  ride `ValidationReadinessBlocker.note` and nowhere else: not `detail`, not `suggestion`, not the check text, not the
+  chat message, not the question the DecisionPanel's Ask button drafts. A backend-authored pre-scan finding gets no
+  header and no note. `note` is REQUIRED (nullable) on the wire model, in `AdvisorSignoffGateDict`/`Fact` and in the
+  Tier-1 parser, so a builder cannot forget the decision and a drifted envelope fails closed — which is why
+  `SESSION_SCHEMA_EPOCH` is 65 and `_COORDINATION_HARD_CUT_EPOCH` moved with it (`schema.py` checks the two for exact
+  equality). Adding a required field to `ValidationReadinessBlocker` costs 12 src + 35 test constructors and 28 frontend
+  fixture literals; the panel's own `DecisionRow` is a SEPARATE type that also needed it, and `note` is deliberately not
+  part of `decisionId`, so every pinned row id is unchanged. The note renders as a React text child under a
+  "not verified by ELSPETH" label — never markdown, never `dangerouslySetInnerHTML`.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-09-22 — the END advisor gate stands aside for an unchanged graph the advisor already blocked** (elspeth-032ec69c41;
   ruling on session 6990d39f). `_evaluate_terminal_no_tool_advisor_gate` returns `fall_through` when the turn changed
   nothing AND the prior state row's `completion_gates` fact was recorded for this exact graph

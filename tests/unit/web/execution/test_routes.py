@@ -533,6 +533,10 @@ class TestValidateEndpoint:
                             "status": "blocked",
                             "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                             "for_graph": "0" * 64,
+                            # elspeth-032ec69c41: the reviewer's note is part of
+                            # the persisted fact, so the /validate seam must
+                            # carry it to the service that merges it.
+                            "note": "choose per-branch sinks",
                         }
                     }
                 },
@@ -551,6 +555,7 @@ class TestValidateEndpoint:
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
+                note="choose per-branch sinks",
             )
         )
 
@@ -907,6 +912,7 @@ class TestExecuteEndpoint:
                 blockers=[
                     ValidationReadinessBlocker(
                         suggestion=None,
+                        note=None,
                         code="graph_structure",
                         component_id="rate",
                         component_type="transform",
@@ -936,6 +942,7 @@ class TestExecuteEndpoint:
 
         blocker = ValidationReadinessBlocker(
             suggestion=None,
+            note=None,
             code="runtime_admission",
             component_id="pipeline",
             component_type="pipeline",
@@ -961,6 +968,7 @@ class TestExecuteEndpoint:
                     "component_type": "pipeline",
                     "detail": "The selected runtime policy does not admit this pipeline.",
                     "suggestion": None,
+                    "note": None,
                 }
             ],
         }
