@@ -678,3 +678,16 @@ class TestStageOneRuntimeFatalPromotions:
             version=1,
         )
         assert _errors_for(state, "quarantine_unknown_output")
+
+
+def test_coalesce_on_error_rejection_names_the_supported_alternatives() -> None:
+    """elspeth-032ec69c41: the only place the model learns this limit must also teach the way forward."""
+    from elspeth.web.composer.state import EdgeSpec, edge_lowering_error
+
+    edge = EdgeSpec(id="e1", from_node="merge_ab", to_node="errors", edge_type="on_error", label=None)
+    message = edge_lowering_error(edge, from_kind="coalesce", to_kind="output")
+    assert message is not None
+    assert "Coalesce 'merge_ab' has no on_error route" in message
+    assert "on_error of each branch transform" in message
+    assert "'best_effort'" in message
+    assert "ask the user" in message
