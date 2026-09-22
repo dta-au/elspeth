@@ -8,6 +8,7 @@ from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
 from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.execution.completion_gates import parse_completion_gates
 
 from .._helpers import (
     _COMPOSER_REQUESTS_INFLIGHT,
@@ -127,6 +128,11 @@ async def recompose(
         else:
             state = _state_from_record(state_record)
             pre_send_state_id = state_record.id
+        # The prior row's durable advisor gate fact, handed to the END gate
+        # (ruling 2026-09-22). Parsed here, outside every ``try``: a corrupt
+        # envelope is Tier 1 and must propagate, not be mistaken for a
+        # compose failure.
+        prior_completion_gates_facts = parse_completion_gates(state_record.composer_meta) if state_record is not None else None
 
         # Fetch full chat history. Audit-only tool rows can trail a failed
         # user turn, so the recompose precondition is the last
@@ -204,6 +210,7 @@ async def recompose(
                         guided_terminal=_guided_terminal_for_compose,
                         user_message_id=request_id,
                         session_operation_context=compose_operation_lease.context,
+                        completion_gates=prior_completion_gates_facts,
                     )
             except ComposerConvergenceError as exc:
                 terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"

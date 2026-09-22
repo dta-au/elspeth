@@ -222,7 +222,7 @@ from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin, withheld_reply_envelope
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
+from elspeth.web.execution.completion_gates import CompletionGateFacts, advisor_signoff_check_failed
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -3970,6 +3970,9 @@ class ComposerServiceImpl:
         guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -4090,6 +4093,7 @@ class ComposerServiceImpl:
                     plugin_snapshot=plugin_snapshot,
                     policy_catalog=policy_catalog,
                     session_operation_context=session_operation_context,
+                    completion_gates=completion_gates,
                 )
             except ComposerConvergenceError as exc:
                 await emit_progress(
@@ -5591,6 +5595,9 @@ class ComposerServiceImpl:
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> _ClassifyOutcome:
         """Phase P5 of the compose loop — anti-anchor + budget classify.
 
@@ -5947,6 +5954,7 @@ class ComposerServiceImpl:
                             advisor_repair_context_introduced=advisor_repair_context_introduced,
                             advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                             deadline=deadline,
+                            completion_gates=completion_gates,
                         )
                     except _AdvisorCheckpointComposeDeadlineExpired:
                         # The model had already replied; the timeout envelope
@@ -6081,6 +6089,9 @@ class ComposerServiceImpl:
         composition_turns_used: int = 0,
         discovery_turns_used: int = 0,
         failed_turn: FailedTurnMetadata | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> _TerminateOutcome:
         """Phase P2 of the compose loop — handle the no-tool-calls branch.
 
@@ -6270,6 +6281,7 @@ class ComposerServiceImpl:
                 advisor_repair_context_introduced=advisor_repair_context_introduced,
                 advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                 deadline=deadline,
+                completion_gates=completion_gates,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             # The model had already replied; the timeout envelope carries no
@@ -6673,6 +6685,9 @@ class ComposerServiceImpl:
         advisor_repair_context_introduced: bool,
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
         """Run the shared terminal no-tool END advisor gate for P2 and P5.
 
@@ -6957,6 +6972,9 @@ class ComposerServiceImpl:
         plugin_snapshot: PluginAvailabilitySnapshot,
         policy_catalog: PolicyCatalogView,
         session_operation_context: SessionOperationContext | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 
@@ -7190,6 +7208,7 @@ class ComposerServiceImpl:
                     composition_turns_used=composition_turns_used,
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
+                    completion_gates=completion_gates,
                 )
                 if terminate.advisor_review_state is not None:
                     advisor_review_state = terminate.advisor_review_state
@@ -7543,6 +7562,7 @@ class ComposerServiceImpl:
                 advisor_repair_context_introduced=advisor_repair_context_introduced,
                 plugin_snapshot=plugin_snapshot,
                 advisor_review_state=advisor_review_state,
+                completion_gates=completion_gates,
             )
             composition_turns_used += classify.composition_turns_delta
             discovery_turns_used += classify.discovery_turns_delta

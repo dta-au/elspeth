@@ -5737,3 +5737,20 @@ def test_bound_advisor_pipeline_summary_publishes_marker_alone_when_no_line_fits
     assert bounded.startswith("additional_evidence_lines_withheld=2 ")
     assert "a" * 10 not in bounded
     assert len(bounded) <= 200
+
+
+def test_both_end_gate_call_sites_pass_the_durable_gate_fact():
+    """P2 and P5 share one gate; a site that omits the fact reviews where the other skips."""
+    from elspeth.web.composer import service as service_module
+
+    tree = ast.parse(inspect.getsource(service_module))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_evaluate_terminal_no_tool_advisor_gate"
+    ]
+    assert len(calls) == 2
+    for call in calls:
+        assert "completion_gates" in {kw.arg for kw in call.keywords}

@@ -471,8 +471,10 @@ class _BlockingRecordingComposer:
         guided_terminal=None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        completion_gates=None,
     ) -> ComposerResult:
-        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id, session_operation_context
+        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id
+        del session_operation_context, completion_gates
 
         self.calls.append(
             {
@@ -512,8 +514,9 @@ class _ProgressAwareComposer:
         guided_terminal=None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        completion_gates=None,
     ) -> ComposerResult:
-        del message, chat_messages, session_id, current_state_id, user_id, guided_terminal, user_message_id
+        del message, chat_messages, session_id, current_state_id, user_id, guided_terminal, user_message_id, completion_gates
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -11412,8 +11415,9 @@ class TestComposerProgressRoutes:
                 guided_terminal=None,
                 user_message_id: str | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                completion_gates=None,
             ) -> ComposerResult:
-                del message, chat_messages, session_id, current_state_id, user_id, progress, user_message_id
+                del message, chat_messages, session_id, current_state_id, user_id, progress, user_message_id, completion_gates
                 assert session_operation_context is not None
                 assert guided_terminal == guided.terminal
                 return ComposerResult(message="Freeform response", state=state)

@@ -81,6 +81,7 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
         guided_terminal=None,
         user_message_id=None,
         session_operation_context=None,
+        completion_gates=None,
     ):
         kwargs = {
             "message": message,
@@ -93,6 +94,7 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
             "guided_terminal": guided_terminal,
             "user_message_id": user_message_id,
             "session_operation_context": session_operation_context,
+            "completion_gates": completion_gates,
         }
 
         async def call(**kw):
