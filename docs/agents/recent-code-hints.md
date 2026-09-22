@@ -8,6 +8,23 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-23 — the advisor blocker's `detail` stopped claiming the composer's reply was withheld; the dead withheld
+  notices are deleted** (operator request after the reply-withholding self-review; branch `fix/withheld-notice-cleanup`)
+  Since the 2026-09-22 ruling a blocked turn publishes the composer's reply, but `_advisor_signoff_blocked_wording`
+  still defaulted to `_ADVISOR_SIGNOFF_PENDING_NOTICE` and the unverified builder passed
+  `_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE` — the WITHHELD forms. So every FLAGGED block's durable blocker, shown in the
+  DecisionPanel, said "ELSPETH withheld the composer's own summary" beside the published summary (`unavailable` and
+  `malformed` were clean: their arms do not embed the notice). Both now use the `_PUBLISHED_` notices, pinned by
+  `test_advisor_blocker_detail_never_claims_the_composer_reply_was_withheld` over all five reasons and all three
+  builders. A stored gate fact's `detail` is parsed only as a non-empty string, so no epoch bump: a block persisted
+  before this change keeps its old sentence until the graph changes. Deleted with the operator's go-ahead: the
+  withheld form of nine blocked-notice families (their notice/footer, bare suffix, wrapped template, recognizer arm and
+  segment-test case) and the `prose_withheld` parameter of the nine composers that only the END gate calls. Kept:
+  the withheld sign-off-pending and pending-handoff forms, which the advisor-repair replacer still produces, so
+  `compose_advisor_signoff_pending_message` and `compose_advisor_pending_handoff_message` still take the required
+  flag. Rule rewritten in
+  [CONTRIBUTING: Gate: wire-shape templates](../../CONTRIBUTING.md#gate-wire-shape-templates).
+
 - **2026-09-22 — the advisory reviewer's own words reach the user, as a bounded `note` on the advisor blocker; session epoch 65** (elspeth-032ec69c41 ruling; 351a15b6e, 6a34007fb, d8a6e2902, 37fc43c00, 539121b17, b5e458d1d, 9e13ef830)
   R2-F13 is NARROWED, not lifted. A FLAGGED verdict now parses into
   `AdvisorCheckpointVerdict.category` (closed set, `ADVISOR_FINDING_CATEGORIES`), `.affected_step_ids` (RAW) and `.note`
@@ -86,8 +103,8 @@ the same commit; the rules live there, the history lives here.
   for withheld prose to asserting, in the backend's voice, that completion was withheld whatever the published prose
   claims, so the gate now writes it unconditionally (both cohorts) ahead of the publication row. Measured limit: the
   control envelope's hash binds content only, so swapping one registered user-role origin for another replays cleanly.
-  Nine `prose_withheld=True` composer arms in `no_tool_policy.py` now have no producer (only case 5 withholds); they
-  are kept pending an operator ruling, not by design. Case 5 (`_replace_advisor_repair_public_result`, the
+  Nine `prose_withheld=True` composer arms in `no_tool_policy.py` had no producer (only case 5 withholds); the
+  operator ruled them deleted on 2026-09-23 (see that entry). Case 5 (`_replace_advisor_repair_public_result`, the
   CLEAN-after-repair replacement) still withholds and still reads `advisor_repair_context_introduced` in
   `_compose_loop`; do not "align" it — and because of it the repair-continue clauses name the exit ("make no change:
   tell the user what blocks you … That reply ends the turn.") without promising the user sees the reply. The coalesce

@@ -322,29 +322,8 @@ _WRAPPED_TEMPLATE_ROUND_TRIP_CASES = [
         {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
         id="_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
     ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
-        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL,
-        no_tool_policy._PREFLIGHT_NOTICE_HEADER,
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
-        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
-        id="_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL,
-        no_tool_policy._PREFLIGHT_NOTICE_HEADER,
-        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
-        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
-        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL",
-    ),
-    # The ``_PUBLISHED_`` twins: the same shapes for a block whose model prose
-    # is published beside the notice, so the withheld-prose disclosure is absent.
+    # The ``_PUBLISHED_`` notices: an END-gate block publishes the model's prose
+    # beside the notice, so these carry no withheld-prose disclosure.
     pytest.param(
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINDINGS_SUFFIX_WITH_DETAIL,
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE,
@@ -411,10 +390,11 @@ class TestWrappedDiagnosticWireShapeLinkage:
     ) -> None:
         """Through the WHOLE recognizer, not the splitter alone.
 
-        Several shapes share a header, and each ``_PUBLISHED_`` twin differs
-        from its withheld sibling only by the trailing disclosure sentence. The
-        splitter test above cannot see one arm claiming another's suffix; this
-        one can — a stolen suffix would come back under the wrong footer.
+        Several shapes share a header, and the pending-handoff findings shape
+        exists twice, differing only by the withheld-prose disclosure in its
+        header. The splitter test above cannot see one arm claiming another's
+        suffix; this one can — a stolen suffix would come back under the wrong
+        header or footer.
         """
         segments = no_tool_policy._canonical_trusted_suffix_segments(template.format(**format_kwargs))
         assert segments is not None
@@ -477,61 +457,6 @@ _BARE_SUFFIX_ROUND_TRIP_CASES = [
         id="_ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX",
     ),
     pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_NOTICE,
-        id="_ADVISOR_SIGNOFF_MALFORMED_PENDING_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_NOTICE,
-        id="_ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
-        f"{no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER}",
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
-        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER}",
-        id="_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
-        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER}",
-        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE",
-    ),
-    pytest.param(
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX,
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
         id="_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX",
@@ -546,7 +471,7 @@ _BARE_SUFFIX_ROUND_TRIP_CASES = [
         f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._PREFLIGHT_NOTICE_FOOTER}",
         id="_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE",
     ),
-    # The ``_PUBLISHED_`` twins of the END-gate blocked notices.
+    # The END-gate blocked notices, published beside the model's reply.
     pytest.param(
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX,
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
@@ -674,51 +599,25 @@ class TestBareTrustedSuffixCompleteness:
 _RED_COMPOSER_BARE_FALLBACK_CASES = [
     pytest.param(
         no_tool_policy.compose_advisor_signoff_unrepairable_red_message,
-        True,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_BARE,
         id="unrepairable",
     ),
     pytest.param(
         no_tool_policy.compose_advisor_signoff_flagged_red_message,
-        True,
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE,
         id="flagged",
     ),
     pytest.param(
         no_tool_policy.compose_advisor_signoff_unrendered_red_message,
-        True,
-        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
-        id="unrendered",
-    ),
-    # The published-prose member of each pair falls back to its OWN bare twin:
-    # handing it the withheld sibling's fallback would publish "ELSPETH
-    # withheld the composer's own summary" directly beneath that summary.
-    pytest.param(
-        no_tool_policy.compose_advisor_signoff_unrepairable_red_message,
-        False,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_BARE,
-        id="unrepairable-published",
-    ),
-    pytest.param(
-        no_tool_policy.compose_advisor_signoff_flagged_red_message,
-        False,
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE,
-        id="flagged-published",
-    ),
-    pytest.param(
-        no_tool_policy.compose_advisor_signoff_unrendered_red_message,
-        False,
         no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_BARE,
-        id="unrendered-published",
+        id="unrendered",
     ),
 ]
 
 
 class TestRedComposerBareFallbackPairing:
-    @pytest.mark.parametrize(("composer", "prose_withheld", "expected_bare_suffix"), _RED_COMPOSER_BARE_FALLBACK_CASES)
-    def test_detail_less_red_result_falls_back_to_the_composers_own_class_framing(
-        self, composer, prose_withheld: bool, expected_bare_suffix: str
-    ) -> None:
+    @pytest.mark.parametrize(("composer", "expected_bare_suffix"), _RED_COMPOSER_BARE_FALLBACK_CASES)
+    def test_detail_less_red_result_falls_back_to_the_composers_own_class_framing(self, composer, expected_bare_suffix: str) -> None:
         detail_less_red = ValidationResult(
             is_valid=False,
             checks=[],
@@ -731,10 +630,12 @@ class TestRedComposerBareFallbackPairing:
             ),
         )
 
-        message = composer("model prose", runtime_result=detail_less_red, prose_withheld=prose_withheld)
+        message = composer("model prose", runtime_result=detail_less_red)
 
         assert message == "model prose" + expected_bare_suffix
-        assert (no_tool_policy.ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE in message) is prose_withheld
+        # The reply is published beside this notice, so it must not claim the
+        # reply was withheld.
+        assert no_tool_policy.ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in message
 
 
 class TestInterpretationReviewHandoffSegments:

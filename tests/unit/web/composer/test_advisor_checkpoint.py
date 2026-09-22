@@ -45,6 +45,7 @@ from elspeth.web.composer.no_tool_policy import (
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE,
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL,
+    ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE,
     AssistantTextSegment,
     TrustedSystemNoticeSegment,
     is_pending_interpretation_handoff,
@@ -3197,6 +3198,28 @@ def test_advisor_completion_blocker_copy_does_not_claim_whole_pipeline_approval(
     assert "approve" not in rendered
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["flagged_final_pass", "flagged_no_repair", "flagged_unrepairable", "unavailable", "malformed"],
+)
+def test_advisor_blocker_detail_never_claims_the_composer_reply_was_withheld(reason: str) -> None:
+    """A blocked turn publishes the composer's reply (elspeth-032ec69c41), and
+    these builders serve only that blocked result. The durable blocker the
+    DecisionPanel shows sits beside that published reply, so it must not say
+    ELSPETH withheld the composer's summary."""
+    from elspeth.web.composer.service import (
+        _advisor_signoff_blocked_validation,
+        _advisor_signoff_blocked_wording,
+        _advisor_signoff_unverified_validation,
+    )
+
+    detail, suggestion = _advisor_signoff_blocked_wording(reason=reason, findings="advisor provider result")
+    assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in f"{detail} {suggestion}"
+    for builder in (_advisor_signoff_blocked_validation, _advisor_signoff_unverified_validation):
+        validation = builder(reason=reason, findings="advisor provider result", category="other", step_ids=(), note=None)
+        assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in validation.model_dump_json()
+
+
 @pytest.mark.asyncio
 async def test_end_gate_unavailable_wire_payload_stays_fixed_language(make_service, clean_runnable_state):
     """C2 non-regression: the unavailable/malformed branch carries a fixed
@@ -3447,22 +3470,22 @@ def test_signoff_unverified_note_mints_trusted_chrome() -> None:
     suffix, or its fixed backend copy renders as ordinary (unattributed)
     assistant text."""
     from elspeth.web.composer.no_tool_policy import (
-        _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+        _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
         TrustedSystemNoticeSegment,
         compose_advisor_signoff_unverified_message,
         visible_message_segments,
     )
 
     raw = "Done — the pipeline is ready."
-    content = compose_advisor_signoff_unverified_message(raw, prose_withheld=True)
+    content = compose_advisor_signoff_unverified_message(raw)
     segments = visible_message_segments(content=content, raw_content=raw)
-    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE)
+    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE)
 
-    # The blocked terminal composes over withheld prose (raw_content == "");
-    # the recognizer's empty-prefix arm must mint the same chrome.
-    bare = compose_advisor_signoff_unverified_message("", prose_withheld=True)
+    # A blocked turn whose model reply was empty composes over "" — the
+    # recognizer's empty-prefix arm must mint the same chrome.
+    bare = compose_advisor_signoff_unverified_message("")
     segments = visible_message_segments(content=bare, raw_content="")
-    assert segments == (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE),)
+    assert segments == (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE),)
 
 
 def test_prescan_user_message_finding_carries_unactionable_surface(simple_state) -> None:
@@ -3818,23 +3841,23 @@ async def test_blocked_terminal_trusted_bytes_are_request_independent(make_servi
 
 def test_signoff_unrepairable_note_mints_trusted_chrome() -> None:
     """Sibling of ``test_signoff_unverified_note_mints_trusted_chrome``: the
-    unrepairable terminal composes over withheld prose, so its fixed copy must
-    be in the closed canonical-suffix set or it renders unattributed."""
+    unrepairable terminal's fixed copy must be in the closed canonical-suffix
+    set or it renders unattributed, with or without the model's reply."""
     from elspeth.web.composer.no_tool_policy import (
-        _ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE,
+        _ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE,
         TrustedSystemNoticeSegment,
         compose_advisor_signoff_unrepairable_message,
         visible_message_segments,
     )
 
     raw = "Done — the pipeline is ready."
-    content = compose_advisor_signoff_unrepairable_message(raw, prose_withheld=True)
+    content = compose_advisor_signoff_unrepairable_message(raw)
     segments = visible_message_segments(content=content, raw_content=raw)
-    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE)
+    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE)
 
-    bare = compose_advisor_signoff_unrepairable_message("", prose_withheld=True)
+    bare = compose_advisor_signoff_unrepairable_message("")
     segments = visible_message_segments(content=bare, raw_content="")
-    assert segments == (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE),)
+    assert segments == (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE),)
 
 
 @pytest.mark.asyncio
