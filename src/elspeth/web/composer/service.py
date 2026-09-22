@@ -8482,7 +8482,11 @@ class ComposerServiceImpl:
                 "withheld entry as absent. "
                 "CLEAN means only that no blocking defect is visible in the supplied advisory evidence; "
                 "it is not certification of withheld, omitted, or truncated constraints. "
-                "Start your reply with CLEAN or FLAGGED."
+                "Start your reply with CLEAN or FLAGGED. After a FLAGGED verdict, end with two "
+                "lines: 'CATEGORY: <request_not_met|error_handling|prompt_defect|schema_mismatch|other>' "
+                "and 'STEPS: <comma-separated step ids from the pipeline excerpt, or none>'. "
+                "Your FLAGGED prose is shown to the user as your note: write it for them, "
+                "name the step and the option, and do not quote user text or row data."
             ),
             "recent_errors": recent_errors,
             "attempted_actions": attempted_actions,
@@ -9735,6 +9739,18 @@ class AdvisorCheckpointVerdict:
     # applied inline by ``_run_advisor_checkpoint``'s exception handling and
     # read by ``_evaluate_terminal_no_tool_advisor_gate``.
     failure_class: Literal["none", "unavailable", "malformed"] = "none"
+    # elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): populated on
+    # the FLAGGED arm of ``_parse_advisor_checkpoint_guidance`` only. The
+    # category is already normalised to ``ADVISOR_FINDING_CATEGORIES``; the
+    # step ids are RAW, as the advisor wrote them, and are checked against
+    # the pipeline state by the blocker builder, not here; the note is the
+    # advisor's own prose after the verdict token, bounded and sanitised by
+    # ``_advisor_note_text`` — the one place the advisor's words are prepared
+    # for a user surface. ``None`` for CLEAN, for ``ok=False`` (the
+    # "findings" there are fixed backend copy) and for an empty body.
+    category: str = "other"
+    affected_step_ids: tuple[str, ...] = ()
+    note: str | None = None
 
 
 def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdict:
@@ -9798,7 +9814,24 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
             # FLAGGED, and the scan is unbounded in this direction only —
             # blocking is the safe direction. The second arm is the widened
             # any-register FLAGGED (terminator-guarded; see its definition).
-            return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=text)
+            # The machine lines are read from the whole reply: an absent or
+            # unrecognised CATEGORY is "other", an absent STEPS line or the
+            # literal "none" is no step ids.
+            category_match = _ADVISOR_CATEGORY_LINE_RE.search(text)
+            category = category_match.group(1).lower() if category_match else "other"
+            if category not in ADVISOR_FINDING_CATEGORIES:
+                category = "other"
+            steps_match = _ADVISOR_STEPS_LINE_RE.search(text)
+            raw_steps = steps_match.group(1) if steps_match else ""
+            affected = tuple(step for step in _ADVISOR_STEP_ID_RE.findall(raw_steps) if step.lower() != "none")
+            return AdvisorCheckpointVerdict(
+                ok=True,
+                blocking=True,
+                findings_text=text,
+                category=category,
+                affected_step_ids=affected,
+                note=_advisor_note_text(text),
+            )
         # CLEAN acceptance reads its own scanned copy, in which a code span
         # holding lowercase text keeps its backticks (quoted data, e.g. a field
         # named ``clean``); FLAGGED dominance above keeps the full strip.
@@ -10864,6 +10897,45 @@ def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) 
 _ADVISOR_FINDINGS_MAX_CHARS: Final[int] = 4_000
 _ADVISOR_FINDINGS_UNTRUSTED_BEGIN: Final[str] = "BEGIN_UNTRUSTED_ADVISOR_FINDINGS"
 _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
+
+# elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): the advisor's own
+# words reach the user as a labelled note. Bounded here, once, before any
+# surface or row sees them. The category vocabulary is closed: the blocker
+# header is chosen from it server-side, never from advisor text.
+ADVISOR_NOTE_MAX_CHARS: Final[int] = 600
+ADVISOR_FINDING_CATEGORIES: Final[frozenset[str]] = frozenset(
+    {"request_not_met", "error_handling", "prompt_defect", "schema_mismatch", "other"}
+)
+_ADVISOR_CATEGORY_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\s*CATEGORY\s*:\s*([a-z_]+)\s*$", re.IGNORECASE | re.MULTILINE)
+_ADVISOR_STEPS_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^\s*STEPS\s*:\s*(.*?)\s*$", re.IGNORECASE | re.MULTILINE)
+_ADVISOR_STEP_ID_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_.\-]+")
+# ANSI CSI escape sequences first, then C0 controls (minus \t \n \r) and DEL:
+# ESC is itself a C0 byte, so with the classes the other way round the
+# alternation consumed the ESC alone and left ``[31m`` in the note.
+_ADVISOR_NOTE_CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _advisor_note_text(findings_text: str) -> str | None:
+    """The advisor's prose after the verdict token, bounded and sanitised, or None.
+
+    Removes the leading verdict token (``_ADVISOR_VERDICT_LINE_RE``, the
+    anchored CLEAN/FLAGGED lead), the CATEGORY/STEPS machine lines, the
+    untrusted-findings fence sentinels and control characters. Markdown
+    emphasis is left alone on purpose: ``_ADVISOR_MARKDOWN_EMPHASIS_RE``
+    strips underscores, which would mangle step ids the note names.
+    """
+    body = _ADVISOR_VERDICT_LINE_RE.sub("", findings_text.strip(), count=1)
+    body = _ADVISOR_CATEGORY_LINE_RE.sub("", body)
+    body = _ADVISOR_STEPS_LINE_RE.sub("", body)
+    body = body.replace(_ADVISOR_FINDINGS_UNTRUSTED_BEGIN, "").replace(_ADVISOR_FINDINGS_UNTRUSTED_END, "")
+    body = _ADVISOR_NOTE_CONTROL_RE.sub("", body).strip()
+    if not body:
+        return None
+    if len(body) > ADVISOR_NOTE_MAX_CHARS:
+        body = body[: ADVISOR_NOTE_MAX_CHARS - 1].rstrip() + "…"
+    return body
+
+
 # R2-F12 (elspeth-bff8fe6864): the user-facing output-contract sentence
 # shared by BOTH advisor-injection sites (the END gate's FLAGGED repair
 # message and the EARLY advisory transition message) — a single source of

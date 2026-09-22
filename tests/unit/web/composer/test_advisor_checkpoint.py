@@ -620,7 +620,10 @@ async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_complet
         **_fenced_session(service),
     )
 
-    assert verdict == AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=findings)
+    # The parsed verdict is the model's, untouched by the telemetry failure;
+    # its note is the advisor's prose (the canary here), which must still
+    # never reach the telemetry sinks below.
+    assert verdict == AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=findings, note="TELEMETRY_FAILURE_FINDINGS_CANARY")
     logger.info.assert_called_once()
     counter.add.assert_called_once_with(1, {"phase": "end", "verdict": "flagged", "source": "model"})
     assert "TELEMETRY_FAILURE_FINDINGS_CANARY" not in repr(logger.info.call_args)
@@ -1842,6 +1845,73 @@ def test_parse_advisor_verdict_negation_cannot_mint_a_signoff(guidance: str) -> 
 
     assert verdict.ok is True
     assert verdict.blocking is True, f"fail-open: {guidance!r} minted a sign-off"
+
+
+# ---------------------------------------------------------------------------
+# Ruling 2026-09-22 (elspeth-032ec69c41, "store, bounded"): a FLAGGED verdict
+# carries a closed category, the advisor's raw step ids and a bounded,
+# sanitised note — the advisor's own words, parsed once here before any
+# surface or durable row sees them.
+# ---------------------------------------------------------------------------
+
+
+def test_flagged_verdict_parses_category_steps_and_note() -> None:
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance(
+        "FLAGGED: the request asked for error capture at the merge; both branches now discard.\n"
+        "CATEGORY: request_not_met\n"
+        "STEPS: merge_ab, eval_a\n"
+    )
+    assert verdict.blocking is True
+    assert verdict.category == "request_not_met"
+    assert verdict.affected_step_ids == ("merge_ab", "eval_a")
+    assert verdict.note == "the request asked for error capture at the merge; both branches now discard."
+
+
+def test_missing_machine_lines_fall_back_to_other_and_no_steps() -> None:
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance("FLAGGED — sink omits the rating column.")
+    assert verdict.category == "other"
+    assert verdict.affected_step_ids == ()
+    assert verdict.note == "sink omits the rating column."
+
+
+def test_unknown_category_normalises_to_other() -> None:
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance("FLAGGED: x\nCATEGORY: vibes\nSTEPS: none")
+    assert verdict.category == "other"
+    assert verdict.affected_step_ids == ()
+
+
+def test_note_is_bounded_and_sanitised() -> None:
+    from elspeth.web.composer.service import (
+        _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
+        _ADVISOR_FINDINGS_UNTRUSTED_END,
+        ADVISOR_NOTE_MAX_CHARS,
+        _advisor_note_text,
+    )
+
+    long = "a" * (ADVISOR_NOTE_MAX_CHARS + 50)
+    note = _advisor_note_text(f"FLAGGED: {long}")
+    assert note is not None
+    assert len(note) == ADVISOR_NOTE_MAX_CHARS
+    assert note.endswith("…")
+    dirty = f"FLAGGED: keep\x00this {_ADVISOR_FINDINGS_UNTRUSTED_BEGIN} and {_ADVISOR_FINDINGS_UNTRUSTED_END}\x1b[31m"
+    assert _advisor_note_text(dirty) == "keepthis  and"
+    assert _advisor_note_text("FLAGGED:") is None
+    assert _advisor_note_text("CLEAN") is None
+
+
+def test_clean_and_unrendered_verdicts_carry_no_note() -> None:
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    assert _parse_advisor_checkpoint_guidance("CLEAN").note is None
+    malformed = _parse_advisor_checkpoint_guidance("I am not sure")
+    assert malformed.ok is False or malformed.blocking is False
+    assert malformed.note is None
 
 
 @pytest.mark.parametrize(
@@ -4535,7 +4605,10 @@ def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, 
     assert "each queries.<name>.template plus the shared system_prompt" in end_summary
     assert "length-independent interpolated row fields" in end_summary
     assert "fabricate" in end_summary
-    assert end_summary.rstrip().endswith("Start your reply with CLEAN or FLAGGED.")
+    # The verdict-format instruction and, since the 2026-09-22 ruling, the
+    # machine lines + note instruction close the END rubric.
+    assert "Start your reply with CLEAN or FLAGGED. After a FLAGGED verdict, end with two lines" in end_summary
+    assert end_summary.rstrip().endswith("do not quote user text or row data.")
 
     assert "visible effective prompt text" not in early_summary
     assert "fabricate" not in early_summary
