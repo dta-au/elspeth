@@ -301,6 +301,62 @@ async def test_durable_stream_integrity_failure_closes_1011_and_propagates() -> 
 
 
 @pytest.mark.asyncio
+async def test_durable_stream_transient_backend_failure_closes_4503_and_propagates() -> None:
+    """A momentary database outage invites the client back; it does not stop it.
+
+    This is also the ordering pin for the two backend arms in
+    ``_stream_durable_run_progress``. ``OperationalError`` is a
+    ``SQLAlchemyError``, so if the broad arm is ever written above the
+    transient one it swallows this case and the close code silently becomes
+    1011 — the socket still closes, nothing raises, and only this assertion
+    notices.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
+    from elspeth.web.execution.websocket_close import RunStreamCloseCode
+
+    app = _create_ws_test_app()
+    run_id = str(uuid4())
+    app.state.run_progress_reader = RepositoryRunProgressReader(cast(Any, None))
+    websocket = FakeWebSocket(app)
+    outage = OperationalError("SELECT 1", (), Exception("server closed the connection unexpectedly"))
+    with (
+        patch.object(RepositoryRunProgressReader, "read_after", side_effect=outage),
+        pytest.raises(OperationalError),
+    ):
+        await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+    assert websocket.close_code == RunStreamCloseCode.BACKEND_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_durable_stream_permanent_backend_failure_closes_1011_and_propagates() -> None:
+    """A defective query fails identically on reconnect, so the client stops.
+
+    The negative half of the pair above: widening
+    ``TRANSIENT_BACKEND_FAILURES`` to all of ``SQLAlchemyError`` would send
+    this to 4503 and spin the client through the whole backoff ladder against
+    a fault no reconnect can clear.
+    """
+    from sqlalchemy.exc import ProgrammingError
+
+    from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
+    from elspeth.web.execution.websocket_close import RunStreamCloseCode
+
+    app = _create_ws_test_app()
+    run_id = str(uuid4())
+    app.state.run_progress_reader = RepositoryRunProgressReader(cast(Any, None))
+    websocket = FakeWebSocket(app)
+    defect = ProgrammingError("SELECT nope", (), Exception('column "nope" does not exist'))
+    with (
+        patch.object(RepositoryRunProgressReader, "read_after", side_effect=defect),
+        pytest.raises(ProgrammingError),
+    ):
+        await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+    assert websocket.close_code == RunStreamCloseCode.INTERNAL_ERROR
+
+
+@pytest.mark.asyncio
 async def test_durable_terminal_event_closes_without_local_status_projection() -> None:
     from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
 
