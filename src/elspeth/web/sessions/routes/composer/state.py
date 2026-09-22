@@ -536,13 +536,15 @@ async def get_composer_progress(
     registry = _get_composer_progress_registry(request)
     # The durable authority re-checks committed identity and ownership inside
     # its own snapshot, so access revoked or a session archived between the
-    # checks above and that read is denied there. Answer exactly as the
-    # earlier checks would have: a disabled login and a non-disclosing 404,
-    # never a server error for an expected concurrent access change.
+    # checks above and that read is denied there. Answer as the next request
+    # would be answered anyway: the opaque 401 the per-request token check
+    # gives a revoked principal (auth/session_token.py), and the
+    # non-disclosing 404 the ownership check gives. Never a server error for
+    # an expected concurrent access change.
     try:
         return await registry.get_latest(str(session.id), user.user_id)
     except ComposerProgressIdentityInactive:
-        raise HTTPException(status_code=401, detail="This account has been disabled") from None
+        raise HTTPException(status_code=401, detail="Invalid token") from None
     except ComposerProgressSessionUnavailable:
         raise HTTPException(status_code=404, detail="Session not found") from None
 

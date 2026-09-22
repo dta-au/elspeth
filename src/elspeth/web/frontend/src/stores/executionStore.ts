@@ -131,9 +131,8 @@ interface ExecutionState {
    * 3s loadRuns loop) also records it when the poll observes the active run
    * terminal while progress still says in-flight — the WS-drop degraded
    * path must not silently reinstate the off-Run-tab silence this state
-   * exists to fix. Known gap: that poll only runs while the Run tab body is
-   * mounted, so a WS drop with the Run tab closed still surfaces the
-   * outcome only on the next Run-tab visit.
+   * exists to fix. With the Run tab closed, the store-owned recovery poll
+   * armed on a stream that ends for good (1000/1011) records it instead.
    */
   lastRunOutcome: RunOutcome | null;
   /**
@@ -207,6 +206,21 @@ let executionRequestSeq = 0;
  */
 const RUN_RECOVERY_POLL_INTERVAL_MS = 3000;
 let runRecoveryPollTimer: ReturnType<typeof setInterval> | null = null;
+// The read a recovery tick is still waiting on. A tick never starts a second
+// read while one is pending: this poll exists for a degraded server, where a
+// read can outlast the interval, and overlapping reads answer in whatever
+// order the network returns them — the same fault the composer pollers'
+// read tickets fix. Deliberately NOT cleared by stopRunRecoveryPoll, so a
+// read left over from a superseded poll still holds off the next one, and
+// only the read that set it may release it.
+//
+// Bounded by age because authFetch sets no timeout: a read that never
+// settles would otherwise stop recovery for good, which is worse than the
+// overlap it prevents. Past the bound a tick starts a fresh read anyway; the
+// late reply is then harmless, because loadRuns' reconciliation only ever
+// moves progress from live to terminal.
+const RUN_RECOVERY_READ_STALE_MS = 30_000;
+let runRecoveryPollInFlight: { read: Promise<unknown>; startedAt: number } | null = null;
 
 function stopRunRecoveryPoll(): void {
   if (runRecoveryPollTimer !== null) {
@@ -848,12 +862,24 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
             stopRunRecoveryPoll();
             return;
           }
+          if (
+            runRecoveryPollInFlight !== null &&
+            Date.now() - runRecoveryPollInFlight.startedAt < RUN_RECOVERY_READ_STALE_MS
+          ) {
+            return;
+          }
           const sessionId = useSessionStore.getState().activeSessionId;
           if (sessionId === null) return;
           // loadRuns carries the degraded-path reconciliation that records
           // the outcome and retires progress; the next tick then sees the
-          // terminal status and stops this poll.
-          void get().loadRuns(sessionId);
+          // terminal status and stops this poll. It never rejects (it maps
+          // every failure to "unavailable"), so the release always runs.
+          const read = get().loadRuns(sessionId);
+          const claim = { read, startedAt: Date.now() };
+          runRecoveryPollInFlight = claim;
+          void read.finally(() => {
+            if (runRecoveryPollInFlight === claim) runRecoveryPollInFlight = null;
+          });
         }, RUN_RECOVERY_POLL_INTERVAL_MS);
       },
       onProgress(event: RunEvent, _data: RunEventProgress) {
@@ -967,9 +993,11 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         // terminal event was lost — record the outcome (stamped with the
         // LAUNCH session) and reconcile progress.status so the always-mounted
         // surfaces (toast, badge) and ProgressView retire instead of showing
-        // a live run forever. Known gap: this poll only runs while the Run
-        // tab body is mounted (InlineRunResults' 3s loop), so a WS drop with
-        // the Run tab closed still surfaces only on the next Run-tab visit.
+        // a live run forever. Two callers drive it: InlineRunResults' 3s loop
+        // while the Run tab body is mounted, and the store-owned recovery
+        // poll (see RUN_RECOVERY_POLL_INTERVAL_MS) armed when the stream ends
+        // for good on 1000/1011, which covers the Run tab being closed. A
+        // drop that reconnects (1006/4503) is recovered by the socket itself.
         const activeRow =
           state.activeRunId !== null
             ? runs.find((run) => run.id === state.activeRunId)

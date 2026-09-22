@@ -11351,8 +11351,11 @@ class TestComposerProgressRoutes:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.get(f"/api/sessions/{service.session.id}/composer-progress")
 
+        # The same opaque answer the per-request token check gives a revoked
+        # principal (auth/session_token.py): this endpoint must not tell a
+        # revoked user more than every other endpoint does.
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "This account has been disabled"
+        assert resp.json()["detail"] == "Invalid token"
 
     @pytest.mark.asyncio
     async def test_progress_endpoint_translates_session_archived_between_checks(self, tmp_path) -> None:
@@ -11588,7 +11591,7 @@ class TestComposerInFlightEndpoint:
             resp = await client.get("/api/sessions/_active")
 
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "This account has been disabled"
+        assert resp.json()["detail"] == "Invalid token"
 
     @pytest.mark.asyncio
     async def test_route_path_does_not_collide_with_session_id_route(self, tmp_path) -> None:

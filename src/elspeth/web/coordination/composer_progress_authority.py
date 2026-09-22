@@ -114,8 +114,8 @@ class ComposerProgressIdentityInactive(PermissionError):
     """The committed identity row is no longer ``active``.
 
     Access can be revoked between a route's authentication and the authority's
-    own snapshot; the authority re-checks and denies. Routes translate this to
-    the same response a disabled login receives rather than a server error.
+    own snapshot; the authority re-checks and denies. Routes answer with the
+    opaque 401 the per-request token check gives, not a server error.
     """
 
 

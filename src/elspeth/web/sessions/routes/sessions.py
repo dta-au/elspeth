@@ -876,11 +876,13 @@ def register_session_routes(router: APIRouter) -> None:
         registry = _get_composer_progress_registry(request)
         # The durable authority re-checks the committed identity inside its
         # own snapshot; an identity disabled after authentication is denied
-        # there and answered as a disabled login, not a server error.
+        # there and answered with the same opaque 401 the per-request token
+        # check gives a revoked principal (auth/session_token.py), not a
+        # server error.
         try:
             snapshots = await registry.list_active(user_id=str(user.user_id))
         except ComposerProgressIdentityInactive:
-            raise HTTPException(status_code=401, detail="This account has been disabled") from None
+            raise HTTPException(status_code=401, detail="Invalid token") from None
         return list(snapshots)
 
     @router.get("/{session_id}", response_model=SessionResponse)
