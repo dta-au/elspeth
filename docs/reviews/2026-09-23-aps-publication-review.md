@@ -3,7 +3,21 @@
 **Date:** 2026-09-23
 **Scope:** every `.md` file in `docs/github-issues/issues/` (46 files, 2,773 lines)
 **Question:** does anything in these files reflect badly on the Australian Public Service?
-**Target:** `github.com/dta-au/elspeth`, public, issues not deletable by either available account
+**Target:** `github.com/dta-au/elspeth`, public
+
+> **Two header corrections, made after the review was delivered.** The brief told the
+> reviewer that issues would not be deletable by either available account. That was measured
+> from the wrong account: `johnm-dta` holds `admin: true` on this repository and an admin can
+> delete an issue. It changes no verdict — the amplification argument in §1 rests on
+> indexing, notification and cross-linking, and deleting an issue does not recall the
+> notifications it sent — but the claim itself was false and appears again at §1.
+>
+> The exact strings recommended for removal in §5.1 and §5.2 have been replaced with
+> bracketed placeholders. They had done their job — every edit was applied and controlled to
+> zero remaining matches — and leaving them here would have re-published, in this public
+> repository, two of the things the review existed to remove. The reviewer raised this risk
+> itself and left the call to the maintainer; this is the call. The original text remains in
+> the diff at commit `1c79f56d5` for anyone auditing the edit.
 
 **Verdict: 34 PASS · 10 FIX · 2 HOLD.** No file leaks an infrastructure identifier, a
 client name, a person, a credential or a home path. Register is clean: zero first-person
@@ -30,8 +44,9 @@ $ git diff --stat origin/release/0.8.1 HEAD -- docs/github-issues/issues/
 
 So importing them creates no new disclosure of their *text*. What the import adds is
 **amplification and permanence**: a GitHub issue is indexed, notified, linked, and — per the
-brief — not deletable by either available account, where a file in a docs directory is none
-of those things.
+brief — not deletable by either available account [corrected: see the header — `johnm-dta`
+is an admin and can delete one; the notifications it sent cannot be recalled], where a file
+in a docs directory is none of those things.
 
 Two consequences run through this report:
 
@@ -249,7 +264,7 @@ capacity and saturation belong in the same family.
 
 **Edit 1 — OLD** (end of the "Measured on disk" paragraph):
 
-> There were 28 runs on 5 September alone. The filesystem at the time of measurement: 1.7 TB total, 1.2 TB used, 463 GB available, 72% full. At the observed run rate the remaining headroom is weeks rather than months.
+> There were 28 runs on 5 September alone. The filesystem at the time of measurement: [total, used, available and percent-full figures removed — see below]. At the observed run rate the remaining headroom is weeks rather than months.
 
 **NEW:**
 
@@ -257,7 +272,7 @@ capacity and saturation belong in the same family.
 
 **Edit 2 — OLD** (the whole `## Impact beyond disk` paragraph):
 
-> The same machines run the project's local test suites. Disk pressure and cache eviction on a host measured at load 41 during concurrent CI may be upstream of some of the intermittent CI timing failures seen on this project. That link is **not** claimed as measured — it is a reason to fix this rather than defer it.
+> The same machines run the project's local test suites. Disk pressure and cache eviction on a host measured at [load figure removed — see below] during concurrent CI may be upstream of some of the intermittent CI timing failures seen on this project. That link is **not** claimed as measured — it is a reason to fix this rather than defer it.
 
 **NEW:**
 
@@ -277,9 +292,9 @@ the file internally consistent and removes a line a reader could lift out of con
 Measured on a staging deployment on 2026-09-13. One session composed on 2026-09-07 records
 its authoring model in its interpretation events:
 
-    model_identifier: openrouter/anthropic/claude-sonnet-5
-    model_version:    anthropic/claude-sonnet-5
-    provider:         openrouter
+    model_identifier: [provider/vendor/model removed — see below]
+    model_version:    [vendor/model removed — see below]
+    provider:         [provider removed — see below]
 ```
 
 **NEW:**

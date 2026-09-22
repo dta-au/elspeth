@@ -32,8 +32,8 @@ Australian Public Service. It returned 34 PASS, 10 FIX and these 2 HOLD.
 **Read this before assuming a hold contains anything.** Every file in this directory is
 tracked and has been on `origin/release/0.8.1` — a public repository — since it was
 written. Withholding the import withholds *amplification*: a GitHub issue is indexed,
-notified, cross-linked and not deletable by the accounts available here. It does not
-withhold the text. For anything where the content itself is the concern, holding the
+notified and cross-linked, and its notifications cannot be recalled even by deleting it.
+It does not withhold the text. For anything where the content itself is the concern, holding the
 import alone is theatre and the tracked file has to be dealt with too.
 
 | File | Why it is held | The decision needed |
