@@ -789,7 +789,8 @@ def test_compute_snapshot_validates_already_read_state():
 
 def test_compute_snapshot_passes_persisted_completion_gates():
     """The record's completion_gates envelope reaches the readiness recompute."""
-    from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+    from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
+    from elspeth.web.execution.completion_gates import CompletionGateFacts
 
     state = _state(transforms=(("t", "passthrough"),))
     exec_svc = _ExecutionServiceDouble(_OK)
@@ -798,13 +799,15 @@ def test_compute_snapshot_passes_persisted_completion_gates():
         session_service=_make_session_service(
             composer_meta={
                 "completion_gates": {
+                    "schema_version": 2,
                     "advisor_signoff": {
+                        "cause": "graph_rejected",
                         "suggestion": None,
                         "status": "blocked",
                         "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                         "for_graph": "0" * 64,
                         "note": None,
-                    }
+                    },
                 }
             }
         ),
@@ -825,6 +828,7 @@ def test_compute_snapshot_passes_persisted_completion_gates():
     assert args == (state,)
     assert kwargs["completion_gates"] == CompletionGateFacts(
         advisor_signoff=AdvisorSignoffGateFact(
+            cause=AdvisorBlockCause.GRAPH_REJECTED,
             suggestion=None,
             detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
             for_graph="0" * 64,

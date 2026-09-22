@@ -3699,7 +3699,7 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
         ]
     )
 
-    await composer._run_one_turn_for_test(
+    result = await composer._run_one_turn_for_test(
         llm=llm,
         session_id=str(session_id),
         current_state_id=str(state_id),
@@ -3711,6 +3711,10 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
     # PT site suppressed it). Discriminate on the END phase for robustness.
     end_calls = [call for call in advisor_mock.await_args_list if call.kwargs.get("phase") == "end"]
     assert end_calls, "P5 budget-exhaustion END advisor gate must fire for a PT pipeline"
+    from elspeth.web.composer.advisor_decision import AdvisorGatePassed
+    from elspeth.web.execution.completion_gates import completion_gate_fingerprint
+
+    assert result.advisor_gate_decision == AdvisorGatePassed(completion_gate_fingerprint(state))
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     assert any(e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE for e in events)
 
@@ -4349,12 +4353,34 @@ async def test_staged_handoff_threads_the_persisted_row_content_to_the_route(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_prior_block", [False, True])
 async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matches_terminal_turn(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+    with_prior_block: bool,
 ) -> None:
     """A P4 advisor-repair substitution is not the terminal model prose."""
     composer = _build_composer(tmp_path, sessions_service)
+    if with_prior_block:
+        from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
+        from elspeth.web.execution.completion_gates import CompletionGateFacts, completion_gate_fingerprint
+
+        original_classify = composer._classify_and_budget_turn
+
+        async def classify_with_prior(**kwargs: Any) -> Any:
+            kwargs["completion_gates"] = CompletionGateFacts(
+                advisor_signoff=AdvisorSignoffGateFact(
+                    detail="Previous advisor outage",
+                    suggestion=None,
+                    note=None,
+                    for_graph=completion_gate_fingerprint(kwargs["dispatch"].state),
+                    cause=AdvisorBlockCause.UNAVAILABLE,
+                )
+            )
+            return await original_classify(**kwargs)
+
+        monkeypatch.setattr(composer, "_classify_and_budget_turn", classify_with_prior)
     composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the interpretation before completion")
     )
@@ -4403,6 +4429,13 @@ async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matc
     assert result.persisted_assistant_content == ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
     assert result.persisted_assistant_content != _REVIEW_TURN_PROSE
     assert result.persisted_assistant_matches_terminal_model_turn is False
+    if with_prior_block:
+        assert result.advisor_gate_decision is None
+        assert result.runtime_preflight.readiness.completion_ready is True
+        assert any(
+            check.name == "advisor_signoff" and not check.passed and "review remains outstanding" in check.detail
+            for check in result.runtime_preflight.checks
+        )
 
 
 @pytest.mark.asyncio

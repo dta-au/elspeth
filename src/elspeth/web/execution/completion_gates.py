@@ -6,8 +6,8 @@ pipeline graph, so readiness recomputes cannot rediscover it. This module
 owns the persistence envelope for those facts inside ``composer_meta`` and
 the read-side merge into a recomputed ``ValidationResult``:
 
-- ``completion_gates_meta_value`` derives the envelope a compose save
-  persists (writer side, ``_state_data_from_composer_state``);
+- ``resolve_completion_gate_facts`` applies an explicit advisor decision;
+- ``completion_gates_meta_from_facts`` serializes the effective facts;
 - ``parse_completion_gates`` parses the envelope back off a
   ``composition_states`` row (Tier 1: our data, malformed shape raises);
 - ``merge_completion_gates`` folds parsed facts into a fresh
@@ -21,9 +21,16 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Final, TypedDict
+from typing import Any, Final, NotRequired, TypedDict
 
 from elspeth.core.canonical import stable_hash
+from elspeth.web.composer.advisor_decision import (
+    AdvisorBlockCause,
+    AdvisorGateBlocked,
+    AdvisorGateDecision,
+    AdvisorGatePassed,
+    AdvisorSignoffGateFact,
+)
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import (
     ADVISOR_SIGNOFF_BLOCKED_CODE,
@@ -35,6 +42,7 @@ from elspeth.web.execution.schemas import (
     ValidationReadinessBlocker,
     ValidationResult,
 )
+from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 
 COMPLETION_GATES_META_KEY: Final[str] = "completion_gates"
 _ADVISOR_SIGNOFF_GATE_KEY: Final[str] = "advisor_signoff"
@@ -66,26 +74,17 @@ class AdvisorSignoffGateDict(TypedDict):
     # reviewer behind it, and an ABSENT key is writer drift the strict parser
     # refuses rather than defaults.
     note: str | None
+    cause: str
 
 
-class CompletionGatesDict(TypedDict, total=False):
+class CompletionGatesDict(TypedDict):
     """Wire/persistence shape of the ``completion_gates`` envelope.
 
-    ``total=False``: an empty mapping is the explicit "no gates withheld"
-    value the writer persists on every clean compose turn.
+    A version-only mapping is the explicit "no gates withheld" value.
     """
 
-    advisor_signoff: AdvisorSignoffGateDict
-
-
-@dataclass(frozen=True, slots=True)
-class AdvisorSignoffGateFact:
-    """One persisted advisor sign-off outcome, bound to the reviewed graph."""
-
-    detail: str
-    suggestion: str | None
-    for_graph: str
-    note: str | None
+    schema_version: int
+    advisor_signoff: NotRequired[AdvisorSignoffGateDict]
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,40 +182,6 @@ def completion_gate_fingerprint(state: CompositionState) -> str:
     )
 
 
-def completion_gates_meta_value(
-    runtime_preflight: ValidationResult | None,
-    state: CompositionState,
-) -> CompletionGatesDict:
-    """Derive the ``completion_gates`` value a compose save persists.
-
-    Always returns a mapping (possibly empty): the writer overwrites the key
-    on every compose-preflight save, so a stale blocked fact cannot survive a
-    clean turn and ``merge_composer_meta_updates`` needs no deletion
-    semantics. ``None`` (preflight crashed or never ran) yields ``{}`` —
-    those saves persist ``is_valid=False`` and carry no gate verdict.
-    """
-    if runtime_preflight is None:
-        return {}
-    blocked = [blocker for blocker in runtime_preflight.readiness.blockers if blocker.code == ADVISOR_SIGNOFF_BLOCKED_CODE]
-    if not blocked:
-        return {}
-    return {
-        "advisor_signoff": AdvisorSignoffGateDict(
-            status=_GATE_STATUS_BLOCKED,
-            detail=blocked[0].detail,
-            suggestion=blocked[0].suggestion,
-            for_graph=completion_gate_fingerprint(state),
-            # ``or None``: the reader refuses an empty note (a note with no
-            # words is writer drift, not a reviewer saying nothing — that is
-            # null), so normalising here keeps a builder that passes "" from
-            # persisting a row every later read rejects. ``parse_completion_gates``
-            # is called uncaught from /validate, execute, compose and messages,
-            # so such a row would brick the session rather than degrade it.
-            note=blocked[0].note or None,
-        )
-    }
-
-
 def completion_gates_meta_from_facts(facts: CompletionGateFacts | None) -> CompletionGatesDict:
     """Re-serialize parsed gate facts into the persistence envelope.
 
@@ -231,16 +196,56 @@ def completion_gates_meta_from_facts(facts: CompletionGateFacts | None) -> Compl
     advisor did not see.
     """
     if facts is None or facts.advisor_signoff is None:
-        return {}
+        return {"schema_version": 2}
     return {
+        "schema_version": 2,
         "advisor_signoff": AdvisorSignoffGateDict(
             status=_GATE_STATUS_BLOCKED,
             detail=facts.advisor_signoff.detail,
             suggestion=facts.advisor_signoff.suggestion,
             for_graph=facts.advisor_signoff.for_graph,
             note=facts.advisor_signoff.note,
-        )
+            cause=facts.advisor_signoff.cause.value,
+        ),
     }
+
+
+def resolve_completion_gate_facts(
+    prior: CompletionGateFacts | None,
+    decision: AdvisorGateDecision | None,
+    state: CompositionState,
+) -> CompletionGateFacts:
+    """Apply only an explicit adjudication for the final graph.
+
+    No decision preserves the prior fact, even on a changed graph: readers
+    then display pending-review wording until an actual review supersedes it.
+    """
+    if decision is None:
+        return prior if prior is not None else CompletionGateFacts(advisor_signoff=None)
+    if isinstance(decision, AdvisorGatePassed):
+        for_graph = decision.for_graph
+        fact = None
+    elif isinstance(decision, AdvisorGateBlocked):
+        for_graph = decision.fact.for_graph
+        fact = decision.fact
+    else:
+        raise TypeError(f"Unknown advisor gate decision: {type(decision).__name__}")
+    if for_graph != completion_gate_fingerprint(state):
+        raise ValueError("Advisor gate decision does not match the final graph fingerprint")
+    return CompletionGateFacts(advisor_signoff=fact)
+
+
+def completion_gate_decision_changes(
+    prior: CompletionGateFacts | None,
+    decision: AdvisorGateDecision | None,
+    state: CompositionState,
+) -> bool:
+    """Whether an explicit decision changes the normalized durable facts."""
+    effective = resolve_completion_gate_facts(prior, decision, state)
+    if decision is None:
+        return False
+    previous = prior if prior is not None else CompletionGateFacts(advisor_signoff=None)
+    return effective != previous
 
 
 def parse_completion_gates(
@@ -248,8 +253,8 @@ def parse_completion_gates(
 ) -> CompletionGateFacts | None:
     """Parse the persisted envelope off a ``composition_states`` row.
 
-    Returns ``None`` when no envelope was ever written (historical rows,
-    fork/revert paths) — the recompute answers alone. An empty mapping is an
+    Returns ``None`` when no envelope was written (for example, fork/revert
+    paths) — the recompute answers alone. A version-only mapping is an
     explicit "no gates withheld". Tier 1: this is our own persisted data, so
     a malformed shape means corruption or writer drift — raise, never skip
     the gate.
@@ -260,18 +265,20 @@ def parse_completion_gates(
     """
     if composer_meta is None:
         return None
-    # Sentinel probe: rows written before this envelope existed (and
-    # fork/revert paths) legitimately lack the key.
+    # Sentinel probe: never-reviewed and fork/revert rows can lack the key.
     if COMPLETION_GATES_META_KEY not in composer_meta:
         return None
     raw = composer_meta[COMPLETION_GATES_META_KEY]
     if type(raw) not in (dict, MappingProxyType):
         raise ValueError(f"Tier 1: composer_meta.completion_gates is {type(raw).__name__}, expected a dict or frozen dict")
-    unknown = set(raw) - {_ADVISOR_SIGNOFF_GATE_KEY}
+    version = raw["schema_version"] if "schema_version" in raw else None
+    if type(version) is not int or version != 2:
+        raise ValueError("Tier 1: completion_gates.schema_version must be 2")
+    unknown = set(raw) - {_ADVISOR_SIGNOFF_GATE_KEY, "schema_version"}
     if unknown:
         raise ValueError(f"Tier 1: composer_meta.completion_gates has unknown gate keys {sorted(unknown)!r}")
-    # Sentinel probe: the writer persists {} on every clean compose turn, so
-    # a missing gate key means "not withheld", not corruption.
+    # Sentinel probe: the writer persists a version-only envelope after a
+    # clean review, so a missing gate key means "not withheld".
     if _ADVISOR_SIGNOFF_GATE_KEY not in raw:
         return CompletionGateFacts(advisor_signoff=None)
     raw_signoff = raw[_ADVISOR_SIGNOFF_GATE_KEY]
@@ -299,7 +306,19 @@ def parse_completion_gates(
     note = raw_signoff["note"]
     if note is not None and (type(note) is not str or not note):
         raise ValueError("Tier 1: completion_gates.advisor_signoff.note must be a non-empty string or null")
-    return CompletionGateFacts(advisor_signoff=AdvisorSignoffGateFact(detail=detail, suggestion=suggestion, for_graph=for_graph, note=note))
+    allowed_fields = {"status", "detail", "suggestion", "for_graph", "note", "cause"}
+    cause_raw = raw_signoff["cause"] if "cause" in raw_signoff else None
+    if type(cause_raw) is not str:
+        raise ValueError("Tier 1: completion_gates.advisor_signoff.cause must be a string")
+    try:
+        cause = AdvisorBlockCause(cause_raw)
+    except ValueError as exc:
+        raise ValueError(f"Tier 1: completion_gates.advisor_signoff.cause is unknown: {cause_raw!r}") from exc
+    if set(raw_signoff) - allowed_fields:
+        raise ValueError("Tier 1: completion_gates.advisor_signoff has unknown fields")
+    return CompletionGateFacts(
+        advisor_signoff=AdvisorSignoffGateFact(detail=detail, suggestion=suggestion, for_graph=for_graph, note=note, cause=cause)
+    )
 
 
 def merge_completion_gates(
@@ -314,13 +333,30 @@ def merge_completion_gates(
     same posture as R2-F14's in-turn ``_advisor_signoff_pending_validation``
     (composer/service.py). A fact whose ``for_graph`` no longer matches the
     state's content is reported with pending wording instead of the persisted
-    verdict.
+    verdict. A resolvable interpretation handoff keeps its readiness shape;
+    its advisor failure is a check only, matching the in-turn projection.
     """
     if facts is None or facts.advisor_signoff is None:
         return result
     fact = facts.advisor_signoff
     current = fact.for_graph == completion_gate_fingerprint(state)
     detail = fact.detail if current else ADVISOR_SIGNOFF_PENDING_DETAIL
+    # Mirror no_tool_policy.is_pending_interpretation_handoff without importing
+    # that module: its tools registry imports this module through preflight.
+    if (
+        result.readiness.authoring_valid
+        and result.readiness.completion_ready
+        and not result.readiness.execution_ready
+        and any(blocker.code == INTERPRETATION_REVIEW_PENDING_CODE for blocker in result.readiness.blockers)
+    ):
+        # Completion-ready denotes the review-card handoff here, not a passed
+        # advisor. Retain the durable fact so it blocks ordinary readiness once
+        # those cards resolve; only an explicit CLEAN decision clears it.
+        handoff_detail = (
+            "The evidence-scoped completion advisory review has not cleared. "
+            "Resolve the pending interpretation review cards; the advisory review remains outstanding."
+        )
+        return result.model_copy(update={"checks": _reconcile_advisor_check(result.checks, detail=handoff_detail)})
     return result.model_copy(
         update={
             "checks": _reconcile_advisor_check(result.checks, detail=detail),
@@ -350,15 +386,13 @@ def advisor_block_covers_unchanged_graph(
 ) -> bool:
     """True when this turn changed nothing AND the advisor already blocked this exact graph.
 
-    Operator ruling 2026-09-22 (elspeth-032ec69c41). A gate fact persists only
-    alongside a new state row, so re-reviewing a graph that is unchanged this
-    turn and already carries a blocked fact can re-block or trap the turn but
-    can never clear anything. ``None`` facts, a fact for other content, or any
-    version movement all answer False: a graph no advisor has ruled on still
-    gets its review. Decided on state and persisted facts, never on user text.
+    Only a classified graph rejection supports explanation-only turns.
+    Transient and message-scoped failures need fresh review.
     """
     if state.version != initial_version:
         return False
     if facts is None or facts.advisor_signoff is None:
+        return False
+    if facts.advisor_signoff.cause is not AdvisorBlockCause.GRAPH_REJECTED:
         return False
     return facts.advisor_signoff.for_graph == completion_gate_fingerprint(state)

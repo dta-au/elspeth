@@ -101,6 +101,13 @@ from elspeth.web.composer.advisor_audit import (
     persist_advisor_terminal_publication,
 )
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointVerdictSource
+from elspeth.web.composer.advisor_decision import (
+    AdvisorBlockCause,
+    AdvisorGateBlocked,
+    AdvisorGateDecision,
+    AdvisorGatePassed,
+    AdvisorSignoffGateFact,
+)
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -227,7 +234,9 @@ from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
     advisor_block_covers_unchanged_graph,
     advisor_signoff_check_failed,
+    completion_gate_fingerprint,
     merge_completion_gates,
+    resolve_completion_gate_facts,
 )
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
@@ -1510,6 +1519,7 @@ class _TerminalNoToolAdvisorGateOutcome:
     action: Literal["fall_through", "continue", "return"]
     result: ComposerResult | None = None
     advisor_passes_delta: int = 0
+    advisor_gate_decision: AdvisorGateDecision | None = None
     # Set only on a FLAGGED "continue" action: the index (``len(llm_messages)``
     # at append time) of the synthetic advisor sign-off message just appended.
     # The driver (``_compose_loop``) uses this as a stable, non-heuristic
@@ -2336,6 +2346,19 @@ class ComposerAdmissionRefused(ComposerServiceError):
     """A committed admission decision refused this provider operation."""
 
 
+def _with_advisor_gate_decision(
+    result: ComposerResult,
+    prior: CompletionGateFacts | None,
+    decision: AdvisorGateDecision | None,
+) -> ComposerResult:
+    """Project unresolved facts without treating deterministic validation as review."""
+    facts = resolve_completion_gate_facts(prior, decision, result.state)
+    preflight = result.runtime_preflight
+    if preflight is not None:
+        preflight = merge_completion_gates(preflight, facts, result.state)
+    return replace(result, advisor_gate_decision=decision, runtime_preflight=preflight)
+
+
 class ComposerServiceImpl:
     """LLM-driven pipeline composer with dual-counter budget and discovery caching.
 
@@ -2596,6 +2619,7 @@ class ComposerServiceImpl:
             persisted_tool_row_content=tuple(row.content for row in self._phase3_last_redacted_tool_rows),
             tool_invocations=result.tool_invocations,
             runtime_preflight=result.runtime_preflight,
+            advisor_gate_decision=result.advisor_gate_decision,
         )
 
     def _serialize_response_via_walker(
@@ -5855,6 +5879,7 @@ class ComposerServiceImpl:
                     if (result.runtime_preflight is None or not _is_pending_interpretation_handoff(result.runtime_preflight))
                     else result
                 )
+                handoff_result = _with_advisor_gate_decision(handoff_result, completion_gates, None)
                 if reply is None:
                     handoff_result = replace(
                         handoff_result,
@@ -6015,6 +6040,7 @@ class ComposerServiceImpl:
                         repair_turns_used=repair_turns_used,
                         plugin_snapshot=plugin_snapshot,
                     )
+                    result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
                     threaded = replace(
                         result,
                         repair_turns_used=repair_turns_used,
@@ -6366,17 +6392,7 @@ class ComposerServiceImpl:
             repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
         )
-        # The END gate stood aside for a graph the advisor already blocked
-        # (ruling 2026-09-22). Fold the same durable fact into this turn's
-        # preflight with the read-side merge the Run path uses, so the chat
-        # never reports completion that /validate and Run still withhold.
-        if result.runtime_preflight is not None and advisor_block_covers_unchanged_graph(
-            completion_gates, state, initial_version=initial_version
-        ):
-            result = replace(
-                result,
-                runtime_preflight=merge_completion_gates(result.runtime_preflight, completion_gates, state),
-            )
+        result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
         # Thread repair_turns_used through to the result so the route handler can
         # persist it onto the new ``composition_states.composer_meta`` row (and the
         # API state response can surface ``composer_meta.repair_turns_used``) — see
@@ -6719,15 +6735,9 @@ class ComposerServiceImpl:
         if _state_is_structurally_empty(state) or advisor_checkpoint_passes_used >= max_passes:
             return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
 
-        # Operator ruling 2026-09-22 (elspeth-032ec69c41): this turn changed
-        # nothing and the advisor has already blocked this exact graph. A
-        # gate fact persists only with a new state row, so another review
-        # could re-block or trap the turn but never clear anything. Observed
-        # live (session 6990d39f): "what does this block mean?" was answered,
-        # FLAGGED over the unchanged graph, and the repair injection ordered
-        # pipeline edits. Unlike the proof gate above (whose version guard was
-        # removed because a resumed session can carry an unreported blocker),
-        # the last advisor ruling is already durable on the state row.
+        # Preserve explanation-only turns for an identified graph rejection.
+        # Provider failures and user-message findings instead receive a fresh
+        # review; their outcome can now persist without editing the graph.
         if advisor_block_covers_unchanged_graph(completion_gates, state, initial_version=initial_version):
             slog.info(
                 "composer_advisor_end_gate_skipped",
@@ -6825,6 +6835,7 @@ class ComposerServiceImpl:
                 progress=progress,
             )
             if orphan_result is not None:
+                orphan_result = _with_advisor_gate_decision(orphan_result, completion_gates, None)
                 return _TerminalNoToolAdvisorGateOutcome(
                     action="return",
                     result=replace(
@@ -6966,7 +6977,9 @@ class ComposerServiceImpl:
 
         # Fall-through terminates the turn (the caller finalizes and returns),
         # so the consumed passes need not be charged forward.
-        return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
+        return _TerminalNoToolAdvisorGateOutcome(
+            action="fall_through", advisor_gate_decision=AdvisorGatePassed(for_graph=completion_gate_fingerprint(state))
+        )
 
     async def _compose_loop(
         self,
@@ -8605,6 +8618,29 @@ class ComposerServiceImpl:
         # a reviewer's note, so it carries none.
         step_ids = _validated_advisor_step_ids(state, verdict.affected_step_ids)
         note = None if verdict.findings_backend_authored else verdict.note
+        cause = {
+            "unavailable": AdvisorBlockCause.UNAVAILABLE,
+            "malformed": AdvisorBlockCause.MALFORMED,
+            "flagged_unrepairable": AdvisorBlockCause.MESSAGE_REJECTED,
+            "flagged_final_pass": AdvisorBlockCause.GRAPH_REJECTED,
+            "flagged_no_repair": AdvisorBlockCause.GRAPH_REJECTED,
+        }[reason]
+        detail, suggestion = _advisor_signoff_blocked_wording(
+            reason=reason,
+            findings=verdict.findings_text,
+            findings_backend_authored=verdict.findings_backend_authored,
+            category=verdict.category,
+            step_ids=step_ids,
+        )
+        decision = AdvisorGateBlocked(
+            fact=AdvisorSignoffGateFact(
+                detail=detail,
+                suggestion=suggestion,
+                for_graph=completion_gate_fingerprint(state),
+                note=note or None,
+                cause=cause,
+            )
+        )
         validated_base = runtime_preflight if runtime_preflight is not None and runtime_preflight.is_valid else None
         if validated_base is not None:
             runtime_result = _advisor_signoff_pending_validation(
@@ -8724,6 +8760,7 @@ class ComposerServiceImpl:
                 tool_invocations=recorder.invocations,
                 llm_calls=recorder.llm_calls,
                 advisor_terminal_publication=publication,
+                advisor_gate_decision=decision,
             ),
             repair_turns_used=repair_turns_used,
             persisted_assistant_message_id=persisted_assistant_message_id,
@@ -9704,6 +9741,7 @@ class ComposeLoopTestResult:
     # (e.g. the fail-closed orphaned-interpretation gate) without bypassing
     # the production ``_compose_loop`` path.
     runtime_preflight: ValidationResult | None = None
+    advisor_gate_decision: AdvisorGateDecision | None = None
 
     @property
     def tool_outcomes_for_assertion(self) -> tuple[Any, ...]:
@@ -11349,22 +11387,18 @@ def _advisor_signoff_blocked_wording(
             f"{_advisor_flagged_header(category, step_ids)} {notice}",
             "Review the pipeline; validation and the advisory review run again after your next pipeline change.",
         )
-    # Ruling 2026-09-22 (elspeth-032ec69c41): this pair is what the durable
-    # gate fact carries to /validate and the DecisionPanel, and a durable
-    # block is cleared only by a pipeline change — a retry on the unchanged
-    # graph meets the END gate's skip — so neither suggestion may offer a
-    # retry. The chat notice for the same block says the same
-    # (``_ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP``).
+    # Provider failures are turn-scoped; another message may obtain a verdict
+    # without editing the graph, and its decision replaces the durable block.
     if reason == "unavailable":
         return (
             f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
             "The advisor model was unavailable after retry; check the advisor model configuration. "
-            "Validation and the advisory review run again after your next pipeline change.",
+            "Validation and the advisory review run again on your next message.",
         )
     return (
         f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
         "The advisor returned no usable verdict after a format retry; check the advisor model configuration. "
-        "Validation and the advisory review run again after your next pipeline change.",
+        "Validation and the advisory review run again on your next message.",
     )
 
 

@@ -865,15 +865,15 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
 _NOTICES_FOR_A_PERSISTED_BLOCK = (
     no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
     no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER,
-    no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER,
-    no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
-    no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE,
 )
 _NOTICES_FOR_AN_UNCHANGED_TURN_BLOCK = (
     no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
     no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE,
     no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE,
     no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER,
+    no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE,
 )
 
 
@@ -898,8 +898,6 @@ def test_unchanged_turn_block_notice_promises_a_review_on_the_next_message(notic
         ("flagged_final_pass", "", False),
         ("flagged_final_pass", "field 'prompt_template' on step 'rate'", True),
         ("flagged_no_repair", "", False),
-        ("unavailable", "Model unavailable.", False),
-        ("malformed", "No usable verdict.", False),
     ],
 )
 def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reason: str, findings: str, authored: bool) -> None:
@@ -915,3 +913,12 @@ def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reaso
     assert "after your next pipeline change" in suggestion
     assert "on your next message" not in suggestion
     assert "retry the request" not in suggestion.lower()
+
+
+@pytest.mark.parametrize("reason", ["unavailable", "malformed"])
+def test_transient_advisor_blocker_offers_retry_without_graph_edit(reason: str) -> None:
+    from elspeth.web.composer.service import _advisor_signoff_blocked_wording
+
+    _, suggestion = _advisor_signoff_blocked_wording(reason=reason, findings="No verdict.")
+    assert "on your next message" in suggestion
+    assert "pipeline change" not in suggestion
