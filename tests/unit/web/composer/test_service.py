@@ -2570,7 +2570,6 @@ def test_none_preflight_reads_unknown_fail_closed_in_both_advisor_consumers() ->
         persisted_tool_call_turn=False,
         runtime_preflight=None,
         outstanding_findings=None,
-        advisor_repair_context_introduced=True,
     )
     blocked_preflight = blocked.runtime_preflight
     assert blocked_preflight is not None

@@ -339,7 +339,6 @@ def _blocked_terminal(
         persisted_tool_call_turn=False,
         runtime_preflight=runtime_preflight,
         outstanding_findings=None,
-        advisor_repair_context_introduced=True,
     )
 
 

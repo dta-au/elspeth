@@ -42,6 +42,7 @@ from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.no_tool_policy import (
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE,
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL,
     AssistantTextSegment,
     TrustedSystemNoticeSegment,
@@ -1619,12 +1620,84 @@ def test_advisor_blocked_result_surfaces_backend_prescan_finding(make_service, s
             readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
         ),
         outstanding_findings=None,
-        advisor_repair_context_introduced=True,
     )
 
     runtime_result = result.runtime_preflight
     assert runtime_result is not None
     assert any(prescan_finding in blocker.detail for blocker in runtime_result.readiness.blockers)
+
+
+def _green_preflight() -> ValidationResult:
+    return ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+
+class _ExplainingAssistantMessage:
+    content = "Merge steps have no error route. You can keep a failure output on each branch, or change the merge policy."
+
+
+def _blocked_after_injection(service, state, assistant_message):
+    """Build the terminal-block result for a turn whose advisor findings entered
+    the model's context (a FLAG on the last pass). The helper omits the retired
+    ``advisor_repair_context_introduced`` argument on purpose: that flag alone
+    used to decide whether the reply was deleted."""
+    return service._advisor_blocked_result(
+        reason="flagged_final_pass",
+        verdict=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: request not met"),
+        state=state,
+        assistant_message=assistant_message,
+        recorder=make_recorder(),
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        runtime_preflight=_green_preflight(),
+        outstanding_findings=None,
+    )
+
+
+def test_blocked_turn_publishes_the_composers_reply(make_service, simple_state) -> None:
+    """Ruling 2026-09-22 (elspeth-032ec69c41): a block no longer deletes what the composer said."""
+    result = _blocked_after_injection(make_service(), simple_state, _ExplainingAssistantMessage())
+    assert result.message.startswith(_ExplainingAssistantMessage.content)
+    assert result.raw_assistant_content == _ExplainingAssistantMessage.content
+    assert "Completion advisory review did not clear" in result.message
+    assert result.runtime_preflight is not None
+    assert result.runtime_preflight.readiness.completion_ready is False
+
+
+def test_blocked_result_tolerates_no_assistant_message(make_service, simple_state) -> None:
+    result = _blocked_after_injection(make_service(), simple_state, None)
+    assert "Completion advisory review did not clear" in result.message
+    assert result.raw_assistant_content == ""
+
+
+def test_published_reply_never_carries_fence_sentinels(make_service, simple_state) -> None:
+    from elspeth.web.composer.service import _ADVISOR_FINDINGS_UNTRUSTED_BEGIN, _ADVISOR_FINDINGS_UNTRUSTED_END
+
+    result = _blocked_after_injection(make_service(), simple_state, _ExplainingAssistantMessage())
+    assert _ADVISOR_FINDINGS_UNTRUSTED_BEGIN not in result.message
+    assert _ADVISOR_FINDINGS_UNTRUSTED_END not in result.message
+    assert "FLAGGED: request not met" not in result.message
+
+
+def test_repair_instruction_offers_a_published_way_out() -> None:
+    """Ruling 2026-09-22: 'say what blocks you' must describe an exit that exists."""
+    from elspeth.web.composer.service import _ADVISOR_MUTATION_EXPECTATION_CLAUSE, _ADVISOR_OUTPUT_CONTRACT_CLAUSE
+
+    # The anti-lookup wording from elspeth-71617f1d21 stays.
+    assert "lookup-only calls is not a fix" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    # The exit is named, covers a decision only the user can make, and says the reply is shown.
+    assert "decision only the user can make" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "make no change" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    assert "shown to the user" in _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+    # Quoting the fenced text is still forbidden; rebutting or mentioning the review is not.
+    assert "do not quote the fenced text" in _ADVISOR_OUTPUT_CONTRACT_CLAUSE
+    assert "never reference, quote, or rebut" not in _ADVISOR_OUTPUT_CONTRACT_CLAUSE
 
 
 def test_advisor_prompt_explains_withheld_values_are_present_and_not_defects(make_service) -> None:
@@ -2353,14 +2426,8 @@ async def drive_try_terminate(
     initial_version: int = 1,
     completion_gates: CompletionGateFacts | None = None,
     finalize_result: ComposerResult | None = None,
-    advisor_repair_context_introduced: bool = True,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
-
-    ``advisor_repair_context_introduced`` defaults to the withheld cohort,
-    which is what the blocked-terminal tests in this module were written
-    against; the published-prose arm passes ``False`` explicitly.
-
 
     Stubs the SERVICE-level orphan pre-check to return empty (so the end
     gate runs) and the shared finalize tail to return a canned runnable
@@ -2442,9 +2509,9 @@ async def drive_try_terminate(
         # turn computed no preflight at all (``_turn_runtime_preflight``'s
         # question-only / unmutated-state arm, covered in its own suite).
         service._turn_runtime_preflight = _AsyncRecorder(return_value=None)
-    # elspeth-2306940c70: a terminal END-gate block persists a durable
-    # withheld-turn disclosure, so the gate needs a sessions service and a
-    # UUID-shaped session id even in this advisor-focused harness.
+    # A terminal END-gate block persists its publication record, so the gate
+    # needs a sessions service and a UUID-shaped session id even in this
+    # advisor-focused harness.
     if service._sessions_service is None:
         service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=_AsyncRecorder(return_value=None))
     kwargs = {}
@@ -2472,7 +2539,6 @@ async def drive_try_terminate(
         persisted_assistant_content=None,
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
-        advisor_repair_context_introduced=advisor_repair_context_introduced,
         completion_gates=completion_gates,
         **kwargs,
     )
@@ -2492,11 +2558,13 @@ def _audit_row_origins(service) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_end_gate_block_publishes_the_models_reply_when_no_advisor_context_entered(make_service, clean_runnable_state):
-    """The withholding exists because prose written AFTER hidden advisor
-    findings entered the model's context may quote them. An advisor outage on
-    the first pass injected nothing, so the reply is the model's own and the
-    block is reported beside it, not in place of it."""
+async def test_end_gate_block_publishes_the_models_reply(make_service, clean_runnable_state):
+    """Ruling 2026-09-22 (elspeth-032ec69c41): a blocked turn publishes the
+    composer's reply beside the block, not the block in place of it — whether
+    or not advisor findings entered the model's context earlier in the turn.
+    Before the ruling only the uninjected cohort (an outage on the first pass)
+    was published; the injected cohort was withheld and compensated with two
+    audit rows (elspeth-2306940c70). Neither row is written now."""
     from elspeth.web.composer.no_tool_policy import (
         _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
         ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE,
@@ -2507,9 +2575,7 @@ async def test_end_gate_block_publishes_the_models_reply_when_no_advisor_context
 
     service = make_service()
     service._run_advisor_checkpoint = _AsyncRecorder(return_value=_unavailable_verdict())
-    outcome = await drive_try_terminate(
-        service, clean_runnable_state, advisor_checkpoint_passes_used=0, advisor_repair_context_introduced=False
-    )
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
 
     assert outcome.action == "return"
     result = outcome.result
@@ -2524,33 +2590,6 @@ async def test_end_gate_block_publishes_the_models_reply_when_no_advisor_context
     assert result.runtime_preflight.readiness.completion_ready is False
     # Nothing was withheld, so neither withholding record is written.
     assert _audit_row_origins(service) == []
-
-
-@pytest.mark.asyncio
-async def test_end_gate_block_withholds_and_keeps_the_reply_recoverable_once_advisor_context_entered(make_service, clean_runnable_state):
-    from elspeth.web.composer.no_tool_policy import (
-        _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE,
-        ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE,
-        TrustedSystemNoticeSegment,
-        visible_message_segments,
-    )
-
-    service = make_service()
-    service._run_advisor_checkpoint = _AsyncRecorder(return_value=_unavailable_verdict())
-    outcome = await drive_try_terminate(
-        service, clean_runnable_state, advisor_checkpoint_passes_used=0, advisor_repair_context_introduced=True
-    )
-
-    result = outcome.result
-    assert result.raw_assistant_content == ""
-    assert _AssistantMessage.content not in result.message
-    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
-        TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE),
-    )
-    assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE in result.message
-    assert _audit_row_origins(service) == ["advisor_terminal_block", "advisor_signoff_withheld"]
-    withheld_row = service._sessions_service.add_message.calls[0]
-    assert withheld_row.args[1:3] == ("audit", _AssistantMessage.content)
 
 
 @pytest.mark.asyncio
@@ -2746,7 +2785,6 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
-        advisor_repair_context_introduced=True,
     )
 
     assert outcome.action == "return"
@@ -2786,8 +2824,18 @@ async def test_end_gate_final_flag_never_exposes_advisor_findings_on_human_surfa
         assert _ADVISOR_FINDINGS_UNTRUSTED_END not in surface
 
 
-def test_advisor_blocked_result_replaces_echoed_assistant_prose_with_fixed_notice(make_service, clean_runnable_state):
-    from elspeth.web.composer.no_tool_policy import _ADVISOR_SIGNOFF_PENDING_NOTICE, visible_message_segments
+def test_advisor_blocked_result_publishes_an_echoing_reply_and_keeps_backend_surfaces_clean(make_service, clean_runnable_state):
+    """Ruling 2026-09-22 (elspeth-032ec69c41): a reply that echoes the advisor
+    is the model's own words and is published as written (the reworded repair
+    clause asks it not to quote the fenced text; the clause, not a deleter,
+    is the control). The backend-authored surfaces — the sign-off validation
+    and the appended notice — still never carry advisor findings."""
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+        AssistantTextSegment,
+        TrustedSystemNoticeSegment,
+        visible_message_segments,
+    )
 
     canary = "ECHOED_PRIOR_ADVISOR_FINDING_CANARY"
 
@@ -2812,21 +2860,16 @@ def test_advisor_blocked_result_replaces_echoed_assistant_prose_with_fixed_notic
             readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
         ),
         outstanding_findings=None,
-        advisor_repair_context_introduced=True,
     )
 
-    assert result.message.endswith(_ADVISOR_SIGNOFF_PENDING_NOTICE)
-    assert result.raw_assistant_content == ""
-    public_blob = repr(
-        (
-            result.message,
-            result.raw_assistant_content,
-            result.runtime_preflight.model_dump(mode="json"),
-            visible_message_segments(content=result.message, raw_content=result.raw_assistant_content),
-        )
+    assert result.raw_assistant_content == _EchoingAssistant.content
+    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+        AssistantTextSegment(_EchoingAssistant.content),
+        TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE),
     )
-    assert canary not in public_blob
-    assert "Repair:" not in public_blob
+    backend_blob = repr((_ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE, result.runtime_preflight.model_dump(mode="json")))
+    assert canary not in backend_blob
+    assert "Repair:" not in backend_blob
 
 
 @pytest.mark.parametrize(
@@ -2909,8 +2952,8 @@ async def test_end_gate_signoff_pending_note_is_not_the_preflight_header(make_se
     Finding #4: an UNRENDERED verdict (here unavailable) now publishes the
     could-not-be-obtained sibling rather than the did-not-clear notice."""
     from elspeth.web.composer.no_tool_policy import (
-        _ADVISOR_SIGNOFF_PENDING_NOTICE,
-        _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE,
+        _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+        _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
         _PREFLIGHT_NOTICE_HEADER,
     )
 
@@ -2923,8 +2966,8 @@ async def test_end_gate_signoff_pending_note_is_not_the_preflight_header(make_se
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
 
     message = outcome.result.message
-    assert _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE in message
-    assert _ADVISOR_SIGNOFF_PENDING_NOTICE not in message
+    assert _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE in message
+    assert _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE not in message
     assert _PREFLIGHT_NOTICE_HEADER not in message
     assert message.startswith(outcome.result.raw_assistant_content or "")
 
@@ -2957,6 +3000,7 @@ async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
     """
     from elspeth.web.composer.no_tool_policy import (
         _PREFLIGHT_NOTICE_HEADER,
+        AssistantTextSegment,
         TrustedSystemNoticeSegment,
         visible_message_segments,
     )
@@ -2996,11 +3040,13 @@ async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
         assert "not re-verified this turn" in message
     else:
         assert "not re-verified" not in message
-    # Fixed backend copy only: the whole suffix is one trusted notice.
+    # The model's reply, then fixed backend copy: the whole suffix is one
+    # trusted notice (ruling 2026-09-22: the reply is published on a block).
     raw = outcome.result.raw_assistant_content or ""
     segments = visible_message_segments(content=message, raw_content=raw)
-    assert len(segments) == 1
-    assert type(segments[0]) is TrustedSystemNoticeSegment
+    assert segments[0] == AssistantTextSegment(_AssistantMessage.content)
+    assert len(segments) == 2
+    assert type(segments[1]) is TrustedSystemNoticeSegment
     # The fail-closed structure is unchanged: completion stays withheld.
     assert outcome.result.runtime_preflight.readiness.completion_ready is False
 
@@ -3009,7 +3055,10 @@ async def test_end_gate_unrendered_verdict_chat_names_the_real_cause(
 @pytest.mark.parametrize("preflight_shape", ["green", "absent"])
 async def test_end_gate_flagged_verdict_keeps_did_not_clear_chat(make_service, clean_runnable_state, preflight_shape: str):
     """Finding #4 control: a rendered FLAG keeps the did-not-clear notices byte for byte."""
-    from elspeth.web.composer.no_tool_policy import _ADVISOR_SIGNOFF_PENDING_NOTICE, _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+        _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
+    )
 
     service = make_service()
     service._run_advisor_checkpoint = _AsyncRecorder(
@@ -3024,8 +3073,9 @@ async def test_end_gate_flagged_verdict_keeps_did_not_clear_chat(make_service, c
     )
 
     assert outcome.action == "return"
-    expected = _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE if preflight_shape == "absent" else _ADVISOR_SIGNOFF_PENDING_NOTICE
+    expected = _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE if preflight_shape == "absent" else _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE
     assert outcome.result.message.endswith(expected)
+    assert outcome.result.message.startswith(_AssistantMessage.content)
     assert "MODEL_FINDING_CANARY" not in outcome.result.message
 
 
@@ -3062,9 +3112,9 @@ async def test_end_gate_absent_preflight_publishes_unverified_notice(make_servic
     could-not-be-obtained absent sibling; the did-not-clear unverified notice
     stays for a rendered FLAG."""
     from elspeth.web.composer.no_tool_policy import (
-        _ADVISOR_SIGNOFF_PENDING_NOTICE,
-        _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_NOTICE,
-        _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+        _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+        _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE,
+        _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
         _PREFLIGHT_NOTICE_HEADER,
     )
 
@@ -3083,10 +3133,10 @@ async def test_end_gate_absent_preflight_publishes_unverified_notice(make_servic
 
     assert outcome.action == "return"
     message = outcome.result.message
-    assert _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_NOTICE in message
-    assert _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE not in message
+    assert _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE in message
+    assert _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE not in message
     assert _PREFLIGHT_NOTICE_HEADER not in message
-    assert _ADVISOR_SIGNOFF_PENDING_NOTICE not in message
+    assert _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE not in message
     # Fail-closed structure is UNCHANGED: unknown readiness advances nothing.
     preflight = outcome.result.runtime_preflight
     assert preflight is not None
@@ -3207,8 +3257,8 @@ async def test_end_gate_unactionable_flag_terminal_blocks_without_consuming_repa
     with an instruction the model could not satisfy, re-fired the identical
     pre-scan on pass 2, and the LLM advisory review never ran at all."""
     from elspeth.web.composer.no_tool_policy import (
-        _ADVISOR_SIGNOFF_PENDING_NOTICE,
-        _ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE,
+        _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+        _ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE,
         _PREFLIGHT_NOTICE_HEADER,
     )
 
@@ -3222,8 +3272,8 @@ async def test_end_gate_unactionable_flag_terminal_blocks_without_consuming_repa
     assert outcome.advisor_passes_delta == 1
     assert all("[Completion advisory review — BLOCKING." not in str(m.get("content", "")) for m in llm_messages)
     message = outcome.result.message
-    assert _ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE in message
-    assert _ADVISOR_SIGNOFF_PENDING_NOTICE not in message
+    assert _ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE in message
+    assert _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE not in message
     assert _PREFLIGHT_NOTICE_HEADER not in message
     publication = outcome.result.advisor_terminal_publication
     assert publication is not None and publication.branch == "terminal_block"
@@ -3565,7 +3615,7 @@ async def test_end_gate_preserves_pending_handoff_shape(make_service, clean_runn
     assert preflight.readiness.completion_ready is True
     assert [check.name for check in preflight.checks if not check.passed] == [CHECK_ADVISOR_SIGNOFF]
     assert _PREFLIGHT_NOTICE_HEADER not in outcome.result.message
-    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE in outcome.result.message
+    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE in outcome.result.message
     # The appended check's detail is read beside a readiness block asserting
     # completion_ready=True, so it must not claim the turn cannot be completed.
     detail = next(check.detail for check in preflight.checks if check.name == CHECK_ADVISOR_SIGNOFF)
@@ -3710,14 +3760,16 @@ async def test_end_gate_blocked_handoff_names_outstanding_findings(make_service,
     assert preflight.readiness.completion_ready is True
     # ... but the terminal message no longer implies the review is the only
     # remaining step: the validator's objection is named alongside it.
-    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE in outcome.result.message
+    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE in outcome.result.message
     assert "Edge contract violation" in outcome.result.message
     assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER in outcome.result.message
     segments = visible_message_segments(
         content=outcome.result.message,
         raw_content=outcome.result.raw_assistant_content,
     )
-    assert segments[0] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE)
+    # The model's reply leads (ruling 2026-09-22), then the handoff notice.
+    assert segments[0] == AssistantTextSegment(_AssistantMessage.content)
+    assert segments[1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE)
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER)
     assert any(isinstance(segment, AssistantTextSegment) and "Edge contract violation" in segment.content for segment in segments)
 
@@ -4481,68 +4533,18 @@ def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, 
 
 
 # ---------------------------------------------------------------------------
-# elspeth-2306940c70: a terminal END-gate withhold must leave a durable,
-# provider-visible disclosure so LATER turns' model context knows the
-# preceding request was not confirmed as applied. Without it the withheld
-# turn replays as an EMPTY assistant message (raw_assistant_content="") and
-# the next-turn model reconstructs the refusal as silent compliance —
-# telling the user their refused instruction is live.
+# Ruling 2026-09-22 (elspeth-032ec69c41): a terminal END-gate block publishes
+# the model's reply. elspeth-2306940c70 had the block withhold the prose and
+# compensate with two audit rows — the withheld words and a user-role
+# disclosure replayed into later turns so the model would not read the empty
+# reply as silent compliance. With the reply published, the turn replays as
+# itself and neither row is written.
 # ---------------------------------------------------------------------------
 
 
-def test_advisor_withheld_control_envelope_round_trips_to_user_role() -> None:
-    from elspeth.web.composer.control_messages import (
-        advisor_signoff_withheld_control_envelope,
-        replay_composer_control_message,
-    )
-
-    content = "[composer-system] The completion advisory review did not clear."
-    replayed = replay_composer_control_message(
-        stored_role="audit",
-        writer_principal="compose_loop",
-        content=content,
-        tool_calls=[advisor_signoff_withheld_control_envelope(content)],
-    )
-
-    assert replayed == {"role": "user", "content": content}
-
-
-@pytest.mark.parametrize("tamper", ("content", "stored_role", "writer_principal", "provider_role", "origin"))
-def test_advisor_withheld_control_replay_fails_closed_on_provenance_tamper(tamper: str) -> None:
-    from elspeth.contracts.errors import AuditIntegrityError
-    from elspeth.web.composer.control_messages import (
-        advisor_signoff_withheld_control_envelope,
-        replay_composer_control_message,
-    )
-
-    content = "[composer-system] The completion advisory review did not clear."
-    envelope = advisor_signoff_withheld_control_envelope(content)
-    stored_role = "audit"
-    writer_principal = "compose_loop"
-    if tamper == "content":
-        content += " altered"
-    elif tamper == "stored_role":
-        stored_role = "user"
-    elif tamper == "writer_principal":
-        writer_principal = "route_user_message"
-    elif tamper == "provider_role":
-        envelope["provider_role"] = "system"
-    else:
-        envelope["origin"] = "not_a_registered_origin"
-
-    with pytest.raises(AuditIntegrityError):
-        replay_composer_control_message(
-            stored_role=stored_role,
-            writer_principal=writer_principal,
-            content=content,
-            tool_calls=[envelope],
-        )
-
-
 @pytest.mark.asyncio
-async def test_end_gate_terminal_block_persists_withheld_disclosure_before_returning(make_service, clean_runnable_state):
-    from elspeth.web.composer.control_messages import replay_composer_control_message
-
+async def test_end_gate_terminal_block_writes_only_the_publication_row(make_service, clean_runnable_state):
+    """Ruling 2026-09-22: no withheld-reply row and no withheld disclosure on a block."""
     service = make_service()
     service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
@@ -4581,57 +4583,27 @@ async def test_end_gate_terminal_block_persists_withheld_disclosure_before_retur
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
-        advisor_repair_context_introduced=True,
     )
 
     assert outcome.action == "return"
-    # Three fenced audit rows, in this order: the withheld words themselves,
-    # the withheld-turn disclosure, then the ``terminal_block`` publication
-    # record (audit primacy: the row lands before the publication event
-    # mirrors it).
-    assert sessions.add_message.await_count == 3
-    withheld_reply_row, persist, publication_row = sessions.add_message.calls
-    assert withheld_reply_row.args[1:3] == ("audit", _AssistantMessage.content)
-    (withheld_reply_envelope,) = withheld_reply_row.kwargs["tool_calls"]
-    assert withheld_reply_envelope["_kind"] == "composer_withheld_reply"
-    assert withheld_reply_envelope["origin"] == "advisor_terminal_block"
-    # Kept, never replayed: the control-message decoder does not claim it.
-    assert (
-        replay_composer_control_message(
-            stored_role="audit",
-            writer_principal="compose_loop",
-            content=_AssistantMessage.content,
-            tool_calls=[withheld_reply_envelope],
-        )
-        is None
-    )
+    assert outcome.result.raw_assistant_content == _AssistantMessage.content
+    # One fenced audit row: the ``terminal_block`` publication record (audit
+    # primacy: the row lands before the publication event mirrors it).
+    assert sessions.add_message.await_count == 1
+    (publication_row,) = sessions.add_message.calls
     assert publication_row.args[1] == "audit"
     (publication_envelope,) = publication_row.kwargs["tool_calls"]
     assert publication_envelope["_kind"] == "advisor_terminal_publication_audit"
     assert publication_envelope["publication"]["branch"] == "terminal_block"
     assert publication_envelope["publication"]["reason"] == "flagged_no_repair"
     assert publication_envelope["publication"]["preflight_shape"] == "green"
-    assert outcome.result is not None and outcome.result.advisor_terminal_publication is not None
+    assert outcome.result.advisor_terminal_publication is not None
     assert publication_envelope["publication"] == outcome.result.advisor_terminal_publication.to_dict()
-    assert persist.args[1] == "audit"
-    disclosure = persist.args[2]
-    assert "withheld" in disclosure
-    assert "Do not assume that request was applied" in disclosure
-    assert persist.kwargs["writer_principal"] == "compose_loop"
-    (envelope,) = persist.kwargs["tool_calls"]
-    assert envelope["origin"] == "advisor_signoff_withheld"
-    # The durable row must replay to a user-role provider message.
-    replayed = replay_composer_control_message(
-        stored_role="audit",
-        writer_principal="compose_loop",
-        content=disclosure,
-        tool_calls=[envelope],
-    )
-    assert replayed == {"role": "user", "content": disclosure}
+    assert _audit_row_origins(service) == []
 
 
 @pytest.mark.asyncio
-async def test_end_gate_terminal_block_skips_disclosure_without_session(make_service, clean_runnable_state):
+async def test_end_gate_terminal_block_blocks_cleanly_without_session(make_service, clean_runnable_state):
     """No durable store exists without a session — the gate must still block cleanly."""
     service = make_service()
     service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
@@ -4667,7 +4639,6 @@ async def test_end_gate_terminal_block_skips_disclosure_without_session(make_ser
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
-        advisor_repair_context_introduced=True,
     )
 
     assert outcome.action == "return"
@@ -4675,13 +4646,12 @@ async def test_end_gate_terminal_block_skips_disclosure_without_session(make_ser
 
 
 @pytest.mark.asyncio
-async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp_path: Path, make_service, clean_runnable_state):
-    """Battery-round-2 repro (session b2ad4da8): the model-facing history for
-    the turn AFTER an advisor withhold must disclose the non-completion.
-
-    Pre-fix the withheld turn contributed only an empty assistant message, so
-    the recovery-turn model saw silent compliance and told the user the
-    refused instruction was live.
+async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(tmp_path: Path, make_service, clean_runnable_state):
+    """Battery-round-2 repro (session b2ad4da8), re-seated on the 2026-09-22
+    ruling (elspeth-032ec69c41): the model-facing history for the turn AFTER
+    an advisor block carries the model's own reply — the words that explain
+    what blocked it — not an empty assistant message, and no backend
+    disclosure row stands in for it.
     """
     from elspeth.web.sessions.routes._helpers import _composer_chat_history
 
@@ -4715,7 +4685,7 @@ async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
 
-    # This harness holds a REAL sessions service, so the disclosure row the
+    # This harness holds a REAL sessions service, so the publication row the
     # gate persists goes through the live fence: the turn runs under a real
     # acquired COMPOSE operation, released before the route's own trailing
     # assistant write below (P4-D6 family A2b).
@@ -4742,12 +4712,12 @@ async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp
             initial_version=1,
             session_scope="s1",
             plugin_snapshot=None,
-            advisor_repair_context_introduced=True,
         )
     assert outcome.action == "return"
     result = outcome.result
+    assert result.raw_assistant_content == _AssistantMessage.content
     # Persist the terminal assistant row exactly as the route does
-    # (sessions/routes/composer/compose.py): content=message, raw_content="".
+    # (sessions/routes/composer/compose.py): content=message, raw_content=prose.
     await sessions.add_message(
         session.id,
         "assistant",
@@ -4758,21 +4728,12 @@ async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp
 
     history = _composer_chat_history(await sessions.get_messages(session.id, limit=None))
 
-    # The withheld turn still replays the model's withheld prose as empty —
-    # the attribution rule pinned by
-    # test_augmented_assistant_history_treats_empty_raw_content_as_augmentation
-    # is unchanged.
-    assert history[-1] == {"role": "assistant", "content": ""}
-    # But the refusal is no longer invisible: a backend-attributed user-role
-    # disclosure sits between the refused instruction and the empty reply.
-    disclosures = [
-        message for message in history if message["role"] == "user" and "Do not assume that request was applied" in message["content"]
-    ]
-    assert len(disclosures) == 1
-    instruction_index = next(index for index, message in enumerate(history) if message["content"] == contradiction)
-    assert instruction_index < history.index(disclosures[0]) < len(history) - 1
-    # The disclosure must not be misattributed to the human user.
-    assert disclosures[0].get("_elspeth_user_authored") is not True
+    # The blocked turn replays the model's own prose, not the appended notice
+    # and not an empty message.
+    assert history[-1] == {"role": "assistant", "content": _AssistantMessage.content}
+    # Nothing between the instruction and the reply: no backend user-role
+    # disclosure is written any more.
+    assert [message["content"] for message in history if message["role"] == "user"] == [contradiction]
 
 
 # ---------------------------------------------------------------------------
@@ -5128,9 +5089,6 @@ async def _drive_gate_with_review_state(service, state, review_state):
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
-        # A prior pass FLAGGED and was granted a repair-continue, so advisor
-        # findings are already in the model's context.
-        advisor_repair_context_introduced=True,
         advisor_review_state=review_state,
     )
 
@@ -5231,9 +5189,6 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
-        # A prior pass FLAGGED and was granted a repair-continue, so advisor
-        # findings are already in the model's context.
-        advisor_repair_context_introduced=True,
         advisor_review_state=review_state,
     )
     assert service._run_advisor_checkpoint.await_count == 1
