@@ -215,6 +215,7 @@ def test_persisted_advisor_suggestion_rejects_malformed_values(value: object) ->
                         "status": "blocked",
                         "detail": "Review blocked",
                         "for_graph": "graph",
+                        "note": None,
                         "suggestion": value,
                     }
                 }
@@ -231,6 +232,7 @@ def test_persisted_advisor_suggestion_is_required() -> None:
                         "status": "blocked",
                         "detail": "Review blocked",
                         "for_graph": "graph",
+                        "note": None,
                     }
                 }
             }
@@ -347,6 +349,7 @@ class TestWriter:
                 "detail": _BLOCKED_DETAIL,
                 "suggestion": None,
                 "for_graph": completion_gate_fingerprint(state),
+                "note": None,
             }
         }
 
@@ -364,7 +367,7 @@ class TestParse:
     def test_noncanonical_mapping_cannot_supply_a_persisted_signoff(self) -> None:
         from collections import UserDict
 
-        signoff = UserDict({"status": "blocked", "detail": "d", "for_graph": "f"})
+        signoff = UserDict({"status": "blocked", "detail": "d", "for_graph": "f", "note": None})
         with pytest.raises(ValueError, match="expected a dict"):
             parse_completion_gates({COMPLETION_GATES_META_KEY: {"advisor_signoff": signoff}})
 
@@ -385,6 +388,7 @@ class TestParse:
             detail=_BLOCKED_DETAIL,
             suggestion=None,
             for_graph=completion_gate_fingerprint(state),
+            note=None,
         )
 
     @pytest.mark.parametrize(
@@ -395,10 +399,10 @@ class TestParse:
             {"unknown_gate": {}},
             {"advisor_signoff": None},
             {"advisor_signoff": "not-a-mapping"},
-            {"advisor_signoff": {"status": "cleared", "detail": "d", "for_graph": "f"}},
-            {"advisor_signoff": {"status": "blocked", "detail": "", "for_graph": "f"}},
-            {"advisor_signoff": {"status": "blocked", "detail": "d", "for_graph": ""}},
-            {"advisor_signoff": {"status": "blocked", "detail": 7, "for_graph": "f"}},
+            {"advisor_signoff": {"status": "cleared", "detail": "d", "for_graph": "f", "note": None}},
+            {"advisor_signoff": {"status": "blocked", "detail": "", "for_graph": "f", "note": None}},
+            {"advisor_signoff": {"status": "blocked", "detail": "d", "for_graph": "", "note": None}},
+            {"advisor_signoff": {"status": "blocked", "detail": 7, "for_graph": "f", "note": None}},
             {"advisor_signoff": {"status": "blocked", "detail": "d"}},
         ],
     )
@@ -421,6 +425,7 @@ class TestMetaFromFacts:
                     "detail": "The advisor sign-off could not be obtained.",
                     "suggestion": "Retry advisory review.",
                     "for_graph": "fingerprint-abc",
+                    "note": None,
                 }
             }
         }
@@ -456,6 +461,7 @@ class TestMerge:
                 detail=_BLOCKED_DETAIL,
                 suggestion=None,
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
         merged = merge_completion_gates(_green_result(), facts, state)
@@ -480,6 +486,7 @@ class TestMerge:
                 detail=_BLOCKED_DETAIL,
                 suggestion=None,
                 for_graph=completion_gate_fingerprint(blocked_for),
+                note=None,
             )
         )
         merged = merge_completion_gates(_green_result(), facts, current)
@@ -519,6 +526,7 @@ class TestMerge:
                 detail=_BLOCKED_DETAIL,
                 suggestion=None,
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
         merged = merge_completion_gates(base, facts, state)
@@ -535,6 +543,7 @@ class TestMerge:
                 detail=_BLOCKED_DETAIL,
                 suggestion=None,
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
 
@@ -563,6 +572,7 @@ class TestMerge:
                 detail=_BLOCKED_DETAIL,
                 suggestion=None,
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
 
@@ -575,14 +585,75 @@ class TestMerge:
         _assert_canonical_check_order(twice)
 
 
-def _blocked_facts_for(state: CompositionState) -> CompletionGateFacts:
+def _blocked_facts_for(state: CompositionState, *, note: str | None = None) -> CompletionGateFacts:
     return CompletionGateFacts(
         advisor_signoff=AdvisorSignoffGateFact(
             detail=_BLOCKED_DETAIL,
             suggestion=None,
             for_graph=completion_gate_fingerprint(state),
+            note=note,
         )
     )
+
+
+def test_note_survives_reload_and_reaches_validate() -> None:
+    """Ruling 2026-09-22: the note the blocking turn showed is the note /validate shows on the same graph."""
+    from elspeth.web.composer.service import _advisor_signoff_pending_validation
+
+    state = _make_state()
+    result = _advisor_signoff_pending_validation(
+        _green_result(),
+        reason="flagged_final_pass",
+        findings="FLAGGED: choose per-branch sinks",
+        category="error_handling",
+        step_ids=(),
+        note="choose per-branch sinks",
+    )
+    assert result.readiness.blockers[0].note == "choose per-branch sinks"
+    facts = parse_completion_gates({COMPLETION_GATES_META_KEY: completion_gates_meta_value(result, state)})
+    assert facts is not None and facts.advisor_signoff is not None
+    assert facts.advisor_signoff.note == "choose per-branch sinks"
+    reloaded = merge_completion_gates(_green_result(), facts, state)
+    assert reloaded.readiness.blockers[0].note == "choose per-branch sinks"
+    # The carry-forward writer keeps it too.
+    carried = parse_completion_gates({COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(facts)})
+    assert carried is not None and carried.advisor_signoff is not None
+    assert carried.advisor_signoff.note == "choose per-branch sinks"
+    # A changed graph gets the pending wording and no note: the words applied
+    # to a graph that no longer exists.
+    changed = _make_state(node_options={"operations": [{"target": "y", "expression": "2"}]})
+    assert merge_completion_gates(_green_result(), facts, changed).readiness.blockers[0].note is None
+
+
+def test_gate_fact_without_note_key_is_rejected() -> None:
+    """Tier 1: an envelope missing the key is writer drift or corruption, never a default."""
+    legacy = {
+        COMPLETION_GATES_META_KEY: {
+            "advisor_signoff": {"status": "blocked", "detail": "d", "suggestion": None, "for_graph": "f"},
+        }
+    }
+    with pytest.raises(ValueError, match="note is required"):
+        parse_completion_gates(legacy)
+
+
+def test_gate_fact_note_null_round_trips() -> None:
+    state = _make_state()
+    facts = _blocked_facts_for(state, note=None)
+    parsed = parse_completion_gates({COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(facts)})
+    assert parsed is not None and parsed.advisor_signoff is not None
+    assert parsed.advisor_signoff.note is None
+    assert merge_completion_gates(_green_result(), parsed, state).readiness.blockers[0].note is None
+
+
+@pytest.mark.parametrize("bad", ["", 7, b"x"], ids=["empty", "int", "bytes"])
+def test_gate_fact_note_must_be_a_non_empty_string_or_null(bad: object) -> None:
+    envelope = {
+        COMPLETION_GATES_META_KEY: {
+            "advisor_signoff": {"status": "blocked", "detail": "d", "suggestion": None, "for_graph": "f", "note": bad},
+        }
+    }
+    with pytest.raises(ValueError, match="note must be"):
+        parse_completion_gates(envelope)
 
 
 def test_block_covers_an_unchanged_graph_it_was_recorded_for() -> None:

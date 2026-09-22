@@ -651,6 +651,7 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
                     "status": "blocked",
                     "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                     "for_graph": "0" * 64,
+                    "note": None,
                 }
             }
         },
@@ -678,6 +679,7 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
+                note=None,
             )
         )
     ]

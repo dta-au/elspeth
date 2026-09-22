@@ -11489,6 +11489,7 @@ class TestComposerProgressRoutes:
                     detail=blocker.detail,
                     suggestion=blocker.suggestion,
                     for_graph=completion_gate_fingerprint(seeded_state),
+                    note=None,
                 )
             )
         else:
@@ -11497,6 +11498,7 @@ class TestComposerProgressRoutes:
                     detail="Completion advisory review did not clear after the available attempts.",
                     suggestion="Review the pipeline.",
                     for_graph=completion_gate_fingerprint(seeded_state),
+                    note=None,
                 )
             )
             envelope = completion_gates_meta_from_facts(seeded_fact)
@@ -12901,7 +12903,7 @@ async def test_state_data_overwrites_carried_forward_gate() -> None:
     stale_meta = {
         "repair_turns_used": 2,
         "completion_gates": {
-            "advisor_signoff": {"status": "blocked", "detail": "stale verdict", "for_graph": "0" * 64, "suggestion": None}
+            "advisor_signoff": {"status": "blocked", "detail": "stale verdict", "for_graph": "0" * 64, "note": None, "suggestion": None}
         },
     }
     state_data = await _state_data_with_preflight(
@@ -12925,7 +12927,9 @@ async def test_state_data_preserves_prior_gate_on_non_adjudicating_save(monkeypa
     from elspeth.web.sessions.routes import _helpers as routes
 
     state = _make_authoring_valid_partial("gate-preserve")
-    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64, "suggestion": None}}
+    prior_gates = {
+        "advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64, "note": None, "suggestion": None}
+    }
 
     async def fake_preflight(*args: Any, **kwargs: Any) -> ValidationResult:
         del args, kwargs
@@ -12944,7 +12948,9 @@ async def test_state_data_adjudicated_clean_save_still_clears_prior_gate() -> No
     """An adjudicated clean compose result overwrites: offering a prior fact
     must not make a blocked verdict sticky across a clean advisor turn."""
     state = _make_authoring_valid_partial("gate-clear-adjudicated")
-    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64, "suggestion": None}}
+    prior_gates = {
+        "advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64, "note": None, "suggestion": None}
+    }
 
     state_data = await _state_data_with_preflight(
         state,

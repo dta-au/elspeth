@@ -60,6 +60,12 @@ class AdvisorSignoffGateDict(TypedDict):
     detail: str
     suggestion: str | None
     for_graph: str
+    # elspeth-032ec69c41 (ruling 2026-09-22): the reviewer's own words, bounded
+    # and sanitised at the parser (``ADVISOR_NOTE_MAX_CHARS``). REQUIRED and
+    # nullable: null is the honest value for every blocker that has no
+    # reviewer behind it, and an ABSENT key is writer drift the strict parser
+    # refuses rather than defaults.
+    note: str | None
 
 
 class CompletionGatesDict(TypedDict, total=False):
@@ -79,6 +85,7 @@ class AdvisorSignoffGateFact:
     detail: str
     suggestion: str | None
     for_graph: str
+    note: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +140,7 @@ def _reconcile_advisor_blocker(
     *,
     detail: str,
     suggestion: str | None,
+    note: str | None,
 ) -> list[ValidationReadinessBlocker]:
     """Replace duplicate advisor blockers while retaining the first slot."""
     replacement = ValidationReadinessBlocker(
@@ -141,7 +149,7 @@ def _reconcile_advisor_blocker(
         component_type="pipeline",
         detail=detail,
         suggestion=suggestion,
-        note=None,
+        note=note,
     )
     reconciled: list[ValidationReadinessBlocker] = []
     replaced = False
@@ -198,6 +206,7 @@ def completion_gates_meta_value(
             detail=blocked[0].detail,
             suggestion=blocked[0].suggestion,
             for_graph=completion_gate_fingerprint(state),
+            note=blocked[0].note,
         )
     }
 
@@ -223,6 +232,7 @@ def completion_gates_meta_from_facts(facts: CompletionGateFacts | None) -> Compl
             detail=facts.advisor_signoff.detail,
             suggestion=facts.advisor_signoff.suggestion,
             for_graph=facts.advisor_signoff.for_graph,
+            note=facts.advisor_signoff.note,
         )
     }
 
@@ -278,7 +288,12 @@ def parse_completion_gates(
     suggestion = raw_signoff["suggestion"]
     if suggestion is not None and type(suggestion) is not str:
         raise ValueError("Tier 1: completion_gates.advisor_signoff.suggestion must be a string or null")
-    return CompletionGateFacts(advisor_signoff=AdvisorSignoffGateFact(detail=detail, suggestion=suggestion, for_graph=for_graph))
+    if "note" not in raw_signoff:
+        raise ValueError("Tier 1: completion_gates.advisor_signoff.note is required")
+    note = raw_signoff["note"]
+    if note is not None and (type(note) is not str or not note):
+        raise ValueError("Tier 1: completion_gates.advisor_signoff.note must be a non-empty string or null")
+    return CompletionGateFacts(advisor_signoff=AdvisorSignoffGateFact(detail=detail, suggestion=suggestion, for_graph=for_graph, note=note))
 
 
 def merge_completion_gates(
@@ -308,7 +323,13 @@ def merge_completion_gates(
                 execution_ready=result.readiness.execution_ready,
                 completion_ready=False,
                 blockers=_reconcile_advisor_blocker(
-                    result.readiness.blockers, detail=detail, suggestion=fact.suggestion if current else None
+                    result.readiness.blockers,
+                    detail=detail,
+                    suggestion=fact.suggestion if current else None,
+                    # The reviewer's words described the graph it reviewed; on
+                    # a changed graph they are dropped with the verdict they
+                    # came from, exactly like ``suggestion``.
+                    note=fact.note if current else None,
                 ),
             ),
         }

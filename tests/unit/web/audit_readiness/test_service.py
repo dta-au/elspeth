@@ -803,6 +803,7 @@ def test_compute_snapshot_passes_persisted_completion_gates():
                         "status": "blocked",
                         "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                         "for_graph": "0" * 64,
+                        "note": None,
                     }
                 }
             }
@@ -827,6 +828,7 @@ def test_compute_snapshot_passes_persisted_completion_gates():
             suggestion=None,
             detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
             for_graph="0" * 64,
+            note=None,
         )
     )
     assert kwargs["session_operation_context"] is _blob_read_context()

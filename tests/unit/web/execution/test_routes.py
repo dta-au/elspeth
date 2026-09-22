@@ -533,6 +533,10 @@ class TestValidateEndpoint:
                             "status": "blocked",
                             "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                             "for_graph": "0" * 64,
+                            # elspeth-032ec69c41: the reviewer's note is part of
+                            # the persisted fact, so the /validate seam must
+                            # carry it to the service that merges it.
+                            "note": "choose per-branch sinks",
                         }
                     }
                 },
@@ -551,6 +555,7 @@ class TestValidateEndpoint:
                 suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
+                note="choose per-branch sinks",
             )
         )
 

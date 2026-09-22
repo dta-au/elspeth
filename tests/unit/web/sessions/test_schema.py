@@ -544,6 +544,7 @@ def test_epoch_61_is_rejected_before_reading_old_advisor_gate_grammar() -> None:
                         "status": "blocked",
                         "detail": "Review pending.",
                         "for_graph": "reviewed-graph",
+                        "note": None,
                     }
                 }
             }

@@ -6001,6 +6001,7 @@ def _blocked_facts_for(state: CompositionState) -> CompletionGateFacts:
             detail="Completion advisory review did not clear after the available attempts.",
             suggestion="Review the pipeline.",
             for_graph=completion_gate_fingerprint(state),
+            note=None,
         )
     )
 
