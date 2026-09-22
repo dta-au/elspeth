@@ -1615,6 +1615,24 @@ def _marked_decline_body(content: str, marker: str) -> str | None:
     return body if body else None
 
 
+def _unadmitted_prose(response: Any) -> str:
+    """Return the text of a reply ``_parse_response_tool_calls`` refused as PROSE_REPLY.
+
+    That code is raised only after the single choice and its message were
+    validated, so both reads below are the ones the parser already made. An
+    empty reply, a non-string content, or a text past the planner's own text
+    bound yields ``""``: there are no words to keep, or too many to keep safely.
+    """
+    content = _provider_field(_provider_field(_provider_field(response, "choices")[0], "message"), "content")
+    if type(content) is not str:
+        return ""
+    try:
+        require_bounded_text(content, label="planner text response")
+    except JsonBoundaryError:
+        return ""
+    return content
+
+
 def _parse_response_tool_calls(
     response: Any,
     *,
@@ -4108,6 +4126,11 @@ async def _plan_pipeline_inner(
                     )
                 )
                 begin_response_attempt(call)
+                if exc.code == "PROSE_REPLY":
+                    # The nudge drops this reply from the conversation, and the
+                    # call audit above stores no response text. Stage the
+                    # model's words for the caller that holds the session.
+                    recorder.record_withheld_reply("planner_prose_unadmitted", _unadmitted_prose(response))
                 if truncated:
                     raise PipelinePlannerError(
                         "planner response was truncated at the completion token limit",

@@ -70,6 +70,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
 
 __all__ = [
     "BufferingRecorder",
@@ -230,6 +231,7 @@ class BufferingRecorder(
         self._llm_calls: list[ComposerLLMCall] = []
         self._chat_turns: list[ComposerChatTurn] = []
         self._planner_attempts: list[ComposerPlannerAttempt] = []
+        self._withheld_replies: list[WithheldReply] = []
         self._lock = threading.Lock()
 
     def record(self, invocation: ComposerToolInvocation) -> None:
@@ -258,6 +260,25 @@ class BufferingRecorder(
         """Append one semantic planner response disposition."""
         with self._lock:
             self._planner_attempts.append(attempt)
+
+    def record_withheld_reply(self, origin: WithheldReplyOrigin, content: str) -> None:
+        """Stage a model reply its producer will not publish.
+
+        For a producer that holds no session write context (the pipeline
+        planner). A blank reply has no words to keep and is not staged; the
+        caller that holds the session persists the rest as
+        ``composer_withheld_reply`` audit rows.
+        """
+        if not content.strip():
+            return
+        with self._lock:
+            self._withheld_replies.append(WithheldReply(origin=origin, content=content))
+
+    @property
+    def withheld_replies(self) -> tuple[WithheldReply, ...]:
+        """Snapshot staged unpublished replies as an immutable tuple."""
+        with self._lock:
+            return tuple(self._withheld_replies)
 
     @property
     def invocations(self) -> tuple[ComposerToolInvocation, ...]:

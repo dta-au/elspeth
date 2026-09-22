@@ -377,8 +377,41 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
                 llm_calls=(),
                 planner_attempts=(),
                 invocations=(invocation,),
+                withheld_replies=(),
                 session_operation_context=compose_context,
             )
+
+
+@pytest.mark.asyncio
+async def test_planner_audit_cohort_carries_the_prose_the_planner_refused_to_publish(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+) -> None:
+    """Unadmitted planner prose joins the SAME atomic cohort as the planner's
+    call and attempt rows, so it lands or is absent with them. It must not be a
+    separate write: the cohort's all-or-nothing settlement is the contract."""
+    from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND, WithheldReply
+    from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_messages
+
+    prose = "Before I build this: which column holds the colour?"
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert sessions_service is not None
+    async with acquire_compose_context(sessions_service, UUID(result_session_id)) as compose_context:
+        await composer_service_with_real_sessions._persist_pipeline_planner_audit(
+            session_id=UUID(result_session_id),
+            current_state_id=None,
+            llm_calls=(),
+            planner_attempts=(),
+            invocations=(),
+            withheld_replies=(WithheldReply(origin="planner_prose_unadmitted", content=prose),),
+            session_operation_context=compose_context,
+        )
+
+    stored = await sessions_service.get_messages(UUID(result_session_id))
+    (row,) = [m for m in stored if m.tool_calls and m.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND]
+    assert (row.role, row.content, row.tool_calls[0]["origin"]) == ("audit", prose, "planner_prose_unadmitted")
+    assert row not in _composer_conversation_messages(stored)
+    assert all(item["content"] != prose for item in _composer_chat_history(stored))
 
 
 @pytest.mark.asyncio

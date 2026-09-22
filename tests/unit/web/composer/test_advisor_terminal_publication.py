@@ -162,11 +162,11 @@ class TestWithheldProseDisclosure:
         """The finalize suffixes derive from the same constants, so the
         recognizer must keep minting trusted chrome after the extension —
         a hand-copied suffix in the recognizer would fail here."""
-        bare = no_tool_policy.compose_advisor_pending_handoff_message("")
+        bare = no_tool_policy.compose_advisor_pending_handoff_message("", prose_withheld=True)
         segments = no_tool_policy.visible_message_segments(content=bare, raw_content="")
         assert segments == (no_tool_policy.TrustedSystemNoticeSegment(no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE),)
 
-        pending = no_tool_policy.compose_advisor_signoff_pending_message("")
+        pending = no_tool_policy.compose_advisor_signoff_pending_message("", prose_withheld=True)
         segments = no_tool_policy.visible_message_segments(content=pending, raw_content="")
         assert segments == (no_tool_policy.TrustedSystemNoticeSegment(no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE),)
 
@@ -339,6 +339,7 @@ def _blocked_terminal(
         persisted_tool_call_turn=False,
         runtime_preflight=runtime_preflight,
         outstanding_findings=None,
+        advisor_repair_context_introduced=True,
     )
 
 

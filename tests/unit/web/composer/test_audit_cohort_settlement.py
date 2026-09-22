@@ -393,6 +393,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
                 planner_llm_calls=(),
                 planner_attempts=(),
                 planner_invocations=_PLANNER_COHORT,
+                planner_withheld_replies=(),
                 plugin_snapshot=None,
             )
 
@@ -610,6 +611,7 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
                 planner_llm_calls=(),
                 planner_attempts=(),
                 planner_invocations=_PLANNER_COHORT,
+                planner_withheld_replies=(),
                 plugin_snapshot=None,
             )
 

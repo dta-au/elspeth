@@ -39,14 +39,46 @@ describe("ComposerPreferencesForm", () => {
     vi.clearAllMocks();
   });
 
-  it.each(["freeform", "guided"] as const)("focuses the selected %s mode and lists Freeform first", (mode) => {
+  it.each(["freeform", "guided"] as const)("lists Freeform first and focuses it when the saved default is %s", (mode) => {
     usePreferencesStore.setState({ defaultMode: mode });
     render(<ComposerPreferencesPanel onClose={vi.fn()} />);
     const group = screen.getByRole("group", { name: "Default mode for new sessions" });
     const radios = within(group).getAllByRole("radio");
     expect(radios[0]).toHaveAccessibleName("Freeform");
     expect(radios[1]).toHaveAccessibleName("Guided");
-    expect(screen.getByRole("radio", { name: mode === "freeform" ? "Freeform" : "Guided" })).toHaveFocus();
+    // Guided is disabled, and a disabled input cannot take focus: a saved
+    // Guided default must not leave the dialog with no initial focus.
+    expect(screen.getByRole("radio", { name: "Freeform" })).toHaveFocus();
+  });
+
+  it("disables the Guided option while idle and says why (guided mode is being retired)", () => {
+    usePreferencesStore.setState({ defaultMode: "freeform", writing: false });
+    render(<ComposerPreferencesForm />);
+
+    expect(screen.getByRole("radio", { name: "Guided" })).toBeDisabled();
+    expect(screen.getByRole("radio", { name: "Freeform" })).toBeEnabled();
+    expect(screen.getByText(/guided mode is being retired/i)).toBeInTheDocument();
+  });
+
+  it("still shows a saved Guided default as selected, and lets the user switch to Freeform", async () => {
+    const setDefault = vi.spyOn(usePreferencesStore.getState(), "setDefaultMode").mockResolvedValueOnce(undefined);
+    usePreferencesStore.setState({ defaultMode: "guided" });
+    render(<ComposerPreferencesForm />);
+
+    expect(screen.getByRole("radio", { name: "Guided" })).toBeChecked();
+    await userEvent.click(screen.getByRole("radio", { name: "Freeform" }));
+
+    expect(setDefault).toHaveBeenCalledWith("freeform");
+  });
+
+  it("does not write a Guided default when the disabled option is clicked", async () => {
+    const setDefault = vi.spyOn(usePreferencesStore.getState(), "setDefaultMode").mockResolvedValueOnce(undefined);
+    usePreferencesStore.setState({ defaultMode: "freeform" });
+    render(<ComposerPreferencesForm />);
+
+    await userEvent.click(screen.getByRole("radio", { name: "Guided" }));
+
+    expect(setDefault).not.toHaveBeenCalled();
   });
 
   it("renders the current default-mode selection (freeform)", () => {

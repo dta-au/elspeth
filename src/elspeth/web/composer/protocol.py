@@ -510,11 +510,17 @@ class ComposerConvergenceError(ComposerServiceError):
         evidence: Mapping[str, Any] | None = None,
         failed_turn: FailedTurnMetadata | None = None,
     ) -> None:
-        super().__init__(
-            f"Composer did not converge within {max_turns} turns "
-            f"(budget exhausted: {budget_exhausted}). "
-            f"The LLM kept making tool calls without producing a final response."
+        # This string is the HTTP ``detail`` the user reads. A turn budget is
+        # spent by tool-call turns, so the loop wording is true for those. A
+        # timeout is not: the deadline can expire after the model's final
+        # reply, while the END gate re-validates, so the timeout wording claims
+        # only what every timeout has in common.
+        cause = (
+            "The request ran out of time before the turn could be completed."
+            if budget_exhausted == "timeout"
+            else "The LLM kept making tool calls without producing a final response."
         )
+        super().__init__(f"Composer did not converge within {max_turns} turns (budget exhausted: {budget_exhausted}). {cause}")
         self.max_turns = max_turns
         self.budget_exhausted = budget_exhausted
         self.partial_state = partial_state

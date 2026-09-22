@@ -8825,6 +8825,43 @@ async def test_prose_reply_gets_bounded_nudge_then_converges(
 
 
 @pytest.mark.asyncio
+async def test_unadmitted_prose_is_staged_on_the_recorder_as_a_withheld_reply(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The nudge discards the reply from the conversation and nothing else
+    keeps it: ``ComposerLLMCall`` stores no response text. The planner has no
+    session to write to, so it stages the words on the recorder and the caller
+    persists them."""
+    prose = "Before I build this: which column holds the colour?"
+    completion = _ScriptedCompletion(
+        _text_response(prose),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert [(reply.origin, reply.content) for reply in recorder.withheld_replies] == [("planner_prose_unadmitted", prose)]
+
+
+@pytest.mark.asyncio
+async def test_a_published_decline_is_not_staged_as_withheld(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Only UNADMITTED prose is withheld. An admitted ``DECLINE:`` reply is
+    published verbatim, so recording it would double-count the model's words."""
+    completion = _ScriptedCompletion(_text_response("DECLINE: no installed plugin can read that format."))
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PlannerDeclined):
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder, information_aware=True)
+
+    assert recorder.withheld_replies == ()
+
+
+@pytest.mark.asyncio
 async def test_prose_replies_exhaust_nudge_budget_then_terminate_malformed(
     tmp_path: Path,
     tool_context: ToolContext,

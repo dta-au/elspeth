@@ -104,21 +104,23 @@ export function ComposerPreferencesForm({
           />
           <span>Freeform</span>
         </label>
+        {/* Guided mode is being retired. This was the only way into it (ruling
+            D1), so the option is disabled rather than removed: a saved Guided
+            default still shows as selected, and Freeform stays selectable so
+            that user can switch away. The clean removal is separate work. */}
         <label className="composer-preferences-option">
           <Input
             type="radio"
             name="composer-default-mode"
             value="guided"
             checked={defaultMode === "guided"}
-            disabled={writing}
+            disabled
             onChange={() => void onChange("guided")}
           />
           <span>Guided</span>
         </label>
-        {/* The only way into guided mode (ruling D1): say how it takes effect,
-            or a user in a Freeform session picks Guided and sees no change. */}
         <p className="composer-preferences-hint">
-          Applies to sessions you start from now on. To use a different mode, start a new session.
+          Guided mode is being retired and can no longer be selected. Applies to sessions you start from now on.
         </p>
       </fieldset>
       <fieldset className="composer-preferences-fieldset">
@@ -233,10 +235,12 @@ export function ComposerPreferencesPanel({
   onResetTutorialComplete,
 }: ComposerPreferencesPanelProps): JSX.Element {
   const modalRef = useRef<HTMLDivElement>(null);
+  // ``:enabled`` because the Guided option is disabled: a saved Guided default
+  // is checked but cannot take focus, and the dialog must still open focused.
   useFocusTrap(
     modalRef,
     true,
-    "input[name='composer-default-mode']:checked",
+    "input[name='composer-default-mode']:enabled",
   );
 
   useEffect(() => {
