@@ -77,12 +77,32 @@ close-code change, compared line by line rather than to zero:
 - The classifier is an `except` tuple rather than an `isinstance` predicate
   specifically so it adds no R5 finding; `websocket_close.py` contributes none.
 
-The full-suite gate at `3d404f14d` (before the close-code change) recorded
-`frozen=yes`: ruff/mypy/contracts exit 0, lints 2274, pytest 2 failed / 55621
-passed — the two failures being the pre-existing
-`test_freeform_planner_failure_translation` reds on `release/0.8.1` — and
-testcontainer 1 failed / 558 passed, which is the stale assertion repaired in
-`d2362c0c8`. A re-run covers the close-code change.
+### Full-suite gate
+
+Two runs, both `frozen=yes`, so both are evidence.
+
+| Stage | `3d404f14d` (findings 1–5) | `954e0b7ec` (with the close code) |
+|---|---|---|
+| ruff / mypy / contracts | 0 / 0 / 0 | 0 / 0 / 0 |
+| lints | 1, findings=2274 | 1, findings=2274 |
+| pytest | 1 — 2 failed, 55621 passed | 1 — 2 failed, **55628** passed |
+| testcontainer | 1 — **1 failed**, 558 passed | 0 — **559 passed** |
+
+The pytest pair is `test_freeform_planner_failure_translation`
+(`test_send_message_..._is_translated[malformed]` and
+`test_recompose_..._is_translated`), pre-existing on `release/0.8.1` and
+unrelated to this branch: the same two reds appear on the unrelated
+`reply-on-advisor-block` branch's gate, and nothing here touches the composer
+planner path. The +7 is this branch's new tests — five parity pins and the two
+close-code behavioural pins.
+
+The testcontainer red in the first run is the stale assertion repaired in
+`d2362c0c8`; the second run is clean, which is what puts finding 5's teardown
+on real PostgreSQL.
+
+`RESULT=FAIL` on both runs is the lints stage alone, which is the deliberate
+fail-closed trust-tier state described in AGENTS.md, not a regression from this
+work — the corpus is identical before and after.
 
 ## Correction
 
@@ -111,10 +131,14 @@ wrong, and are corrected here for the same reason:
   `ast` rather than by eye.
 - The tier-model cost was quoted as "up to 6 `websocket_run_progress` allowlist
   entries will go stale and need re-signing." They were **already stale before
-  this branch existed**: all 12 `routes.py` entries carry an `ast_path` whose
-  leading module index is off by +4, and the gate's own corpus reports exactly
-  those 6 as stale on the base tree. The change adds none. See the evidence
-  below.
+  this branch existed**, which is measured rather than recalled:
+  `git diff --stat release/0.8.1..3d404f14d -- src/elspeth/web/execution/routes.py`
+  prints nothing, so none of the five findings-1–5 commits touched that file,
+  and the gate at `3d404f14d` already reported exactly those 6 as stale. All 12
+  `routes.py` entries carry an `ast_path` whose leading module index is off by
+  +4, yet only these 6 are flagged — so a module-index shift alone does not
+  stale an entry, and the new import disturbs none of the other 6. The change
+  adds no signing work. See the evidence below.
 
 ## Deliberately not done
 

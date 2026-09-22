@@ -190,16 +190,20 @@ let executionRequestSeq = 0;
  *
  * The socket does not reconnect after close codes 1000 and 1011, and the only
  * other REST fallback — InlineRunResults' 3s loadRuns loop — unmounts with the
- * Run tab. A server-side database error therefore left an off-tab run looking
- * live until the next Run-tab visit. This timer lives beside wsConnection, in
- * the store, precisely so it outlives any component: it retires itself as soon
- * as loadRuns' degraded-path reconciliation observes the run terminal, when
- * the tab stops following the run, when a new connection supersedes it, or on
+ * Run tab. A server-side failure therefore left an off-tab run looking live
+ * until the next Run-tab visit. This timer lives beside wsConnection, in the
+ * store, precisely so it outlives any component: it retires itself as soon as
+ * loadRuns' degraded-path reconciliation observes the run terminal, when the
+ * tab stops following the run, when a new connection supersedes it, or on
  * reset().
  *
- * It is deliberately NOT armed for the reconnecting close (1006) — the socket
- * owns recovery there — nor for the terminal refusals (4001/4004), where
- * polling could only repeat the refusal.
+ * It is deliberately NOT armed for the closes that reconnect — 1006, and 4503
+ * where the server reports a backend failure a later read may not hit — since
+ * the socket owns recovery there and a poll would only duplicate it. Nor for
+ * the terminal refusals (4001/4004), where polling could only repeat the
+ * refusal. 1011 is the remaining case: the server could read nothing, and
+ * retrying the same read would fail the same way, so REST is the only route
+ * left.
  */
 const RUN_RECOVERY_POLL_INTERVAL_MS = 3000;
 let runRecoveryPollTimer: ReturnType<typeof setInterval> | null = null;

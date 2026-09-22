@@ -84,6 +84,17 @@ class RunStreamCloseCode(IntEnum):
 #: failures in ``OperationalError``, so a bare ``ConnectionError`` in these
 #: handlers comes from writing to a client socket that has already gone, and a
 #: close frame aimed at a departed client is delivered to nobody.
+#:
+#: Nor ``AsyncWorkerAdmissionTimeoutError``, which is the one exclusion worth
+#: naming because it looks like it belongs. It is a ``TimeoutError`` and so an
+#: ``OSError``, which puts it in the broad arm, and it is an exhaustion
+#: timeout, which is the same shape as the pool timeout admitted above. The
+#: difference is what exhaustion means on each side: the database pool is
+#: momentary contention, whereas ``async_workers`` raises this one "typically
+#: because earlier workers are hung and their callers have already timed out"
+#: (its own docstring). A hung pool is still hung on the next connection, so
+#: inviting the client back would ask it to re-enter the queue that is stuck.
+#: The REST fallback is the better answer there.
 TRANSIENT_BACKEND_FAILURES: tuple[type[Exception], ...] = (
     OperationalError,
     SQLAlchemyPoolTimeoutError,
