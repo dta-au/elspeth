@@ -3110,9 +3110,14 @@ async def test_end_gate_final_flag_never_exposes_advisor_findings_on_human_surfa
         assert _ADVISOR_FINDINGS_UNTRUSTED_BEGIN not in surface
         assert _ADVISOR_FINDINGS_UNTRUSTED_END not in surface
 
-    # The serialised wire blob carries the canary ONLY inside the note: strip
-    # the note's exact text and the blob must be clean again.
-    blob_without_note = runtime_preflight.model_dump_json().replace(json.dumps(advisor_blocker.note)[1:-1], "")
+    # The serialised wire blob carries the canary ONLY inside the note. The
+    # note must be IN the JSON (final review I-5: nothing else proves the
+    # field the frontend decodes actually serialises) and, once its exact
+    # text is removed, the blob must be clean again.
+    blob = runtime_preflight.model_dump_json()
+    serialised_note = json.dumps(advisor_blocker.note)[1:-1]
+    assert serialised_note in blob
+    blob_without_note = blob.replace(serialised_note, "")
     assert canary not in blob_without_note
     assert "Repair:" not in blob_without_note
 
