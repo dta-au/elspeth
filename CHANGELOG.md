@@ -49,7 +49,9 @@ separate deployment requirement.
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 64 and Landscape databases below epoch 43 must be recreated together.
+epoch 65 and Landscape databases below epoch 43 must be recreated together.
+Startup accepts an empty database or an existing database matching the exact
+current schema epoch (session 65, Landscape 43); these are not minimum versions.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service
