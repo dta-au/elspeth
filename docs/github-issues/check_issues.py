@@ -23,6 +23,8 @@ import pathlib
 import re
 import sys
 
+import yaml
+
 ROOT = pathlib.Path(__file__).resolve().parent
 ISSUES = ROOT / "issues"
 
@@ -183,16 +185,34 @@ def scan(path: pathlib.Path) -> tuple[list[str], list[str]]:
                 continue
             warns.append(f"{label}: {m!r}")
 
-    # Front matter must exist and carry exactly the two keys the importer reads.
+    # Front matter is EXECUTABLE, not decoration. A regex sees `title: Repair X: Y` as
+    # fine; YAML sees a mapping value where none is allowed and the importer dies. So
+    # parse it the way the importer will, rather than pattern-matching it.
     if not text.startswith("---\n"):
         blocks.append("missing YAML front matter")
     else:
         fm = text.split("---\n", 2)[1]
-        for key in REQUIRED_FRONT_MATTER:
-            if not re.search(rf"^{key}:", fm, re.M):
-                blocks.append(f"front matter missing {key!r}")
-        if not re.search(r"^type/(bug|task|epic)\b", fm, re.M) and "type/" not in fm:
-            warns.append("front matter has no type/* label")
+        try:
+            meta = yaml.safe_load(fm)
+        except yaml.YAMLError as exc:
+            meta = None
+            first = str(exc).splitlines()[0]
+            blocks.append(f"front matter is not valid YAML ({first}) — the importer would fail")
+        if meta is not None and not isinstance(meta, dict):
+            blocks.append(f"front matter parsed as {type(meta).__name__}, not a mapping")
+            meta = None
+        if isinstance(meta, dict):
+            for key in REQUIRED_FRONT_MATTER:
+                if key not in meta:
+                    blocks.append(f"front matter missing {key!r}")
+            title = meta.get("title")
+            if isinstance(title, str) and len(title) > 100:
+                warns.append(f"title is {len(title)} chars — over the 100 guide")
+            labels = meta.get("labels") or []
+            if not isinstance(labels, list):
+                blocks.append("front matter 'labels' is not a list")
+            elif not any(str(x).startswith("type/") for x in labels):
+                warns.append("front matter has no type/* label")
 
     body = text.split("---\n", 2)[-1]
     words = len(body.split())

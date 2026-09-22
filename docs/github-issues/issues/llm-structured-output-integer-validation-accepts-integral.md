@@ -33,7 +33,8 @@ JSON number rendered as a float.
 ## Where the work starts
 
 One file: `src/elspeth/plugins/transforms/llm/validation.py`. The two functions above are the
-whole mechanism. Tests for this module live under `tests/unit/plugins/transforms/llm/`.
+whole mechanism. Its tests are `tests/unit/plugins/llm/test_validation.py`, with property-based
+coverage in `tests/property/plugins/llm/test_response_validation_properties.py`.
 
 ## Fix — one decision, then a small change
 

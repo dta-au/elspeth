@@ -29,6 +29,13 @@ that was never collected. The supported profiles are a closed registry —
 `DeploymentTarget` in `src/elspeth/web/config.py` — so narrowing them is a concrete,
 reviewable change rather than a statement of intent.
 
+## Done looks like
+
+One of two outcomes, not neither: the Azure acceptance module has been run against a live
+environment and its evidence recorded, or a merged change narrows `DEPLOYMENT_STARTUP_PROFILES`
+and the stated scope of the 1.0 completeness claim to the profiles that were actually
+exercised.
+
 ## Size and who can pick this up
 
 This is not a code task and it is not startable by a new contributor: it needs cloud

@@ -21,7 +21,7 @@ Coalesce is the node kind most exposed to this. An aggregation cannot reach the 
 
 ## Why
 
-The check is `_runtime_consumer_connections` (`src/elspeth/web/composer/state.py:2346`), which collects the connection names the runtime can resolve to a consuming node. It deliberately ignores `node.input` for `coalesce` and `row_union`, reading their declared branch values instead.
+The check is `_runtime_consumer_connections` (`src/elspeth/web/composer/state.py:2346`), which collects the connection names the runtime can resolve to a consuming node. It deliberately ignores `node.input` for `coalesce` and `row_union` — a sibling merge kind that combines branches row-wise — reading their declared branch values instead.
 
 For a *branchless* coalesce or row_union, that would leave a real consumer invisible and the check would miss a genuine problem. Today that state cannot arise, because `branches` is mandatory for exactly those two kinds. So the exclusion is safe only by virtue of a rule enforced somewhere else, and it reads like a free choice. Searching `tests/` returns no reference to `_runtime_consumer_connections`, so if the mandatory-`branches` rule were ever relaxed, this check would break silently with nothing going red.
 

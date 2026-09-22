@@ -5,27 +5,35 @@ labels: [area/composer, type/bug]
 
 `CompositionState.validate()` returns `is_valid=True` with an empty error list for a transform whose options can never build, so the composer gives a clean bill of health to a pipeline the runtime will reject.
 
+**Where this lives.** The Composer is ELSPETH's web authoring surface for pipelines. Its validation runs in `src/elspeth/web/composer/state.py`; the runtime that builds the same pipeline for real is `instantiate_plugins_from_config` in `src/elspeth/plugins/infrastructure/runtime_factory.py:86`. This issue is about the two disagreeing.
+
 ## What happens
 
-`field_mapper` declares `select_only: bool` (`src/elspeth/plugins/transforms/field_mapper.py:172`). Giving it a non-boolean value is a plain, permanent configuration error — not an unfinished draft. Composer validation reports nothing; the runtime path raises `PluginConfigError` from `instantiate_plugins_from_config` for the same configuration. This was reported as reproduced on a clean tree, independent of any in-flight work, at the time of filing. The reproduction recorded with the report drove a unit-test helper for the rule C schema-contract check that no longer exists under that name, so the snippet needs reconstructing before it can be re-measured; the divergence it describes is validate-green, runtime-red.
+The `field_mapper` transform declares `select_only: bool` (`src/elspeth/plugins/transforms/field_mapper.py:172`). Giving it a non-boolean value is a plain, permanent configuration error — not an unfinished draft. Composer validation reports nothing. The runtime raises `PluginConfigError` for the same configuration.
+
+This was reported as reproduced on a clean tree at the time of filing. The reproduction recorded with the report drives a unit-test helper that is no longer in the tree, so it needs rebuilding before it can be re-measured; the behaviour it describes is validation green, runtime red.
 
 ## Why
 
-The composer's probe helpers in `src/elspeth/web/composer/state.py` — `_probe_transform_output_schema` (line 4754), `_probe_transform_declared_inputs` (line 4835) and their sink and source siblings — construct the plugin in order to read its contract facts. Construction failures are filtered through `_is_config_probe_exception` (line 2004) and the probe abstains with an empty result.
+To check a node, the composer constructs the plugin and reads what it declares about its inputs and outputs. Those construction calls are wrapped by probe helpers in `src/elspeth/web/composer/state.py` — `_probe_transform_output_schema` (line 4754), `_probe_transform_declared_inputs` (line 4835), and sink and source equivalents. When construction raises, the failure is passed to `_is_config_probe_exception` (line 2004) and the probe returns an empty result instead of an error.
 
-That abstention is deliberate and documented in the helpers themselves: a draft node whose options do not yet build is owned by the existing config-validation paths, and these rules must not turn an incomplete draft into a hard error. The gap is that a draft which can *never* construct is not the same as one that is merely incomplete, and the probe boundary cannot currently tell them apart, so it stays silent for both. Because every probe abstains, the node contributes no contract facts at all, and downstream rules that would otherwise fire also go quiet.
+That silence is deliberate and documented in the helpers: a half-written node whose options do not yet build is the business of the ordinary config-validation paths, and these checks must not turn an unfinished draft into a hard error. The gap is that a node which can *never* build is not the same as one that is merely unfinished, and the probe cannot currently tell the two apart. Because the probe returns nothing, the node supplies no information about its inputs or outputs at all, so later checks that depend on that information also stay quiet — one bad option silences more than its own rule.
 
 ## Impact
 
-The composer is one of two authoring surfaces, and its premise is that validation is part of the workflow rather than an after-the-fact diagnostic. A green result that cannot distinguish "your configuration is fine" from "your configuration is unbuildable and I could not tell" weakens that premise, and the author has no way to see the difference until a run fails.
+The Composer is one of two authoring surfaces, and its premise is that validation happens while you author rather than after you run. A green result that cannot distinguish "your configuration is fine" from "your configuration cannot build and I could not tell" weakens that premise, and the author sees no difference until a run fails.
 
 ## Fix
 
-The seam needs a way to say "this construction failure is permanent, not pending". Two directions, neither prescriptive:
+Correct behaviour: a configuration error that can never be resolved by finishing the draft — a wrong type on a declared option — is reported by `validate()` as a blocking error naming the node and the option. A genuinely unfinished draft still validates quietly, as it does today.
 
-- Have the config-validation path, which already runs and already holds the `PluginConfigError`, surface it as a blocking validation entry instead of leaving the probes to notice and abstain.
-- Widen the taxonomy at the probe boundary: a type error on a declared field is permanent, whereas a missing required field on a half-written draft is pending. A closed exception set already exists — `test_rule_c_unexpected_constructor_exception_propagates` (`tests/unit/web/composer/test_state.py:5722`) pins that anything outside `_is_config_probe_exception` must propagate rather than be silently deferred to execution — so this may be a matter of widening it at the right site rather than inventing one.
+Two directions, and picking between them is the first task:
 
-Do not fix this by making the probes raise on any construction failure: that turns every incomplete draft into a hard error, which is the behaviour the abstention was added to prevent.
+- Let the config-validation path, which already runs and already holds the `PluginConfigError`, report it as a blocking validation entry, instead of leaving the probes to notice and stay silent.
+- Or sort the exceptions at the probe boundary: a type error on a declared option is permanent, a missing required option on a half-written node is not. A closed set of tolerated exceptions already exists — `test_rule_c_unexpected_constructor_exception_propagates` (`tests/unit/web/composer/test_state.py:5722`) pins that anything outside `_is_config_probe_exception` must propagate rather than be deferred to run time — so this may be a matter of widening that set at the right place rather than inventing one.
 
-`tests/integration/pipeline/test_composer_runtime_agreement.py` is the home for this divergence class; it already hosts comparable cases, such as `TestComposerRuntimeFixedModeImplicitRequiredAgreement` (line 4217).
+Do not fix this by making the probes raise on any construction failure: that turns every unfinished draft into a hard error, which is what the silence was added to prevent.
+
+You would know it holds from a test in `tests/integration/pipeline/test_composer_runtime_agreement.py` — the file that exists to pin composer and runtime agreeing — that gives `select_only` a non-boolean value and asserts both halves: `validate()` reports a blocking error, and the runtime rejects the same configuration. A second test must show an unfinished draft still validating without error, or the fix has traded one defect for another.
+
+Size: not a one-line change. The code edit is small either way, but the choice between the two directions wants a decision before anyone starts, and the regression test has to cover both sides.
