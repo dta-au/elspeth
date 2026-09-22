@@ -471,8 +471,10 @@ class _BlockingRecordingComposer:
         guided_terminal=None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        completion_gates=None,
     ) -> ComposerResult:
-        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id, session_operation_context
+        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id
+        del session_operation_context, completion_gates
 
         self.calls.append(
             {
@@ -512,8 +514,9 @@ class _ProgressAwareComposer:
         guided_terminal=None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        completion_gates=None,
     ) -> ComposerResult:
-        del message, chat_messages, session_id, current_state_id, user_id, guided_terminal, user_message_id
+        del message, chat_messages, session_id, current_state_id, user_id, guided_terminal, user_message_id, completion_gates
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -11412,8 +11415,9 @@ class TestComposerProgressRoutes:
                 guided_terminal=None,
                 user_message_id: str | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                completion_gates=None,
             ) -> ComposerResult:
-                del message, chat_messages, session_id, current_state_id, user_id, progress, user_message_id
+                del message, chat_messages, session_id, current_state_id, user_id, progress, user_message_id, completion_gates
                 assert session_operation_context is not None
                 assert guided_terminal == guided.terminal
                 return ComposerResult(message="Freeform response", state=state)
@@ -11440,6 +11444,131 @@ class TestComposerProgressRoutes:
             }
         ]
         assert body["state"]["composer_meta"]["guided_session"]["transition_consumed"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("envelope_writer", ["production_writer", "carry_forward"])
+    async def test_send_message_hands_the_prior_rows_advisor_block_to_the_composer(self, tmp_path, envelope_writer: str) -> None:
+        """Ruling 2026-09-22 (elspeth-032ec69c41): the persisted fact must reach ``compose`` as the writer wrote it.
+
+        The END gate's skip is decided on ``completion_gates``; the unit tests
+        inject a hand-built fact, so this is the one place that proves the
+        route derives that object from the prior state row's envelope rather
+        than from something else (or nothing). Seeds the envelope through BOTH
+        writers — the compose-save writer (``completion_gates_meta_value`` over
+        the blocked ``ValidationResult`` the END gate builds) and the
+        recovery-save carry-forward (``completion_gates_meta_from_facts``) —
+        so a drift in either serializer shows here.
+        """
+        from elspeth.web.composer.service import _advisor_signoff_blocked_validation
+        from elspeth.web.execution.completion_gates import (
+            COMPLETION_GATES_META_KEY,
+            AdvisorSignoffGateFact,
+            CompletionGateFacts,
+            completion_gate_fingerprint,
+            completion_gates_meta_from_facts,
+            completion_gates_meta_value,
+        )
+        from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
+
+        seeded_state = CompositionState(
+            source=SourceSpec(plugin="csv", on_success="main", options={}, on_validation_failure="discard"),
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="main", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(name="blocked graph"),
+            version=4,
+        )
+        if envelope_writer == "production_writer":
+            blocked_preflight = _advisor_signoff_blocked_validation(reason="flagged_final_pass", findings="")
+            envelope = completion_gates_meta_value(blocked_preflight, seeded_state)
+            (blocker,) = [b for b in blocked_preflight.readiness.blockers if b.code == ADVISOR_SIGNOFF_BLOCKED_CODE]
+            seeded_fact = CompletionGateFacts(
+                advisor_signoff=AdvisorSignoffGateFact(
+                    detail=blocker.detail,
+                    suggestion=blocker.suggestion,
+                    for_graph=completion_gate_fingerprint(seeded_state),
+                )
+            )
+        else:
+            seeded_fact = CompletionGateFacts(
+                advisor_signoff=AdvisorSignoffGateFact(
+                    detail="Completion advisory review did not clear after the available attempts.",
+                    suggestion="Review the pipeline.",
+                    for_graph=completion_gate_fingerprint(seeded_state),
+                )
+            )
+            envelope = completion_gates_meta_from_facts(seeded_fact)
+        app, service = _make_progress_route_app(tmp_path)
+        seeded_d = seeded_state.to_dict()
+        await _save_test_composition_state(
+            service,
+            service.session.id,
+            CompositionStateData(
+                sources=seeded_d["sources"],
+                nodes=seeded_d["nodes"],
+                edges=seeded_d["edges"],
+                outputs=seeded_d["outputs"],
+                metadata_=seeded_d["metadata"],
+                is_valid=True,
+                validation_errors=None,
+                composer_meta={COMPLETION_GATES_META_KEY: envelope},
+            ),
+            provenance="session_seed",
+        )
+        received: list[object] = []
+
+        class _FactRecordingComposer:
+            async def compose(self, message: str, chat_messages, state: CompositionState, **kwargs) -> ComposerResult:
+                del message, chat_messages
+                received.append(kwargs["completion_gates"])
+                return ComposerResult(message="What the block means is …", state=state)
+
+        app.state.composer_service = _FactRecordingComposer()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                f"/api/sessions/{service.session.id}/messages",
+                json={"content": "What does this block mean, and what are my options?"},
+            )
+
+        assert response.status_code == 200
+        assert received == [seeded_fact]
+
+    @pytest.mark.asyncio
+    async def test_send_message_hands_no_advisor_block_when_the_prior_row_recorded_none(self, tmp_path) -> None:
+        """Control for the test above: an envelope-less row reaches ``compose`` as ``None`` (the always-review default)."""
+        app, service = _make_progress_route_app(tmp_path)
+        seeded_d = _EMPTY_STATE.to_dict()
+        await _save_test_composition_state(
+            service,
+            service.session.id,
+            CompositionStateData(
+                sources=seeded_d["sources"],
+                nodes=seeded_d["nodes"],
+                edges=seeded_d["edges"],
+                outputs=seeded_d["outputs"],
+                metadata_=seeded_d["metadata"],
+                is_valid=True,
+                validation_errors=None,
+                composer_meta={},
+            ),
+            provenance="session_seed",
+        )
+        received: list[object] = []
+
+        class _FactRecordingComposer:
+            async def compose(self, message: str, chat_messages, state: CompositionState, **kwargs) -> ComposerResult:
+                del message, chat_messages
+                received.append(kwargs["completion_gates"])
+                return ComposerResult(message="reply", state=state)
+
+        app.state.composer_service = _FactRecordingComposer()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(f"/api/sessions/{service.session.id}/messages", json={"content": "hello"})
+
+        assert response.status_code == 200
+        assert received == [None]
 
     @pytest.mark.asyncio
     async def test_recompose_marks_terminal_progress_with_last_user_message_id(self, tmp_path) -> None:

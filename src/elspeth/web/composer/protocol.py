@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     )
     from elspeth.web.composer.pipeline_proposal import PresentBase
     from elspeth.web.composer.service import AdvisorCheckpointVerdict
+    from elspeth.web.execution.completion_gates import CompletionGateFacts
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from elspeth.web.sessions.protocol import GuidedOperationFence
 
@@ -1486,6 +1487,9 @@ class ComposerService(Protocol):
         guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 
