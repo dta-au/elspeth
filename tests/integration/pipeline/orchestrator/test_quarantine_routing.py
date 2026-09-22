@@ -796,7 +796,7 @@ class TestQuarantineErrorLengthBound:
     error text is length-bounded before persisting, so an unbounded or
     input-echoing plugin string cannot flood node_states.error_json and the
     DIVERT routing reason. Plugins own input-free text (see
-    _safe_validation_errors); this cap is defense in depth, not a substitute.
+    contracts.safe_validation_errors); this cap is defense in depth, not a substitute.
     """
 
     def test_overlong_quarantine_error_is_truncated_on_audit_surfaces(self, payload_store) -> None:

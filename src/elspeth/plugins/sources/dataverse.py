@@ -26,6 +26,7 @@ from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.events import DataverseLoadStatistics
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.wire_visible_identity import (
     is_operator_required_placeholder_value,
@@ -47,7 +48,6 @@ from elspeth.plugins.infrastructure.config_base import (
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldResolution,
@@ -289,7 +289,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:83446ab50355e51b"
+    source_file_hash: str | None = "sha256:f2e3eb37507d53e0"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ValidationError
 
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 
 SECRET = "SECRET-abc123"
 

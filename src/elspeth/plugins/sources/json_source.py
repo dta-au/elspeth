@@ -20,6 +20,7 @@ from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
@@ -28,7 +29,6 @@ from elspeth.plugins.infrastructure.config_base import (
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldResolution,
@@ -176,7 +176,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0ecba5e947ba4010"
+    source_file_hash: str | None = "sha256:33fd5411565563bb"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str

@@ -29,6 +29,7 @@ from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identifiers import validate_field_names
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
@@ -40,7 +41,6 @@ from elspeth.plugins.infrastructure.config_base import (
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
@@ -424,7 +424,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:381281824b27afa5"
+    source_file_hash: str | None = "sha256:bfe66878ce6d846d"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (

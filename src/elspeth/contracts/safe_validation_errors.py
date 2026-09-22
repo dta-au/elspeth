@@ -6,6 +6,11 @@ verbatim in ``node_states.error_json``, the DIVERT routing reason, and audit
 exports — surfaces the input-data hashing discipline deliberately keeps raw
 payloads out of. Render loc/msg/type only; the full raw row still travels on
 ``SourceRow.row`` to the designated quarantine sink by design.
+
+The engine's own contract checks validate ROW data against a plugin's declared
+schema and put the result in a ``PluginContractViolation`` message that becomes
+a routed reason, so they need the same rendering. It lives in ``contracts`` so
+both layers call this one function (the engine may not import ``plugins``).
 """
 
 from __future__ import annotations

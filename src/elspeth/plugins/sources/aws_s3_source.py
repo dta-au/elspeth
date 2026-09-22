@@ -35,6 +35,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identifiers import validate_field_names
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.aws_s3_common import build_s3_client
@@ -46,7 +47,6 @@ from elspeth.plugins.infrastructure.config_base import (
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
@@ -885,7 +885,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5570ff78dfec18f3"
+    source_file_hash: str | None = "sha256:efc30ff9f58d734b"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 

@@ -22,6 +22,7 @@ from elspeth.contracts.contract_builder import ContractBuilder
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.value_source import register_value_source_plugin
@@ -32,7 +33,6 @@ from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 from elspeth.plugins.infrastructure.clients.llm import LLMClientError, build_llm_call_request
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed, make_warn_telemetry_before_start
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.llm.config import (
     SOURCE_PROVIDER_CONFIGS,
     AzureOpenAILLMSourceConfig,
@@ -123,7 +123,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6d172ccf1b3baeca"
+    source_file_hash: str | None = "sha256:ce638da90cb01908"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
