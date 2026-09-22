@@ -23,7 +23,7 @@ The gate's input is the session's validation state, not the turn's effect on it.
 
 Two supporting details from the recorded session:
 
-- `intent_is_explicit_mutation` is `null`, which means not evaluated rather than false. The classifier that sets it runs only when the pipeline is empty (`service.py:4066`), so on a populated pipeline nothing distinguishes "the user asked a question" from "the user asked for a change".
+- `intent_is_explicit_mutation` is `null`, which means not evaluated rather than false. The classifier that sets it runs only when the pipeline is empty (`service.py:4066`), so on a populated pipeline that signal is simply unavailable.
 - A related change to reply withholding does not resolve this by itself. Because an injection did occur, `prose_withheld` stays true (`compose_advisor_signoff_flagged_red_message`, `no_tool_policy.py:1082`) and the reply is still suppressed.
 
 ## Impact

@@ -76,6 +76,21 @@ Each folder holds a README with the full scope and a `tracker-rows.json` preserv
 original rows verbatim. Those folders were written and committed **before** the tracker
 rows were closed, so no detail depends on the old tracker to survive.
 
+## After the import
+
+Two things can only be done once issues have numbers.
+
+**Cross-references.** Four issues point at a sibling in prose — "raise a separate issue
+for it", "tracked separately", "the guided retirement". They read correctly as written,
+but in a system of record they want real `#123` links. `import_issues.py` writes
+`.import-state.jsonl` mapping every slug to its issue number, which is the input for that
+pass. It is deliberately manual: the references are prose, not slugs, and a regex that
+guessed at them would produce confident wrong links.
+
+**The held set.** `held/` contains issues whose work verification found already in the
+tree. Each needs a decision — publish the remaining scope, or close the tracker row — and
+neither should be imported as written. See `held/README.md`.
+
 ## Provenance
 
 The triage that produced this set — what was closed as already-done, what was consolidated,

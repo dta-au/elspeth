@@ -1,6 +1,6 @@
 ---
 title: Deliver maintained Kubernetes deployment support with kind acceptance
-labels: [area/deployment, type/task]
+labels: [area/deployment, type/epic]
 ---
 
 Deliver a maintained Kubernetes deployment path for ELSPETH: canonical base manifests, deterministic render validation, an immutable accepted-digest policy, and an acceptance run on kind (Kubernetes in Docker, a local single-machine cluster used for testing).

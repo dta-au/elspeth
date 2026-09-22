@@ -12,7 +12,7 @@ Two subsystems meet here:
 - **The graph builder**, `src/elspeth/core/dag/builder.py` — turns validated settings into an execution graph, assigning each node a deterministic id via its local `node_id` function. Ids must be stable across runs, because checkpoint and resume match on them.
 - **The web execution path**, `src/elspeth/web/execution/` — loads a pipeline authored in the Composer, resolves any secret references, and hands the settings to the builder.
 
-Background on secrets: a pipeline never stores a credential inline. It stores a *reference marker*, `{"secret_ref": NAME, "secret_scope": SCOPE}`, and whichever surface is about to run the pipeline materialises that marker through its own secret store.
+Background on secrets: a Composer-authored pipeline stores a *reference marker* rather than the credential itself — `{"secret_ref": NAME, "secret_scope": SCOPE}` — and whichever surface is about to run the pipeline materialises that marker through its own secret store.
 
 ## What happens
 

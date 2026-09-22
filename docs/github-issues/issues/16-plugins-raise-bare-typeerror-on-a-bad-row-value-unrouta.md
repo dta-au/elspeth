@@ -20,7 +20,7 @@ One worked example exists in the tree: `batch_stats.py` raises the shared `Batch
 | `0` — bad value, right type | `raw_copies < 1` → quarantine | 2 | none | 2 | 2 terminal |
 | `"abc"` — bad type | `type(raw_copies) is not int` → `raise TypeError` | 4 | yes | 0 | 0 terminal, 4 pending |
 
-Audit outcomes are the per-row records ELSPETH writes to its audit trail, so four left pending means the run's account of those rows is never closed. The routable idiom sits three lines from the crashing one (`src/elspeth/plugins/transforms/batch_replicate.py:298`). Reproduced at commits `d211fcc8a`, `280887d9c` and `28a602dfd`.
+Audit outcomes are the per-row records ELSPETH writes to its audit trail, so four left pending means the run's account of those rows is never closed. The routable idiom sits three lines from the crashing one (`src/elspeth/plugins/transforms/batch_replicate.py:298`). Evidence for this issue was measured at commits `d211fcc8a`, `280887d9c` and `28a602dfd`.
 
 ## Why
 
@@ -60,7 +60,7 @@ One limit matters before starting. Even with the error returned, the audit still
 
 ## Testing notes
 
-A test here can pass while arming nothing, because the guards differ:
+A test here can pass while arming nothing. The four non-obvious guards:
 
 - The seven numeric guards (`not in (int, float)`) need a `str` to survive as a `str`. Set the aggregation's own schema to `mode: observed` — which infers column types from the data rather than declaring them — as well as the source's, or the aggregation's fixed schema re-coerces `str` to `float` and the guard never fires. A fixture missing this is silently vacuous.
 - `batch_classifier_metrics` (`not in (str, int, bool)`) rejects floats, not strings: use a float label column.
