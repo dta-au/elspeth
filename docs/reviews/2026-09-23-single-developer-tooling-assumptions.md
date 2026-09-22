@@ -11,19 +11,20 @@ report cites those files only where a tooling rule contradicts them.
 
 ## Summary
 
-| Theme | Findings | Must change | Should change | Deliberate — keep, but write it down |
+| Theme | Entries | Must change | Should change | Deliberate — keep, but write it down |
 |---|---|---|---|---|
-| A. Rules that exist only in personal memory | 10 | 4 | 5 | 1 |
-| B. Single-holder assumptions | 6 | 3 | 1 | 2 |
+| A. Rules that exist only in personal memory | 11 | 5 | 5 | 1 |
+| B. Single-holder assumptions | 6 | 3 | 0 | 3 |
 | C. Machine-local coupling | 9 | 3 | 5 | 1 |
 | D. Tracker coupling | 7 | 4 | 3 | 0 |
-| E. Agent process vs human collaborators | 7 | 1 | 3 | 3 |
-| **Total** | **39** | **15** | **17** | **7** |
+| E. Agent process vs human collaborators | 7 | 0 | 3 | 4 |
+| **Total** | **40** | **15** | **16** | **9** |
 
 The single highest-value class is **A**: operating rules a new developer would
 violate on their first day, which are currently written down nowhere a
-contributor can read. Ten of those are named below, four of which the project's
-own tracked documents either omit or actively contradict.
+contributor can read. Ten are named below (A11 is a positive precedent, not a
+defect), and of those ten the project's own tracked documents omit nine and
+actively contradict one.
 
 ### The question that decides a third of this report
 
@@ -50,7 +51,8 @@ Findings below are written for both branches where it matters.
 
 This is a tracked file in a public repository. Quotes from the maintainer's
 local memory store are verbatim **except** that the maintainer's name is
-rendered as `[the maintainer]`, and account identifiers, hostnames,
+rendered as `[the maintainer]`, gendered pronouns referring to them are
+neutralised in square brackets, and account identifiers, hostnames,
 credentials, home paths and machine-local temporary paths are omitted or
 described generically. One quoted expletive is elided as `[...]`.
 
@@ -102,7 +104,7 @@ mean what they say.
 **Source:** memory `feedback_ready_for_merge_means_stop_before_landing`.
 
 > On 2026-09-08 [the maintainer] asked me to "resolve and get it ready for merge
-> following your 6 steps". [...] He interrupted within seconds: "holy [...], do
+> following your 6 steps". [...] [They] interrupted within seconds: "holy [...], do
 > not merge".
 >
 > **Why:** "ready for merge" names an END STATE short of the merge. The release
@@ -222,8 +224,8 @@ rule a new contributor's agent needs on day one.
 > follow-up in release-branch reports, don't stage re-sign bundles mid-release,
 > and don't count the signature CI lane as a gate for release-branch work.
 
-> the operator is aware of the gate debt and holds the HMAC key himself; the
-> red-gate state on merge is a **deliberate friction point** he uses to stay
+> the operator is aware of the gate debt and holds the HMAC key [themselves]; the
+> red-gate state on merge is a **deliberate friction point** [they use] to stay
 > attentive to what's being landed.
 
 **Why it breaks:** `AGENTS.md` does say the operator signs once at package
@@ -472,7 +474,7 @@ budget or move the cap to the account.
 
 > The **user-scope** `~/.claude/settings.json` `enableAll:true` covers those — but
 > it **globally auto-trusts the `.mcp.json` of EVERY repo** opened in Claude Code
-> (a clone with a hostile `.mcp.json` would auto-run). **Operator [name]
+> (a clone with a hostile `.mcp.json` would auto-run). **Operator [the maintainer]
 > explicitly authorized this global widening [...], informed of the blast
 > radius** — do NOT tighten it back without asking.
 
@@ -740,27 +742,56 @@ number, and add one line to `CONTRIBUTING.md` explaining that `elspeth-<hex>`
 identifiers are legacy tracker ids resolvable through that map. That preserves
 every citation at a cost of one file.
 
-### D2. The covenant names the tracker as the system of record
+### D2. The tracker installer writes itself into the harness-neutral covenant
 
-**Source:** tracked `AGENTS.md` § Filigree Issue Tracker, reproduced into
-`CLAUDE.md`:
+**Source:** tracked `AGENTS.md` § Filigree Issue Tracker, which states:
 
 > `filigree` tracks this project's work. Use it to find, claim, update and close
 > issues: `filigree session-context` at session start, then
 > `filigree start-next-work --assignee <name>`.
->
-> Two rules `--help` will not tell you:
-> 1. Claim atomically [...] 2. On `SCHEMA_MISMATCH` [...]
 
-**Why it breaks:** the harness-neutral covenant — the document that explicitly
-promises "none of it is required to contribute" about the maintainer's toolchain
-— mandates a specific local tracker binary. Under GitHub Issues this block is
-simply wrong, and it is the first thing every agent reads.
+**Measured — this block is not hand-maintained.** `AGENTS.md` carries installer
+markers at lines 373–409:
 
-**Recommendation — MUST CHANGE.** Replace with a tracker-neutral statement
-("work is tracked in GitHub Issues; see `CONTRIBUTING.md`"), and move any
-surviving filigree guidance into `docs/maintainer/toolchain.md` where the rest of
-the personal toolchain lives.
+```
+AGENTS.md:373:<!-- filigree:instructions:v3.1.0:c1c023c3 -->
+AGENTS.md:374:<!-- filigree:last-writer:filigree install -->
+AGENTS.md:394:<!-- loomweave:instructions:v1.6.0:39edbf6d -->
+```
+
+`docs/maintainer/toolchain.md` confirms the mechanism and says so plainly:
+
+> The Filigree and Loomweave blocks below are installer-written mirrors: their
+> installers rewrite the block between the `<!-- <tool>:instructions -->` markers
+> on every run. Their exact placement is installer-owned and may also include
+> `AGENTS.md` or `CLAUDE.md`; this document must not claim exclusive custody of
+> those blocks.
+
+The two copies have already drifted: the filigree block is content hash
+`c1c023c3` in `AGENTS.md` but `65e6fb25` in `toolchain.md`, and loomweave is
+`v1.6.0` in the former against `v1.5.0` in the latter.
+
+**Why it breaks:** this is not simply "a document mentions the wrong tracker" —
+it is a tooling finding, which is why it sits in this report rather than the
+repository auditor's. ADR-043 split the maintainer's toolchain out of `AGENTS.md`
+precisely so the public covenant would stay harness-neutral, and the installer
+puts it straight back on every run. Two consequences for a multi-developer
+project: first, hand-editing the block to say "work is tracked in GitHub Issues"
+will be silently reverted the next time anyone runs `filigree install`; second,
+until the tool is uninstalled or retargeted, every contributor and every agent
+reads a mandate to use a local binary they do not have, in the one document that
+promises the maintainer's tooling "is not a requirement of the project".
+
+**Recommendation — MUST CHANGE, and fix the mechanism, not the text.** In order:
+(1) retarget or uninstall the installer's write into `AGENTS.md` and `CLAUDE.md`
+so the covenant is hand-owned again — the tool supports placement configuration,
+since `toolchain.md` is already a chosen target; (2) then replace the block with
+a tracker-neutral line pointing at `CONTRIBUTING.md`; (3) leave the
+installer-written mirror in `docs/maintainer/toolchain.md`, where a
+harness-specific block is appropriate and already framed as personal. Doing (2)
+before (1) will not survive the next install. Recording the placement change is
+itself an ADR-043-style decision, since it adds or removes standing agent
+instructions.
 
 ### D3. The claim protocol is agent-native and has no human analogue
 
@@ -880,7 +911,7 @@ migration.
 
 > **How to apply:** for a bulk tracker write, build it as a dry-run-by-default
 > script with a logged plan, show the dry run, then give [the maintainer] the
-> exact `! python3 <path> --execute` line to run himself.
+> exact `! python3 <path> --execute` line to run [themselves].
 
 **Why it breaks:** the *pattern* is good (dry-run default, logged plan, resumable)
 and is exactly the shape the repository's own canonical scripts use. The
@@ -1130,13 +1161,14 @@ fallback from the skills at migration time rather than leaving dead guidance.
   `docs/maintainer/toolchain.md`, `docs/agents/tracker-label-vocabulary.md`.
 - `.claude/agents/red-team.md` (first 60 lines — the frontmatter and attack
   catalog; the remainder not read).
-- Memory store, 27 files read in full: the branch/merge/push set
+- Memory store, 32 files read in full: the branch/merge/push set
   (`work_on_release_branch_not_feature_branches`, `ready_for_merge_means_stop_before_landing`,
   `prefer_no_ff_merges`, `bare_push_not_destructive`, `no_verify_ok_with_end_of_slice_reconciliation`,
   `dod_is_merged_to_release_branch_and_green`, `never_git_add_in_a_shared_checkout_commit_by_pathspec`,
   `concurrent_writers_share_one_checkout_stop_me`); the signing/custody set
   (`commits_banned_until_signing_campaign_lands`, `signing_is_one_operator_responsibility_outside_packages`,
-  `gate_debt_is_operator_friction_point`, `hmac_key_present_in_agent_shell_env`);
+  `gate_debt_is_operator_friction_point`, `hmac_key_present_in_agent_shell_env`,
+  `operator_gate_destructive_actions`);
   the tracker set (`filigree_no_deferred_status`, `filigree_ready_means_unassigned`,
   `filigree_mcp_vs_cli_actor`, `filigree_cli_in_worktrees`, `verifying_is_not_closed`,
   `auto_mode_classifier_blocks_bulk_tracker_writes`); the machine/grant set
@@ -1157,14 +1189,14 @@ fallback from the skills at migration time rather than leaving dead guidance.
   `.agents/skills/filigree-workflow/references/team-coordination.md` (first 60),
   `docs/agents/recent-code-hints.md` (first 40 lines of 2,359).
 
-**Indexed but not read:** the memory store contains **773** files. I read 27 of
-them in full — roughly 3.5% by file count, selected by following both index files
+**Indexed but not read:** the memory store contains **773** files. I read 32 of
+them in full — 4.1% by file count, selected by following both index files
 (`MEMORY.md` and `MEMORY-secondary-index.md`, both read in full) and prioritising
 entries whose index line signalled a single-holder premise, a machine-local path,
 a tracker convention, or an agent-process protocol. The indexes are themselves
 curated by priority, so the sample is biased toward high-signal entries by
 design — but it is a **sample**, and further single-holder assumptions almost
-certainly exist in the 746 files I did not open. In particular I did not
+certainly exist in the 741 files I did not open. In particular I did not
 systematically read the `project_*` lane-history entries, which are numerous and
 where merge-protocol and seat conventions tend to be recorded incidentally.
 
@@ -1186,9 +1218,17 @@ were identified as tracker-coupled but not read in full.
 - `grep -n -i worktree CLAUDE.md` + `wc -l CLAUDE.md` — 23 lines, one worktree
   mention, no "Filigree from a worktree" section.
 
-**Note on overlap:** `scripts/red_team/trigger.py` and
-`scripts/cicd/generate_skill_inventory.py` (D5) sit in the second auditor's
-territory as well as mine. I have flagged them rather than assumed coverage.
+**Note on overlap with the repository audit:** five findings quote or recommend
+edits to files the brief assigned to the second auditor, and are included here
+because the *cause* is tooling rather than repository content. **D2** (the
+tracker installer rewriting a block inside `AGENTS.md` on every run) and **D5**
+(`scripts/red_team/trigger.py`, `scripts/cicd/generate_skill_inventory.py`) are
+tooling defects that happen to land in repository files. **C8** (the `AGENTS.md`
+worktree-layout wording) and **E4** (the `AGENTS.md` test-capacity paragraph)
+quote the covenant to show a harness convention stated as project fact. **A4**
+(the `--no-verify` contradiction) necessarily cites `AGENTS.md`, since the
+contradiction is between it and a memory grant. I have flagged all five rather
+than assumed coverage; they may be duplicated in the other report.
 
 **Redaction control:** the finished document was grepped for the maintainer's
 name, home paths, both GitHub account identifiers, the dev-server hostname, the
