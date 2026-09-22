@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { useSessionStore } from "./sessionStore";
@@ -1275,6 +1275,118 @@ describe("executionStore WebSocket lifecycle", () => {
     expect(useExecutionStore.getState().error).toBe(
       "Run is unavailable or you do not have access.",
     );
+  });
+
+  // Store-owned recovery after the stream ends (polling audit 2026-09-22,
+  // finding 1). Until now the only REST fallback was InlineRunResults' 3s
+  // loop, which unmounts with the Run tab, so a 1011 close off the Run tab
+  // left the run live-looking until the next visit.
+  describe("recovery poll after the stream ends", () => {
+    function armLiveRun(): void {
+      useExecutionStore.setState({
+        runs: [makeRun()],
+        activeRunId: "run-1",
+        activeRunSessionId: "session-1",
+        progress: {
+          source_rows_processed: 0,
+          tokens_succeeded: 0,
+          tokens_failed: 0,
+          tokens_quarantined: 0,
+          tokens_routed_success: 0,
+          tokens_routed_failure: 0,
+          accounting: null,
+          recent_errors: [],
+          status: "running",
+        },
+      });
+      useSessionStore.setState({ activeSessionId: "session-1" } as never);
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    });
+
+    it("polls run status with no Run tab mounted until the run reports terminal", async () => {
+      const { fetchRuns } = await import("@/api/client");
+      (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+      (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([makeRun()]);
+      armLiveRun();
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = (connectToRun as ReturnType<typeof vi.fn>).mock.calls[0][2];
+
+      handlers.onStreamEnded();
+
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(fetchRuns).toHaveBeenCalledTimes(1);
+      expect(useExecutionStore.getState().progress?.status).toBe("running");
+
+      (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+        makeRun({ status: "completed", finished_at: "2026-04-26T05:40:00.000Z" }),
+      ]);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(fetchRuns).toHaveBeenCalledTimes(2);
+      expect(useExecutionStore.getState().progress?.status).toBe("completed");
+      expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+        runId: "run-1",
+        status: "completed",
+        sessionId: "session-1",
+      });
+
+      // Terminal reached: the poll retires itself rather than hammering REST.
+      await vi.advanceTimersByTimeAsync(9000);
+      expect(fetchRuns).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not poll when the stream ends on an already-terminal run", async () => {
+      const { fetchRuns } = await import("@/api/client");
+      (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+      armLiveRun();
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = (connectToRun as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      useExecutionStore.setState((state) => ({
+        progress: { ...state.progress!, status: "completed" },
+      }));
+
+      handlers.onStreamEnded();
+
+      await vi.advanceTimersByTimeAsync(9000);
+      expect(fetchRuns).not.toHaveBeenCalled();
+    });
+
+    it("retires the recovery poll when a new connection supersedes it", async () => {
+      const { fetchRuns } = await import("@/api/client");
+      (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+      (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([makeRun()]);
+      armLiveRun();
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = (connectToRun as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      handlers.onStreamEnded();
+
+      useExecutionStore.getState().connectWebSocket("run-2");
+
+      await vi.advanceTimersByTimeAsync(9000);
+      expect(fetchRuns).not.toHaveBeenCalled();
+    });
+
+    it("retires the recovery poll on reset", async () => {
+      const { fetchRuns } = await import("@/api/client");
+      (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+      (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([makeRun()]);
+      armLiveRun();
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = (connectToRun as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      handlers.onStreamEnded();
+
+      useExecutionStore.getState().reset();
+
+      await vi.advanceTimersByTimeAsync(9000);
+      expect(fetchRuns).not.toHaveBeenCalled();
+    });
   });
 });
 

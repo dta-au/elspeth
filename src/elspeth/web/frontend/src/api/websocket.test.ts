@@ -53,6 +53,7 @@ describe("connectToRun", () => {
       onConnected: vi.fn(),
       onDisconnected: vi.fn(),
       onRunUnavailable: vi.fn(),
+      onStreamEnded: vi.fn(),
     };
   }
 
@@ -135,5 +136,78 @@ describe("connectToRun", () => {
     vi.advanceTimersByTime(1000);
     await flushPromises();
     expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  // Stream-ended notification (polling audit 2026-09-22, finding 1). A close
+  // that neither reconnects nor hands the caller a terminal refusal leaves the
+  // caller with no further events at all; it has to be told so it can take
+  // over recovery itself.
+  it("notifies the caller that the stream ended after a server-error close", async () => {
+    const handlers = callbacks();
+
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    MockWebSocket.instances[0].closeWith(1011);
+
+    expect(handlers.onStreamEnded).toHaveBeenCalledTimes(1);
+    expect(handlers.onDisconnected).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(30_000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it("notifies the caller that the stream ended after a normal close", async () => {
+    const handlers = callbacks();
+
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    MockWebSocket.instances[0].closeWith(1000);
+
+    expect(handlers.onStreamEnded).toHaveBeenCalledTimes(1);
+    expect(handlers.onDisconnected).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(30_000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it("does not report a stream end for an abnormal close that reconnects", async () => {
+    const handlers = callbacks();
+
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    MockWebSocket.instances[0].closeWith(1006);
+
+    expect(handlers.onDisconnected).toHaveBeenCalledTimes(1);
+    expect(handlers.onStreamEnded).not.toHaveBeenCalled();
+  });
+
+  it("does not report a stream end for the run-unavailable refusal", async () => {
+    const handlers = callbacks();
+
+    connectToRun("missing-run", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+
+    MockWebSocket.instances[0].closeWith(4004);
+
+    expect(handlers.onRunUnavailable).toHaveBeenCalledTimes(1);
+    expect(handlers.onStreamEnded).not.toHaveBeenCalled();
+  });
+
+  it("does not report a stream end when the caller closes the connection itself", async () => {
+    const handlers = callbacks();
+
+    const connection = connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    connection.close();
+
+    expect(handlers.onStreamEnded).not.toHaveBeenCalled();
   });
 });

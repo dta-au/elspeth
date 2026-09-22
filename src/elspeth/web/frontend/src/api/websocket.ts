@@ -34,7 +34,14 @@ import type {
  * - onCancelled: Terminal. Pipeline was cancelled.
  * - onFailed: Terminal. Pipeline aborted due to unrecoverable error.
  * - onConnected: Socket opened, including after a reconnect.
- * - onDisconnected: Abnormal close entered the reconnect loop.
+ * - onDisconnected: Abnormal close entered the reconnect loop. The socket
+ *   owns recovery; the caller only reflects the gap in the UI.
+ * - onStreamEnded: Close codes 1000 and 1011. The stream is over and nothing
+ *   will reconnect, yet the run may still be live (a terminal event lost to a
+ *   server-side failure, or a normal close whose terminal event never
+ *   arrived). The caller owns recovery from here — poll GET /api/runs. This is
+ *   deliberately NOT raised for the terminal refusals (4001, 4004), which have
+ *   their own callbacks and for which polling would be pointless.
  * - onAuthFailure: Close code 4001. Ticket or session auth failed.
  *   Caller should trigger authStore.logout(). No reconnect attempt.
  * - onRunUnavailable: Close code 4004. Run not found or not owned.
@@ -48,6 +55,7 @@ export interface WebSocketCallbacks {
   onFailed: (event: RunEvent, data: RunEventFailed) => void;
   onConnected?: () => void;
   onDisconnected?: () => void;
+  onStreamEnded?: () => void;
   onAuthFailure: () => void;
   onRunUnavailable?: () => void;
 }
@@ -191,8 +199,10 @@ export function connectToRun(
         case 1000:
           // Normal closure -- run reached terminal state.
           // Do NOT reconnect. The caller should poll GET /api/runs/{id}
-          // for the final status if they haven't received a terminal event.
+          // for the final status if they haven't received a terminal event,
+          // which is what onStreamEnded hands it the cue to do.
           closed = true;
+          callbacks.onStreamEnded?.();
           return;
 
         case 1006:
@@ -202,9 +212,12 @@ export function connectToRun(
           return;
 
         case 1011:
-          // Internal error -- server-side failure.
-          // Do NOT reconnect. The caller should poll REST for status.
+          // Internal error -- server-side failure (a database error or an
+          // audit-integrity refusal in the durable poller). Do NOT reconnect:
+          // the run itself may still be advancing, so hand recovery to the
+          // caller's REST poll rather than leaving the stream silently dead.
           closed = true;
+          callbacks.onStreamEnded?.();
           return;
 
         case 4001:

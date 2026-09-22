@@ -110,6 +110,16 @@ interface ExecutionState {
   validationError: string | null;
   isExecuting: boolean;
   wsDisconnected: boolean;
+  /**
+   * The progress stream ended for good and will not reconnect, while the run
+   * was still live (polling audit 2026-09-22, finding 1). Distinguishes the
+   * two ways `wsDisconnected` becomes true: a transient drop the socket is
+   * retrying, versus a terminal close (1000/1011) after which this store's
+   * own REST recovery poll — not the socket — is what retires the run. The
+   * only consumer is the progress banner's copy, which must not promise a
+   * reconnect that is never coming.
+   */
+  wsStreamEnded: boolean;
   error: string | null;
   /** Last exact-state approval refusal from execute; also shown beside readiness. */
   pendingApproval: string | null;
@@ -173,6 +183,33 @@ interface ValidateOptions {
 let wsConnection: WebSocketConnection | null = null;
 let validationRequestSeq = 0;
 let executionRequestSeq = 0;
+
+/**
+ * Store-owned REST recovery for a run whose progress stream ended for good
+ * (polling audit 2026-09-22, finding 1).
+ *
+ * The socket does not reconnect after close codes 1000 and 1011, and the only
+ * other REST fallback — InlineRunResults' 3s loadRuns loop — unmounts with the
+ * Run tab. A server-side database error therefore left an off-tab run looking
+ * live until the next Run-tab visit. This timer lives beside wsConnection, in
+ * the store, precisely so it outlives any component: it retires itself as soon
+ * as loadRuns' degraded-path reconciliation observes the run terminal, when
+ * the tab stops following the run, when a new connection supersedes it, or on
+ * reset().
+ *
+ * It is deliberately NOT armed for the reconnecting close (1006) — the socket
+ * owns recovery there — nor for the terminal refusals (4001/4004), where
+ * polling could only repeat the refusal.
+ */
+const RUN_RECOVERY_POLL_INTERVAL_MS = 3000;
+let runRecoveryPollTimer: ReturnType<typeof setInterval> | null = null;
+
+function stopRunRecoveryPoll(): void {
+  if (runRecoveryPollTimer !== null) {
+    clearInterval(runRecoveryPollTimer);
+    runRecoveryPollTimer = null;
+  }
+}
 
 function shouldApplyValidationResult(
   sessionId: string,
@@ -418,6 +455,7 @@ function applyRunEvent(
     runs: updatedRuns,
     lastRunOutcome,
     wsDisconnected: false,
+    wsStreamEnded: false,
   };
 }
 
@@ -443,6 +481,7 @@ const initialExecutionState = {
   validationError: null as string | null,
   isExecuting: false,
   wsDisconnected: false,
+  wsStreamEnded: false,
   error: null as string | null,
   pendingApproval: null as string | null,
   lastRunOutcome: null as RunOutcome | null,
@@ -747,7 +786,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   connectWebSocket(runId: string) {
     // Close any existing WebSocket connection
     wsConnection?.close();
-    set({ wsDisconnected: false });
+    // A live stream supersedes the previous stream's REST recovery.
+    stopRunRecoveryPoll();
+    set({ wsDisconnected: false, wsStreamEnded: false });
 
     const getTicket = async (): Promise<string> => {
       const response = await api.createRunWebSocketTicket(runId);
@@ -773,12 +814,43 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       }
     }
 
+    function runStillLive(): boolean {
+      const { activeRunId, progress } = get();
+      return (
+        activeRunId === runId &&
+        progress !== null &&
+        !isTerminalRunStatus(progress.status)
+      );
+    }
+
     wsConnection = connectToRun(runId, getTicket, {
       onConnected() {
-        set({ wsDisconnected: false });
+        stopRunRecoveryPoll();
+        set({ wsDisconnected: false, wsStreamEnded: false });
       },
       onDisconnected() {
-        set({ wsDisconnected: true });
+        set({ wsDisconnected: true, wsStreamEnded: false });
+      },
+      onStreamEnded() {
+        // Nothing will reconnect. A stream that ended on a run already known
+        // terminal owes nothing: the outcome is recorded and the banner is
+        // hidden, so leave the connection state clean rather than reporting a
+        // loss that did not happen.
+        if (!runStillLive()) return;
+        set({ wsDisconnected: true, wsStreamEnded: true });
+        stopRunRecoveryPoll();
+        runRecoveryPollTimer = setInterval(() => {
+          if (!runStillLive()) {
+            stopRunRecoveryPoll();
+            return;
+          }
+          const sessionId = useSessionStore.getState().activeSessionId;
+          if (sessionId === null) return;
+          // loadRuns carries the degraded-path reconciliation that records
+          // the outcome and retires progress; the next tick then sees the
+          // terminal status and stops this poll.
+          void get().loadRuns(sessionId);
+        }, RUN_RECOVERY_POLL_INTERVAL_MS);
       },
       onProgress(event: RunEvent, _data: RunEventProgress) {
         applyActiveRunEvent(event);
@@ -816,9 +888,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         useAuthStore.getState().logout();
       },
       onRunUnavailable() {
-        // Close code 4004 -- run not found or not owned.
+        // Close code 4004 -- run not found or not owned. A definitive
+        // refusal: polling REST could only repeat it.
+        stopRunRecoveryPoll();
         set({
           wsDisconnected: false,
+          wsStreamEnded: false,
           error: "Run is unavailable or you do not have access.",
         });
       },
@@ -1085,6 +1160,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     executionRequestSeq += 1;
     wsConnection?.close();
     wsConnection = null;
+    stopRunRecoveryPoll();
     // runDisclosureAckBySession survives reset(): reset fires on every
     // session switch (hooks/useSession.ts), and the pre-run disclosure
     // opt-out is per composer session, not per activation. It is cleared
