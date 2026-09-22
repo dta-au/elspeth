@@ -89,6 +89,28 @@ Each folder holds a README with the full scope and a `tracker-rows.json` preserv
 original rows verbatim. Those folders were written and committed **before** the tracker
 rows were closed, so no detail depends on the old tracker to survive.
 
+## The import happened — 2026-09-23
+
+**44 issues created as `#158`–`#201`**, all authored by `johnm-dta`, all labelled.
+`.import-state.jsonl` records every slug against its issue number and URL.
+
+Before publication the whole set went through a review against one question: does
+anything here reflect badly on the Australian Public Service. It returned **34 PASS,
+10 FIX and 2 HOLD** — `docs/reviews/2026-09-23-aps-publication-review.md`. The ten
+fixes were applied first; the two holds are in `held/` with the decision each needs.
+
+That review established one fact worth repeating, because it changes what withholding
+an issue achieves: **these files were already public.** They have been on
+`origin/release/0.8.1` of this public repository since they were written. Creating a
+GitHub issue adds indexing, notification, cross-linking and permanence — amplification,
+not disclosure. Holding a file back withholds reach, not content, so anything whose
+*text* is the concern needs the tracked file dealt with as well.
+
+Forty tracker rows were closed with the GitHub URL in the close reason. **Four were
+not**, because another session held a live claim on them; each got a comment naming
+its GitHub issue and was left alone. They are `#158`, `#162`, `#188` and `#190` —
+close them when that work lands, or let the lease lapse.
+
 ## After the import
 
 Two things can only be done once issues have numbers.
