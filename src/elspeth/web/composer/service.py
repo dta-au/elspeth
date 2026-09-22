@@ -114,7 +114,7 @@ from elspeth.web.composer.audit import (
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.availability import ComposerAvailability as ComposerAvailability  # re-export; genuine home is availability.py
-from elspeth.web.composer.control_messages import anti_anchor_control_envelope
+from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
 )
@@ -6821,9 +6821,28 @@ class ComposerServiceImpl:
                 )
             # The blocked result publishes the model's prose (ruling
             # 2026-09-22, elspeth-032ec69c41), so this turn replays into later
-            # model context as itself; the withheld-reply row and the
-            # withheld-prose disclosure that elspeth-2306940c70 wrote here are
-            # gone with the withholding.
+            # model context as itself and the withheld-reply row that
+            # elspeth-2306940c70 wrote here has nothing to hold. The user-role
+            # disclosure stays and is no longer conditional on advisor context
+            # having entered the turn: the published prose is the model's
+            # account and may claim the refused change landed, so the backend
+            # asserts in its own voice — durably, before the next turn's model
+            # reads this one — that completion was withheld. Like the
+            # anti-anchor hint, audit publication is a precondition of the
+            # provider-visible intervention.
+            if session_id is not None:
+                # Fenced session write (P4-D6 family A2b): the disclosure row
+                # carries the compose operation this turn runs under.
+                if session_operation_context is None:
+                    raise TypeError("advisor disclosure requires the turn's session_operation_context")
+                await self._require_sessions_service().add_message(
+                    UUID(session_id),
+                    "audit",
+                    _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE,
+                    writer_principal="compose_loop",
+                    tool_calls=[advisor_signoff_withheld_control_envelope(_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE)],
+                    session_operation_context=session_operation_context,
+                )
             # R2-F14: ``failure_class`` is READ here rather than every
             # ``ok=False`` being labelled "unavailable". Only the EXACT value
             # ``"unavailable"`` maps to the outage wording; ``"malformed"``,
@@ -6849,9 +6868,9 @@ class ComposerServiceImpl:
                 runtime_preflight=runtime_preflight,
                 outstanding_findings=outstanding_findings,
             )
-            # Audit row for the branch that spoke, before the telemetry
-            # mirror — the replacer will pass this result through without
-            # publishing it a second time.
+            # Audit row for the branch that spoke, after the disclosure row
+            # above and before the telemetry mirror — the replacer will pass
+            # this result through without publishing it a second time.
             await self._persist_advisor_terminal_publication(
                 blocked,
                 session_id=session_id,
@@ -10800,10 +10819,13 @@ _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 # blocked turn, so the clause asks for a reply that stands on its own
 # rather than one that hides the review; quoting the fenced text stays
 # forbidden — it derives from pipeline data and can carry injected text.
+# The clause does NOT promise the reply reaches the user: a no-tool reply
+# after which the next advisor pass returns CLEAN falls through to finalize
+# and case 5 (``_replace_advisor_repair_public_result``) replaces it.
 _ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
     "Fix the findings via tool calls. The end user has not read these "
-    "findings: your final reply is shown to them, so write it to stand on "
-    "its own and do not quote the fenced text."
+    "findings: write your final reply to stand on its own and do not quote "
+    "the fenced text."
 )
 
 # elspeth-71617f1d21: the END-gate repair-continue message must state that
@@ -10814,9 +10836,11 @@ _ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
 # "continue if it does not apply" framing, where demanding a mutation would
 # be wrong.
 # Ruling 2026-09-22 (elspeth-032ec69c41): the "say what blocks you" exit
-# now names an outcome that exists — a no-tool reply ends the turn and is
-# shown to the user — instead of routing into a deleted reply (session
-# 6990d39f). Trailing space is load-bearing: the two clauses concatenate.
+# now names an outcome that exists — a no-tool reply ends the turn, and on a
+# blocked turn it is published — instead of routing into a deleted reply
+# (session 6990d39f). It stops short of promising the user sees it, for the
+# case-5 reason on ``_ADVISOR_OUTPUT_CONTRACT_CLAUSE``. Trailing space is
+# load-bearing: the two clauses concatenate.
 _ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
     "Resolving these findings requires pipeline MUTATIONS via tool calls "
     "(e.g. patch_node_options, upsert_node, patch_source_options, "
@@ -10824,7 +10848,22 @@ _ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
     "lookup-only calls is not a fix and wastes this repair pass. If a "
     "finding needs a decision only the user can make, or no tool call can "
     "address it, make no change: tell the user what blocks you and what "
-    "their options are. That reply ends the turn and is shown to the user. "
+    "their options are. That reply ends the turn. "
+)
+
+# elspeth-2306940c70: durable provider-visible disclosure persisted on every
+# terminal END-gate block. Fixed backend copy only — no advisor findings ride
+# this string, so replaying it into later turns cannot re-introduce the
+# repair-cohort contamination the gate keeps out of user-visible surfaces.
+# Since the 2026-09-22 ruling (elspeth-032ec69c41) the blocked turn's own
+# prose is published and replays beside this row; the row is the backend's
+# assertion that completion was withheld, whatever that prose claims.
+_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE: Final[str] = (
+    "[composer-system] The completion advisory review did not clear, so "
+    "ELSPETH withheld composer completion for the preceding request. Do not "
+    "assume that request was applied: the pipeline state supplied in the "
+    "current context is the authoritative record. Verify against it before "
+    "describing any earlier instruction as applied or in effect."
 )
 
 

@@ -1051,6 +1051,15 @@ def _append_advisor_suffix(content: str, suffix: str) -> str:
 # substituted for prose it withheld; False selects the ``_PUBLISHED_`` twin for
 # a reply published beside the notice. A default would let a new caller publish
 # the disclosure over prose it did not withhold, or omit it over prose it did.
+# Since the 2026-09-22 ruling (elspeth-032ec69c41) the END gate's blocked
+# result publishes the prose, so its single production call site passes the
+# literal False to each of these composers and their True arms have no
+# producer; only case 5 (``_replace_advisor_repair_public_result``) still
+# withholds, through ``_compose_advisor_pending_handoff_message`` and
+# ``_compose_advisor_signoff_pending_message``. The True arms and their
+# ``_WITHHELD_`` notices are kept pending an operator ruling on the whole
+# withheld-notice family (final review 2026-09-22, I4), not because a caller
+# chooses between them.
 def compose_advisor_signoff_flagged_red_message(content: str, *, runtime_result: ValidationResult, prose_withheld: bool) -> str:
     """RED preflight + a FLAGGED advisory verdict (elspeth-b61894d93d).
 

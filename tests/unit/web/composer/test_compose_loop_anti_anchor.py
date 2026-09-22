@@ -301,10 +301,12 @@ def test_anti_anchor_control_replay_fails_closed_on_provenance_tamper(tamper: st
     elif tamper == "provider_role":
         envelope["provider_role"] = "system"
     else:
-        # The origin retired on 2026-09-22 (elspeth-032ec69c41) with the END
-        # gate's prose withholding: an unregistered origin, historical or
-        # forged, fails replay closed.
-        envelope["origin"] = "advisor_signoff_withheld"
+        # Measured 2026-09-22: the content hash binds the content alone, so
+        # swapping in another REGISTERED user-role origin (there is one:
+        # ``advisor_signoff_withheld``) replays successfully — the provider
+        # message is identical either way. Only an unregistered origin fails
+        # closed; that is the case pinned here.
+        envelope["origin"] = "not_a_registered_origin"
 
     with pytest.raises(AuditIntegrityError):
         replay_composer_control_message(
