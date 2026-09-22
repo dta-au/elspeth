@@ -425,11 +425,11 @@ _compose_advisor_signoff_unrepairable_handoff_message = _no_tool_policy.compose_
 _compose_advisor_signoff_unrepairable_red_message = _no_tool_policy.compose_advisor_signoff_unrepairable_red_message
 _compose_advisor_signoff_flagged_red_message = _no_tool_policy.compose_advisor_signoff_flagged_red_message
 _compose_advisor_signoff_unrendered_red_message = _no_tool_policy.compose_advisor_signoff_unrendered_red_message
-_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE
+_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE
 _compose_advisor_pending_handoff_message = _no_tool_policy.compose_advisor_pending_handoff_message
 _compose_interpretation_review_handoff_message = _no_tool_policy.compose_interpretation_review_handoff_message
 _advisor_signoff_pending_handoff_wording = _no_tool_policy.advisor_signoff_pending_handoff_wording
-_ADVISOR_SIGNOFF_PENDING_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE
+_ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE
 _ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
 _ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
 _ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE
@@ -8605,10 +8605,9 @@ class ComposerServiceImpl:
         # publishes the composer's reply. The withholding existed so prose
         # written after advisor findings entered context could not leak them;
         # findings are no longer secret from the user. Case 5 (the repair
-        # replacer) keeps its own withholding and does not pass through here.
-        # The local name stays: the notice composers below share this one
-        # decision, and a literal at each call would hide that.
-        prose_withheld = False
+        # replacer) keeps its own withholding and does not pass through here,
+        # which is why the two composers it shares with this builder still
+        # take ``prose_withheld`` and are passed False below.
         raw_content = (assistant_message.content or "") if assistant_message is not None else ""
         # elspeth-032ec69c41 (ruling 2026-09-22, "store, bounded"): computed
         # once for every shape below. The step ids are checked against THIS
@@ -8657,12 +8656,11 @@ class ComposerServiceImpl:
             # class and remedy instead of telling the user to review a
             # pipeline that validated.
             if verdict.ok:
-                augmented = _compose_advisor_signoff_pending_message(raw_content, prose_withheld=prose_withheld)
+                augmented = _compose_advisor_signoff_pending_message(raw_content, prose_withheld=False)
             else:
                 augmented = _compose_advisor_signoff_unrendered_pending_message(
                     raw_content,
                     failure_class="unavailable" if reason == "unavailable" else "malformed",
-                    prose_withheld=prose_withheld,
                 )
         elif runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
             # Matches the discriminator EXACTLY, not merely ``not is_valid``:
@@ -8676,7 +8674,7 @@ class ComposerServiceImpl:
             )
             augmented = _compose_advisor_pending_handoff_message(
                 raw_content,
-                prose_withheld=prose_withheld,
+                prose_withheld=False,
                 outstanding_findings_detail=_outstanding_findings_detail(outstanding_findings),
             )
         elif runtime_preflight is None:
@@ -8689,12 +8687,11 @@ class ComposerServiceImpl:
                 note=note,
             )
             if verdict.ok:
-                augmented = _compose_advisor_signoff_unverified_message(raw_content, prose_withheld=prose_withheld)
+                augmented = _compose_advisor_signoff_unverified_message(raw_content)
             else:
                 augmented = _compose_advisor_signoff_unrendered_unverified_message(
                     raw_content,
                     failure_class="unavailable" if reason == "unavailable" else "malformed",
-                    prose_withheld=prose_withheld,
                 )
         else:
             runtime_result = _advisor_signoff_blocked_validation(
@@ -8716,13 +8713,9 @@ class ComposerServiceImpl:
             # keeps could-not-be-obtained. (A flagged_unrepairable reason is
             # re-composed by the shape-aware override below.)
             if verdict.ok:
-                augmented = _compose_advisor_signoff_flagged_red_message(
-                    raw_content, runtime_result=runtime_preflight, prose_withheld=prose_withheld
-                )
+                augmented = _compose_advisor_signoff_flagged_red_message(raw_content, runtime_result=runtime_preflight)
             else:
-                augmented = _compose_advisor_signoff_unrendered_red_message(
-                    raw_content, runtime_result=runtime_preflight, prose_withheld=prose_withheld
-                )
+                augmented = _compose_advisor_signoff_unrendered_red_message(raw_content, runtime_result=runtime_preflight)
         if reason == "flagged_unrepairable":
             # elspeth-25f7b757e7 (A1, fix round 1 N1): the block's cause is
             # the user's own chat message, so every variant names the reword
@@ -8734,18 +8727,16 @@ class ComposerServiceImpl:
             # ac85b0ab0e class), and on red it hid the validator's objection
             # from the user who most needs it.
             if validated_base is not None:
-                augmented = _compose_advisor_signoff_unrepairable_message(raw_content, prose_withheld=prose_withheld)
+                augmented = _compose_advisor_signoff_unrepairable_message(raw_content)
             elif runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
-                augmented = _compose_advisor_signoff_unrepairable_handoff_message(raw_content, prose_withheld=prose_withheld)
+                augmented = _compose_advisor_signoff_unrepairable_handoff_message(raw_content)
             elif runtime_preflight is None:
-                augmented = _compose_advisor_signoff_unrepairable_unverified_message(raw_content, prose_withheld=prose_withheld)
+                augmented = _compose_advisor_signoff_unrepairable_unverified_message(raw_content)
             else:
                 # The turn's ACTUAL red preflight — never the synthesized
                 # advisor-signoff validation, whose errors carry the advisor
                 # wording rather than the validator's objection.
-                augmented = _compose_advisor_signoff_unrepairable_red_message(
-                    raw_content, runtime_result=runtime_preflight, prose_withheld=prose_withheld
-                )
+                augmented = _compose_advisor_signoff_unrepairable_red_message(raw_content, runtime_result=runtime_preflight)
         _enforce_augmentation_prefix_invariant(
             branch="advisor_signoff_blocked_augmentation",
             content=raw_content,
@@ -10953,7 +10944,7 @@ def _advisor_signoff_unverified_validation(
         reason=reason,
         findings=findings,
         findings_backend_authored=findings_backend_authored,
-        notice=_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+        notice=_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
         category=category,
         step_ids=step_ids,
     )
@@ -11312,7 +11303,7 @@ def _advisor_signoff_blocked_wording(
     reason: str,
     findings: str,
     findings_backend_authored: bool = False,
-    notice: str = _ADVISOR_SIGNOFF_PENDING_NOTICE,
+    notice: str = _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
     category: str = "other",
     step_ids: Sequence[str] = (),
 ) -> tuple[str, str]:
@@ -11324,7 +11315,11 @@ def _advisor_signoff_blocked_wording(
     so the surfaces cannot drift. ``notice`` swaps the fixed notice the FLAGGED
     arms embed — the unverified shape states readiness was not re-verified
     (elspeth-2ae50afcd1 facet B) — while the could-not-be-obtained arms are
-    notice-independent and identical across all three consumers.
+    notice-independent and identical across all three consumers. All three
+    serve only ``_advisor_blocked_result``, which publishes the composer's
+    reply, so ``notice`` is always a ``_PUBLISHED_`` notice: the withheld form
+    would put "ELSPETH withheld the composer's own summary" on the durable
+    blocker beside that published summary.
 
     R2-F14: ``reason`` is now the RESOLVED failure class, not a fixed literal.
     The old text interpolated ``(unavailable)`` unconditionally and then

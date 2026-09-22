@@ -104,7 +104,10 @@ def _publication_rows(service: Any) -> list[dict[str, Any]]:
 class TestWithheldProseDisclosure:
     """The disclosure is one fixed sentence, present on every cohort terminal.
 
-    The intermediate repair status line ("ELSPETH is applying a pipeline
+    Only the advisor-repair replacer (``_replace_advisor_repair_public_result``)
+    still withholds the model's prose: an END-gate block publishes it
+    (elspeth-032ec69c41), so the blocked notices carry no disclosure and are
+    not listed here. The intermediate repair status line ("ELSPETH is applying a pipeline
     correction.") is deliberately excluded: it is transient progress copy, and
     the turn always ends in one of the terminals below, which is where the
     user decides what the turn did.
@@ -118,17 +121,6 @@ class TestWithheldProseDisclosure:
         "message",
         [
             no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
-            no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
-            no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
             no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
             no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
             no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
@@ -137,17 +129,6 @@ class TestWithheldProseDisclosure:
         ],
         ids=[
             "signoff_pending_notice",
-            "signoff_unverified_notice",
-            "signoff_unavailable_pending_notice",
-            "signoff_malformed_pending_notice",
-            "signoff_unavailable_unverified_notice",
-            "signoff_malformed_unverified_notice",
-            "signoff_unrepairable_notice",
-            "signoff_unrepairable_unverified_notice",
-            "signoff_unrepairable_handoff_notice",
-            "signoff_unrepairable_red_footer",
-            "signoff_flagged_red_footer",
-            "signoff_unrendered_red_footer",
             "pending_handoff_notice",
             "repair_success",
             "repair_review",
