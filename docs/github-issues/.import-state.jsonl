@@ -42,3 +42,11 @@
 {"slug": "untrusted-content-admission-does-not-propagate-taint-from", "number": "199", "url": "https://github.com/dta-au/elspeth/issues/199"}
 {"slug": "untyped-app-state-service-access-lets-required-keyword-con", "number": "200", "url": "https://github.com/dta-au/elspeth/issues/200"}
 {"slug": "validate-every-maintained-shipped-example-as-production-el", "number": "201", "url": "https://github.com/dta-au/elspeth/issues/201"}
+{"slug": "acceptance-harness-trust-boundary-documents-a-naive-dateti", "number": "202", "url": "https://github.com/dta-au/elspeth/issues/202"}
+{"slug": "define-and-prove-a-data-preserving-schema-migration-contra", "number": "203", "url": "https://github.com/dta-au/elspeth/issues/203"}
+{"slug": "frontend-api-client-trusts-most-responses-through-an-unche", "number": "204", "url": "https://github.com/dta-au/elspeth/issues/204"}
+{"slug": "planner-byte-budget-ledger-is-hand-maintained-prose-with-n", "number": "205", "url": "https://github.com/dta-au/elspeth/issues/205"}
+{"slug": "retention-and-azure-safety-properties-are-vacuous-no-gene", "number": "206", "url": "https://github.com/dta-au/elspeth/issues/206"}
+{"slug": "scope-map-is-last-write-wins-on-a-duplicate-closer-name-un", "number": "207", "url": "https://github.com/dta-au/elspeth/issues/207"}
+{"slug": "telemetry-health-metrics-cannot-distinguish-enabled-with-n", "number": "208", "url": "https://github.com/dta-au/elspeth/issues/208"}
+{"slug": "transform-on-error-parity-test-varies-two-things-at-once-s", "number": "209", "url": "https://github.com/dta-au/elspeth/issues/209"}
