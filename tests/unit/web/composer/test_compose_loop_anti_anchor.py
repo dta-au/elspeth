@@ -286,7 +286,7 @@ async def test_replayed_anti_anchor_user_role_is_not_misattributed_to_the_human(
     assert [request.content for request in context.prior_user_requests] == ["Route rows with amount > 500 to high_value."]
 
 
-@pytest.mark.parametrize("tamper", ("content", "stored_role", "writer_principal", "provider_role"))
+@pytest.mark.parametrize("tamper", ("content", "stored_role", "writer_principal", "provider_role", "origin"))
 def test_anti_anchor_control_replay_fails_closed_on_provenance_tamper(tamper: str) -> None:
     content = "[ELSPETH-SYSTEM-HINT] Choose a structurally different repair."
     envelope = anti_anchor_control_envelope(content)
@@ -298,8 +298,15 @@ def test_anti_anchor_control_replay_fails_closed_on_provenance_tamper(tamper: st
         stored_role = "user"
     elif tamper == "writer_principal":
         writer_principal = "route_user_message"
-    else:
+    elif tamper == "provider_role":
         envelope["provider_role"] = "system"
+    else:
+        # Measured 2026-09-22: the content hash binds the content alone, so
+        # swapping in another REGISTERED user-role origin (there is one:
+        # ``advisor_signoff_withheld``) replays successfully — the provider
+        # message is identical either way. Only an unregistered origin fails
+        # closed; that is the case pinned here.
+        envelope["origin"] = "not_a_registered_origin"
 
     with pytest.raises(AuditIntegrityError):
         replay_composer_control_message(

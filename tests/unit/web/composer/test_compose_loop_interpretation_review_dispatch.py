@@ -1989,7 +1989,6 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
             persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
-            advisor_repair_context_introduced=True,
             session_operation_context=_compose_ctx,
         )
 
@@ -3527,7 +3526,6 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
             persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
-            advisor_repair_context_introduced=True,
             session_operation_context=_compose_ctx,
         )
 
@@ -3586,7 +3584,6 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
             persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
-            advisor_repair_context_introduced=True,
             session_operation_context=_compose_ctx,
         )
 
@@ -3640,7 +3637,6 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
             persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=composer._settings.composer_advisor_checkpoint_max_passes - 1,
-            advisor_repair_context_introduced=True,
             session_operation_context=_compose_ctx,
         )
 
@@ -3786,7 +3782,6 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
             persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
-            advisor_repair_context_introduced=True,
             session_operation_context=_compose_ctx,
         )
 
@@ -3873,7 +3868,6 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
             persisted_tool_call_turn=False,
             # Force last-pass so (used + 1) >= max_passes -> the final-FLAG return.
             advisor_checkpoint_passes_used=composer._settings.composer_advisor_checkpoint_max_passes - 1,
-            advisor_repair_context_introduced=True,
             session_operation_context=_compose_ctx,
         )
 
@@ -4005,7 +3999,6 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
             persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
-            advisor_repair_context_introduced=True,
             session_operation_context=_compose_ctx,
         )
 

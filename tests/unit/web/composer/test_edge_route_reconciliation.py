@@ -678,3 +678,24 @@ class TestStageOneRuntimeFatalPromotions:
             version=1,
         )
         assert _errors_for(state, "quarantine_unknown_output")
+
+
+def test_coalesce_on_error_rejection_names_the_supported_alternatives() -> None:
+    """elspeth-032ec69c41: the only place the model learns this limit must also teach the way forward."""
+    from elspeth.web.composer.state import EdgeSpec, edge_lowering_error
+
+    edge = EdgeSpec(id="e1", from_node="merge_ab", to_node="errors", edge_type="on_error", label=None)
+    message = edge_lowering_error(edge, from_kind="coalesce", to_kind="output")
+    assert message is not None
+    assert "Coalesce 'merge_ab' has no on_error route" in message
+    assert "on_error of each branch transform" in message
+    # The consequence is stated as the engine applies it (``decide_coalesce``
+    # LOSS row): a lost branch fails the whole ``require_all`` group and the
+    # arrived branches are recorded failed with it — not a benign drop.
+    assert "the whole merge group then fails" in message
+    assert "recorded as failed too" in message
+    assert "'best_effort'" in message
+    # ``'first'`` merges on the first arrival; it is not a sibling of
+    # ``'best_effort'`` and ``'quorum'`` and is described on its own.
+    assert "'first' merges on the first arrival" in message
+    assert "ask the user" in message

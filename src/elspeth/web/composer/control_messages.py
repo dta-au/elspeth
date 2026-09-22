@@ -54,12 +54,15 @@ def anti_anchor_control_envelope(content: str) -> dict[str, str]:
 def advisor_signoff_withheld_control_envelope(content: str) -> dict[str, str]:
     """Return bounded provenance for one advisor-withheld disclosure.
 
-    elspeth-2306940c70: the END advisor gate's terminal withhold publishes
-    fixed backend copy with the model's prose withheld, so the turn replays
-    into later model context as an empty assistant message. This envelope
-    makes the non-completion durable and provider-visible: the disclosure
-    replays as a user-role control message so the next turn's model cannot
-    read the withheld turn as silent compliance.
+    elspeth-2306940c70 introduced this row to stand in for the prose the
+    END advisor gate's terminal block withheld, so the next turn's model
+    would not read an empty assistant turn as silent compliance. Since the
+    2026-09-22 ruling (elspeth-032ec69c41) the block publishes the model's
+    prose, and the row's job changed: that prose may itself claim the
+    refused change landed, and this disclosure — fixed backend copy,
+    replayed as a user-role control message — is the backend's own
+    assertion to the next turn that completion was withheld. Written on
+    every terminal block.
     """
 
     return _control_envelope(_ADVISOR_SIGNOFF_WITHHELD_ORIGIN, content)
