@@ -7,7 +7,7 @@ import hashlib
 import json
 import threading
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -53,6 +53,7 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.resolved import SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession, GuidedStep, TerminalKind, TerminalReason, TerminalState
@@ -14774,6 +14775,60 @@ def test_recompose_uses_last_conversational_user_before_audit_tool_rows(tmp_path
     composer.compose.assert_awaited_once()
     assert composer.compose.call_args.args[0] == "Build a CSV pipeline"
     assert composer.compose.call_args.args[1] == []
+    assert composer.compose.call_args.kwargs["user_message_id"] == str(user_message.id)
+
+
+@pytest.mark.parametrize(
+    ("origin", "envelope_factory"),
+    [
+        pytest.param("anti_anchor", anti_anchor_control_envelope, id="anti_anchor"),
+        pytest.param("advisor_signoff_withheld", advisor_signoff_withheld_control_envelope, id="advisor_signoff_withheld"),
+    ],
+)
+def test_recompose_replays_trailing_control_row_without_ordinary_audit(
+    tmp_path: Path,
+    origin: str,
+    envelope_factory: Callable[[str], dict[str, str]],
+) -> None:
+    app, service = _make_app(tmp_path)
+    composer = _make_composer_mock(response_text="Retrying failed turn.")
+    app.state.composer_service = composer
+    client = TestClient(app, raise_server_exceptions=False)
+
+    session_id = uuid.UUID(client.post("/api/sessions", json={"title": "Retry"}).json()["id"])
+    control_content = f"Backend control from {origin}"
+    loop = asyncio.new_event_loop()
+    try:
+        user_message = loop.run_until_complete(
+            service.add_message(session_id, "user", "Build a CSV pipeline", writer_principal="route_user_message")
+        )
+        loop.run_until_complete(
+            service.add_message(
+                session_id,
+                "audit",
+                "ordinary dispatch audit",
+                tool_calls=_audit_tool_calls("call-1"),
+                writer_principal="compose_loop",
+            )
+        )
+        loop.run_until_complete(
+            service.add_message(
+                session_id,
+                "audit",
+                control_content,
+                tool_calls=[envelope_factory(control_content)],
+                writer_principal="compose_loop",
+            )
+        )
+    finally:
+        loop.close()
+
+    response = client.post(f"/api/sessions/{session_id}/recompose")
+
+    assert response.status_code == 200
+    composer.compose.assert_awaited_once()
+    assert composer.compose.call_args.args[0] == "Build a CSV pipeline"
+    assert composer.compose.call_args.args[1] == [{"role": "user", "content": control_content}]
     assert composer.compose.call_args.kwargs["user_message_id"] == str(user_message.id)
 
 

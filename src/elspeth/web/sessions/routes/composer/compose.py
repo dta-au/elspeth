@@ -184,9 +184,10 @@ async def recompose(
         _COMPOSER_REQUESTS_INFLIGHT.add(1, {"endpoint": "recompose"})
         terminal_status: _ComposerRequestTerminalStatus = "failed"
         try:
-            # Exclude the last user message — the composer receives it
-            # separately via the message arg and appends it in _build_messages.
-            chat_messages = _composer_chat_history(conversation_records[:-1])
+            # Exclude only the retried user message — the composer receives it
+            # separately. Keep the full transcript so the history builder can
+            # replay provider-visible control audit rows in their stored order.
+            chat_messages = _composer_chat_history([record for record in records if record.id != conversation_records[-1].id])
 
             # Run the LLM composition loop
             composer: ComposerService = request.app.state.composer_service
