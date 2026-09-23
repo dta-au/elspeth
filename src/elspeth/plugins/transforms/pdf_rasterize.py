@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field, model_validator
 
-from elspeth.contracts import Determinism
+from elspeth.contracts import Call, Determinism
 from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES, binary_document_signature_matches
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
@@ -381,7 +381,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7140a13f10275faa"
+    source_file_hash: str | None = "sha256:89687a0a81a01a23"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -839,12 +839,8 @@ class PDFRasterize(BaseTransform):
         *,
         source_call_id: str | None,
         latency_ms: float,
-    ) -> Any:
-        if ctx.landscape is None or ctx.state_id is None:
-            raise AuditIntegrityError("PDF render call has no audit parent")
-        writer = cast(Any, ctx.landscape)
-        return writer.record_call(
-            state_id=ctx.state_id,
+    ) -> Call:
+        return ctx.record_row_call(
             call_index=call_index,
             call_type=CallType.FILESYSTEM,
             status=CallStatus.SUCCESS,
@@ -852,8 +848,6 @@ class PDFRasterize(BaseTransform):
             response_data=RawCallPayload(response_data),
             latency_ms=latency_ms,
             source_call_id=source_call_id,
-            member_token=ctx.require_member_token(),
-            work_item=ctx.require_work_item(),
         )
 
     def _map_document_result(self, result: RenderResult, *, blob_ref: str, row: PipelineRow, output_dir: Path | None) -> TransformResult:

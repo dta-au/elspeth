@@ -35,6 +35,7 @@ from elspeth.contracts.trust_boundary import observation_boundary
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType, SourceRow, TransformErrorReason
     from elspeth.contracts.audit_protocols import PluginAuditWriter
+    from elspeth.contracts.call_data import CallPayload
     from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
     from elspeth.contracts.errors import ContractViolation
@@ -329,6 +330,33 @@ class PluginContext:
             raise FrameworkBugError("Row call index allocation requires a node-state audit parent")
         return self.landscape.allocate_call_index(
             self.state_id,
+            member_token=self.require_member_token(),
+            work_item=self.require_work_item(),
+        )
+
+    def record_row_call(
+        self,
+        *,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        latency_ms: float | None = None,
+        source_call_id: str | None = None,
+    ) -> Call:
+        """Record a row call under this context's exact node state and claim."""
+        if self.landscape is None or self.state_id is None:
+            raise FrameworkBugError("Row call recording requires a node-state audit parent")
+        return self.landscape.record_call(
+            state_id=self.state_id,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            request_data=request_data,
+            response_data=response_data,
+            latency_ms=latency_ms,
+            source_call_id=source_call_id,
             member_token=self.require_member_token(),
             work_item=self.require_work_item(),
         )
