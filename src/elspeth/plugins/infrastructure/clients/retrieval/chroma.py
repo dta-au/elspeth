@@ -20,6 +20,7 @@ import math
 import re
 import time
 from collections.abc import Mapping
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 import chromadb
@@ -183,10 +184,15 @@ class ChromaSearchProvider:
 
         self._client: chromadb.api.ClientAPI | None = None
         self._collection: Any = None
-        if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY:
+        if call_mode_session is not None and call_mode_session.mode in (RunMode.REPLAY, RunMode.VERIFY):
             # Chroma's constructors and get_collection may contact a server or
-            # touch a persistent index. Replay must intercept before both.
+            # touch a persistent index. Admit the source call before either.
             return
+
+        self._initialize_client()
+
+    def _initialize_client(self) -> None:
+        config = self._config
 
         client: chromadb.api.ClientAPI
         if config.mode == "ephemeral":
@@ -255,6 +261,17 @@ class ChromaSearchProvider:
                 member_token=member_token,
                 work_item=work_item,
             )
+        call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.admit_verify_call(
+                call_type=CallType.VECTOR,
+                request_data=request_data,
+                current_state_id=state_id,
+                current_operation_id=None,
+                current_call_index=call_index,
+            )
+        if self._collection is None:
+            self._initialize_client()
         count_start = time.monotonic()
         count_request = request_payload
         try:
@@ -265,17 +282,44 @@ class ChromaSearchProvider:
             chromadb.errors.NotFoundError,
             chromadb.errors.AuthorizationError,
         ) as exc:
-            self._record_error(state_id, count_start, count_request, exc, retryable=False, member_token=member_token, work_item=work_item)
+            self._record_error(
+                state_id,
+                count_start,
+                count_request,
+                exc,
+                call_index=call_index,
+                retryable=False,
+                member_token=member_token,
+                work_item=work_item,
+            )
             raise RetrievalError(
                 f"Chroma count failed (permanent): {exc}",
                 retryable=False,
             ) from exc
         except chromadb.errors.ChromaError as exc:
-            self._record_error(state_id, count_start, count_request, exc, retryable=True, member_token=member_token, work_item=work_item)
+            self._record_error(
+                state_id,
+                count_start,
+                count_request,
+                exc,
+                call_index=call_index,
+                retryable=True,
+                member_token=member_token,
+                work_item=work_item,
+            )
             raise RetrievalError(f"Chroma count failed: {exc}", retryable=True) from exc
         except (ConnectionError, TimeoutError, OSError) as exc:
             # OS-level failures that bypass the ChromaDB SDK's own error wrapping
-            self._record_error(state_id, count_start, count_request, exc, retryable=True, member_token=member_token, work_item=work_item)
+            self._record_error(
+                state_id,
+                count_start,
+                count_request,
+                exc,
+                call_index=call_index,
+                retryable=True,
+                member_token=member_token,
+                work_item=work_item,
+            )
             raise RetrievalError(f"Chroma connection failed during count: {exc}", retryable=True) from exc
         if type(collection_count) is not int or collection_count < 0:
             error = RetrievalError(
@@ -283,7 +327,16 @@ class ChromaSearchProvider:
                 f"got {collection_count!r} ({type(collection_count).__name__}).",
                 retryable=False,
             )
-            self._record_error(state_id, count_start, count_request, error, retryable=False, member_token=member_token, work_item=work_item)
+            self._record_error(
+                state_id,
+                count_start,
+                count_request,
+                error,
+                call_index=call_index,
+                retryable=False,
+                member_token=member_token,
+                work_item=work_item,
+            )
             raise error
         if collection_count == 0:
             # The corpus is empty: no query() is issued and zero chunks are
@@ -294,7 +347,6 @@ class ChromaSearchProvider:
             # "retrieval never ran"; collection_count=0 further distinguishes
             # it from a populated query that simply matched nothing.
             empty_elapsed_ms = (time.monotonic() - count_start) * 1000
-            call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
             response_payload = RawCallPayload(
                 {
                     "result_count": 0,
@@ -347,17 +399,44 @@ class ChromaSearchProvider:
             chromadb.errors.NotFoundError,
             chromadb.errors.AuthorizationError,
         ) as exc:
-            self._record_error(state_id, start_time, request_payload, exc, retryable=False, member_token=member_token, work_item=work_item)
+            self._record_error(
+                state_id,
+                start_time,
+                request_payload,
+                exc,
+                call_index=call_index,
+                retryable=False,
+                member_token=member_token,
+                work_item=work_item,
+            )
             raise RetrievalError(
                 f"Chroma query failed (permanent): {exc}",
                 retryable=False,
             ) from exc
         except chromadb.errors.ChromaError as exc:
-            self._record_error(state_id, start_time, request_payload, exc, retryable=True, member_token=member_token, work_item=work_item)
+            self._record_error(
+                state_id,
+                start_time,
+                request_payload,
+                exc,
+                call_index=call_index,
+                retryable=True,
+                member_token=member_token,
+                work_item=work_item,
+            )
             raise RetrievalError(f"Chroma query failed: {exc}", retryable=True) from exc
         except (ConnectionError, TimeoutError, OSError) as exc:
             # OS-level failures that bypass the ChromaDB SDK's own error wrapping
-            self._record_error(state_id, start_time, request_payload, exc, retryable=True, member_token=member_token, work_item=work_item)
+            self._record_error(
+                state_id,
+                start_time,
+                request_payload,
+                exc,
+                call_index=call_index,
+                retryable=True,
+                member_token=member_token,
+                work_item=work_item,
+            )
             raise RetrievalError(f"Chroma connection failed: {exc}", retryable=True) from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
 
@@ -370,7 +449,14 @@ class ChromaSearchProvider:
             chunks, skipped_items = self._parse_and_build_chunks(results, min_score)
         except RetrievalError as exc:
             self._record_error(
-                state_id, start_time, request_payload, exc, retryable=exc.retryable, member_token=member_token, work_item=work_item
+                state_id,
+                start_time,
+                request_payload,
+                exc,
+                call_index=call_index,
+                retryable=exc.retryable,
+                member_token=member_token,
+                work_item=work_item,
             )
             raise
 
@@ -378,7 +464,6 @@ class ChromaSearchProvider:
         self.last_skipped_count = len(skipped_items)
         self.last_skipped_reasons = skipped_items
 
-        call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
         response_payload = RawCallPayload(
             {
                 "result_count": len(chunks),
@@ -465,7 +550,19 @@ class ChromaSearchProvider:
         skips = deep_thaw(raw_skips)
         if not isinstance(skips, list) or any(not isinstance(item, dict) for item in skips):
             raise RetrievalError("Chroma replay source call has malformed skip evidence", retryable=False)
-        if response.get("result_count") != len(chunks) or response.get("skipped_count") != len(skips):
+        result_count = response.get("result_count")
+        skipped_count = response.get("skipped_count")
+        top_score = response.get("top_score")
+        if (
+            type(result_count) is not int
+            or result_count != len(chunks)
+            or type(skipped_count) is not int
+            or skipped_count != len(skips)
+            or count < len(chunks)
+            or (top_score is not None and (isinstance(top_score, bool) or not isinstance(top_score, (int, float))))
+            or (float(top_score) if top_score is not None else None) != (chunks[0].score if chunks else None)
+            or any(left.score < right.score for left, right in pairwise(chunks))
+        ):
             raise RetrievalError("Chroma replay source call summary disagrees with retained chunks", retryable=False)
         self.last_skipped_count = len(skips)
         self.last_skipped_reasons = skips
@@ -611,6 +708,7 @@ class ChromaSearchProvider:
         request_data: RawCallPayload,
         exc: Exception,
         *,
+        call_index: int,
         retryable: bool,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
@@ -623,7 +721,6 @@ class ChromaSearchProvider:
         here because the caller is about to raise a RetrievalError).
         """
         elapsed_ms = (time.monotonic() - start_time) * 1000
-        call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
         error_data = {
             "error_type": type(exc).__name__,
             "message": str(exc),
@@ -668,9 +765,11 @@ class ChromaSearchProvider:
         coordination_token = self._coordination_token
         if session is not None and (operation_id is None or coordination_token is None):
             raise RetrievalError("Chroma replay/verify readiness requires an audited operation parent", retryable=False)
-        if session is not None and session.mode is RunMode.REPLAY:
-            assert operation_id is not None and coordination_token is not None
+        call_index: int | None = None
+        if operation_id is not None and coordination_token is not None:
             call_index = self._execution.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+        if session is not None and session.mode is RunMode.REPLAY:
+            assert operation_id is not None and coordination_token is not None and call_index is not None
             evidence = session.replay_call(
                 call_type=CallType.VECTOR,
                 request_data=request_data,
@@ -703,6 +802,17 @@ class ChromaSearchProvider:
                 if count > 0
                 else f"Collection '{collection_name}' is empty",
             )
+        if session is not None and session.mode is RunMode.VERIFY:
+            assert operation_id is not None and call_index is not None
+            session.admit_verify_call(
+                call_type=CallType.VECTOR,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=operation_id,
+                current_call_index=call_index,
+            )
+        if self._collection is None:
+            self._initialize_client()
 
         try:
             count = self._collection.count()
@@ -713,7 +823,7 @@ class ChromaSearchProvider:
             else:
                 message = f"Collection '{collection_name}' is empty"
             if operation_id is not None and coordination_token is not None:
-                call_index = self._execution.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+                assert call_index is not None
                 response_data = {"collection_count": count}
                 recorded = self._execution.record_operation_call(
                     operation_id=operation_id,

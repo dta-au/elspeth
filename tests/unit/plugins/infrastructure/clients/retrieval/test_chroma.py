@@ -1362,6 +1362,36 @@ class TestNegativeL2DistanceBoundary:
 
 
 class TestChromaCallMode:
+    def test_verify_readiness_rejects_source_before_sdk_construction(self) -> None:
+        session = MagicMock()
+        session.mode = RunMode.VERIFY
+        session.admit_verify_call.side_effect = RuntimeError("missing source readiness")
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
+            provider = ChromaSearchProvider(
+                config=ChromaSearchProviderConfig(collection="missing-source"),
+                execution=_fake_execution(),
+                run_id="verify-run",
+                call_mode_session=session,
+            )
+            with pytest.raises(RuntimeError, match="missing source readiness"):
+                provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
+            client.assert_not_called()
+
+    def test_verify_search_rejects_source_before_sdk_construction(self) -> None:
+        session = MagicMock()
+        session.mode = RunMode.VERIFY
+        session.admit_verify_call.side_effect = RuntimeError("ambiguous source search")
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
+            provider = ChromaSearchProvider(
+                config=ChromaSearchProviderConfig(collection="ambiguous-source"),
+                execution=_fake_execution(),
+                run_id="verify-run",
+                call_mode_session=session,
+            )
+            with pytest.raises(RuntimeError, match="ambiguous source search"):
+                provider.search("query", 1, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+            client.assert_not_called()
+
     def test_verify_readiness_records_and_compares_collection_count(self) -> None:
         collection_name = f"ready-{uuid.uuid4().hex[:12]}"
         collection = chromadb.Client().get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
@@ -1378,6 +1408,7 @@ class TestChromaCallMode:
         readiness = provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
         assert readiness.count == 1
         assert execution.operation_calls[0]["response_data"].to_dict() == {"collection_count": 1}
+        session.admit_verify_call.assert_called_once()
         session.verify_call.assert_called_once()
         assert session.verify_call.call_args.kwargs["current_operation_id"] == "operation-1"
 
@@ -1396,6 +1427,7 @@ class TestChromaCallMode:
         )
         chunks = provider.search("verified text", 1, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
         assert chunks[0].content == "verified text"
+        session.admit_verify_call.assert_called_once()
         session.verify_call.assert_called_once()
         compared = session.verify_call.call_args.kwargs["live_response_data"]
         assert compared["chunks"][0]["content"] == "verified text"
@@ -1453,6 +1485,34 @@ class TestChromaCallMode:
             with pytest.raises(RetrievalError, match="complete chunk"):
                 provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
         client.assert_not_called()
+        assert execution.recorded_calls == []
+
+    def test_replay_rejects_corrupt_top_score_before_new_call(self) -> None:
+        session = MagicMock()
+        session.mode = RunMode.REPLAY
+        session.replay_call.return_value = ReplayCallEvidence(
+            source_call_id="corrupt-vector",
+            status=CallStatus.SUCCESS,
+            response_data={
+                "result_count": 1,
+                "skipped_count": 0,
+                "top_score": 0.1,
+                "collection_count": 1,
+                "chunks": [{"content": "retained text", "score": 0.75, "source_id": "doc-1", "metadata": {}}],
+                "skipped_items": [],
+            },
+            error_data=None,
+            latency_ms=1,
+        )
+        execution = _fake_execution()
+        provider = ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(collection="retained-col"),
+            execution=execution,
+            run_id="replay-run",
+            call_mode_session=session,
+        )
+        with pytest.raises(RetrievalError, match="summary disagrees"):
+            provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
         assert execution.recorded_calls == []
 
     def test_replay_readiness_uses_archived_operation_count(self) -> None:
