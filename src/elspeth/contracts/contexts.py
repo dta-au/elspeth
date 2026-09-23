@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
     from elspeth.contracts.audit_protocols import PluginAuditWriter
     from elspeth.contracts.call_governance import LLMCallGovernance
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.identity import TokenInfo
@@ -93,6 +94,9 @@ class SourceContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def call_mode_session(self) -> CallModeSession | None: ...
+
+    @property
     def node_id(self) -> str | None: ...
 
     @property
@@ -148,6 +152,9 @@ class TransformContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def call_mode_session(self) -> CallModeSession | None: ...
+
+    @property
     def state_id(self) -> str | None: ...
 
     @property
@@ -195,6 +202,9 @@ class SinkContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def call_mode_session(self) -> CallModeSession | None: ...
+
+    @property
     def contract(self) -> SchemaContract | None: ...
 
     @property
@@ -230,6 +240,9 @@ class LifecycleContext(Protocol):
 
     @property
     def run_id(self) -> str: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
 
     @property
     def llm_call_governance(self) -> LLMCallGovernance | None: ...
