@@ -36,7 +36,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
     mint_worker_id,
 )
-from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.enums import RunMode, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunLeadershipLostError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence, decode_admission_decision
@@ -306,6 +306,8 @@ class RunLifecycleRepository:
         leader_worker_id: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
         run_start_permit: RunStartPermitBinding | None = None,
+        run_mode: RunMode = RunMode.LIVE,
+        replay_from_run_id: str | None = None,
     ) -> Run:
         """Begin a new pipeline run.
 
@@ -357,6 +359,10 @@ class RunLifecycleRepository:
             raise AuditIntegrityError(
                 "begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail."
             )
+        if not isinstance(run_mode, RunMode):
+            raise AuditIntegrityError("run_mode must be a RunMode")
+        if (run_mode is RunMode.LIVE) != (replay_from_run_id is None):
+            raise AuditIntegrityError("live runs have no replay source; replay/verify runs require one")
         validate_run_attribution(initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type)
         _validate_openrouter_catalog_snapshot(
             sha256=openrouter_catalog_sha256,
@@ -366,6 +372,8 @@ class RunLifecycleRepository:
             raise AuditIntegrityError("web_plugin_policy_evidence must be a WebPluginPolicyEvidence value")
 
         run_id = run_id or generate_id()
+        if replay_from_run_id == run_id:
+            raise AuditIntegrityError("a replay/verify run cannot cite itself as its source")
         if run_start_permit is not None and (type(run_start_permit) is not RunStartPermitBinding or run_start_permit.run_id != run_id):
             raise AuditIntegrityError("Run start permit must bind the exact run UUID")
         settings_json = canonical_json(config)
@@ -388,6 +396,8 @@ class RunLifecycleRepository:
             settings_json=settings_json,
             canonical_version=canonical_version,
             status=status,
+            run_mode=run_mode,
+            replay_from_run_id=replay_from_run_id,
             reproducibility_grade=reproducibility_grade,
         )
 
@@ -429,6 +439,8 @@ class RunLifecycleRepository:
                         settings_json=run.settings_json,
                         canonical_version=run.canonical_version,
                         status=run.status.value,
+                        run_mode=run.run_mode.value,
+                        replay_from_run_id=run.replay_from_run_id,
                         reproducibility_grade=run.reproducibility_grade,
                         source_schema_json=source_schema_json,
                         runtime_val_manifest_json=runtime_val_manifest_json,

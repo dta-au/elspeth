@@ -205,6 +205,7 @@ class AuditedHTTPClient(AuditedClientBase):
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         llm_call_attempt: str | None = None,
+        source_call_id: str | None = None,
     ) -> Call:
         """Sanitize HTTP error URLs at the shared audit persistence boundary."""
         if isinstance(error, HTTPCallError):
@@ -224,6 +225,7 @@ class AuditedHTTPClient(AuditedClientBase):
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
             llm_call_attempt=llm_call_attempt,
+            source_call_id=source_call_id,
         )
 
     def _extract_provider(self, url: str) -> str:

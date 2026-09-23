@@ -56,6 +56,7 @@ from elspeth.contracts import (
     TerminalPath,
     TriggerType,
 )
+from elspeth.contracts.audit import CallVerification
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
@@ -610,6 +611,7 @@ class ExecutionRepository:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record an external call for a node state."""
         return self.calls.record_call(
@@ -627,6 +629,7 @@ class ExecutionRepository:
             response_ref=response_ref,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
+            source_call_id=source_call_id,
         )
 
     # === Operations (Source/Sink I/O) ===
@@ -689,6 +692,7 @@ class ExecutionRepository:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record an external call made during an operation."""
         return self.calls.record_operation_call(
@@ -705,7 +709,70 @@ class ExecutionRepository:
             response_ref=response_ref,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
+            source_call_id=source_call_id,
         )
+
+    def record_verification_decision(
+        self,
+        *,
+        current_run_id: str,
+        current_call_id: str,
+        source_run_id: str,
+        source_call_id: str | None,
+        is_match: bool | None,
+        differences_json: str,
+    ) -> CallVerification:
+        return self.calls.record_verification_decision(
+            current_run_id=current_run_id,
+            current_call_id=current_call_id,
+            source_run_id=source_run_id,
+            source_call_id=source_call_id,
+            is_match=is_match,
+            differences_json=differences_json,
+        )
+
+    def get_verification_decision(self, current_call_id: str) -> CallVerification | None:
+        return self.calls.get_verification_decision(current_call_id)
+
+    def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
+        return self.calls.get_verification_decisions_for_run(current_run_id)
+
+    def find_call_for_current_parent(
+        self,
+        *,
+        source_run_id: str,
+        call_type: CallType,
+        request_hash: str | None,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int,
+    ) -> Call | None:
+        return self.calls.find_call_for_current_parent(
+            source_run_id=source_run_id,
+            call_type=call_type,
+            request_hash=request_hash,
+            current_state_id=current_state_id,
+            current_operation_id=current_operation_id,
+            current_call_index=current_call_index,
+        )
+
+    def list_source_calls_for_current_parent(
+        self,
+        *,
+        source_run_id: str,
+        call_type: CallType,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> list[Call]:
+        return self.calls.list_source_calls_for_current_parent(
+            source_run_id=source_run_id,
+            call_type=call_type,
+            current_state_id=current_state_id,
+            current_operation_id=current_operation_id,
+        )
+
+    def get_call_request_data(self, call_id: str) -> CallDataResult:
+        return self.calls.get_call_request_data(call_id)
 
     def get_operation(self, operation_id: str) -> Operation | None:
         """Get an operation by ID."""

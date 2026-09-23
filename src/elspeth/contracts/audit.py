@@ -32,6 +32,7 @@ from elspeth.contracts.enums import (
     NodeType,
     ReproducibilityGrade,
     RoutingMode,
+    RunMode,
     RunStatus,
     TerminalOutcome,
     TerminalPath,
@@ -141,6 +142,8 @@ class Run:
     settings_json: str
     canonical_version: str
     status: RunStatus  # Strict: enum only
+    run_mode: RunMode = RunMode.LIVE
+    replay_from_run_id: str | None = None
     completed_at: datetime | None = None
     reproducibility_grade: ReproducibilityGrade | None = None
     export_status: ExportStatus | None = None  # Strict: enum only
@@ -156,6 +159,9 @@ class Run:
         """Validate enum fields - Tier 1 crash on invalid types."""
         require_int(self.llm_call_count, "llm_call_count", optional=True, min_value=0)
         _validate_enum(self.status, RunStatus, "status")
+        _validate_enum(self.run_mode, RunMode, "run_mode")
+        if (self.run_mode is RunMode.LIVE) != (self.replay_from_run_id is None):
+            raise ValueError("live runs have no replay source; replay/verify runs require one")
         _validate_enum(self.reproducibility_grade, ReproducibilityGrade, "reproducibility_grade", optional=True)
         _validate_enum(self.export_status, ExportStatus, "export_status", optional=True)
         if type(self.seeded_from_cache) is not bool:
@@ -544,6 +550,7 @@ class Call:
     request_ref: str | None = None
     response_hash: str | None = None
     response_ref: str | None = None
+    source_call_id: str | None = None
     error_json: str | None = None
     latency_ms: float | None = None
     # Cross-DB hash anchor for LLM transforms downstream of an interpretation
@@ -578,6 +585,19 @@ class Call:
             raise ValueError(
                 f"Call requires exactly one of state_id or operation_id. Got state_id={self.state_id!r}, operation_id={self.operation_id!r}"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class CallVerification:
+    """Durable comparison of a current call with a source-run call."""
+
+    current_call_id: str
+    current_run_id: str
+    source_run_id: str
+    source_call_id: str | None
+    is_match: bool | None
+    differences_json: str
+    recorded_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

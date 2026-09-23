@@ -446,7 +446,9 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        16-hex error fingerprints, the 32-hex SchemaContract.version_hash
 #        values and the ``sha256:<16 hex>`` plugin source fingerprint now each
 #        have their own rule. Deploy with Sessions epoch 63; delete/recreate.
-SQLITE_SCHEMA_EPOCH = 43
+#  44 → Calls gain source-call lineage and durable verification decisions.
+#        Populated epoch-43 stores require delete/recreate under pre-1.0 policy.
+SQLITE_SCHEMA_EPOCH = 44
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -505,6 +507,8 @@ runs_table = Table(
     Column("completed_at", DateTime(timezone=True)),
     Column("config_hash", String(64), nullable=False),
     Column("settings_json", Text, nullable=False),
+    Column("run_mode", String(16), nullable=False, server_default="live"),
+    Column("replay_from_run_id", String(64), ForeignKey("runs.run_id"), nullable=True),
     Column("reproducibility_grade", String(32)),
     Column("canonical_version", String(64), nullable=False),
     # Source schema for resume type restoration
@@ -557,6 +561,11 @@ runs_table = Table(
         name="ck_runs_openrouter_catalog_source",
     ),
     CheckConstraint(_LowerHex64Check("config_hash"), name="ck_runs_config_hash_hex"),
+    CheckConstraint("run_mode IN ('live', 'replay', 'verify')", name="ck_runs_mode"),
+    CheckConstraint(
+        "(run_mode = 'live' AND replay_from_run_id IS NULL) OR (run_mode <> 'live' AND replay_from_run_id IS NOT NULL AND replay_from_run_id <> run_id)",
+        name="ck_runs_mode_source",
+    ),
     CheckConstraint(_LowerHex64Check("openrouter_catalog_sha256"), name="ck_runs_openrouter_catalog_sha256_hex"),
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
@@ -2202,6 +2211,7 @@ calls_table = Table(
     Column("request_ref", String(256)),
     Column("response_hash", String(64)),
     Column("response_ref", String(256)),
+    Column("source_call_id", String(64), ForeignKey("calls.call_id"), nullable=True),
     # Cross-DB hash anchor for interpretation events (Option A — Phase 5b).
     # Populated by the LLM-transform plugin at execution time when the runtime
     # node config contains an ``approved_prompt_artifact_hash`` sibling field
@@ -2244,6 +2254,21 @@ calls_table = Table(
     # same name; both sides carry the identical shape rule.
     CheckConstraint(_OptionalLowerHex64Check("approved_prompt_artifact_hash"), name="ck_calls_approved_prompt_artifact_hash_hex"),
 )
+
+call_verifications_table = Table(
+    "call_verifications",
+    metadata,
+    Column("current_call_id", String(64), ForeignKey("calls.call_id"), primary_key=True),
+    Column("current_run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("source_run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("source_call_id", String(64), ForeignKey("calls.call_id"), nullable=True),
+    Column("is_match", Boolean, nullable=True),
+    Column("differences_json", Text, nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("current_run_id <> source_run_id", name="ck_call_verifications_distinct_runs"),
+    CheckConstraint("is_match IS NOT TRUE OR source_call_id IS NOT NULL", name="ck_call_verifications_match_has_source"),
+)
+Index("ix_call_verifications_run", call_verifications_table.c.current_run_id)
 
 # Partial unique indexes for call_index uniqueness within each parent type.
 # Since calls can be parented by EITHER state_id OR operation_id (XOR),

@@ -62,6 +62,7 @@ class CallRecorder(Protocol):
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
     ) -> Call: ...
@@ -81,6 +82,7 @@ class CallRecorder(Protocol):
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
         coordination_token: CoordinationToken,
     ) -> Call: ...
 
@@ -117,6 +119,7 @@ class PluginAuditWriter(Protocol):
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
     ) -> Call: ...
@@ -136,6 +139,7 @@ class PluginAuditWriter(Protocol):
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
         coordination_token: CoordinationToken,
     ) -> Call: ...
 
