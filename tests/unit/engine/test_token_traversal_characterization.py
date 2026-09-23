@@ -254,7 +254,7 @@ class TestProcessSingleTokenOrchestration:
             sink_name="error_sink",
         )
 
-        def _route(gate_config, node_id, token, ctx, token_manager=None):
+        def _route(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return sink_outcome
 
         processor._gate_executor.execute_config_gate = _route  # type: ignore[method-assign]
@@ -283,7 +283,7 @@ class TestProcessSingleTokenOrchestration:
             updated_token=token,
         )
 
-        def _continue(gate_config, node_id, token, ctx, token_manager=None):
+        def _continue(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return continue_outcome
 
         processor._gate_executor.execute_config_gate = _continue  # type: ignore[method-assign]
@@ -334,7 +334,7 @@ class TestProcessSingleTokenOrchestration:
         recorded: list[dict[str, object]] = []
         emitted: list[tuple[TerminalOutcome, TerminalPath]] = []
 
-        def _discard(gate_config, node_id, token, ctx, token_manager=None):
+        def _discard(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return gate_outcome
 
         processor._gate_executor.execute_config_gate = _discard  # type: ignore[method-assign]
@@ -450,7 +450,7 @@ class TestProcessSingleTokenOrchestration:
         )
         recorded: list[dict[str, object]] = []
 
-        def _gate_error(gate_config, node_id, token, ctx, token_manager=None):
+        def _gate_error(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return gate_outcome
 
         def _telemetry_failure(*_args: object, **_kwargs: object) -> None:
@@ -488,7 +488,7 @@ class TestProcessSingleTokenOrchestration:
             next_node_id=NodeID("ghost-node"),
         )
 
-        def _jump(gate_config, node_id, token, ctx, token_manager=None):
+        def _jump(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return jump_outcome
 
         processor._gate_executor.execute_config_gate = _jump  # type: ignore[method-assign]
